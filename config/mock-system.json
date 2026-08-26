@@ -1,0 +1,26 @@
+{
+  "system": {"hostname": "vyb-lab", "architecture": "x86_64-linux", "profile": "development"},
+  "kernel": {
+    "package": "linux",
+    "version": "6.12.0",
+    "source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz",
+    "config": ["CONFIG_64BIT=y", "CONFIG_BLK_DEV_INITRD=y", "CONFIG_EXT4_FS=y", "CONFIG_VIRTIO=y", "CONFIG_VIRTIO_BLK=y", "CONFIG_NET=y"],
+    "initramfs": {"enabled": true, "modules": ["virtio_blk", "ext4"]}
+  },
+  "toolchain": [
+    {"name": "binutils", "version": "2.43", "role": "bootstrap"},
+    {"name": "gcc", "version": "14.2.0", "role": "build"},
+    {"name": "musl", "version": "1.2.5", "role": "runtime"}
+  ],
+  "packages": [
+    {"name": "busybox", "version": "1.37.0", "source": "upstream", "selected": true, "depends_on": []},
+    {"name": "qemu", "version": "9.1.0", "source": "upstream", "selected": true, "depends_on": ["glib", "zlib"]},
+    {"name": "openssh", "version": "9.9p1", "source": "upstream", "selected": true, "depends_on": ["zlib", "openssl"]},
+    {"name": "vim", "version": "9.1", "source": "upstream", "selected": true, "depends_on": []}
+  ],
+  "services": [{"name": "getty", "enabled": true, "settings": {"tty": "tty1"}}, {"name": "sshd", "enabled": true, "settings": {"port": 22}}],
+  "users": [{"name": "rick", "groups": ["wheel"], "ssh_authorized_keys_ref": "secret://users/rick/authorized_keys"}],
+  "storage": {"root": "/dev/vda1", "state": "/var/lib/vyb-os", "store": "/vyb/store"},
+  "network": {"mode": "dhcp", "interfaces": ["eth0"]},
+  "boot": {"target": "container-rootfs", "loader": "direct-init", "generation_rollback": true}
+}

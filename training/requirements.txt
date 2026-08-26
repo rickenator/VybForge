@@ -1,0 +1,7 @@
+# Install torch from the NVIDIA CUDA index appropriate to the target GB10 host.
+accelerate>=1.5,<2
+bitsandbytes>=0.45,<1
+datasets>=3.3,<4
+peft>=0.14,<1
+transformers>=4.51,<5
+trl>=0.15,<1

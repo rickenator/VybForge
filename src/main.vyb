@@ -1,0 +1,73 @@
+# VybAIConf: local-only, interactive Vyb client for Ollama.
+#
+# stdout is reserved for one JSON response per submitted question. Prompts and
+# diagnostics go to stderr, so callers can safely capture or pipe stdout.
+
+import env::{env_get}
+import http::{http_close, http_header_value, http_parse_int, http_read_line,
+             http_read_rest, http_send_all}
+import network::{socket_close, socket_connect, socket_open, socket_resolve, Socket}
+import term::{eprint, eprintln, flush, stdin_read_line}
+
+json_escape(value<String>)<String> -> {
+    escaped<String> = value.replace("\\", "\\\\")
+    escaped = escaped.replace("\"", "\\\"")
+    escaped = escaped.replace("\n", "\\n")
+    escaped = escaped.replace("\r", "\\r")
+    return escaped.replace("\t", "\\t")
+}
+
+error_json(message<String>)<String> -> {
+    return "{\"kind\":\"summary\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[],\"proposed_changes\":[],\"requires_confirmation\":false}"
+}
+
+ollama_body(model<String>, question<String>)<String> -> {
+    system<String> = "You are a VybOS configuration interviewer. Draft desired-state configuration only; never build, install, deploy, apply, run shell commands, or modify VybOS. Ask one high-information question at a time. Return exactly one JSON object. kind must be question, proposal, or summary. missing_fields and proposed_changes must always be arrays. Each proposed_changes item has path, value, and reason."
+    schema<String> = "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"kind\",\"message\",\"missing_fields\",\"proposed_changes\",\"requires_confirmation\"],\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"question\",\"proposal\",\"summary\"]},\"message\":{\"type\":\"string\"},\"missing_fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"proposed_changes\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"path\",\"value\",\"reason\"],\"properties\":{\"path\":{\"type\":\"string\"},\"value\":{},\"reason\":{\"type\":\"string\"}}}},\"requires_confirmation\":{\"type\":\"boolean\"}}}"
+    return "{\"model\":\"" + json_escape(model) + "\",\"stream\":false,\"think\":false,\"format\":" + schema + ",\"options\":{\"num_ctx\":8192,\"num_predict\":256},\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(system) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(question) + "\"}]}"
+}
+
+call_ollama(model<String>, question<String>)<String> -> {
+    ip<String> = socket_resolve("127.0.0.1") else ""
+    if (ip.len() == 0) { return error_json("Cannot resolve local Ollama endpoint") }
+
+    fd<Int> = socket_open(Socket::AF_INET, Socket::SOCK_STREAM, Socket::IPPROTO_TCP) else -1
+    if (fd < 0) { return error_json("Cannot open local Ollama socket") }
+    if (!(socket_connect(fd, ip, 11434) else false)) {
+        socket_close(fd)
+        return error_json("Cannot connect to Ollama at 127.0.0.1:11434")
+    }
+
+    body<String> = ollama_body(model, question)
+    request<String> = "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1:11434\r\nContent-Type: application/json\r\nContent-Length: " + body.len().to_string() + "\r\nConnection: close\r\n\r\n" + body
+    if (http_send_all(fd, request) != request.len()) {
+        socket_close(fd)
+        return error_json("Incomplete request to local Ollama")
+    }
+
+    status<String> = http_read_line(fd)
+    if (status.index_of(" 200 ") < 0) {
+        socket_close(fd)
+        return error_json("Ollama returned an unsuccessful HTTP response")
+    }
+    header<String> = http_read_line(fd)
+    while (header.len() > 0) { header = http_read_line(fd) }
+    response<String> = http_read_rest(fd, 16777216)
+    http_close(fd)
+    if (response.len() == 0) { return error_json("Ollama returned an empty response") }
+    return response
+}
+
+main()<Int> -> {
+    model<String> = env_get("VYBAICONF_MODEL") else "qwen3:4b"
+    eprintln("VybAIConf local configurator — model " + model)
+    eprintln("Enter a VybOS goal; /quit exits. JSON responses are written to stdout.")
+    while (true) {
+        eprint("vyb-config> ")
+        flush()
+        question<String> = stdin_read_line()
+        if (question.len() == 0 || question == "/quit") { break }
+        println(call_ollama(model, question))
+    }
+    return 0
+}

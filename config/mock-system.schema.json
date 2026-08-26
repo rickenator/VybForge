@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VybOS desired system",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["system", "kernel", "toolchain", "packages", "services", "users", "storage", "network", "boot"],
+  "properties": {
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostname", "architecture", "profile"],
+      "properties": {
+        "hostname": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "enum": ["x86_64-linux", "aarch64-linux"]},
+        "profile": {"type": "string", "enum": ["development", "server", "desktop", "appliance"]}
+      }
+    },
+    "kernel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "version", "source", "config", "initramfs"],
+      "properties": {
+        "package": {"const": "linux"},
+        "version": {"type": "string"},
+        "source": {"type": "string", "format": "uri"},
+        "config": {"type": "array", "items": {"type": "string"}},
+        "initramfs": {"type": "object", "required": ["enabled", "modules"], "properties": {"enabled": {"type": "boolean"}, "modules": {"type": "array", "items": {"type": "string"}}}}
+      }
+    },
+    "toolchain": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["name", "version", "role"], "properties": {"name": {"type": "string"}, "version": {"type": "string"}, "role": {"type": "string", "enum": ["bootstrap", "build", "runtime"]}}}},
+    "packages": {"type": "array", "items": {"type": "object", "required": ["name", "version", "source", "selected"], "properties": {"name": {"type": "string"}, "version": {"type": "string"}, "source": {"type": "string"}, "selected": {"type": "boolean"}, "depends_on": {"type": "array", "items": {"type": "string"}}}}},
+    "services": {"type": "array", "items": {"type": "object", "required": ["name", "enabled"], "properties": {"name": {"type": "string"}, "enabled": {"type": "boolean"}, "settings": {"type": "object"}}}},
+    "users": {"type": "array", "items": {"type": "object", "required": ["name", "groups", "ssh_authorized_keys_ref"], "properties": {"name": {"type": "string"}, "groups": {"type": "array", "items": {"type": "string"}}, "ssh_authorized_keys_ref": {"type": "string"}}}},
+    "storage": {"type": "object", "required": ["root", "state", "store"], "properties": {"root": {"type": "string"}, "state": {"type": "string"}, "store": {"type": "string"}}},
+    "network": {"type": "object", "required": ["mode", "interfaces"], "properties": {"mode": {"type": "string", "enum": ["dhcp", "static"]}, "interfaces": {"type": "array", "items": {"type": "string"}}}},
+    "boot": {"type": "object", "required": ["target", "loader", "generation_rollback"], "properties": {"target": {"type": "string", "enum": ["container-rootfs", "qemu", "bare-metal"]}, "loader": {"type": "string"}, "generation_rollback": {"type": "boolean"}}}
+  }
+}

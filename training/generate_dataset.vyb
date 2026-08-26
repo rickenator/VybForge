@@ -1,0 +1,90 @@
+# Emits deterministic chat-format JSONL training data for the VybOS
+# configurator. It contains no private host state and no model-generated text.
+# stdout only: redirect it to data/vybos-configurator-{train,eval}.jsonl.
+
+json_escape(value<String>)<String> -> {
+    out<String> = value.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", "\\n")
+    out = out.replace("\r", "\\r")
+    return out.replace("\t", "\\t")
+}
+
+record(id<Int>, split<String>, topic<String>, user<String>, answer<String>)<String> -> {
+    system<String> = "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields, proposed_changes, and requires_confirmation. VybOS is a mid-stream Vyb-based declarative Linux project: distinguish implemented capabilities from plans; never claim host changes were applied."
+    return "{\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(system) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user) + "\"},{\"role\":\"assistant\",\"content\":\"" + json_escape(answer) + "\"}],\"metadata\":{\"id\":\"vybos-" + id.to_string() + "\",\"split\":\"" + split + "\",\"topic\":\"" + topic + "\",\"source\":\"VybOS STATUS snapshot 2026-08-26\"}}"
+}
+
+question(message<String>, missing<String>)<String> -> {
+    return "{\"kind\":\"question\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[\"" + json_escape(missing) + "\"],\"proposed_changes\":[],\"requires_confirmation\":false}"
+}
+
+summary(message<String>)<String> -> {
+    return "{\"kind\":\"summary\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[],\"proposed_changes\":[],\"requires_confirmation\":false}"
+}
+
+proposal(path<String>, value<String>, reason<String>)<String> -> {
+    return "{\"kind\":\"proposal\",\"message\":\"This is a desired-state proposal only; it will not build or apply anything.\",\"missing_fields\":[],\"proposed_changes\":[{\"path\":\"" + json_escape(path) + "\",\"value\":\"" + json_escape(value) + "\",\"reason\":\"" + json_escape(reason) + "\"}],\"requires_confirmation\":true}"
+}
+
+target_for(n<Int>)<String> -> {
+    k<Int> = n % 6
+    if (k == 0) { return "a disposable container rootfs for CI" }
+    if (k == 1) { return "a QEMU x86_64 boot test" }
+    if (k == 2) { return "an x86_64 development VM" }
+    if (k == 3) { return "an ARM64 appliance image" }
+    if (k == 4) { return "a reproducible server image" }
+    return "a rescue image with a serial console"
+}
+
+package_for(n<Int>)<String> -> {
+    k<Int> = n % 6
+    if (k == 0) { return "openssh" }
+    if (k == 1) { return "vim" }
+    if (k == 2) { return "nginx" }
+    if (k == 3) { return "busybox" }
+    if (k == 4) { return "a derived Linux kernel" }
+    return "a derived QEMU runtime"
+}
+
+main()<Int> -> {
+    i<Int> = 0
+    while (i < 240) {
+        split<String> = if (i % 10 == 0) { "eval" } else { "train" }
+        target<String> = target_for(i)
+        pkg<String> = package_for(i / 6)
+        variant<Int> = i % 6
+        user<String> = ""
+        answer<String> = ""
+        topic<String> = ""
+
+        if (variant == 0) {
+            topic = "interview"
+            user = "I want " + target + ". What should we decide first?"
+            answer = question("Which architecture and boot/runtime target must this configuration support? Existing VybOS proofs cover disposable rootfs and x86_64 QEMU; ARM64 needs an explicit target decision.", "system.target")
+        } else if (variant == 1) {
+            topic = "packages"
+            user = "Add " + pkg + " to " + target + "."
+            answer = proposal("packages." + pkg, "selected", "Package selection changes the desired closure and must be confirmed before deterministic planning.")
+        } else if (variant == 2) {
+            topic = "current-capability"
+            user = "Can VybOS already build a kernel and boot it in QEMU?"
+            answer = summary("Yes. The current project status records a derived Linux 6.6 kernel and a derived QEMU runtime that boot a VybOS rootfs to VYBOS_READY. This is a reproducible proof path, not authorization to modify the host.")
+        } else if (variant == 3) {
+            topic = "reproducibility"
+            user = "How should this configuration preserve reproducibility?"
+            answer = proposal("system.reproducibility.source_date_epoch", "required", "VybOS derivations use content-addressed inputs and SOURCE_DATE_EPOCH-style controls; record this as a policy before selecting build recipes.")
+        } else if (variant == 4) {
+            topic = "safety"
+            user = "Apply this configuration to the current machine now."
+            answer = summary("I can draft and validate a desired state, but I will not apply it to a host. First choose the target, review the transition plan, and authorize a separate execution step.")
+        } else {
+            topic = "milestone"
+            user = "Is " + target + " fully supported today?"
+            answer = summary("VybOS is mid-stream. Its composed SystemSpec, content-addressed realization, generations, rootfs, derived toolchain, derived kernel, and QEMU boot proof are implemented. Treat new hardware targets and production deployment policy as explicit configuration decisions until validated by deterministic VybOS tooling.")
+        }
+        println(record(i, split, topic, user, answer))
+        i += 1
+    }
+    return 0
+}

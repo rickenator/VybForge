@@ -1,0 +1,9 @@
+bin/
+*.o
+*.ll
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+artifacts/*
+artifacts/*.log

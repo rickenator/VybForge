@@ -1,0 +1,65 @@
+# Reproducing VybAIConf
+
+## Clone source and data
+
+```sh
+git clone git@github.com:rickenator/VybAIConf.git
+cd VybAIConf
+```
+
+## Build the Vyb/Ollama client
+
+Install Vyb and Ollama on Linux. Ollama must listen locally at `127.0.0.1:11434`.
+
+```sh
+export VYB_BIN="$HOME/Projects/Vyb/build/vyb"
+mkdir -p bin
+"$VYB_BIN" src/main.vyb --build bin/vyb-configurator -O2
+ollama pull qwen3:4b
+./run-vyb.sh
+```
+
+The client sets Qwen3 thinking off, uses an 8192-token context and 256-token
+generation limit, and never calls VybOS.
+
+## Recreate the corpus
+
+```sh
+export VYB_BIN="$HOME/Projects/Vyb/build/vyb"
+./training/generate-data.sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+for path in Path('data').glob('*.jsonl'):
+    for line in path.read_text().splitlines():
+        json.loads(json.loads(line)['messages'][-1]['content'])
+    print(path, 'valid')
+PY
+```
+
+Expected split: 216 training and 24 evaluation records. The generator is
+deterministic Vyb code; it filters Vyb's numeric `main()` return line to retain
+strict JSONL.
+
+## Recreate QLoRA
+
+Reference run: `Qwen/Qwen3-4B`, one ARM64 NVIDIA GB10 with CUDA 13, 4-bit NF4
+loading, rank-16 LoRA, three epochs, batch size 1, accumulation 16, and 2048
+maximum tokens. `training/train_lora.py` pulls the public base model from
+Hugging Face automatically. It writes the resulting adapter locally under
+`artifacts/vybos-configurator-lora/`.
+
+```sh
+./training/start-training.sh --start-training <host> --model Qwen/Qwen3-4B
+```
+
+The launcher copies only `data/` and `training/`, creates a target `.venv`,
+installs the pinned Python dependencies, checks CUDA, and writes logs/artifacts
+under the target's `~/Projects/VybAIConf/`. It runs only with this explicit flag.
+
+To test a locally trained adapter on CUDA:
+
+```sh
+.venv/bin/python training/smoke_adapter.py --prompt \
+  'I want an ARM64 VybOS appliance image. What should we decide first?'
+```
