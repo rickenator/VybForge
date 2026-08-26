@@ -7,7 +7,33 @@ git clone git@github.com:rickenator/VybAIConf.git
 cd VybAIConf
 ```
 
-## Build the Vyb/Ollama client
+## Run a GPU or hosted interviewer (recommended)
+
+The CPU-only Vyb executable is intentionally not the normal runtime. Use a
+GPU-backed Ollama instance or a hosted model with `run.sh`.
+
+```sh
+# GPU-backed Ollama
+ollama pull qwen3:8b
+./run.sh
+
+# OpenAI Responses
+VYBAICONF_BACKEND=openai-responses \
+VYBAICONF_MODEL='your-model-name' \
+OPENAI_API_KEY='...' ./run.sh
+
+# Hermes or an OpenAI-compatible gateway
+VYBAICONF_BACKEND=openai-chat \
+VYBAICONF_ENDPOINT='https://model-gateway.example/v1' \
+VYBAICONF_MODEL='provider-model-name' \
+VYBAICONF_API_KEY='...' ./run.sh
+```
+
+The launcher supports strict JSON Schema by default. If the selected compatible
+gateway lacks it, set `VYBAICONF_STRUCTURED_OUTPUT=json_object` or `prompt`.
+No launcher path calls VybOS.
+
+## Build the Vyb/Ollama CPU fallback
 
 Install Vyb and Ollama on Linux. Ollama must listen locally at `127.0.0.1:11434`.
 
@@ -19,8 +45,9 @@ ollama pull qwen3:4b
 ./run-vyb.sh
 ```
 
-The client sets Qwen3 thinking off, uses an 8192-token context and 256-token
-generation limit, and never calls VybOS.
+This path sets Qwen3 thinking off, uses an 8192-token context and 256-token
+generation limit. It is retained for portable development only and never calls
+VybOS.
 
 ## Recreate the corpus
 

@@ -2,7 +2,9 @@
 
 `bin/vyb-configurator` is a Linux Vyb executable. It talks only to the local
 Ollama listener at `127.0.0.1:11434`; it has no Hermes dependency and never
-invokes VybOS tooling.
+invokes VybOS tooling. It is a portable CPU fallback, not the recommended
+interviewer runtime: use GPU-backed Ollama or the hosted backends in
+`./run.sh` for a useful session.
 
 Run it with:
 
