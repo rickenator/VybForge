@@ -66,6 +66,10 @@ export VYBAICONF_API_KEY='...'
 ./run.sh
 ```
 
+`VYBAICONF_API_KEY` is optional for `openai-chat`, which permits an
+unauthenticated trusted-LAN vLLM listener such as Lefty. Set it whenever the
+gateway requires bearer authentication.
+
 Some compatible gateways do not support JSON Schema. Set
 `VYBAICONF_STRUCTURED_OUTPUT=json_object` (or, as a last fallback, `prompt`) to
 relax transport enforcement; VybAIConf will still parse the returned JSON.

@@ -105,7 +105,7 @@ def main() -> int:
     context = "Desired-state schema:\n" + json.dumps(config_schema) + "\n\nCurrent mock configuration:\n" + json.dumps(config)
     messages = [{"role": "system", "content": system_prompt + "\n\n" + context}]
     api_key = api_key_from_environment(args.api_key_env)
-    if args.backend != "ollama" and not api_key:
+    if args.backend == "openai-responses" and not api_key:
         parser.error(f"{args.backend} requires ${args.api_key_env} (or $OPENAI_API_KEY); credentials are never stored by VybAIConf")
 
     request_backend = {"ollama": request_ollama, "openai-chat": request_openai_chat, "openai-responses": request_openai_responses}[args.backend]
