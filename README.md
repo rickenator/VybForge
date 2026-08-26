@@ -14,9 +14,9 @@ or modifies VybOS or the host.
 - `data/` — deterministic VybOS seed corpus: 216 train / 24 eval records.
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
   rules.
-- No base-model weights or adapter weights are committed. Training pulls the
-  public base model from Hugging Face and writes a local adapter under
-  `artifacts/`.
+- The final 66 MB LoRA adapter and tokenizer are committed directly under
+  `artifacts/vybos-configurator-lora/`. The much larger public base model is
+  pulled from Hugging Face when training or using the adapter.
 
 ## Quick start
 

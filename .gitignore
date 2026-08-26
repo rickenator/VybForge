@@ -6,4 +6,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 artifacts/*
+!artifacts/vybos-configurator-lora/
+!artifacts/vybos-configurator-lora/**
+artifacts/vybos-configurator-lora/checkpoint-*/
+artifacts/vybos-configurator-lora/README.md
 artifacts/*.log

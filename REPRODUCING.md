@@ -1,6 +1,6 @@
 # Reproducing VybAIConf
 
-## Clone source and data
+## Clone source, data, and final adapter
 
 ```sh
 git clone git@github.com:rickenator/VybAIConf.git
@@ -45,9 +45,9 @@ strict JSONL.
 
 Reference run: `Qwen/Qwen3-4B`, one ARM64 NVIDIA GB10 with CUDA 13, 4-bit NF4
 loading, rank-16 LoRA, three epochs, batch size 1, accumulation 16, and 2048
-maximum tokens. `training/train_lora.py` pulls the public base model from
-Hugging Face automatically. It writes the resulting adapter locally under
-`artifacts/vybos-configurator-lora/`.
+maximum tokens. The final adapter/tokenizer are already in this repository.
+`training/train_lora.py` pulls the public base model from Hugging Face when
+retraining and overwrites the local adapter path.
 
 ```sh
 ./training/start-training.sh --start-training <host> --model Qwen/Qwen3-4B
@@ -57,7 +57,7 @@ The launcher copies only `data/` and `training/`, creates a target `.venv`,
 installs the pinned Python dependencies, checks CUDA, and writes logs/artifacts
 under the target's `~/Projects/VybAIConf/`. It runs only with this explicit flag.
 
-To test a locally trained adapter on CUDA:
+To test the included adapter on CUDA:
 
 ```sh
 .venv/bin/python training/smoke_adapter.py --prompt \

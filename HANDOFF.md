@@ -3,8 +3,8 @@
 ## Current state
 
 There are two paths: `src/main.vyb` directly calls local Ollama without Hermes,
-and `training/train_lora.py` reproduces a Qwen3-4B LoRA adapter locally. The
-Vyb executable is CPU-oriented; adapter training/inference needs CUDA.
+and `artifacts/vybos-configurator-lora/` contains a Qwen3-4B LoRA adapter.
+The Vyb executable is CPU-oriented; adapter training/inference needs CUDA.
 
 ## Reference training result
 
@@ -16,11 +16,11 @@ Vyb executable is CPU-oriented; adapter training/inference needs CUDA.
 - Final logged evaluation loss: 0.05948377028107643
 
 The successful reference run completed all 42 steps and saved a 66 MB final
-adapter. It remains a local training artifact, not a GitHub payload. Training
-downloads the public base model from Hugging Face, and a new adapter is created
-locally. The reference adapter was loaded with the base model and, with Qwen3
-thinking disabled, returned valid configurator JSON for an ARM64 appliance
-interview prompt.
+adapter, committed directly in this private repository with its tokenizer.
+Training/inference downloads only the public base model from Hugging Face. The
+reference adapter was loaded with the base model and, with Qwen3 thinking
+disabled, returned valid configurator JSON for an ARM64 appliance interview
+prompt.
 
 ## Limitations
 
@@ -32,6 +32,7 @@ capability-separated human-reviewed evaluation set.
 
 ## Repository hygiene
 
-Do not commit adapters, checkpoints, model caches, Python environments,
-optimizer state, raw training logs, or host data. Base weights are retrieved
-from Hugging Face at training/inference time.
+Keep this final adapter and tokenizer. Do not commit resumable checkpoints,
+base-model caches, Python environments, optimizer state, raw training logs, or
+host data. Base weights are retrieved from Hugging Face at training/inference
+time.
