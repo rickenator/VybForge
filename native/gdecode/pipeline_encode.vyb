@@ -1,0 +1,32 @@
+// G-decode pipeline stage A: prompt -> token ids.
+// Tokenizes a config-interview prompt with the real Qwen3 BPE tokenizer, writes
+// the prompt ids (one per line) to native/out/prompt_ids.txt, and prints the
+// ids as a comma-separated string on stdout (consumed as
+// VYBFORGE_DECODE_PROMPT by native/host/decode_driver.vyb).
+// Run from repo root with --module-path native/tokenizer.
+import io::{open_write, write_str, close}
+import tokenizer::{encode}
+
+main()<Int> -> {
+    prompt<String> = "Add a package to a QEMU x86_64 boot test."
+    ids<Vec<Int>> = encode(prompt)
+    match (open_write("native/out/prompt_ids.txt")) {
+        f -> {
+            i<Int> = 0
+            for (i in 0..ids.len() - 1) {
+                match (write_str(f, ids.get(i).to_string())) { q -> { } ? -> { } }
+                match (write_str(f, "\n")) { r -> { } ? -> { } }
+            }
+            close(f)
+        }
+        ? -> { return 2 }
+    }
+    combos<String> = ""
+    j<Int> = 0
+    for (j in 0..ids.len() - 1) {
+        if (j > 0) { combos = combos + "," }
+        combos = combos + ids.get(j).to_string()
+    }
+    println(combos)
+    return 0
+}

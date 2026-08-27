@@ -51,6 +51,9 @@ gdecode:
 	cd $(ROOT) && $(VYB) native/gdecode/test_contract.vyb --module-path native/gdecode
 	cd $(ROOT) && python3 native/gdecode/verify_contract.py
 
+gdecode-pipeline:
+	cd $(ROOT) && ./native/gdecode/run_pipeline.sh
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

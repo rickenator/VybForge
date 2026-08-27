@@ -12,28 +12,29 @@ schema = json.load(open(os.path.join(repo, "config", "agent-response.schema.json
 validator = jsonschema.Draft7Validator(schema)
 
 files = {
-    "question": "native/out/contract_question.json",
-    "summary":  "native/out/contract_summary.json",
-    "proposal": "native/out/contract_proposal.json",
+    "question": ("native/out/contract_question.json", "question"),
+    "summary":  ("native/out/contract_summary.json", "summary"),
+    "proposal": ("native/out/contract_proposal.json", "proposal"),
+    "pipeline": ("native/out/contract_pipeline.json", "summary"),
 }
 allok = True
-for kind, rel in files.items():
+for label, (rel, expkind) in files.items():
     path = os.path.join(repo, rel)
     if not os.path.exists(path):
-        print(f"CONTRACT_VERIFY: {kind} MISSING ({rel})")
+        print(f"CONTRACT_VERIFY: {label} MISSING ({rel})")
         allok = False
         continue
     doc = json.load(open(path))
     errs = list(validator.iter_errors(doc))
-    ok = (doc.get("kind") == kind) and not errs
+    ok = (doc.get("kind") == expkind) and not errs
     if errs:
-        print(f"CONTRACT_VERIFY: {kind} FAIL")
+        print(f"CONTRACT_VERIFY: {label} FAIL")
         for e in errs:
             print("   ", e.message)
-    elif doc.get("kind") != kind:
-        print(f"CONTRACT_VERIFY: {kind} FAIL (kind mismatch: {doc.get('kind')})")
+    elif doc.get("kind") != expkind:
+        print(f"CONTRACT_VERIFY: {label} FAIL (kind mismatch: {doc.get('kind')})")
     else:
-        print(f"CONTRACT_VERIFY: {kind} OK")
+        print(f"CONTRACT_VERIFY: {label} OK")
     allok = allok and ok
 
 print("CONTRACT_VERIFY:", "ALL_OK" if allok else "FAIL")

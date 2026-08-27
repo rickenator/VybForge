@@ -48,12 +48,13 @@ Status legend: [x] done · [~] in progress · [ ] not started
       (question/summary/proposal) via Vyb auto-serialization, all three
       **schema-valid** (`CONTRACT_VERIFY: ALL_OK`), and the module-struct
       `from_string()` round-trip is restored (blocker `rickenator/Vyb#206`
-      fixed at `9bada99`). **PROGRESS/REMAINING**: the GPU decode slot is now
-      parameterizable (decode_driver reads `VYBFORGE_DECODE_PROMPT` as
-      comma-separated ids; defaults to `[1,5,3,2]`, `DECODE_VERIFY` still OK).
-      Remaining: wire the vertical-slice end-to-end prompt → tokenize → on-GPU
-      decode → detokenize → emit+validate, using the slice as an inference
-      stand-in. **VERTICAL SLICE otherwise complete**:
+      fixed at `9bada99`). **VERTICAL-SLICE END-TO-END WIRED & VERIFIED**:
+      `native/gdecode/run_pipeline.sh` composes prompt → tokenizer encode →
+      on-GPU decode (`VYBFORGE_DECODE_PROMPT`) → detokenizer decode →
+      agent-response contract emission + jsonschema check — pure Vyb runtime,
+      contract `ALL_OK` + round-trip OK (`make gdecode-pipeline`). Slice is the
+      inference stand-in; swap the real Qwen3-4B in later. **VERTICAL SLICE
+      otherwise complete**:
       substrate → GGUF/JSON/tokenizer loaders → stack → decode → stochastic
       sampling, all Vyb-native on-GPU + reference-verified.
 
