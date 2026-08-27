@@ -48,9 +48,9 @@ posted `bindings/cuda/` module.
 
 **Environment gotchas (verified):**
 - `a..b` ranges are **inclusive** — write `0..n-1`.
-- Fixed-array element **write** is unsupported (`a[i]=v` → invalid GEP, #201) —
-  initialize arrays by literal, and build buffers via `Vec` or device-memory + the
-  `ld/st` kernels.
+- Fixed-array element **write is now supported** (`a[i]=v`, constant or loop index —
+  fixed #201) — build host-side dense buffers directly in fixed arrays, or via
+  `Vec` / device-memory + the `ld/st` kernels.
 - `cuModuleLoadData` of a non-trivial kernel in a fresh process returns
   NO_BINARY_FOR_GPU (218) once and caches per-String — re-read the PTX into a FRESH
   String and reload (the #198 tests show the pattern).
@@ -101,7 +101,7 @@ posted `bindings/cuda/` module.
   `doc/.../PROGRAMMERS_GUIDE.md` (types/cast), the #198/#203 skill notes
   (`references/nvptx-kernel-mode-198.md`), tests `test/kernel/test_device_intrinsics.vyb`,
   `test/ffi/test_cuda_{axpy,matmul,p203}.vyb`, `test/units/test_numeric_cast.vyb`.
-- VybAIConf: `artifacts/vybos-configurator-lora*/` (base `Qwen/Qwen3-4B`, LoRA r16/
+- VybForge: `artifacts/vybos-configurator-lora*/` (base `Qwen/Qwen3-4B`, LoRA r16/
   α32 on q,k,v,o,gate,up,down), `training/train_lora.py` (NF4), `config/*.schema.json`
   (the JSON contract), `README.md`/`HANDOFF.md`.
 - This repo's earlier audit: `VYB-NATIVE-INFERENCE-AUDIT.md` (G1/G4/G5 remain open;

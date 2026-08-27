@@ -15,7 +15,7 @@ Run it with:
 It defaults to the CPU-friendlier `qwen3:4b`. Select the 8B model when useful:
 
 ```bash
-VYBAICONF_MODEL=qwen3:8b ./run-vyb.sh
+VYBFORGE_MODEL=qwen3:8b ./run-vyb.sh
 ```
 
 Human prompts go to stderr. Each model result is emitted on stdout as one

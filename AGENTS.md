@@ -1,8 +1,8 @@
-# VybAIConf Agent Mission
+# VybForge Agent Mission
 
 ## Purpose
 
-VybAIConf is a configuration-interview prototype for VybOS. Its job is to
+VybForge is a configuration-interview prototype for VybOS. Its job is to
 turn a user's goals into a complete, reviewable **desired-state** document:
 target architecture, kernel source and configuration, toolchain, initramfs,
 packages, services, users, storage, network, boot method, and any open

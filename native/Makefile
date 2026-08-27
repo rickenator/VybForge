@@ -1,4 +1,4 @@
-# VybAIConf native GPU substrate — builds kernels to sm_86 PTX and runs the
+# VybForge native GPU substrate — builds kernels to sm_86 PTX and runs the
 # Vyb-native host drivers. No Python in the runtime path; verification is done
 # inside Vyb (a numpy reference verifies the standalone single-layer forward).
 # Run `make -f native/Makefile verify` from the repo root.

@@ -1,4 +1,4 @@
-# Native GPU inference substrate (VybAIConf)
+# Native GPU inference substrate (VybForge)
 
 The handoff slice (HANDOFF-VYB-NATIVE-INFERENCE.md) — Vyb-native decode of the
 Qwen3-4B configurator on the RTX 3090, with **zero Python in the production

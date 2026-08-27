@@ -4,7 +4,7 @@
 
 ## 0. Goal
 
-Replace the Python/torch stack in `VybAIConf` with a **Vyb-native** pipeline that
+Replace the Python/torch stack in `VybForge` with a **Vyb-native** pipeline that
 loads the already-trained **Qwen3-4B + LoRA** configuration model (the
 `artifacts/vybos-configurator-lora*/adapter_model.safetensors`, rank 16 / alpha 32 on
 all of `q,k,v,o,gate,up,down` over base `Qwen/Qwen3-4B`) and runs it on the GPU, via

@@ -1,4 +1,4 @@
-# VybAIConf: local-only, interactive Vyb client for Ollama.
+# VybForge: local-only, interactive Vyb client for Ollama.
 #
 # stdout is reserved for one JSON response per submitted question. Prompts and
 # diagnostics go to stderr, so callers can safely capture or pipe stdout.
@@ -59,8 +59,8 @@ call_ollama(model<String>, question<String>)<String> -> {
 }
 
 main()<Int> -> {
-    model<String> = env_get("VYBAICONF_MODEL") else "qwen3:4b"
-    eprintln("VybAIConf local configurator — model " + model)
+    model<String> = env_get("VYBFORGE_MODEL") else (env_get("VYBAICONF_MODEL") else "qwen3:4b")
+    eprintln("VybForge local configurator — model " + model)
     eprintln("Enter a VybOS goal; /quit exits. JSON responses are written to stdout.")
     while (true) {
         eprint("vyb-config> ")

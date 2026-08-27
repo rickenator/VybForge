@@ -1,4 +1,4 @@
-# Reproducing VybAIConf
+# Reproducing VybForge
 
 ## Clone source, data, and final adapter
 
@@ -18,19 +18,20 @@ ollama pull qwen3:8b
 ./run.sh
 
 # OpenAI Responses
-VYBAICONF_BACKEND=openai-responses \
-VYBAICONF_MODEL='your-model-name' \
+VYBFORGE_BACKEND=openai-responses \
+VYBFORGE_MODEL='your-model-name' \
 OPENAI_API_KEY='...' ./run.sh
 
 # Hermes or an OpenAI-compatible gateway
-VYBAICONF_BACKEND=openai-chat \
-VYBAICONF_ENDPOINT='https://model-gateway.example/v1' \
-VYBAICONF_MODEL='provider-model-name' \
-VYBAICONF_API_KEY='...' ./run.sh
+VYBFORGE_BACKEND=openai-chat \
+VYBFORGE_ENDPOINT='https://model-gateway.example/v1' \
+VYBFORGE_MODEL='provider-model-name' \
+VYBFORGE_API_KEY='...' ./run.sh
 ```
 
 The launcher supports strict JSON Schema by default. If the selected compatible
-gateway lacks it, set `VYBAICONF_STRUCTURED_OUTPUT=json_object` or `prompt`.
+gateway lacks it, set `VYBFORGE_STRUCTURED_OUTPUT=json_object` or `prompt`.
+(Env vars accept the legacy `VYBAICONF_*` spellings as a deprecated fallback.)
 No launcher path calls VybOS.
 
 ## Build the Vyb/Ollama CPU fallback

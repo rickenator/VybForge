@@ -1,0 +1,47 @@
+// === MINIMAL REPRO: Compiler native-stack overflow during generic monomorphization ===
+//
+// Toolchain: ~/Projects/Vyb/build/vyb @ 55593fc
+// Run:       <vyb> mini_map_repro.vyb          (exit 139, SIGSEGV at COMPILE time)
+//
+// Instantiating TWO DIFFERENT generic HashMap types in one program makes the
+// JIT (LLVMCodegen) overflow the native stack while codegen'ing the HashMap
+// ctor (monomorphizeGenericFunction("__ctor_HashMap_0")). EACH ALONE compiles
+// fine:
+//   - mini_map_A.vyb : HashMap<String, Int> only                      -> exit 0
+//   - mini_map_B.vyb : HashMap<Int, String> only                      -> exit 0
+//   - mini_map_repro : both in one program (this file)                -> SIGSEGV 3/3
+//
+// gdb backtrace (crash is in the COMPILER, not in user code):
+//   LLVMCodegen::visit(CallExpression)  cgen_expr.cpp:1357
+//     -> ConstructionExpression::accept (ast.cpp:398)
+//       -> VariableDeclaration::accept  (ast.cpp:1128)
+//         -> BlockStatement::accept     (ast.cpp:517)
+//           -> monomorphizeGenericFunction("__ctor_HashMap_0")
+//   ... (25+ identical frames, recursively nesting) ...
+//   Program received signal SIGSEGV; rsp=0x7fffff7fef68 (main thread 8MB
+//   stack limit at ~0x7fffff800000) -> native stack overflow, not a runaway.
+//
+// Impact on VybForge: the Qwen tokenizer's encode() (HashMap<String,Int>
+// vocab) and decode_ids() (HashMap<Int,String> reverse-vocab) are each
+// correct standalone (encode 13/13 vs transformers; decode round-trips
+// exactly). But a program that uses BOTH — i.e. the real encode->decode
+// pipeline — crashes the compiler before running. Not a workaround; needs a
+// compiler fix (bounded/incremental monomorphization or a larger/JIT work-stack).
+import collections
+share(all) build_vocab2()<HashMap<String, Int>> -> {
+    m<HashMap<String, Int>> = HashMap<String, Int>()
+    m.put("a", 1)
+    return m
+}
+share(all) build_rev2()<HashMap<Int, String>> -> {
+    m<HashMap<Int, String>> = HashMap<Int, String>()
+    m.put(1, "a")
+    return m
+}
+main()<Int> -> {
+    v<HashMap<String, Int>> = build_vocab2()
+    r<HashMap<Int, String>> = build_rev2()
+    println_int(v.get("a") else -1)
+    println(r.get(1) else "?")
+    return 0
+}

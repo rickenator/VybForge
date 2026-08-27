@@ -1,4 +1,4 @@
-# VybAIConf Handoff
+# VybForge Handoff
 
 ## Current state
 
@@ -10,12 +10,12 @@ recommended interview runtime. Adapter training/inference needs CUDA.
 
 For useful, responsive configuration interviews, provide GPU-backed local
 inference or a hosted model. Hermes is supported as a gateway protocol, not as
-a required profile: point `VYBAICONF_BACKEND=openai-chat` at its `/v1` base URL
-and put its credential only in `VYBAICONF_API_KEY`. Use
+a required profile: point `VYBFORGE_BACKEND=openai-chat` at its `/v1` base URL
+and put its credential only in `VYBFORGE_API_KEY`. Use
 `openai-responses` for an OpenAI API model. Do not embed service URLs, keys, or
 host-specific assumptions in the repository. A Codex-capable model, when
 authorized for the user's OpenAI API project, uses the same Responses path;
-VybAIConf never attempts to borrow an interactive Codex login.
+VybForge never attempts to borrow an interactive Codex login.
 
 ## Reference training result
 
