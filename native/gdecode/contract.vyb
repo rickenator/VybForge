@@ -1,0 +1,63 @@
+// config_contract — Vyb-native emission of the VybOS configurator agent-response
+// JSON contract ({kind, message, missing_fields, proposed_changes,
+// requires_confirmation}), as consumed by tools/apply.vyb and validated against
+// config/agent-response.schema.json (see native/gdecode/verify_contract.py).
+//
+// Field names/order match the schema exactly so Vyb's auto-serialization
+// (struct.to_string()) yields schema-valid JSON. The one wrinkle: the schema's
+// change.value is any-JSON (object for pkgs/services, plain string for
+// hostname/system), but Vyb has no union/polymorphic value field. So value is
+// modeled as PatchValue (the union of the SystemSpec object keys:
+// name/version/source/command) and, for scalar values, the caller zeroes the
+// irrelevant keys. doc_mk_patch()/doc_mk_response() build the contract.
+
+share(all)
+struct PatchValue {
+    name<String>,
+    version<String>,
+    source<String>,
+    command<String>
+}
+
+share(all)
+struct Change {
+    path<String>,
+    op<String>,
+    value<PatchValue>,
+    reason<String>
+}
+
+share(all)
+struct AgentResponse {
+    kind<String>,
+    message<String>,
+    missing_fields<Vec<String>>,
+    proposed_changes<Vec<Change>>,
+    requires_confirmation<Bool>
+}
+
+// Build a patch value object with exactly the SystemSpec object keys set
+// (others = ""). Returns a PatchValue for use in a Change.value.
+share(all) pv(name<String>, version<String>, source<String>, command<String>)<PatchValue> -> {
+    return PatchValue { name = name, version = version, source = source, command = command }
+}
+
+// Build an AgentResponse of a given kind, message, missing-fields list and
+// proposed-changes list. Pass pre-built vectors (Vyb struct literals can't
+// inline push).
+share(all) doc_mk_response(kind<String>, message<String>,
+                           mf<Vec<String>>, pc<Vec<Change>>,
+                           confirm<Bool>)<AgentResponse> -> {
+    return AgentResponse {
+        kind = kind,
+        message = message,
+        missing_fields = mf,
+        proposed_changes = pc,
+        requires_confirmation = confirm
+    }
+}
+
+// Serialize a contract to its agent-response JSON string (Vyb auto).
+share(all) doc_to_json(d<AgentResponse>)<String> -> {
+    return d.to_string()
+}

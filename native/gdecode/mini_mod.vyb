@@ -1,0 +1,37 @@
+// === MINIMAL REPRO (module half): Type::from_string() drops a Vec-of-struct
+//     field that follows an EMPTY Vec<String> field ===
+//
+// Toolchain: ~/Projects/Vyb/build/vyb @ bf46304
+// Pair:  this file (mini_mod.vyb) + mini_repro.vyb (driver).
+// Run:   <vyb> mini_repro.vyb --module-path native/gdecode
+//
+// Trigger: Outer has `missing_fields<Vec<String>>` (serialized EMPTY as `[]`)
+// immediately before `proposed_changes<Vec<Change>>`. from_string() reconstructs
+// missing_fields ([]) but DROPS proposed_changes (-> []) and resets the trailing
+// Bool requires_confirmation (true -> false, its default).
+//   - Flip missing_fields to non-empty (["system"]) and it round-trips FINE.
+//   - Locally-declared structs round-trip fine regardless.
+// So the bug needs an EMPTY Vec<String> field immediately preceding a Vec-of-
+// struct field, in from_string().
+share(all)
+struct PatchValue {
+    name<String>,
+    version<String>,
+    source<String>,
+    command<String>
+}
+share(all)
+struct Change {
+    path<String>,
+    op<String>,
+    value<PatchValue>,
+    reason<String>
+}
+share(all)
+struct Outer {
+    kind<String>,
+    message<String>,
+    missing_fields<Vec<String>>,
+    proposed_changes<Vec<Change>>,
+    requires_confirmation<Bool>
+}

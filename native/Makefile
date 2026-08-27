@@ -12,7 +12,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 KERNELS := gemm rmsnorm math_probe layer deq
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack tensor decode clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack tensor decode gdecode clean
 
 all: verify
 
@@ -82,6 +82,9 @@ verify: $(PTX)
 	@echo "== BPE TOKENIZER (vs transformers reference) =="
 	cd $(ROOT) && $(VYB) native/tokenizer/test_tokenizer.vyb --module-path native/tokenizer
 	cd $(ROOT) && (.venv/bin/python native/tokenizer/verify_tokenizer.py || echo "TOKENIZER_VERIFY: SKIP (venv)")
+	@echo "== G-DECODE: agent-response CONTRACT EMISSION (jsonschema) =="
+	cd $(ROOT) && $(VYB) native/gdecode/test_contract.vyb --module-path native/gdecode
+	cd $(ROOT) && python3 native/gdecode/verify_contract.py
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out

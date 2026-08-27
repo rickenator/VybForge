@@ -41,11 +41,18 @@ Status legend: [x] done · [~] in progress · [ ] not started
       PTX-load / dev-mem / copy / **gemm + rmsnorm** via single-arg
       `cuLaunchKernel`, `TENSOR_GEMM_AND_RMSNORM_OK`); remaining polish is
       moving rope/attn/silu/resid (and the final embed/sample) behind it.
-- [ ] **G-decode** (final): schema-driven config-interview decode → emits
+- [~] **G-decode** (final): schema-driven config-interview decode → emits
       `{path, op, value, reason}` SystemSpec JSON; verify byte-compatible with
-      the Python/Ollama path on a few interviews. **VERTICAL SLICE otherwise
-      complete**: substrate → GGUF/JSON/tokenizer loaders → stack → decode →
-      stochastic sampling, all Vyb-native on-GPU and reference-verified.
+      the Python/Ollama path on a few interviews. **PROGRESS**: agent-response
+      contract **emission** built & verified — `native/gdecode/contract.vyb`
+      (question/summary/proposal) via Vyb auto-serialization, all three
+      **schema-valid** (`CONTRACT_VERIFY: ALL_OK`). **BLOCKED** partway:
+      `Type::from_string()` on module structs drops a Vec-of-struct field after
+      an empty `Vec<String>` (see **rickenator/Vyb#206**, minimal repro
+      `native/gdecode/mini_mod.vyb` + `mini_repro.vyb`); the emission path
+      (to_string + apply.vyb's own parser) is unaffected. **VERTICAL SLICE
+      otherwise complete**: substrate → GGUF/JSON/tokenizer loaders → stack →
+      decode → stochastic sampling, all Vyb-native on-GPU + reference-verified.
 
 ## Serial dependency chain
 G-json → (independent) · G-tokenizer → (independent) · G-gguf-data →

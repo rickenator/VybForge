@@ -1,0 +1,66 @@
+// Emit the three agent-response kinds (question / summary / proposal) via Vyb
+// auto-serialization, write each to native/out/contract_<kind>.json, and print.
+// Schema-validated separately by native/gdecode/verify_contract.py (jsonschema).
+// (AgentResponse::from_string() round-trip is deferred pending rickenator/Vyb#206.)
+import io::{open_write, write_str, close}
+import contract::{pv, doc_mk_response, doc_to_json, Change, AgentResponse, PatchValue}
+
+emit_file(p<String>, s<String>)<Int> -> {
+    match (open_write(p)) {
+        f -> {
+            match (write_str(f, s)) { q -> { } ? -> { close(f); return 1 } }
+            close(f)
+            return 0
+        }
+        ? -> { return 1 }
+    }
+}
+
+main()<Int> -> {
+    # ---- question ----
+    mfq<Vec<String>> = Vec<String>()
+    mfq.push("system")
+    pcq<Vec<Change>> = Vec<Change>()
+    q<AgentResponse> = doc_mk_response("question",
+        "Which architecture and boot/runtime target must this configuration support? Existing VybOS proofs cover disposable rootfs and x86_64 QEMU; ARM64 needs an explicit decision.",
+        mfq, pcq, false)
+    qs<String> = doc_to_json(q)
+
+    # ---- summary ----
+    mfs<Vec<String>> = Vec<String>()
+    pcs<Vec<Change>> = Vec<Change>()
+    s2<AgentResponse> = doc_mk_response("summary",
+        "Yes. Current VybOS status records a derived Linux kernel and a derived QEMU runtime that boot a rootfs to VYBOS_READY. This is a reproducible proof path, not authorization to modify the host.",
+        mfs, pcs, false)
+    ss<String> = doc_to_json(s2)
+
+    # ---- proposal (one pkgs-add change) ----
+    mfp<Vec<String>> = Vec<String>()
+    pcp<Vec<Change>> = Vec<Change>()
+    pv1<PatchValue> = pv("openssh", "9.9p1", "upstream", "")
+    pcp.push(Change { path = "pkgs", op = "add", value = pv1,
+        reason = "Adding a package changes the desired closure and must be confirmed before deterministic planning." })
+    p<AgentResponse> = doc_mk_response("proposal",
+        "This is a desired-state proposal only; it will not build or apply anything.",
+        mfp, pcp, true)
+    ps<String> = doc_to_json(p)
+
+    println("Q=")
+    println(qs)
+    println("S=")
+    println(ss)
+    println("P=")
+    println(ps)
+
+    if (emit_file("native/out/contract_question.json", qs) != 0) { return 1 }
+    if (emit_file("native/out/contract_summary.json", ss) != 0) { return 2 }
+    if (emit_file("native/out/contract_proposal.json", ps) != 0) { return 3 }
+    println("CONTRACT_EMITTED")
+
+    # NOTE: AgentResponse::from_string() round-trip of these emitted docs is
+    # deferred pending rickenator/Vyb#206 — from_string currently drops a
+    # Vec-of-struct field that follows an empty Vec<String> (an empty
+    # missing_fields breaks proposed_changes). Emission via to_string() is
+    # unaffected; schema validation is in native/gdecode/verify_contract.py.
+    return 0
+}

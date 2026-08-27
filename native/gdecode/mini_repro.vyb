@@ -1,0 +1,19 @@
+// === MINIMAL REPRO (driver half) — see mini_mod.vyb header ===
+// from_string() DROPS the Vec-of-struct field (proposed_changes) that follows an
+// EMPTY Vec<String> field (missing_fields), and resets the trailing Bool.
+import mini_mod::{Outer, Change, PatchValue}
+main()<Int> -> {
+    mf<Vec<String>> = Vec<String>()
+    v<Vec<Change>> = Vec<Change>()
+    v.push(Change { path = "pkgs", op = "add",
+                    value = PatchValue { name = "x", version = "1", source = "u", command = "" },
+                    reason = "r" })
+    o<Outer> = Outer { kind = "proposal", message = "m", missing_fields = mf,
+                       proposed_changes = v, requires_confirmation = true }
+    j<String> = o.to_string()
+    println("OUT = " + j)
+    back<Outer> = Outer::from_string(j)
+    println("IN  = " + back.to_string())
+    if (back.to_string() == j) { println("REPRO: roundtrip OK") } else { println("REPRO: DIFF (bug reproduced)") }
+    return 0
+}
