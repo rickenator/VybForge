@@ -21,15 +21,12 @@ Status legend: [x] done · [~] in progress · [ ] not started
 ## In flight / planned
 - [x] **G-json** — generic JSON value parser in Vyb (verified: parses
       `config/mock-system.json` and a `vocab.json` slice with real `build/vyb`).
-- [~] **G-tokenizer** — Qwen3 byte-level BPE in Vyb: **core VERIFIED** (real
-      151k vocab + merges; encode of plain ASCII words matches transformers
-      exactly, e.g. `"configure VybOS" -> [21002,647,84307,3126]`). GAP: the
-      pre-tokenizer regex is an approximation and drops standalone punctuation
-      (`'`) / some spacing → 8/11 test strings mismatch. Fix = implement the
-      exact Qwen2 split regex
-      `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
-      (needs `\p{L}`/`\p{N}` Unicode classes + the `[^\s\p{L}\p{N}]` punct
-      branch) in the Vyb pre-tokenizer.
+- [x] **G-tokenizer** — Qwen3 byte-level BPE in Vyb (real 151k vocab + merges).
+      Pre-tokenizer is a faithful algorithmic reproduction of the Qwen2 regex
+      (letters/digits/punct segmentation + space-before-punct); **EXACT match,
+      13/13** vs transformers on plain words, contractions, leading/trailing
+      apostrophes, punctuation, and whitespace runs. Non-ASCII words still
+      approximate (no Unicode-class regex in Vyb).
 - [ ] **G-tensor** (serial, after loaders): tensor:: module + 36-layer stack
       + KV cache + sampling (top_k/top_p/temperature).
 - [ ] **G-decode** (final): schema-driven config-interview decode → emits

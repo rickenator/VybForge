@@ -20,7 +20,7 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | **GGUF v3 reader** (header, metadata KV, tensor index; little-endian binary parse) | `gguf/parse_gguf.vyb` | `GGUF_PARSE_VERIFY: OK` on synthetic fixture |
 | **Q4_0 dequant on-GPU** (GGUF tensor data → device mem → `deq_q4_0`) | `gguf/dequant_gguf.vyb` | `DEQUANT_OK` bad=0 (32/32) |
 | **Generic JSON value parser** (object/array/string/num/bool/null tree) | `json/json_parse.vyb` | verified: parses mock-system.json + vocab slice |
-| **Qwen3 BPE tokenizer** (core) | `tokenizer/tokenizer.vyb` | plain ASCII words match transformers exactly (real 151k vocab); pre-tokenizer regex approx — punctuation pending |
+| **Qwen3 BPE tokenizer** (real 151k vocab + merges, Qwen2 pre-tokenizer) | `tokenizer/tokenizer.vyb` | EXACT match 13/13 vs transformers (words, contractions, apostrophes, punctuation, whitespace) |
 
 The single-layer forward is the handoff's **P0 go/no-go gate**; GGUF reader +
 Q4_0 dequant is **G-gguf-data**; the JSON parser is **G-json** (done); the

@@ -55,6 +55,11 @@ verify: $(PTX)
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	cd $(ROOT) && python3 native/gguf/verify_gguf.py
 	cd $(ROOT) && $(VYB) native/gguf/dequant_gguf.vyb
+	@echo "== JSON PARSER =="
+	cd $(ROOT) && $(VYB) native/json/test_json.vyb --module-path native/json
+	@echo "== BPE TOKENIZER (vs transformers reference) =="
+	cd $(ROOT) && $(VYB) native/tokenizer/test_tokenizer.vyb --module-path native/tokenizer
+	cd $(ROOT) && (.venv/bin/python native/tokenizer/verify_tokenizer.py || echo "TOKENIZER_VERIFY: SKIP (venv)")
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out

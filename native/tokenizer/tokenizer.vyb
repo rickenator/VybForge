@@ -11,14 +11,13 @@
 //   4. map final byte-token strings to ids via vocab.json (exact, unescaped),
 //      with a per-byte fallback if a merged token is somehow missing.
 //
-// SIMPLIFICATION (documented honestly): the real Qwen/GPT-2 pre-tokenizer is
-// the standard `gpt2` regex (with `\p{L}`/`\p{N}` Unicode classes). Vyb's
-// `regex` module is POSIX ERE only (no `\p{..}` classes), so instead of that
-// regex this module uses an algorithmic word/space splitter tuned to reproduce
-// the regex results for ASCII text (single space attaches to the following
-// word; extra leading spaces emit standalone ' ', trailing spaces standalone;
-// punctuation/apostrophes stay inside the word). Non-ASCII (Unicode-letter
-// words, newline/tab handling) may diverge from the reference — see report.
+// FAITHFUL algorithmic reproduction of the Qwen2 pre-tokenize regex, also
+// handling punctuation and standalone apostrophes (Vyb's regex module is POSIX
+// ERE only — no \p{L}/\p{N} classes — so instead of the regex this segments
+// letters / single-digits / punctuation per the `[^L/N]?L+` leading-punct and
+// space-before-punct rules). VERIFIED EXACT vs transformers on plain words,
+// contractions, leading/trailing apostrophes, punctuation, and whitespace runs.
+// Non-ASCII (Unicode-letter) words may still diverge (no Unicode regex).
 
 import io::{open_read, read_all, close}
 import collections
@@ -310,6 +309,109 @@ share(all) bpe_word_ids(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>
 // Full encode. Walks the flat byte-char vector, splits into words (space
 // handling identical to the Qwen/GPT-2 regex for ASCII text — see header),
 // and byte-BPEs each word in place.
+
+// Class of a byte-char (by its codepoint/lead byte) for the Qwen2 pre-tokenizer
+// segmentation: 0 = \p{L}-ish letter (incl. the remapped space glyph 'Ġ'=0xC4
+// used as leading-space), 1 = \p{N} digit, 2 = punctuation/other.
+share(all) cls(b0<Int>)<Int> -> {
+    if (b0 >= 65) { if (b0 <= 90) { return 0 } }
+    if (b0 >= 97) { if (b0 <= 122) { return 0 } }
+    if (b0 >= 48) { if (b0 <= 57) { return 1 } }
+    if (b0 >= 194) { if (b0 <= 196) { return 0 } }
+    return 2
+}
+
+// Byte-BPE wc[a..b) (a contiguous slice of byte-chars) -> Vec of ids.
+share(all) bpe_chars(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>, wc<Vec<String>>, a<Int>, b<Int>)<Vec<Int>> -> {
+    sw<String> = ""
+    st<Vec<Int>> = Vec()
+    st.push(0)
+    acc<Int> = 0
+    t<Int> = a
+    for (t in a..b - 1) {
+        sw = sw.concat(wc.get(t))
+        acc = acc + wc.get(t).len()
+        st.push(acc)
+    }
+    return bpe_word_ids(vocab, merges, sw, st)
+}
+
+// Apply the Qwen2 pre-tokenize regex segmentation ([^L/N]?L+ | N | [^\sL/N]+)
+// inside one space-delimited word wc[0..n) and BPE each segment.
+share(all) segment_word(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>, wc<Vec<String>>, n<Int>)<Vec<Int>> -> {
+    res<Vec<Int>> = Vec()
+    i<Int> = 0
+    rr<Int> = 0
+    while (i < n) {
+        gx<String> = wc.get(i)
+        b0<Int> = (gx.char_at(0) as Int) & 255
+        c0<Int> = cls(b0)
+        if (c0 == 0) {
+            if (b0 == 196) {
+                nx<Int> = -1
+                if (i + 1 < n) {
+                    gN<String> = wc.get(i + 1)
+                    bN<Int> = (gN.char_at(0) as Int) & 255
+                    nx = cls(bN)
+                }
+                if (nx == 2) {
+                    rr = i + 1
+                    while (rr < n) {
+                        gP<String> = wc.get(rr)
+                        bP<Int> = (gP.char_at(0) as Int) & 255
+                        if (cls(bP) == 2) { rr = rr + 1 } else { break }
+                    }
+                } else {
+                    rr = i
+                    while (rr < n) {
+                        gA<String> = wc.get(rr)
+                        bA<Int> = (gA.char_at(0) as Int) & 255
+                        if (cls(bA) == 0) { rr = rr + 1 } else { break }
+                    }
+                }
+            } else {
+                rr = i
+                while (rr < n) {
+                    gA<String> = wc.get(rr)
+                    bA<Int> = (gA.char_at(0) as Int) & 255
+                    if (cls(bA) == 0) { rr = rr + 1 } else { break }
+                }
+            }
+        } else {
+            if (c0 == 1) {
+                rr = i + 1
+            } else {
+                if (i + 1 < n) {
+                    gB<String> = wc.get(i + 1)
+                    bB<Int> = (gB.char_at(0) as Int) & 255
+                    if (cls(bB) == 0) {
+                        rr = i + 1
+                        while (rr < n) {
+                            gC<String> = wc.get(rr)
+                            bC<Int> = (gC.char_at(0) as Int) & 255
+                            if (cls(bC) == 0) { rr = rr + 1 } else { break }
+                        }
+                    } else {
+                        rr = i
+                        while (rr < n) {
+                            gD<String> = wc.get(rr)
+                            bD<Int> = (gD.char_at(0) as Int) & 255
+                            if (cls(bD) == 2) { rr = rr + 1 } else { break }
+                        }
+                    }
+                } else {
+                    rr = i + 1
+                }
+            }
+        }
+        sub<Vec<Int>> = bpe_chars(vocab, merges, wc, i, rr)
+        a2<Int> = 0
+        for (a2 in 0..sub.len() - 1) { res.push(sub.get(a2)) }
+        i = rr
+    }
+    return res
+}
+
 share(all) encode_with(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>, sp<String>, input<String>)<Vec<Int>> -> {
     ids<Vec<Int>> = Vec()
     chars<Vec<String>> = text_to_chars(input)
@@ -323,32 +425,33 @@ share(all) encode_with(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>
             }
             run<Int> = j - i
             if (j >= n) {
+                wcS<Vec<String>> = Vec()
                 z<Int> = 0
-                for (z in 0..run - 1) { ids.push(vocab.get(sp) else -1) }
+                for (z in 0..run - 1) { wcS.push(sp) }
+                subS<Vec<Int>> = segment_word(vocab, merges, wcS, wcS.len())
+                a2<Int> = 0
+                for (a2 in 0..subS.len() - 1) { ids.push(subS.get(a2)) }
                 i = j
             } else {
                 standalone<Int> = run - 1
                 if (standalone > 0) {
+                    wcS<Vec<String>> = Vec()
                     z<Int> = 0
-                    for (z in 0..standalone - 1) { ids.push(vocab.get(sp) else -1) }
+                    for (z in 0..standalone - 1) { wcS.push(sp) }
+                    subS<Vec<Int>> = segment_word(vocab, merges, wcS, wcS.len())
+                    a2<Int> = 0
+                    for (a2 in 0..subS.len() - 1) { ids.push(subS.get(a2)) }
                 }
                 hi<Int> = j
                 while (hi < n) {
                     if (chars.get(hi) == sp) { break } else { hi = hi + 1 }
                 }
-                sw<String> = ""
-                st<Vec<Int>> = Vec()
-                st.push(0)
-                acc<Int> = 0
-                q<Int> = j - 1
-                for (q in (j - 1)..hi - 1) {
-                    sw = sw.concat(chars.get(q))
-                    acc = acc + chars.get(q).len()
-                    st.push(acc)
-                }
-                wid<Vec<Int>> = bpe_word_ids(vocab, merges, sw, st)
+                wc<Vec<String>> = Vec()
+                qq2<Int> = j - 1
+                for (qq2 in (j - 1)..hi - 1) { wc.push(chars.get(qq2)) }
+                subw<Vec<Int>> = segment_word(vocab, merges, wc, wc.len())
                 a2<Int> = 0
-                for (a2 in 0..wid.len() - 1) { ids.push(wid.get(a2)) }
+                for (a2 in 0..subw.len() - 1) { ids.push(subw.get(a2)) }
                 i = hi
             }
         } else {
@@ -356,19 +459,12 @@ share(all) encode_with(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>
             while (hi < n) {
                 if (chars.get(hi) == sp) { break } else { hi = hi + 1 }
             }
-            sw<String> = ""
-            st<Vec<Int>> = Vec()
-            st.push(0)
-            acc<Int> = 0
-            q<Int> = i
-            for (q in i..hi - 1) {
-                sw = sw.concat(chars.get(q))
-                acc = acc + chars.get(q).len()
-                st.push(acc)
-            }
-            wid<Vec<Int>> = bpe_word_ids(vocab, merges, sw, st)
+            wc<Vec<String>> = Vec()
+            qq<Int> = i
+            for (qq in i..hi - 1) { wc.push(chars.get(qq)) }
+            subw<Vec<Int>> = segment_word(vocab, merges, wc, wc.len())
             a2<Int> = 0
-            for (a2 in 0..wid.len() - 1) { ids.push(wid.get(a2)) }
+            for (a2 in 0..subw.len() - 1) { ids.push(subw.get(a2)) }
             i = hi
         }
     }
