@@ -3,8 +3,8 @@
 ## Clone source, data, and final adapter
 
 ```sh
-git clone git@github.com:rickenator/VybAIConf.git
-cd VybAIConf
+git clone git@github.com:rickenator/VybForge.git
+cd VybForge
 ```
 
 ## Run a GPU or hosted interviewer (recommended)
