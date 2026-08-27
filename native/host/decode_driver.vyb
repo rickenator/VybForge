@@ -4,6 +4,10 @@
 // Heavy compute (the stack) is on the GPU; embed/lm_head/argmax are host-side
 // for the tiny vocab (V=16). Dumps the generated token ids + weights for the
 // numpy reference (verify_decode.py).
+// The prompt is read from env VYBFORGE_DECODE_PROMPT as comma-separated token
+// ids (G-decode wires a real tokenizer prompt here); if unset it defaults to
+// the original [1,5,3,2] so `make decode` / DECODE_VERIFY stay unchanged.
+import env::{env_get}
 import io::{open_read, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -21,6 +25,28 @@ extern "C" {
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
                   a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+// Parse a comma-separated token-id string ("1,5,3,2") into Vec<Int>.
+parse_ids(s<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    cur<Int> = 0
+    in_num<Int> = 0
+    i<Int> = 0
+    n<Int> = s.len()
+    while (i < n) {
+        c<Int> = (s.char_at(i) as Int) & 255
+        if (c == 44) {
+            if (in_num == 1) { out.push(cur) }
+            cur = 0
+            in_num = 0
+        } else {
+            if (c >= 48) { if (c <= 57) { cur = cur * 10 + (c - 48); in_num = 1 } }
+        }
+        i = i + 1
+    }
+    if (in_num == 1) { out.push(cur) }
+    return out
 }
 
 dump_vec(pth<String>, v<Vec<Float>>)<Int> -> {
@@ -157,12 +183,16 @@ main()<Int> -> {
     freq.push(1.0)
     freq.push(0.01)
 
-    # prompt + generated tokens
+    # prompt + generated tokens (env VYBFORGE_DECODE_PROMPT overrides; comma-sep ids)
     toks<Vec<Int>> = Vec()
-    toks.push(1)
-    toks.push(5)
-    toks.push(3)
-    toks.push(2)
+    pi<String> = env_get("VYBFORGE_DECODE_PROMPT") else ""
+    if (pi.len() > 0) { toks = parse_ids(pi) }
+    if (toks.len() == 0) {
+        toks.push(1)
+        toks.push(5)
+        toks.push(3)
+        toks.push(2)
+    }
 
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
