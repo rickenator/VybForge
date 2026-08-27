@@ -47,7 +47,8 @@ one transformer layer, GGUF reader + q4_0 dequant, JSON parser, Qwen3 BPE
 tokenizer, multi-layer stack, autoregressive decode, stochastic sampler, and the
 `tensor::` wrapper). CUDA is today's device backend; host code talks to
 buffers/kernels, not to a specific vendor as a product — a future sponsor can
-change the backend without renaming the shop.
+change the backend without renaming the shop. Real base-model weights are kept
+central (never committed): see `MODELS.md`.
 
 ## Configuration
 
