@@ -62,6 +62,22 @@ Status legend: [x] done · [~] in progress · [ ] not started
 G-json → (independent) · G-tokenizer → (independent) · G-gguf-data →
 G-tensor → G-decode. G-json/G-tokenizer and G-gguf-data can run in parallel.
 
+## Next: swap-in (slice → real Qwen3) — phased
+Central model store `~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf` (2.5GB, 24GB VRAM; see
+`MODELS.md`). Ground truth captured by `native/gguf/dump_qwen3_meta.py` (gguf-py):
+arch qwen3, 36 layers, D=2560, FF=9728, 32/8 heads (GQA 4), eps 1e-6, ctx
+262144, file_type 15 = Q4_K_M, 398 tensors (`blk.N.attn_q/k/v/output`,
+`attn_q_norm/attn_k_norm/attn_norm/ffn_norm`, `ffn_gate/up/down`, output_norm,
+token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.tsv`.
+1. Real-model GGUF loader: full GGUF v3 metadata-spec reader (all KV types +
+   arrays) → header config + tensor index matching the inventory above.
+2. Weights on-GPU + q4_K dequant (only q4_0 today).
+3. Real 1-layer forward vs llama.cpp/python reference.
+4. Full 36-layer decode → real text → contract.
+5. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
+6. Qwen3-8B dogfood (fetch).
+Vyb-native **training** is a separate, later research-scale plan.
+
 ## Hard-won Vyb gotchas (see native/README.md for detail)
 - libm math (`exp/sin/cos/tan`) doesn't lower to device code → pure-arithmetic
   device fns (`vexp/vsin/vcos/vsqrt` in `native/kernels/vmath.vyb`).
