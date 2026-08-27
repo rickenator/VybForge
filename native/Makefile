@@ -40,6 +40,11 @@ gguf:
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	python3 $(ROOT)/native/gguf/verify_gguf.py
 
+# Phase-1 swap-in: real Qwen3-4B GGUF metadata reader (uses stdlib io::read_at #207)
+gguf-real:
+	cd $(ROOT) && $(VYB) native/gguf/read_real_meta.vyb
+	cd $(ROOT) && python3 native/gguf/verify_gguf_meta.py
+
 stack: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_stack.py

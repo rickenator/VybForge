@@ -1,0 +1,149 @@
+// Phase 1 (using stdlib io::read_at, #207): full GGUF v3 metadata + tensor-index
+// reader that streams the header/info region of the REAL 2.5 GB Qwen3 GGUF by
+// offset (never loads the whole file). Emits config + tensor list to
+// native/out/qwen3_4b_vyb.txt for cross-check vs dump_qwen3_meta.py ground truth.
+import io::{open_read, read_at, open_write, write_str, close}
+
+struct R8 { v<Int>, off<Int> }        // 8-byte little-endian int + new offset
+struct RS { s<String>, off<Int> }     // string chunk + new offset
+
+u8v(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+u32le(s<String>, o<Int>)<Int> -> {
+    return u8v(s,o) | (u8v(s,o+1)<<8) | (u8v(s,o+2)<<16) | (u8v(s,o+3)<<24)
+}
+u64le(s<String>, o<Int>)<Int> -> {
+    return u8v(s,o) | (u8v(s,o+1)<<8) | (u8v(s,o+2)<<16) | (u8v(s,o+3)<<24) |
+           (u8v(s,o+4)<<32) | (u8v(s,o+5)<<40) | (u8v(s,o+6)<<48) | (u8v(s,o+7)<<56)
+}
+rd(f<File>, off<Int>, n<Int>)<String> -> {
+    match (read_at(f, off, n)) { s -> { return s } ? -> { return "" } }
+}
+rd_u64(f<File>, off<Int>)<R8> -> { return R8 { v = u64le(rd(f, off, 8), 0), off = off + 8 } }
+skip_n(f<File>, off<Int>, n<Int>)<Int> -> { if (rd(f, off, n).len() < n) { return off } return off + n }
+
+// scalar-sized value advancement (bytes per GGUF type)
+ty_size(ty<Int>)<Int> -> {
+    if (ty == 0) { return 1 } if (ty == 1) { return 1 }
+    if (ty == 2) { return 2 } if (ty == 3) { return 2 }
+    if (ty == 4) { return 4 } if (ty == 5) { return 4 }
+    if (ty == 6) { return 4 } if (ty == 7) { return 1 }
+    if (ty == 10) { return 8 } if (ty == 11) { return 8 }
+    if (ty == 12) { return 8 }
+    return 0
+}
+skip_value(f<File>, off<Int>, ty<Int>)<Int> -> {
+    if (ty == 8) {
+        r<Int> = u64le(rd(f, off, 8), 0)
+        return skip_n(f, off + 8, r)
+    }
+    if (ty == 9) {
+        et<Int> = u32le(rd(f, off, 4), 0)
+        cnt<Int> = u64le(rd(f, off + 4, 8), 0)
+        off = off + 12
+        i<Int> = 0
+        for (i in 0..cnt - 1) {
+            if (et == 8) {
+                l2<Int> = u64le(rd(f, off, 8), 0)
+                off = off + 8 + l2
+            } else {
+                off = off + ty_size(et)
+            }
+        }
+        return off
+    }
+    return off + ty_size(ty)
+}
+
+main()<Int> -> {
+    fpath<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    match (open_read(fpath)) {
+        f -> {
+            # ---- header (24 bytes) ----
+            head<String> = rd(f, 0, 24)
+            magic<String> = head.substring(0, 4)
+            ver<Int> = u32le(head, 4)
+            nten<Int> = u64le(head, 8)
+            nkv<Int> = u64le(head, 16)
+            off<Int> = 24
+
+            # ---- metadata KV walk (capture config, skip others) ----
+            arch<String> = ""
+            blk<Int> = -1; embd<Int> = -1; ff<Int> = -1
+            heads<Int> = -1; kvheads<Int> = -1; ctx<Int> = -1
+            ei<Int> = 0
+            for (ei in 0..nkv - 1) {
+                kl<Int> = u64le(rd(f, off, 8), 0)
+                key<String> = rd(f, off + 8, kl)
+                off = off + 8 + kl
+                ty<Int> = u32le(rd(f, off, 4), 0)
+                off = off + 4
+                if (key == "general.architecture") {
+                    l0<Int> = u64le(rd(f, off, 8), 0)
+                    arch = rd(f, off + 8, l0)
+                    off = off + 8 + l0
+                } else {
+                    if (key == "qwen3.block_count") { blk = u32le(rd(f, off, 4), 0); off = off + 4 }
+                    else {
+                        if (key == "qwen3.embedding_length") { embd = u32le(rd(f, off, 4), 0); off = off + 4 }
+                        else {
+                            if (key == "qwen3.feed_forward_length") { ff = u32le(rd(f, off, 4), 0); off = off + 4 }
+                            else {
+                                if (key == "qwen3.attention.head_count") { heads = u32le(rd(f, off, 4), 0); off = off + 4 }
+                                else {
+                                    if (key == "qwen3.attention.head_count_kv") { kvheads = u32le(rd(f, off, 4), 0); off = off + 4 }
+                                    else {
+                                        if (key == "qwen3.context_length") { ctx = u32le(rd(f, off, 4), 0); off = off + 4 }
+                                        else { off = skip_value(f, off, ty) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            # ---- tensor index ----
+            match (open_write("native/out/qwen3_4b_vyb.txt")) {
+                w -> {
+                    ti<Int> = 0
+                    for (ti in 0..nten - 1) {
+                        nl<Int> = u64le(rd(f, off, 8), 0)
+                        name<String> = rd(f, off + 8, nl)
+                        off = off + 8 + nl
+                        nd<Int> = u32le(rd(f, off, 4), 0)
+                        off = off + 4
+                        dims<String> = ""
+                        dj<Int> = 0
+                        for (dj in 0..nd - 1) {
+                            if (dj > 0) { dims = dims + "x" }
+                            dims = dims + u64le(rd(f, off, 8), 0).to_string()
+                            off = off + 8
+                        }
+                        ty2<Int> = u32le(rd(f, off, 4), 0)
+                        off = off + 4
+                        toff<Int> = u64le(rd(f, off, 8), 0)
+                        off = off + 8
+                        match (write_str(w, name + "\t" + dims + "\t" + ty2.to_string() + "\t" + toff.to_string() + "\n")) { q -> { } ? -> { } }
+                    }
+                    close(w)
+                }
+                ? -> { return 3 }
+            }
+            data_start<Int> = off
+            close(f)
+
+            println("ARCH=" + arch)
+            println("BLOCKS=" + blk.to_string())
+            println("EMBD=" + embd.to_string())
+            println("FF=" + ff.to_string())
+            println("HEADS=" + heads.to_string())
+            println("KVHEADS=" + kvheads.to_string())
+            println("CTX=" + ctx.to_string())
+            println("TENSORS=" + nten.to_string())
+            println("DATA_START=" + data_start.to_string())
+            println("READ_REAL_META_DONE")
+            return 0
+        }
+        ? -> { println("OPEN_FAIL"); return 5 }
+    }
+}

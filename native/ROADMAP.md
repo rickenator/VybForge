@@ -69,8 +69,10 @@ arch qwen3, 36 layers, D=2560, FF=9728, 32/8 heads (GQA 4), eps 1e-6, ctx
 262144, file_type 15 = Q4_K_M, 398 tensors (`blk.N.attn_q/k/v/output`,
 `attn_q_norm/attn_k_norm/attn_norm/ffn_norm`, `ffn_gate/up/down`, output_norm,
 token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.tsv`.
-1. Real-model GGUF loader: full GGUF v3 metadata-spec reader (all KV types +
-   arrays) → header config + tensor index matching the inventory above.
+1. **Real-model GGUF loader — DONE** `native/gguf/read_real_meta.vyb` (uses
+   stdlib `io::read_at`, #207, to stream the header/info prefix of the live
+   2.5 GB file). Vyb parse == llama.cpp gguf-py on all 398 tensors
+   (name/shape/type/offset) + config (`GGUF_META_VERIFY: OK`, `make gguf-real`).
 2. Weights on-GPU + q4_K dequant (only q4_0 today).
 3. Real 1-layer forward vs llama.cpp/python reference.
 4. Full 36-layer decode → real text → contract.

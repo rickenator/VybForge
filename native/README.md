@@ -18,6 +18,7 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | Native `exp` / `sin` / `cos` (pure arithmetic) | `kernels/vmath.vyb` | `VMATH_OK` exp<2.6e-10 rel, sin/cos<6e-12 abs |
 | **ONE transformer layer forward** (RMSNorm → GQA/RoPE → causal softmax attn → o_proj → residual → RMSNorm → SiLU MLP → residual) | `kernels/layer.vyb` | `LAYER_VERIFY: OK` — max diff ~5e-5 vs numpy ref at every stage (attn 5.3e-6) |
 | **GGUF v3 reader** (header, metadata KV, tensor index; little-endian binary parse) | `gguf/parse_gguf.vyb` | `GGUF_PARSE_VERIFY: OK` on synthetic fixture |
+| **Real Qwen3-4B GGUF metadata reader** (streams the 2.5 GB file's header/tensor index via stdlib `io::read_at` #207) | `gguf/read_real_meta.vyb` | `GGUF_META_VERIFY: OK` — all 398 tensors exact vs llama.cpp |
 | **Q4_0 dequant on-GPU** (GGUF tensor data → device mem → `deq_q4_0`) | `gguf/dequant_gguf.vyb` | `DEQUANT_OK` bad=0 (32/32) |
 | **Generic JSON value parser** (object/array/string/num/bool/null tree) | `json/json_parse.vyb` | verified: parses mock-system.json + vocab slice |
 | **Qwen3 BPE tokenizer** (real 151k vocab + merges, Qwen2 pre-tokenizer) | `tokenizer/tokenizer.vyb` | EXACT match 13/13 vs transformers (words, contractions, apostrophes, punctuation, whitespace) |
