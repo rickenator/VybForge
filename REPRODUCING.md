@@ -31,7 +31,6 @@ VYBFORGE_API_KEY='...' ./run.sh
 
 The launcher supports strict JSON Schema by default. If the selected compatible
 gateway lacks it, set `VYBFORGE_STRUCTURED_OUTPUT=json_object` or `prompt`.
-(Env vars accept the legacy `VYBAICONF_*` spellings as a deprecated fallback.)
 No launcher path calls VybOS.
 
 ## Build the Vyb/Ollama CPU fallback

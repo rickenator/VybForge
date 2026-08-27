@@ -51,8 +51,7 @@ change the backend without renaming the shop.
 
 ## Configuration
 
-Env vars are `VYBFORGE_*`. The legacy `VYBAICONF_*` names still work as a
-deprecated fallback for one cycle; `VYBFORGE_*` wins when both are set.
+Env vars are `VYBFORGE_*`.
 
 ```sh
 # OpenAI Responses API

@@ -59,7 +59,7 @@ call_ollama(model<String>, question<String>)<String> -> {
 }
 
 main()<Int> -> {
-    model<String> = env_get("VYBFORGE_MODEL") else (env_get("VYBAICONF_MODEL") else "qwen3:4b")
+    model<String> = env_get("VYBFORGE_MODEL") else "qwen3:4b"
     eprintln("VybForge local configurator — model " + model)
     eprintln("Enter a VybOS goal; /quit exits. JSON responses are written to stdout.")
     while (true) {

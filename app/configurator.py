@@ -12,8 +12,8 @@ from pathlib import Path
 
 
 def getenv(name: str, default: str = "") -> str:
-    """VYBFORGE_<name> wins; VYBAICONF_<name> is the deprecated fallback."""
-    return os.environ.get("VYBFORGE_" + name) or os.environ.get("VYBAICONF_" + name) or default
+    """Read a VYBFORGE_<name> env var, falling back to `default`."""
+    return os.environ.get("VYBFORGE_" + name) or default
 
 
 def read_json(path: str) -> dict:
@@ -40,7 +40,7 @@ def structured_format(response_schema: dict, mode: str) -> dict | None:
         return None
     if mode == "json_object":
         return {"type": "json_object"}
-    return {"type": "json_schema", "json_schema": {"name": "vybos_configurator_response", "strict": True, "schema": response_schema}}
+    return {"type": "json_schema", "json_schema": {"name": "vybforge_response", "strict": True, "schema": response_schema}}
 
 
 def responses_structured_format(response_schema: dict, mode: str) -> dict | None:
@@ -48,7 +48,7 @@ def responses_structured_format(response_schema: dict, mode: str) -> dict | None
         return None
     if mode == "json_object":
         return {"type": "json_object"}
-    return {"type": "json_schema", "name": "vybos_configurator_response", "strict": True, "schema": response_schema}
+    return {"type": "json_schema", "name": "vybforge_response", "strict": True, "schema": response_schema}
 
 
 def request_ollama(endpoint: str, model: str, messages: list[dict], response_schema: dict, _: str, __: str) -> dict:
@@ -89,10 +89,7 @@ def request_openai_responses(endpoint: str, model: str, messages: list[dict], re
 def api_key_from_environment(key_env: str) -> str | None:
     if key_env:
         return os.environ.get(key_env) or (os.environ.get("OPENAI_API_KEY") if key_env != "OPENAI_API_KEY" else None)
-    for name in ("VYBFORGE_API_KEY", "VYBAICONF_API_KEY", "OPENAI_API_KEY"):
-        if os.environ.get(name):
-            return os.environ[name]
-    return None
+    return os.environ.get("VYBFORGE_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
 
 def main() -> int:
@@ -100,7 +97,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=["ollama", "openai-chat", "openai-responses"], default=getenv("BACKEND", "ollama"))
     parser.add_argument("--endpoint", default=getenv("ENDPOINT", "http://127.0.0.1:11434"))
     parser.add_argument("--model", default=getenv("MODEL", "qwen3:8b"))
-    parser.add_argument("--api-key-env", default=getenv("API_KEY_ENV", ""), help="environment variable holding a hosted-provider API key (leave unset to use VYBFORGE_API_KEY/VYBAICONF_API_KEY/OPENAI_API_KEY in order)")
+    parser.add_argument("--api-key-env", default=getenv("API_KEY_ENV", ""), help="environment variable holding a hosted-provider API key (leave unset to use VYBFORGE_API_KEY or OPENAI_API_KEY)")
     parser.add_argument("--structured-output", choices=["json_schema", "json_object", "prompt"], default=getenv("STRUCTURED_OUTPUT", "json_schema"), help="fall back to json_object or prompt for compatible gateways without JSON Schema support")
     parser.add_argument("--schema", required=True)
     parser.add_argument("--response-schema", required=True)
@@ -116,7 +113,7 @@ def main() -> int:
     messages = [{"role": "system", "content": system_prompt + "\n\n" + context}]
     api_key = api_key_from_environment(args.api_key_env)
     if args.backend == "openai-responses" and not api_key:
-        parser.error(f"{args.backend} requires ${args.api_key_env or 'VYBFORGE_API_KEY / VYBAICONF_API_KEY'} (or $OPENAI_API_KEY); credentials are never stored by VybForge")
+        parser.error(f"{args.backend} requires ${args.api_key_env or 'VYBFORGE_API_KEY'} (or $OPENAI_API_KEY); credentials are never stored by VybForge")
 
     request_backend = {"ollama": request_ollama, "openai-chat": request_openai_chat, "openai-responses": request_openai_responses}[args.backend]
     print(f"VybForge configurator using {args.backend} / {args.model}. Ctrl-D exits; no changes are applied.")
