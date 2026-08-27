@@ -22,11 +22,12 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | **Generic JSON value parser** (object/array/string/num/bool/null tree) | `json/json_parse.vyb` | verified: parses mock-system.json + vocab slice |
 | **Qwen3 BPE tokenizer** (real 151k vocab + merges, Qwen2 pre-tokenizer) | `tokenizer/tokenizer.vyb` | EXACT match 13/13 vs transformers (words, contractions, apostrophes, punctuation, whitespace) |
 | **Multi-layer stack** (L× weight-tied decoder, double-buffered) | `host/stack_driver.vyb` | `STACK_VERIFY: OK` at L=4 (~8e-7 rel vs numpy) |
+| **Greedy autoregressive decode** (embed→stack→lm_head→argmax, token loop) | `host/decode_driver.vyb` | `DECODE_VERIFY: OK` (generated ids == numpy) |
 
 The single-layer forward is the handoff's **P0 go/no-go gate**; GGUF reader +
 Q4_0 dequant is **G-gguf-data**; **G-json**, **G-tokenizer**, and the
-**multi-layer stack** (G-tensor part 1) are done. Remaining: KV cache +
-autoregressive sampling (G-tensor part 2), then **G-decode**
+**G-tensor decode machinery** (stack + greedy autoregressive) are done.
+Remaining: sampling variety (top_k/top_p), then **G-decode**
 (config-contract interview). See `ROADMAP.md` for phase status.
 
 ## Build & run
