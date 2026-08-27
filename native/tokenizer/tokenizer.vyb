@@ -491,3 +491,71 @@ share(all) encode_str(s<String>)<String> -> {
     }
     return out
 }
+
+// ---------------- detokenization (decode) ----------------
+
+// Reverse vocab: id -> token string (rebuild from vocab.json).
+share(all) build_revvocab()<HashMap<Int, String>> -> {
+    m<HashMap<Int, String>> = HashMap<Int, String>()
+    s<String> = read_file_or_empty("artifacts/vybos-configurator-lora/vocab.json")
+    n<Int> = s.len()
+    i<Int> = 0
+    while (i < n) {
+        c<Int> = (s.char_at(i) as Int) & 255
+        if (c == 34) {
+            rt<ReadTok> = read_quoted(s, i)
+            key<String> = rt.token
+            j<Int> = rt.next
+            while (j < n) {
+                c2<Int> = (s.char_at(j) as Int) & 255
+                if (c2 == 58) { j = j + 1; break }
+                if (c2 == 44) { break }
+                j = j + 1
+            }
+            ri<ReadInt> = read_int(s, j)
+            m.put(ri.v, key)
+            i = ri.next
+        } else { i = i + 1 }
+    }
+    return m
+}
+
+// Inverse bytes_to_unicode: a byte-char glyph -> the original byte it encodes.
+share(all) glyph2byte(g<String>)<Int> -> {
+    b<Int> = 0
+    for (b in 0..255) {
+        if (byte_char(b) == g) { return b }
+    }
+    return 0
+}
+
+// decode(ids) -> text. RUNTIME SEGFAULT (compiler-bug repro): the identical
+// logic inline in main() works, but this share(all) function crashes even for a
+// single one-token input (e.g. decode_ids([0]) -> token "!").
+// NOTE (2026-08-27): the crash was the vyb-lang #205 compiler bug (native-stack
+// overflow mono'ing two generic HashMap types), FIXED at bf46304. This fn is
+// correct and now runs in-process alongside encode(). decode_ids = detokenizer.
+share(all) decode_ids(ids<Vec<Int>>)<String> -> {
+    rev<HashMap<Int, String>> = build_revvocab()
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..ids.len() - 1) {
+        tk<String> = rev.get(ids.get(k)) else ""
+        n2<Int> = tk.len()
+        ii<Int> = 0
+        while (ii < n2) {
+            lb<Int> = (tk.char_at(ii) as Int) & 255
+            lw<Int> = lead_width(lb)
+            g2<String> = tk.substring(ii, ii + lw)
+            ob<Int> = glyph2byte(g2)
+            out = out.concat(String::from_byte(ob))
+            ii = ii + lw
+        }
+    }
+    return out
+}
+
+// Public detokenizer (symmetric with encode): ids -> text.
+share(all) decode(ids<Vec<Int>>)<String> -> {
+    return decode_ids(ids)
+}

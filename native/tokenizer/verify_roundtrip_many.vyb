@@ -1,0 +1,78 @@
+// Many-prompt round-trip verification (the parked G-decode tokenizer slice).
+// For each config-interview prompt: encode() -> ids, decode() -> text; assert
+// round-trip == original. Also writes paired encodings to
+// native/out/enc_dec_roundtrip.txt for reference/regression.
+import io::{open_write, write_str, close}
+import tokenizer::{encode, decode, encode_str}
+
+share(all) prompt0()<String> -> { return "I want a disposable container rootfs for CI. What should we decide first?" }
+share(all) prompt1()<String> -> { return "Add a package to a QEMU x86_64 boot test." }
+share(all) prompt2()<String> -> { return "Can VybOS already build a kernel and boot it in QEMU?" }
+share(all) prompt3()<String> -> { return "Name this an ARM64 appliance image host." }
+share(all) prompt4()<String> -> { return "Apply this configuration to the current machine now." }
+share(all) prompt5()<String> -> { return "Enable a service on a rescue image with a serial console." }
+share(all) prompt6()<String> -> { return "Make this target an ARM64 image instead of x86_64." }
+share(all) prompt7()<String> -> { return "I no longer need interactive console access on a QEMU x86_64 boot test." }
+share(all) prompt8()<String> -> { return "I want an x86_64 development VM. What should we decide first?" }
+share(all) prompt9()<String> -> { return "Add a package to an ARM64 appliance image." }
+share(all) prompt10()<String> -> { return "Name this a rescue image with a serial console host." }
+share(all) prompt11()<String> -> { return "Enable a service on a QEMU x86_64 boot test." }
+share(all) prompt12()<String> -> { return "I no longer need interactive console access on an ARM64 appliance image." }
+share(all) prompt13()<String> -> { return "I want a reproducible server image. What should we decide first?" }
+share(all) prompt14()<String> -> { return "Add a package to a rescue image with a serial console." }
+share(all) prompt15()<String> -> { return "Name this a QEMU x86_64 boot test host." }
+share(all) prompt16()<String> -> { return "Enable a service on an ARM64 appliance image." }
+share(all) prompt17()<String> -> { return "I no longer need interactive console access on a rescue image with a serial console." }
+
+main()<Int> -> {
+    texts<Vec<String>> = Vec()
+    texts.push(prompt0())
+    texts.push(prompt1())
+    texts.push(prompt2())
+    texts.push(prompt3())
+    texts.push(prompt4())
+    texts.push(prompt5())
+    texts.push(prompt6())
+    texts.push(prompt7())
+    texts.push(prompt8())
+    texts.push(prompt9())
+    texts.push(prompt10())
+    texts.push(prompt11())
+    texts.push(prompt12())
+    texts.push(prompt13())
+    texts.push(prompt14())
+    texts.push(prompt15())
+    texts.push(prompt16())
+    texts.push(prompt17())
+
+    match (open_write("native/out/enc_dec_roundtrip.txt")) {
+        fh -> {
+            bad<Int> = 0
+            k<Int> = 0
+            for (k in 0..texts.len() - 1) {
+                src<String> = texts.get(k)
+                ids<Vec<Int>> = encode(src)
+                back<String> = decode(ids)
+                match (write_str(fh, "id " + encode_str(src) + "\n")) { q -> { } ? -> { } }
+                match (write_str(fh, "rt " + src + "\n")) { q -> { } ? -> { } }
+                if (back == src) {
+                    println("OK  ")
+                } else {
+                    println("X   ")
+                    bad = bad + 1
+                }
+                println(src)
+            }
+            close(fh)
+            println("ROUNDTRIP ")
+            println_int(texts.len())
+            println(" prompts, bad=")
+            println_int(bad)
+            if (bad == 0) { println("ROUNDTRIP_OK") } else { println("ROUNDTRIP_FAIL") }
+        }
+        ? -> {
+            println("ERR open_write failed")
+        }
+    }
+    return 0
+}

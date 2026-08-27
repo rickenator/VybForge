@@ -27,6 +27,12 @@ Status legend: [x] done · [~] in progress · [ ] not started
       13/13** vs transformers on plain words, contractions, leading/trailing
       apostrophes, punctuation, and whitespace runs. Non-ASCII words still
       approximate (no Unicode-class regex in Vyb).
+- [x] **G-tokenizer detokenizer** — `decode`/`decode_ids` (id → text, reverse
+      vocab + glyph→byte). Verified exact in-process round-trip
+      encode→decode on the full config-interview prompt batch (18/18 `bad=0`).
+      The old `decode_ids` "runtime segfault" was **vyb-lang #205** (native-stack
+      overflow mono'ing two generic HashMap types when encode+decode coexist),
+      FIXED at bf46304 — not tokenizer logic.
 - [~] **G-tensor** — **complete for the vertical slice**: multi-layer stack
       (`STACK_VERIFY: OK`), greedy autoregressive decode (`DECODE_VERIFY: OK`),
       and **stochastic sampling** (temperature + top_k + top_p + seeded LCG;
