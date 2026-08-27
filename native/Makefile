@@ -12,7 +12,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 KERNELS := gemm rmsnorm math_probe layer deq
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack clean
 
 all: verify
 
@@ -40,6 +40,10 @@ gguf:
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	python3 $(ROOT)/native/gguf/verify_gguf.py
 
+stack: $(ROOT)/native/build/layer.ptx
+	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
+	cd $(ROOT) && python3 native/tools/verify_stack.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="
@@ -51,6 +55,9 @@ verify: $(PTX)
 	@echo "== ONE-LAYER FORWARD (numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_layer.py
+	@echo "== MULTI-LAYER STACK (4x, numpy reference) =="
+	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
+	cd $(ROOT) && python3 native/tools/verify_stack.py
 	@echo "== GGUF READER + Q4_0 DEQUANT ON-GPU =="
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	cd $(ROOT) && python3 native/gguf/verify_gguf.py

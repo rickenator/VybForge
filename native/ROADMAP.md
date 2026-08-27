@@ -27,8 +27,11 @@ Status legend: [x] done · [~] in progress · [ ] not started
       13/13** vs transformers on plain words, contractions, leading/trailing
       apostrophes, punctuation, and whitespace runs. Non-ASCII words still
       approximate (no Unicode-class regex in Vyb).
-- [ ] **G-tensor** (serial, after loaders): tensor:: module + 36-layer stack
-      + KV cache + sampling (top_k/top_p/temperature).
+- [~] **G-tensor** — tensor::/36-layer stack: **multi-layer stack done** (the
+      verified layer stacked L× over a weight-tied residual stream,
+      double-buffered, `STACK_VERIFY: OK` at L=4, ~8e-7 rel; set `LAYERS`=36 for
+      the real depth). Remaining: KV cache + autoregressive next-token decode +
+      sampling (top_k/top_p), then the tensor:: module wrapper.
 - [ ] **G-decode** (final): schema-driven config-interview decode → emits
       `{path, op, value, reason}` SystemSpec JSON; verify byte-compatible with
       the Python/Ollama path on a few interviews.
