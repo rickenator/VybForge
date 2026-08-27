@@ -19,13 +19,14 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | **ONE transformer layer forward** (RMSNorm → GQA/RoPE → causal softmax attn → o_proj → residual → RMSNorm → SiLU MLP → residual) | `kernels/layer.vyb` | `LAYER_VERIFY: OK` — max diff ~5e-5 vs numpy ref at every stage (attn 5.3e-6) |
 | **GGUF v3 reader** (header, metadata KV, tensor index; little-endian binary parse) | `gguf/parse_gguf.vyb` | `GGUF_PARSE_VERIFY: OK` on synthetic fixture |
 | **Q4_0 dequant on-GPU** (GGUF tensor data → device mem → `deq_q4_0`) | `gguf/dequant_gguf.vyb` | `DEQUANT_OK` bad=0 (32/32) |
+| **Generic JSON value parser** (object/array/string/num/bool/null tree) | `json/json_parse.vyb` | verified: parses mock-system.json + vocab slice |
+| **Qwen3 BPE tokenizer** (core) | `tokenizer/tokenizer.vyb` | plain ASCII words match transformers exactly (real 151k vocab); pre-tokenizer regex approx — punctuation pending |
 
-The single-layer forward is the handoff's **P0 go/no-go gate**; the GGUF reader
-+ Q4_0 dequant is **G-gguf-data** (the model loader's weight path: parse →
-locate tensor → read data → device → dequant). G-json (generic JSON parser) and
-G-tokenizer (Qwen3 BPE) run as parallel subagents on the CPU side. Next:
+The single-layer forward is the handoff's **P0 go/no-go gate**; GGUF reader +
+Q4_0 dequant is **G-gguf-data**; the JSON parser is **G-json** (done); the
+tokenizer is **G-tokenizer** (core done, pre-tokenizer regex pending). Next:
 G-tensor (36-layer stack + KV cache + sampling) then G-decode
-(config-contract interview). See `ROADMAP.md` for the phase breakdown.
+(config-contract interview). See `ROADMAP.md` for phase status.
 
 ## Build & run
 

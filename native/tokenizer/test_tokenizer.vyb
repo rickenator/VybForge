@@ -1,0 +1,48 @@
+// Vyb-native Qwen3 byte-level BPE tokenizer — verification against the
+// transformers reference. Encodes ASCII strings and prints the id lists.
+//
+// Run from the repo root:
+//   cd ~/Projects/VybAIConf && ~/Projects/Vyb/build/vyb native/tokenizer/test_tokenizer.vyb --module-path native/tokenizer
+//
+// Reference ids (transformers 4.57.6, artifacts/vybos-configurator-lora):
+//   "Hello world"         -> [9707, 1879]
+//   "configure VybOS"     -> [21002, 647, 84307, 3126]
+//   "Rick's configurator" -> [72245, 594, 46971, 850]
+//   "  hello"             -> [220, 23811]
+//   "Hello  world"        -> [9707, 220, 1879]
+//   "Hello world "        -> [9707, 1879, 220]
+//   "Hi, there!"          -> [13048, 11, 1052, 0]
+//   "a,b.c"               -> [64, 8402, 520]
+//   "configure:"          -> [21002, 25]
+//   "yes/no"              -> [9693, 33100]
+//   "x=1+y"               -> [87, 28, 16, 43010]
+import tokenizer::{encode, encode_str}
+
+print_ids(label<String>, ids<Vec<Int>>) -> {
+    out<String> = label + ": ["
+    k<Int> = 0
+    for (k in 0..ids.len() - 1) {
+        v<Int> = ids.get(k)
+        if (k > 0) { out = out + ", " }
+        out = out + v.to_string()
+    }
+    out = out + "]"
+    println(out)
+}
+
+main()<Int> -> {
+    print_ids("Hello world", encode("Hello world"))
+    print_ids("configure VybOS", encode("configure VybOS"))
+    print_ids("Rick's configurator", encode("Rick's configurator"))
+    print_ids("'  hello'", encode("  hello"))
+    print_ids("'Hello  world'", encode("Hello  world"))
+    print_ids("'Hello world '", encode("Hello world "))
+    print_ids("'Hi, there!'", encode("Hi, there!"))
+    print_ids("'a,b.c'", encode("a,b.c"))
+    print_ids("'configure:'", encode("configure:"))
+    print_ids("'yes/no'", encode("yes/no"))
+    print_ids("'x=1+y'", encode("x=1+y"))
+    println("---")
+    println("encode_str: " + encode_str("Hello world"))
+    return 0
+}

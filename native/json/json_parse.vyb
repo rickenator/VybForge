@@ -1,0 +1,529 @@
+# json_parse.vyb - a GENERIC JSON value parser in host-mode Vyb.
+#
+# Parses an arbitrary JSON document string into a typed value tree and supports
+# nested lookup.  Vyb's type system cannot express a self-recursive struct
+# (`Vec<Value>` inside `Value` segfaults in this build) and has no mutable
+# globals or by-ref function params, so the tree is stored as a FLAT ARENA:
+#
+#   JsonDoc { nodes, child, ckey, root }
+#
+#   nodes  : Vec<JNode>  every value is one JNode (object/array/string/number/
+#                        true/false/null) tagged by JTag.
+#   child  : Vec<Int>    dense child-id list.  For an object/array node with
+#                        .first/.nchild, its children are child[first..first+nchild).
+#   ckey   : Vec<String> parallel to `child`; the key for object members, "" for
+#                        array elements.
+#   root   : Int         node id of the document root.
+#
+# The tree is therefore NON-recursive (arena + integer ids), so arbitrary
+# nesting depth works within Vyb's type system.
+#
+# Usage:
+#   import json_parse
+#   match (json_parse(s)) {
+#       d -> {
+#           print(d.kind(d.root))           # "object" / "array" / ...
+#           nid<Int> = d.get(d.root, "k")   # nested lookup by key
+#           print(d.hstr(nid))              # scalar text
+#           print(d.gint(d.root, "k"))      # convenience: child as Int
+#           el<Int> = d.elem(nid, 0)        # array element
+#           print(d.len(nid))               # array/object length
+#           ks<Vec<String>> = d.keys(nid)
+#       }
+#       ? -> { /* parse failure */ }
+#   }
+#
+# Escape handling: basic `\"` and `\\` are decoded (plus \/ \b \f \n \r \t);
+# `\uXXXX` is passed through verbatim (left as-is for this slice).  Whitespace
+# is tolerated between tokens.  Numbers parse to Float; whole (integer)
+# literals are also exposed as Int via .int().
+
+# ---- tags ----
+share(all)
+enum JTag {
+    J_NULL = 0
+    J_OBJ = 1
+    J_ARR = 2
+    J_STR = 3
+    J_NUM = 4
+    J_TRUE = 5
+    J_FALSE = 6
+}
+
+# ---- arena node ----
+share(all)
+struct JNode {
+    tag<Int>,        # JTag
+    sval<String>,    # payload for strings
+    nval<Float>,     # payload for numbers
+    ival<Int>,       # whole-number payload for numbers
+    first<Int>,      # child/ckey start offset (objects & arrays)
+    nchild<Int>      # child count (objects & arrays)
+}
+
+# ---- the parsed tree ----
+share(all)
+struct JsonDoc {
+    nodes<Vec<JNode>>,
+    child<Vec<Int>>,
+    ckey<Vec<String>>,
+    root<Int>
+}
+
+# ---- shared scalar helpers ----
+share(all)
+isdigit(c<Int>)<Bool> -> {
+    if (c < 48) { return false }
+    if (c > 57) { return false }
+    return true
+}
+
+share(all)
+isws(c<Int>)<Bool> -> {
+    if (c == 32) { return true }
+    if (c == 9) { return true }
+    if (c == 10) { return true }
+    if (c == 13) { return true }
+    return false
+}
+
+share(all)
+isexpe(c<Int>)<Bool> -> {
+    if (c == 101) { return true }
+    if (c == 69) { return true }
+    return false
+}
+
+share(all)
+oob(id<Int>, n<Int>)<Bool> -> {
+    if (id < 0) { return true }
+    if (id >= n) { return true }
+    return false
+}
+
+# ---- parser state (mutated via methods: no globals / no by-ref params) ----
+share(all)
+struct JParser {
+    src<String>,
+    pos<Int>,
+    nodes<Vec<JNode>>,
+    child<Vec<Int>>,
+    ckey<Vec<String>>
+}
+
+share(all)
+aspect JParserOps {
+    pc(self<their<JParser>>)<Int> -> { }
+    eof(self<their<JParser>>)<Bool> -> { }
+    skip_ws(self<their<JParser>>) -> { }
+    mknode(self<their<JParser>>, tag<Int>)<Int> -> { }
+    commit(self<their<JParser>>, oid<Int>, kv<Vec<Int>>, kk<Vec<String>>) -> { }
+    eat_lit(self<their<JParser>>, lw<String>)<Bool> -> { }
+    parse_string_raw(self<their<JParser>>)<String?> -> { }
+    parse_number_value(self<their<JParser>>)<Int> -> { }
+    parse_any(self<their<JParser>>)<Int> -> { }
+}
+
+share(all)
+bind JParserOps -> JParser {
+    pc(self<their<JParser>>)<Int> -> {
+        if (self.pos >= self.src.len()) { return 0 }
+        return (self.src.char_at(self.pos) as Int) & 255
+    }
+    eof(self<their<JParser>>)<Bool> -> {
+        return self.pos >= self.src.len()
+    }
+    skip_ws(self<their<JParser>>) -> {
+        more<Bool> = true
+        while (more) {
+            if (self.eof()) { more = false }
+            else {
+                if (isws(self.pc())) { self.pos = self.pos + 1 }
+                else { more = false }
+            }
+        }
+    }
+    mknode(self<their<JParser>>, tag<Int>)<Int> -> {
+        nd<JNode> = JNode { tag = tag, sval = "", nval = 0.0, ival = 0, first = self.child.len(), nchild = 0 }
+        self.nodes.push(nd)
+        return self.nodes.len() - 1
+    }
+    commit(self<their<JParser>>, oid<Int>, kv<Vec<Int>>, kk<Vec<String>>) -> {
+        t0<JNode> = self.nodes.get(oid)
+        t0.first = self.child.len()
+        t0.nchild = kv.len()
+        self.nodes.set(oid, t0)
+        i<Int> = 0
+        while (i < kv.len()) {
+            self.child.push(kv.get(i))
+            self.ckey.push(kk.get(i))
+            i = i + 1
+        }
+    }
+    eat_lit(self<their<JParser>>, lw<String>)<Bool> -> {
+        nl<Int> = lw.len()
+        if (self.pos + nl > self.src.len()) { return false }
+        j<Int> = 0
+        ok<Bool> = true
+        while (ok) {
+            if (j >= nl) { ok = false }
+            else {
+                a<Int> = (self.src.char_at(self.pos + j) as Int) & 255
+                b<Int> = (lw.char_at(j) as Int) & 255
+                if (a != b) { ok = false } else { j = j + 1 }
+            }
+        }
+        if (j == nl) {
+            self.pos = self.pos + nl
+            return true
+        }
+        return false
+    }
+    parse_string_raw(self<their<JParser>>)<String?> -> {
+        if (self.pc() != 34) { return String?() }
+        i<Int> = self.pos + 1
+        out<String> = ""
+        esc<String> = "\"\\/bfnrt"
+        done<Bool> = false
+        while (done == false) {
+            if (i >= self.src.len()) { return String?() }
+            c<Int> = (self.src.char_at(i) as Int) & 255
+            if (c == 34) {
+                done = true
+            } else if (c == 92) {
+                if (i + 1 >= self.src.len()) { return String?() }
+                e<Int> = (self.src.char_at(i + 1) as Int) & 255
+                idx<Int> = -1
+                if (e == 34) { idx = 0 }
+                if (e == 92) { idx = 1 }
+                if (e == 47) { idx = 2 }
+                if (e == 98) { idx = 3 }
+                if (e == 102) { idx = 4 }
+                if (e == 110) { idx = 5 }
+                if (e == 114) { idx = 6 }
+                if (e == 116) { idx = 7 }
+                if (idx >= 0) {
+                    out = out + esc.substring(idx, idx + 1)
+                    i = i + 2
+                } else {
+                    out = out + self.src.substring(i, i + 1)
+                    i = i + 1
+                }
+            } else {
+                out = out + self.src.substring(i, i + 1)
+                i = i + 1
+            }
+        }
+        self.pos = i + 1
+        return String?(out)
+    }
+    parse_number_value(self<their<JParser>>)<Int> -> {
+        oid<Int> = self.mknode(JTag::J_NUM)
+        i<Int> = self.pos
+        n<Int> = self.src.len()
+        neg<Bool> = false
+        c<Int> = 0
+        if (i < n) {
+            c = (self.src.char_at(i) as Int) & 255
+            if (c == 45) { neg = true; i = i + 1 }
+        }
+        iv<Float> = 0.0
+        has<Bool> = false
+        more<Bool> = true
+        while (more) {
+            if (i >= n) { more = false }
+            else {
+                c = (self.src.char_at(i) as Int) & 255
+                if (isdigit(c)) { iv = iv * 10 + (c - 48); has = true; i = i + 1 }
+                else { more = false }
+            }
+        }
+        fv<Float> = 0.0
+        scale<Float> = 10.0
+        hasf<Bool> = false
+        if (i < n) {
+            c = (self.src.char_at(i) as Int) & 255
+            if (c == 46) {
+                hasf = true
+                i = i + 1
+                more = true
+                while (more) {
+                    if (i >= n) { more = false }
+                    else {
+                        c = (self.src.char_at(i) as Int) & 255
+                        if (isdigit(c)) { fv = fv + (c - 48) / scale; scale = scale * 10; i = i + 1 }
+                        else { more = false }
+                    }
+                }
+            }
+        }
+        ex<Int> = 0
+        hasx<Bool> = false
+        if (i < n) {
+            c = (self.src.char_at(i) as Int) & 255
+            if (isexpe(c)) {
+                hasx = true
+                i = i + 1
+                sgn<Int> = 1
+                if (i < n) {
+                    c = (self.src.char_at(i) as Int) & 255
+                    if (c == 43) { i = i + 1 }
+                    else if (c == 45) { sgn = -1; i = i + 1 }
+                }
+                more = true
+                while (more) {
+                    if (i >= n) { more = false }
+                    else {
+                        c = (self.src.char_at(i) as Int) & 255
+                        if (isdigit(c)) { ex = ex * 10 + (c - 48); i = i + 1 }
+                        else { more = false }
+                    }
+                }
+                ex = ex * sgn
+            }
+        }
+        if (has == false) { return -1 }
+        nv<Float> = iv + fv
+        if (ex >= 0) {
+            p<Int> = 0
+            while (p < ex) { nv = nv * 10; p = p + 1 }
+        } else {
+            p<Int> = 0
+            en<Int> = 0 - ex
+            while (p < en) { nv = nv / 10; p = p + 1 }
+        }
+        if (neg) { nv = 0.0 - nv }
+        ivl<Int> = 0
+        if (hasf == false) {
+            if (hasx == false) {
+                ivl = (iv as Int)
+                if (neg) { ivl = 0 - ivl }
+            }
+        }
+        nd<JNode> = self.nodes.get(oid)
+        nd.nval = nv
+        nd.ival = ivl
+        self.nodes.set(oid, nd)
+        self.pos = i
+        return oid
+    }
+    parse_any(self<their<JParser>>)<Int> -> {
+        self.skip_ws()
+        if (self.eof()) { return -1 }
+        c<Int> = self.pc()
+        if (c == 123) {
+            oid<Int> = self.mknode(JTag::J_OBJ)
+            ov<Vec<Int>> = Vec()
+            okk<Vec<String>> = Vec()
+            self.pos = self.pos + 1
+            self.skip_ws()
+            done<Bool> = false
+            if (self.pc() == 125) { self.pos = self.pos + 1; done = true }
+            while (done == false) {
+                self.skip_ws()
+                if (self.pc() != 34) { return -1 }
+                match (self.parse_string_raw()) {
+                    key -> {
+                        self.skip_ws()
+                        if (self.pc() != 58) { return -1 }
+                        self.pos = self.pos + 1
+                        vid<Int> = self.parse_any()
+                        if (vid < 0) { return -1 }
+                        ov.push(vid)
+                        okk.push(key)
+                        self.skip_ws()
+                        ch<Int> = self.pc()
+                        if (ch == 44) { self.pos = self.pos + 1 }
+                        else if (ch == 125) { self.pos = self.pos + 1; done = true }
+                        else { return -1 }
+                    }
+                    ? -> { return -1 }
+                }
+            }
+            self.commit(oid, ov, okk)
+            return oid
+        }
+        if (c == 91) {
+            oid<Int> = self.mknode(JTag::J_ARR)
+            av<Vec<Int>> = Vec()
+            akk<Vec<String>> = Vec()
+            self.pos = self.pos + 1
+            self.skip_ws()
+            done<Bool> = false
+            if (self.pc() == 93) { self.pos = self.pos + 1; done = true }
+            while (done == false) {
+                vid<Int> = self.parse_any()
+                if (vid < 0) { return -1 }
+                av.push(vid)
+                akk.push("")
+                self.skip_ws()
+                ch<Int> = self.pc()
+                if (ch == 44) { self.pos = self.pos + 1 }
+                else if (ch == 93) { self.pos = self.pos + 1; done = true }
+                else { return -1 }
+            }
+            self.commit(oid, av, akk)
+            return oid
+        }
+        if (c == 34) {
+            match (self.parse_string_raw()) {
+                sv -> {
+                    sid<Int> = self.mknode(JTag::J_STR)
+                    nd<JNode> = self.nodes.get(sid)
+                    nd.sval = sv
+                    self.nodes.set(sid, nd)
+                    return sid
+                }
+                ? -> { return -1 }
+            }
+        }
+        if (c == 116) { if (self.eat_lit("true")) { return self.mknode(JTag::J_TRUE) } return -1 }
+        if (c == 102) { if (self.eat_lit("false")) { return self.mknode(JTag::J_FALSE) } return -1 }
+        if (c == 110) { if (self.eat_lit("null")) { return self.mknode(JTag::J_NULL) } return -1 }
+        if (c == 45) { return self.parse_number_value() }
+        if (isdigit(c)) { return self.parse_number_value() }
+        return -1
+    }
+}
+
+# ---- top-level entry point ----
+share(all)
+json_parse(s<String>)<JsonDoc?> -> {
+    p<JParser> = JParser { src = s, pos = 0, nodes = Vec(), child = Vec(), ckey = Vec() }
+    rid<Int> = p.parse_any()
+    p.skip_ws()
+    if (rid < 0) { return JsonDoc?() }
+    if (p.eof() == false) { return JsonDoc?() }
+    d<JsonDoc> = JsonDoc { nodes = p.nodes, child = p.child, ckey = p.ckey, root = rid }
+    return JsonDoc?(d)
+}
+
+# ---- tree accessors (methods on JsonDoc) ----
+share(all)
+aspect JsonDocOps {
+    kind(self<their<JsonDoc>>, id<Int>)<String> -> { }
+    hstr(self<their<JsonDoc>>, id<Int>)<String> -> { }
+    get(self<their<JsonDoc>>, id<Int>, key<String>)<Int> -> { }
+    len(self<their<JsonDoc>>, id<Int>)<Int> -> { }
+    elem(self<their<JsonDoc>>, id<Int>, i<Int>)<Int> -> { }
+    keys(self<their<JsonDoc>>, id<Int>)<Vec<String>> -> { }
+    sval(self<their<JsonDoc>>, id<Int>)<String> -> { }
+    num(self<their<JsonDoc>>, id<Int>)<Float> -> { }
+    int(self<their<JsonDoc>>, id<Int>)<Int> -> { }
+    rootid(self<their<JsonDoc>>)<Int> -> { }
+}
+
+share(all)
+bind JsonDocOps -> JsonDoc {
+    kind(self<their<JsonDoc>>, id<Int>)<String> -> {
+        if (oob(id, self.nodes.len())) { return "invalid" }
+        t<Int> = self.nodes.get(id).tag
+        if (t == JTag::J_OBJ) { return "object" }
+        if (t == JTag::J_ARR) { return "array" }
+        if (t == JTag::J_STR) { return "string" }
+        if (t == JTag::J_NUM) { return "number" }
+        if (t == JTag::J_TRUE) { return "true" }
+        if (t == JTag::J_FALSE) { return "false" }
+        return "null"
+    }
+    hstr(self<their<JsonDoc>>, id<Int>)<String> -> {
+        if (oob(id, self.nodes.len())) { return "<missing>" }
+        nd<JNode> = self.nodes.get(id)
+        t<Int> = nd.tag
+        if (t == JTag::J_STR) { return nd.sval }
+        if (t == JTag::J_NUM) { return nd.nval.to_string() }
+        if (t == JTag::J_TRUE) { return "true" }
+        if (t == JTag::J_FALSE) { return "false" }
+        if (t == JTag::J_NULL) { return "null" }
+        return "<object/array>"
+    }
+    get(self<their<JsonDoc>>, id<Int>, key<String>)<Int> -> {
+        if (oob(id, self.nodes.len())) { return -1 }
+        nd<JNode> = self.nodes.get(id)
+        if (nd.tag != JTag::J_OBJ) { return -1 }
+        e<Int> = nd.first + nd.nchild
+        i<Int> = nd.first
+        while (i < e) {
+            if (self.ckey.get(i) == key) { return self.child.get(i) }
+            i = i + 1
+        }
+        return -1
+    }
+    len(self<their<JsonDoc>>, id<Int>)<Int> -> {
+        if (oob(id, self.nodes.len())) { return 0 }
+        return self.nodes.get(id).nchild
+    }
+    elem(self<their<JsonDoc>>, id<Int>, i<Int>)<Int> -> {
+        if (oob(id, self.nodes.len())) { return -1 }
+        nd<JNode> = self.nodes.get(id)
+        if (nd.tag != JTag::J_ARR) { return -1 }
+        if (oob(i, nd.nchild)) { return -1 }
+        return self.child.get(nd.first + i)
+    }
+    keys(self<their<JsonDoc>>, id<Int>)<Vec<String>> -> {
+        out<Vec<String>> = Vec()
+        if (oob(id, self.nodes.len())) { return out }
+        nd<JNode> = self.nodes.get(id)
+        if (nd.tag != JTag::J_OBJ) { return out }
+        e<Int> = nd.first + nd.nchild
+        i<Int> = nd.first
+        while (i < e) {
+            out.push(self.ckey.get(i))
+            i = i + 1
+        }
+        return out
+    }
+    sval(self<their<JsonDoc>>, id<Int>)<String> -> {
+        if (oob(id, self.nodes.len())) { return "" }
+        return self.nodes.get(id).sval
+    }
+    num(self<their<JsonDoc>>, id<Int>)<Float> -> {
+        if (oob(id, self.nodes.len())) { return 0.0 }
+        return self.nodes.get(id).nval
+    }
+    int(self<their<JsonDoc>>, id<Int>)<Int> -> {
+        if (oob(id, self.nodes.len())) { return 0 }
+        return self.nodes.get(id).ival
+    }
+    rootid(self<their<JsonDoc>>)<Int> -> {
+        return self.root
+    }
+}
+
+# ---- convenience free functions (fetch a child key as a scalar / array) ----
+# Implemented as free functions rather than JsonDoc methods because Vyb's method
+# dispatch does not reliably route `self.<sibling>()` calls; from a free
+# function the calls resolve exactly as they do from `main`.
+share(all)
+jexists(d<JsonDoc>, id<Int>, key<String>)<Bool> -> {
+    return d.get(id, key) >= 0
+}
+
+share(all)
+jgetstr(d<JsonDoc>, id<Int>, key<String>)<String> -> {
+    return d.hstr(d.get(id, key))
+}
+
+share(all)
+jgetint(d<JsonDoc>, id<Int>, key<String>)<Int> -> {
+    return d.int(d.get(id, key))
+}
+
+share(all)
+jgetnum(d<JsonDoc>, id<Int>, key<String>)<Float> -> {
+    return d.num(d.get(id, key))
+}
+
+share(all)
+jgetarr(d<JsonDoc>, id<Int>, key<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    cid<Int> = d.get(id, key)
+    if (cid < 0) { return out }
+    nn<Int> = d.len(cid)
+    i<Int> = 0
+    while (i < nn) {
+        out.push(d.elem(cid, i))
+        i = i + 1
+    }
+    return out
+}

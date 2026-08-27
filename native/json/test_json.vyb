@@ -1,0 +1,176 @@
+# test_json.vyb - self-contained test for the generic JSON parser.
+#
+#   1) parses a hand-written nested JSON literal (object / array / numbers /
+#      string / booleans / null, plus escapes and whitespace),
+#   2) reads config/mock-system.json from disk via io and parses it,
+#   3) reads a bounded PREFIX of artifacts/.../vocab.json via a pread FFI
+#      (the full ~2.7 MB file exceeds Vyb's string-registry floor, so we parse
+#      only the leading tokens) and prints a few token -> id pairs.
+#
+# Run:  cd ~/Projects/VybAIConf && ~/Projects/Vyb/build/vyb native/json/test_json.vyb
+import io::{open_read, read_all, close}
+import json_parse
+
+extern "C" {
+    pread(fd<Int>, buf<loc<CVoid>>, count<Int>, offset<Int>)<Int>
+    malloc(size<Int>)<loc<CVoid>>
+}
+
+# locate the last top-level ',' that is followed by the next key's opening quote,
+# so the slice we parse ends at a complete "key":num pair (no truncated token).
+find_sep(p<String>)<Int> -> {
+    sep<Int> = -1
+    n<Int> = p.len()
+    j<Int> = 0
+    while (j < n - 1) {
+        if (((p.char_at(j) as Int) & 255) == 44) {
+            if (((p.char_at(j + 1) as Int) & 255) == 34) { sep = j }
+        }
+        j = j + 1
+    }
+    return sep
+}
+
+main()<Int> -> {
+    # ---------- 1) hand-written nested JSON literal ----------
+    jlit<String> = "{\"name\":\"vyb\",\"nums\":[1,2,3.5,-4],\"nested\":{\"ok\":true,\"no\":false,\"nil\":null,\"msg\":\"a\\\"b\",\"bs\":\"c\\\\d\",\"ul\":\"\\u0041\"},\"pi\":3.14159,\"big\":42,\"exp\":1e3}"
+    match (json_parse(jlit)) {
+        d -> {
+            println("== literal ==  root=")
+            println(d.kind(d.root))
+            println("name=")
+            println(jgetstr(d, d.root, "name"))
+            ns<Int> = d.get(d.root, "nums")
+            println("nums kind=")
+            println(d.kind(ns))
+            println("nums len=")
+            println_int(d.len(ns))
+            println("nums[0]=")
+            println(d.hstr(d.elem(ns, 0)))
+            println("nums[2]=")
+            println(d.hstr(d.elem(ns, 2)))
+            println("nums[3]=")
+            println(d.hstr(d.elem(ns, 3)))
+            ne<Int> = d.get(d.root, "nested")
+            println("nested.ok=")
+            println(d.hstr(d.get(ne, "ok")))
+            println("nested.no=")
+            println(d.hstr(d.get(ne, "no")))
+            println("nested.nil=")
+            println(d.hstr(d.get(ne, "nil")))
+            println("nested.msg=")
+            println(d.hstr(d.get(ne, "msg")))
+            println("nested.bs=")
+            println(d.hstr(d.get(ne, "bs")))
+            println("nested.ul=")
+            println(d.hstr(d.get(ne, "ul")))
+            println("pi=")
+            println(d.num(d.get(d.root, "pi")).to_string())
+            println("big int=")
+            println_int(d.int(d.get(d.root, "big")))
+            println("exp=")
+            println(d.num(d.get(d.root, "exp")).to_string())
+            println("keys of root:")
+            ks<Vec<String>> = d.keys(d.root)
+            i<Int> = 0
+            while (i < ks.len()) {
+                println("  ")
+                println(ks.get(i))
+                i = i + 1
+            }
+        }
+        ? -> { println("LITERAL_PARSE_FAILED") }
+    }
+
+    # ---------- 2) config/mock-system.json from disk via io ----------
+    match (open_read("config/mock-system.json")) {
+        f -> {
+            match (read_all(f)) {
+                s -> {
+                    match (json_parse(s)) {
+                        d -> {
+                            println("== mock-system ==")
+                            sys<Int> = d.get(d.root, "system")
+                            println("hostname=")
+                            println(jgetstr(d, sys, "hostname"))
+                            println("architecture=")
+                            println(jgetstr(d, sys, "architecture"))
+                            println("kernel.version=")
+                            println(jgetstr(d, d.get(d.root, "kernel"), "version"))
+                            println("packages len=")
+                            println_int(d.len(d.get(d.root, "packages")))
+                            pkg0<Int> = d.elem(d.get(d.root, "packages"), 0)
+                            println("packages[0].name=")
+                            println(jgetstr(d, pkg0, "name"))
+                            println("storage.root=")
+                            println(jgetstr(d, d.get(d.root, "storage"), "root"))
+                            println("network.mode=")
+                            println(jgetstr(d, d.get(d.root, "network"), "mode"))
+                            svc0<Int> = d.elem(d.get(d.root, "services"), 0)
+                            println("services[0].name=")
+                            println(jgetstr(d, svc0, "name"))
+                            println("services[0].settings.tty=")
+                            println(jgetstr(d, d.get(svc0, "settings"), "tty"))
+                            svc1<Int> = d.elem(d.get(d.root, "services"), 1)
+                            println("services[1].name=")
+                            println(jgetstr(d, svc1, "name"))
+                            println("services[1].settings.port=")
+                            println_int(jgetint(d, d.get(svc1, "settings"), "port"))
+                            println("boot.target=")
+                            println(jgetstr(d, d.get(d.root, "boot"), "target"))
+                        }
+                        ? -> { println("MOCK_PARSE_FAILED") }
+                    }
+                }
+                ? -> { println("read mock failed") }
+            }
+            close(f)
+        }
+        ? -> { println("open mock failed") }
+    }
+
+    # ---------- 3) vocab.json prefix (bounded pread; full file too large) ----------
+    match (open_read("artifacts/vybos-configurator-lora/vocab.json")) {
+        vf -> {
+            freedom {
+                buf<loc<CVoid>> = malloc(300)
+                nrd<Int> = pread(vf.fd, buf, 300, 0)
+                p<String> = String::from_bytes(buf, nrd)
+                sep<Int> = find_sep(p)
+                println("== vocab prefix ==")
+                println("bytes read=")
+                println_int(nrd)
+                if (sep < 0) {
+                    println("no clean pair boundary in prefix; parse aborted")
+                } else {
+                    slice<String> = p.substring(0, sep) + "}"
+                    match (json_parse(slice)) {
+                        d -> {
+                            ksv<Vec<String>> = d.keys(d.root)
+                            println("tokens parsed=")
+                            println_int(ksv.len())
+                            k<Int> = 0
+                            pmore<Bool> = true
+                            while (pmore) {
+                                if (k >= 3) { pmore = false }
+                                else if (k >= ksv.len()) { pmore = false }
+                                else {
+                                    println("token=")
+                                    println(ksv.get(k))
+                                    println(" id=")
+                                    println_int(d.int(d.get(d.root, ksv.get(k))))
+                                    k = k + 1
+                                }
+                            }
+                        }
+                        ? -> { println("VOCAB_PREFIX_PARSE_FAILED") }
+                    }
+                }
+            }
+            close(vf)
+        }
+        ? -> { println("open vocab failed") }
+    }
+    println("DONE")
+    return 0
+}
