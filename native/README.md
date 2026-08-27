@@ -24,12 +24,14 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | **Multi-layer stack** (L× weight-tied decoder, double-buffered) | `host/stack_driver.vyb` | `STACK_VERIFY: OK` at L=4 (~8e-7 rel vs numpy) |
 | **Greedy autoregressive decode** (embed→stack→lm_head→argmax, token loop) | `host/decode_driver.vyb` | `DECODE_VERIFY: OK` (generated ids == numpy) |
 | **Stochastic sampler** (temp + top_k + top_p + seeded LCG) | `sampler/sampler.vyb` | `SAMPLER_VERIFY: OK` (kept set/probs/12 draws exact vs numpy) |
+| **`tensor::` wrapper module** (CUDA ctx / PTX module-load / dev buffer / H2D–D2H / gemm + rmsnorm via single-arg `cuLaunchKernel`) | `tensor/tensor.vyb` | `TENSOR_GEMM_AND_RMSNORM_OK` — both bad=0, exact vs in-Vyb ref |
 
 The handoff **P0 go/no-go gate** (single layer) plus the **full vertical slice**
 (substrate → GGUF/JSON/tokenizer loaders → multi-layer stack → autoregressive
 decode → **stochastic sampling**) all run Vyb-native on the RTX 3090 and are
-reference-verified. Remaining: G-decode (config-contract emission) and polish
-(kernel-side embed/sample, tensor:: wrapper). See `ROADMAP.md`.
+reference-verified. Remaining: G-decode (config-contract emission) and the rest
+of the `tensor::` wrapper (rope/attn/silu/resid ops moved behind it). See
+`ROADMAP.md`.
 
 ## Build & run
 

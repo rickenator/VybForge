@@ -12,7 +12,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 KERNELS := gemm rmsnorm math_probe layer deq
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack decode clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack tensor decode clean
 
 all: verify
 
@@ -44,6 +44,9 @@ stack: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_stack.py
 
+tensor: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/rmsnorm.ptx
+	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
@@ -62,6 +65,8 @@ verify: $(PTX)
 	@echo "== MULTI-LAYER STACK (4x, numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_stack.py
+	@echo "== TENSOR:: WRAPPER (gemm + rmsnorm via module + cuLaunchKernel) =="
+	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
 	@echo "== GREEDY AUTOREGRESSIVE DECODE (numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

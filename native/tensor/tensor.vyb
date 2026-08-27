@@ -1,0 +1,188 @@
+// tensor — reusable on-GPU tensor/launch wrapper for Vyb-native inference.
+//
+// Encapsulates the CUDA-driver plumbing that the monolithic decode driver
+// (native/host/decode_driver.vyb) currently hand-wires: context init, PTX
+// module load/retry, device buffer alloc/free, H2D/D2H copies, and the
+// params-buffer kernel launches (single 8-byte pointer arg via cuLaunchKernel).
+// Each op resolves its CUfunction and packs the params buffer, so a decoder /
+// G-decode program is a short sequence of tensor:: calls instead of raw
+// cuMemcpyHtoD_v2 + cuda_launch4i.
+//
+// Handle model (lossless, opaque):
+//   - CUmodule  -> Int (from module_load_path)
+//   - CUfunction-> Int (from module_func)
+//   - CUdeviceptr (device address) -> Int (from dev_alloc / htod outputs)
+// All raw-pointer work stays inside freedom blocks; only Ints cross the surface.
+//
+// Launch pattern: every kernel here reads its args from a device "params
+// buffer" addressed by ONE pointer (see kernels/gemm.vyb for the layout), so a
+// single-arg cuLaunchKernel suffices (no multi-arg void*[] packing needed).
+//
+// Assumes the FFI/cuda_binding pointer intrinsics (loc/from/addr/CVoid) are
+// resolvable: run with `--module-path <repo>/native/tensor:<repo>/<Vyb>/bindings/cuda`.
+
+import cuda_binding::{cuInit, cuDeviceGetCount, cuDeviceGet,
+                      cuDevicePrimaryCtxRetain, cuCtxSetCurrent, cuModuleLoadData,
+                      cuModuleGetFunction, cuLaunchKernel, cuMemAlloc_v2,
+                      cuMemcpyHtoD_v2, cuMemcpyDtoH_v2, cuMemFree_v2, cuCtxSynchronize}
+import io::{open_read, read_all}
+
+// Initialize the CUDA driver and retain+set the primary context of device 0.
+// Returns 0 on success, else a negative code.
+share(all) tensor_init()<Int> -> {
+    freedom {
+        if (cuInit(0) != 0) { return -1 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0) { return -2 }
+        if (ndev < 1) { return -3 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return -4 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuDevicePrimaryCtxRetain(loc(ctx), dev) != 0) { return -5 }
+        if (cuCtxSetCurrent(ctx) != 0) { return -6 }
+        return 0
+    }
+}
+
+// Load a CUmodule from a PTX file (with the NO_BINARY_FOR_GPU-once reload
+// retry). Returns an opaque module handle as Int (0 = failure).
+share(all) module_load_path(path<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 0 } } } ? -> { return 0 } }
+    hmod<Int> = 0
+    freedom {
+        hm<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hm), ptx) != 0) { hmod = 0 } else { hmod = addr(hm) }
+    }
+    if (hmod != 0) { return hmod }
+    # retry once with a freshly read String (NO_BINARY_FOR_GPU-once gotcha)
+    ptx2<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { g -> { ptx2 = g } ? -> { return 0 } } } ? -> { return 0 } }
+    freedom {
+        hm2<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hm2), ptx2) != 0) { return 0 }
+        return addr(hm2)
+    }
+}
+
+// Resolve a CUfunction by name from a loaded module. 0 = failure.
+share(all) module_func(hmod<Int>, name<String>)<Int> -> {
+    freedom {
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), from<loc<CVoid>>(hmod), name) != 0) { return 0 }
+        return addr(hf)
+    }
+}
+
+// Allocate `bytes` of device memory. Returns the CUdeviceptr (0 = failure).
+share(all) dev_alloc(bytes<Int>)<Int> -> {
+    freedom {
+        dp<Int> = 0
+        if (cuMemAlloc_v2(loc(dp), bytes) != 0) { return 0 }
+        return dp
+    }
+}
+
+// Free a device buffer.
+share(all) dev_free(p<Int>)<CInt> -> {
+    freedom { return cuMemFree_v2(p) }
+}
+
+// Copy one 8-byte Float into device buffer p (at byte offset 0 of the caller's
+// pointer arithmetic; the caller passes p + i*8 to write element i).
+share(all) htod(p<Int>, v<Float>)<CInt> -> {
+    freedom { return cuMemcpyHtoD_v2(p, loc(v), 8) }
+}
+
+// Read one 8-byte Float from device buffer p.
+share(all) dtoh(p<Int>)<Float> -> {
+    freedom {
+        v<Float> = 0.0
+        if (cuMemcpyDtoH_v2(loc(v), p, 8) != 0) { return 0.0 }
+        return v
+    }
+}
+
+// Copy a whole host Vec<Float> into device memory at `base` (contiguous f64).
+share(all) htod_vec(base<Int>, v<Vec<Float>>)<CInt> -> {
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (htod(base + i * 8, v.get(i)) != 0) { return 1 }
+    }
+    return 0
+}
+
+// Read `n` contiguous Float elements from device memory at `base` into a Vec.
+share(all) dtoh_vec(base<Int>, n<Int>)<Vec<Float>> -> {
+    r<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..n - 1) { r.push(dtoh(base + i * 8)) }
+    return r
+}
+
+// Block until queued device work finishes.
+share(all) sync()<CInt> -> {
+    freedom { return cuCtxSynchronize() }
+}
+
+// Launch a single-8-byte-arg kernel (the params-buffer pattern): grid blocks of
+// `threads` threads, function handle `hfunc`, kernel arg = device pointer `arg`.
+share(all) launch1(hfunc<Int>, blocks<Int>, threads<Int>, arg<Int>)<CInt> -> {
+    freedom {
+        slot<loc<CVoid>> = from<loc<CVoid>>(arg)
+        sel<loc<loc<CVoid>>> = loc(slot)
+        pp<loc<CVoid>> = from<loc<CVoid>>(addr(sel))
+        return cuLaunchKernel(from<loc<CVoid>>(hfunc), blocks, 1, 1, threads, 1, 1, 0,
+                              from<loc<CVoid>>(0), loc(pp), from<loc<CVoid>>(0))
+    }
+}
+
+// Copy one 8-byte Int word into device memory (params-buffer pointer/dim word).
+share(all) htod_i(p<Int>, iv<Int>)<CInt> -> {
+    freedom { return cuMemcpyHtoD_v2(p, loc(iv), 8) }
+}
+
+// Read one 8-byte Int word back from device memory.
+share(all) dtoh_i(p<Int>)<Int> -> {
+    freedom {
+        iv<Int> = 0
+        if (cuMemcpyDtoH_v2(loc(iv), p, 8) != 0) { return 0 }
+        return iv
+    }
+}
+
+// GEMM: C = alpha * A@B + beta * C, row-major A[M,K] B[K,N] C[M,N].
+// `params` is a caller-owned 64-byte device scratch buffer (dev_alloc(64)).
+// Packs the 8-word params buffer (A,B,C,M,N,K,alpha,beta at byte 0..56) and
+// launches the `gemm` CUfunction `hfunc`. Returns the CUresult (0 = OK).
+share(all) gemm(hfunc<Int>, params<Int>, A<Int>, B<Int>, C<Int>,
+                M<Int>, N<Int>, K<Int>, alpha<Float>, beta<Float>)<CInt> -> {
+    if (htod_i(params + 0, A) != 0) { return 1 }
+    if (htod_i(params + 8, B) != 0) { return 2 }
+    if (htod_i(params + 16, C) != 0) { return 3 }
+    if (htod_i(params + 24, M) != 0) { return 4 }
+    if (htod_i(params + 32, N) != 0) { return 5 }
+    if (htod_i(params + 40, K) != 0) { return 6 }
+    if (htod(params + 48, alpha) != 0) { return 7 }
+    if (htod(params + 56, beta) != 0) { return 8 }
+    total<Int> = M * N
+    blocks<Int> = (total + 255) / 256
+    return launch1(hfunc, blocks, 256, params)
+}
+
+// RMSNorm: Y[s][d] = X[s][d] * w[d] / sqrt(mean(X[s,:]^2) + eps), row-major
+// X[S,D], W[D], Y[S,D]. `params` is a caller-owned 48-byte device scratch
+// buffer (dev_alloc(48)). Packs (X,W,Y,S,D,eps) at bytes 0..40 and launches
+// the `rmsnorm` CUfunction. Returns the CUresult (0 = OK).
+share(all) rmsnorm(hfunc<Int>, params<Int>, X<Int>, W<Int>, Y<Int>,
+                   S<Int>, D<Int>, eps<Float>)<CInt> -> {
+    if (htod_i(params + 0, X) != 0) { return 1 }
+    if (htod_i(params + 8, W) != 0) { return 2 }
+    if (htod_i(params + 16, Y) != 0) { return 3 }
+    if (htod_i(params + 24, S) != 0) { return 4 }
+    if (htod_i(params + 32, D) != 0) { return 5 }
+    if (htod(params + 40, eps) != 0) { return 6 }
+    total<Int> = S * D
+    blocks<Int> = (total + 255) / 256
+    return launch1(hfunc, blocks, 256, params)
+}

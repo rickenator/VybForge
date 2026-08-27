@@ -36,8 +36,11 @@ Status legend: [x] done · [~] in progress · [ ] not started
 - [~] **G-tensor** — **complete for the vertical slice**: multi-layer stack
       (`STACK_VERIFY: OK`), greedy autoregressive decode (`DECODE_VERIFY: OK`),
       and **stochastic sampling** (temperature + top_k + top_p + seeded LCG;
-      `SAMPLER_VERIFY: OK` — kept set/probs/12 draws exact vs numpy). Remaining
-      polish: kernel-side embed/sample + the tensor:: module wrapper.
+      `SAMPLER_VERIFY: OK` — kept set/probs/12 draws exact vs numpy). Polish:
+      **`tensor::` wrapper module** done & verified for the core ops (context /
+      PTX-load / dev-mem / copy / **gemm + rmsnorm** via single-arg
+      `cuLaunchKernel`, `TENSOR_GEMM_AND_RMSNORM_OK`); remaining polish is
+      moving rope/attn/silu/resid (and the final embed/sample) behind it.
 - [ ] **G-decode** (final): schema-driven config-interview decode → emits
       `{path, op, value, reason}` SystemSpec JSON; verify byte-compatible with
       the Python/Ollama path on a few interviews. **VERTICAL SLICE otherwise

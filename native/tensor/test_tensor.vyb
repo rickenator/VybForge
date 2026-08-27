@@ -1,0 +1,129 @@
+// tensor:: wrapper test: init -> load gemm kernel -> dev buffers -> htod ->
+// gemm() -> dtoh, verify C against an in-Vyb host reference (no Python).
+// Run from repo root with the bindings module-path:
+//   <vyb> native/tensor/test_tensor.vyb \
+//         --module-path native/tensor --module-path /home/rick/Projects/Vyb/bindings/cuda
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, dev_free,
+                htod_vec, dtoh_vec, gemm, rmsnorm, sync}
+
+main()<Int> -> {
+    # ============================ GEMM ============================
+    M<Int> = 20
+    N<Int> = 16
+    K<Int> = 8
+    alpha<Float> = 1.0
+    beta<Float> = 0.0
+
+    # ---- host matrices (deterministic) ----
+    a<Vec<Float>> = Vec()
+    p<Int> = 0
+    for (p in 0..M * K - 1) { a.push(((p * 13 + 7) % 997) / 40.0 - 3.0) }
+    b<Vec<Float>> = Vec()
+    p = 0
+    for (p in 0..K * N - 1) { b.push(((p * 29 + 3) % 991) / 40.0 - 3.0) }
+    cref<Vec<Float>> = Vec()
+    m<Int> = 0
+    for (m in 0..M - 1) {
+        n<Int> = 0
+        for (n in 0..N - 1) {
+            s<Float> = 0.0
+            kk<Int> = 0
+            for (kk in 0..K - 1) { s = s + a.get(m * K + kk) * b.get(kk * N + n) }
+            cref.push(alpha * s)
+        }
+    }
+
+    if (tensor_init() != 0) { println("TENSOR_INIT_FAIL"); return 2 }
+    hmod<Int> = module_load_path("native/build/gemm.ptx")
+    if (hmod == 0) { println("MODULE_LOAD_FAIL"); return 3 }
+    hg<Int> = module_func(hmod, "gemm")
+    if (hg == 0) { println("FUNC_LOAD_FAIL"); return 4 }
+
+    AD<Int> = dev_alloc(M * K * 8)
+    BD<Int> = dev_alloc(K * N * 8)
+    CD<Int> = dev_alloc(M * N * 8)
+    paramsG<Int> = dev_alloc(64)
+    if (AD == 0 || BD == 0 || CD == 0 || paramsG == 0) { println("ALLOC_FAIL"); return 5 }
+
+    htod_vec(AD, a)
+    htod_vec(BD, b)
+
+    rc<CInt> = gemm(hg, paramsG, AD, BD, CD, M, N, K, alpha, beta)
+    if (rc != 0) { println("GEMM_LAUNCH_FAIL rc="); println_int(rc); return 6 }
+    sync()
+
+    got<Vec<Float>> = dtoh_vec(CD, M * N)
+    gbad<Int> = 0
+    gmax<Float> = 0.0
+    m = 0
+    for (m in 0..M - 1) {
+        n<Int> = 0
+        for (n in 0..N - 1) {
+            idx<Int> = m * N + n
+            d<Float> = got.get(idx) - cref.get(idx)
+            if (d < 0.0) { d = 0.0 - d }
+            if (d > gmax) { gmax = d }
+            if (d > 0.000001) { gbad = gbad + 1 }
+        }
+    }
+    println("TENSOR_GEMM bad=")
+    println_int(gbad)
+    println(" maxerr=")
+    println(gmax.to_string())
+
+    dev_free(AD); dev_free(BD); dev_free(CD); dev_free(paramsG)
+
+    # ============================ RMSNorm ============================
+    S<Int> = 5
+    D<Int> = 16
+    eps<Float> = 0.000001
+    x<Vec<Float>> = Vec()
+    p = 0
+    for (p in 0..S * D - 1) { x.push(((p * 37 + 11) % 1000) / 50.0 - 3.0) }
+    w<Vec<Float>> = Vec()
+    p = 0
+    for (p in 0..D - 1) { w.push(0.5 + ((p * 7) % 100) / 200.0) }
+    yref<Vec<Float>> = Vec()
+    s2<Int> = 0
+    for (s2 in 0..S - 1) {
+        m2<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) { vv<Float> = x.get(s2 * D + j); m2 = m2 + vv * vv }
+        r<Float> = 1.0 / sqrt(m2 / (D as Float) + eps)
+        j = 0
+        for (j in 0..D - 1) { yref.push(x.get(s2 * D + j) * r * w.get(j)) }
+    }
+
+    hr<Int> = module_func(module_load_path("native/build/rmsnorm.ptx"), "rmsnorm")
+    if (hr == 0) { println("FUNC_RMSNORM_FAIL"); return 8 }
+    XD<Int> = dev_alloc(S * D * 8)
+    WD<Int> = dev_alloc(D * 8)
+    YD<Int> = dev_alloc(S * D * 8)
+    paramsR<Int> = dev_alloc(48)
+    if (XD == 0 || WD == 0 || YD == 0 || paramsR == 0) { println("RMS_ALLOC_FAIL"); return 9 }
+    htod_vec(XD, x)
+    htod_vec(WD, w)
+    rc = rmsnorm(hr, paramsR, XD, WD, YD, S, D, eps)
+    if (rc != 0) { println("RMSNORM_LAUNCH_FAIL rc="); println_int(rc); return 10 }
+    sync()
+    ygot<Vec<Float>> = dtoh_vec(YD, S * D)
+    rbad<Int> = 0
+    rmax<Float> = 0.0
+    i<Int> = 0
+    for (i in 0..S * D - 1) {
+        dd<Float> = ygot.get(i) - yref.get(i)
+        if (dd < 0.0) { dd = 0.0 - dd }
+        if (dd > rmax) { rmax = dd }
+        if (dd > 0.000001) { rbad = rbad + 1 }
+    }
+    println("TENSOR_RMSNORM bad=")
+    println_int(rbad)
+    println(" maxerr=")
+    println(rmax.to_string())
+    dev_free(XD); dev_free(WD); dev_free(YD); dev_free(paramsR)
+
+    if (gbad != 0 || rbad != 0) { return 7 }
+    println("TENSOR_GEMM_AND_RMSNORM_OK")
+    return 0
+}
+
