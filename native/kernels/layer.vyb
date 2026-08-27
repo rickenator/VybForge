@@ -1,0 +1,201 @@
+// One transformer decoder layer forward, as launchable Vyb kernels (sm_86).
+// Entry kernels: gemm, rmsnorm, rope, attn, silu, resid.
+// NOTE: never write `X * (Y)` — the compiler misparses it as a pointer type
+// (`X *` + parenthesized expr -> ptr<X>) and silently nulls the expression
+// (garbage/zero). Always expand to a plain multiply chain `X * Y1 * Y2`.
+import vmath::{vexp, vsin, vcos, vsqrt}
+
+// Reusable GEMM C=alpha A@B + beta C (f64). Small 56-B params buffer:
+//   +0 A, +8 B, +16 C, +24 M, +32 N, +40 K, +48 alpha, +56 beta.
+gemm(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    alpha<Float> = ld_f64(p + 48)
+    beta<Float> = ld_f64(p + 56)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        acc<Float> = 0.0
+        kk<Int> = 0
+        for (kk in 0..K - 1) {
+            av<Float> = ld_f64(A + (mm * K + kk) * 8)
+            bv<Float> = ld_f64(B + (kk * N + nn) * 8)
+            acc = acc + av * bv
+        }
+        cval<Float> = ld_f64(C + (mm * N + nn) * 8)
+        st_f64(C + (mm * N + nn) * 8, alpha * acc + beta * cval)
+    }
+}
+
+// RMSNorm y[s][d] = x[s][d] * 1/sqrt(mean(rowsq)+eps) * w[d]. Small 48-B params.
+rmsnorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            v<Float> = ld_f64(X + (s * D + j) * 8)
+            ss = ss + v * v
+        }
+        r<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+        wv<Float> = ld_f64(W + d * 8)
+        xv<Float> = ld_f64(X + (s * D + d) * 8)
+        st_f64(Y + (s * D + d) * 8, xv * r * wv)
+    }
+}
+
+// RoPE in place on Q [S,H*HD] and K [S,KVH*HD].
+// Big PD offsets: +80 Q, +88 K, +176 FREQ, +184 S, +200 HD, +208 H, +216 KVH.
+rope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    half<Int> = HD / 2
+    shd<Int> = S * H * half
+    skd<Int> = S * KVH * half
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * half)
+            rem<Int> = gid % (H * half)
+            hh<Int> = rem / half
+            ii<Int> = rem % half
+            ang<Float> = (s as Float) * ld_f64(FR + ii * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            rbase<Int> = Q + (s * H * HD + hh * HD) * 8
+            q0<Float> = ld_f64(rbase + ii * 2 * 8)
+            q1<Float> = ld_f64(rbase + (ii * 2 + 1) * 8)
+            st_f64(rbase + ii * 2 * 8, q0 * c - q1 * sn)
+            st_f64(rbase + (ii * 2 + 1) * 8, q0 * sn + q1 * c)
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * half)
+            rem2<Int> = g2 % (KVH * half)
+            hh2<Int> = rem2 / half
+            ii2<Int> = rem2 % half
+            ang2<Float> = (s2 as Float) * ld_f64(FR + ii2 * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            rbase2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            k0<Float> = ld_f64(rbase2 + ii2 * 2 * 8)
+            k1<Float> = ld_f64(rbase2 + (ii2 * 2 + 1) * 8)
+            st_f64(rbase2 + ii2 * 2 * 8, k0 * c2 - k1 * sn2)
+            st_f64(rbase2 + (ii2 * 2 + 1) * 8, k0 * sn2 + k1 * c2)
+        }
+    }
+}
+
+// Grouped-query, causal, scaled-softmax attention: Q,K,V -> Ctx [S,H*HD].
+// kv head for q head h = h / (H/KVH).
+// PD offsets: +80 Q, +88 K, +96 V, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH.
+attn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    total<Int> = S * H
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / H
+        h<Int> = gid % H
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        # pass 1: row max over causal t<=s
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..s) {
+            sc<Float> = 0.0
+            ia<Int> = 0
+            for (ia in 0..HD - 1) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(K + (ta * KVH * HD + kvh * HD + ia) * 8)
+                sc = sc + qv * kv
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        # pass 2: sum of exp over causal t<=s
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..s) {
+            sc2<Float> = 0.0
+            ib<Int> = 0
+            for (ib in 0..HD - 1) {
+                qv2<Float> = ld_f64(qb + ib * 8)
+                kv2<Float> = ld_f64(K + (tb * KVH * HD + kvh * HD + ib) * 8)
+                sc2 = sc2 + qv2 * kv2
+            }
+            sc2 = sc2 * scale
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        # pass 3: weighted sum of V over causal t<=s (one thread per dim)
+        ii<Int> = 0
+        for (ii in 0..HD - 1) {
+            acc<Float> = 0.0
+            tc<Int> = 0
+            for (tc in 0..s) {
+                sc3<Float> = 0.0
+                jj<Int> = 0
+                for (jj in 0..HD - 1) {
+                    qv3<Float> = ld_f64(qb + jj * 8)
+                    kv3<Float> = ld_f64(K + (tc * KVH * HD + kvh * HD + jj) * 8)
+                    sc3 = sc3 + qv3 * kv3
+                }
+                sc3 = sc3 * scale
+                e<Float> = vexp(sc3 - mx)
+                w<Float> = e / ssum
+                vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+                acc = acc + w * vv
+            }
+            st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+        }
+    }
+}
+
+// MLP gate: h[gid] = silu(g[gid]) * u[gid], elementwise over n.
+silu(g<Int>, u<Int>, h<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        st_f64(h + gid * 8, gv * sg * uv)
+    }
+}
+
+// Residual add: y[gid] = a[gid] + b[gid] over n.
+resid(a<Int>, b<Int>, y<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        av<Float> = ld_f64(a + gid * 8)
+        bv<Float> = ld_f64(b + gid * 8)
+        st_f64(y + gid * 8, av + bv)
+    }
+}

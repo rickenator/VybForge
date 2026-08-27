@@ -60,3 +60,14 @@ share(all) vsin(x<Float>)<Float> -> {
 share(all) vcos(x<Float>)<Float> -> {
     return vsin(1.5707963267948966 - x)
 }
+
+# Pure-arithmetic sqrt (Newton) — the `sqrt` libm builtin does not reliably
+# lower to a device instruction in kernel mode.
+share(all) vsqrt(x<Float>, iters<Int>)<Float> -> {
+    y<Float> = x
+    i<Int> = 0
+    for (i in 0..iters - 1) {
+        y = 0.5 * (y + x / y)
+    }
+    return y
+}

@@ -1,0 +1,383 @@
+// Full one-layer decoder forward on the GPU, Vyb-native. Dumps the generated
+// inputs+weights (native/out/weights.txt) and the GPU output (native/out/out.txt);
+// a python *reference* (native/tools/verify_layer.py) verifies the forward.
+// The production GPU path is 100% Vyb; python is verification-only.
+import io::{open_read, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+# write a Vec<Float> to path, one value per line.
+dump_vec(pth<String>, v<Vec<Float>>)<Int> -> {
+    match (open_write(pth)) {
+        f -> {
+            i<Int> = 0
+            for (i in 0..v.len() - 1) {
+                match (write_str(f, v.get(i).to_string())) { p -> { } ? -> { return 1 } }
+                match (write_str(f, "\n")) { q -> { } ? -> { return 1 } }
+            }
+            close(f)
+            return 0
+        }
+        ? -> { return 1 }
+    }
+}
+
+main()<Int> -> {
+    S<Int> = 4
+    D<Int> = 16
+    NH<Int> = 4
+    HD<Int> = 4
+    NKVH<Int> = 2
+    HM<Int> = 32
+    EPS<Float> = 0.000001
+    NCOL<Int> = NH * HD
+    NKCOL<Int> = NKVH * HD
+
+    # ---- deterministic weights (shared with python reference by serial number) ----
+    k<Int> = 0
+    xw<Vec<Float>> = Vec()
+    w1v<Vec<Float>> = Vec()
+    w2v<Vec<Float>> = Vec()
+    wqv<Vec<Float>> = Vec()
+    wkv<Vec<Float>> = Vec()
+    wvv<Vec<Float>> = Vec()
+    wov<Vec<Float>> = Vec()
+    wgv<Vec<Float>> = Vec()
+    wuv<Vec<Float>> = Vec()
+    wdv<Vec<Float>> = Vec()
+
+    i<Int> = 0
+    vv<Float> = 0.0
+    tv<Float> = 0.0
+    for (i in 0..S * D - 1) { xw.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D - 1) { w1v.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D - 1) { w2v.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * NCOL - 1) { wqv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * NKCOL - 1) { wkv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * NKCOL - 1) { wvv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * D - 1) { wov.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * HM - 1) { wgv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..D * HM - 1) { wuv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    for (i in 0..HM * D - 1) { wdv.push(((k * 1103515 + 12345) % 2147483647) as Float / 2147483647.0 * 2.0 - 1.0); k = k + 1 }
+    freq<Vec<Float>> = Vec()
+    freq.push(1.0)
+    freq.push(0.01)
+    # precomputed scalars (some `X * (...)` forms fail to parse inside freedom)
+    halfHD<Int> = HD / 2
+    rtot0<Int> = S * NH * 2 + S * NKVH * 2
+
+    # CUDA setup
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/layer.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/layer.ptx")) { f -> { match (read_all(f)) { g -> { ptx2 = g } ? -> { return 20 } } } ? -> { return 20 } }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hfg<loc<CVoid>> = from<loc<CVoid>>(0)
+        hfr<loc<CVoid>> = from<loc<CVoid>>(0)
+        hro<loc<CVoid>> = from<loc<CVoid>>(0)
+        hfa<loc<CVoid>> = from<loc<CVoid>>(0)
+        hsi<loc<CVoid>> = from<loc<CVoid>>(0)
+        hre<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hfg), hmod, "gemm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hfr), hmod, "rmsnorm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hro), hmod, "rope") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hfa), hmod, "attn") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hsi), hmod, "silu") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hre), hmod, "resid") != 0) { return 10 }
+
+        # ---- alloc device buffers ----
+        DX<Int> = 0;  DW1<Int> = 0; DW2<Int> = 0; DXN<Int> = 0; DX1N<Int> = 0
+        DWq<Int> = 0; DWk<Int> = 0; DWv<Int> = 0; DWo<Int> = 0
+        DWg<Int> = 0; DWu<Int> = 0; DWd<Int> = 0
+        DQ<Int> = 0;  DK<Int> = 0;  DV<Int> = 0; DCtx<Int> = 0; DO<Int> = 0
+        DGr<Int> = 0; DUp<Int> = 0; DHu<Int> = 0; DM<Int> = 0; DX1<Int> = 0; DOut<Int> = 0
+        DFreq<Int> = 0
+        PD<Int> = 0;  GMP<Int> = 0; RNP<Int> = 0
+
+        if (cuMemAlloc_v2(loc(DX), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DW1), D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DW2), D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DXN), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DX1N), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWq), D * NCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWk), D * NKCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWv), D * NKCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWo), D * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWg), D * HM * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWu), D * HM * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWd), HM * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQ), S * NCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DK), S * NKCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DV), S * NKCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DCtx), S * NCOL * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DO), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DGr), S * HM * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DUp), S * HM * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DHu), S * HM * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DM), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DX1), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DOut), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DFreq), S * halfHD * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PD), 248) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(GMP), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(RNP), 48) != 0) { return 11 }
+
+        # copy host weights -> device (element-wise)
+        i = 0
+        for (i in 0..S * D - 1) { tv = xw.get(i); if (cuMemcpyHtoD_v2(DX + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D - 1) { tv = w1v.get(i); if (cuMemcpyHtoD_v2(DW1 + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D - 1) { tv = w2v.get(i); if (cuMemcpyHtoD_v2(DW2 + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * NCOL - 1) { tv = wqv.get(i); if (cuMemcpyHtoD_v2(DWq + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * NKCOL - 1) { tv = wkv.get(i); if (cuMemcpyHtoD_v2(DWk + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * NKCOL - 1) { tv = wvv.get(i); if (cuMemcpyHtoD_v2(DWv + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * D - 1) { tv = wov.get(i); if (cuMemcpyHtoD_v2(DWo + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * HM - 1) { tv = wgv.get(i); if (cuMemcpyHtoD_v2(DWg + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..D * HM - 1) { tv = wuv.get(i); if (cuMemcpyHtoD_v2(DWu + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..HM * D - 1) { tv = wdv.get(i); if (cuMemcpyHtoD_v2(DWd + i * 8, loc(tv), 8) != 0) { return 15 } }
+        for (i in 0..(HD / 2) - 1) { tv = freq.get(i); if (cuMemcpyHtoD_v2(DFreq + i * 8, loc(tv), 8) != 0) { return 15 } }
+
+        af<Float> = 1.0
+        bf<Float> = 0.0
+
+        # ---------- 1) RMSNorm(X, W1) -> XN ----------
+        rA<Int> = DX; rB<Int> = DW1; rC<Int> = DXN
+        if (cuMemcpyHtoD_v2(RNP + 0, loc(rA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 8, loc(rB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 16, loc(rC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 24, loc(S), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 32, loc(D), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 40, loc(EPS), 8) != 0) { return 15 }
+        blk<Int> = (S * D + 255) / 256
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hfr)), blk, 1, 1, 256, 1, 1, RNP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+
+        # ---------- gemm helper body (inlined per call) ----------
+        # call 1: Q = XN*Wq -> M=S,N=NCOL,K=D
+        gA<Int> = DXN; gB<Int> = DWq; gC<Int> = DQ
+        gM<Int> = S; gN<Int> = NCOL; gK<Int> = D
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # call 2: K = XN*Wk
+        gA = DXN; gB = DWk; gC = DK
+        gM = S; gN = NKCOL; gK = D
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # call 3: V = XN*Wv
+        gA = DXN; gB = DWv; gC = DV
+        gM = S; gN = NKCOL; gK = D
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # ---------- rope ----------
+        hp<Int> = 0
+        if (cuMemcpyHtoD_v2(PD + 80, loc(DQ), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 88, loc(DK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 96, loc(DV), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 104, loc(DCtx), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 176, loc(DFreq), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 184, loc(S), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 200, loc(HD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 208, loc(NH), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 216, loc(NKVH), 8) != 0) { return 15 }
+        rtot<Int> = rtot0
+        blk = (rtot + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hro)), blk, 1, 1, 256, 1, 1, PD, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # ---------- attention -> Ctx ----------
+        blk = (S * NH + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfa)), blk, 1, 1, 256, 1, 1, PD, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # ---------- o_proj -> O; residual X1 = X + O ----------
+        gA = DCtx; gB = DWo; gC = DO
+        gM = S; gN = D; gK = NCOL
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        blk = (S * D + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hre)), blk, 1, 1, 256, 1, 1, DX, DO, DX1, S * D)
+        if (rc != 0) { return 12 }
+        # ---------- RMSNorm(X1, W2) -> X1N ----------
+        rA = DX1; rB = DW2; rC = DX1N
+        if (cuMemcpyHtoD_v2(RNP + 0, loc(rA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 8, loc(rB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 16, loc(rC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 24, loc(S), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 32, loc(D), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(RNP + 40, loc(EPS), 8) != 0) { return 15 }
+        blk = (S * D + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfr)), blk, 1, 1, 256, 1, 1, RNP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        # ---------- MLP gate/up ; SiLU ----------
+        gA = DX1N; gB = DWg; gC = DGr
+        gM = S; gN = HM; gK = D
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        gA = DX1N; gB = DWu; gC = DUp
+        gM = S; gN = HM; gK = D
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        blk = (S * HM + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hsi)), blk, 1, 1, 256, 1, 1, DGr, DUp, DHu, S * HM)
+        if (rc != 0) { return 12 }
+        # ---------- down-proj M = NH*Wd ; residual Out = X1 + M ----------
+        gA = DHu; gB = DWd; gC = DM
+        gM = S; gN = D; gK = HM
+        if (cuMemcpyHtoD_v2(GMP + 0, loc(gA), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 8, loc(gB), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 16, loc(gC), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 24, loc(gM), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 32, loc(gN), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 40, loc(gK), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 48, loc(af), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(GMP + 56, loc(bf), 8) != 0) { return 15 }
+        blk = (gM * gN + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfg)), blk, 1, 1, 256, 1, 1, GMP, 0, 0, 0)
+        if (rc != 0) { return 12 }
+        blk = (S * D + 255) / 256
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hre)), blk, 1, 1, 256, 1, 1, DX1, DM, DOut, S * D)
+        if (rc != 0) { return 12 }
+
+        cuCtxSynchronize()
+
+        # ---- read Out + intermediates back ----
+        outv<Vec<Float>> = Vec()
+        rv<Float> = 0.0
+        i = 0
+        for (i in 0..S * D - 1) {
+            rv = 0.0
+            if (cuMemcpyDtoH_v2(loc(rv), DOut + i * 8, 8) != 0) { return 16 }
+            outv.push(rv)
+        }
+        qg<Vec<Float>> = Vec()
+        for (i in 0..S * NCOL - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DQ + i * 8, 8) != 0) { return 16 }; qg.push(rv) }
+        kg2<Vec<Float>> = Vec()
+        for (i in 0..S * NKCOL - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DK + i * 8, 8) != 0) { return 16 }; kg2.push(rv) }
+        vg2<Vec<Float>> = Vec()
+        for (i in 0..S * NKCOL - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DV + i * 8, 8) != 0) { return 16 }; vg2.push(rv) }
+        ctv<Vec<Float>> = Vec()
+        for (i in 0..S * NCOL - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DCtx + i * 8, 8) != 0) { return 16 }; ctv.push(rv) }
+        x1v<Vec<Float>> = Vec()
+        for (i in 0..S * D - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DX1 + i * 8, 8) != 0) { return 16 }; x1v.push(rv) }
+        huv<Vec<Float>> = Vec()
+        for (i in 0..S * HM - 1) { rv = 0.0; if (cuMemcpyDtoH_v2(loc(rv), DHu + i * 8, 8) != 0) { return 16 }; huv.push(rv) }
+
+        cuMemFree_v2(DX); cuMemFree_v2(DW1); cuMemFree_v2(DW2); cuMemFree_v2(DXN); cuMemFree_v2(DX1N)
+        cuMemFree_v2(DWq); cuMemFree_v2(DWk); cuMemFree_v2(DWv); cuMemFree_v2(DWo)
+        cuMemFree_v2(DWg); cuMemFree_v2(DWu); cuMemFree_v2(DWd)
+        cuMemFree_v2(DQ); cuMemFree_v2(DK); cuMemFree_v2(DV); cuMemFree_v2(DCtx); cuMemFree_v2(DO)
+        cuMemFree_v2(DGr); cuMemFree_v2(DUp); cuMemFree_v2(DHu); cuMemFree_v2(DM); cuMemFree_v2(DX1); cuMemFree_v2(DOut)
+        cuMemFree_v2(DFreq)
+        cuMemFree_v2(PD); cuMemFree_v2(GMP); cuMemFree_v2(RNP)
+
+        # ---- dump inputs/weights + output for python reference ----
+        if (dump_vec("native/out/weights.txt", xw) != 0) { return 17 }
+        if (dump_vec("native/out/w1.txt", w1v) != 0) { return 17 }
+        if (dump_vec("native/out/w2.txt", w2v) != 0) { return 17 }
+        if (dump_vec("native/out/wq.txt", wqv) != 0) { return 17 }
+        if (dump_vec("native/out/wk.txt", wkv) != 0) { return 17 }
+        if (dump_vec("native/out/wv.txt", wvv) != 0) { return 17 }
+        if (dump_vec("native/out/wo.txt", wov) != 0) { return 17 }
+        if (dump_vec("native/out/wg.txt", wgv) != 0) { return 17 }
+        if (dump_vec("native/out/wu.txt", wuv) != 0) { return 17 }
+        if (dump_vec("native/out/wd.txt", wdv) != 0) { return 17 }
+        if (dump_vec("native/out/freq.txt", freq) != 0) { return 17 }
+        if (dump_vec("native/out/out.txt", outv) != 0) { return 17 }
+        if (dump_vec("native/out/q.txt", qg) != 0) { return 17 }
+        if (dump_vec("native/out/k.txt", kg2) != 0) { return 17 }
+        if (dump_vec("native/out/v.txt", vg2) != 0) { return 17 }
+        if (dump_vec("native/out/ctx.txt", ctv) != 0) { return 17 }
+        if (dump_vec("native/out/x1.txt", x1v) != 0) { return 17 }
+        if (dump_vec("native/out/hu.txt", huv) != 0) { return 17 }
+
+        println("LAYER_FORWARD_DONE")
+        return 0
+    }
+}

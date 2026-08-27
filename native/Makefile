@@ -1,6 +1,6 @@
 # VybAIConf native GPU substrate — builds kernels to sm_86 PTX and runs the
 # Vyb-native host drivers. No Python in the runtime path; verification is done
-# inside Vyb (CPU/host-libm reference vs GPU readback).
+# inside Vyb (a numpy reference verifies the standalone single-layer forward).
 # Run `make -f native/Makefile verify` from the repo root.
 VYBDIR ?= /home/rick/Projects/Vyb
 VYB     ?= $(VYBDIR)/build/vyb
@@ -9,17 +9,16 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-# kernels -> ptx (kernel mode). vmath.vyb is a device library, not a kernel.
-KERNELS := gemm rmsnorm math_probe
+KERNELS := gemm rmsnorm math_probe layer
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe clean
+.PHONY: all verify gemm rmsnorm mathprobe layer clean
 
 all: verify
 
 # Compile a kernel source to PTX via kernel mode (with vmath in scope)
 $(KPTX): $(KSRC)
-	@mkdir -p $(ROOT)/native/build
+	@mkdir -p $(ROOT)/native/build $(ROOT)/native/out
 	cd $(ROOT)/native/build && $(VYB) --kernel ../kernels/$*.vyb --ptx $*.ptx $(MODPATH)
 
 gemm: $(ROOT)/native/build/gemm.ptx
@@ -31,6 +30,10 @@ rmsnorm: $(ROOT)/native/build/rmsnorm.ptx
 mathprobe: $(ROOT)/native/build/math_probe.ptx
 	cd $(ROOT) && $(VYB) native/host/math_probe_driver.vyb
 
+layer: $(ROOT)/native/build/layer.ptx
+	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
+	python3 native/tools/verify_layer.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="
@@ -39,6 +42,9 @@ verify: $(PTX)
 	cd $(ROOT) && $(VYB) native/host/rmsnorm_driver.vyb
 	@echo "== VMATH =="
 	cd $(ROOT) && $(VYB) native/host/math_probe_driver.vyb
+	@echo "== ONE-LAYER FORWARD (numpy reference) =="
+	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
+	cd $(ROOT) && python3 native/tools/verify_layer.py
 
 clean:
-	rm -rf $(ROOT)/native/build
+	rm -rf $(ROOT)/native/build $(ROOT)/native/out

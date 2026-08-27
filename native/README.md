@@ -16,11 +16,13 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | Reusable GEMM `C=αAB+βC` (f64, params-buffer launch, multi-block) | `kernels/gemm.vyb` | `GEMM_OK` bad=0 maxerr=0 |
 | RMSNorm (native Newton sqrt) | `kernels/rmsnorm.vyb` | `RMSNORM_OK` bad=0 |
 | Native `exp` / `sin` / `cos` (pure arithmetic) | `kernels/vmath.vyb` | `VMATH_OK` exp<2.6e-10 rel, sin/cos<6e-12 abs |
+| **ONE transformer layer forward** (RMSNorm → GQA/RoPE → causal softmax attn → o_proj → residual → RMSNorm → SiLU MLP → residual) | `kernels/layer.vyb` | `LAYER_VERIFY: OK` — max diff ~5e-5 vs numpy ref at every stage (attn 5.3e-6) |
 
-The substrate already has every op a single transformer layer needs
-(GEMM + RMSNorm + exp for softmax/SiLU + sin/cos for RoPE). Next increment:
-RoPE → attention (GQA, causal softmax) → o_proj, SiLU MLP, residual → one-layer
-forward verified vs an in-Vyb CPU reference.
+The single-layer forward is the handoff's **P0 go/no-go gate**: a real decoder
+layer (embed→RMSNorm→QKV→RoPE→GQA causal-softmax→o_proj→residual→MLP SiLU→
+residual) runs fully on the RTX 3090 in Vyb and matches a reference. Next: the
+G4 loaders (GGUF/Q4 base reader, Qwen3 BPE tokenizer, JSON value parser) then
+stacking to 36 layers + the config-contract decode.
 
 ## Build & run
 
@@ -49,6 +51,12 @@ layout (`A,B,C,M,N,K,alpha,beta` at offsets 0..56).
   ptxas rejects; `exp`/`sin`/`cos`/`tan` are *always* unresolved externs. Do not
   use them in kernels — implement in pure `+,-,*,/` (Newton sqrt, polynomial
   exp/sin/cos). Every one here is a plain-arithmetic device function.
+- **`X * (Y)` is parsed as a pointer type** (`*` followed by a parenthesized
+  group ⇒ `Y` is read as a type to point to: `ptr<X>`), which **silently nulls
+  the expression** — the kernel compiles but writes garbage/zero. Happens in
+  host `freedom` blocks *and* inside kernels. Always expand to a plain multiply
+  chain: `s * (H * HD)` ⇒ `s * H * HD`; compute `rtot`-style sums without
+  parenthesized products. This one cost a full layer of debugging.
 - **Deeply-nested Horner expressions evaluate to `0`/null** in the runtime.
   Write polynomials as explicit power-sum terms (`p = 1.0 + r*c1 + r2*c2 + ...`),
   not `r * (c1 + r * (c2 + ...))`. This silently zeroed `vexp`.
