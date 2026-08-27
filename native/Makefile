@@ -12,7 +12,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 KERNELS := gemm rmsnorm math_probe layer
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf clean
 
 all: verify
 
@@ -34,6 +34,12 @@ layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py
 
+gguf:
+	mkdir -p $(ROOT)/native/gguf
+	python3 $(ROOT)/native/gguf/mk_fixture.py
+	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
+	python3 $(ROOT)/native/gguf/verify_gguf.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="
@@ -45,6 +51,9 @@ verify: $(PTX)
 	@echo "== ONE-LAYER FORWARD (numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_layer.py
+	@echo "== GGUF READER (header + kv + tensor index) =="
+	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
+	cd $(ROOT) && python3 native/gguf/verify_gguf.py
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out

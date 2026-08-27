@@ -17,12 +17,13 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | RMSNorm (native Newton sqrt) | `kernels/rmsnorm.vyb` | `RMSNORM_OK` bad=0 |
 | Native `exp` / `sin` / `cos` (pure arithmetic) | `kernels/vmath.vyb` | `VMATH_OK` exp<2.6e-10 rel, sin/cos<6e-12 abs |
 | **ONE transformer layer forward** (RMSNorm → GQA/RoPE → causal softmax attn → o_proj → residual → RMSNorm → SiLU MLP → residual) | `kernels/layer.vyb` | `LAYER_VERIFY: OK` — max diff ~5e-5 vs numpy ref at every stage (attn 5.3e-6) |
+| **GGUF v3 reader** (header, metadata KV, tensor index; little-endian binary parse) | `gguf/parse_gguf.vyb` | `GGUF_PARSE_VERIFY: OK` on synthetic fixture |
 
-The single-layer forward is the handoff's **P0 go/no-go gate**: a real decoder
-layer (embed→RMSNorm→QKV→RoPE→GQA causal-softmax→o_proj→residual→MLP SiLU→
-residual) runs fully on the RTX 3090 in Vyb and matches a reference. Next: the
-G4 loaders (GGUF/Q4 base reader, Qwen3 BPE tokenizer, JSON value parser) then
-stacking to 36 layers + the config-contract decode.
+The single-layer forward is the handoff's **P0 go/no-go gate**, and the GGUF
+reader is the first piece of G4 (the model loader). Next: GGUF tensor **data**
+dequant (`deq_q4_0` already proven on-GPU), the Qwen3 BPE tokenizer (151k vocab,
+regex + merges), a JSON value parser, then stacking to 36 layers + the
+config-contract decode.
 
 ## Build & run
 

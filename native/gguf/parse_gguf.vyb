@@ -1,0 +1,108 @@
+// Vyb-native GGUF v3 header + metadata KV + tensor-index reader (little-endian
+// binary parse on raw file bytes), verified against a synthetic fixture.
+// Writes the parsed index to native/gguf/parsed.txt as numeric fields (names as
+// byte-integer sequences, since rebuilding arbitrary name strings from bytes is
+// not the point of this test).
+import io::{open_read, read_all, open_write, write_str, close}
+
+u8v(s<String>, off<Int>)<Int> -> {
+    return (s.char_at(off) as Int) & 255
+}
+
+u32le(s<String>, off<Int>)<Int> -> {
+    return u8v(s, off) | (u8v(s, off + 1) << 8) | (u8v(s, off + 2) << 16) | (u8v(s, off + 3) << 24)
+}
+
+u64le(s<String>, off<Int>)<Int> -> {
+    return u8v(s, off) | (u8v(s, off + 1) << 8) | (u8v(s, off + 2) << 16) | (u8v(s, off + 3) << 24) |
+           (u8v(s, off + 4) << 32) | (u8v(s, off + 5) << 40) | (u8v(s, off + 6) << 48) | (u8v(s, off + 7) << 56)
+}
+
+wline(f<File>, t<String>)<Bool> -> {
+    match (write_str(f, t)) { p -> { } ? -> { return false } }
+    match (write_str(f, "\n")) { q -> { } ? -> { return false } }
+    return true
+}
+
+// append byte ints [off, off+n) to a buffer String via our own accumulator is
+// awkward; instead write direct: emit_prefix + each byte separated by spaces.
+emit_bytes(f<File>, s<String>, off<Int>, n<Int>)<Bool> -> {
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        if (wline(f, u8v(s, off + i).to_string())) { } else { return false }
+    }
+    return true
+}
+
+main()<Int> -> {
+    data<String> = ""
+    match (open_read("native/gguf/test.gguf")) {
+        f -> { match (read_all(f)) { g -> { data = g } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    # magic
+    magic_ok<Int> = 0
+    if (u8v(data, 0) == 71) {
+        if (u8v(data, 1) == 71) {
+            if (u8v(data, 2) == 85) {
+                if (u8v(data, 3) == 70) { magic_ok = 1 }
+            }
+        }
+    }
+    ver<Int> = u32le(data, 4)
+    nti<Int> = u64le(data, 8)
+    nkv<Int> = u64le(data, 16)
+    off<Int> = 24
+
+    match (open_write("native/gguf/parsed.txt")) {
+        f -> {
+            wline(f, "MAGIC " + magic_ok.to_string() + " VER " + ver.to_string() + " NT " + nti.to_string() + " NKV " + nkv.to_string())
+            # metadata kv 1: key name ("general.name")
+            kl<Int> = u64le(data, off)
+            wline(f, "KEYLEN " + kl.to_string())
+            off = off + 8
+            emit_bytes(f, data, off, kl)
+            off = off + kl
+            vt<Int> = u32le(data, off)
+            off = off + 4
+            wline(f, "KEYTYPE " + vt.to_string())
+            if (vt == 8) {
+                vl<Int> = u64le(data, off)
+                wline(f, "VALLEN " + vl.to_string())
+                off = off + 8
+                emit_bytes(f, data, off, vl)
+                off = off + vl
+            }
+            # tensor index
+            t<Int> = 0
+            for (t in 0..nti - 1) {
+                nl<Int> = u64le(data, off)
+                wline(f, "TN " + t.to_string() + " NAMELEN " + nl.to_string())
+                off = off + 8
+                emit_bytes(f, data, off, nl)
+                off = off + nl
+                nd<Int> = u32le(data, off)
+                off = off + 4
+                line<String> = "TDIM " + t.to_string() + " ND " + nd.to_string()
+                d<Int> = 0
+                for (d in 0..nd - 1) {
+                    dv<Int> = u64le(data, off)
+                    off = off + 8
+                    line = line + " d" + dv.to_string()
+                }
+                wline(f, line)
+                ty<Int> = u32le(data, off)
+                off = off + 4
+                oset<Int> = u64le(data, off)
+                off = off + 8
+                wline(f, "TINFO " + t.to_string() + " ty " + ty.to_string() + " off " + oset.to_string())
+            }
+            wline(f, "END")
+            println("PARSE_DONE")
+            close(f)
+            return 0
+        }
+        ? -> { return 13 }
+    }
+}
