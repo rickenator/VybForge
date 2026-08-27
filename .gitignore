@@ -13,3 +13,4 @@ artifacts/vybos-configurator-lora/README.md
 artifacts/*.log
 # native GPU substrate build outputs
 native/build/
+native/out/
