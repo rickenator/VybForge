@@ -9,7 +9,7 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer
+KERNELS := gemm rmsnorm math_probe layer deq
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf clean
@@ -51,9 +51,10 @@ verify: $(PTX)
 	@echo "== ONE-LAYER FORWARD (numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_layer.py
-	@echo "== GGUF READER (header + kv + tensor index) =="
+	@echo "== GGUF READER + Q4_0 DEQUANT ON-GPU =="
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	cd $(ROOT) && python3 native/gguf/verify_gguf.py
+	cd $(ROOT) && $(VYB) native/gguf/dequant_gguf.vyb
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out

@@ -1,0 +1,12 @@
+// GPU dequant of a GGUF q4_0 block: reads 18-byte blocks at int4 offsets,
+// dequantizes to f64 out[]. Uses the #203 deq_q4_0 intrinsic (0 = u8, not a
+// kernel need; non-kernel file marker).
+q4deq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 32
+        ii<Int> = gid % 32
+        v<Float> = deq_q4_0(q + block * 18, ii)
+        st_f64(o + gid * 8, v)
+    }
+}

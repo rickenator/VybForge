@@ -1,0 +1,45 @@
+// Probe: their<Int> mutation, addr of fixed array, substring, escape table.
+struct PP {
+    x<Int>,
+    y<Int>
+}
+
+inc(p<their<Int>>)<Int> -> {
+    p = p + 1
+    return p
+}
+
+main()<Int> -> {
+    # their<Int> mutation test
+    c<Int> = 0
+    r<Int> = inc(their(c))
+    println("after inc c=")
+    println_int(c)
+    println(" r=")
+    println_int(r)
+
+    # substring test
+    src<String> = "hello world"
+    println(src.substring(6, 8))
+    println_int((src.char_at(1) as Int) & 255)
+
+    # escape table via literal string
+    esc<String> = "\"\\/bfnrt"
+    println("esc len=")
+    println_int(esc.len())
+    i<Int> = 2
+    println(esc.substring(i, i + 1))
+
+    # fixed array
+    arr<[Int; 5]> = [72, 105, 33, 33, 33]   # "Hi!!!"
+    a<Int> = arr[0]
+    println_int(a)
+
+    # Vec of Int
+    v<Vec<Int>> = Vec()
+    v.push(65)
+    v.push(66)
+    println_int(v.get(0))
+    println("done")
+    return 0
+}

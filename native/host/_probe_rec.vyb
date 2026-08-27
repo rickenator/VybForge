@@ -1,0 +1,37 @@
+// Probe recursive struct via Vec indirection.
+struct Value {
+    tag<Int>,
+    sval<String>,
+    nval<Float>,
+    objk<Vec<String>>,
+    objv<Vec<Value>>,
+    arr<Vec<Value>>
+}
+
+mk(s<String>)<Value> -> {
+    return Value { tag = 3, sval = s, nval = 0.0, objk = Vec(), objv = Vec(), arr = Vec() }
+}
+
+walk(v<Value>, depth<Int>)<Int> -> {
+    if (depth > 3) { return 0 }
+    if (v.tag == 3) { println(v.sval) }
+    if (v.tag == 1) {
+        i<Int> = 0
+        for (i in 0..v.objv.len() - 1) {
+            println(" key=")
+            println(v.objk.get(i))
+            walk(v.objv.get(i), depth + 1)
+        }
+    }
+    return 0
+}
+
+main()<Int> -> {
+    c<Value> = mk("child")
+    p<Value> = Value { tag = 1, sval = "", nval = 0.0, objk = Vec(), objv = Vec(), arr = Vec() }
+    p.objk.push("a")
+    p.objv.push(c)
+    walk(p, 0)
+    println("RECURSIVE_OK")
+    return 0
+}

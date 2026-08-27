@@ -1,0 +1,14 @@
+// Minimal: does a struct containing Vec<Value> (recursive) even compile/run?
+struct Value {
+    tag<Int>,
+    arr<Vec<Value>>
+}
+
+main()<Int> -> {
+    v<Value> = Value { tag = 0, arr = Vec() }
+    c<Value> = Value { tag = 0, arr = Vec() }
+    v.arr.push(c)
+    println("PUSHED")
+    println_int(v.arr.len())
+    return 0
+}
