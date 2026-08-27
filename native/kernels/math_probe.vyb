@@ -1,0 +1,13 @@
+// Verify native Vyb transcendentals (vexp/vsin/vcos) on the GPU vs host libm.
+// One thread per test input; out layout per input i (f64 words):
+//   [3i+0]=vexp(x[i])  [3i+1]=vsin(x[i])  [3i+2]=vcos(x[i])
+import vmath::{vexp, vsin, vcos}
+mathprobe(x<Int>, out<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f64(x + gid * 8)
+        st_f64(out + (gid * 3 + 0) * 8, vexp(v))
+        st_f64(out + (gid * 3 + 1) * 8, vsin(v))
+        st_f64(out + (gid * 3 + 2) * 8, vcos(v))
+    }
+}

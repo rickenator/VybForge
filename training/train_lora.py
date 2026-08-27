@@ -36,7 +36,7 @@ def main() -> None:
     dataset = dataset.map(render)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        device_map='auto',
+        device_map={"": 0},   # single-GPU QLoRA: avoid 'auto' splitting cpu/cuda
         torch_dtype=torch.bfloat16,
         quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type='nf4'),
         trust_remote_code=True,

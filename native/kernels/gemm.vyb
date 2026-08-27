@@ -1,0 +1,39 @@
+// Reusable fp64 GEMM kernel: C = alpha*A@B + beta*C, row-major.
+//   A[M,K], B[K,N], C[M,N]. One thread per output element, 1-D grid over M*N.
+//   Launch via the params-buffer pattern (cuda_launch4i passes ONE base ptr):
+//   PARAMS (device, 64 B, all 64-bit words):
+//     +0  A ptr (Int)
+//     +8  B ptr
+//     +16 C ptr
+//     +24 M
+//     +32 N
+//     +40 K
+//     +48 alpha (Float)
+//     +56 beta  (Float)
+// NOTE: kernel mode is capped at 4 Int args to cuda_launch4i, so every tensor
+// pointer and dimension is read from this packing, not from kernel params.
+gemm(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    alpha<Float> = ld_f64(p + 48)
+    beta<Float> = ld_f64(p + 56)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        m<Int> = gid / N
+        n<Int> = gid % N
+        acc<Float> = 0.0
+        kk<Int> = 0
+        for (kk in 0..K - 1) {
+            av<Float> = ld_f64(A + (m * K + kk) * 8)
+            bv<Float> = ld_f64(B + (kk * N + n) * 8)
+            acc = acc + av * bv
+        }
+        cval<Float> = ld_f64(C + (m * N + n) * 8)
+        st_f64(C + (m * N + n) * 8, alpha * acc + beta * cval)
+    }
+}

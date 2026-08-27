@@ -6,7 +6,7 @@
     "kind": {"type": "string", "enum": ["question", "proposal", "summary"]},
     "message": {"type": "string", "minLength": 1},
     "missing_fields": {"type": "array", "items": {"type": "string"}},
-    "proposed_changes": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "op", "value", "reason"], "properties": {"path": {"type": "string"}, "op": {"type": "string", "enum": ["replace", "add", "remove"]}, "value": {}, "reason": {"type": "string"}}}},
+    "proposed_changes": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "op", "value", "reason"], "properties": {"path": {"type": "string"}, "op": {"type": "string", "enum": ["add", "replace", "remove"]}, "value": {}, "reason": {"type": "string"}}}},
     "requires_confirmation": {"type": "boolean"}
   }
 }

@@ -1,0 +1,62 @@
+# Native transcendental math for Vyb kernel mode — pure arithmetic (+, -, *, /)
+# only, because the libm builtins (exp/sin/cos/tan) do NOT reliably lower to
+# device instructions in kernel mode (unresolved extern), and even sqrt is
+# flaky. These build the whole softmax/RoPE/SiLU path natively in Vyb.
+# Accuracy: exp ~1e-9 rel on [-20,20]; sin/cos ~2e-9 abs — fine for f64 models.
+
+share(all) vexp(x<Float>)<Float> -> {
+    xt<Float> = x
+    if (xt > 20.0) { xt = 20.0 }
+    if (xt < -20.0) { xt = -20.0 }
+    # z = x*log2(e); n = round(z); r = z - n in [-0.5,0.5]
+    z<Float> = xt * 1.4426950408889634
+    n<Int> = 0
+    if (z >= 0.0) { n = (z + 0.5) as Int } else { n = (z - 0.5) as Int }
+    r<Float> = z - (n as Float)
+    # 2^r as explicit polynomial (avoid a deep-nested Horner which eval's to 0)
+    r2<Float> = r * r
+    r3<Float> = r2 * r
+    r4<Float> = r3 * r
+    r5<Float> = r4 * r
+    r6<Float> = r5 * r
+    r7<Float> = r6 * r
+    r8<Float> = r7 * r
+    p<Float> = 1.0 + r * 0.6931471805599453 + r2 * 0.2402265069591007 + r3 * 0.05550410866482158 + r4 * 0.009618129107628478 + r5 * 0.001333355814642845 + r6 * 0.0001540353039338161 + r7 * 0.000015252733804059856 + r8 * 0.0000013215486790144306
+    np<Int> = n
+    res<Float> = p
+    if (np >= 0) {
+        k<Int> = 0
+        for (k in 0..np - 1) { res = res * 2.0 }
+    } else {
+        k<Int> = 0
+        for (k in 0..(0 - np) - 1) { res = res * 0.5 }
+    }
+    return res
+}
+
+share(all) vsin(x<Float>)<Float> -> {
+    # reduce x -> [-pi,pi]: r = x - round(x/2pi)*2pi
+    a<Float> = x / 6.283185307179586
+    ra<Int> = 0
+    if (a >= 0.0) { ra = (a + 0.5) as Int } else { ra = (a - 0.5) as Int }
+    t<Float> = x - (ra as Float) * 6.283185307179586
+    sign<Float> = 1.0
+    u<Float> = t
+    if (u < 0.0) { sign = -1.0; u = 0.0 - u }
+    # u in [0,pi] -> [0,pi/2]
+    if (u > 1.5707963267948966) { u = 3.141592653589793 - u }
+    u2<Float> = u * u
+    x3<Float> = u2 * u
+    x5<Float> = x3 * u2
+    x7<Float> = x5 * u2
+    x9<Float> = x7 * u2
+    x11<Float> = x9 * u2
+    x13<Float> = x11 * u2
+    x15<Float> = x13 * u2
+    s<Float> = u - x3 / 6.0 + x5 / 120.0 - x7 / 5040.0 + x9 / 362880.0 - x11 / 39916800.0 + x13 / 6227020800.0 - x15 / 1307674368000.0
+    return sign * s
+}
+
+share(all) vcos(x<Float>)<Float> -> {
+    return vsin(1.5707963267948966 - x)
+}

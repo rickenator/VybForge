@@ -1,0 +1,142 @@
+// Verify Vyb-native transcendentals on the GPU vs host libm (as reference).
+import io::{open_read, read_all}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    N<Int> = 128
+    # test values: sweep -25..25 plus RoPE-style angles (0..~65 rad with freqs)
+    xv<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..N - 1) {
+        xv.push(((i - 64) as Float) * 0.4)
+    }
+
+    # host reference (true libm)
+    we<Vec<Float>> = Vec()
+    ws<Vec<Float>> = Vec()
+    wc<Vec<Float>> = Vec()
+    i = 0
+    for (i in 0..N - 1) {
+        a<Float> = xv.get(i)
+        xc<Float> = a
+        if (xc > 20.0) { xc = 20.0 }
+        if (xc < -20.0) { xc = -20.0 }
+        we.push(exp(xc))
+        ws.push(sin(a))
+        wc.push(cos(a))
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/math_probe.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/math_probe.ptx")) { f -> { match (read_all(f)) { g -> { ptx2 = g } ? -> { return 20 } } } ? -> { return 20 } }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "mathprobe") != 0) { return 10 }
+
+        XD<Int> = 0
+        OD<Int> = 0
+        if (cuMemAlloc_v2(loc(XD), N * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(OD), N * 3 * 8) != 0) { return 11 }
+
+        i = 0
+        for (i in 0..N - 1) {
+            xd<Float> = xv.get(i)
+            if (cuMemcpyHtoD_v2(XD + i * 8, loc(xd), 8) != 0) { return 15 }
+        }
+
+        blocks<Int> = (N + 255) / 256
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), blocks, 1, 1, 256, 1, 1, XD, OD, N, 0)
+        if (rc != 0) { println("launch rc "); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        bade<Int> = 0
+        bads<Int> = 0
+        badc<Int> = 0
+        maxee<Float> = 0.0
+        maxse<Float> = 0.0
+        maxce<Float> = 0.0
+        i = 0
+        for (i in 0..N - 1) {
+            ev<Float> = 0.0
+            sv<Float> = 0.0
+            cv<Float> = 0.0
+            if (cuMemcpyDtoH_v2(loc(ev), OD + (i * 3 + 0) * 8, 8) != 0) { return 16 }
+            if (cuMemcpyDtoH_v2(loc(sv), OD + (i * 3 + 1) * 8, 8) != 0) { return 16 }
+            if (cuMemcpyDtoH_v2(loc(cv), OD + (i * 3 + 2) * 8, 8) != 0) { return 16 }
+            a<Float> = xv.get(i)
+            # exp: relative error
+            ex<Float> = we.get(i)
+            d<Float> = ev - ex
+            if (d < 0.0) { d = 0.0 - d }
+            rel<Float> = d / (1.0 + abs(ex))
+            if (rel > maxee) { maxee = rel }
+            if (rel > 0.00001) { bade = bade + 1 }
+            # sin/cos: absolute error
+            ds<Float> = sv - ws.get(i)
+            if (ds < 0.0) { ds = 0.0 - ds }
+            if (ds > maxse) { maxse = ds }
+            if (ds > 0.00001) { bads = bads + 1 }
+            dc<Float> = cv - wc.get(i)
+            if (dc < 0.0) { dc = 0.0 - dc }
+            if (dc > maxce) { maxce = dc }
+            if (dc > 0.00001) { badc = badc + 1 }
+        }
+
+        cuMemFree_v2(XD)
+        cuMemFree_v2(OD)
+
+        println("EXP bad=")
+        println_int(bade)
+        println(" maxRelErr=")
+        println(maxee.to_string())
+        println("SIN bad=")
+        println_int(bads)
+        println(" maxAbsErr=")
+        println(maxse.to_string())
+        println("COS bad=")
+        println_int(badc)
+        println(" maxAbsErr=")
+        println(maxce.to_string())
+        if (bade != 0 || bads != 0 || badc != 0) { return 1 }
+        println("VMATH_OK")
+        return 0
+    }
+}

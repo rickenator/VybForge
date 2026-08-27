@@ -75,7 +75,7 @@ Use this shape:
   "message": "Concise user-facing explanation.",
   "missing_fields": ["dotted.path"],
   "proposed_changes": [
-    {"path": "dotted.path", "value": "JSON value", "reason": "why"}
+    {"path": "dotted.path", "op": "add|replace|remove", "value": "JSON value", "reason": "why"}
   ],
   "requires_confirmation": true
 }

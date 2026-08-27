@@ -11,3 +11,5 @@ artifacts/*
 artifacts/vybos-configurator-lora/checkpoint-*/
 artifacts/vybos-configurator-lora/README.md
 artifacts/*.log
+# native GPU substrate build outputs
+native/build/

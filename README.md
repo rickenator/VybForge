@@ -1,21 +1,47 @@
 # VybAIConf
 
 VybAIConf is a schema-guided configuration interviewer for VybOS. It ships a
-portable Vyb executable for local Ollama, a backend-neutral Python launcher,
-and source for reproducing a small Qwen3-4B LoRA adapter that follows the same
-review-first JSON contract.
+deterministic JSON → `.vyb` applier (the backbone), a portable Vyb executable
+for local Ollama, a backend-neutral Python launcher, and source for reproducing
+a small Qwen3-4B LoRA adapter that follows the same review-first JSON contract.
 
 It drafts desired state only. It never builds, realizes, activates, deploys,
 or modifies VybOS or the host.
 
+## The deterministic backbone (AI is optional)
+
+An LLM is **not strictly required** to configure VybOS. The core pipeline is:
+
+```
+config/default-state.json   (a known-good SystemSpec baseline)
+        + confirmed interviewer proposed_changes  ({path, op, value, reason})
+        ── tools/apply.vyb (Vyb 0.7.3, runs locally) ──>
+        out/spec.json    (validated, merged machine contract)
+        out/system.vyb   (a self-contained config-as-program that reproduces it)
+```
+
+`tools/apply.vyb` validates each patch against the contract (path/op/value),
+merges add/replace/remove operations onto the baseline, and — via
+`tools/apply_interview.py` — writes `out/spec.json` + `out/system.vyb`, then
+compiles and runs the rendered program to prove it reproduces the spec. The
+schema, generator, Vyb client, and applier all share one contract:
+`{path, op: add|replace|remove, value, reason}` targeting
+`system | hostname | pkgs | services` (the real VybOS `SystemSpec` shape).
+
+```sh
+VYB_BIN="$HOME/Projects/Vyb-vybos/build/vyb" ./tools/apply_interview.py patches.jsonl
+```
+
 ## Included
 
+- `tools/apply.vyb` + `tools/apply_interview.py` — deterministic desired-state
+  applier (Vyb core, Python plumbing).
 - `src/main.vyb` — portable Linux Vyb client for local Ollama.
-- `config/` — complete mock-system and response schemas.
+- `config/` — default-state (real SystemSpec baseline) and response schemas.
 - `data/` — deterministic VybOS seed corpus: 216 train / 24 eval records.
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
-  rules.
-- The final 66 MB LoRA adapter and tokenizer are committed directly under
+  rules. Retrained/inferred on godzilla's RTX 3090.
+- The final LoRA adapter and tokenizer are committed directly under
   `artifacts/vybos-configurator-lora/`. The much larger public base model is
   pulled from Hugging Face when training or using the adapter.
 

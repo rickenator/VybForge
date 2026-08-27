@@ -1,0 +1,142 @@
+// RMSNorm host driver: fills X,W, launches rmsnorm, reads Y back and verifies
+// every element against an in-Vyb CPU reference. No Python in the check.
+import io::{open_read, read_all}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    S<Int> = 5
+    D<Int> = 16
+    eps<Float> = 0.000001
+
+    x<Vec<Float>> = Vec()
+    p<Int> = 0
+    for (p in 0..S * D - 1) {
+        x.push(((p * 37 + 11) % 1000) / 50.0 - 3.0)
+    }
+    w<Vec<Float>> = Vec()
+    p = 0
+    for (p in 0..D - 1) {
+        w.push(0.5 + ((p * 7) % 100) / 200.0)
+    }
+
+    # CPU reference
+    yref<Vec<Float>> = Vec()
+    s<Int> = 0
+    for (s in 0..S - 1) {
+        m2<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            vv<Float> = x.get(s * D + j)
+            m2 = m2 + vv * vv
+        }
+        r<Float> = 1.0 / sqrt(m2 / (D as Float) + eps)
+        j = 0
+        for (j in 0..D - 1) {
+            yref.push(x.get(s * D + j) * r * w.get(j))
+        }
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/rmsnorm.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/rmsnorm.ptx")) { f -> { match (read_all(f)) { g -> { ptx2 = g } ? -> { return 20 } } } ? -> { return 20 } }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "rmsnorm") != 0) { return 10 }
+
+        XD<Int> = 0
+        WD<Int> = 0
+        YD<Int> = 0
+        PD<Int> = 0
+        if (cuMemAlloc_v2(loc(XD), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WD), D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(YD), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PD), 48) != 0) { return 11 }
+
+        i<Int> = 0
+        for (i in 0..S * D - 1) {
+            xv<Float> = x.get(i)
+            if (cuMemcpyHtoD_v2(XD + i * 8, loc(xv), 8) != 0) { return 15 }
+        }
+        i = 0
+        for (i in 0..D - 1) {
+            wv<Float> = w.get(i)
+            if (cuMemcpyHtoD_v2(WD + i * 8, loc(wv), 8) != 0) { return 15 }
+        }
+        if (cuMemcpyHtoD_v2(PD + 0, loc(XD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 8, loc(WD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 16, loc(YD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 24, loc(S), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 32, loc(D), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 40, loc(eps), 8) != 0) { return 15 }
+
+        total<Int> = S * D
+        blocks<Int> = (total + 255) / 256
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), blocks, 1, 1, 256, 1, 1, PD, 0, 0, 0)
+        if (rc != 0) { println("launch rc "); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        bad<Int> = 0
+        maxerr<Float> = 0.0
+        i = 0
+        for (i in 0..S * D - 1) {
+            rv<Float> = 0.0
+            if (cuMemcpyDtoH_v2(loc(rv), YD + i * 8, 8) != 0) { return 16 }
+            expv<Float> = yref.get(i)
+            d<Float> = rv - expv
+            if (d < 0.0) { d = 0.0 - d }
+            if (d > maxerr) { maxerr = d }
+            if (d > 0.000001) { bad = bad + 1 }
+        }
+
+        cuMemFree_v2(XD)
+        cuMemFree_v2(WD)
+        cuMemFree_v2(YD)
+        cuMemFree_v2(PD)
+
+        println("RMSNORM bad=")
+        println_int(bad)
+        println(" maxerr=")
+        println(maxerr.to_string())
+        if (bad != 0) { return 1 }
+        println("RMSNORM_OK")
+        return 0
+    }
+}

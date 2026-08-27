@@ -1,6 +1,13 @@
 # Emits deterministic chat-format JSONL training data for the VybOS
 # configurator. It contains no private host state and no model-generated text.
 # stdout only: redirect it to data/vybos-configurator-{train,eval}.jsonl.
+#
+# Proposed changes are REAL SystemSpec operations a deterministic VybOS applier
+# can merge onto config/default-state.json:
+#   system  -> replace "x86_64-linux" | "aarch64-linux"
+#   hostname-> replace <string>
+#   pkgs    -> add {name,version,source} | remove {name}
+#   services-> add {name,command}        | remove {name}
 
 json_escape(value<String>)<String> -> {
     out<String> = value.replace("\\", "\\\\")
@@ -11,7 +18,7 @@ json_escape(value<String>)<String> -> {
 }
 
 record(id<Int>, split<String>, topic<String>, user<String>, answer<String>)<String> -> {
-    system<String> = "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields, proposed_changes, and requires_confirmation. VybOS is a mid-stream Vyb-based declarative Linux project: distinguish implemented capabilities from plans; never claim host changes were applied."
+    system<String> = "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields, proposed_changes, and requires_confirmation. VybOS builds a machine from a minimal SystemSpec: system, hostname, pkgs, services. A default baseline is in config/default-state.json. Each proposed_changes item is {path, op, value, reason}; paths are system|hostname|pkgs|services and values must be schema-conformant so a deterministic applier can merge them. Distinguish implemented capabilities from plans; never claim host changes were applied."
     return "{\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(system) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user) + "\"},{\"role\":\"assistant\",\"content\":\"" + json_escape(answer) + "\"}],\"metadata\":{\"id\":\"vybos-" + id.to_string() + "\",\"split\":\"" + split + "\",\"topic\":\"" + topic + "\",\"source\":\"VybOS STATUS snapshot 2026-08-26\"}}"
 }
 
@@ -23,8 +30,8 @@ summary(message<String>)<String> -> {
     return "{\"kind\":\"summary\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[],\"proposed_changes\":[],\"requires_confirmation\":false}"
 }
 
-proposal(path<String>, value<String>, reason<String>)<String> -> {
-    return "{\"kind\":\"proposal\",\"message\":\"This is a desired-state proposal only; it will not build or apply anything.\",\"missing_fields\":[],\"proposed_changes\":[{\"path\":\"" + json_escape(path) + "\",\"value\":\"" + json_escape(value) + "\",\"reason\":\"" + json_escape(reason) + "\"}],\"requires_confirmation\":true}"
+proposal(op<String>, path<String>, value_js<String>, reason<String>)<String> -> {
+    return "{\"kind\":\"proposal\",\"message\":\"This is a desired-state proposal only; it will not build or apply anything.\",\"missing_fields\":[],\"proposed_changes\":[{\"path\":\"" + json_escape(path) + "\",\"op\":\"" + op + "\",\"value\":" + value_js + ",\"reason\":\"" + json_escape(reason) + "\"}],\"requires_confirmation\":true}"
 }
 
 target_for(n<Int>)<String> -> {
@@ -37,14 +44,21 @@ target_for(n<Int>)<String> -> {
     return "a rescue image with a serial console"
 }
 
-package_for(n<Int>)<String> -> {
+pkg_json(n<Int>)<String> -> {
     k<Int> = n % 6
-    if (k == 0) { return "openssh" }
-    if (k == 1) { return "vim" }
-    if (k == 2) { return "nginx" }
-    if (k == 3) { return "busybox" }
-    if (k == 4) { return "a derived Linux kernel" }
-    return "a derived QEMU runtime"
+    if (k == 0) { return "{\"name\":\"openssh\",\"version\":\"9.9p1\",\"source\":\"upstream\"}" }
+    if (k == 1) { return "{\"name\":\"vim\",\"version\":\"9.1\",\"source\":\"upstream\"}" }
+    if (k == 2) { return "{\"name\":\"nginx\",\"version\":\"1.26.2\",\"source\":\"upstream\"}" }
+    if (k == 3) { return "{\"name\":\"busybox\",\"version\":\"1.37.0\",\"source\":\"upstream\"}" }
+    if (k == 4) { return "{\"name\":\"linux\",\"version\":\"6.12.0\",\"source\":\"cdn.kernel.org\"}" }
+    return "{\"name\":\"qemu\",\"version\":\"9.1.0\",\"source\":\"upstream\"}"
+}
+
+svc_json(n<Int>)<String> -> {
+    k<Int> = n % 3
+    if (k == 0) { return "{\"name\":\"sshd\",\"command\":\"/usr/sbin/sshd -D\"}" }
+    if (k == 1) { return "{\"name\":\"nginx\",\"command\":\"nginx -g daemon off;\"}" }
+    return "{\"name\":\"getty\",\"command\":\"getty 0 tty1\"}"
 }
 
 main()<Int> -> {
@@ -52,8 +66,7 @@ main()<Int> -> {
     while (i < 240) {
         split<String> = if (i % 10 == 0) { "eval" } else { "train" }
         target<String> = target_for(i)
-        pkg<String> = package_for(i / 6)
-        variant<Int> = i % 6
+        variant<Int> = i % 8
         user<String> = ""
         answer<String> = ""
         topic<String> = ""
@@ -61,27 +74,35 @@ main()<Int> -> {
         if (variant == 0) {
             topic = "interview"
             user = "I want " + target + ". What should we decide first?"
-            answer = question("Which architecture and boot/runtime target must this configuration support? Existing VybOS proofs cover disposable rootfs and x86_64 QEMU; ARM64 needs an explicit target decision.", "system.target")
+            answer = question("Which architecture and boot/runtime target must this configuration support? Existing VybOS proofs cover disposable rootfs and x86_64 QEMU; ARM64 needs an explicit decision.", "system")
         } else if (variant == 1) {
             topic = "packages"
-            user = "Add " + pkg + " to " + target + "."
-            answer = proposal("packages." + pkg, "selected", "Package selection changes the desired closure and must be confirmed before deterministic planning.")
+            user = "Add a package to " + target + "."
+            answer = proposal("add", "pkgs", pkg_json(i / 6), "Adding a package changes the desired closure and must be confirmed before deterministic planning.")
         } else if (variant == 2) {
             topic = "current-capability"
             user = "Can VybOS already build a kernel and boot it in QEMU?"
-            answer = summary("Yes. The current project status records a derived Linux 6.6 kernel and a derived QEMU runtime that boot a VybOS rootfs to VYBOS_READY. This is a reproducible proof path, not authorization to modify the host.")
+            answer = summary("Yes. Current VybOS status records a derived Linux kernel and a derived QEMU runtime that boot a rootfs to VYBOS_READY. This is a reproducible proof path, not authorization to modify the host.")
         } else if (variant == 3) {
-            topic = "reproducibility"
-            user = "How should this configuration preserve reproducibility?"
-            answer = proposal("system.reproducibility.source_date_epoch", "required", "VybOS derivations use content-addressed inputs and SOURCE_DATE_EPOCH-style controls; record this as a policy before selecting build recipes.")
+            topic = "hostname"
+            user = "Name this " + target + " host."
+            answer = proposal("replace", "hostname", "\"vyb-appliance\"", "Hostname is part of the machine identity in the SystemSpec.")
         } else if (variant == 4) {
             topic = "safety"
             user = "Apply this configuration to the current machine now."
             answer = summary("I can draft and validate a desired state, but I will not apply it to a host. First choose the target, review the transition plan, and authorize a separate execution step.")
+        } else if (variant == 5) {
+            topic = "services"
+            user = "Enable a service on " + target + "."
+            answer = proposal("add", "services", svc_json(i / 6), "Enabling a service changes what runs and must be confirmed before deterministic planning.")
+        } else if (variant == 6) {
+            topic = "architecture"
+            user = "Make this target an ARM64 image instead of x86_64."
+            answer = proposal("replace", "system", "\"aarch64-linux\"", "Architecture is a SystemSpec field; changing it selects a different toolchain and kernel target.")
         } else {
-            topic = "milestone"
-            user = "Is " + target + " fully supported today?"
-            answer = summary("VybOS is mid-stream. Its composed SystemSpec, content-addressed realization, generations, rootfs, derived toolchain, derived kernel, and QEMU boot proof are implemented. Treat new hardware targets and production deployment policy as explicit configuration decisions until validated by deterministic VybOS tooling.")
+            topic = "removal"
+            user = "I no longer need interactive console access on " + target + "."
+            answer = proposal("remove", "services", "{\"name\":\"getty\"}", "Removing a service from the desired state reduces the enabled service set.")
         }
         println(record(i, split, topic, user, answer))
         i += 1

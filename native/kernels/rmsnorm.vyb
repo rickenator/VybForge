@@ -1,0 +1,42 @@
+// RMSNorm kernel: y[s][d] = x[s][d] * rmsinv(s) * w[d],
+//   rmsinv(s) = 1 / sqrt( mean_d(x[s][d]^2) + eps ).
+// Params buffer (device, 48 B): +0 X, +8 W, +16 Y, +24 S, +32 D, +40 eps(Float).
+// One thread per output element (grid over S*D); each thread computes the row
+// stat it needs (correct for small D; a proper block-reduction comes later).
+
+// Pure-arithmetic sqrt (Newton). The `sqrt` libm builtin does NOT reliably
+// lower to a device instruction in kernel mode (sometimes an unresolved extern),
+// so compute it from +,-,*,/ which always lower.
+vsqrt(x<Float>, iters<Int>)<Float> -> {
+    y<Float> = x
+    i<Int> = 0
+    for (i in 0..iters - 1) {
+        y = 0.5 * (y + x / y)
+    }
+    return y
+}
+
+rmsnorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            v<Float> = ld_f64(X + (s * D + j) * 8)
+            ss = ss + v * v
+        }
+        r<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+        wv<Float> = ld_f64(W + d * 8)
+        xv<Float> = ld_f64(X + (s * D + d) * 8)
+        st_f64(Y + (s * D + d) * 8, xv * r * wv)
+    }
+}

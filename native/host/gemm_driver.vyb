@@ -1,0 +1,156 @@
+// Host driver: compile via `make gemm` (runs `vyb --kernel`), then run this.
+// Builds A,B on the CPU, copies HtoD, launches the `gemm` kernel with a packed
+// device params buffer, reads C back and verifies EVERY element against a
+// CPU-computed reference computed HERE in Vyb — no Python in the check.
+import io::{open_read, read_all}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    M<Int> = 20
+    N<Int> = 16
+    K<Int> = 8
+    alpha<Float> = 1.0
+    beta<Float> = 0.0
+
+    # ---- host matrices (deterministic, non-trivial values) ----
+    a<Vec<Float>> = Vec()
+    p<Int> = 0
+    for (p in 0..M * K - 1) {
+        a.push(((p * 13 + 7) % 997) / 40.0 - 3.0)
+    }
+    b<Vec<Float>> = Vec()
+    p = 0
+    for (p in 0..K * N - 1) {
+        b.push(((p * 29 + 3) % 991) / 40.0 - 3.0)
+    }
+
+    # ---- CPU reference: Cref = alpha * A@B  (beta=0) ----
+    cref<Vec<Float>> = Vec()
+    m<Int> = 0
+    for (m in 0..M - 1) {
+        n<Int> = 0
+        for (n in 0..N - 1) {
+            s<Float> = 0.0
+            kk<Int> = 0
+            for (kk in 0..K - 1) {
+                s = s + a.get(m * K + kk) * b.get(kk * N + n)
+            }
+            cref.push(alpha * s)
+        }
+    }
+
+    # ---- CUDA setup ----
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/gemm.ptx")) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            # NO_BINARY_FOR_GPU-once gotcha: re-read into a FRESH string + reload
+            ptx2<String> = ""
+            match (open_read("native/build/gemm.ptx")) { f -> { match (read_all(f)) { s -> { ptx2 = s } ? -> { return 20 } } } ? -> { return 20 } }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "gemm") != 0) { return 10 }
+
+        AD<Int> = 0
+        BD<Int> = 0
+        CD<Int> = 0
+        PD<Int> = 0
+        if (cuMemAlloc_v2(loc(AD), M * K * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(BD), K * N * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(CD), M * N * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PD), 64) != 0) { return 11 }
+
+        # copy A,B host -> device (element by element, f64)
+        i<Int> = 0
+        for (i in 0..M * K - 1) {
+            av<Float> = a.get(i)
+            if (cuMemcpyHtoD_v2(AD + i * 8, loc(av), 8) != 0) { return 15 }
+        }
+        i = 0
+        for (i in 0..K * N - 1) {
+            bv<Float> = b.get(i)
+            if (cuMemcpyHtoD_v2(BD + i * 8, loc(bv), 8) != 0) { return 15 }
+        }
+
+        # pack params buffer (device): 6 Int words then 2 Float words
+        if (cuMemcpyHtoD_v2(PD + 0, loc(AD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 8, loc(BD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 16, loc(CD), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 24, loc(M), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 32, loc(N), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 40, loc(K), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 48, loc(alpha), 8) != 0) { return 15 }
+        if (cuMemcpyHtoD_v2(PD + 56, loc(beta), 8) != 0) { return 15 }
+
+        total<Int> = M * N
+        blocks<Int> = (total + 255) / 256
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), blocks, 1, 1, 256, 1, 1, PD, 0, 0, 0)
+        if (rc != 0) { println("launch rc "); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # read back + verify vs CPU reference (all in Vyb)
+        bad<Int> = 0
+        maxerr<Float> = 0.0
+        m = 0
+        for (m in 0..M - 1) {
+            n<Int> = 0
+            for (n in 0..N - 1) {
+                rv<Float> = 0.0
+                if (cuMemcpyDtoH_v2(loc(rv), CD + (m * N + n) * 8, 8) != 0) { return 16 }
+                exp<Float> = cref.get(m * N + n)
+                d<Float> = rv - exp
+                if (d < 0.0) { d = 0.0 - d }
+                if (d > maxerr) { maxerr = d }
+                if (d > 0.000001) { bad = bad + 1 }
+            }
+        }
+
+        cuMemFree_v2(AD)
+        cuMemFree_v2(BD)
+        cuMemFree_v2(CD)
+        cuMemFree_v2(PD)
+
+        println("GEMM bad=")
+        println_int(bad)
+        println(" maxerr=")
+        println(maxerr.to_string())
+        if (bad != 0) { return 1 }
+        println("GEMM_OK")
+        return 0
+    }
+}

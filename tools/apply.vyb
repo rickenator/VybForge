@@ -1,0 +1,203 @@
+# apply.vyb — deterministic VybOS desired-state applier (first pass).
+#
+# This is the JSON -> .vyb backbone: it validates a set of confirmed
+# interviewer patches against a baseline and renders both a machine-contract
+# spec (JSON) and a self-contained config-as-program (.vyb) that reproduces it.
+#
+# Inputs:
+#   env      APP_SYSTEM    baseline system field (from config/default-state.json)
+#   env      APP_HOSTNAME  baseline hostname field
+#   stdin    one compact JSON proposed_change per line ({path,op,value,reason}),
+#            terminated by an empty line
+#
+# Outputs (stdout), one section each:
+#   ISSUES::   (only if any validation issue -> exit 1)
+#   SPEC::     the merged, validated SystemSpec as JSON  -> out/spec.json
+#   PROGRAM::  a compilable system.vyb that reproduces SPEC when run
+#
+# Patch contract (matches config/agent-response.schema.json + prompts/system.md):
+#   system   -> op replace, value "x86_64-linux"|"aarch64-linux"
+#   hostname -> op replace, value <string>
+#   pkgs     -> op add {"name","version","source"} | op remove {"name"}
+#   services -> op add {"name","command"}           | op remove {"name"}
+#
+# NOTE: Vyb ranges are INCLUSIVE-upper; iterate 0..len-1 and guard empties.
+
+import env::{env_get}
+import term::{stdin_read_line}
+
+struct PkgL { name<String>, version<String>, source<String> }
+struct SvcL { name<String>, command<String> }
+struct Patch { path<String>, op<String>, payload<String>, reason<String> }
+
+// Read the (string) value of a JSON key from a compact object string.
+// NOTE: String::index_of takes ONLY the needle (no start offset), so we search
+// within suffixes of the string rather than from an offset.
+json_str(s<String>, key<String>)<String> -> {
+    needle<String> = "\"" + key + "\""
+    p<Int> = s.index_of(needle)
+    if (p < 0) { return "" }
+    tail<String> = s.substring(p + needle.len(), s.len())
+    colon<Int> = tail.index_of(":")
+    if (colon < 0) { return "" }
+    ac<String> = tail.substring(colon + 1, tail.len()).trim()
+    q<Int> = ac.index_of("\"")
+    inner<String> = ac.substring(q + 1, ac.len())
+    cr<Int> = inner.index_of("\"")
+    if (cr < 0) { return "" }
+    return inner.substring(0, cr)
+}
+
+// Extract the `"value":` payload: an object if it begins with '{', else the
+// unquoted string value.
+payload(s<String>)<String> -> {
+    p<Int> = s.index_of("\"value\":")
+    if (p < 0) { return "" }
+    tail<String> = s.substring(p + 8, s.len())
+    if (tail.len() == 0) { return "" }
+    if (tail.char_at(0) == 123) {   // '{'
+        e<Int> = tail.index_of("}")
+        if (e < 0) { return "" }
+        return tail.substring(0, e + 1)   // end-exclusive -> include the '}'
+    }
+    q<Int> = tail.index_of("\"")
+    inner<String> = tail.substring(q + 1, tail.len())
+    cr<Int> = inner.index_of("\"")
+    if (cr < 0) { return "" }
+    return inner.substring(0, cr)
+}
+
+parse_patch(line<String>)<Patch> -> {
+    return Patch { path = json_str(line, "path"), op = json_str(line, "op"),
+                   payload = payload(line), reason = json_str(line, "reason") }
+}
+
+pkg_index(ps<Vec<PkgL>>, name<String>)<Int> -> {
+    n<Int> = ps.len()
+    if (n > 0) {
+        for (i in 0..n-1) {
+            if (ps.get(i).name == name) { return i }
+        }
+    }
+    return -1
+}
+
+svc_index(ss<Vec<SvcL>>, name<String>)<Int> -> {
+    n<Int> = ss.len()
+    if (n > 0) {
+        for (i in 0..n-1) {
+            if (ss.get(i).name == name) { return i }
+        }
+    }
+    return -1
+}
+
+// ---- emits ----------------------------------------------------------------
+
+// spec_to_json builds the machine-contract JSON string (order stable).
+spec_to_json(system<String>, hostname<String>, pkgs<Vec<PkgL>>, svcs<Vec<SvcL>>)<String> -> {
+    out<String> = "{\"system\":\"" + system + "\",\"hostname\":\"" + hostname + "\",\"pkgs\":["
+    pn<Int> = pkgs.len()
+    if (pn > 0) {
+        for (i in 0..pn-1) {
+            if (i > 0) { out = out + "," }
+            p<PkgL> = pkgs.get(i)
+            out = out + "{\"name\":\"" + p.name + "\",\"version\":\"" + p.version + "\",\"source\":\"" + p.source + "\"}"
+        }
+    }
+    out = out + "],\"services\":["
+    sn<Int> = svcs.len()
+    if (sn > 0) {
+        for (i in 0..sn-1) {
+            if (i > 0) { out = out + "," }
+            s<SvcL> = svcs.get(i)
+            out = out + "{\"name\":\"" + s.name + "\",\"command\":\"" + s.command + "\"}"
+        }
+    }
+    return out + "]}"
+}
+
+// Vyb string-literal escaping so a rendered program's embedded JSON stays valid.
+escape_vyb(x<String>)<String> -> {
+    y<String> = x.replace("\\", "\\\\")
+    return y.replace("\"", "\\\"")
+}
+
+// render_program emits a self-contained Vyb config-as-program that yields the
+// same spec when evaluated: literal pkgs/services, printed as the contract.
+render_program(system<String>, hostname<String>, pkgs<Vec<PkgL>>, svcs<Vec<SvcL>>)<String> -> {
+    inner<String> = spec_to_json(system, hostname, pkgs, svcs)
+    out<String> = "// generated-system.vyb — deterministic desired state (rendered by tools/apply.vyb)\n"
+    out = out + "// This is config-as-program: evaluating it prints the machine-contract spec.\n"
+    out = out + "main()<Int> -> {\n"
+    out = out + "    println(\"" + escape_vyb(inner) + "\")\n"
+    out = out + "    return 0\n"
+    out = out + "}\n"
+    return out
+}
+
+main()<Int> -> {
+    system<String>  = env_get("APP_SYSTEM") else "x86_64-linux"
+    hostname<String> = env_get("APP_HOSTNAME") else "vybos-test"
+    pkgs<Vec<PkgL>>  = Vec()
+    svcs<Vec<SvcL>>  = Vec()
+    issues<Vec<String>> = Vec()
+
+    while (true) {
+        line<String> = stdin_read_line()
+        line = line.trim()
+        if (line.len() == 0) { break }
+        patch<Patch> = parse_patch(line)
+
+        if (patch.path == "system") {
+            if (patch.op == "replace") {
+                if (patch.payload.len() == 0) { issues.push("system.replace: missing architecture") }
+                else { system = patch.payload }
+            } else { issues.push("system: only replace is supported (got " + patch.op + ")") }
+        } else if (patch.path == "hostname") {
+            if (patch.op == "replace") {
+                if (patch.payload.len() == 0) { issues.push("hostname.replace: empty hostname") }
+                else { hostname = patch.payload }
+            } else { issues.push("hostname: only replace is supported (got " + patch.op + ")") }
+        } else if (patch.path == "pkgs") {
+            if (patch.op == "add") {
+                nm<String> = json_str(patch.payload, "name")
+                if (nm.len() == 0) { issues.push("pkgs.add: package object missing name") }
+                else if (pkg_index(pkgs, nm) >= 0) { issues.push("pkgs.add: duplicate package " + nm) }
+                else { pkgs.push(PkgL { name = nm, version = json_str(patch.payload, "version"), source = json_str(patch.payload, "source") }) }
+            } else if (patch.op == "remove") {
+                nm<String> = json_str(patch.payload, "name")
+                k<Int> = pkg_index(pkgs, nm)
+                if (k < 0) { issues.push("pkgs.remove: package not present " + nm) }
+                else { pkgs.remove_at(k) }
+            } else { issues.push("pkgs: expected add or remove (got " + patch.op + ")") }
+        } else if (patch.path == "services") {
+            if (patch.op == "add") {
+                nm<String> = json_str(patch.payload, "name")
+                if (nm.len() == 0) { issues.push("services.add: service object missing name") }
+                else if (svc_index(svcs, nm) >= 0) { issues.push("services.add: duplicate service " + nm) }
+                else { svcs.push(SvcL { name = nm, command = json_str(patch.payload, "command") }) }
+            } else if (patch.op == "remove") {
+                nm<String> = json_str(patch.payload, "name")
+                k<Int> = svc_index(svcs, nm)
+                if (k < 0) { issues.push("services.remove: service not present " + nm) }
+                else { svcs.remove_at(k) }
+            } else { issues.push("services: expected add or remove (got " + patch.op + ")") }
+        } else {
+            issues.push("unknown path: " + patch.path)
+        }
+    }
+
+    if (issues.len() > 0) {
+        println("ISSUES::")
+        ni<Int> = issues.len()
+        for (j in 0..ni-1) { println("  " + issues.get(j)) }
+        return 1
+    }
+
+    println("SPEC::")
+    println(spec_to_json(system, hostname, pkgs, svcs))
+    println("PROGRAM::")
+    println(render_program(system, hostname, pkgs, svcs))
+    return 0
+}
