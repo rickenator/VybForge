@@ -52,6 +52,66 @@ dump_int_vec(pth<String>, v<Vec<Int>>)<Int> -> {
     }
 }
 
+struct Tok { id<Int>, p<Float> }
+
+struct SampleSet { ids<Vec<Int>>, probs<Vec<Float>> }
+
+// temperature-softmax + top_k + top_p -> kept (id, prob) pairs in descending
+// prob order, renormalized over the kept set. Sorted via push+remove_at (no Vec
+// element writes). Deterministic; numpy replicates it exactly.
+filter_probs(lv<Vec<Float>>)<SampleSet> -> {
+    TV<Float> = 0.7
+    TK<Int> = 8
+    TP<Float> = 0.9
+    n<Int> = lv.len()
+    mx<Float> = -1000000000000000000000000000000.0
+    v<Int> = 0
+    for (v in 0..n - 1) {
+        tvx<Float> = lv.get(v) / TV
+        if (tvx > mx) { mx = tvx }
+    }
+    pr<Vec<Float>> = Vec()
+    ssum<Float> = 0.0
+    for (v in 0..n - 1) {
+        e<Float> = exp(lv.get(v) / TV - mx)
+        pr.push(e)
+        ssum = ssum + e
+    }
+    src<Vec<Tok>> = Vec()
+    for (v in 0..n - 1) { src.push(Tok { id = v, p = pr.get(v) / ssum }) }
+    # selection sort descending by probability (pop max into srt via remove_at)
+    srt<Vec<Tok>> = Vec()
+    while (src.len() > 0) {
+        bi<Int> = 0
+        j2<Int> = 1
+        while (j2 < src.len()) {
+            if (src.get(j2).p > src.get(bi).p) { bi = j2 }
+            j2 = j2 + 1
+        }
+        srt.push(src.get(bi))
+        src.remove_at(bi)
+    }
+    # kept = top TK, then nucleus prefix until cumulative >= TP
+    kept<Vec<Int>> = Vec()
+    kp<Vec<Float>> = Vec()
+    cum<Float> = 0.0
+    for (v in 0..n - 1) {
+        if (v < TK) {
+            if (cum < TP) {
+                kept.push(srt.get(v).id)
+                kp.push(srt.get(v).p)
+                cum = cum + srt.get(v).p
+            }
+        }
+    }
+    ksum<Float> = 0.0
+    z<Int> = 0
+    for (z in 0..kp.len() - 1) { ksum = ksum + kp.get(z) }
+    nrm<Vec<Float>> = Vec()
+    for (z in 0..kp.len() - 1) { nrm.push(kp.get(z) / ksum) }
+    return SampleSet { ids = kept, probs = nrm }
+}
+
 main()<Int> -> {
     D<Int> = 16
     V<Int> = 16
@@ -196,6 +256,8 @@ main()<Int> -> {
 
         af<Float> = 1.0
         bf<Float> = 0.0
+        prng<Int> = 12345
+        lgacc<Vec<Float>> = Vec()
         curIn<Int> = DR0
         nxtIn<Int> = DR1
         gen<Int> = 0
@@ -361,18 +423,29 @@ main()<Int> -> {
                 if (cuMemcpyDtoH_v2(loc(rv), curIn + ((M - 1) * D + i) * 8, 8) != 0) { return 16 }
                 hid.push(rv)
             }
-            best<Int> = 0
-            bl2<Float> = -1000000000000000000000000000000.0
+            lv<Vec<Float>> = Vec()
             vb<Int> = 0
             for (vb in 0..V - 1) {
                 lg<Float> = 0.0
                 d2<Int> = 0
-                for (d2 in 0..D - 1) {
-                    lg = lg + hid.get(d2) * lmh.get(d2 * V + vb)
-                }
-                if (lg > bl2) { bl2 = lg; best = vb }
+                for (d2 in 0..D - 1) { lg = lg + hid.get(d2) * lmh.get(d2 * V + vb) }
+                lv.push(lg)
+                lgacc.push(lg)
             }
-            toks.push(best)
+            ss<SampleSet> = filter_probs(lv)
+            prng = (prng * 1664525 + 1013904223) & 4294967295
+            uu<Float> = (prng as Float) / 4294967296.0
+            acc2<Float> = 0.0
+            picked<Int> = V - 1
+            found2<Int> = 0
+            vb = 0
+            for (vb in 0..ss.probs.len() - 1) {
+                acc2 = acc2 + ss.probs.get(vb)
+                if (found2 == 0) {
+                    if (uu <= acc2) { picked = ss.ids.get(vb); found2 = 1 }
+                }
+            }
+            toks.push(picked)
         }
         cuCtxSynchronize()
 
@@ -397,6 +470,7 @@ main()<Int> -> {
         if (dump_vec("native/out/wd.txt", wdv) != 0) { return 17 }
         if (dump_vec("native/out/freq.txt", freq) != 0) { return 17 }
         if (dump_int_vec("native/out/gen_tokens.txt", toks) != 0) { return 17 }
+        if (dump_vec("native/out/sample_logits.txt", lgacc) != 0) { return 17 }
 
         println("DECODE_DONE")
         return 0

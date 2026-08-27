@@ -23,12 +23,13 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | **Qwen3 BPE tokenizer** (real 151k vocab + merges, Qwen2 pre-tokenizer) | `tokenizer/tokenizer.vyb` | EXACT match 13/13 vs transformers (words, contractions, apostrophes, punctuation, whitespace) |
 | **Multi-layer stack** (L× weight-tied decoder, double-buffered) | `host/stack_driver.vyb` | `STACK_VERIFY: OK` at L=4 (~8e-7 rel vs numpy) |
 | **Greedy autoregressive decode** (embed→stack→lm_head→argmax, token loop) | `host/decode_driver.vyb` | `DECODE_VERIFY: OK` (generated ids == numpy) |
+| **Stochastic sampler** (temp + top_k + top_p + seeded LCG) | `sampler/sampler.vyb` | `SAMPLER_VERIFY: OK` (kept set/probs/12 draws exact vs numpy) |
 
-The single-layer forward is the handoff's **P0 go/no-go gate**; GGUF reader +
-Q4_0 dequant is **G-gguf-data**; **G-json**, **G-tokenizer**, and the
-**G-tensor decode machinery** (stack + greedy autoregressive) are done.
-Remaining: sampling variety (top_k/top_p), then **G-decode**
-(config-contract interview). See `ROADMAP.md` for phase status.
+The handoff **P0 go/no-go gate** (single layer) plus the **full vertical slice**
+(substrate → GGUF/JSON/tokenizer loaders → multi-layer stack → autoregressive
+decode → **stochastic sampling**) all run Vyb-native on the RTX 3090 and are
+reference-verified. Remaining: G-decode (config-contract emission) and polish
+(kernel-side embed/sample, tensor:: wrapper). See `ROADMAP.md`.
 
 ## Build & run
 

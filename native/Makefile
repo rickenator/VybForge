@@ -65,6 +65,9 @@ verify: $(PTX)
 	@echo "== GREEDY AUTOREGRESSIVE DECODE (numpy reference) =="
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
+	@echo "== STOCHASTIC SAMPLER (temp + top_k + top_p + LCG) =="
+	cd $(ROOT) && $(VYB) native/sampler/test_sampler.vyb --module-path native/sampler
+	cd $(ROOT) && python3 native/sampler/verify_sampler.py
 	@echo "== GGUF READER + Q4_0 DEQUANT ON-GPU =="
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	cd $(ROOT) && python3 native/gguf/verify_gguf.py

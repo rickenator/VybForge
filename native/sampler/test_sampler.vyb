@@ -1,0 +1,57 @@
+// Unit test for the stochastic sampler on a crafted spread of logits (so the
+// distribution is non-degenerate and the top_k/top_p/LCG path is exercised).
+// Prints kept ids, kept probs, and 12 LCG draws; verify_sampler.py checks exact.
+import sampler::{filter_probs, SampleSet}
+import io::{open_write, write_str, close}
+
+dump_f(pth<String>, s<String>)<Int> -> {
+    match (open_write(pth)) {
+        f -> { match (write_str(f, s)) { p -> { } ? -> { return 1 } } close(f); return 0 }
+        ? -> { return 1 }
+    }
+}
+
+main()<Int> -> {
+    lv<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..15) { lv.push((i as Float) * 1.5 - 10.0) }
+    ss<SampleSet> = filter_probs(lv)
+    outline<String> = ""
+    # kept ids
+    i = 0
+    for (i in 0..ss.ids.len() - 1) {
+        if (i > 0) { outline = outline + " " }
+        outline = outline + ss.ids.get(i).to_string()
+    }
+    outline = outline + "\n"
+    # kept probs
+    i = 0
+    for (i in 0..ss.probs.len() - 1) {
+        if (i > 0) { outline = outline + " " }
+        outline = outline + ss.probs.get(i).to_string()
+    }
+    outline = outline + "\n"
+    # 12 LCG draws
+    prng<Int> = 12345
+    d2<Int> = 0
+    for (d2 in 0..11) {
+        prng = (prng * 1664525 + 1013904223) & 4294967295
+        uu<Float> = (prng as Float) / 4294967296.0
+        acc2<Float> = 0.0
+        picked<Int> = ss.ids.get(ss.ids.len() - 1)
+        found2<Int> = 0
+        k<Int> = 0
+        for (k in 0..ss.probs.len() - 1) {
+            acc2 = acc2 + ss.probs.get(k)
+            if (found2 == 0) {
+                if (uu <= acc2) { picked = ss.ids.get(k); found2 = 1 }
+            }
+        }
+        if (d2 > 0) { outline = outline + " " }
+        outline = outline + picked.to_string()
+    }
+    outline = outline + "\n"
+    if (dump_f("native/out/sampler_out.txt", outline) != 0) { return 1 }
+    println("SAMPLER_TEST_DONE")
+    return 0
+}

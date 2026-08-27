@@ -27,15 +27,16 @@ Status legend: [x] done · [~] in progress · [ ] not started
       13/13** vs transformers on plain words, contractions, leading/trailing
       apostrophes, punctuation, and whitespace runs. Non-ASCII words still
       approximate (no Unicode-class regex in Vyb).
-- [~] **G-tensor** — tensor::/36-layer stack: **multi-layer stack done** (L×
-      weight-tied residual, `STACK_VERIFY: OK` at L=4, ~8e-7 rel) and **greedy
-      autoregressive decode done** (embed → stack → lm_head → argmax → append,
-      `DECODE_VERIFY: OK`, generated ids match numpy exactly). Remaining:
-      stochastic top_k/top_p sampling (seeded RNG) + a kernel-side embed, and
-      the tensor:: module wrapper.
+- [~] **G-tensor** — **complete for the vertical slice**: multi-layer stack
+      (`STACK_VERIFY: OK`), greedy autoregressive decode (`DECODE_VERIFY: OK`),
+      and **stochastic sampling** (temperature + top_k + top_p + seeded LCG;
+      `SAMPLER_VERIFY: OK` — kept set/probs/12 draws exact vs numpy). Remaining
+      polish: kernel-side embed/sample + the tensor:: module wrapper.
 - [ ] **G-decode** (final): schema-driven config-interview decode → emits
       `{path, op, value, reason}` SystemSpec JSON; verify byte-compatible with
-      the Python/Ollama path on a few interviews.
+      the Python/Ollama path on a few interviews. **VERTICAL SLICE otherwise
+      complete**: substrate → GGUF/JSON/tokenizer loaders → stack → decode →
+      stochastic sampling, all Vyb-native on-GPU and reference-verified.
 
 ## Serial dependency chain
 G-json → (independent) · G-tokenizer → (independent) · G-gguf-data →
