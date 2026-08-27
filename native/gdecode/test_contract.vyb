@@ -57,10 +57,12 @@ main()<Int> -> {
     if (emit_file("native/out/contract_proposal.json", ps) != 0) { return 3 }
     println("CONTRACT_EMITTED")
 
-    # NOTE: AgentResponse::from_string() round-trip of these emitted docs is
-    # deferred pending rickenator/Vyb#206 — from_string currently drops a
-    # Vec-of-struct field that follows an empty Vec<String> (an empty
-    # missing_fields breaks proposed_changes). Emission via to_string() is
-    # unaffected; schema validation is in native/gdecode/verify_contract.py.
+    # round-trip the emitted module-struct contract back through from_string
+    # (formerly blocked by rickenator/Vyb#206 — fixed at 9bada99).
+    back<AgentResponse> = AgentResponse::from_string(ps)
+    backjs<String> = doc_to_json(back)
+    println("ROUNDTRIP re-serialized=")
+    println(backjs)
+    if (backjs == ps) { println("ROUNDTRIP_OK") } else { println("ROUNDTRIP_DIFF") }
     return 0
 }

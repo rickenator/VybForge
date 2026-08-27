@@ -47,6 +47,10 @@ stack: $(ROOT)/native/build/layer.ptx
 tensor: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/rmsnorm.ptx
 	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
 
+gdecode:
+	cd $(ROOT) && $(VYB) native/gdecode/test_contract.vyb --module-path native/gdecode
+	cd $(ROOT) && python3 native/gdecode/verify_contract.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
