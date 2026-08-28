@@ -1,0 +1,35 @@
+// GGUF block_q6_K dequant kernel (Qwen3 attn_v / ffn_down / token_embd bodies),
+// ported from llama.cpp ggml-quants.c dequantize_row_q6_K.
+// block layout (210 B): ql[128]@0 (low 4 bits), qh[64]@128 (upper 2 bits),
+// scales[16] int8 @192, d f16 @208. 256 values/block, 2x 128 groups.
+q6kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        bb<Int> = q + block * 210
+        g<Int> = (gid % 256) / 128
+        yl<Int> = gid % 128
+        quad<Int> = yl / 32        # 0..3
+        l<Int> = yl % 32
+        is2<Int> = l / 16
+        sidx<Int> = g * 8 + is2 + quad * 2
+        qlbase<Int> = g * 64
+        qhbase<Int> = g * 32
+        qloff<Int> = qlbase + (quad % 2) * 32 + l
+        d<Float> = ld_f16(bb + 208)
+        sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)          # signed scale
+        qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
+        qhb<Int> = (ld_i8(bb + 128 + qhbase + l) as Int) & 255
+        nib<Int> = 0
+        if (quad < 2) { nib = qlb & 15 } else { nib = qlb >> 4 }
+        hib<Int> = 0
+        if (quad == 0) { hib = (qhb >> 0) & 3 }
+        if (quad == 1) { hib = (qhb >> 2) & 3 }
+        if (quad == 2) { hib = (qhb >> 4) & 3 }
+        if (quad == 3) { hib = (qhb >> 6) & 3 }
+        qs<Int> = (nib | (hib << 4)) - 32
+        sf<Float> = sc0 as Float
+        qf<Float> = qs as Float
+        st_f64(o + gid * 8, d * sf * qf)
+    }
+}

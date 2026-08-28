@@ -9,7 +9,7 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
@@ -55,6 +55,11 @@ q4k: $(ROOT)/native/build/q4k.ptx
 q4k-load: $(ROOT)/native/build/q4k.ptx
 	cd $(ROOT) && $(VYB) native/host/q4k_load_driver.vyb
 	cd $(ROOT) && python3 native/gguf/attnq_slice_verify.py
+
+# Phase-3 step 2: q6_K dequant (attn_v/ffn_down/token_embd bodies)
+q6k: $(ROOT)/native/build/q6k.ptx
+	cd $(ROOT) && $(VYB) native/host/q6k_load_driver.vyb
+	cd $(ROOT) && python3 native/gguf/q6k_verify.py
 
 stack: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb

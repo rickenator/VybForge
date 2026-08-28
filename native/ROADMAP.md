@@ -85,6 +85,10 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    2.1MB f32, `ATTNQ_SLICE_VERIFY: OK` bad=0, `make q4k-load`). Whole-model f64 ≈
    32GB > 24GB VRAM → per-tensor/per-layer expansion only (one Qwen3 layer ≈
    404MB f32).
+   **q6_K dequant — DONE** (attn_v / ffn_down / token_embd bodies):
+   `kernels/q6k.vyb`, streamed via read_at (`make q6k`), exact on a real `attn_v`
+   Q6_K slice (`Q6K_VERIFY: OK`, bad=0, maxerr ~5e-7). Quant set for a full
+   layer is now complete (Q4_K, Q6_K, F32).
 4. Real 1-layer forward vs llama.cpp/python reference.
 5. Full 36-layer decode → real text → contract.
 6. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
