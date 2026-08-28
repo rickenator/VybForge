@@ -73,7 +73,10 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    stdlib `io::read_at`, #207, to stream the header/info prefix of the live
    2.5 GB file). Vyb parse == llama.cpp gguf-py on all 398 tensors
    (name/shape/type/offset) + config (`GGUF_META_VERIFY: OK`, `make gguf-real`).
-2. Weights on-GPU + q4_K dequant (only q4_0 today).
+2. **Weights on-GPU + q4_K dequant — DONE** `native/kernels/q4k.vyb` (port of
+   llama.cpp `block_q4_K`/`get_scale_min_k4`; signed-byte masking gotcha). Exact
+   on a real model weight block vs llama.cpp formula (`Q4K_VERIFY: OK`, bad=0,
+   `make q4k`).
 3. Real 1-layer forward vs llama.cpp/python reference.
 4. Full 36-layer decode → real text → contract.
 5. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.

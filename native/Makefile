@@ -9,10 +9,10 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer deq
+KERNELS := gemm rmsnorm math_probe layer deq q4k
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf stack tensor decode gdecode clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
 
 all: verify
 
@@ -44,6 +44,11 @@ gguf:
 gguf-real:
 	cd $(ROOT) && $(VYB) native/gguf/read_real_meta.vyb
 	cd $(ROOT) && python3 native/gguf/verify_gguf_meta.py
+
+# Phase-2 swap-in: q4_K dequant kernel on a real model weight block
+q4k: $(ROOT)/native/build/q4k.ptx
+	cd $(ROOT) && $(VYB) native/host/q4k_driver.vyb
+	cd $(ROOT) && python3 native/gguf/q4k_verify.py
 
 stack: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb

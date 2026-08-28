@@ -1,0 +1,41 @@
+// GGUF block_q4_K dequant kernel (Q4_K_M model weights), ported faithfully from
+// llama.cpp ggml-quants.c dequantize_row_q4_K / get_scale_min_k4.
+// block layout (144 B): d f16 @0, dmin f16 @2, scales[12] @4, qs[128] @16.
+//   256 values/block; 8 groups of 32; group is: sc,m = 6-bit scale & min packed
+//   in scales[]; element uses low (is even) or high (is odd) 4-bit nibble of qs.
+// Thread = one output element (Float, 8 bytes). Launch via cuda_launch4i.
+q4kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        e<Int> = gid % 256
+        bb<Int> = q + block * 144
+        t<Int> = e / 64          # 0..3
+        qbase<Int> = t * 32
+        l<Int> = e % 32
+        half<Int> = (e / 32) % 2
+        is<Int> = t * 2 + half   # group 0..7
+        d<Float> = ld_f16(bb + 0)
+        min<Float> = ld_f16(bb + 2)
+        # get_scale_min_k4(is, scales, &sc, &m)  (mask bytes to unsigned 0..255)
+        sc<Int> = 0
+        m<Int> = 0
+        if (is < 4) {
+            sc = (ld_i8(bb + 4 + is) as Int) & 63
+            m = (ld_i8(bb + 4 + is + 4) as Int) & 63
+        } else {
+            a<Int> = (ld_i8(bb + 4 + is + 4) as Int) & 255
+            b<Int> = (ld_i8(bb + 4 + is - 4) as Int) & 255
+            c<Int> = (ld_i8(bb + 4 + is) as Int) & 255
+            sc = (a & 15) | ((b >> 6) << 4)
+            m = (a >> 4) | ((c >> 6) << 4)
+        }
+        bq<Int> = (ld_i8(bb + 16 + qbase + l) as Int) & 255
+        bqb<Int> = 0
+        if (half == 0) { bqb = bq & 15 } else { bqb = bq >> 4 }
+        scf<Float> = sc as Float
+        mf<Float> = m as Float
+        nbf<Float> = (bqb) as Float
+        st_f64(o + gid * 8, d * scf * nbf - min * mf)
+    }
+}
