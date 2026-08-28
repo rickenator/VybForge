@@ -79,12 +79,14 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    `make q4k`).
 3. **Streaming real-weight loader — DONE (issue #5 storage boundary)** —
    `host/q4k_load_driver.vyb` streams real Q4_K bytes via stdlib `read_at` (#207)
-   and bulk-dequants with `q4k` to an f32 device buffer; packed bytes stay
+   and bulk-dequants with `q4k` to a device buffer; packed bytes stay
    canonical, only the requested slice expands, packed vs expanded memory is
    reported. Verified on a 2048-block real `attn_q` slice (294KB packed →
-   2.1MB f32, `ATTNQ_SLICE_VERIFY: OK` bad=0, `make q4k-load`). Whole-model f64 ≈
+   4.2MB f64 output; the dequant kernels write f64, so that is the honest figure;
+   `ATTNQ_SLICE_VERIFY: OK` bad=0, `make q4k-load`). H2D upload is chunked
+   (8 bytes/CUDA call) and read_at length is checked. Whole-model f64 ≈
    32GB > 24GB VRAM → per-tensor/per-layer expansion only (one Qwen3 layer ≈
-   404MB f32).
+   404MB f32 / 808MB f64).
    **q6_K dequant — DONE** (attn_v / ffn_down / token_embd bodies):
    `kernels/q6k.vyb`, streamed via read_at (`make q6k`), exact on a real `attn_v`
    Q6_K slice (`Q6K_VERIFY: OK`, bad=0, maxerr ~5e-7). Quant set for a full

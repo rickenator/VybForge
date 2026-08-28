@@ -29,6 +29,7 @@ main()<Int> -> {
         f -> { match (read_at(f, ABSOFF, PBS)) { s -> { data = s } ? -> { return 12 } } close(f) }
         ? -> { return 12 }
     }
+    if (data.len() < PBS) { println("SHORT_READ got=" + data.len().to_string()); return 22 }
 
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
@@ -66,9 +67,24 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(qd), qdb) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(od), odb) != 0) { return 11 }
         pb<Int> = 0
-        for (pb in 0..PBS - 1) {
-            by<Int> = (data.char_at(pb) as Int) & 255
-            if (cuMemcpyHtoD_v2(qd + pb, loc(by), 1) != 0) { return 15 }
+        # bulk upload: 8 packed bytes per CUDA call
+        npb<Int> = PBS - (PBS % 8)
+        ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8
+            ch<Int> = 0
+            bj<Int> = 0
+            for (bj in 0..7) {
+                bv<Int> = (data.char_at(o8 + bj) as Int) & 255
+                ch = ch | (bv << (bj * 8))
+            }
+            if (cuMemcpyHtoD_v2(qd + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < PBS) {
+            by<Int> = (data.char_at(tj) as Int) & 255
+            if (cuMemcpyHtoD_v2(qd + tj, loc(by), 1) != 0) { return 15 }
+            tj = tj + 1
         }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), NB, 1, 1, 256, 1, 1, qd, od, ELC, 0)
         if (rc != 0) { println("launch rc "); println_int(rc); return 12 }
@@ -88,7 +104,7 @@ main()<Int> -> {
         }
         cuMemFree_v2(qd)
         cuMemFree_v2(od)
-        println("Q6K_LOAD_DONE packed=" + PBS.to_string() + " f32=" + (ELC * 4).to_string())
+        println("Q6K_LOAD_DONE packed=" + PBS.to_string() + " f64=" + (ELC * 8).to_string())
         return 0
     }
 }
