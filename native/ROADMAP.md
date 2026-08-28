@@ -77,10 +77,18 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    llama.cpp `block_q4_K`/`get_scale_min_k4`; signed-byte masking gotcha). Exact
    on a real model weight block vs llama.cpp formula (`Q4K_VERIFY: OK`, bad=0,
    `make q4k`).
-3. Real 1-layer forward vs llama.cpp/python reference.
-4. Full 36-layer decode → real text → contract.
-5. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
-6. Qwen3-8B dogfood (fetch).
+3. **Streaming real-weight loader — DONE (issue #5 storage boundary)** —
+   `host/q4k_load_driver.vyb` streams real Q4_K bytes via stdlib `read_at` (#207)
+   and bulk-dequants with `q4k` to an f32 device buffer; packed bytes stay
+   canonical, only the requested slice expands, packed vs expanded memory is
+   reported. Verified on a 2048-block real `attn_q` slice (294KB packed →
+   2.1MB f32, `ATTNQ_SLICE_VERIFY: OK` bad=0, `make q4k-load`). Whole-model f64 ≈
+   32GB > 24GB VRAM → per-tensor/per-layer expansion only (one Qwen3 layer ≈
+   404MB f32).
+4. Real 1-layer forward vs llama.cpp/python reference.
+5. Full 36-layer decode → real text → contract.
+6. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
+7. Qwen3-8B dogfood (fetch).
 Vyb-native **training** is a separate, later research-scale plan.
 
 ## Hard-won Vyb gotchas (see native/README.md for detail)

@@ -50,6 +50,12 @@ q4k: $(ROOT)/native/build/q4k.ptx
 	cd $(ROOT) && $(VYB) native/host/q4k_driver.vyb
 	cd $(ROOT) && python3 native/gguf/q4k_verify.py
 
+# Phase-3 swap-in (issue #5 storage boundary): stream real Q4_K weights via
+# read_at + bulk q4k dequant to f32, packed stays canonical, memory reported
+q4k-load: $(ROOT)/native/build/q4k.ptx
+	cd $(ROOT) && $(VYB) native/host/q4k_load_driver.vyb
+	cd $(ROOT) && python3 native/gguf/attnq_slice_verify.py
+
 stack: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/stack_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_stack.py

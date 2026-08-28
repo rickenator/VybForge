@@ -1,0 +1,107 @@
+// Phase 3 (per issue #5): stream real Q4_K tensor bytes from the live model via
+// io::read_at (#207), dequant in bulk with the q4k kernel to an f32 device
+// buffer (packed stays canonical; only this slice is expanded), read back, and
+// report packed vs expanded bytes + peak buffer use. Validated separately by
+// native/gguf/attnq_slice_verify.py.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    ABSOFF<Int> = 332415936          # blk.0.attn_q.weight data (Q4_K), abs offset
+    NB<Int> = 2048                   # blocks to load (each 144 B, 256 f32)
+    PBS<Int> = NB * 144
+    ELC<Int> = NB * 256
+
+    data<String> = ""
+    match (open_read("/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf")) {
+        f -> {
+            match (read_at(f, ABSOFF, PBS)) { s -> { data = s } ? -> { return 12 } }
+            close(f)
+        }
+        ? -> { return 12 }
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/q4k.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/q4k.ptx")) { f -> { match (read_all(f)) { g -> { ptx2 = g } ? -> { return 20 } } } ? -> { return 20 } }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "q4kdeq") != 0) { return 10 }
+
+        qd<Int> = 0
+        od<Int> = 0
+        qdb<Int> = PBS
+        odb<Int> = ELC * 8
+        if (cuMemAlloc_v2(loc(qd), qdb) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(od), odb) != 0) { return 11 }
+
+        pb<Int> = 0
+        for (pb in 0..PBS - 1) {
+            by<Int> = (data.char_at(pb) as Int) & 255
+            if (cuMemcpyHtoD_v2(qd + pb, loc(by), 1) != 0) { return 15 }
+        }
+
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), NB, 1, 1, 256, 1, 1, qd, od, ELC, 0)
+        if (rc != 0) { println("launch rc "); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        match (open_write("native/out/attnq_f32_slice.txt")) {
+            w -> {
+                i2<Int> = 0
+                for (i2 in 0..ELC - 1) {
+                    rv<Float> = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv), od + i2 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+
+        cuMemFree_v2(qd)
+        cuMemFree_v2(od)
+
+        println("LOAD_SLICE_DONE nb=" + NB.to_string())
+        println("PACKED_BYTES=" + PBS.to_string())
+        println("EXPANDED_F32_BYTES=" + (ELC * 4).to_string())
+        return 0
+    }
+}
