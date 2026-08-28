@@ -91,20 +91,50 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    `kernels/q6k.vyb`, streamed via read_at (`make q6k`), exact on a real `attn_v`
    Q6_K slice (`Q6K_VERIFY: OK`, bad=0, maxerr ~5e-7). Quant set for a full
    layer is now complete (Q4_K, Q6_K, F32).
-4. **Real 1-layer forward — IN PROGRESS.** One-layer weight budget (issue #5):
-   blk.0 = 11 tensors, packed 63.9MB → f32 403.7MB → f64 807.5MB (all fit).
-   **Qwen3 layer-0 semantics PINNED** (transformers modeling_qwen3 Qwen3Attention
+4. **Real 1-layer forward — DONE (layer-0 match gate passed).** One-layer weight
+   budget (issue #5): blk.0 = 11 tensors, packed 63.9MB → f32 403.7MB → f64
+   807.5MB (all fit). Qwen3 layer-0 semantics PINNED (transformers modeling_qwen3
    + real GGUF metadata): D=2560, H=32, KVH=8, HD=128, FF=9728, eps 1e-6,
    `qwen3.rope.freq_base=5e6`. Order: input_layernorm(D) → q/k/v proj →
-   **q_norm/k_norm = RMSNorm over HD post-projection** → RoPE (standard; base
+   **q_norm/k_norm = RMSNorm over HD post-projection** → RoPE (split-half; base
    5e6; identity at pos 0) → causal **GQA** attn (scaling=HD^-0.5, fp32 softmax)
-   → o_proj → +residual; then post_attention_layernorm(D) → SiLU(gate)⊗up ·
-   down → +residual. Weights are GGUF [in,out] row-major (dequant → reshape).
-   Staging: stream each tensor via read_at + bulk q4k/q6k dequant to f32/f64
-   buffers (norms F32). Kernels to build (against a python numpy reference using
-   real dequantized weights): qk_norm, rope, qkv GQA attention, siLU MLP.
-5. Full 36-layer decode → real text → contract.
-6. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
+   → o_proj → +residual; then post_attention_layernorm(D) → SiLU(gate)⊗up · down
+   → +residual. Weights are GGUF [in,out] row-major (dequant → reshape).
+   - `native/gguf/layer0_ref.py` numpy reference (verification-only): vectorized
+     full-tensor q4k/q6k dequant (bit-exact vs llama.cpp), implements the pinned
+     math for S=2 (tokens 0,1 → exercises nonzero-pos RoPE), writes the contract
+     text + `layer0_input.bin`/`layer0_invfreq.bin` (f64, read back by Vyb).
+   - `native/kernels/qwen3.vyb` — **qwen3rope** (split-half, base 5e6; k-index
+     fix: write `Kd+g2`, not `Kd+gid`) and **f32expand** (norm weights f32→f64).
+   - `native/host/layer0_driver.vyb` — tensor-index-wired (parses the tsv, no
+     hardcoded offsets): streams all 11 real blk.0 tensors via read_at, bulk
+     dequants Q4_K/Q6_K/F32→f64 on-GPU, runs the full layer reusing layer.vyb
+     gemm/rmsnorm/attn/silu/resid. Reports packed=63888384 / expanded_f64=
+     807446528. (4 module loads need a bounded retry — cuModuleLoadData is flaky;
+ filed rickenator/Vyb#209 (String→CString NUL hazard, intermittently
+ CUDA_ERROR_INVALID_PTX 218). NOTE: `&&` works fine in Vyb conditions — my
+ earlier attribution was wrong; the module-load sweep failure was #209.)
+   - `native/tools/verify_layer0.py` + `make layer0` gate: GPU out vs numpy ref
+     at tol 2e-3 → **LAYER0_MATCH: OK, maxrel ~5e-6, bad=0** (Phase-3 gate 4).
+5. Full 36-layer decode → real text → contract. **PREFILL fully DONE & VERIFIED**:
+   `native/gguf/prefill_ref.py` (numpy full-36 prefill) + `native/host/model_driver.vyb`
+   (per-layer staged loop, ping-pong, tied lm_head via `emb_dequant` chunked dequant
+   + `logits_slice` chunked kernel + `argmax_row`) → `make prefill` →
+   **PREFILL_HIDDEN_MATCH: OK (maxrel ~5e-6)** AND **PREFILL_TOP1_MATCH: OK
+   (31784, both tokens)**. The real Qwen3-4B next-token argmax is now correct
+   on-GPU, pure Vyb. NOTE: the earlier "launch-drop" (#210) was MY bug — a
+   `freedom{... return 0}` inside the chunk loop returned after chunk 0, so only
+   ~26 token_embd rows dequantized; fixed by returning only after the loop. #209
+   (cuModuleLoadData/CString) was a real compiler bug, fixed by Rick.
+   **DECODE (greedy autoregressive) FULLY DONE & VERIFIED**: `native/host/decode_driver.vyb`
+   keeps all 36 layers packed-resident, dequants per layer per step (handling MIXED
+   per-layer quant — attn_v/ffn_down are Q6_K on 0-3 & 31-35, Q4_K elsewhere) and loads
+   each layer's RMSNorm weights, runs the full 36-layer forward + tied lm_head argmax →
+   `make decode-real` → **DECODE_REAL_MATCH: OK** `[0,1,31784,73305,43790,1888,86805,31784]`
+   == numpy. Fixes: vexp NaN→1e14 loop clamp (native/kernels/vmath.vyb), per-layer mixed
+   quant offsets+kernels, per-layer norms, and a greedy re-embed bug in `decode_ref.py`
+   (was carrying hidden forward instead of re-embedding the full prefix).
+6. kv-cache decode (per-layer cached k/v) to stop recomputing the whole prefix.
 7. Qwen3-8B dogfood (fetch).
 Vyb-native **training** is a separate, later research-scale plan.
 
