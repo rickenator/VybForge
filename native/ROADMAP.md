@@ -89,7 +89,15 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    `kernels/q6k.vyb`, streamed via read_at (`make q6k`), exact on a real `attn_v`
    Q6_K slice (`Q6K_VERIFY: OK`, bad=0, maxerr ~5e-7). Quant set for a full
    layer is now complete (Q4_K, Q6_K, F32).
-4. Real 1-layer forward vs llama.cpp/python reference.
+4. **Real 1-layer forward — IN PROGRESS.** One-layer weight budget (issue #5):
+   blk.0 = 11 tensors, packed 63.9MB → f32 403.7MB → f64 807.5MB (all fit).
+   Staging plan: stream each tensor via read_at + bulk q4k/q6k dequant into an
+   f32/f64 device buffer (norms F32 direct). Then the Qwen3 layer kernels:
+   - qk_norm: RMSNorm over the 128-dim head (attn_q_norm / attn_k_norm)
+   - rope: Qwen3 rotary (pin exact scheme/freq from Qwen3 + llama.cpp before coding)
+   - qkv attention: GQA (32 Q / 8 KV), causal softmax, 4096 out
+   - mlp: SiLU(gate)⊗up → down; reuse gemm / rmsnorm / resid / gemm kernels
+   Reference: python layer-0 using real dequantized weights (verification-only).
 5. Full 36-layer decode → real text → contract.
 6. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
 7. Qwen3-8B dogfood (fetch).
