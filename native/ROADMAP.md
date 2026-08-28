@@ -91,13 +91,16 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    layer is now complete (Q4_K, Q6_K, F32).
 4. **Real 1-layer forward — IN PROGRESS.** One-layer weight budget (issue #5):
    blk.0 = 11 tensors, packed 63.9MB → f32 403.7MB → f64 807.5MB (all fit).
-   Staging plan: stream each tensor via read_at + bulk q4k/q6k dequant into an
-   f32/f64 device buffer (norms F32 direct). Then the Qwen3 layer kernels:
-   - qk_norm: RMSNorm over the 128-dim head (attn_q_norm / attn_k_norm)
-   - rope: Qwen3 rotary (pin exact scheme/freq from Qwen3 + llama.cpp before coding)
-   - qkv attention: GQA (32 Q / 8 KV), causal softmax, 4096 out
-   - mlp: SiLU(gate)⊗up → down; reuse gemm / rmsnorm / resid / gemm kernels
-   Reference: python layer-0 using real dequantized weights (verification-only).
+   **Qwen3 layer-0 semantics PINNED** (transformers modeling_qwen3 Qwen3Attention
+   + real GGUF metadata): D=2560, H=32, KVH=8, HD=128, FF=9728, eps 1e-6,
+   `qwen3.rope.freq_base=5e6`. Order: input_layernorm(D) → q/k/v proj →
+   **q_norm/k_norm = RMSNorm over HD post-projection** → RoPE (standard; base
+   5e6; identity at pos 0) → causal **GQA** attn (scaling=HD^-0.5, fp32 softmax)
+   → o_proj → +residual; then post_attention_layernorm(D) → SiLU(gate)⊗up ·
+   down → +residual. Weights are GGUF [in,out] row-major (dequant → reshape).
+   Staging: stream each tensor via read_at + bulk q4k/q6k dequant to f32/f64
+   buffers (norms F32). Kernels to build (against a python numpy reference using
+   real dequantized weights): qk_norm, rope, qkv GQA attention, siLU MLP.
 5. Full 36-layer decode → real text → contract.
 6. LoRA merge (r16; q/k/v/o/gate/up/down) → configurator behavior.
 7. Qwen3-8B dogfood (fetch).
