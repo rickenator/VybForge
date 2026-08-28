@@ -1,0 +1,26 @@
+// Standalone probe: what does Vyb's `(expr) as Int` produce for NaN / inf?
+main()<Int> -> {
+    nan<Float> = 0.0 / 0.0
+    inf<Float> = 1.0 / 0.0
+    ninf<Float> = 0.0 - inf
+    # vexp clamp logic minus loop; xt is the clamped input
+    xt<Float> = nan
+    if (xt > 20.0) { xt = 20.0 }
+    if (xt < -20.0) { xt = -20.0 }
+    z<Float> = xt * 1.4426950408889634
+    n<Int> = 0
+    if (z >= 0.0) { n = (z + 0.5) as Int } else { n = (z - 0.5) as Int }
+    println("nan->xt=" + xt.to_string() + " n=" + n.to_string())
+    xt = inf
+    if (xt > 20.0) { xt = 20.0 }
+    if (xt < -20.0) { xt = -20.0 }
+    z = xt * 1.4426950408889634
+    if (z >= 0.0) { n = (z + 0.5) as Int } else { n = (z - 0.5) as Int }
+    println("inf->xt=" + xt.to_string() + " n=" + n.to_string())
+    # the loop-count expression both vexp branches use:
+    np<Int> = n
+    hi<Int> = np     # for np>=0 branch: 0..np-1 -> len np
+    lo<Int> = 0 - np # for np<0 branch: 0..(0-np)-1 -> len 0-np
+    println("np=" + np.to_string() + " if-np>=0 len=" + hi.to_string() + " else-dep len=0-np=" + lo.to_string())
+    return 0
+}

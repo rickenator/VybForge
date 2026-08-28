@@ -12,6 +12,14 @@ share(all) vexp(x<Float>)<Float> -> {
     z<Float> = xt * 1.4426950408889634
     n<Int> = 0
     if (z >= 0.0) { n = (z + 0.5) as Int } else { n = (z - 0.5) as Int }
+    # Hard termination clamp: NaN bypasses both `xt>20` guards above (NaN compare
+    # is false), so `(NaN+0.5) as Int` yields a garbage ~1e14 count and the
+    # multiply-down loop below spins ~1e14 times -> GPU kernel hang. Finite xt in
+    # [-20,20] always gives n in [-29,29], so clamping to +/-2048 never alters a
+    # valid result; it only bounds runaway NaN/garbage loop counts.
+    np<Int> = n
+    if (np > 2048) { np = 2048 }
+    if (np < -2048) { np = -2048 }
     r<Float> = z - (n as Float)
     # 2^r as explicit polynomial (avoid a deep-nested Horner which eval's to 0)
     r2<Float> = r * r
@@ -22,7 +30,6 @@ share(all) vexp(x<Float>)<Float> -> {
     r7<Float> = r6 * r
     r8<Float> = r7 * r
     p<Float> = 1.0 + r * 0.6931471805599453 + r2 * 0.2402265069591007 + r3 * 0.05550410866482158 + r4 * 0.009618129107628478 + r5 * 0.001333355814642845 + r6 * 0.0001540353039338161 + r7 * 0.000015252733804059856 + r8 * 0.0000013215486790144306
-    np<Int> = n
     res<Float> = p
     if (np >= 0) {
         k<Int> = 0

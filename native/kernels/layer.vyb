@@ -28,7 +28,8 @@ gemm(p<Int>) -> {
             bv<Float> = ld_f64(B + (kk * N + nn) * 8)
             acc = acc + av * bv
         }
-        cval<Float> = ld_f64(C + (mm * N + nn) * 8)
+        cval<Float> = 0.0
+        if (beta != 0.0) { cval = ld_f64(C + (mm * N + nn) * 8) }
         st_f64(C + (mm * N + nn) * 8, alpha * acc + beta * cval)
     }
 }

@@ -79,6 +79,12 @@ decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
 
+# Real Qwen3-4B greedy decode: token stream == numpy decode_ref.py (decode_ids_ref.txt)
+decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/decode_ref.py
+	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
+	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="
@@ -116,3 +122,16 @@ verify: $(PTX)
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out
+
+# Phase-3 swap-in step 4: real Qwen3-4B blk.0 layer-0 forward vs numpy reference
+# (gate). Builds the layer/kernels + qwen3 kernel, runs the staged forward.
+layer0: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/layer0_ref.py
+	cd $(ROOT) && $(VYB) native/host/layer0_driver.vyb
+	cd $(ROOT) && .venv/bin/python native/tools/verify_layer0.py
+
+# Full-36-layer Qwen3-4B prefill + tied lm_head vs numpy reference (prefill gate)
+prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/prefill_ref.py
+	cd $(ROOT) && $(VYB) native/host/model_driver.vyb
+	cd $(ROOT) && .venv/bin/python native/tools/verify_prefill.py

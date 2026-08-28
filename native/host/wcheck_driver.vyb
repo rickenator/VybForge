@@ -1,0 +1,196 @@
+// Standalone weight-path check: verifies the mixed-quant packed layout +
+// per-layer dequant kernel dispatch reproduce numpy's weights for attn_v
+// (Q4_K on L4, Q6_K on L35) and ffn_down. Packs several layers contiguously
+// into one buffer at cumulative offsets (ov2/ov6), dequants with the per-layer
+// kernel, reads back first 6 f64. Compare native/gguf/wcheck_ref.py.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) { if ((s.char_at(i) as Int) == nd) { return i } }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0; i<Int> = frm
+    for (i in frm..endp - 1) { c<Int> = (s.char_at(i) as Int); if (c >= 48) { if (c <= 57) { a = a * 10 + (c - 48) } } }
+    return a
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1; seg<Int> = frm; i<Int> = frm
+    for (i in frm..endp - 1) { if ((s.char_at(i) as Int) == 120) { n = n * parse_u(s, seg, i); seg = i + 1 } }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) { if (nmv.get(i) == nm) { return i } }
+    return -1
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
+            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        return 0
+    }
+    return 0
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, pkb + off, dout, numel, 0)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+
+dump6(base<Int>, tag<String>)<Int> -> {
+    freedom {
+        rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
+        for (rj in 0..5) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8); acc = acc + rv.to_string() + " " }
+        println(tag + " -> " + acc)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    NLAYS<Int> = 36
+    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    TSV<String> = "native/out/qwen3_4b_tensors.tsv"
+    nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+    bff<String> = read_bin(TSV); ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                t2<Int> = strchr(bff, 9, t1 + 1); if (t2 < 0) { t2 = i }
+                nm<String> = bff.substring(st, t1)
+                keep<Int> = 0
+                if (nm.substring(0, 4) == "blk.") { keep = 1 }
+                if (keep == 1) {
+                    t3<Int> = strchr(bff, 9, t2 + 1); if (t3 < 0) { t3 = i }
+                    t4<Int> = strchr(bff, 9, t3 + 1); if (t4 < 0) { t4 = i }
+                    nmv.push(nm); tyv.push(parse_u(bff, t2 + 1, t3)); nlv.push(parse_numel(bff, t1 + 1, t2)); ofv.push(parse_u(bff, t3 + 1, t4))
+                }
+            }
+            st = i + 1
+        }
+    }
+    println("WCHECK_TSV=" + nmv.len().to_string())
+    ix<Int> = find_nm(nmv, "blk.0.attn_v.weight"); wv_nl<Int> = nlv.get(ix)
+    ix = find_nm(nmv, "blk.0.ffn_down.weight"); wd_nl<Int> = nlv.get(ix)
+
+    ov2<Vec<Int>> = Vec(); os2<Vec<Int>> = Vec()
+    ov6<Vec<Int>> = Vec(); os6<Vec<Int>> = Vec()
+    run2<Int> = 0; run6<Int> = 0; Lx<Int> = 0
+    for (Lx in 0..NLAYS - 1) {
+        t2<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_v.weight"))
+        sz2<Int> = 0; if (t2 == 12) { sz2 = wv_nl * 144 / 256 } else { sz2 = wv_nl * 210 / 256 }
+        ov2.push(run2); os2.push(sz2); run2 = run2 + sz2
+        t6<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_down.weight"))
+        sz6<Int> = 0; if (t6 == 12) { sz6 = wd_nl * 144 / 256 } else { sz6 = wd_nl * 210 / 256 }
+        ov6.push(run6); os6.push(sz6); run6 = run6 + sz6
+    }
+    println("WCHECK_OFFS L0 av_os=" + os2.get(0).to_string() + " fd_os=" + os6.get(0).to_string() + " | L4 av_os=" + os2.get(4).to_string() + " fd_os=" + os6.get(4).to_string() + " | L35 av_os=" + os2.get(35).to_string() + " fd_os=" + os6.get(35).to_string())
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        m4<loc<CVoid>> = from<loc<CVoid>>(0); m6<loc<CVoid>> = from<loc<CVoid>>(0)
+        rc4<CInt> = -1; t4<Int> = 0
+        for (t4 in 0..5) { if (rc4 != 0) { m4 = from<loc<CVoid>>(0); rc4 = cuModuleLoadData(loc(m4), read_bin("native/build/q4k.ptx")) } }
+        if (rc4 != 0) { println("MODLOAD_FAIL q4k"); return 9 }
+        rc6<CInt> = -1; t6<Int> = 0
+        for (t6 in 0..5) { if (rc6 != 0) { m6 = from<loc<CVoid>>(0); rc6 = cuModuleLoadData(loc(m6), read_bin("native/build/q6k.ptx")) } }
+        if (rc6 != 0) { println("MODLOAD_FAIL q6k"); return 9 }
+        q4fn<loc<CVoid>> = from<loc<CVoid>>(0); q6fn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4fn), m4, "q4kdeq") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6fn), m6, "q6kdeq") != 0) { return 10 }
+
+        PK2<Int> = 0; PK6<Int> = 0; WA<Int> = 0; WD<Int> = 0
+        if (cuMemAlloc_v2(loc(PK2), run2) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK6), run6) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WA), wv_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WD), wd_nl * 8) != 0) { return 11 }
+        # pack attn_v + ffn_down for layers 0,4,35 contiguously at ov2/ov6
+        UL<Int> = 0; ee<Int> = 0; UI<Int> = 0
+        for (UI in 0..2) {
+            Lc<Int> = 0
+            if (UI == 0) { Lc = 4 }
+            if (UI == 1) { Lc = 35 }
+            if (UI == 2) { Lc = 0 }
+            pd<String> = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + Lc.to_string() + ".attn_v.weight")), os2.get(Lc))
+            if (pd.len() < os2.get(Lc)) { println("SHORTED av L" + Lc.to_string()); return 66 }
+            freedom { ee = download(pd, PK2 + ov2.get(Lc), os2.get(Lc)) }
+            if (ee != 0) { return 66 }
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + Lc.to_string() + ".ffn_down.weight")), os6.get(Lc))
+            if (pd.len() < os6.get(Lc)) { println("SHORTED fd L" + Lc.to_string()); return 66 }
+            freedom { ee = download(pd, PK6 + ov6.get(Lc), os6.get(Lc)) }
+            if (ee != 0) { return 66 }
+        }
+        # dequant attn_v L4 (Q4) and L35 (Q6), ffn_down L4 (Q4) and L35 (Q6)
+        t2<Int> = tyv.get(find_nm(nmv, "blk.4.attn_v.weight")); q2<loc<CVoid>> = q4fn; if (t2 == 14) { q2 = q6fn }
+        e2<Int> = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, q2); if (e2 != 0) { println("D1"); return 70 }
+        t6b<Int> = tyv.get(find_nm(nmv, "blk.35.attn_v.weight")); q6b<loc<CVoid>> = q4fn; if (t6b == 14) { q6b = q6fn }
+        e2 = dequant_gpu(PK2, ov2.get(35), WA, wv_nl, q6b); if (e2 != 0) { println("D2"); return 70 }
+        cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L35 (@" + ov2.get(35).to_string() + ") ty" + t6b.to_string())
+        t2 = tyv.get(find_nm(nmv, "blk.4.attn_v.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
+        e2 = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, q2); if (e2 != 0) { println("D3"); return 70 }
+        cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L4 (@" + ov2.get(4).to_string() + ") ty" + t2.to_string())
+        e2 = dequant_gpu(PK2, ov2.get(0), WA, wv_nl, q4fn); if (e2 != 0) { println("D4"); return 70 }
+        cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L0 (@" + ov2.get(0).to_string() + ") ty14")
+        # ffn_down
+        t2 = tyv.get(find_nm(nmv, "blk.35.ffn_down.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
+        e2 = dequant_gpu(PK6, ov6.get(35), WD, wd_nl, q2); if (e2 != 0) { println("D5"); return 70 }
+        cuCtxSynchronize(); dump6(WD, "WCHECK ffn_down L35 (@" + ov6.get(35).to_string() + ") ty" + t2.to_string())
+        t2 = tyv.get(find_nm(nmv, "blk.4.ffn_down.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
+        e2 = dequant_gpu(PK6, ov6.get(4), WD, wd_nl, q2); if (e2 != 0) { println("D6"); return 70 }
+        cuCtxSynchronize(); dump6(WD, "WCHECK ffn_down L4 (@" + ov6.get(4).to_string() + ") ty" + t2.to_string())
+        return 0
+    }
+    return 0
+}
