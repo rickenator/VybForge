@@ -258,6 +258,27 @@ addscaled(p<Int>) -> {
     }
 }
 
+// sub: dst[e] = a[e] - b[e] (elementwise, 4-arg). For the MSE gradient dy = h - t.
+sub(a<Int>, b<Int>, dst<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(dst + gid * 8, ld_f64(a + gid * 8) - ld_f64(b + gid * 8))
+    }
+}
+
+// scalec: dst[e] = c * src[e] (elementwise f64-c kernel, params). For gv = (alpha/r)*dy.
+// Params: +0 dst, +8 src, +16 c(f64), +24 n (32 bytes).
+scalec(p<Int>) -> {
+    D<Int> = ld_i64(p + 0)
+    Src<Int> = ld_i64(p + 8)
+    c<Float> = ld_f64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(D + gid * 8, c * ld_f64(Src + gid * 8))
+    }
+}
+
 // adamw: elementwise AdamW update of a trainable (LoRA) parameter from its gradient.
 //   m = b1 m + (1-b1) g ; v = b2 v + (1-b2) g^2
 //   p -= lr * ( mhat/(sqrt(vhat)+eps) + wd*p ),  mhat=m/(1-b1t), vhat=v/(1-b2t)
