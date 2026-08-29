@@ -122,6 +122,12 @@ bwd-attn: $(ROOT)/native/build/backprop.ptx
 	cd $(ROOT) && $(VYB) native/train/bwd5_probe.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_bwd5.py
 
+# T4 LoRA apply (gemmf + addscaled: h=x@W+alpha_r*(x@U@V)) + one AdamW step vs analytic.
+t4-lora: $(ROOT)/native/build/backprop.ptx
+	cd $(ROOT) && .venv/bin/python native/train/t4_ref.py
+	cd $(ROOT) && $(VYB) native/train/t4_probe.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_t4.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

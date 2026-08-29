@@ -217,6 +217,82 @@ zbuf(b<Int>, n<Int>) -> {
     if (gid < n) { st_f64(b + gid * 8, 0.0) }
 }
 
+// Forward GEMM (kept local to this module so LoRA apply + optimizer load one .ptx;
+// C = alpha A@B + beta C). Params: +0 A +8 B +16 C +24 M +32 N +40 K +48 alpha +56 beta.
+gemmf(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    alpha<Float> = ld_f64(p + 48)
+    beta<Float> = ld_f64(p + 56)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        acc<Float> = 0.0
+        kk<Int> = 0
+        for (kk in 0..K - 1) {
+            acc = acc + ld_f64(A + (mm * K + kk) * 8) * ld_f64(B + (kk * N + nn) * 8)
+        }
+        cv<Float> = 0.0
+        if (beta != 0.0) { cv = ld_f64(C + (mm * N + nn) * 8) }
+        st_f64(C + (mm * N + nn) * 8, alpha * acc + beta * cv)
+    }
+}
+
+// addscaled: a[e] += c * b[e] over n elements — the LoRA apply accumulator step
+// h = x@W + (alpha_r)*( (x@U) @ V ), adding alpha_r*extra into the base output.
+// Params: +0 a, +8 b, +16 c(f64), +24 n (32 bytes). 4-arg with f64 c via params.
+addscaled(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    c<Float> = ld_f64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(A + gid * 8, ld_f64(A + gid * 8) + c * ld_f64(B + gid * 8))
+    }
+}
+
+// adamw: elementwise AdamW update of a trainable (LoRA) parameter from its gradient.
+//   m = b1 m + (1-b1) g ; v = b2 v + (1-b2) g^2
+//   p -= lr * ( mhat/(sqrt(vhat)+eps) + wd*p ),  mhat=m/(1-b1t), vhat=v/(1-b2t)
+// (weight decay applied separately = AdamW). Params (96 bytes):
+//   +0 p, +8 g, +16 m, +24 v, +32 lr, +40 b1, +48 b2, +56 eps, +64 wd, +72 b1t, +80 b2t, +88 n.
+adamw(p<Int>) -> {
+    P<Int> = ld_i64(p + 0)
+    G<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    lr<Float> = ld_f64(p + 32)
+    b1<Float> = ld_f64(p + 40)
+    b2<Float> = ld_f64(p + 48)
+    eps<Float> = ld_f64(p + 56)
+    wd<Float> = ld_f64(p + 64)
+    b1t<Float> = ld_f64(p + 72)
+    b2t<Float> = ld_f64(p + 80)
+    n<Int> = ld_i64(p + 88)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(G + gid * 8)
+        mv<Float> = ld_f64(M + gid * 8)
+        vv<Float> = ld_f64(V + gid * 8)
+        mv2<Float> = b1 * mv + (1.0 - b1) * gv
+        vv2<Float> = b2 * vv + (1.0 - b2) * gv * gv
+        st_f64(M + gid * 8, mv2)
+        st_f64(V + gid * 8, vv2)
+        mhat<Float> = mv2 / (1.0 - b1t)
+        vhat<Float> = vv2 / (1.0 - b2t)
+        pv<Float> = ld_f64(P + gid * 8)
+        step<Float> = mhat / (vsqrt(vhat, 24) + eps) + wd * pv
+        st_f64(P + gid * 8, pv - lr * step)
+    }
+}
+
 // dAttention (causal, grouped-query, scaled-softmax) backward. One thread per (s,h).
 // Forward (query row s, head h, kvh=h/(H/KVH)): scores_t = scale*(q.k_t) for t<=s;
 // a_t=exp(sc_t-mx); w_t=a_t/ssum; ctx = sum_t w_t v_t.  Backward produces the grads of
