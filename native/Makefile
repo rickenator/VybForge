@@ -134,6 +134,12 @@ train-layer: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_layer.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer.py
 
+# M2c real blk.0 backward chain -> LoRA grads (7 projections) + dx, vs numpy oracle.
+train-layer-back: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_layer_back_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_layer_back.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer_back.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
