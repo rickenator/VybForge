@@ -54,7 +54,7 @@ dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
 
 main()<Int> -> {
     S<Int> = 3; IN<Int> = 4; R<Int> = 2; OUT<Int> = 3
-    NSTEP<Int> = 3
+    NSTEP<Int> = 5
     freedom {
         if (cuInit(0) != 0) { println("SKIP"); return 0 }
         var<CInt> ndev = 0
@@ -153,7 +153,6 @@ main()<Int> -> {
             cuMemcpyHtoD_v2(DGP+0, loc(s),8); cuMemcpyHtoD_v2(DGP+8, loc(gv),8); cuMemcpyHtoD_v2(DGP+16, loc(dV),8)
             cuMemcpyHtoD_v2(DGP+24, loc(S),8); cuMemcpyHtoD_v2(DGP+32, loc(R),8); cuMemcpyHtoD_v2(DGP+40, loc(OUT),8)
             cuda_launch4i(from<loc<CVoid>>(addr(rb)), (R*OUT+255)/256, 1,1, 256,1,1, DGP,0,0,0)     # dV = s^T gv
-            if (st == 2) { e = dumpf(dU, IN*R, "native/out/t5_dU_s2.txt"); if (e != 0) { return 62 } }
             # ---- AdamW on U then V (inline, like t4_probe) ----
             b1t = b1t * B1; b2t = b2t * B2
             cuMemcpyHtoD_v2(AU+0, loc(U),8); cuMemcpyHtoD_v2(AU+8, loc(dU),8); cuMemcpyHtoD_v2(AU+16, loc(mU),8); cuMemcpyHtoD_v2(AU+24, loc(vU),8)
@@ -165,12 +164,10 @@ main()<Int> -> {
             cuMemcpyHtoD_v2(AV+64, loc(WD),8); cuMemcpyHtoD_v2(AV+72, loc(b1t),8); cuMemcpyHtoD_v2(AV+80, loc(b2t),8); cuMemcpyHtoD_v2(AV+88, loc(R*OUT),8)
             cuda_launch4i(from<loc<CVoid>>(addr(aw)), (R*OUT+255)/256, 1,1, 256,1,1, AV,0,0,0)
             cuCtxSynchronize()
-            e = dumpf(vU, IN*R, "native/out/t5_vU_s1.txt"); if (e != 0) { return 66 }
             e = dumpf(U, IN*R, "native/out/t5_U_vyb_s" + st.to_string() + ".txt"); if (e != 0) { return 64 }
             e = dumpf(Vb, R*OUT, "native/out/t5_V_vyb_s" + st.to_string() + ".txt"); if (e != 0) { return 65 }
             st = st + 1
         }
-        e = dumpf(mU, IN*R, "native/out/t5_mU_final.txt"); if (e != 0) { return 60 }
         e = dumpf(U, IN*R, "native/out/t5_U_vyb.txt"); if (e != 0) { return 60 }
         e = dumpf(Vb, R*OUT, "native/out/t5_V_vyb.txt"); if (e != 0) { return 61 }
         println("T5_DRIVER_DONE")
