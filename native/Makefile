@@ -128,6 +128,12 @@ t4-lora: $(ROOT)/native/build/backprop.ptx
 	cd $(ROOT) && $(VYB) native/train/t4_probe.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_t4.py
 
+# M2b real blk.0 forward with LoRA on all 7 projections + activation cache, vs numpy.
+train-layer: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_layer_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_layer.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

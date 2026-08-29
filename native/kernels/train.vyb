@@ -633,3 +633,138 @@ dattn(p<Int>) -> {
     }
 }
 
+
+qwen3rope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    shd<Int> = S * H * HD
+    skd<Int> = S * KVH * HD
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * HD)
+            rem<Int> = gid % (H * HD)
+            hh<Int> = rem / HD
+            i<Int> = rem % HD
+            ang<Float> = ((POS + s) as Float) * ld_f64(FR + (i % half) * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            src<Int> = Q + (s * H * HD + hh * HD) * 8
+            v0<Float> = ld_f64(src + i * 8)
+            if (i < half) {
+                v1<Float> = ld_f64(src + (i + half) * 8)
+                st_f64(Qd + gid * 8, v0 * c - v1 * sn)
+            } else {
+                v1<Float> = ld_f64(src + (i - half) * 8)
+                st_f64(Qd + gid * 8, v0 * c + v1 * sn)
+            }
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * HD)
+            rem2<Int> = g2 % (KVH * HD)
+            hh2<Int> = rem2 / HD
+            i2<Int> = rem2 % HD
+            ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + (i2 % half) * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            src2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            v0<Float> = ld_f64(src2 + i2 * 8)
+            if (i2 < half) {
+                v1<Float> = ld_f64(src2 + (i2 + half) * 8)
+                st_f64(Kd + g2 * 8, v0 * c2 - v1 * sn2)
+            } else {
+                v1<Float> = ld_f64(src2 + (i2 - half) * 8)
+                st_f64(Kd + g2 * 8, v0 * c2 + v1 * sn2)
+            }
+        }
+    }
+}
+
+q4kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        e<Int> = gid % 256
+        bb<Int> = q + block * 144
+        t<Int> = e / 64          # 0..3
+        qbase<Int> = t * 32
+        l<Int> = e % 32
+        half<Int> = (e / 32) % 2
+        is<Int> = t * 2 + half   # group 0..7
+        d<Float> = ld_f16(bb + 0)
+        min<Float> = ld_f16(bb + 2)
+        # get_scale_min_k4(is, scales, &sc, &m)  (mask bytes to unsigned 0..255)
+        sc<Int> = 0
+        m<Int> = 0
+        if (is < 4) {
+            sc = (ld_i8(bb + 4 + is) as Int) & 63
+            m = (ld_i8(bb + 4 + is + 4) as Int) & 63
+        } else {
+            a<Int> = (ld_i8(bb + 4 + is + 4) as Int) & 255
+            b<Int> = (ld_i8(bb + 4 + is - 4) as Int) & 255
+            c<Int> = (ld_i8(bb + 4 + is) as Int) & 255
+            sc = (a & 15) | ((b >> 6) << 4)
+            m = (a >> 4) | ((c >> 6) << 4)
+        }
+        bq<Int> = (ld_i8(bb + 16 + qbase + l) as Int) & 255
+        bqb<Int> = 0
+        if (half == 0) { bqb = bq & 15 } else { bqb = bq >> 4 }
+        scf<Float> = sc as Float
+        mf<Float> = m as Float
+        nbf<Float> = (bqb) as Float
+        st_f64(o + gid * 8, d * scf * nbf - min * mf)
+    }
+}
+
+q6kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        bb<Int> = q + block * 210
+        g<Int> = (gid % 256) / 128
+        yl<Int> = gid % 128
+        quad<Int> = yl / 32        # 0..3
+        l<Int> = yl % 32
+        is2<Int> = l / 16
+        sidx<Int> = g * 8 + is2 + quad * 2
+        qlbase<Int> = g * 64
+        qhbase<Int> = g * 32
+        qloff<Int> = qlbase + (quad % 2) * 32 + l
+        d<Float> = ld_f16(bb + 208)
+        sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)          # signed scale
+        qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
+        qhb<Int> = (ld_i8(bb + 128 + qhbase + l) as Int) & 255
+        nib<Int> = 0
+        if (quad < 2) { nib = qlb & 15 } else { nib = qlb >> 4 }
+        hib<Int> = 0
+        if (quad == 0) { hib = (qhb >> 0) & 3 }
+        if (quad == 1) { hib = (qhb >> 2) & 3 }
+        if (quad == 2) { hib = (qhb >> 4) & 3 }
+        if (quad == 3) { hib = (qhb >> 6) & 3 }
+        qs<Int> = (nib | (hib << 4)) - 32
+        sf<Float> = sc0 as Float
+        qf<Float> = qs as Float
+        st_f64(o + gid * 8, d * sf * qf)
+    }
+}
+
+f32expand(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f32(src + gid * 4)
+        st_f64(dst + gid * 8, v)
+    }
+}
