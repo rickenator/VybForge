@@ -1,0 +1,39 @@
+// Backward (gradient) kernels for Vyb-native LoRA training. Consume the forward
+// activation cache; each is verified element-wise against a numpy reference.
+import vmath::{vexp}
+
+// dSiLU: given cached gate g and up u, and the upstream gradient dhu of hu =
+// silu(g)*u, produce dg and du (elementwise over n).
+// silu(x) = x*sigmoid(x); silu'(x) = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x)).
+// Params buffer: +0 g, +8 u, +16 dhu, +24 dg, +32 du, +40 n.
+dsilu(p<Int>) -> {
+    g<Int> = ld_i64(p + 0)
+    u<Int> = ld_i64(p + 8)
+    dhu<Int> = ld_i64(p + 16)
+    dg<Int> = ld_i64(p + 24)
+    du<Int> = ld_i64(p + 32)
+    n<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        dv<Float> = ld_f64(dhu + gid * 8)
+        s<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        silu<Float> = gv * s
+        om<Float> = 1.0 - s
+        silup<Float> = s + gv * s * om
+        st_f64(dg + gid * 8, dv * uv * silup)
+        st_f64(du + gid * 8, dv * silu)
+    }
+}
+
+// dresid: y = a + b; the upstream grad dy splits equally: da = db = dy (elementwise).
+// 4-arg: cuda_launch4i(f, dy, da, db, n).
+dresid(dy<Int>, da<Int>, db<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        vv<Float> = ld_f64(dy + gid * 8)
+        st_f64(da + gid * 8, vv)
+        st_f64(db + gid * 8, vv)
+    }
+}

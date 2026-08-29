@@ -1,0 +1,104 @@
+// T3.1 backward-kernel probe: dSiLU + dresid on synthetic data from the reference.
+// Reads native/out/bwd_{g,u,dhu,dy}.bin, launches the kernels, writes the grads to
+// native/out/bwd_{dg,du,da,db}.txt for the numpy verifier to compare.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
+            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        return 0
+    }
+    return 0
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
+    freedom {
+        match (open_write(path)) {
+            w -> {
+                rv<Float> = 0.0; k<Int> = 0
+                for (k in 0..count - 1) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), src + k * 8, 8); write_str(w, rv.to_string() + "\n") }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+    }
+    return 0
+}
+
+main()<Int> -> {
+    n<Int> = 1024
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0); rc<CInt> = -1; t4<Int> = 0
+        for (t4 in 0..5) { if (rc != 0) { m = from<loc<CVoid>>(0); rc = cuModuleLoadData(loc(m), read_bin("native/build/backprop.ptx")) } }
+        if (rc != 0) { println("MODLOAD_FAIL"); return 9 }
+        ds<loc<CVoid>> = from<loc<CVoid>>(0); dr<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(ds), m, "dsilu") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(dr), m, "dresid") != 0) { return 10 }
+
+        g<Int> = 0; u<Int> = 0; dhu<Int> = 0; dg<Int> = 0; du<Int> = 0; dy<Int> = 0; da<Int> = 0; db<Int> = 0; PB<Int> = 0
+        if (cuMemAlloc_v2(loc(g), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(u), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dhu), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dg), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(du), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dy), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(da), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(db), n*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PB), 48) != 0) { return 11 }
+
+        e<Int> = download(read_bin("native/out/bwd_g.bin"), g, n*8); if (e != 0) { return 20 }
+        e = download(read_bin("native/out/bwd_u.bin"), u, n*8); if (e != 0) { return 21 }
+        e = download(read_bin("native/out/bwd_dhu.bin"), dhu, n*8); if (e != 0) { return 22 }
+        e = download(read_bin("native/out/bwd_dy.bin"), dy, n*8); if (e != 0) { return 23 }
+
+        cuMemcpyHtoD_v2(PB + 0, loc(g), 8); cuMemcpyHtoD_v2(PB + 8, loc(u), 8); cuMemcpyHtoD_v2(PB + 16, loc(dhu), 8)
+        cuMemcpyHtoD_v2(PB + 24, loc(dg), 8); cuMemcpyHtoD_v2(PB + 32, loc(du), 8); cuMemcpyHtoD_v2(PB + 40, loc(n), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(ds)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(dr)), (n + 255) / 256, 1, 1, 256, 1, 1, dy, da, db, n)
+        cuCtxSynchronize()
+        e = dumpf(dg, n, "native/out/bwd_dg.txt"); if (e != 0) { return 30 }
+        e = dumpf(du, n, "native/out/bwd_du.txt"); if (e != 0) { return 31 }
+        e = dumpf(da, n, "native/out/bwd_da.txt"); if (e != 0) { return 32 }
+        e = dumpf(db, n, "native/out/bwd_db.txt"); if (e != 0) { return 33 }
+        println("BWD_PROBE_DONE")
+        return 0
+    }
+    return 0
+}

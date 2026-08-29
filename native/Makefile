@@ -9,7 +9,7 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
@@ -91,6 +91,12 @@ fwd-cache: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && .venv/bin/python native/train/train_fwd_ref.py
 	cd $(ROOT) && $(VYB) native/train/train_fwd.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_fwd.py
+
+# T3.1 backward kernels (dSiLU, dresid): synthetic inputs -> analytic vs kernel grads.
+bwd-probe: $(ROOT)/native/build/backprop.ptx
+	cd $(ROOT) && .venv/bin/python native/train/bwd_ref.py
+	cd $(ROOT) && $(VYB) native/train/bwd_probe.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_bwd.py
 
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
