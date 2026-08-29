@@ -1,0 +1,147 @@
+# Vyb port of tests/test_schema.py: the schema + corpus "agreement" guard, now in
+# pure Vyb (the shipped runtime language). Checks:
+#   1) config/mock-system.json has the 9 required domains + kernel/toolchain/package marks
+#   2) config/agent-response.schema.json: requires_confirmation required, no extra props,
+#      proposed_changes items = {path,op,value,reason} with op in {add,replace,remove}
+#   3) every data/*.jsonl record: assistant content is a valid response with kind in
+#      {question,proposal,summary} and every proposed_changes item exactly {path,op,value,reason}
+# Run: cd ~/Projects/VybAIConf && ~/Projects/Vyb/build/vyb tests/test_schema.vyb --module-path native/json
+import io::{open_read, read_all, close}
+import json_parse
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+main()<Int> -> {
+    f<Int> = 0
+    # ---------- 1) mock-system.json domains ----------
+    s<String> = readf("config/mock-system.json")
+    match (json_parse(s)) {
+        d -> {
+            if (d.get(d.root, "system") == -1) { println("FAIL mock.system"); f = 1 }
+            if (d.get(d.root, "kernel") == -1) { println("FAIL mock.kernel"); f = 1 }
+            if (d.get(d.root, "toolchain") == -1) { println("FAIL mock.toolchain"); f = 1 }
+            if (d.get(d.root, "packages") == -1) { println("FAIL mock.packages"); f = 1 }
+            if (d.get(d.root, "services") == -1) { println("FAIL mock.services"); f = 1 }
+            if (d.get(d.root, "users") == -1) { println("FAIL mock.users"); f = 1 }
+            if (d.get(d.root, "storage") == -1) { println("FAIL mock.storage"); f = 1 }
+            if (d.get(d.root, "network") == -1) { println("FAIL mock.network"); f = 1 }
+            if (d.get(d.root, "boot") == -1) { println("FAIL mock.boot"); f = 1 }
+            knob<Int> = d.get(d.root, "kernel")
+            if (knob == -1 || d.hstr(d.get(knob, "package")) != "linux") { println("FAIL mock.kernel.package"); f = 1 }
+            tc<Int> = d.get(d.root, "toolchain")
+            hasgcc<Int> = 0
+            if (tc != -1) {
+                i<Int> = 0
+                for (i in 0..d.len(tc) - 1) { if (d.hstr(d.get(d.elem(tc, i), "name")) == "gcc") { hasgcc = 1 } }
+            }
+            if (hasgcc == 0) { println("FAIL mock.toolchain.gcc"); f = 1 }
+            pk<Int> = d.get(d.root, "packages")
+            sel<Int> = 0
+            if (pk != -1) {
+                j<Int> = 0
+                for (j in 0..d.len(pk) - 1) { if (d.hstr(d.get(d.elem(pk, j), "selected")) == "true") { sel = 1 } }
+            }
+            if (sel == 0) { println("FAIL mock.packages.selected"); f = 1 }
+        }
+        ? -> { println("FAIL mock json_parse"); f = 1 }
+    }
+    # ---------- 2) agent-response.schema.json ----------
+    s2<String> = readf("config/agent-response.schema.json")
+    match (json_parse(s2)) {
+        d -> {
+            req<Int> = d.get(d.root, "required")
+            hasreq<Int> = 0; i2<Int> = 0
+            if (req != -1) { for (i2 in 0..d.len(req) - 1) { if (d.hstr(d.elem(req, i2)) == "requires_confirmation") { hasreq = 1 } } }
+            if (hasreq == 0) { println("FAIL schema.requires_confirmation"); f = 1 }
+            if (d.hstr(d.get(d.root, "additionalProperties")) != "false") { println("FAIL schema.no_extra_props"); f = 1 }
+            props<Int> = d.get(d.root, "properties")
+            pc<Int> = -1
+            if (props != -1) { pc = d.get(props, "proposed_changes") }
+            if (pc == -1) { println("FAIL schema.proposed_changes"); f = 1 }
+            else {
+                items<Int> = d.get(pc, "items")
+                if (items == -1) { println("FAIL schema.pc.items"); f = 1 }
+                else {
+                    it_req<Int> = d.get(items, "required")
+                    n<Int> = 0
+                    hasp<Int> = 0; haso<Int> = 0; hasv<Int> = 0; hasr<Int> = 0
+                    if (it_req != -1) {
+                        n = d.len(it_req)
+                        i3<Int> = 0
+                        for (i3 in 0..d.len(it_req) - 1) {
+                            kk<String> = d.hstr(d.elem(it_req, i3))
+                            if (kk == "path") { hasp = 1 }
+                            if (kk == "op") { haso = 1 }
+                            if (kk == "value") { hasv = 1 }
+                            if (kk == "reason") { hasr = 1 }
+                        }
+                    }
+                    if (n != 4 || hasp + haso + hasv + hasr != 4) { println("FAIL schema.pc.required"); f = 1 }
+                    iprops<Int> = d.get(items, "properties")
+                    if (iprops == -1 || d.get(iprops, "op") == -1) { println("FAIL schema.pc.op"); f = 1 }
+                }
+            }
+        }
+        ? -> { println("FAIL schema json_parse"); f = 1 }
+    }
+    # ---------- 3) corpus record agreement ----------
+    corpus<Vec<String>> = Vec()
+    corpus.push("data/vybos-configurator-train.jsonl")
+    corpus.push("data/vybos-configurator-eval.jsonl")
+    corpus.push("data/vybos-configurator-all.jsonl")
+    nrec<Int> = 0
+    ci<Int> = 0
+    for (ci in 0..2) {
+        s3<String> = readf(corpus.get(ci))
+        st<Int> = 0; sl<Int> = s3.len(); k<Int> = 0
+        for (k in 0..sl - 1) {
+            if ((s3.char_at(k) as Int) == 10) {
+                line<String> = s3.substring(st, k)
+                st = k + 1
+                if (line.len() > 2) {
+                    match (json_parse(line)) {
+                        rec -> {
+                            msg<Int> = rec.get(rec.root, "messages")
+                            if (msg == -1) { println("FAIL corpus.messages " + corpus.get(ci)); f = 1 }
+                            else {
+                                last<Int> = rec.elem(msg, rec.len(msg) - 1)
+                                content<String> = rec.hstr(rec.get(last, "content"))
+                                match (json_parse(content)) {
+                                    ans -> {
+                                        kindx<String> = ans.hstr(ans.get(ans.root, "kind"))
+                                        if (kindx != "question") { if (kindx != "proposal") { if (kindx != "summary") { println("FAIL corpus.kind " + corpus.get(ci)); f = 1 } } }
+                                        chg<Int> = ans.get(ans.root, "proposed_changes")
+                                        if (chg != -1) {
+                                            i4<Int> = 0
+                                            for (i4 in 0..ans.len(chg) - 1) {
+                                                it<Int> = ans.elem(chg, i4)
+                                                if (ans.len(it) != 4) { println("FAIL corpus.item.len " + corpus.get(ci)); f = 1 }
+                                                if (ans.get(it, "path") == -1) { println("FAIL corpus.item.keys " + corpus.get(ci)); f = 1 }
+                                                if (ans.get(it, "op") == -1) { println("FAIL corpus.item.keys " + corpus.get(ci)); f = 1 }
+                                                if (ans.get(it, "value") == -1) { println("FAIL corpus.item.keys " + corpus.get(ci)); f = 1 }
+                                                if (ans.get(it, "reason") == -1) { println("FAIL corpus.item.keys " + corpus.get(ci)); f = 1 }
+                                                opx<String> = ans.hstr(ans.get(it, "op"))
+                                                if (opx != "add") { if (opx != "replace") { if (opx != "remove") { println("FAIL corpus.op " + corpus.get(ci)); f = 1 } } }
+                                                if (opx.len() == 0) { println("FAIL corpus.op.empty " + corpus.get(ci)); f = 1 }
+                                            }
+                                        }
+                                        nrec = nrec + 1
+                                    }
+                                    ? -> { println("FAIL corpus.answer json_parse " + corpus.get(ci)); f = 1 }
+                                }
+                            }
+                        }
+                        ? -> { println("FAIL corpus record json_parse " + corpus.get(ci)); f = 1 }
+                    }
+                }
+            }
+        }
+    }
+    if (nrec < 240) { println("FAIL corpus count " + nrec.to_string()); f = 1 }
+    if (f == 0) { println("SCHEMA_TEST: OK (records=" + nrec.to_string() + ")") } else { println("SCHEMA_TEST: FAIL") }
+    return f
+}

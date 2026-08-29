@@ -75,6 +75,10 @@ gdecode:
 gdecode-pipeline:
 	cd $(ROOT) && ./native/gdecode/run_pipeline.sh
 
+# Vyb port of tests/test_schema.py (schema + corpus agreement guard) in the runtime language
+schemacheck:
+	cd $(ROOT) && $(VYB) tests/test_schema.vyb --module-path native/json
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
