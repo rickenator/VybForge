@@ -1,0 +1,635 @@
+// Combined kernel module for Vyb-native Qwen3 LoRA TRAINING: forward layer kernels
+// (layer.vyb) + training/backward kernels (backprop.vyb) in ONE .ptx (single-module rule).
+// Forward: gemm, rmsnorm, rope, attn, silu, resid, gemmf, addscaled, sub, scalec.
+// Backward: dsilu, dresid, dgemm_at/bt, drmsnorm, dnormw, drope, dattn. Optimizer: adamw. Clear: zbuf.
+import vmath::{vexp, vsin, vcos, vsqrt}
+
+gemm(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    alpha<Float> = ld_f64(p + 48)
+    beta<Float> = ld_f64(p + 56)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        acc<Float> = 0.0
+        kk<Int> = 0
+        for (kk in 0..K - 1) {
+            av<Float> = ld_f64(A + (mm * K + kk) * 8)
+            bv<Float> = ld_f64(B + (kk * N + nn) * 8)
+            acc = acc + av * bv
+        }
+        cval<Float> = 0.0
+        if (beta != 0.0) { cval = ld_f64(C + (mm * N + nn) * 8) }
+        st_f64(C + (mm * N + nn) * 8, alpha * acc + beta * cval)
+    }
+}
+
+// RMSNorm y[s][d] = x[s][d] * 1/sqrt(mean(rowsq)+eps) * w[d]. Small 48-B params.
+rmsnorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            v<Float> = ld_f64(X + (s * D + j) * 8)
+            ss = ss + v * v
+        }
+        r<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+        wv<Float> = ld_f64(W + d * 8)
+        xv<Float> = ld_f64(X + (s * D + d) * 8)
+        st_f64(Y + (s * D + d) * 8, xv * r * wv)
+    }
+}
+
+// RoPE in place on Q [S,H*HD] and K [S,KVH*HD].
+// Big PD offsets: +80 Q, +88 K, +176 FREQ, +184 S, +200 HD, +208 H, +216 KVH.
+rope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    half<Int> = HD / 2
+    shd<Int> = S * H * half
+    skd<Int> = S * KVH * half
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * half)
+            rem<Int> = gid % (H * half)
+            hh<Int> = rem / half
+            ii<Int> = rem % half
+            ang<Float> = (s as Float) * ld_f64(FR + ii * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            rbase<Int> = Q + (s * H * HD + hh * HD) * 8
+            q0<Float> = ld_f64(rbase + ii * 2 * 8)
+            q1<Float> = ld_f64(rbase + (ii * 2 + 1) * 8)
+            st_f64(rbase + ii * 2 * 8, q0 * c - q1 * sn)
+            st_f64(rbase + (ii * 2 + 1) * 8, q0 * sn + q1 * c)
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * half)
+            rem2<Int> = g2 % (KVH * half)
+            hh2<Int> = rem2 / half
+            ii2<Int> = rem2 % half
+            ang2<Float> = (s2 as Float) * ld_f64(FR + ii2 * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            rbase2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            k0<Float> = ld_f64(rbase2 + ii2 * 2 * 8)
+            k1<Float> = ld_f64(rbase2 + (ii2 * 2 + 1) * 8)
+            st_f64(rbase2 + ii2 * 2 * 8, k0 * c2 - k1 * sn2)
+            st_f64(rbase2 + (ii2 * 2 + 1) * 8, k0 * sn2 + k1 * c2)
+        }
+    }
+}
+
+// Grouped-query, causal, scaled-softmax attention: Q,K,V -> Ctx [S,H*HD].
+// kv head for q head h = h / (H/KVH).
+// PD offsets: +80 Q, +88 K, +96 V, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH.
+attn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    total<Int> = S * H
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / H
+        h<Int> = gid % H
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        # pass 1: row max over causal t<=s
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..s) {
+            sc<Float> = 0.0
+            ia<Int> = 0
+            for (ia in 0..HD - 1) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(K + (ta * KVH * HD + kvh * HD + ia) * 8)
+                sc = sc + qv * kv
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        # pass 2: sum of exp over causal t<=s
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..s) {
+            sc2<Float> = 0.0
+            ib<Int> = 0
+            for (ib in 0..HD - 1) {
+                qv2<Float> = ld_f64(qb + ib * 8)
+                kv2<Float> = ld_f64(K + (tb * KVH * HD + kvh * HD + ib) * 8)
+                sc2 = sc2 + qv2 * kv2
+            }
+            sc2 = sc2 * scale
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        # pass 3: weighted sum of V over causal t<=s (one thread per dim)
+        ii<Int> = 0
+        for (ii in 0..HD - 1) {
+            acc<Float> = 0.0
+            tc<Int> = 0
+            for (tc in 0..s) {
+                sc3<Float> = 0.0
+                jj<Int> = 0
+                for (jj in 0..HD - 1) {
+                    qv3<Float> = ld_f64(qb + jj * 8)
+                    kv3<Float> = ld_f64(K + (tc * KVH * HD + kvh * HD + jj) * 8)
+                    sc3 = sc3 + qv3 * kv3
+                }
+                sc3 = sc3 * scale
+                e<Float> = vexp(sc3 - mx)
+                w<Float> = e / ssum
+                vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+                acc = acc + w * vv
+            }
+            st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+        }
+    }
+}
+
+// MLP gate: h[gid] = silu(g[gid]) * u[gid], elementwise over n.
+silu(g<Int>, u<Int>, h<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        st_f64(h + gid * 8, gv * sg * uv)
+    }
+}
+
+// Residual add: y[gid] = a[gid] + b[gid] over n.
+resid(a<Int>, b<Int>, y<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        av<Float> = ld_f64(a + gid * 8)
+        bv<Float> = ld_f64(b + gid * 8)
+        st_f64(y + gid * 8, av + bv)
+    }
+}
+// dSiLU: given cached gate g and up u, and the upstream gradient dhu of hu =
+// silu(g)*u, produce dg and du (elementwise over n).
+// silu(x) = x*sigmoid(x); silu'(x) = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x)).
+// Params buffer: +0 g, +8 u, +16 dhu, +24 dg, +32 du, +40 n.
+dsilu(p<Int>) -> {
+    g<Int> = ld_i64(p + 0)
+    u<Int> = ld_i64(p + 8)
+    dhu<Int> = ld_i64(p + 16)
+    dg<Int> = ld_i64(p + 24)
+    du<Int> = ld_i64(p + 32)
+    n<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        dv<Float> = ld_f64(dhu + gid * 8)
+        s<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        silu<Float> = gv * s
+        om<Float> = 1.0 - s
+        silup<Float> = s + gv * s * om
+        st_f64(dg + gid * 8, dv * uv * silup)
+        st_f64(du + gid * 8, dv * silu)
+    }
+}
+
+// dresid: y = a + b; the upstream grad dy splits equally: da = db = dy (elementwise).
+// 4-arg: cuda_launch4i(f, dy, da, db, n).
+dresid(dy<Int>, da<Int>, db<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        vv<Float> = ld_f64(dy + gid * 8)
+        st_f64(da + gid * 8, vv)
+        st_f64(db + gid * 8, vv)
+    }
+}
+
+// dGEMM-A: dX = dY @ W^T. For C = A @ B (A=[S,K],B=[K,O]) backprop to A:
+//   dA[s,k] = sum_o dC[s,o] * B[k,o].
+// Params: +0 dY (=[S,O]), +8 W (=[K,O]), +16 dX (=[S,K]), +24 S, +32 K, +40 O.
+dgemm_at(p<Int>) -> {
+    dY<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    dX<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    K<Int> = ld_i64(p + 32)
+    O<Int> = ld_i64(p + 40)
+    total<Int> = S * K
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / K
+        k<Int> = gid % K
+        acc<Float> = 0.0
+        o<Int> = 0
+        for (o in 0..O - 1) {
+            acc = acc + ld_f64(dY + (s * O + o) * 8) * ld_f64(W + (k * O + o) * 8)
+        }
+        st_f64(dX + (s * K + k) * 8, acc)
+    }
+}
+
+// dGEMM-B: dW = X^T @ dY. For C = A @ B (A=[S,K],B=[K,O]) backprop to B:
+//   dB[k,o] = sum_s A[s,k] * dC[s,o].
+// Params: +0 X (=[S,K]), +8 dY (=[S,O]), +16 dW (=[K,O]), +24 S, +32 K, +40 O.
+dgemm_bt(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    dY<Int> = ld_i64(p + 8)
+    dW<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    K<Int> = ld_i64(p + 32)
+    O<Int> = ld_i64(p + 40)
+    total<Int> = K * O
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        k<Int> = gid / O
+        o<Int> = gid % O
+        acc<Float> = 0.0
+        s<Int> = 0
+        for (s in 0..S - 1) {
+            acc = acc + ld_f64(X + (s * K + k) * 8) * ld_f64(dY + (s * O + o) * 8)
+        }
+        st_f64(dW + (k * O + o) * 8, acc)
+    }
+}
+
+// dRMSNorm input-gradient: dx_d = dy_d*w_d*inv - x_d*(inv^3/D)*T  (T = sum_j dy_j*w_j*x_j).
+// Per (s,d) thread loops D twice (like forward rmsnorm). dW is handled by dnormw (needs
+// a row-sum). Params: +0 X, +8 W, +16 dY, +24 dX, +40 S, +48 D, +56 eps (64 bytes).
+drmsnorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    dY<Int> = ld_i64(p + 16)
+    dX<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 40)
+    D<Int> = ld_i64(p + 48)
+    eps<Float> = ld_f64(p + 56)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            vv<Float> = ld_f64(X + (s * D + j) * 8)
+            ss = ss + vv * vv
+        }
+        inv<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+        T<Float> = 0.0
+        k2<Int> = 0
+        for (k2 in 0..D - 1) {
+            gj<Float> = ld_f64(dY + (s * D + k2) * 8)
+            wj<Float> = ld_f64(W + k2 * 8)
+            xj<Float> = ld_f64(X + (s * D + k2) * 8)
+            T = T + gj * wj * xj
+        }
+        gd<Float> = ld_f64(dY + gid * 8)
+        wd<Float> = ld_f64(W + d * 8)
+        xd<Float> = ld_f64(X + gid * 8)
+        Sterm<Float> = gd * wd
+        inv3<Float> = inv * inv * inv
+        tmp<Float> = inv3 * T / (D as Float)
+        st_f64(dX + gid * 8, Sterm * inv - xd * tmp)
+    }
+}
+
+// dRMSNorm norm-weight gradient: dw[d] = sum_s dy_sd * x_sd * inv_s (row-sum over S).
+// Params: +0 X, +8 dY, +16 dW, +24 S, +32 D, +40 eps (48 bytes). Grid = D threads.
+dnormw(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    dY<Int> = ld_i64(p + 8)
+    dW<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    d<Int> = blk_x() * dim_x() + tid_x()
+    if (d < D) {
+        acc<Float> = 0.0
+        s<Int> = 0
+        for (s in 0..S - 1) {
+            ss<Float> = 0.0
+            j<Int> = 0
+            for (j in 0..D - 1) {
+                vv<Float> = ld_f64(X + (s * D + j) * 8)
+                ss = ss + vv * vv
+            }
+            inv<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+            acc = acc + ld_f64(dY + (s * D + d) * 8) * ld_f64(X + (s * D + d) * 8) * inv
+        }
+        st_f64(dW + d * 8, acc)
+    }
+}
+
+// dRoPE adjoint (split-half rotary): the forward is, per half-pair (i, i+half),
+//   [out_i, out_{i+half}] = [[c,-sn],[sn,c]] . [x_i, x_{i+half}]
+// with c=cos((POS+s)*freq[i]), sn=sin(...) (angles fixed, not learned). Backward:
+//   dx_i = c*d_i + sn*d_{i+half} ;  dx_{i+half} = -sn*d_i + c*d_{i+half}.
+// Reads the upstream grad of the ROPED q/k (Q/K), writes grad of the PRE-rope (Qd/Kd).
+// Params (as qwen3rope): +80 Q(dq) +88 K(dk) +96 Qd(dxq) +104 Kd(dxk) +176 FR
+//   +184 S +200 HD +208 H +216 KVH +224 POS.
+drope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    shd<Int> = S * H * half
+    skd<Int> = S * KVH * half
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * half)
+            rem<Int> = gid % (H * half)
+            hh<Int> = rem / half
+            i2<Int> = rem % half
+            ang<Float> = ((POS + s) as Float) * ld_f64(FR + i2 * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            base<Int> = Q + (s * H * HD + hh * HD) * 8
+            di<Float> = ld_f64(base + i2 * 8)
+            dy2<Float> = ld_f64(base + (i2 + half) * 8)
+            neg<Float> = 0.0 - sn
+            st_f64(Qd + (s * H * HD + hh * HD + i2) * 8, c * di + sn * dy2)
+            st_f64(Qd + (s * H * HD + hh * HD + i2 + half) * 8, neg * di + c * dy2)
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * half)
+            rem2<Int> = g2 % (KVH * half)
+            hh2<Int> = rem2 / half
+            i3<Int> = rem2 % half
+            ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + i3 * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            base2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            ei<Float> = ld_f64(base2 + i3 * 8)
+            ej<Float> = ld_f64(base2 + (i3 + half) * 8)
+            neg2<Float> = 0.0 - sn2
+            st_f64(Kd + (s2 * KVH * HD + hh2 * HD + i3) * 8, c2 * ei + sn2 * ej)
+            st_f64(Kd + (s2 * KVH * HD + hh2 * HD + i3 + half) * 8, neg2 * ei + c2 * ej)
+        }
+    }
+}
+
+// Zero a device f64 buffer (n elements) — for clearing gradient accumulators. 4-arg.
+zbuf(b<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) { st_f64(b + gid * 8, 0.0) }
+}
+
+// Forward GEMM (kept local to this module so LoRA apply + optimizer load one .ptx;
+// C = alpha A@B + beta C). Params: +0 A +8 B +16 C +24 M +32 N +40 K +48 alpha +56 beta.
+gemmf(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    alpha<Float> = ld_f64(p + 48)
+    beta<Float> = ld_f64(p + 56)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        acc<Float> = 0.0
+        kk<Int> = 0
+        for (kk in 0..K - 1) {
+            acc = acc + ld_f64(A + (mm * K + kk) * 8) * ld_f64(B + (kk * N + nn) * 8)
+        }
+        cv<Float> = 0.0
+        if (beta != 0.0) { cv = ld_f64(C + (mm * N + nn) * 8) }
+        st_f64(C + (mm * N + nn) * 8, alpha * acc + beta * cv)
+    }
+}
+
+// addscaled: a[e] += c * b[e] over n elements — the LoRA apply accumulator step
+// h = x@W + (alpha_r)*( (x@U) @ V ), adding alpha_r*extra into the base output.
+// Params: +0 a, +8 b, +16 c(f64), +24 n (32 bytes). 4-arg with f64 c via params.
+addscaled(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    c<Float> = ld_f64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(A + gid * 8, ld_f64(A + gid * 8) + c * ld_f64(B + gid * 8))
+    }
+}
+
+// sub: dst[e] = a[e] - b[e] (elementwise, 4-arg). For the MSE gradient dy = h - t.
+sub(a<Int>, b<Int>, dst<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(dst + gid * 8, ld_f64(a + gid * 8) - ld_f64(b + gid * 8))
+    }
+}
+
+// scalec: dst[e] = c * src[e] (elementwise f64-c kernel, params). For gv = (alpha/r)*dy.
+// Params: +0 dst, +8 src, +16 c(f64), +24 n (32 bytes).
+scalec(p<Int>) -> {
+    D<Int> = ld_i64(p + 0)
+    Src<Int> = ld_i64(p + 8)
+    c<Float> = ld_f64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(D + gid * 8, c * ld_f64(Src + gid * 8))
+    }
+}
+
+// adamw: elementwise AdamW update of a trainable (LoRA) parameter from its gradient.
+//   m = b1 m + (1-b1) g ; v = b2 v + (1-b2) g^2
+//   p -= lr * ( mhat/(sqrt(vhat)+eps) + wd*p ),  mhat=m/(1-b1t), vhat=v/(1-b2t)
+// (weight decay applied separately = AdamW). Params (96 bytes):
+//   +0 p, +8 g, +16 m, +24 v, +32 lr, +40 b1, +48 b2, +56 eps, +64 wd, +72 b1t, +80 b2t, +88 n.
+adamw(p<Int>) -> {
+    P<Int> = ld_i64(p + 0)
+    G<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    lr<Float> = ld_f64(p + 32)
+    b1<Float> = ld_f64(p + 40)
+    b2<Float> = ld_f64(p + 48)
+    eps<Float> = ld_f64(p + 56)
+    wd<Float> = ld_f64(p + 64)
+    b1t<Float> = ld_f64(p + 72)
+    b2t<Float> = ld_f64(p + 80)
+    n<Int> = ld_i64(p + 88)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(G + gid * 8)
+        mv<Float> = ld_f64(M + gid * 8)
+        vv<Float> = ld_f64(V + gid * 8)
+        mv2<Float> = b1 * mv + (1.0 - b1) * gv
+        vv2<Float> = b2 * vv + (1.0 - b2) * gv * gv
+        st_f64(M + gid * 8, mv2)
+        st_f64(V + gid * 8, vv2)
+        mhat<Float> = mv2 / (1.0 - b1t)
+        vhat<Float> = vv2 / (1.0 - b2t)
+        pv<Float> = ld_f64(P + gid * 8)
+        step<Float> = mhat / (vsqrt(vhat, 24) + eps) + wd * pv
+        st_f64(P + gid * 8, pv - lr * step)
+    }
+}
+
+// dAttention (causal, grouped-query, scaled-softmax) backward. One thread per (s,h).
+// Forward (query row s, head h, kvh=h/(H/KVH)): scores_t = scale*(q.k_t) for t<=s;
+// a_t=exp(sc_t-mx); w_t=a_t/ssum; ctx = sum_t w_t v_t.  Backward produces the grads of
+// the pre-attention Q,K,V (roped q/k) using the SOFTMAX backward + atomics for the
+// cross-query accumulation into dK/dV (caller zeroes dK/dV first).
+// Params: +80 Q +88 K +96 V +104 dCtx +112 dQ +120 dK +128 dV
+//   +184 S +200 HD +208 H +216 KVH. (232-byte buffer.)
+dattn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    dC<Int> = ld_i64(p + 104)
+    dQ<Int> = ld_i64(p + 112)
+    dK<Int> = ld_i64(p + 120)
+    dV<Int> = ld_i64(p + 128)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    total<Int> = S * H
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / H
+        h<Int> = gid % H
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        # pass 1: row max over causal t<=s
+        mx<Float> = -1000000000000000000000000000000.0
+        t<Int> = 0
+        for (t in 0..s) {
+            sc<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                sc = sc + ld_f64(qb + d * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d) * 8)
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        # pass 2: ssum (denominator), recomputing a_t
+        ssum<Float> = 0.0
+        for (t in 0..s) {
+            sc2<Float> = 0.0
+            d2<Int> = 0
+            for (d2 in 0..HD - 1) {
+                sc2 = sc2 + ld_f64(qb + d2 * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d2) * 8)
+            }
+            ssum = ssum + vexp(sc2 * scale - mx)
+        }
+        # pass 3: mean_w_l = sum_t w_t * l_t,  l_t = dC.v_t
+        mean<Float> = 0.0
+        for (t in 0..s) {
+            sc3<Float> = 0.0
+            d3<Int> = 0
+            for (d3 in 0..HD - 1) {
+                sc3 = sc3 + ld_f64(qb + d3 * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d3) * 8)
+            }
+            aa<Float> = vexp(sc3 * scale - mx)
+            ww<Float> = aa / ssum
+            ll<Float> = 0.0
+            d4<Int> = 0
+            for (d4 in 0..HD - 1) {
+                ll = ll + ld_f64(dC + (s * H * HD + h * HD + d4) * 8) * ld_f64(V + (t * KVH * HD + kvh * HD + d4) * 8)
+            }
+            mean = mean + ww * ll
+        }
+        # dQ[row s] = scale * sum_t dsc_t * k_t  (unique per (s,h) -> direct write)
+        dqb<Int> = dQ + (s * H * HD + h * HD) * 8
+        ll5m<Float> = 0.0
+        dqj<Int> = 0
+        for (dqj in 0..HD - 1) {
+            accq<Float> = 0.0
+            t5<Int> = 0
+            for (t5 in 0..s) {
+                sc5<Float> = 0.0
+                d5<Int> = 0
+                for (d5 in 0..HD - 1) {
+                    sc5 = sc5 + ld_f64(qb + d5 * 8) * ld_f64(K + (t5 * KVH * HD + kvh * HD + d5) * 8)
+                }
+                aa5<Float> = vexp(sc5 * scale - mx)
+                ww5<Float> = aa5 / ssum
+                ll5<Float> = 0.0
+                d6<Int> = 0
+                for (d6 in 0..HD - 1) {
+                    ll5 = ll5 + ld_f64(dC + (s * H * HD + h * HD + d6) * 8) * ld_f64(V + (t5 * KVH * HD + kvh * HD + d6) * 8)
+                }
+                ll5m = ll5 - mean
+                dsc5<Float> = aa5 * ll5m / ssum
+                accq = accq + dsc5 * ld_f64(K + (t5 * KVH * HD + kvh * HD + dqj) * 8)
+            }
+            st_f64(dqb + dqj * 8, scale * accq)
+        }
+        # dK/dV via atomic accumulation over causal t
+        ll7m<Float> = 0.0
+        t7<Int> = 0
+        for (t7 in 0..s) {
+            sc7<Float> = 0.0
+            d7<Int> = 0
+            for (d7 in 0..HD - 1) {
+                sc7 = sc7 + ld_f64(qb + d7 * 8) * ld_f64(K + (t7 * KVH * HD + kvh * HD + d7) * 8)
+            }
+            aa7<Float> = vexp(sc7 * scale - mx)
+            ww7<Float> = aa7 / ssum
+            ll7<Float> = 0.0
+            d8<Int> = 0
+            for (d8 in 0..HD - 1) {
+                ll7 = ll7 + ld_f64(dC + (s * H * HD + h * HD + d8) * 8) * ld_f64(V + (t7 * KVH * HD + kvh * HD + d8) * 8)
+            }
+            ll7m = ll7 - mean
+            dsc7<Float> = aa7 * ll7m / ssum
+            kb<Int> = K + (t7 * KVH * HD + kvh * HD) * 8
+            dkb<Int> = dK + (t7 * KVH * HD + kvh * HD) * 8
+            dvb<Int> = dV + (t7 * KVH * HD + kvh * HD) * 8
+            dbc<Int> = dC + (s * H * HD + h * HD) * 8
+            d9<Int> = 0
+            for (d9 in 0..HD - 1) {
+                atomic_add_f64(dkb + d9 * 8, scale * dsc7 * ld_f64(qb + d9 * 8))
+                atomic_add_f64(dvb + d9 * 8, ww7 * ld_f64(dbc + d9 * 8))
+            }
+        }
+    }
+}
+

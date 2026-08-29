@@ -9,7 +9,7 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
