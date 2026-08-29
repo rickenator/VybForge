@@ -85,6 +85,13 @@ encode-corpus:
 	cd $(ROOT) && $(VYB) native/train/encode_corpus.vyb --module-path native/tokenizer --module-path native/json
 	cd $(ROOT) && .venv/bin/python native/train/verify_encode_corpus.py
 
+# T2 training-forward activation cache: run the forward + dump cached activations; the
+# reference computes the same layer-0 tensors; verify_train_fwd.py gates max-rel < 2e-5.
+fwd-cache: $(ROOT)/native/build/layer.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_fwd_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_fwd.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_fwd.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

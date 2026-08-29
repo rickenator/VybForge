@@ -1,0 +1,580 @@
+// Full-36-layer Qwen3-4B prefill on the GPU, Vyb-native (tied lm_head).
+// Streams each layer's 11 real weights from the live GGUF via io::read_at,
+// tensor index read from native/out/qwen3_4b_tensors.tsv (no hardcoded offsets),
+// bulk-dequants Q4_K/Q6_K/F32->f64 per layer (packed stays canonical), then loops
+// blk.0..35 forward (layer.vyb gemm/rmsnorm/attn/silu/resid + qwen3.vyb rope/
+// f32expand) with ping-pong activations. Ends with output_norm -> tied lm_head
+// (token_embd chunked-dequant -> trans_emb -> gemm -> argmax). Writes:
+//   prefill_hidden_vyb.txt  -- final 36-layer hidden [S,D]
+//   prefill_top1_vyb.txt    -- per-token argmax logit id (tied lm_head)
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) {
+        if ((s.char_at(i) as Int) == nd) { return i }
+    }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1
+    seg<Int> = frm
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        if ((s.char_at(i) as Int) == 120) {
+            n = n * parse_u(s, seg, i)
+            seg = i + 1
+        }
+    }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (nmv.get(i) == nm) { return i }
+    }
+    return -1
+}
+
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8)
+        ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8
+            ch<Int> = 0
+            bj<Int> = 0
+            for (bj in 0..7) {
+                bv<Int> = u8(data, o8 + bj)
+                ch = ch | (bv << (bj * 8))
+            }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) {
+            by<Int> = u8(data, tj)
+            if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }
+            tj = tj + 1
+        }
+        return 0
+    }
+    return 0
+}
+
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+// Dump a device f64 buffer (count elements) to a text file for reference compare.
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
+    freedom {
+        match (open_write(path)) {
+            w -> {
+                rv<Float> = 0.0
+                i2<Int> = 0
+                for (i2 in 0..count - 1) {
+                    rv = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv), src + i2 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+    }
+    return 0
+}
+
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+    data<String> = read_model(path, off, nb)
+    if (data.len() < nb) { return 32 }
+    freedom {
+        e<Int> = download(data, dpack, nb)
+        if (e != 0) { return e }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, 0)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
+    data<String> = read_model(path, off, numel * 4)
+    if (data.len() < numel * 4) { return 32 }
+    freedom {
+        e<Int> = download(data, dpack, numel * 4)
+        if (e != 0) { return e }
+        cuMemcpyHtoD_v2(pf + 0, loc(dpack), 8)
+        cuMemcpyHtoD_v2(pf + 8, loc(dout), 8)
+        cuMemcpyHtoD_v2(pf + 16, loc(numel), 8)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)), (numel + 255) / 256, 1, 1, 256, 1, 1, pf, 0, 0, 0)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+
+stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
+          nm<String>, dpk<Int>, pf<Int>, dout<Int>,
+          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>)<Int> -> {
+    idx<Int> = find_nm(nmv, nm)
+    if (idx < 0) { return 60 }
+    off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
+    if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn) }
+    if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn) }
+    return load_norm(path, pf, dpk, dout, off, numel, efn)
+}
+
+emb_dequant(path<String>, off<Int>, total<Int>, dpk<Int>, q6fn<loc<CVoid>>, de<Int>)<Int> -> {
+    CH<Int> = 65536
+    chunks<Int> = total / CH
+    c<Int> = 0
+    estr<Int> = 0
+    for (c in 0..chunks - 1) {
+        e_start<Int> = c * CH
+        byte_off<Int> = e_start / 256 * 210
+        nbytes<Int> = CH / 256 * 210
+        data<String> = read_model(path, off + byte_off, nbytes)
+        if (data.len() < nbytes) { return 61 }
+        estr = 0
+        freedom {
+            e<Int> = download(data, dpk, nbytes)
+            if (e != 0) { estr = e }
+            else {
+                rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), CH / 256, 1, 1, 256, 1, 1, dpk, de + e_start * 8, CH, 0)
+                if (rc != 0) { estr = 33 }
+            }
+        }
+        if (estr != 0) { return estr }
+    }
+    return 0
+}
+
+// One transformer layer forward on XI -> XO (ping-pong). All buffer/handle ptrs.
+run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
+          EPS<Float>, XI<Int>, XO<Int>,
+          gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
+          GM<Int>, RN<Int>, ATT<Int>, ROP<Int>,
+          N1<Int>, DWq<Int>, DWk<Int>, DWv<Int>, Nq<Int>, Nk<Int>, DF<Int>, DWo<Int>, N2<Int>,
+          DWg<Int>, DWu<Int>, DWd<Int>,
+          XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
+          DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>)<Int> -> {
+    freedom {
+        AF<Float> = 1.0; BF<Float> = 0.0
+        zro<Int> = 0
+        rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+
+        gA<Int> = XN; gB<Int> = DWq; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        gA = XN; gB = DWk; gC = DK; gM = S; gN = NKV; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        gA = XN; gB = DWv; gC = DV; gM = S; gN = NKV; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+
+        rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        rA = DK; rB = Nk; rC = DKN; gM = S * KVH; gN = HD
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+
+        cuMemcpyHtoD_v2(ROP + 80, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN), 8)
+        cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr), 8)
+        cuMemcpyHtoD_v2(ROP + 176, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 184, loc(S), 8)
+        cuMemcpyHtoD_v2(ROP + 200, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 208, loc(H), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVH), 8)
+        cuMemcpyHtoD_v2(ROP + 224, loc(zro), 8)   # POS offset = 0 (qwen3rope +224)
+        rope_total<Int> = S * H * HD + S * KVH * HD
+        cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+
+        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(DKr), 8)
+        cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
+        cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
+        cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+
+        gA = DCtx; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
+
+        rA = X1; rB = N2; rC = X1N
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+
+        gA = X1N; gB = DWg; gC = Gr; gM = S; gN = FF; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        gA = X1N; gB = DWu; gC = Up; gM = S; gN = FF; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
+
+        gA = Hu; gB = DWd; gC = M; gM = S; gN = D; gK = FF
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
+        return 0
+    }
+    return 0
+}
+
+main()<Int> -> {
+    S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728
+    NQ<Int> = H * HD; NKV<Int> = KVH * HD; VOCAB<Int> = 151936
+    MAXL<Int> = 1; DOLM<Int> = 0        # T2: single training forward, cache activations (no lm_head yet)
+    EPS<Float> = 0.000001
+    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    TSV<String> = "native/out/qwen3_4b_tensors.tsv"
+    AF<Float> = 1.0; BF<Float> = 0.0
+    rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
+    gA<Int> = 0; gB<Int> = 0; gC<Int> = 0; gM<Int> = 0; gN<Int> = 0; gK<Int> = 0
+
+    nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+    bff<String> = read_bin(TSV)
+    ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                t2<Int> = strchr(bff, 9, t1 + 1)
+                if (t2 < 0) { t2 = i }
+                nm<String> = bff.substring(st, t1)
+                keep<Int> = 0
+                if (nm.substring(0, 4) == "blk.") { keep = 1 }
+                if (nm == "output_norm.weight") { keep = 1 }
+                if (nm == "token_embd.weight") { keep = 1 }
+                if (keep == 1) {
+                    t3<Int> = strchr(bff, 9, t2 + 1)
+                    if (t3 < 0) { t3 = i }
+                    t4<Int> = strchr(bff, 9, t3 + 1)
+                    if (t4 < 0) { t4 = i }
+                    nmv.push(nm)
+                    tyv.push(parse_u(bff, t2 + 1, t3))
+                    nlv.push(parse_numel(bff, t1 + 1, t2))
+                    ofv.push(parse_u(bff, t3 + 1, t4))
+                }
+            }
+            st = i + 1
+        }
+    }
+    println("TSV_ALL_TENSORS=" + nmv.len().to_string() + " (expect 398)")
+    if (nmv.len() < 396) { println("TSV_PARSE_FAIL"); return 2 }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    freedom {
+        m4<loc<CVoid>> = from<loc<CVoid>>(0)
+        m6<loc<CVoid>> = from<loc<CVoid>>(0)
+        ml<loc<CVoid>> = from<loc<CVoid>>(0)
+        mw<loc<CVoid>> = from<loc<CVoid>>(0)
+        rc4<CInt> = -1
+        t4<Int> = 0
+        for (t4 in 0..5) { if (rc4 != 0) { m4 = from<loc<CVoid>>(0); rc4 = cuModuleLoadData(loc(m4), read_bin("native/build/q4k.ptx")) } }
+        if (rc4 != 0) { println("MODLOAD_FAIL q4k"); return 9 }
+        rc6<CInt> = -1
+        t6<Int> = 0
+        for (t6 in 0..5) { if (rc6 != 0) { m6 = from<loc<CVoid>>(0); rc6 = cuModuleLoadData(loc(m6), read_bin("native/build/q6k.ptx")) } }
+        if (rc6 != 0) { println("MODLOAD_FAIL q6k"); return 9 }
+        rcl<CInt> = -1
+        tl<Int> = 0
+        for (tl in 0..5) { if (rcl != 0) { ml = from<loc<CVoid>>(0); rcl = cuModuleLoadData(loc(ml), read_bin("native/build/layer.ptx")) } }
+        if (rcl != 0) { println("MODLOAD_FAIL layer"); return 9 }
+        rcw<CInt> = -1
+        tw<Int> = 0
+        for (tw in 0..5) { if (rcw != 0) { mw = from<loc<CVoid>>(0); rcw = cuModuleLoadData(loc(mw), read_bin("native/build/qwen3.ptx")) } }
+        if (rcw != 0) { println("MODLOAD_FAIL qwen3"); return 9 }
+        q4fn<loc<CVoid>> = from<loc<CVoid>>(0)
+        q6fn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4fn), m4, "q4kdeq") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6fn), m6, "q6kdeq") != 0) { return 10 }
+        gfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        rfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        afn<loc<CVoid>> = from<loc<CVoid>>(0)
+        sfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        refn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(gfn), ml, "gemm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(rfn), ml, "rmsnorm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(afn), ml, "attn") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
+        rpfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        efn<loc<CVoid>> = from<loc<CVoid>>(0)
+        lsfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        arfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
+
+        i0<Int> = find_nm(nmv, "blk.0.attn_q.weight"); wq_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_k.weight"); wk_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_v.weight"); wv_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_output.weight"); wo_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.ffn_gate.weight"); wg_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.ffn_up.weight"); wu_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.ffn_down.weight"); wd_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_norm.weight"); n1_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_q_norm.weight"); nq_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.attn_k_norm.weight"); nk_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "blk.0.ffn_norm.weight"); n2_nl<Int> = nlv.get(i0)
+        i0 = find_nm(nmv, "token_embd.weight"); te_nl<Int> = nlv.get(i0)
+
+        DWq<Int> = 0; DWk<Int> = 0; DWv<Int> = 0; DWo<Int> = 0; DWg<Int> = 0; DWu<Int> = 0; DWd<Int> = 0
+        N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; ON<Int> = 0
+        XA<Int> = 0; XB<Int> = 0; XN<Int> = 0; DQ<Int> = 0; DQN<Int> = 0; DQr<Int> = 0
+        DK<Int> = 0; DKN<Int> = 0; DKr<Int> = 0; DV<Int> = 0; DCtx<Int> = 0
+        DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
+        DH<Int> = 0; DE<Int> = 0; DEt<Int> = 0; DL<Int> = 0; AO<Int> = 0
+        DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0
+        if (cuMemAlloc_v2(loc(DWq), wq_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWk), wk_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWv), wv_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWo), wo_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWg), wg_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWu), wu_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWd), wd_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(N1), n1_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Nq), nq_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Nk), nk_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(N2), n2_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XA), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XB), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XN), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQ), S * NQ * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQN), S * NQ * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQr), S * NQ * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DK), S * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DKN), S * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DKr), S * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DV), S * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DCtx), S * NQ * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DO), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X1), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X1N), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Gr), S * FF * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Up), S * FF * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Hu), S * FF * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(M), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DH), S * D * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DL), S * VOCAB * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(AO), S * 8) != 0) { return 11 }
+        i0 = find_nm(nmv, "blk.0.ffn_down.weight")
+        pk_max<Int> = packed_bytes(nlv.get(i0), tyv.get(i0))
+        if (cuMemAlloc_v2(loc(DPK), pk_max) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(ATT), 224) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
+        if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(T4), 32) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(A4), 32) != 0) { return 11 }
+        DF<Int> = 0
+        if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
+
+        xb<String> = read_bin("native/out/layer0_input.bin")
+        if (xb.len() < S * D * 8) { println("INPUT_MISSING"); return 35 }
+        download(xb, XA, S * D * 8)
+        fb<String> = read_bin("native/out/layer0_invfreq.bin")
+        if (fb.len() < 64 * 8) { println("INVFREQ_MISSING"); return 35 }
+        download(fb, DF, 64 * 8)
+
+        XI<Int> = XA; XO<Int> = XB
+        e<Int> = 0
+        L<Int> = 0
+        for (L in 0..MAXL - 1) {
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn); if (e != 0) { return 70 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn); if (e != 0) { return 71 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn); if (e != 0) { return 72 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn); if (e != 0) { return 73 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn); if (e != 0) { return 74 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn); if (e != 0) { return 75 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn); if (e != 0) { return 76 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn); if (e != 0) { return 77 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn); if (e != 0) { return 78 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn); if (e != 0) { return 79 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn); if (e != 0) { return 80 }
+
+            e = run_layer(S, D, H, KVH, HD, FF, NQ, NKV, EPS, XI, XO,
+                          gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
+                          N1, DWq, DWk, DWv, Nq, Nk, DF, DWo, N2, DWg, DWu, DWd,
+                          XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
+            if (e != 0) { return 81 }
+            tl2<Int> = XI; XI = XO; XO = tl2
+        }
+
+        # ---- T2: dump cached activations (NLAYER=1 so the transient buffers ARE
+        # the layer-0 activation cache: pre-norm XN, roped Q/K, V, ctx, ffn_norm, silu-out). ----
+        cuCtxSynchronize()
+        e = dumpf(XN, S * D, "native/out/train_fwd_XN.txt"); if (e != 0) { return 90 }
+        e = dumpf(DQr, S * NQ, "native/out/train_fwd_DQr.txt"); if (e != 0) { return 90 }
+        e = dumpf(DKr, S * NKV, "native/out/train_fwd_DKr.txt"); if (e != 0) { return 90 }
+        e = dumpf(DV, S * NKV, "native/out/train_fwd_DV.txt"); if (e != 0) { return 90 }
+        e = dumpf(DCtx, S * NQ, "native/out/train_fwd_DCtx.txt"); if (e != 0) { return 90 }
+        e = dumpf(X1N, S * D, "native/out/train_fwd_X1N.txt"); if (e != 0) { return 90 }
+        e = dumpf(Hu, S * FF, "native/out/train_fwd_Hu.txt"); if (e != 0) { return 90 }
+        println("TRAIN_FWD_CACHE_DUMPED")
+
+        # ---- write final 36-layer hidden (now in XI) ----
+        cuCtxSynchronize()
+        match (open_write("native/out/prefill_hidden_vyb.txt")) {
+            w -> {
+                rv<Float> = 0.0
+                i = 0
+                for (i in 0..S * D - 1) {
+                    rv = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv), XI + i * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+        println("PREFILL_HIDDEN_DONE (layers=" + MAXL.to_string() + ")")
+
+        if (DOLM == 1) {
+            i0 = find_nm(nmv, "output_norm.weight")
+            on_off<Int> = ofv.get(i0); on_nl<Int> = nlv.get(i0)
+            e = load_norm(MODEL, PF, DPK, ON, on_off, on_nl, efn); if (e != 0) { return 90 }
+            rA = XI; rB = ON; rC = DH
+            cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+            cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+            cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+
+            i0 = find_nm(nmv, "token_embd.weight")
+            te_off<Int> = ofv.get(i0)
+            e = emb_dequant(MODEL, te_off, te_nl, DPK, q6fn, DE); if (e != 0) { return 91 }
+
+            # logits via logits_slice (chunked vocab slices; large-grid kernels truncate)
+            LCH<Int> = 16384
+            s7<Int> = 0
+            vs2<Int> = 0
+            ve2<Int> = 0
+            rc_sl<CInt> = 0
+            for (s7 in 0..S - 1) {
+                vs2 = 0
+                while (vs2 < VOCAB) {
+                    ve2 = vs2 + LCH
+                    if (ve2 > VOCAB) { ve2 = VOCAB }
+                    cuMemcpyHtoD_v2(GM + 0, loc(DH), 8); cuMemcpyHtoD_v2(GM + 8, loc(DE), 8); cuMemcpyHtoD_v2(GM + 16, loc(DL), 8)
+                    cuMemcpyHtoD_v2(GM + 24, loc(s7), 8); cuMemcpyHtoD_v2(GM + 32, loc(D), 8)
+                    cuMemcpyHtoD_v2(GM + 40, loc(vs2), 8); cuMemcpyHtoD_v2(GM + 48, loc(ve2), 8); cuMemcpyHtoD_v2(GM + 56, loc(VOCAB), 8)
+                    rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                    if (rc_sl != 0) { println("LMDBG logits_slice rc=" + (rc_sl as Int).to_string()); return 92 }
+                    vs2 = ve2
+                }
+            }
+
+            cuMemcpyHtoD_v2(A4 + 0, loc(DL), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
+            cuMemcpyHtoD_v2(A4 + 16, loc(S), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
+            rc_ar<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(arfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+            println("LMDBG argmax rc=" + (rc_ar as Int).to_string())
+            cuCtxSynchronize()
+
+            match (open_write("native/out/prefill_top1_vyb.txt")) {
+                w -> {
+                    iv<Int> = 0
+                    i = 0
+                    for (i in 0..S - 1) {
+                        iv = 0
+                        if (cuMemcpyDtoH_v2(loc(iv), AO + i * 8, 8) != 0) { return 16 }
+                        match (write_str(w, iv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    }
+                    close(w)
+                }
+                ? -> { return 17 }
+            }
+            println("LMHEAD_TOP1_DONE")
+        }
+
+        println("MODEL_PREFILL_DONE")
+        return 0
+    }
+
+    return 0
+}
