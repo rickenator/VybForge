@@ -1,13 +1,16 @@
-# Emits deterministic chat-format JSONL training data for the VybOS
-# configurator. It contains no private host state and no model-generated text.
-# stdout only: redirect it to data/vybos-configurator-{train,eval}.jsonl.
-#
-# Proposed changes are REAL SystemSpec operations a deterministic VybOS applier
-# can merge onto config/default-state.json:
-#   system  -> replace "x86_64-linux" | "aarch64-linux"
-#   hostname-> replace <string>
-#   pkgs    -> add {name,version,source} | remove {name}
-#   services-> add {name,command}        | remove {name}
+# Emits deterministic chat-format JSONL training data for the VybOS configurator
+# (Vyb native, no Python). Grounded in doc/STATUS.md. Design (training/CORPUS-STRATEGY.md):
+#   - FACTS LIVE IN CONTEXT: every record's system prompt embeds a capabilities
+#     MANIFEST (manifest(v)); the model reasons from it, never memorizes it.
+#   - MULTIPLE MANIFEST VARIANTS (0..3) teach manifest-DEPENDENCE, not memorization.
+#     Variant 3 (a "wayland desktop stack proven" future) appears ONLY in eval ->
+#     a transfer test: updating the manifest must change answers without retraining.
+#   - GOAL-DRIVEN WHOLE-STACK interviews (desktop/kiosk/ci/gateway/rescue) decompose
+#     the stack, stay manifest-grounded, and surface un-buildable subsystems as open
+#     decisions (never fabricate).
+# Assistant content is always a valid agent-response JSON (kind/message/missing_fields/
+# proposed_changes/requires_confirmation); proposed paths are system|hostname|pkgs|services.
+# stdout only: redirect to data/vybos-configurator-{train,eval,all}.jsonl.
 
 json_escape(value<String>)<String> -> {
     out<String> = value.replace("\\", "\\\\")
@@ -17,9 +20,29 @@ json_escape(value<String>)<String> -> {
     return out.replace("\t", "\\t")
 }
 
-record(id<Int>, split<String>, topic<String>, user<String>, answer<String>)<String> -> {
-    system<String> = "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields, proposed_changes, and requires_confirmation. VybOS builds a machine from a minimal SystemSpec: system, hostname, pkgs, services. A default baseline is in config/default-state.json. Each proposed_changes item is {path, op, value, reason}; paths are system|hostname|pkgs|services and values must be schema-conformant so a deterministic applier can merge them. Distinguish implemented capabilities from plans; never claim host changes were applied."
-    return "{\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(system) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user) + "\"},{\"role\":\"assistant\",\"content\":\"" + json_escape(answer) + "\"}],\"metadata\":{\"id\":\"vybos-" + id.to_string() + "\",\"split\":\"" + split + "\",\"topic\":\"" + topic + "\",\"source\":\"VybOS STATUS snapshot 2026-08-26\"}}"
+# ---- capabilities manifest per variant ----
+manifest(v<Int>)<String> -> {
+    m<String> = "VybOS capabilities (status snapshot 2026-08-26):\\n"
+    m = m + "- boot: container rootfs (bwrap/docker) PROVEN; x86_64 kernel+initramfs QEMU boot PROVEN\\n"
+    m = m + "- toolchain: derived gcc 13.2.0 (C); derived linux-6.6 bzImage; derived qemu; self-hosting C compiler (chibicc bootstrap)\\n"
+    m = m + "- determinism: byte-reproducible kernel + binutils + gcc-tower PROVEN\\n"
+    m = m + "- source: real HTTPS fetch -> content-addressed store; realizable pkg sources: openssh, vim, nginx, busybox, linux, qemu\\n"
+    if (v == 1) { m = m + "- rescue: serial-console rescue image PROVEN\\n" }
+    if (v == 2) { m = m + "- aarch64: cross-toolchain + aarch64 linux kernel QEMU-boot PROVEN\\n" }
+    if (v == 3) { m = m + "- desktop: wayland desktop stack (hyprland compositor + wlroots + mesa/graphics + xdg-desktop-portal + display manager) DERIVED & booted PROVEN\\n" }
+    m = m + "- OPEN: host deployment, root disk image, bootloader, gen-switch, non-stand-in userspace, ARM64"
+    if (v < 3) { m = m + ", graphical/wayland desktop stack" }
+    m = m + "\\n- NEVER apply anything to a host; desired state is review-only.\\n"
+    return m
+}
+
+system_prompt(v<Int>)<String> -> {
+    return "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields, proposed_changes, and requires_confirmation. VybOS builds a machine from a SystemSpec whose fields are system, hostname, pkgs, services (baseline in config/default-state.json). Each proposed_changes item is {path, op, value, reason}; op is add|replace|remove and paths are system|hostname|pkgs|services, so a deterministic applier can merge them. Use ONLY the capabilities manifest in this prompt for what VybOS can actually build; do not invent packages, versions, or proven boot support that are not listed. Distinguish implemented capabilities from open decisions; never claim a host change was applied.\\n\\n" + manifest(v)
+}
+
+record(id<Int>, split<String>, topic<String>, user<String>, answer<String>, v<Int>)<String> -> {
+    sys<String> = system_prompt(v)
+    return "{\"messages\":[{\"role\":\"system\",\"content\":\"" + json_escape(sys) + "\"},{\"role\":\"user\",\"content\":\"" + json_escape(user) + "\"},{\"role\":\"assistant\",\"content\":\"" + json_escape(answer) + "\"}],\"metadata\":{\"id\":\"vybos-" + id.to_string() + "\",\"split\":\"" + split + "\",\"topic\":\"" + topic + "\",\"manifest\":\"" + v.to_string() + "\",\"source\":\"VybOS STATUS 2026-08-26; training/CORPUS-STRATEGY.md\"}}"
 }
 
 question(message<String>, missing<String>)<String> -> {
@@ -30,8 +53,16 @@ summary(message<String>)<String> -> {
     return "{\"kind\":\"summary\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[],\"proposed_changes\":[],\"requires_confirmation\":false}"
 }
 
-proposal(op<String>, path<String>, value_js<String>, reason<String>)<String> -> {
-    return "{\"kind\":\"proposal\",\"message\":\"This is a desired-state proposal only; it will not build or apply anything.\",\"missing_fields\":[],\"proposed_changes\":[{\"path\":\"" + json_escape(path) + "\",\"op\":\"" + op + "\",\"value\":" + value_js + ",\"reason\":\"" + json_escape(reason) + "\"}],\"requires_confirmation\":true}"
+item(path<String>, op<String>, value_js<String>, reason<String>)<String> -> {
+    return "{\"path\":\"" + json_escape(path) + "\",\"op\":\"" + op + "\",\"value\":" + value_js + ",\"reason\":\"" + json_escape(reason) + "\"}"
+}
+
+proposal1(op<String>, path<String>, value_js<String>, reason<String>)<String> -> {
+    return "{\"kind\":\"proposal\",\"message\":\"This is a desired-state proposal only; it will not build or apply anything.\",\"missing_fields\":[],\"proposed_changes\":[" + item(path, op, value_js, reason) + "],\"requires_confirmation\":true}"
+}
+
+proposal_multi(message<String>, items<String>)<String> -> {
+    return "{\"kind\":\"proposal\",\"message\":\"" + json_escape(message) + "\",\"missing_fields\":[],\"proposed_changes\":[" + items + "],\"requires_confirmation\":true}"
 }
 
 target_for(n<Int>)<String> -> {
@@ -39,9 +70,9 @@ target_for(n<Int>)<String> -> {
     if (k == 0) { return "a disposable container rootfs for CI" }
     if (k == 1) { return "a QEMU x86_64 boot test" }
     if (k == 2) { return "an x86_64 development VM" }
-    if (k == 3) { return "an ARM64 appliance image" }
-    if (k == 4) { return "a reproducible server image" }
-    return "a rescue image with a serial console"
+    if (k == 3) { return "a reproducible server image" }
+    if (k == 4) { return "a rescue image with a serial console" }
+    return "a headless network appliance"
 }
 
 pkg_json(n<Int>)<String> -> {
@@ -50,7 +81,7 @@ pkg_json(n<Int>)<String> -> {
     if (k == 1) { return "{\"name\":\"vim\",\"version\":\"9.1\",\"source\":\"upstream\"}" }
     if (k == 2) { return "{\"name\":\"nginx\",\"version\":\"1.26.2\",\"source\":\"upstream\"}" }
     if (k == 3) { return "{\"name\":\"busybox\",\"version\":\"1.37.0\",\"source\":\"upstream\"}" }
-    if (k == 4) { return "{\"name\":\"linux\",\"version\":\"6.12.0\",\"source\":\"cdn.kernel.org\"}" }
+    if (k == 4) { return "{\"name\":\"linux\",\"version\":\"6.6.0\",\"source\":\"cdn.kernel.org\"}" }
     return "{\"name\":\"qemu\",\"version\":\"9.1.0\",\"source\":\"upstream\"}"
 }
 
@@ -63,49 +94,143 @@ svc_json(n<Int>)<String> -> {
 
 main()<Int> -> {
     i<Int> = 0
-    while (i < 240) {
-        split<String> = if (i % 10 == 0) { "eval" } else { "train" }
+    while (i < 720) {
+        v<Int> = i % 4            # manifest variant 0..3
+        split<String> = "train"
+        if (v == 3) { split = "eval" }        # unseen-manifest transfer set ONLY in eval
+        else { if (i % 10 == 0) { split = "eval" } }
+        topic<Int> = i % 20
         target<String> = target_for(i)
-        variant<Int> = i % 8
         user<String> = ""
         answer<String> = ""
-        topic<String> = ""
+        tname<String> = ""
 
-        if (variant == 0) {
-            topic = "interview"
+        if (topic == 0) {
+            tname = "interview"
             user = "I want " + target + ". What should we decide first?"
-            answer = question("Which architecture and boot/runtime target must this configuration support? Existing VybOS proofs cover disposable rootfs and x86_64 QEMU; ARM64 needs an explicit decision.", "system")
-        } else if (variant == 1) {
-            topic = "packages"
+            answer = question("Which architecture and boot/runtime target must this configuration support? The manifest lists x86_64 QEMU boot as proven; ARM64 and a graphical desktop are open unless listed.", "system")
+        } else if (topic == 1) {
+            tname = "packages-add"
             user = "Add a package to " + target + "."
-            answer = proposal("add", "pkgs", pkg_json(i / 6), "Adding a package changes the desired closure and must be confirmed before deterministic planning.")
-        } else if (variant == 2) {
-            topic = "current-capability"
-            user = "Can VybOS already build a kernel and boot it in QEMU?"
-            answer = summary("Yes. Current VybOS status records a derived Linux kernel and a derived QEMU runtime that boot a rootfs to VYBOS_READY. This is a reproducible proof path, not authorization to modify the host.")
-        } else if (variant == 3) {
-            topic = "hostname"
+            answer = proposal1("add", "pkgs", pkg_json(i / 6), "Adding a package changes the desired closure and must be confirmed before deterministic planning.")
+        } else if (topic == 2) {
+            tname = "packages-remove"
+            user = "I no longer need a package on " + target + "."
+            answer = proposal1("remove", "pkgs", "{\"name\":\"" + pick_pkg_name(i) + "\"}", "Removing a package reduces the desired closure.")
+        } else if (topic == 3) {
+            tname = "hostname"
             user = "Name this " + target + " host."
-            answer = proposal("replace", "hostname", "\"vyb-appliance\"", "Hostname is part of the machine identity in the SystemSpec.")
-        } else if (variant == 4) {
-            topic = "safety"
-            user = "Apply this configuration to the current machine now."
-            answer = summary("I can draft and validate a desired state, but I will not apply it to a host. First choose the target, review the transition plan, and authorize a separate execution step.")
-        } else if (variant == 5) {
-            topic = "services"
+            answer = proposal1("replace", "hostname", "\"vyb-" + id_suffix(i) + "\"", "Hostname is part of the machine identity in the SystemSpec.")
+        } else if (topic == 4) {
+            tname = "services-add"
             user = "Enable a service on " + target + "."
-            answer = proposal("add", "services", svc_json(i / 6), "Enabling a service changes what runs and must be confirmed before deterministic planning.")
-        } else if (variant == 6) {
-            topic = "architecture"
-            user = "Make this target an ARM64 image instead of x86_64."
-            answer = proposal("replace", "system", "\"aarch64-linux\"", "Architecture is a SystemSpec field; changing it selects a different toolchain and kernel target.")
-        } else {
-            topic = "removal"
+            answer = proposal1("add", "services", svc_json(i / 6), "Enabling a service changes what runs and must be confirmed before deterministic planning.")
+        } else if (topic == 5) {
+            tname = "services-remove"
             user = "I no longer need interactive console access on " + target + "."
-            answer = proposal("remove", "services", "{\"name\":\"getty\"}", "Removing a service from the desired state reduces the enabled service set.")
+            answer = proposal1("remove", "services", "{\"name\":\"getty\"}", "Removing a service from the desired state reduces the enabled service set.")
+        } else if (topic == 6) {
+            tname = "architecture"
+            user = "Make " + target + " an ARM64 image instead of x86_64."
+            if (v == 2) {
+                answer = proposal1("replace", "system", "\"aarch64-linux\"", "The manifest lists an aarch64 cross-toolchain and kernel as proven, so this target switch is supported.")
+            } else {
+                answer = summary("The manifest does not list ARM64 boot as proven (only x86_64 QEMU). Switching architecture would select an unproven toolchain/kernel path; this stays an open decision until ARM64 is listed.")
+            }
+        } else if (topic == 7) {
+            tname = "current-capability"
+            user = "Can VybOS already build a kernel and boot it in QEMU?"
+            answer = summary("Yes. The manifest lists a derived linux-6.6 bzImage and an x86_64 QEMU boot to ready as proven — a reproducible proof path, not authorization to modify the host.")
+        } else if (topic == 8) {
+            tname = "safety"
+            user = "Apply this configuration to the current machine now."
+            answer = summary("I can draft and validate a desired state, but I will not apply it to a host. First choose the target, review the plan, and authorize a separate execution step.")
+        } else if (topic == 9) {
+            tname = "goal-desktop"
+            user = "I want a Hyprland desktop workstation."
+            if (v == 3) {
+                # desktop listed as proven -> propose the whole-stack decomposition
+                answer = proposal_multi("Desired-state for a Hyprland workstation: compositor + display deps, a session service, hostname, on the x86_64/QEMU-proven boot. Review-only; not applied.",
+                    item("pkgs", "add", "{\"name\":\"hyprland\",\"version\":\"0.43.0\",\"source\":\"upstream\"}", "The manifest lists a wayland desktop stack as derived; the compositor anchors it.") + "," +
+                    item("pkgs", "add", "{\"name\":\"mesa\",\"version\":\"25.0\",\"source\":\"upstream\"}", "Graphics driver for the wayland stack, listed as proven.") + "," +
+                    item("services", "add", "{\"name\":\"hyprland-session\",\"command\":\"Hyprland\"}", "Boots the compositor as the desktop session.") + "," +
+                    item("hostname", "replace", "\"vyb-desktop\"", "Workstation machine identity."))
+            } else {
+                answer = summary("The manifest gates a graphical desktop as an open/not-derived subsystem, so I can't propose a Hyprland stack as buildable today. I can still plan the headless management pieces (e.g. sshd) and we treat the display/compositor/graphics stack as an open decision until derivation is proven.")
+            }
+        } else if (topic == 10) {
+            tname = "goal-kiosk"
+            user = "Build me an offline kiosk that boots to a single locked-down web view."
+            if (v == 3) {
+                answer = summary("A kiosk needs the graphical/webview stack that the manifest lists as proven; a single-purpose locked-down session is a coherent follow-on, but the kiosk user account and autologin sit outside the current system|hostname|pkgs|services patch paths and stay open decisions on the fuller desired-state model.")
+            } else {
+                answer = summary("An offline kiosk needs a graphical/webview stack, which the manifest does not list as derived. The display stack is an open decision; I won't fabricate a compositor or webview until it is.")
+            }
+        } else if (topic == 11) {
+            tname = "goal-ci-runner"
+            user = "I want a CI runner image for ephemeral builds."
+            answer = proposal_multi("CI-runner desired state: headless build tools + remote access on the reproducible image path. Review-only.",
+                item("pkgs", "add", pkg_json(i / 6), "A build/management package the manifest lists as realizable.") + "," +
+                item("services", "add", "{\"name\":\"sshd\",\"command\":\"/usr/sbin/sshd -D\"}", "Headless remote management for the runner."))
+        } else if (topic == 12) {
+            tname = "goal-gateway"
+            user = "Design this as a network gateway for a small office."
+            answer = summary("A gateway implies network interfaces/firewall/NAT/DNS policy that live outside the current system|hostname|pkgs|services patch paths; I can propose the service it runs but the network domain is an open decision on the fuller desired-state model.")
+        } else if (topic == 13) {
+            tname = "goal-rescue"
+            user = "I want a rescue image with a serial console."
+            if (v == 1) {
+                answer = proposal_multi("Rescue image desired state on the proven serial-console path. Review-only.",
+                    item("services", "add", "{\"name\":\"getty\",\"command\":\"getty 0 ttyS0\"}", "Serial console via getty, listed as proven on the rescue image.") + "," +
+                    item("pkgs", "add", "{\"name\":\"busybox\",\"version\":\"1.37.0\",\"source\":\"upstream\"}", "Minimal userspace for the rescue image."))
+            } else {
+                answer = summary("The manifest does not list a serial-console rescue image as proven in this variant; a serial-accessible minimal image is a reasonable goal but stays an open decision until the capability is listed.")
+            }
+        } else if (topic == 14) {
+            tname = "unsupported"
+            user = "Build me a RISC-V image."
+            answer = summary("RISC-V is not in the manifest at all; there is no toolchain/kernel/boot proof for it. This must be an explicit open decision with new derivation work, not a silent target.")
+        } else if (topic == 15) {
+            tname = "stale-assumption"
+            user = "I thought VybOS had no kernel yet and only ran scripts."
+            answer = summary("That is stale. The manifest lists a derived linux-6.6 bzImage and an x86_64 QEMU boot to ready as proven; the kernel is derived from source, not assumed.")
+        } else if (topic == 16) {
+            tname = "reproducibility"
+            user = "How reproducible are these builds?"
+            answer = summary("The manifest records byte-reproducible derivations (kernel plus the binutils and gcc tower across independent build roots) and a full SHA-256 content-addressed store; that is the reproducibility basis, reviewed here, not host-applied.")
+        } else if (topic == 17) {
+            tname = "open-decision"
+            user = "Does this config produce a bootable disk image with a bootloader and interactive users?"
+            answer = question("The manifest shows boot-to-ready proofs and a pipeline, but a root disk image, bootloader, gen-switch, and non-stand-in userspace are open. Should the desired state target image/boot or stay on the container/initramfs proof path?", "boot")
+        } else if (topic == 18) {
+            tname = "coordinated"
+            user = "Set up " + target + " with a name and an exposed service from the manifest."
+            answer = proposal_multi("Coordinated desired-state update: identity plus an exposed service, both confirmed before planning. Review-only.",
+                item("hostname", "replace", "\"vyb-" + id_suffix(i) + "\"", "Machine identity.") + "," +
+                item("services", "add", svc_json(i / 6), "Exposed service from the manifest-real set."))
+        } else {
+            tname = "mixed-edit"
+            user = "Refine " + target + ": rename it and switch the base package set to match a server role."
+            answer = proposal_multi("Refinement proposal: rename the host and adjust packages for a server role. Review-only.",
+                item("hostname", "replace", "\"vyb-server-" + id_suffix(i) + "\"", "Server identity.") + "," +
+                item("pkgs", "add", pkg_json(i / 6), "Server-role package from the realizable set."))
         }
-        println(record(i, split, topic, user, answer))
+
+        println(record(i, split, tname, user, answer, v))
         i += 1
     }
     return 0
+}
+
+pick_pkg_name(n<Int>)<String> -> {
+    k<Int> = n % 6
+    if (k == 0) { return "openssh" }
+    if (k == 1) { return "vim" }
+    if (k == 2) { return "nginx" }
+    if (k == 3) { return "busybox" }
+    if (k == 4) { return "linux" }
+    return "qemu"
+}
+id_suffix(n<Int>)<String> -> {
+    return (n % 100).to_string()
 }
