@@ -1,6 +1,6 @@
 // Backward (gradient) kernels for Vyb-native LoRA training. Consume the forward
 // activation cache; each is verified element-wise against a numpy reference.
-import vmath::{vexp}
+import vmath::{vexp, vsqrt}
 
 // dSiLU: given cached gate g and up u, and the upstream gradient dhu of hu =
 // silu(g)*u, produce dg and du (elementwise over n).
@@ -83,5 +83,73 @@ dgemm_bt(p<Int>) -> {
             acc = acc + ld_f64(X + (s * K + k) * 8) * ld_f64(dY + (s * O + o) * 8)
         }
         st_f64(dW + (k * O + o) * 8, acc)
+    }
+}
+
+// dRMSNorm input-gradient: dx_d = dy_d*w_d*inv - x_d*(inv^3/D)*T  (T = sum_j dy_j*w_j*x_j).
+// Per (s,d) thread loops D twice (like forward rmsnorm). dW is handled by dnormw (needs
+// a row-sum). Params: +0 X, +8 W, +16 dY, +24 dX, +40 S, +48 D, +56 eps (64 bytes).
+drmsnorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    dY<Int> = ld_i64(p + 16)
+    dX<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 40)
+    D<Int> = ld_i64(p + 48)
+    eps<Float> = ld_f64(p + 56)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            vv<Float> = ld_f64(X + (s * D + j) * 8)
+            ss = ss + vv * vv
+        }
+        inv<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+        T<Float> = 0.0
+        k2<Int> = 0
+        for (k2 in 0..D - 1) {
+            gj<Float> = ld_f64(dY + (s * D + k2) * 8)
+            wj<Float> = ld_f64(W + k2 * 8)
+            xj<Float> = ld_f64(X + (s * D + k2) * 8)
+            T = T + gj * wj * xj
+        }
+        gd<Float> = ld_f64(dY + gid * 8)
+        wd<Float> = ld_f64(W + d * 8)
+        xd<Float> = ld_f64(X + gid * 8)
+        Sterm<Float> = gd * wd
+        inv3<Float> = inv * inv * inv
+        tmp<Float> = inv3 * T / (D as Float)
+        st_f64(dX + gid * 8, Sterm * inv - xd * tmp)
+    }
+}
+
+// dRMSNorm norm-weight gradient: dw[d] = sum_s dy_sd * x_sd * inv_s (row-sum over S).
+// Params: +0 X, +8 dY, +16 dW, +24 S, +32 D, +40 eps (48 bytes). Grid = D threads.
+dnormw(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    dY<Int> = ld_i64(p + 8)
+    dW<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    d<Int> = blk_x() * dim_x() + tid_x()
+    if (d < D) {
+        acc<Float> = 0.0
+        s<Int> = 0
+        for (s in 0..S - 1) {
+            ss<Float> = 0.0
+            j<Int> = 0
+            for (j in 0..D - 1) {
+                vv<Float> = ld_f64(X + (s * D + j) * 8)
+                ss = ss + vv * vv
+            }
+            inv<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 24)
+            acc = acc + ld_f64(dY + (s * D + d) * 8) * ld_f64(X + (s * D + d) * 8) * inv
+        }
+        st_f64(dW + d * 8, acc)
     }
 }

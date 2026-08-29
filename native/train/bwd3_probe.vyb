@@ -1,0 +1,101 @@
+// T3.3 dRMSNorm probe: read synthetic x,w,dy, launch drmsnorm, dump dx+norm-weight grads dw.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
+            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        return 0
+    }
+    return 0
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
+    freedom {
+        match (open_write(path)) {
+            w -> {
+                rv<Float> = 0.0; k<Int> = 0
+                for (k in 0..count - 1) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), src + k * 8, 8); write_str(w, rv.to_string() + "\n") }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+    }
+    return 0
+}
+
+main()<Int> -> {
+    S<Int> = 4; D<Int> = 16
+    EN<Float> = 0.000001
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0); rc<CInt> = -1; t4<Int> = 0
+        for (t4 in 0..5) { if (rc != 0) { m = from<loc<CVoid>>(0); rc = cuModuleLoadData(loc(m), read_bin("native/build/backprop.ptx")) } }
+        if (rc != 0) { println("MODLOAD_FAIL"); return 9 }
+        dn<loc<CVoid>> = from<loc<CVoid>>(0); nw<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(dn), m, "drmsnorm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(nw), m, "dnormw") != 0) { return 10 }
+
+        x<Int> = 0; w<Int> = 0; dy<Int> = 0; dx<Int> = 0; dw<Int> = 0; PB<Int> = 0
+        if (cuMemAlloc_v2(loc(x), S*D*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(w), D*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dy), S*D*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dx), S*D*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dw), D*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PB), 64) != 0) { return 11 }
+        e<Int> = download(read_bin("native/out/bwd3_x.bin"), x, S*D*8); if (e != 0) { return 20 }
+        e = download(read_bin("native/out/bwd3_w.bin"), w, D*8); if (e != 0) { return 21 }
+        e = download(read_bin("native/out/bwd3_dy.bin"), dy, S*D*8); if (e != 0) { return 22 }
+
+        cuMemcpyHtoD_v2(PB + 0, loc(x), 8); cuMemcpyHtoD_v2(PB + 8, loc(w), 8); cuMemcpyHtoD_v2(PB + 16, loc(dy), 8)
+        cuMemcpyHtoD_v2(PB + 24, loc(dx), 8)
+        cuMemcpyHtoD_v2(PB + 40, loc(S), 8); cuMemcpyHtoD_v2(PB + 48, loc(D), 8); cuMemcpyHtoD_v2(PB + 56, loc(EN), 8)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(dn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { return 40 }
+        cuMemcpyHtoD_v2(PB + 0, loc(x), 8); cuMemcpyHtoD_v2(PB + 8, loc(dy), 8); cuMemcpyHtoD_v2(PB + 16, loc(dw), 8)
+        cuMemcpyHtoD_v2(PB + 24, loc(S), 8); cuMemcpyHtoD_v2(PB + 32, loc(D), 8); cuMemcpyHtoD_v2(PB + 40, loc(EN), 8)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(nw)), (D + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { return 41 }
+        cuCtxSynchronize()
+        e = dumpf(dx, S*D, "native/out/bwd3_dx.txt"); if (e != 0) { return 50 }
+        e = dumpf(dw, D, "native/out/bwd3_dw.txt"); if (e != 0) { return 51 }
+        println("BWD3_PROBE_DONE")
+        return 0
+    }
+    return 0
+}

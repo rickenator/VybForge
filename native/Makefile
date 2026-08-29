@@ -104,6 +104,12 @@ bwd-lora: $(ROOT)/native/build/backprop.ptx
 	cd $(ROOT) && $(VYB) native/train/bwd2_probe.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_bwd2.py
 
+# T3.3 dRMSNorm grads (dx = dy.w.inv - x.inv^3.T/D ; dw row-sum) vs analytic reference.
+bwd-norm: $(ROOT)/native/build/backprop.ptx
+	cd $(ROOT) && .venv/bin/python native/train/bwd3_ref.py
+	cd $(ROOT) && $(VYB) native/train/bwd3_probe.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_bwd3.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
