@@ -1,6 +1,6 @@
 // Backward (gradient) kernels for Vyb-native LoRA training. Consume the forward
 // activation cache; each is verified element-wise against a numpy reference.
-import vmath::{vexp, vsqrt}
+import vmath::{vexp, vsqrt, vcos, vsin}
 
 // dSiLU: given cached gate g and up u, and the upstream gradient dhu of hu =
 // silu(g)*u, produce dg and du (elementwise over n).
@@ -151,5 +151,62 @@ dnormw(p<Int>) -> {
             acc = acc + ld_f64(dY + (s * D + d) * 8) * ld_f64(X + (s * D + d) * 8) * inv
         }
         st_f64(dW + d * 8, acc)
+    }
+}
+
+// dRoPE adjoint (split-half rotary): the forward is, per half-pair (i, i+half),
+//   [out_i, out_{i+half}] = [[c,-sn],[sn,c]] . [x_i, x_{i+half}]
+// with c=cos((POS+s)*freq[i]), sn=sin(...) (angles fixed, not learned). Backward:
+//   dx_i = c*d_i + sn*d_{i+half} ;  dx_{i+half} = -sn*d_i + c*d_{i+half}.
+// Reads the upstream grad of the ROPED q/k (Q/K), writes grad of the PRE-rope (Qd/Kd).
+// Params (as qwen3rope): +80 Q(dq) +88 K(dk) +96 Qd(dxq) +104 Kd(dxk) +176 FR
+//   +184 S +200 HD +208 H +216 KVH +224 POS.
+drope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    shd<Int> = S * H * half
+    skd<Int> = S * KVH * half
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * half)
+            rem<Int> = gid % (H * half)
+            hh<Int> = rem / half
+            i2<Int> = rem % half
+            ang<Float> = ((POS + s) as Float) * ld_f64(FR + i2 * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            base<Int> = Q + (s * H * HD + hh * HD) * 8
+            di<Float> = ld_f64(base + i2 * 8)
+            dy2<Float> = ld_f64(base + (i2 + half) * 8)
+            neg<Float> = 0.0 - sn
+            st_f64(Qd + (s * H * HD + hh * HD + i2) * 8, c * di + sn * dy2)
+            st_f64(Qd + (s * H * HD + hh * HD + i2 + half) * 8, neg * di + c * dy2)
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * half)
+            rem2<Int> = g2 % (KVH * half)
+            hh2<Int> = rem2 / half
+            i3<Int> = rem2 % half
+            ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + i3 * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            base2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            ei<Float> = ld_f64(base2 + i3 * 8)
+            ej<Float> = ld_f64(base2 + (i3 + half) * 8)
+            neg2<Float> = 0.0 - sn2
+            st_f64(Kd + (s2 * KVH * HD + hh2 * HD + i3) * 8, c2 * ei + sn2 * ej)
+            st_f64(Kd + (s2 * KVH * HD + hh2 * HD + i3 + half) * 8, neg2 * ei + c2 * ej)
+        }
     }
 }
