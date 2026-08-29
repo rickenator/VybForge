@@ -210,3 +210,134 @@ drope(p<Int>) -> {
         }
     }
 }
+
+// Zero a device f64 buffer (n elements) — for clearing gradient accumulators. 4-arg.
+zbuf(b<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) { st_f64(b + gid * 8, 0.0) }
+}
+
+// dAttention (causal, grouped-query, scaled-softmax) backward. One thread per (s,h).
+// Forward (query row s, head h, kvh=h/(H/KVH)): scores_t = scale*(q.k_t) for t<=s;
+// a_t=exp(sc_t-mx); w_t=a_t/ssum; ctx = sum_t w_t v_t.  Backward produces the grads of
+// the pre-attention Q,K,V (roped q/k) using the SOFTMAX backward + atomics for the
+// cross-query accumulation into dK/dV (caller zeroes dK/dV first).
+// Params: +80 Q +88 K +96 V +104 dCtx +112 dQ +120 dK +128 dV
+//   +184 S +200 HD +208 H +216 KVH. (232-byte buffer.)
+dattn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    dC<Int> = ld_i64(p + 104)
+    dQ<Int> = ld_i64(p + 112)
+    dK<Int> = ld_i64(p + 120)
+    dV<Int> = ld_i64(p + 128)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    total<Int> = S * H
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / H
+        h<Int> = gid % H
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        # pass 1: row max over causal t<=s
+        mx<Float> = -1000000000000000000000000000000.0
+        t<Int> = 0
+        for (t in 0..s) {
+            sc<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                sc = sc + ld_f64(qb + d * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d) * 8)
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        # pass 2: ssum (denominator), recomputing a_t
+        ssum<Float> = 0.0
+        for (t in 0..s) {
+            sc2<Float> = 0.0
+            d2<Int> = 0
+            for (d2 in 0..HD - 1) {
+                sc2 = sc2 + ld_f64(qb + d2 * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d2) * 8)
+            }
+            ssum = ssum + vexp(sc2 * scale - mx)
+        }
+        # pass 3: mean_w_l = sum_t w_t * l_t,  l_t = dC.v_t
+        mean<Float> = 0.0
+        for (t in 0..s) {
+            sc3<Float> = 0.0
+            d3<Int> = 0
+            for (d3 in 0..HD - 1) {
+                sc3 = sc3 + ld_f64(qb + d3 * 8) * ld_f64(K + (t * KVH * HD + kvh * HD + d3) * 8)
+            }
+            aa<Float> = vexp(sc3 * scale - mx)
+            ww<Float> = aa / ssum
+            ll<Float> = 0.0
+            d4<Int> = 0
+            for (d4 in 0..HD - 1) {
+                ll = ll + ld_f64(dC + (s * H * HD + h * HD + d4) * 8) * ld_f64(V + (t * KVH * HD + kvh * HD + d4) * 8)
+            }
+            mean = mean + ww * ll
+        }
+        # dQ[row s] = scale * sum_t dsc_t * k_t  (unique per (s,h) -> direct write)
+        dqb<Int> = dQ + (s * H * HD + h * HD) * 8
+        ll5m<Float> = 0.0
+        dqj<Int> = 0
+        for (dqj in 0..HD - 1) {
+            accq<Float> = 0.0
+            t5<Int> = 0
+            for (t5 in 0..s) {
+                sc5<Float> = 0.0
+                d5<Int> = 0
+                for (d5 in 0..HD - 1) {
+                    sc5 = sc5 + ld_f64(qb + d5 * 8) * ld_f64(K + (t5 * KVH * HD + kvh * HD + d5) * 8)
+                }
+                aa5<Float> = vexp(sc5 * scale - mx)
+                ww5<Float> = aa5 / ssum
+                ll5<Float> = 0.0
+                d6<Int> = 0
+                for (d6 in 0..HD - 1) {
+                    ll5 = ll5 + ld_f64(dC + (s * H * HD + h * HD + d6) * 8) * ld_f64(V + (t5 * KVH * HD + kvh * HD + d6) * 8)
+                }
+                ll5m = ll5 - mean
+                dsc5<Float> = aa5 * ll5m / ssum
+                accq = accq + dsc5 * ld_f64(K + (t5 * KVH * HD + kvh * HD + dqj) * 8)
+            }
+            st_f64(dqb + dqj * 8, scale * accq)
+        }
+        # dK/dV via atomic accumulation over causal t
+        ll7m<Float> = 0.0
+        t7<Int> = 0
+        for (t7 in 0..s) {
+            sc7<Float> = 0.0
+            d7<Int> = 0
+            for (d7 in 0..HD - 1) {
+                sc7 = sc7 + ld_f64(qb + d7 * 8) * ld_f64(K + (t7 * KVH * HD + kvh * HD + d7) * 8)
+            }
+            aa7<Float> = vexp(sc7 * scale - mx)
+            ww7<Float> = aa7 / ssum
+            ll7<Float> = 0.0
+            d8<Int> = 0
+            for (d8 in 0..HD - 1) {
+                ll7 = ll7 + ld_f64(dC + (s * H * HD + h * HD + d8) * 8) * ld_f64(V + (t7 * KVH * HD + kvh * HD + d8) * 8)
+            }
+            ll7m = ll7 - mean
+            dsc7<Float> = aa7 * ll7m / ssum
+            kb<Int> = K + (t7 * KVH * HD + kvh * HD) * 8
+            dkb<Int> = dK + (t7 * KVH * HD + kvh * HD) * 8
+            dvb<Int> = dV + (t7 * KVH * HD + kvh * HD) * 8
+            dbc<Int> = dC + (s * H * HD + h * HD) * 8
+            d9<Int> = 0
+            for (d9 in 0..HD - 1) {
+                atomic_add_f64(dkb + d9 * 8, scale * dsc7 * ld_f64(qb + d9 * 8))
+                atomic_add_f64(dvb + d9 * 8, ww7 * ld_f64(dbc + d9 * 8))
+            }
+        }
+    }
+}
+
