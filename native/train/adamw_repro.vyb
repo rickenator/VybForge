@@ -1,0 +1,105 @@
+// Standalone repro: does a small-n (8/6) TWO-launch adamw params-buffer context make
+// the v-moment store inconsistent? Guaranteed preloaded gradients; m=v=0 init.
+// If vU/vV return != 0.001*g^2, the anomalous store is reproduced in isolation.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
+            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        return 0
+    }
+    return 0
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
+    freedom {
+        match (open_write(path)) {
+            w -> { rv<Float> = 0.0; k<Int> = 0
+                for (k in 0..count - 1) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), src + k * 8, 8); write_str(w, rv.to_string() + "\n") }
+                close(w) }
+            ? -> { return 17 }
+        }
+    }
+    return 0
+}
+
+main()<Int> -> {
+    N1<Int> = 8; N2<Int> = 6
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        md<loc<CVoid>> = from<loc<CVoid>>(0); rcm<CInt> = -1; t4<Int> = 0
+        for (t4 in 0..5) { if (rcm != 0) { md = from<loc<CVoid>>(0); rcm = cuModuleLoadData(loc(md), read_bin("native/build/backprop.ptx")) } }
+        if (rcm != 0) { println("MODLOAD_FAIL"); return 9 }
+        aw<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(aw), md, "adamw") != 0) { return 10 }
+
+        pU<Int> = 0; gU<Int> = 0; mU<Int> = 0; vU<Int> = 0
+        pV<Int> = 0; gV<Int> = 0; mV<Int> = 0; vV<Int> = 0
+        AU<Int> = 0; AV<Int> = 0
+        if (cuMemAlloc_v2(loc(pU), N1*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(gU), N1*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(mU), N1*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(vU), N1*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(pV), N2*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(gV), N2*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(mV), N2*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(vV), N2*8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(AU), 96) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(AV), 96) != 0) { return 11 }
+        e<Int> = download(read_bin("native/out/rp_gU.bin"), gU, N1*8); if (e != 0) { return 20 }
+        e = download(read_bin("native/out/rp_gV.bin"), gV, N2*8); if (e != 0) { return 21 }
+        ZR<Float> = 0.0
+        LR<Float> = 0.05; B1<Float> = 0.9; B2<Float> = 0.999; EP<Float> = 0.00000001; WD<Float> = 0.01
+        # zero p,m,v via zbuf? just leave uninitialized except v we read; kernels write m,v,p
+        cuMemcpyHtoD_v2(AU+0, loc(pU),8); cuMemcpyHtoD_v2(AU+8, loc(gU),8); cuMemcpyHtoD_v2(AU+16, loc(mU),8); cuMemcpyHtoD_v2(AU+24, loc(vU),8)
+        cuMemcpyHtoD_v2(AU+32, loc(LR),8); cuMemcpyHtoD_v2(AU+40, loc(B1),8); cuMemcpyHtoD_v2(AU+48, loc(B2),8); cuMemcpyHtoD_v2(AU+56, loc(EP),8)
+        cuMemcpyHtoD_v2(AU+64, loc(WD),8); cuMemcpyHtoD_v2(AU+72, loc(ZR),8); cuMemcpyHtoD_v2(AU+80, loc(ZR),8); cuMemcpyHtoD_v2(AU+88, loc(N1),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(aw)), (N1+255)/256, 1,1, 256,1,1, AU,0,0,0)
+        cuMemcpyHtoD_v2(AV+0, loc(pV),8); cuMemcpyHtoD_v2(AV+8, loc(gV),8); cuMemcpyHtoD_v2(AV+16, loc(mV),8); cuMemcpyHtoD_v2(AV+24, loc(vV),8)
+        cuMemcpyHtoD_v2(AV+32, loc(LR),8); cuMemcpyHtoD_v2(AV+40, loc(B1),8); cuMemcpyHtoD_v2(AV+48, loc(B2),8); cuMemcpyHtoD_v2(AV+56, loc(EP),8)
+        cuMemcpyHtoD_v2(AV+64, loc(WD),8); cuMemcpyHtoD_v2(AV+72, loc(ZR),8); cuMemcpyHtoD_v2(AV+80, loc(ZR),8); cuMemcpyHtoD_v2(AV+88, loc(N2),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(aw)), (N2+255)/256, 1,1, 256,1,1, AV,0,0,0)
+        cuCtxSynchronize()
+        e = dumpf(vU, N1, "native/out/rp_vU_out.txt"); if (e != 0) { return 30 }
+        e = dumpf(vV, N2, "native/out/rp_vV_out.txt"); if (e != 0) { return 31 }
+        println("ADAMW_REPRO_DONE")
+        return 0
+    }
+    return 0
+}
