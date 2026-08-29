@@ -1,0 +1,67 @@
+# T1 ground-truth build, Vyb-native: tokenize real corpus records into token ids +
+# cross-entropy targets (labels = shifted ids over the assistant response region).
+# For each sampled train record this reads the JSONL, takes the assistant content
+# text, encodes it with the Vyb Qwen3 tokenizer, and prints:
+#   ASST <i>: <raw response text>  =>  [id0, id1, ...]
+#   LABELS <i>: {ce_id0, ce_id1, ...}  (next-token; last position is a padding/ignore)
+# A python reference (native/train/verify_encode_corpus.py) re-parses the same JSONL
+# and compares the id sequences to transformers `encode(text, add_special_tokens=False)`.
+import io::{open_read, read_all, close}
+import tokenizer::{encode}
+import json_parse
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+fmt_ids(ids<Vec<Int>>)<String> -> {
+    out<String> = "["
+    k<Int> = 0
+    for (k in 0..ids.len() - 1) {
+        if (k > 0) { out = out + " " }
+        out = out + ids.get(k).to_string()
+    }
+    return out + "]"
+}
+
+main()<Int> -> {
+    s<String> = readf("data/vybos-configurator-train.jsonl")
+    sl<Int> = s.len()
+    st<Int> = 0
+    i<Int> = 0
+    SAMPLE<Int> = 4
+    k<Int> = 0
+    for (k in 0..sl - 1) {
+        if ((s.char_at(k) as Int) == 10) {
+            line<String> = s.substring(st, k)
+            st = k + 1
+            if (line.len() > 2 && i < SAMPLE) {
+                match (json_parse(line)) {
+                    rec -> {
+                        msg<Int> = rec.get(rec.root, "messages")
+                        if (msg != -1) {
+                            asst<Int> = rec.elem(msg, rec.len(msg) - 1)
+                            content<String> = rec.hstr(rec.get(asst, "content"))
+                            ids<Vec<Int>> = encode(content)
+                            println("ASST " + i.to_string() + ": " + content + "  =>  " + fmt_ids(ids))
+                            # labels = shifted ids (predict next token). Last id is padding.
+                            lbl<String> = "["
+                            j<Int> = 0
+                            for (j in 1..ids.len() - 1) {
+                                if (j > 1) { lbl = lbl + " " }
+                                lbl = lbl + ids.get(j).to_string()
+                            }
+                            lbl = lbl + " -1]"
+                            println("LABELS " + i.to_string() + ": " + lbl)
+                        }
+                    }
+                    ? -> { }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return 0
+}

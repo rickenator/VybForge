@@ -79,6 +79,12 @@ gdecode-pipeline:
 schemacheck:
 	cd $(ROOT) && $(VYB) tests/test_schema.vyb --module-path native/json
 
+# T1 ground truth: tokenize real corpus responses -> token ids + CE labels with the
+# Vyb Qwen3 tokenizer, cross-checked against transformers (reference only).
+encode-corpus:
+	cd $(ROOT) && $(VYB) native/train/encode_corpus.vyb --module-path native/tokenizer --module-path native/json
+	cd $(ROOT) && .venv/bin/python native/train/verify_encode_corpus.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
