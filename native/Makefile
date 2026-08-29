@@ -98,6 +98,12 @@ bwd-probe: $(ROOT)/native/build/backprop.ptx
 	cd $(ROOT) && $(VYB) native/train/bwd_probe.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_bwd.py
 
+# T3.2 dGEMM + LoRA grads (dU/dV/ds/dx via dgemm_at/dgemm_bt) vs analytic reference.
+bwd-lora: $(ROOT)/native/build/backprop.ptx
+	cd $(ROOT) && .venv/bin/python native/train/bwd2_ref.py
+	cd $(ROOT) && $(VYB) native/train/bwd2_probe.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_bwd2.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

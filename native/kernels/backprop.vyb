@@ -37,3 +37,51 @@ dresid(dy<Int>, da<Int>, db<Int>, n<Int>) -> {
         st_f64(db + gid * 8, vv)
     }
 }
+
+// dGEMM-A: dX = dY @ W^T. For C = A @ B (A=[S,K],B=[K,O]) backprop to A:
+//   dA[s,k] = sum_o dC[s,o] * B[k,o].
+// Params: +0 dY (=[S,O]), +8 W (=[K,O]), +16 dX (=[S,K]), +24 S, +32 K, +40 O.
+dgemm_at(p<Int>) -> {
+    dY<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    dX<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    K<Int> = ld_i64(p + 32)
+    O<Int> = ld_i64(p + 40)
+    total<Int> = S * K
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / K
+        k<Int> = gid % K
+        acc<Float> = 0.0
+        o<Int> = 0
+        for (o in 0..O - 1) {
+            acc = acc + ld_f64(dY + (s * O + o) * 8) * ld_f64(W + (k * O + o) * 8)
+        }
+        st_f64(dX + (s * K + k) * 8, acc)
+    }
+}
+
+// dGEMM-B: dW = X^T @ dY. For C = A @ B (A=[S,K],B=[K,O]) backprop to B:
+//   dB[k,o] = sum_s A[s,k] * dC[s,o].
+// Params: +0 X (=[S,K]), +8 dY (=[S,O]), +16 dW (=[K,O]), +24 S, +32 K, +40 O.
+dgemm_bt(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    dY<Int> = ld_i64(p + 8)
+    dW<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    K<Int> = ld_i64(p + 32)
+    O<Int> = ld_i64(p + 40)
+    total<Int> = K * O
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        k<Int> = gid / O
+        o<Int> = gid % O
+        acc<Float> = 0.0
+        s<Int> = 0
+        for (s in 0..S - 1) {
+            acc = acc + ld_f64(X + (s * K + k) * 8) * ld_f64(dY + (s * O + o) * 8)
+        }
+        st_f64(dW + (k * O + o) * 8, acc)
+    }
+}
