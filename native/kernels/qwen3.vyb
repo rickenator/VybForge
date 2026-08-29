@@ -1,0 +1,145 @@
+// Qwen3-specific kernels (sm_86) — the pieces the shared layer.vyb set can't
+// express. layer.vyb's rope is the PAIRS (LLaMA) form; Qwen3 uses the SPLIT-HALF
+// rotary (transformers rotate_half: out = x*cos + cat(-xR, xL)*sin) with
+// cos/sin = cos/sin(cat(freqs,freqs)), freqs[i]=pos*base^(-2i/HD), base=5e6.
+import vmath::{vexp, vsin, vcos, vsqrt}
+
+// Qwen3 split-half rotary on Q[S,H,HD] and K[S,KVH,HD], reading srcs, writing
+// dsts (separate buffers avoid read/write races). Each thread = one output
+// element. Theta repeats every HD/2: cos/sin angle for index i uses FR[i%half].
+// Params buffer:
+//   +80 Qsrc +88 Ksrc +96 Qdst +104 Kdst +176 FR(inv_freq[half])
+//   +184 S +200 HD +208 H +216 KVH +224 POS (absolute position base; row r -> pos POS+r)
+qwen3rope(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    FR<Int> = ld_i64(p + 176)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    shd<Int> = S * H * HD
+    skd<Int> = S * KVH * HD
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * HD)
+            rem<Int> = gid % (H * HD)
+            hh<Int> = rem / HD
+            i<Int> = rem % HD
+            ang<Float> = ((POS + s) as Float) * ld_f64(FR + (i % half) * 8)
+            c<Float> = vcos(ang)
+            sn<Float> = vsin(ang)
+            src<Int> = Q + (s * H * HD + hh * HD) * 8
+            v0<Float> = ld_f64(src + i * 8)
+            if (i < half) {
+                v1<Float> = ld_f64(src + (i + half) * 8)
+                st_f64(Qd + gid * 8, v0 * c - v1 * sn)
+            } else {
+                v1<Float> = ld_f64(src + (i - half) * 8)
+                st_f64(Qd + gid * 8, v0 * c + v1 * sn)
+            }
+        } else {
+            g2<Int> = gid - shd
+            s2<Int> = g2 / (KVH * HD)
+            rem2<Int> = g2 % (KVH * HD)
+            hh2<Int> = rem2 / HD
+            i2<Int> = rem2 % HD
+            ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + (i2 % half) * 8)
+            c2<Float> = vcos(ang2)
+            sn2<Float> = vsin(ang2)
+            src2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
+            v0<Float> = ld_f64(src2 + i2 * 8)
+            if (i2 < half) {
+                v1<Float> = ld_f64(src2 + (i2 + half) * 8)
+                st_f64(Kd + g2 * 8, v0 * c2 - v1 * sn2)
+            } else {
+                v1<Float> = ld_f64(src2 + (i2 - half) * 8)
+                st_f64(Kd + g2 * 8, v0 * c2 + v1 * sn2)
+            }
+        }
+    }
+}
+
+// Expand F32 norm weights to f64 device buffer: out[gid] = f32(src[gid]).
+// Params: +0 src, +8 dst, +16 n.
+f32expand(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f32(src + gid * 4)
+        st_f64(dst + gid * 8, v)
+    }
+}
+
+// Transpose the tied lm_head embedding [V,D] (vocab-major) into [D,V] so the
+// shared row-major gemm can compute hidden @ emb^T. Params: +0 src, +8 dst,
+// +16 D, +24 V. Thread = one element: v = gid/D, d = gid%D.
+trans_emb(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    D<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    nn<Int> = D * V
+    if (gid < nn) {
+        v<Int> = gid / D
+        d<Int> = gid % D
+        st_f64(dst + (d * V + v) * 8, ld_f64(src + gid * 8))
+    }
+}
+
+// Per-token logits for a vocab slice, reading emb [V,D] directly (no transpose):
+// Log[s, Vstart+gid] = sum_{d<D} H[s*D+d] * Emb[(Vstart+gid)*D+d].
+// Chunked launches keep each grid <= a few dozen blocks (large multi-block
+// launches silently truncate in this build). Params: +0 H +8 Emb +16 Log
+// +24 s +32 D +40 Vstart +48 Vend +56 V (full vocab stride).
+logits_slice(p<Int>) -> {
+    H<Int> = ld_i64(p + 0)
+    Emb<Int> = ld_i64(p + 8)
+    Log<Int> = ld_i64(p + 16)
+    s<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    Vstart<Int> = ld_i64(p + 40)
+    Vend<Int> = ld_i64(p + 48)
+    V<Int> = ld_i64(p + 56)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < Vend - Vstart) {
+        vs<Int> = Vstart + gid
+        acc<Float> = 0.0
+        d<Int> = 0
+        for (d in 0..D - 1) {
+            hv<Float> = ld_f64(H + (s * D + d) * 8)
+            ev<Float> = ld_f64(Emb + (vs * D + d) * 8)
+            acc = acc + hv * ev
+        }
+        st_f64(Log + (s * V + vs) * 8, acc)
+    }
+}
+// Per-token argmax over a [S,V] f64 logits buffer -> S ints (tied lm_head top-1).
+// Params: +0 C, +8 Out, +16 S, +24 V. Grid = S.
+argmax_row(p<Int>) -> {
+    C<Int> = ld_i64(p + 0)
+    Out<Int> = ld_i64(p + 8)
+    S<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S) {
+        rbase<Int> = C + gid * V * 8
+        best<Int> = 0
+        bv<Float> = ld_f64(rbase + 0)
+        i<Int> = 0
+        for (i in 1..V - 1) {
+            v2<Float> = ld_f64(rbase + i * 8)
+            if (v2 > bv) { bv = v2; best = i }
+        }
+        st_i64(Out + gid * 8, best)
+    }
+}

@@ -85,6 +85,13 @@ decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
 
+# KV-cache decode: builds the seed forward once (caching per-layer roped-K/V), then
+# each gen step computes ONLY the new position. Must reproduce the same token stream
+# as decode-real (verified against the same numpy reference).
+decode-kv: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && $(VYB) native/host/kv_driver.vyb
+	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="

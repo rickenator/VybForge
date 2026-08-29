@@ -134,7 +134,13 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    == numpy. Fixes: vexp NaN→1e14 loop clamp (native/kernels/vmath.vyb), per-layer mixed
    quant offsets+kernels, per-layer norms, and a greedy re-embed bug in `decode_ref.py`
    (was carrying hidden forward instead of re-embedding the full prefix).
-6. kv-cache decode (per-layer cached k/v) to stop recomputing the whole prefix.
+6. **kv-cache decode DONE & VERIFIED**: `native/host/kv_driver.vyb` builds the seed forward once via
+   `run_layer` (caching each layer's roped-K/V into per-layer `[MAXS,NKV]` cache slabs), then each gen
+   step `run_kv` computes ONLY the new position (k/v cached, attention attends the new q over cached
+   K/V). `make decode-kv` → **DECODE_REAL_MATCH: OK**, same tokens as the recompute decode and numpy.
+   `qwen3rope` gained a +224 POS (base-position) param for single-row roping; decode/model drivers set
+   +224=0 (ROP alloc 232). Gotcha hit: single-row rmsnorm/rope `S` is 1 (using 0 launches zero threads,
+   collapses the stream to a constant token).
 7. Qwen3-8B dogfood (fetch).
 Vyb-native **training** is a separate, later research-scale plan.
 

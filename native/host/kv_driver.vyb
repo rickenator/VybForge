@@ -237,6 +237,145 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
     return 0
 }
 
+// KV-cache forward of ONE new position P through one layer. N1/Nq/Nk/N2/W* must
+// already hold layer L's norms/weights (caller loads+dequants). XI = input hidden
+// base [MAXS,D] (layer 0 -> EMB, then ping-pong HA/HB); writes output hidden row P
+// to XO. KC/VC = this layer's k/v cache slabs ([MAXS,NKV]); stores this position's
+// roped-K/V into row P and attends against rows 0..P. Build pass reuses run_layer +
+// an explicit cache copy instead.
+run_kv(Sctx<Int>, P<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
+       EPS<Float>, XI<Int>, XO<Int>, KC<Int>, VC<Int>,
+       gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
+       GM<Int>, RN<Int>, ATT<Int>, ROP<Int>,
+       N1<Int>, Nq<Int>, Nk<Int>, N2<Int>,
+       Wq<Int>, Wk<Int>, Wv<Int>, Wo<Int>, Wg<Int>, Wu<Int>, Wd<Int>, DF<Int>,
+       XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
+       DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>)<Int> -> {
+    freedom {
+        AF<Float> = 1.0; BF<Float> = 0.0
+        zro<Int> = 0
+        one<Int> = 1
+        xpi<Int> = XI + P * D * 8
+        xni<Int> = XN + P * D * 8
+        # rmsnorm input row P -> XN row P (S=1,D)
+        cuMemcpyHtoD_v2(RN + 0, loc(xpi), 8); cuMemcpyHtoD_v2(RN + 8, loc(N1), 8); cuMemcpyHtoD_v2(RN + 16, loc(xni), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        # q: XN row P @ Wq -> DQ row P
+        gA<Int> = xni; gB<Int> = Wq; gC<Int> = DQ + P * NQ * 8; gM<Int> = 1; gN<Int> = NQ; gK<Int> = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # k: XN row P @ Wk -> DK row P
+        gA = xni; gB = Wk; gC = DK + P * NKV * 8; gM = 1; gN = NKV; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # v: XN row P @ Wv -> DV row P
+        gA = xni; gB = Wv; gC = DV + P * NKV * 8; gM = 1; gN = NKV; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # q_norm: DQ row P as [H,HD] -> DQN row P (S=H,D=HD)
+        cuMemcpyHtoD_v2(RN + 0, loc(DQ + P * NQ * 8), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nq), 8); cuMemcpyHtoD_v2(RN + 16, loc(DQN + P * NQ * 8), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(H), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (NQ + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        # k_norm: DK row P as [KVH,HD] -> DKN row P
+        cuMemcpyHtoD_v2(RN + 0, loc(DK + P * NKV * 8), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nk), 8); cuMemcpyHtoD_v2(RN + 16, loc(DKN + P * NKV * 8), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(KVH), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (NKV + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        # rope at absolute position P (S=1): qn row P -> qr row P, kn row P -> kr row P
+        cuMemcpyHtoD_v2(ROP + 80, loc(DQN + P * NQ * 8), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN + P * NKV * 8), 8)
+        cuMemcpyHtoD_v2(ROP + 96, loc(DQr + P * NQ * 8), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr + P * NKV * 8), 8)
+        cuMemcpyHtoD_v2(ROP + 176, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 184, loc(one), 8)
+        cuMemcpyHtoD_v2(ROP + 200, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 208, loc(H), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVH), 8)
+        cuMemcpyHtoD_v2(ROP + 224, loc(P), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (NQ + NKV + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        # store this position's rope'd-K -> KC row P, V -> VC row P
+        if (cuMemcpyDtoD_v2(KC + P * NKV * 8, DKr + P * NKV * 8, NKV * 8) != 0) { return 15 }
+        if (cuMemcpyDtoD_v2(VC + P * NKV * 8, DV + P * NKV * 8, NKV * 8) != 0) { return 15 }
+        # attn: new q (DQr row P) over cached K/KV (KC/VC rows 0..P) -> ctx row P (S=Sctx)
+        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(KC), 8); cuMemcpyHtoD_v2(ATT + 96, loc(VC), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
+        cuMemcpyHtoD_v2(ATT + 184, loc(Sctx), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8); cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (Sctx * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        # o: ctx row P @ Wo -> DO row P (M=1,N=D,K=NQ)
+        gA = DCtx + P * NQ * 8; gB = Wo; gC = DO + P * D * 8; gM = 1; gN = D; gK = NQ
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # resid: xpi + DO row P -> X1 row P
+        cuda_launch4i(from<loc<CVoid>>(addr(refn)), (D + 255) / 256, 1, 1, 256, 1, 1, xpi, DO + P * D * 8, X1 + P * D * 8, D)
+        # ffn_norm: X1 row P -> X1N row P (S=1,D)
+        cuMemcpyHtoD_v2(RN + 0, loc(X1 + P * D * 8), 8); cuMemcpyHtoD_v2(RN + 8, loc(N2), 8); cuMemcpyHtoD_v2(RN + 16, loc(X1N + P * D * 8), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        # gate: X1N row P @ Wg -> Gr row P (M=1,N=FF,K=D)
+        gA = X1N + P * D * 8; gB = Wg; gC = Gr + P * FF * 8; gM = 1; gN = FF; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # up: X1N row P @ Wu -> Up row P
+        gA = X1N + P * D * 8; gB = Wu; gC = Up + P * FF * 8; gM = 1; gN = FF; gK = D
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # silu: Gr row P * Up row P -> Hu row P (n=FF)
+        cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (FF + 255) / 256, 1, 1, 256, 1, 1, Gr + P * FF * 8, Up + P * FF * 8, Hu + P * FF * 8, FF)
+        # down: Hu row P @ Wd -> M row P (M=1,N=D,K=FF)
+        gA = Hu + P * FF * 8; gB = Wd; gC = M + P * D * 8; gM = 1; gN = D; gK = FF
+        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        # resid: X1 row P + M row P -> XO row P
+        cuda_launch4i(from<loc<CVoid>>(addr(refn)), (D + 255) / 256, 1, 1, 256, 1, 1, X1 + P * D * 8, M + P * D * 8, XO + P * D * 8, D)
+        return 0
+    }
+    return 0
+}
+
+// lm_head prediction from hidden row `row` of hb: output_norm row -> DH row,
+// chunked logits_slice row -> DL row, argmax_row -> token id. Reads AO/returns.
+lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DH<Int>, DE<Int>, DL<Int>, AO<Int>,
+        rfn<loc<CVoid>>, lsfn<loc<CVoid>>, arfn<loc<CVoid>>, RN<Int>, LSP<Int>, A4<Int>)<Int> -> {
+    freedom {
+        one<Int> = 1
+        hbrow<Int> = hb + row * D * 8
+        dhrow<Int> = DH + row * D * 8
+        cuMemcpyHtoD_v2(RN + 0, loc(hbrow), 8); cuMemcpyHtoD_v2(RN + 8, loc(ON), 8); cuMemcpyHtoD_v2(RN + 16, loc(dhrow), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        LCH<Int> = 16384
+        vs2<Int> = 0
+        ve2<Int> = 0
+        rc_sl<CInt> = 0
+        while (vs2 < VOCAB) {
+            ve2 = vs2 + LCH
+            if (ve2 > VOCAB) { ve2 = VOCAB }
+            cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
+            cuMemcpyHtoD_v2(LSP + 24, loc(row), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
+            cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
+            rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
+            if (rc_sl != 0) { return 92 }
+            vs2 = ve2
+        }
+        cuMemcpyHtoD_v2(A4 + 0, loc(DL + row * VOCAB * 8), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
+        cuMemcpyHtoD_v2(A4 + 16, loc(one), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+        cuCtxSynchronize()
+        nxt<Int> = 0
+        cuMemcpyDtoH_v2(loc(nxt), AO, 8)
+        return nxt
+    }
+    return 0
+}
+
 main()<Int> -> {
     D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728
     NQ<Int> = H * HD; NKV<Int> = KVH * HD; VOCAB<Int> = 151936
@@ -367,6 +506,7 @@ main()<Int> -> {
         XN<Int> = 0; DQ<Int> = 0; DQN<Int> = 0; DQr<Int> = 0; DK<Int> = 0; DKN<Int> = 0; DKr<Int> = 0; DV<Int> = 0
         DCtx<Int> = 0; DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
+        KC<Int> = 0; VC<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
@@ -401,6 +541,9 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Up), MAXS * FF * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Hu), MAXS * FF * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(M), MAXS * D * 8) != 0) { return 11 }
+        # KV caches: per-layer slabs [NLAYER][MAXS][NKV] for roped-K and V
+        if (cuMemAlloc_v2(loc(KC), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(VC), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DL), MAXS * VOCAB * 8) != 0) { return 11 }   # [MAXS, V] rows for per-step logits
         if (cuMemAlloc_v2(loc(AO), 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
@@ -475,77 +618,87 @@ main()<Int> -> {
             w -> {
                 match (write_str(w, "0\n")) { q -> { } ? -> { return 17 } }
                 match (write_str(w, "1\n")) { q -> { } ? -> { return 17 } }
-                g<Int> = 0
-                Scur<Int> = 0
                 nxt<Int> = 0
-                rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
-                for (g in 0..GEN - 1) {
-                    Scur = SEEDLEN + g
-                    cur<Int> = EMB
-                    println("DECG step " + g.to_string() + " Scur=" + Scur.to_string())
-                    L = 0
+                cur<Int> = EMB
+                tgt<Int> = 0; kcslab<Int> = 0; vcslab<Int> = 0
+                avt<Int> = 0; fdt<Int> = 0
+                avq<loc<CVoid>> = q4fn; fdq<loc<CVoid>> = q4fn
+                # ===== BUILD: forward seed (S=SEEDLEN) via run_layer, cache each layer's
+                # roped-K/V for positions 0..SEEDLEN-1, predict the next token (position SEEDLEN).
+                for (L in 0..NLAYER - 1) {
+                    ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
+                    ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
+                    ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
+                    ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
+                    e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
+                    avt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
+                    avq = q4fn
+                    if (avt == 14) { avq = q6fn }
+                    e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
+                    fdt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
+                    fdq = q4fn
+                    if (fdt == 14) { fdq = q6fn }
+                    e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
+                    tgt = HA
+                    if ((L % 2) == 1) { tgt = HB }
+                    e = run_layer(SEEDLEN, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
+                                  gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
+                                  N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
+                                  XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
+                    if (e != 0) { return 71 }
+                    cur = tgt
+                    # cache this layer's roped-K / V for the SEEDLEN seed positions
+                    kcslab = KC + L * MAXS * NKV * 8
+                    vcslab = VC + L * MAXS * NKV * 8
+                    if (cuMemcpyDtoD_v2(kcslab + 0, DKr + 0, SEEDLEN * NKV * 8) != 0) { return 15 }
+                    if (cuMemcpyDtoD_v2(vcslab + 0, DV + 0, SEEDLEN * NKV * 8) != 0) { return 15 }
+                }
+                nxt = lm_next(cur, SEEDLEN - 1, D, VOCAB, EPS, ON, DH, DE, DL, AO, rfn, lsfn, arfn, RN, LSP, A4)
+                match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                copy_row(DE, nxt, D, EMB + SEEDLEN * D * 8)
+                println("KV BUILD token=" + nxt.to_string())
+                # ===== KV steps: compute ONLY the new position P each step; predict token@P+1.
+                P<Int> = 0
+                for (P in SEEDLEN..SEEDLEN + GEN - 2) {
+                    xin<Int> = EMB
+                    Sctx<Int> = P + 1
                     for (L in 0..NLAYER - 1) {
-                        println("DECG L" + L.to_string() + " deqstart")
-                        # per-layer RMSNorm weights (differ every layer — load layer L's)
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
                         e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
                         e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
-                        # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
-                        avt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-                        avq<loc<CVoid>> = q4fn
+                        avt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
+                        avq = q4fn
                         if (avt == 14) { avq = q6fn }
                         e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
                         e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
                         e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
                         e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
-                        # ffn_down: kernel by this layer's real quant type
-                        fdt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-                        fdq<loc<CVoid>> = q4fn
+                        fdt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
+                        fdq = q4fn
                         if (fdt == 14) { fdq = q6fn }
                         e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
-                        println("DECG deqdone L" + L.to_string())
-                        tgt<Int> = HA
+                        tgt = HA
                         if ((L % 2) == 1) { tgt = HB }
-                        e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
-                                      gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                      N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
-                                      XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
-                        if (e != 0) { return 71 }
-                        cur = tgt
-                        println("DECG layer " + L.to_string() + " done")
+                        kcslab = KC + L * MAXS * NKV * 8
+                        vcslab = VC + L * MAXS * NKV * 8
+                        e = run_kv(Sctx, P, D, H, KVH, HD, FF, NQ, NKV, EPS, xin, tgt, kcslab, vcslab,
+                                   gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
+                                   N1, Nq, Nk, N2, Wq, Wk, Wv, Wo, Wg, Wu, Wd, DF,
+                                   XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
+                        if (e != 0) { return 72 }
+                        xin = tgt
                     }
-                    println("DECG forward done")
-                    rA = cur; rB = ON; rC = DH
-                    cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-                    cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-                    cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Scur * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-                    LCH<Int> = 16384
-                    s7<Int> = Scur - 1
-                    vs2<Int> = 0
-                    ve2<Int> = 0
-                    rc_sl<CInt> = 0
-                    while (vs2 < VOCAB) {
-                        ve2 = vs2 + LCH
-                        if (ve2 > VOCAB) { ve2 = VOCAB }
-                        cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
-                        cuMemcpyHtoD_v2(LSP + 24, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
-                        cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
-                        rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
-                        if (rc_sl != 0) { return 92 }
-                        vs2 = ve2
-                    }
-                    cuMemcpyHtoD_v2(A4 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
-                    cuMemcpyHtoD_v2(A4 + 16, loc(1), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
-                    cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
-                    cuCtxSynchronize()
-                    nxt = 0
-                    cuMemcpyDtoH_v2(loc(nxt), AO, 8)
+                    nxt = lm_next(xin, P, D, VOCAB, EPS, ON, DH, DE, DL, AO, rfn, lsfn, arfn, RN, LSP, A4)
                     match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
-                    copy_row(DE, nxt, D, EMB + Scur * D * 8)
-                    println("GEN step " + g.to_string() + " token=" + nxt.to_string())
+                    copy_row(DE, nxt, D, EMB + (P + 1) * D * 8)
+                    println("KV step P=" + P.to_string() + " token=" + nxt.to_string())
                 }
                 close(w)
             }
