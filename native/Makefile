@@ -154,6 +154,13 @@ train-full-forward: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_full.py
 
+# M2e-2 FULL 36-layer LoRA backward -> per-projection grads + chained dx, vs numpy oracle.
+train-full-back: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_full_ref.py
+	cd $(ROOT) && .venv/bin/python native/train/train_full_back_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_full_back.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_back.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

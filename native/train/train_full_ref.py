@@ -92,5 +92,6 @@ for L in range(36):
     c = all_cache[L]
     for t in kept:
         np.savetxt(os.path.join(out, f"m2e_L{L}_{t}_ref.txt"), c[t].reshape(-1), fmt="%.9g")
+        c[t].reshape(-1).astype("<f8").tofile(os.path.join(out, f"m2e_L{L}_{t}.bin"))
 np.savetxt(os.path.join(out, "m2e_hidden_ref.txt"), all_cache[35]["xo"].reshape(-1), fmt="%.17g")
 print("M2E1_REF_DONE layers=36 final hidden norm", np.linalg.norm(all_cache[35]["xo"]))

@@ -1,0 +1,543 @@
+// M2e-2: FULL 36-layer Qwen3-4B LoRA BACKWARD on GPU, chained L=35..0, pure Vyb.
+// Consumes the M2e-1 cached activations (.bin) + per-layer weights + LoRA U/V from
+// native/out/m2e_L{layer}_* , plus upstream grad m2e_dG.bin. Produces per-layer dU/dV
+// (m2e_L{layer}_dU{nm}_vyb.txt / dV) and chains dx. Uses train.ptx (single-module).
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> { i<Int> = st; for (i in st..s.len()-1){ if((s.char_at(i) as Int)==nd){ return i } }; return -1 }
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> { a<Int> = 0; i<Int> = frm; for (i in frm..endp-1){ c<Int> = (s.char_at(i) as Int); if(c>=48){ if(c<=57){ a=a*10+(c-48) } } }; return a }
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> { n<Int> = 1; seg<Int> = frm; i<Int> = frm; for (i in frm..endp-1){ if((s.char_at(i) as Int)==120){ n=n*parse_u(s,seg,i); seg=i+1 } }; n=n*parse_u(s,seg,endp); return n }
+packed_bytes(numel<Int>, ty<Int>)<Int> -> { if(ty==12){ return numel*144/256 }; if(ty==14){ return numel*210/256 }; return numel*4 }
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> { i<Int> = 0; for (i in 0..nmv.len()-1){ if(nmv.get(i)==nm){ return i } }; return -1 }
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes-(nbytes%8); ci<Int> = 0
+        for (ci in 0..(npb/8)-1){ o8<Int> = ci*8; ch<Int> = 0; bj<Int> = 0; for (bj in 0..7){ bv<Int> = u8(data,o8+bj); ch=ch|(bv<<(bj*8)) }; if(cuMemcpyHtoD_v2(dst+o8,loc(ch),8)!=0){ return 15 } }
+        tj<Int> = npb; while(tj<nbytes){ by<Int> = u8(data,tj); if(cuMemcpyHtoD_v2(dst+tj,loc(by),1)!=0){ return 15 }; tj=tj+1 }
+        return 0
+    }
+    return 0
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_at(f,off,nbytes)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
+read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+    data<String> = read_model(path,off,nb); if(data.len()<nb){ return 32 }
+    freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,0); if(rc!=0){ return 33 }; return 0 }
+    return 0
+}
+load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
+    data<String> = read_model(path,off,numel*4); if(data.len()<numel*4){ return 32 }
+    freedom { e<Int> = download(data,dpack,numel*4); if(e!=0){ return e }; cuMemcpyHtoD_v2(pf+0,loc(dpack),8); cuMemcpyHtoD_v2(pf+8,loc(dout),8); cuMemcpyHtoD_v2(pf+16,loc(numel),8); rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)),(numel+255)/256,1,1,256,1,1,pf,0,0,0); if(rc!=0){ return 33 }; return 0 }
+    return 0
+}
+stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>, nm<String>, dpk<Int>, pf<Int>, dout<Int>, q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>)<Int> -> {
+    idx<Int> = find_nm(nmv,nm); if(idx<0){ return 60 }
+    off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
+    if(ty==12){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q4fn) }
+    if(ty==14){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q6fn) }
+    return load_norm(path,pf,dpk,dout,off,numel,efn)
+}
+
+
+main()<Int> -> {
+    S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
+    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0; MAXL<Int> = 36
+    R2<Int> = R
+    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    TSV<String> = "native/out/qwen3_4b_tensors.tsv"
+    freedom {
+        if(cuInit(0)!=0){ println("SKIP"); return 0 }
+        var<CInt> ndev=0
+        if(cuDeviceGetCount(loc(ndev))!=0 || ndev<1){ println("SKIP"); return 0 }
+        var<CInt> dev=0; if(cuDeviceGet(loc(dev),0)!=0){ return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if(cuCtxCreate_v2(loc(ctx),0,dev)!=0){ return 14 }
+    }
+    freedom {
+        # ---- TSV ----
+        nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+        bff<String> = read_bin(TSV); ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
+        for (i in 0..ln-1){ if((bff.char_at(i) as Int)==10){ t1<Int> = strchr(bff,9,st); if(t1>=st){ t2<Int> = strchr(bff,9,t1+1); if(t2<0){ t2=i }; nm<String> = bff.substring(st,t1); if(nm.substring(0,4)=="blk."){ t3<Int> = strchr(bff,9,t2+1); if(t3<0){ t3=i }; t4<Int> = strchr(bff,9,t3+1); if(t4<0){ t4=i }; nmv.push(nm); tyv.push(parse_u(bff,t2+1,t3)); nlv.push(parse_numel(bff,t1+1,t2)); ofv.push(parse_u(bff,t3+1,t4)) } }; st=i+1 } }
+        println("TSV="+nmv.len().to_string()); if(nmv.len()<374){ println("TSV_PARSE_FAIL"); return 2 }
+        # ---- module load (single) ----
+        m<loc<CVoid>> = from<loc<CVoid>>(0); rc<CInt> = -1; t4<Int> = 0
+        for (t4 in 0..5){ if(rc!=0){ m=from<loc<CVoid>>(0); rc=cuModuleLoadData(loc(m),read_bin("native/build/train.ptx")) } }
+        if(rc!=0){ println("MODLOAD_FAIL"); return 9 }
+        dres<loc<CVoid>> =from<loc<CVoid>>(0); dga<loc<CVoid>> =from<loc<CVoid>>(0); dgb<loc<CVoid>> =from<loc<CVoid>>(0)
+        sc2<loc<CVoid>> =from<loc<CVoid>>(0); dsl<loc<CVoid>> =from<loc<CVoid>>(0); drn<loc<CVoid>> =from<loc<CVoid>>(0)
+        dnw<loc<CVoid>> =from<loc<CVoid>>(0); drp<loc<CVoid>> =from<loc<CVoid>>(0); dat2<loc<CVoid>> =from<loc<CVoid>>(0)
+        zbf<loc<CVoid>> =from<loc<CVoid>>(0); ads<loc<CVoid>> =from<loc<CVoid>>(0)
+        q4fn<loc<CVoid>> =from<loc<CVoid>>(0); q6fn<loc<CVoid>> =from<loc<CVoid>>(0); efn<loc<CVoid>> =from<loc<CVoid>>(0)
+        if(cuModuleGetFunction(loc(dres),m,"dresid")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(dga),m,"dgemm_at")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(dgb),m,"dgemm_bt")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(sc2),m,"scalec")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(dsl),m,"dsilu")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(drn),m,"drmsnorm")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(dnw),m,"dnormw")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(drp),m,"drope")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(dat2),m,"dattn")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(zbf),m,"zbuf")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(ads),m,"addscaled")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(q4fn),m,"q4kdeq")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(q6fn),m,"q6kdeq")!=0){ return 10 }
+        if(cuModuleGetFunction(loc(efn),m,"f32expand")!=0){ return 10 }
+        # ---- weight sizes ----
+        i0<Int> = find_nm(nmv,"blk.0.attn_q.weight"); wq_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.attn_k.weight"); wk_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.attn_v.weight"); wv_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.attn_output.weight"); wo_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.ffn_gate.weight"); wg_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.ffn_up.weight"); wu_nl<Int> = nlv.get(i0)
+        i0=find_nm(nmv,"blk.0.ffn_down.weight"); wd_nl<Int> = nlv.get(i0)
+        # ===== allocations (match the backward block) =====
+        Wq<Int> = 0; Wk<Int> = 0; Wv<Int> = 0; Wo<Int> = 0; Wg<Int> = 0; Wu<Int> = 0; Wd<Int> = 0
+        N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; DF<Int> = 0
+        XN<Int> = 0; DQ<Int> = 0; DK<Int> = 0; DV<Int> = 0; X1<Int> = 0; X1N<Int> = 0
+        DQr<Int> = 0; DKr<Int> = 0; DCtx<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; x<Int> = 0
+        Uq<Int> =0; Vq<Int> =0; Uk<Int> =0; Vk<Int> =0; Uv<Int> =0; Vv<Int> =0; Uo<Int> =0; Vo<Int> =0
+        Ug<Int> =0; Vg<Int> =0; Uu<Int> =0; Vu<Int> =0; Ud<Int> =0; Vd<Int> =0
+        sq<Int> = 0; sk<Int> = 0; sv<Int> = 0; so<Int> = 0; sg<Int> = 0; su<Int> = 0; sd<Int> = 0
+        DG<Int> =0; DX1<Int> =0; DM<Int> =0; dHu<Int> =0; dgate<Int> =0; dup<Int> =0
+        dUo2<Int> =0; dVp2<Int> =0; dCtx2<Int> =0; dX1n2<Int> =0; dX1la<Int> =0
+        gvd<Int> =0; ds_d<Int> =0; dU_d2<Int> =0; dV_d2<Int> =0; dxld<Int> =0; dxbd<Int> =0
+        gvg<Int> =0; ds_g<Int> =0; dU_g2<Int> =0; dV_g2<Int> =0; dxlg<Int> =0; dxbg<Int> =0
+        gvu<Int> =0; ds_u<Int> =0; dU_u2<Int> =0; dV_u2<Int> =0; dxlu<Int> =0; dxbu<Int> =0
+        gvo<Int> =0; ds_o2<Int> =0; dU_o2<Int> =0; dV_o2<Int> =0; dxlo<Int> =0; dxbo<Int> =0
+        gvq<Int> =0; ds_q<Int> =0; dU_q2<Int> =0; dV_q2<Int> =0; dxlq<Int> =0; dxbq<Int> =0
+        gvk<Int> =0; ds_k<Int> =0; dU_k2<Int> =0; dV_k2<Int> =0; dxlk<Int> =0; dxbk<Int> =0
+        gvv<Int> =0; ds_v<Int> =0; dU_v2<Int> =0; dV_v2<Int> =0; dxlv<Int> =0; dxbv<Int> =0
+        dQr2<Int> =0; dKr2<Int> =0; dVu2<Int> =0; dQn2<Int> =0; dKn2<Int> =0; dq2<Int> =0; dk2<Int> =0
+        dXN2<Int> =0; dN1b<Int> =0; dN2b<Int> =0; dNqb<Int> =0; dNkb<Int> =0
+        DPK<Int> =0; GM<Int> =0; PB<Int> =0; DGP<Int> =0; ROP<Int> =0; ATT<Int> =0; PF<Int> =0
+
+if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wk),wk_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wv),wv_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wo),wo_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wg),wg_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wu),wu_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Wd),wd_nl*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(N1),D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Nq),HD*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Nk),HD*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(N2),D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DF),64*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(x),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(XN),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DQ),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DK),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DV),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DQr),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DKr),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DCtx),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(X1),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(X1N),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Gr),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Up),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Hu),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Uq),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Uk),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Uv),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Ug),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Uu),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Uo),NQ*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Ud),FF*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vq),R*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vk),R*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vv),R*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vo),R*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vd),R*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vg),R*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(Vu),R*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(sq),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(sk),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(sv),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(so),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(sg),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(su),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(sd),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DG),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DX1),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DM),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dHu),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dgate),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dup),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dUo2),NQ*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dVp2),R*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dCtx2),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dX1n2),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dX1la),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvd),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_d),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_d2),FF*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_d2),R*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxld),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbd),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvg),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_g),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_g2),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_g2),R*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlg),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbg),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvu),S*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_u),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_u2),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_u2),R*FF*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlu),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbu),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvo),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_o2),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_o2),NQ*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_o2),R*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlo),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbo),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvq),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_q),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_q2),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_q2),R*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlq),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbq),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvk),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_k),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_k2),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_k2),R*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlk),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbk),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(gvv),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ds_v),S*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dU_v2),D*R*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dV_v2),R*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxlv),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dxbv),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dQr2),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dKr2),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dVu2),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dQn2),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dKn2),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dq2),S*NQ*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dk2),S*NKV*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dXN2),S*D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dN1b),D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dN2b),D*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dNqb),HD*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(dNkb),HD*8)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DPK),(wd_nl*210)/256)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(GM),64)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(PB),32)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(DGP),48)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ROP),232)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(ATT),224)!=0){ return 11 }
+if(cuMemAlloc_v2(loc(PF),24)!=0){ return 11 }
+        e<Int> = 0
+        fg<String> = read_bin("native/out/m2e_dG.bin"); if(fg.len()<S*D*8){ println("DG_MISSING"); return 40 }
+        e=download(fg,DG,S*D*8); if(e!=0){ return 41 }
+        fb2<String> = read_bin("native/out/layer0_invfreq.bin"); if(fb2.len()<64*8){ return 44 }
+        e=download(fb2,DF,64*8); if(e!=0){ return 45 }
+        SB<Int> = S*D; SF<Int> = S*FF; SNQ<Int> = S*NQ; SNKV<Int> = S*NKV; SR<Int> = S*R
+        SHP<Int> = S*H; SKP<Int> = S*KVH
+        L<Int> = 0; Li<Int> = 0
+        for (Li in 0..MAXL-1){  # ascending; L = MAXL-1-Li gives 35..0
+            L = MAXL - 1 - Li
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_x.bin"),x,S*D*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_xn.bin"),XN,S*D*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_q.bin"),DQ,S*NQ*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_k.bin"),DK,S*NKV*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_v.bin"),DV,S*NKV*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_qr.bin"),DQr,S*NQ*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_kr.bin"),DKr,S*NKV*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_ctx.bin"),DCtx,S*NQ*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_x1.bin"),X1,S*D*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_x1n.bin"),X1N,S*D*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_gate.bin"),Gr,S*FF*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_up.bin"),Up,S*FF*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_hu.bin"),Hu,S*FF*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_q.bin"),sq,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_k.bin"),sk,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_v.bin"),sv,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_o.bin"),so,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_g.bin"),sg,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_u.bin"),su,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_L"+L.to_string()+"_s_d.bin"),sd,S*R*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Uq.bin"),Uq,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vq.bin"),Vq,8192*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Uk.bin"),Uk,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vk.bin"),Vk,2048*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Uv.bin"),Uv,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vv.bin"),Vv,2048*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Uo.bin"),Uo,8192*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vo.bin"),Vo,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Ug.bin"),Ug,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vg.bin"),Vg,19456*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Uu.bin"),Uu,5120*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vu.bin"),Vu,19456*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Ud.bin"),Ud,19456*8); if(e!=0){ return 200 }
+            e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vd.bin"),Vd,5120*8); if(e!=0){ return 200 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q.weight",DPK,PF,Wq,q4fn,q6fn,efn); if(e!=0){ return 60 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k.weight",DPK,PF,Wk,q4fn,q6fn,efn); if(e!=0){ return 61 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_v.weight",DPK,PF,Wv,q4fn,q6fn,efn); if(e!=0){ return 62 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_output.weight",DPK,PF,Wo,q4fn,q6fn,efn); if(e!=0){ return 63 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_gate.weight",DPK,PF,Wg,q4fn,q6fn,efn); if(e!=0){ return 64 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_up.weight",DPK,PF,Wu,q4fn,q6fn,efn); if(e!=0){ return 65 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_down.weight",DPK,PF,Wd,q4fn,q6fn,efn); if(e!=0){ return 66 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_norm.weight",DPK,PF,N1,q4fn,q6fn,efn); if(e!=0){ return 67 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q_norm.weight",DPK,PF,Nq,q4fn,q6fn,efn); if(e!=0){ return 68 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k_norm.weight",DPK,PF,Nk,q4fn,q6fn,efn); if(e!=0){ return 69 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_norm.weight",DPK,PF,N2,q4fn,q6fn,efn); if(e!=0){ return 70 }
+                    SB<Int> = S*D; SF<Int> = S*FF; SNQ<Int> = S*NQ; SNKV<Int> = S*NKV; SR<Int> = S*R
+                    ONE2<Float> = 1.0; AR2<Float> = 2.0; ZR2<Float> = 0.0
+                    # 1) residual xo = x1 + m  -> dx1, dm
+                    rr<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(dres)),(SB+255)/256,1,1,256,1,1,DG,DX1,DM,SB); if(rr!=0){ println("E dres "+ (rr as Int).to_string()); return 90 }
+                    cuCtxSynchronize()
+                    # 2) down proj m = Hu@Wd + LoRA_d
+                    cuMemcpyHtoD_v2(PB+0,loc(gvd),8); cuMemcpyHtoD_v2(PB+8,loc(DM),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SB),8)
+                    rr=cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SB+255)/256,1,1,256,1,1,PB,0,0,0); if(rr!=0){ println("E sc2 "+ (rr as Int).to_string()); return 90 }   # gvd
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvd),8); cuMemcpyHtoD_v2(DGP+8,loc(Vd),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_d),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    rr=cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0); if(rr!=0){ println("E dga "+ (rr as Int).to_string()); return 90 }  # ds_d
+                    cuMemcpyHtoD_v2(DGP+0,loc(Hu),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_d),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_d2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(FF),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(FF*R2+255)/256,1,1,256,1,1,DGP,0,0,0)  # dU_d = Hu^T ds_d
+                    cuCtxSynchronize()
+                    cuMemcpyHtoD_v2(DGP+0,loc(sd),8); cuMemcpyHtoD_v2(DGP+8,loc(gvd),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_d2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*D+255)/256,1,1,256,1,1,DGP,0,0,0)  # dV_d = s_d^T gvd
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_d),8); cuMemcpyHtoD_v2(DGP+8,loc(Ud),8); cuMemcpyHtoD_v2(DGP+16,loc(dxld),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(FF),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SF+255)/256,1,1,256,1,1,DGP,0,0,0)    # dxld=ds_d@Ud^T
+                    cuMemcpyHtoD_v2(DGP+0,loc(DM),8); cuMemcpyHtoD_v2(DGP+8,loc(Wd),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbd),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(FF),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SF+255)/256,1,1,256,1,1,DGP,0,0,0)    # dxbd=DM@Wd^T
+                    cuMemcpyHtoD_v2(PB+0,loc(dxbd),8); cuMemcpyHtoD_v2(PB+8,loc(dxld),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(SF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(SF+255)/256,1,1,256,1,1,PB,0,0,0)     # dHu = dxbd + dxld
+                    # 3) silu
+                    cuMemcpyHtoD_v2(DGP+0,loc(Gr),8); cuMemcpyHtoD_v2(DGP+8,loc(Up),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbd),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(dgate),8); cuMemcpyHtoD_v2(DGP+32,loc(dup),8); cuMemcpyHtoD_v2(DGP+40,loc(SF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dsl)),(SF+255)/256,1,1,256,1,1,DGP,0,0,0)   # dgate,dup = dsilu(Gr,Up,dHu)
+                    # 4) gate proj
+                    cuMemcpyHtoD_v2(PB+0,loc(gvg),8); cuMemcpyHtoD_v2(PB+8,loc(dgate),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SF+255)/256,1,1,256,1,1,PB,0,0,0)   # gvg=AR*dgate
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvg),8); cuMemcpyHtoD_v2(DGP+8,loc(Vg),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_g),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)   # ds_g
+                    cuMemcpyHtoD_v2(DGP+0,loc(X1N),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_g),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_g2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(D*R2+255)/256,1,1,256,1,1,DGP,0,0,0)  # dU_g
+                    cuMemcpyHtoD_v2(DGP+0,loc(sg),8); cuMemcpyHtoD_v2(DGP+8,loc(gvg),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_g2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*FF+255)/256,1,1,256,1,1,DGP,0,0,0) # dV_g
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_g),8); cuMemcpyHtoD_v2(DGP+8,loc(Ug),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlg),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)  # dxlg
+                    cuMemcpyHtoD_v2(DGP+0,loc(dgate),8); cuMemcpyHtoD_v2(DGP+8,loc(Wg),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbg),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)  # dxbg
+                    cuMemcpyHtoD_v2(PB+0,loc(dxbg),8); cuMemcpyHtoD_v2(PB+8,loc(dxlg),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)   # d_xn_g = dxbg+dxlg -> dxbg
+                    # 5) up proj (same -> dxbu as d_xn_u)
+                    cuMemcpyHtoD_v2(PB+0,loc(gvu),8); cuMemcpyHtoD_v2(PB+8,loc(dup),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SF+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvu),8); cuMemcpyHtoD_v2(DGP+8,loc(Vu),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_u),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(X1N),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_u),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_u2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(D*R2+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(su),8); cuMemcpyHtoD_v2(DGP+8,loc(gvu),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_u2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*FF+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_u),8); cuMemcpyHtoD_v2(DGP+8,loc(Uu),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlu),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(dup),8); cuMemcpyHtoD_v2(DGP+8,loc(Wu),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbu),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(FF),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(PB+0,loc(dxbu),8); cuMemcpyHtoD_v2(PB+8,loc(dxlu),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)  # d_xn_u = dxbu
+                    # 6) dX1n = d_xn_g + d_xn_u -> dX1n2
+                    cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(S*D+255)/256,1,1,256,1,1,dX1n2,S*D,0,0)  # zero dX1n2
+                    cuMemcpyHtoD_v2(PB+0,loc(dX1n2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbg),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)   # dX1n2 += dxbg
+                    cuMemcpyHtoD_v2(PB+0,loc(dX1n2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbu),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    # 7) ffn rmsnorm backward: drmsnorm(X1,N2,dX1n2 -> dX1la), dnormw -> dN2b ; then dX1 += dX1la
+                    cuMemcpyHtoD_v2(GM+0,loc(X1),8); cuMemcpyHtoD_v2(GM+8,loc(N2),8); cuMemcpyHtoD_v2(GM+16,loc(dX1n2),8)
+                    cuMemcpyHtoD_v2(GM+24,loc(dX1la),8); cuMemcpyHtoD_v2(GM+32,loc(dN2b),8)
+                    cuMemcpyHtoD_v2(GM+40,loc(S),8); cuMemcpyHtoD_v2(GM+48,loc(D),8); cuMemcpyHtoD_v2(GM+56,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(drn)),(S*D+255)/256,1,1,256,1,1,GM,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(X1),8); cuMemcpyHtoD_v2(DGP+8,loc(dX1n2),8); cuMemcpyHtoD_v2(DGP+16,loc(dN2b),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dnw)),(D+255)/256,1,1,256,1,1,DGP,0,0,0)   # dnormw
+                    cuMemcpyHtoD_v2(PB+0,loc(DX1),8); cuMemcpyHtoD_v2(PB+8,loc(dX1la),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)   # DX1 += dX1la
+                    # 8) o proj: dctx2 = do@Wo^T + lora,  do = DX1
+                    cuMemcpyHtoD_v2(PB+0,loc(gvo),8); cuMemcpyHtoD_v2(PB+8,loc(DX1),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvo),8); cuMemcpyHtoD_v2(DGP+8,loc(Vo),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_o2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(DCtx),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_o2),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_o2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(NQ),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(NQ*R2+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(so),8); cuMemcpyHtoD_v2(DGP+8,loc(gvo),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_o2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_o2),8); cuMemcpyHtoD_v2(DGP+8,loc(Uo),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlo),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(NQ),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SNQ+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(DX1),8); cuMemcpyHtoD_v2(DGP+8,loc(Wo),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbo),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(NQ),8); cuMemcpyHtoD_v2(DGP+40,loc(D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SNQ+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(SNQ+255)/256,1,1,256,1,1,dCtx2,SNQ,0,0)  # zero dCtx2
+                    cuMemcpyHtoD_v2(PB+0,loc(dCtx2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbo),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(SNQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(SNQ+255)/256,1,1,256,1,1,PB,0,0,0)   # dCtx2 += dxbo
+                    cuMemcpyHtoD_v2(PB+0,loc(dCtx2),8); cuMemcpyHtoD_v2(PB+8,loc(dxlo),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(SNQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(SNQ+255)/256,1,1,256,1,1,PB,0,0,0)  # dCtx2 += dxlo
+                    # 9) attention backward (zero dKr2,dVu2 first)
+                    cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(SNKV+255)/256,1,1,256,1,1,dKr2,SNKV,0,0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(SNKV+255)/256,1,1,256,1,1,dVu2,SNKV,0,0)
+                    cuMemcpyHtoD_v2(ATT+80,loc(DQr),8); cuMemcpyHtoD_v2(ATT+88,loc(DKr),8); cuMemcpyHtoD_v2(ATT+96,loc(DV),8); cuMemcpyHtoD_v2(ATT+104,loc(dCtx2),8)
+                    cuMemcpyHtoD_v2(ATT+112,loc(dQr2),8); cuMemcpyHtoD_v2(ATT+120,loc(dKr2),8); cuMemcpyHtoD_v2(ATT+128,loc(dVu2),8)
+                    cuMemcpyHtoD_v2(ATT+184,loc(S),8); cuMemcpyHtoD_v2(ATT+200,loc(HD),8); cuMemcpyHtoD_v2(ATT+208,loc(H),8); cuMemcpyHtoD_v2(ATT+216,loc(KVH),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dat2)),(S*H+255)/256,1,1,256,1,1,ATT,0,0,0)
+                    # 10) rope adjoint
+                    cuMemcpyHtoD_v2(ROP+80,loc(dQr2),8); cuMemcpyHtoD_v2(ROP+88,loc(dKr2),8); cuMemcpyHtoD_v2(ROP+96,loc(dQn2),8); cuMemcpyHtoD_v2(ROP+104,loc(dKn2),8)
+                    cuMemcpyHtoD_v2(ROP+176,loc(DF),8); cuMemcpyHtoD_v2(ROP+184,loc(S),8); cuMemcpyHtoD_v2(ROP+200,loc(HD),8)
+                    cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8); cuMemcpyHtoD_v2(ROP+224,loc(POS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(drp)),(SHP*HD+SKP*HD+255)/256,1,1,256,1,1,ROP,0,0,0)
+                    # 11) q,norm,k,norm backward
+                    cuMemcpyHtoD_v2(GM+0,loc(DQ),8); cuMemcpyHtoD_v2(GM+8,loc(Nq),8); cuMemcpyHtoD_v2(GM+16,loc(dQn2),8)
+                    cuMemcpyHtoD_v2(GM+24,loc(dq2),8); cuMemcpyHtoD_v2(GM+32,loc(dNqb),8)
+                    cuMemcpyHtoD_v2(GM+40,loc(SHP),8); cuMemcpyHtoD_v2(GM+48,loc(HD),8); cuMemcpyHtoD_v2(GM+56,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(drn)),(SHP*HD+255)/256,1,1,256,1,1,GM,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(DQ),8); cuMemcpyHtoD_v2(DGP+8,loc(dQn2),8); cuMemcpyHtoD_v2(DGP+16,loc(dNqb),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(SHP),8); cuMemcpyHtoD_v2(DGP+32,loc(HD),8); cuMemcpyHtoD_v2(DGP+40,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dnw)),(HD+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(GM+0,loc(DK),8); cuMemcpyHtoD_v2(GM+8,loc(Nk),8); cuMemcpyHtoD_v2(GM+16,loc(dKn2),8)
+                    cuMemcpyHtoD_v2(GM+24,loc(dk2),8); cuMemcpyHtoD_v2(GM+32,loc(dNkb),8)
+                    cuMemcpyHtoD_v2(GM+40,loc(SKP),8); cuMemcpyHtoD_v2(GM+48,loc(HD),8); cuMemcpyHtoD_v2(GM+56,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(drn)),(SKP*HD+255)/256,1,1,256,1,1,GM,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(DK),8); cuMemcpyHtoD_v2(DGP+8,loc(dKn2),8); cuMemcpyHtoD_v2(DGP+16,loc(dNkb),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(SKP),8); cuMemcpyHtoD_v2(DGP+32,loc(HD),8); cuMemcpyHtoD_v2(DGP+40,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dnw)),(HD+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    # 12) q,k,v proj backward -> dXN
+                    cuMemcpyHtoD_v2(PB+0,loc(gvq),8); cuMemcpyHtoD_v2(PB+8,loc(dq2),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SNQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SNQ+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvq),8); cuMemcpyHtoD_v2(DGP+8,loc(Vq),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_q),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(XN),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_q),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_q2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(D*R2+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(sq),8); cuMemcpyHtoD_v2(DGP+8,loc(gvq),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_q2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*NQ+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_q),8); cuMemcpyHtoD_v2(DGP+8,loc(Uq),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlq),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(dq2),8); cuMemcpyHtoD_v2(DGP+8,loc(Wq),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbq),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(NQ),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    # k proj
+                    cuMemcpyHtoD_v2(PB+0,loc(gvk),8); cuMemcpyHtoD_v2(PB+8,loc(dk2),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SNKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SNKV+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvk),8); cuMemcpyHtoD_v2(DGP+8,loc(Vk),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_k),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(XN),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_k),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_k2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(D*R2+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(sk),8); cuMemcpyHtoD_v2(DGP+8,loc(gvk),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_k2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*NKV+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_k),8); cuMemcpyHtoD_v2(DGP+8,loc(Uk),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlk),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(dk2),8); cuMemcpyHtoD_v2(DGP+8,loc(Wk),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbk),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    # v proj (use dVu2 as dout)
+                    cuMemcpyHtoD_v2(PB+0,loc(gvv),8); cuMemcpyHtoD_v2(PB+8,loc(dVu2),8); cuMemcpyHtoD_v2(PB+16,loc(AR2),8); cuMemcpyHtoD_v2(PB+24,loc(SNKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(sc2)),(SNKV+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(gvv),8); cuMemcpyHtoD_v2(DGP+8,loc(Vv),8); cuMemcpyHtoD_v2(DGP+16,loc(ds_v),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(SR+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(XN),8); cuMemcpyHtoD_v2(DGP+8,loc(ds_v),8); cuMemcpyHtoD_v2(DGP+16,loc(dU_v2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(D*R2+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(sv),8); cuMemcpyHtoD_v2(DGP+8,loc(gvv),8); cuMemcpyHtoD_v2(DGP+16,loc(dV_v2),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(R2),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dgb)),(R2*NKV+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(ds_v),8); cuMemcpyHtoD_v2(DGP+8,loc(Uv),8); cuMemcpyHtoD_v2(DGP+16,loc(dxlv),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(R2),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(dVu2),8); cuMemcpyHtoD_v2(DGP+8,loc(Wv),8); cuMemcpyHtoD_v2(DGP+16,loc(dxbv),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(NKV),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dga)),(S*D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    # accumulate dXN = q+k+v (dxbq,dxbk,dxbv + dxl*)
+                    cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(S*D+255)/256,1,1,256,1,1,dXN2,S*D,0,0)  # zero dXN2
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbq),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)   # dXN2 += dxbq
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxlq),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbk),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxlk),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxbv),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    cuMemcpyHtoD_v2(PB+0,loc(dXN2),8); cuMemcpyHtoD_v2(PB+8,loc(dxlv),8); cuMemcpyHtoD_v2(PB+16,loc(ONE2),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+                    # 13) input rmsnorm backward -> dx
+                    cuMemcpyHtoD_v2(GM+0,loc(x),8); cuMemcpyHtoD_v2(GM+8,loc(N1),8); cuMemcpyHtoD_v2(GM+16,loc(dXN2),8)
+                    cuMemcpyHtoD_v2(GM+24,loc(dX1la),8); cuMemcpyHtoD_v2(GM+32,loc(dN1b),8)
+                    cuMemcpyHtoD_v2(GM+40,loc(S),8); cuMemcpyHtoD_v2(GM+48,loc(D),8); cuMemcpyHtoD_v2(GM+56,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(drn)),(S*D+255)/256,1,1,256,1,1,GM,0,0,0)
+                    cuMemcpyHtoD_v2(DGP+0,loc(x),8); cuMemcpyHtoD_v2(DGP+8,loc(dXN2),8); cuMemcpyHtoD_v2(DGP+16,loc(dN1b),8)
+                    cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(EPS),8)
+                    cuda_launch4i(from<loc<CVoid>>(addr(dnw)),(D+255)/256,1,1,256,1,1,DGP,0,0,0)
+                    cuCtxSynchronize()
+            e=dumpf(dU_q2,5120,"native/out/m2e_L"+L.to_string()+"_Uq_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_q2,8192,"native/out/m2e_L"+L.to_string()+"_Vq_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_k2,5120,"native/out/m2e_L"+L.to_string()+"_Uk_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_k2,2048,"native/out/m2e_L"+L.to_string()+"_Vk_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_v2,5120,"native/out/m2e_L"+L.to_string()+"_Uv_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_v2,2048,"native/out/m2e_L"+L.to_string()+"_Vv_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_o2,8192,"native/out/m2e_L"+L.to_string()+"_Uo_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_o2,5120,"native/out/m2e_L"+L.to_string()+"_Vo_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_g2,5120,"native/out/m2e_L"+L.to_string()+"_Ug_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_g2,19456,"native/out/m2e_L"+L.to_string()+"_Vg_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_u2,5120,"native/out/m2e_L"+L.to_string()+"_Uu_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_u2,19456,"native/out/m2e_L"+L.to_string()+"_Vu_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dU_d2,19456,"native/out/m2e_L"+L.to_string()+"_Ud_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dV_d2,5120,"native/out/m2e_L"+L.to_string()+"_Vd_vyb.txt"); if(e!=0){ return 90 }
+            e=dumpf(dX1la,S*D,"native/out/m2e_L"+L.to_string()+"_dx_vyb.txt"); if(e!=0){ return 90 }
+            i2<Int> = 0; fv<Float> = 0.0
+            for (i2 in 0..S*D-1){ fv=0.0; cuMemcpyDtoH_v2(loc(fv),dX1la+i2*8,8); cuMemcpyHtoD_v2(DG+i2*8,loc(fv),8) }
+            cuCtxSynchronize()
+            println("M2E bwd layer "+L.to_string()+" done")
+        }
+        println("M2E2_DONE layers="+MAXL.to_string())
+        return 0
+    }
+    return 0
+}
