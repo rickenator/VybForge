@@ -215,7 +215,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 main()<Int> -> {
     S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
-    MAXL<Int> = 36; NSTP<Int> = 1; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
+    MAXL<Int> = 36; NSTP<Int> = 5; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
@@ -579,10 +579,10 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
 
 
         # ---- loss: dG = xo - t (xo now in XI) ----
-        cuda_launch4i(from<loc<CVoid>>(addr(sbb)),(S*D+255)/256,1,1,256,1,1,XI,TGT,dG,S*D)
+        cuda_launch4i(from<loc<CVoid>>(addr(sbb)),(S*D+255)/256,1,1,256,1,1,XI,TGT,DG,S*D)
         cuCtxSynchronize()
         lv<Float> = 0.0; rl<Int> = 0; rvv<Float> = 0.0
-        for (rl in 0..S*D-1){ rvv=0.0; cuMemcpyDtoH_v2(loc(rvv),dG+rl*8,8); lv=lv+rvv*rvv }
+        for (rl in 0..S*D-1){ rvv=0.0; cuMemcpyDtoH_v2(loc(rvv),DG+rl*8,8); lv=lv+rvv*rvv }
         lsc<Float> = (0.5 * lv) / (S as Float) / (D as Float)
         println("M2E3 loss step "+stp_d.to_string()+" = "+lsc.to_string())
         losstr = losstr + lsc.to_string() + "\n"
@@ -857,10 +857,10 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
             # (DX1 = dG + ffn-norm-back). Without +DX1 each layer drops the skip connection and
             # gradients to lower layers vanish (FD-verified: analytic L0 dU was 1e-18 vs FD 7.6).
             ONE3<Float> = 1.0
-            cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(S*D+255)/256,1,1,256,1,1,dG,S*D,0,0)
-            cuMemcpyHtoD_v2(PB+0,loc(dG),8); cuMemcpyHtoD_v2(PB+8,loc(DX1),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+            cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(S*D+255)/256,1,1,256,1,1,DG,S*D,0,0)
+            cuMemcpyHtoD_v2(PB+0,loc(DG),8); cuMemcpyHtoD_v2(PB+8,loc(DX1),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
             cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
-            cuMemcpyHtoD_v2(PB+0,loc(dG),8); cuMemcpyHtoD_v2(PB+8,loc(dX1la),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+            cuMemcpyHtoD_v2(PB+0,loc(DG),8); cuMemcpyHtoD_v2(PB+8,loc(dX1la),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
             cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
             cuCtxSynchronize()
             # ---- AdamW on this layer's 14 U/V (grads in dU_*/dV_* buffers) ----
