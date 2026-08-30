@@ -215,7 +215,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 main()<Int> -> {
     S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
-    MAXL<Int> = 36; NSTP<Int> = 3; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
+    MAXL<Int> = 36; NSTP<Int> = 1; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
@@ -853,6 +853,11 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
                 cuCtxSynchronize()
             cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,dG,dX1la,S*D,0)
             cuCtxSynchronize()
+            if (Li2 == 0) {
+                e=dumpf(dU_q2,D*R,"native/out/m2e3_dbg_dUq35.txt"); if(e!=0){ return 95 }
+                e=dumpf(dV_q2,R*NQ,"native/out/m2e3_dbg_dVq35.txt"); if(e!=0){ return 95 }
+                e=dumpf(dCtx2,S*NQ,"native/out/m2e3_dbg_dctx35.txt"); if(e!=0){ return 95 }
+            }
             # ---- AdamW on this layer's 14 U/V (grads in dU_*/dV_* buffers) ----
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+0),8); cuMemcpyHtoD_v2(AW+8,loc(dU_q2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+0),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+0),8)
@@ -934,6 +939,22 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         stp_d = stp_d + 1
         }
         # ---- write per-step losses ----
+
+        # ---- dump representative final Adapters + moments (parity gate) ----
+        SELN<Int> = 3
+        SELV<Vec<Int>> = Vec()
+        SELV.push(0); SELV.push(17); SELV.push(35)
+        sj<Int> = 0
+        for (sj in 0..SELN-1){
+            LL<Int> = SELV.get(sj)
+            # Uq slice (5120 f64 = 40960 B at LORA_BYTES*LL + 0); dump first 128 f64
+            e=dumpf(LSLB+LL*917504+0,128,"native/out/m2e3_L"+LL.to_string()+"_Uq_U_final_vyb.txt"); if(e!=0){ return 92 }
+            e=dumpf(LSLB+LL*917504+40960,128,"native/out/m2e3_L"+LL.to_string()+"_Vq_V_final_vyb.txt"); if(e!=0){ return 92 }
+            e=dumpf(MSLB+LL*917504+0,128,"native/out/m2e3_L"+LL.to_string()+"_Uq_mU_vyb.txt"); if(e!=0){ return 92 }
+            e=dumpf(VSLB+LL*917504+0,128,"native/out/m2e3_L"+LL.to_string()+"_Uq_vU_vyb.txt"); if(e!=0){ return 92 }
+            e=dumpf(MSLB+LL*917504+40960,128,"native/out/m2e3_L"+LL.to_string()+"_Vq_mV_vyb.txt"); if(e!=0){ return 92 }
+            e=dumpf(VSLB+LL*917504+40960,128,"native/out/m2e3_L"+LL.to_string()+"_Vq_vV_vyb.txt"); if(e!=0){ return 92 }
+        }
         freedom { match(open_write("native/out/m2e3_loss.txt")){ w->{ write_str(w,losstr); close(w) } ?->{ return 71 } } }
         println("M2E3_DONE steps="+NSTP.to_string())
         return 0

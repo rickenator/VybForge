@@ -72,37 +72,32 @@ Lo = {L: load_Lo(L) for L in range(36)}
 # Choose representative adapters (bottom/middle/top) x projection: q & ffn_down give good spread.
 cases = [
   (0,  "q",0,0),      # bottom, Uq[0,0]
-  (0,  "d",5,3),      # bottom, Vd? use Ud[r=1]? we pick U matrix though
+  (0,  "q",5,1),      # bottom, Uq[5,1]
   (17, "q",100,1),
   (17, "g",200,0),
   (35, "q",50,1),
-  (35, "d",100,0),
+  (35, "q",100,0),
 ]
 # For V final we also test a V element. We'll pick element indices within U shape (In,R).
+# deep-copy helpers for the full Lo dict (36 layers, 7 projs each)
+def clone_Lo(Lo):
+    return {L: {pr:(U.copy(),V.copy()) for pr,(U,V) in Lo[L].items()} for L in range(36)}
+
 results=[]
 for (LL, proj, i, r) in cases:
     U=Lo[LL][proj][0]
     h=0.01*max(abs(U[i,r]),1e-4)
-    # unit-ish direction on that one element
-    LoP={LL:{pr:(U.copy(),V.copy()) for pr,(U,V) in Lo[LL].items()}}
-    # perturb
-    LoP[LL][proj][0][i,r]+=h
-    lp=loss(LoP)
-    LoM={LL:{pr:(U.copy(),V.copy()) for pr,(U,V) in Lo[LL].items()}}
-    LoM[LL][proj][0][i,r]-=h
-    lm=loss(LoM)
+    LoP=clone_Lo(Lo); LoP[LL][proj][0][i,r]+=h; lp=loss(LoP)
+    LoM=clone_Lo(Lo); LoM[LL][proj][0][i,r]-=h; lm=loss(LoM)
     fd=(lp-lm)/(2*h)
     results.append((LL,proj,"U",i,r,float(fd)))
     print(f"L{LL} {proj} U[{i},{r}] h={h:.2e} fd={fd:.6e}")
-# a few V elements (V shape (R, out))
 casesV=[(0,"q",0,0),(17,"g",1,5),(35,"d",0,3)]
 for (LL,proj,rr,oi) in casesV:
     V=Lo[LL][proj][1]
     h=0.01*max(abs(V[rr,oi]),1e-4)
-    LoP={LL:{pr:(U.copy(),V.copy()) for pr,(U,V) in Lo[LL].items()}}
-    LoP[LL][proj][1][rr,oi]+=h; lp=loss(LoP)
-    LoM={LL:{pr:(U.copy(),V.copy()) for pr,(U,V) in Lo[LL].items()}}
-    LoM[LL][proj][1][rr,oi]-=h; lm=loss(LoM)
+    LoP=clone_Lo(Lo); LoP[LL][proj][1][rr,oi]+=h; lp=loss(LoP)
+    LoM=clone_Lo(Lo); LoM[LL][proj][1][rr,oi]-=h; lm=loss(LoM)
     fd=(lp-lm)/(2*h)
     results.append((LL,proj,"V",rr,oi,float(fd)))
     print(f"L{LL} {proj} V[{rr},{oi}] h={h:.2e} fd={fd:.6e}")

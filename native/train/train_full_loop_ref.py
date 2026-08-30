@@ -138,7 +138,7 @@ def load_x(L):
     return XCACHE[L]
 
 # hyperparams (match M2d + GPU)
-NSTP=10; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
+NSTP=1; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
 
 x0 = np.fromfile(os.path.join(out,"m2e_input.bin"),"<f8").reshape(S,D)
 tpath=os.path.join(out,"tl_t.bin")
@@ -168,6 +168,30 @@ for step in range(1,NSTP+1):
         for nm in proj_shapes:
             adamw(Lo[L][nm][0], gu["dU_"+nm], mU[L][nm], vU[L][nm], step)
             adamw(Lo[L][nm][1], gu["dV_"+nm], mV[L][nm], vV[L][nm], step)
+            if step==1 and L==35 and nm=="q":
+                np.savetxt(os.path.join(out,"m2e3_dbg_dUq35_ref.txt"), gu["dU_q"].reshape(-1), fmt="%.10g")
+                np.savetxt(os.path.join(out,"m2e3_dbg_dVq35_ref.txt"), gu["dV_q"].reshape(-1), fmt="%.10g")
     print(f"step {step} loss {loss:.6g}", flush=True)
 np.savetxt(os.path.join(out,"m2e3_loss_ref.txt"), np.array(losses), fmt="%.10g")
+
+# ---- dump final U/V adapters + AdamW moments (for the parity gate: loss alone can hide bad updates) ----
+for L in range(36):
+    for nm,(U,V) in Lo[L].items():
+        U.tofile(os.path.join(out, f"m2e3_L{L}_{nm}_U_final.bin"))
+        V.tofile(os.path.join(out, f"m2e3_L{L}_{nm}_V_final.bin"))
+        mU[L][nm].tofile(os.path.join(out, f"m2e3_L{L}_{nm}_mU.bin"))
+        vU[L][nm].tofile(os.path.join(out, f"m2e3_L{L}_{nm}_vU.bin"))
+        mV[L][nm].tofile(os.path.join(out, f"m2e3_L{L}_{nm}_mV.bin"))
+        vV[L][nm].tofile(os.path.join(out, f"m2e3_L{L}_{nm}_vV.bin"))
+
+# ---- matching GPU parity selection: first 128 f64 of Uq/Vq + moments for L in {0,17,35} ----
+for LL in (0,17,35):
+    U,V = Lo[LL]["q"]
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Uq_U_final_ref.txt"), U.reshape(-1)[:128], fmt="%.10g")
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Vq_V_final_ref.txt"), V.reshape(-1)[:128], fmt="%.10g")
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Uq_mU_ref.txt"), mU[LL]["q"].reshape(-1)[:128], fmt="%.10g")
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Uq_vU_ref.txt"), vU[LL]["q"].reshape(-1)[:128], fmt="%.10g")
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Vq_mV_ref.txt"), mV[LL]["q"].reshape(-1)[:128], fmt="%.10g")
+    np.savetxt(os.path.join(out, f"m2e3_L{LL}_Vq_vV_ref.txt"), vV[LL]["q"].reshape(-1)[:128], fmt="%.10g")
+print("M2E3_ORACLE_ADAPTERS_DONE")
 print("M2E3_ORACLE_DONE steps",NSTP,"loss0",losses[0],"lossN",losses[-1],"descend",losses[-1]<losses[0])
