@@ -103,6 +103,10 @@ def backward_layer(L, dG):
     x_in = load_cache(L)["x"].reshape(S,D)  # layer input (MUST reshape: flat otherwise)
     for s_ in range(S):
         dx[s_] = rmsnorm_layer(x_in[s_], dXN[s_], lnn["attn_norm"], D)
+    # RESIDUAL-IDENTITY FIX: x1 = x + o => dL/dx also carries dx1 (dG + ffn-norm-back),
+    # the gradient through the skip connection. Without it the 36-layer chain under-counts
+    # lower-layer gradients by orders of magnitude (FD-verified: L0 dU was 1e-18 vs FD 7.62).
+    dx = dx + dx1
     if L == 35:
         np.savetxt(os.path.join(out, "m2e_dbg_dq_ref.txt"), dq.reshape(-1), fmt="%.10g")
         np.savetxt(os.path.join(out, "m2e_dbg_dk_ref.txt"), dk.reshape(-1), fmt="%.10g")

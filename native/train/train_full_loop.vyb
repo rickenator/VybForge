@@ -851,13 +851,18 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
                 cuMemcpyHtoD_v2(DGP+24,loc(S),8); cuMemcpyHtoD_v2(DGP+32,loc(D),8); cuMemcpyHtoD_v2(DGP+40,loc(EPS),8)
                 cuda_launch4i(from<loc<CVoid>>(addr(dnw)),(D+255)/256,1,1,256,1,1,DGP,0,0,0)
                 cuCtxSynchronize()
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,dG,dX1la,S*D,0)
+            # ---- chain dx -> dG for next (lower) layer: RESIDUAL-IDENTITY FIX ----
+            # x1 = x + o, so the gradient that reaches the layer input x is the attention path
+            # (dX1la, from step-13 rmsnorm-back) PLUS the residual-identity path through x1
+            # (DX1 = dG + ffn-norm-back). Without +DX1 each layer drops the skip connection and
+            # gradients to lower layers vanish (FD-verified: analytic L0 dU was 1e-18 vs FD 7.6).
+            ONE3<Float> = 1.0
+            cuda_launch4i(from<loc<CVoid>>(addr(zbf)),(S*D+255)/256,1,1,256,1,1,dG,S*D,0,0)
+            cuMemcpyHtoD_v2(PB+0,loc(dG),8); cuMemcpyHtoD_v2(PB+8,loc(DX1),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+            cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
+            cuMemcpyHtoD_v2(PB+0,loc(dG),8); cuMemcpyHtoD_v2(PB+8,loc(dX1la),8); cuMemcpyHtoD_v2(PB+16,loc(ONE3),8); cuMemcpyHtoD_v2(PB+24,loc(S*D),8)
+            cuda_launch4i(from<loc<CVoid>>(addr(ads)),(S*D+255)/256,1,1,256,1,1,PB,0,0,0)
             cuCtxSynchronize()
-            if (Li2 == 0) {
-                e=dumpf(dU_q2,D*R,"native/out/m2e3_dbg_dUq35.txt"); if(e!=0){ return 95 }
-                e=dumpf(dV_q2,R*NQ,"native/out/m2e3_dbg_dVq35.txt"); if(e!=0){ return 95 }
-                e=dumpf(dCtx2,S*NQ,"native/out/m2e3_dbg_dctx35.txt"); if(e!=0){ return 95 }
-            }
             # ---- AdamW on this layer's 14 U/V (grads in dU_*/dV_* buffers) ----
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+0),8); cuMemcpyHtoD_v2(AW+8,loc(dU_q2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+0),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+0),8)

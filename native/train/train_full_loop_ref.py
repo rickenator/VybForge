@@ -143,7 +143,7 @@ def load_x(L):
     return XCACHE[L]
 
 # hyperparams (match M2d + GPU)
-NSTP=1; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
+NSTP=5; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
 
 x0 = np.fromfile(os.path.join(out,"m2e_input.bin"),"<f8").reshape(S,D)
 tpath=os.path.join(out,"tl_t.bin")
