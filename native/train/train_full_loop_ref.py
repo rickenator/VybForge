@@ -130,6 +130,11 @@ def backward_layer(L, dG, c):
     dXN = dxn+dxk+dxv
     dx=np.zeros((S,D)); x_in = load_x(L)
     for s_ in range(S): dx[s_]=rmsnorm_layer(x_in[s_], dXN[s_], lnn["attn_norm"], D)
+    # RESIDUAL IDENTITY FIX: x1 = x + o  =>  dL/dx must ALSO include dx1 (the gradient that lands
+    # on x1 = dG + ffn-norm-back, which then flows to x through the identity in x1 = x + o).
+    # Without this term each layer drops the residual path and the 36-layer chain under-counts
+    # gradients to lower layers (FD says ~7.6 at L0; analytic was ~1e-18).
+    dx = dx + dx1  # dx1 held the accumulated (dG + rmsnorm_back(dX1n)) gradient of x1
     return gu, dx
 
 def load_x(L):
