@@ -168,6 +168,16 @@ train-full-loop: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full_loop.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_loop.py
 
+# M2e-3 PACKED-WEIGHT-CACHE variant: weights dequantized device-side ONCE into PKD, forward/backward
+# index slabs instead of streaming GGUF per-8-byte -> ~3 min/step (was ~40). ROCKSOLVED: step 2+ were
+# re-seeding forward with the clobbered XA scratch (input aliased by layer swaps); fixed with a
+# pristine XIN buffer refilled into XA each step. GPU now matches the FD-verified oracle per-step and
+# DESCENDS. Gate = verify_train_full_loop.py (per-step loss + L0/17/35 adapter/moment parity).
+train-full-loop-pkd: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_full_loop_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_full_loop_pkd.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_loop.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

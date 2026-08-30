@@ -294,7 +294,7 @@ main()<Int> -> {
         # ---- buffer declarations ----
         Wq<Int> = 0; Wk<Int> = 0; Wv<Int> = 0; Wo<Int> = 0; Wg<Int> = 0; Wu<Int> = 0; Wd<Int> = 0
         N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; DF<Int> = 0
-        XI<Int> = 0; XO<Int> = 0; XA<Int> = 0; XN<Int> = 0; DQ<Int> = 0; DK<Int> = 0; DV<Int> = 0
+        XI<Int> = 0; XO<Int> = 0; XA<Int> = 0; XIN<Int> = 0; XN<Int> = 0; DQ<Int> = 0; DK<Int> = 0; DV<Int> = 0
         DQN<Int> = 0; DKN<Int> = 0; DQr<Int> = 0; DKr<Int> = 0; DCtx<Int> = 0; DO<Int> = 0
         X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M2<Int> = 0
         sq<Int> = 0; sk<Int> = 0; sv<Int> = 0; so<Int> = 0; sg<Int> = 0; su<Int> = 0; sd<Int> = 0
@@ -396,6 +396,7 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(DF),64*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(XI),5120*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(XA),5120*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XIN),5120*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(XO),5120*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(XN),5120*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(DQ),8192*8)!=0){ return 11 }
@@ -511,7 +512,7 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
 
         e<Int> = 0
         xb<String> = read_bin("native/out/m2e_input.bin"); if(xb.len()<S*D*8){ println("INPUT_MISSING"); return 35 }
-        e=download(xb,XA,S*D*8); if(e!=0){ return 41 }
+        e=download(xb,XIN,S*D*8); if(e!=0){ return 41 }   # pristine input, NEVER used as layer scratch
         fb<String> = read_bin("native/out/layer0_invfreq.bin"); if(fb.len()<64*8){ return 42 }
         e=download(fb,DF,64*8); if(e!=0){ return 43 }
         tg<String> = read_bin("native/out/tl_t.bin"); if(tg.len()<S*D*8){ return 44 }
@@ -606,6 +607,8 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         b1tc<Float> = 1.0; b2tc<Float> = 1.0
         while(stp_d<=NSTP){
         b1tc = b1tc * B1; b2tc = b2tc * B2
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,XA,XIN,S*D,0)  # refill scratch from pristine input (XA is clobbered by layer swaps)
+        cuCtxSynchronize()
         XI<Int> = XA   # reset layer-0 input each step (m2e_input)
         XOcur<Int> = XO
         L3<Int> = 0
