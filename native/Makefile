@@ -161,6 +161,13 @@ train-full-back: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full_back.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_back.py
 
+# M2e-3 FULL 36-layer LoRA TRAINING LOOP on GPU, per-step loss vs numpy oracle.
+# (Slow: ~40 min/step, weight streaming is per-8-byte H2D. Run with a long timeout / in bg.)
+train-full-loop: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_full_loop_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_full_loop.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_loop.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

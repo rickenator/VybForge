@@ -412,6 +412,12 @@ zbuf(b<Int>, n<Int>) -> {
     if (gid < n) { st_f64(b + gid * 8, 0.0) }
 }
 
+// Device-to-device copy of an f64 buffer (src -> dst, n elements). 4-arg.
+dcopy(dst<Int>, src<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) { st_f64(dst + gid * 8, ld_f64(src + gid * 8)) }
+}
+
 // Forward GEMM (kept local to this module so LoRA apply + optimizer load one .ptx;
 // C = alpha A@B + beta C). Params: +0 A +8 B +16 C +24 M +32 N +40 K +48 alpha +56 beta.
 gemmf(p<Int>) -> {
