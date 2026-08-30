@@ -148,6 +148,12 @@ train-layer-train: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_layer_train.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer_train.py
 
+# M2e-1 FULL 36-layer LoRA forward + per-layer activation cache, vs numpy (train_full_ref).
+train-full-forward: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_full_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_full.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_full.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
