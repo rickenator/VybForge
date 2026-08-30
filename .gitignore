@@ -16,3 +16,5 @@ native/build/
 native/out/
 native/gguf/*.gguf
 native/gguf/parsed.txt
+
+native/gguf/qwen3-4b-head.bin

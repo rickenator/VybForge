@@ -140,6 +140,14 @@ train-layer-back: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_layer_back.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer_back.py
 
+# M2d teacher-forced real blk.0 LoRA TRAINING LOOP: forward + MSE + verified backward +
+# AdamW on U/V (7 pairs), overfit one fixed target; per-step loss vs numpy oracle + descent.
+train-layer-train: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_layer_ref.py
+	cd $(ROOT) && .venv/bin/python native/train/train_layer_train_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_layer_train.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_train_layer_train.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py

@@ -70,7 +70,10 @@ share(all) vcos(x<Float>)<Float> -> {
 
 # Pure-arithmetic sqrt (Newton) — the `sqrt` libm builtin does not reliably
 # lower to a device instruction in kernel mode.
+# GOTCHA: y0=x -> for x=0 the first Newton step y=0.5*(0 + 0/0) = NaN (0/0).
+# sqrt(0)=0 (matches libm/numpy), so guard x<=0 before iterating.
 share(all) vsqrt(x<Float>, iters<Int>)<Float> -> {
+    if (x <= 0.0) { return 0.0 }
     y<Float> = x
     i<Int> = 0
     for (i in 0..iters - 1) {
