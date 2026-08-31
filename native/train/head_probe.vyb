@@ -1,0 +1,112 @@
+// CE-head probe: output_norm -> tied lm_head -> softmax CE + dlog -> head-back -> dxo.
+// Runs the 4 new head kernels (embed, hgemm, cefwd, hback) + existing rmsnorm/drmsnorm on a
+// synthetic EMB (V=100) + apps real D=2560/S=4. Verifies loss + dlog/dh/dxo/plab vs head_ref.py.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes-(nbytes%8); ci<Int> = 0
+        for (ci in 0..(npb/8)-1){ o8<Int> = ci*8; ch<Int> = 0; bj<Int> = 0; for (bj in 0..7){ bv<Int> = u8(data,o8+bj); ch=ch|(bv<<(bj*8)) }; if(cuMemcpyHtoD_v2(dst+o8,loc(ch),8)!=0){ return 15 } }
+        tj<Int> = npb; while(tj<nbytes){ by<Int> = u8(data,tj); if(cuMemcpyHtoD_v2(dst+tj,loc(by),1)!=0){ return 15 }; tj=tj+1 }
+        return 0
+    }
+    return 0
+}
+read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
+dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
+
+main()<Int> -> {
+    S<Int> = 4; D<Int> = 2560; V<Int> = 100; EPS<Float> = 0.000001
+    EMB<Int> = 0; ON<Int> = 0; XO<Int> = 0; X0<Int> = 0; H<Int> = 0; LS<Int> = 0; DLG<Int> = 0; DH<Int> = 0; DXO<Int> = 0; LOS<Int> = 0; IDS<Int> = 0; LAB<Int> = 0; PP<Int> = 0
+    rc<CInt> = -1; t4<Int> = 0
+    e<Int> = 0
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        rn<loc<CVoid>> = from<loc<CVoid>>(0); drn<loc<CVoid>> = from<loc<CVoid>>(0)
+        emb<loc<CVoid>> = from<loc<CVoid>>(0); hg<loc<CVoid>> = from<loc<CVoid>>(0); cf<loc<CVoid>> = from<loc<CVoid>>(0); hb<loc<CVoid>> = from<loc<CVoid>>(0)
+        cuInit(0); dc<CInt> = 0; cuDeviceGetCount(loc(dc)); de<CInt> = 0; cuDeviceGet(loc(de),0); ctx<loc<CVoid>> = from<loc<CVoid>>(0); cuCtxCreate_v2(loc(ctx),0,de)
+        for (t4 in 0..5){ if(rc!=0){ m=from<loc<CVoid>>(0); rc=cuModuleLoadData(loc(m),read_bin("native/build/train.ptx")) } }
+        if(rc!=0){ println("MODLOAD_FAIL"); }
+        if(cuModuleGetFunction(loc(rn),m,"rmsnorm")!=0){ }
+        if(cuModuleGetFunction(loc(drn),m,"drmsnorm")!=0){ }
+        if(cuModuleGetFunction(loc(emb),m,"embed")!=0){ }
+        if(cuModuleGetFunction(loc(hg),m,"hgemm")!=0){ }
+        if(cuModuleGetFunction(loc(cf),m,"cefwd")!=0){ }
+        if(cuModuleGetFunction(loc(hb),m,"hback")!=0){ }
+        if(cuMemAlloc_v2(loc(EMB),V*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(ON),D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(XO),S*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(X0),S*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(H),S*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(LS),S*V*8)!=0){ }
+        if(cuMemAlloc_v2(loc(DLG),S*V*8)!=0){ }
+        if(cuMemAlloc_v2(loc(DH),S*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(DXO),S*D*8)!=0){ }
+        if(cuMemAlloc_v2(loc(LOS),S*8)!=0){ }
+        if(cuMemAlloc_v2(loc(IDS),S*8)!=0){ }
+        if(cuMemAlloc_v2(loc(LAB),S*8)!=0){ }
+        if(cuMemAlloc_v2(loc(PP),64)!=0){ }
+        e = download(read_bin("native/out/head_emb.bin"),EMB,V*D*8)
+        e = download(read_bin("native/out/head_on.bin"),ON,D*8)
+        e = download(read_bin("native/out/head_xo.bin"),XO,S*D*8)
+        e = download(read_bin("native/out/head_ids.bin"),IDS,S*8)
+        e = download(read_bin("native/out/head_labels.bin"),LAB,S*8)
+        cuCtxSynchronize()
+        # --- x0 = embed(EMB, ids) (into X0; XO stays the random head_xo used by the head math) ---
+        cuMemcpyHtoD_v2(PP+0,loc(EMB),8); cuMemcpyHtoD_v2(PP+8,loc(IDS),8); cuMemcpyHtoD_v2(PP+16,loc(X0),8)
+        cuMemcpyHtoD_v2(PP+24,loc(S),8); cuMemcpyHtoD_v2(PP+32,loc(D),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(emb)),(S*D+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        e=dumpf(X0,S*D,"native/out/head_vyb_embedded.txt")
+        # --- h = rmsnorm(xo, ON) ---
+        cuMemcpyHtoD_v2(PP+0,loc(XO),8); cuMemcpyHtoD_v2(PP+8,loc(ON),8); cuMemcpyHtoD_v2(PP+16,loc(H),8)
+        cuMemcpyHtoD_v2(PP+24,loc(S),8); cuMemcpyHtoD_v2(PP+32,loc(D),8); cuMemcpyHtoD_v2(PP+40,loc(EPS),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)),(S*D+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        # --- logits = h @ emb^T ---
+        cuMemcpyHtoD_v2(PP+0,loc(H),8); cuMemcpyHtoD_v2(PP+8,loc(EMB),8); cuMemcpyHtoD_v2(PP+16,loc(LS),8)
+        cuMemcpyHtoD_v2(PP+24,loc(S),8); cuMemcpyHtoD_v2(PP+32,loc(D),8); cuMemcpyHtoD_v2(PP+40,loc(V),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(hg)),(S*V+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        # --- cefwd: dlog + plab ---
+        cuMemcpyHtoD_v2(PP+0,loc(LS),8); cuMemcpyHtoD_v2(PP+8,loc(DLG),8); cuMemcpyHtoD_v2(PP+16,loc(LOS),8); cuMemcpyHtoD_v2(PP+24,loc(LAB),8)
+        cuMemcpyHtoD_v2(PP+32,loc(S),8); cuMemcpyHtoD_v2(PP+40,loc(V),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(cf)),(S+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        # --- host CE loss = -(1/S) sum_s log(P_lab[s]) ---
+        losstr<String> = ""; ll<Float> = 0.0; pv2<Float> = 0.0; kk<Int> = 0
+        for (kk in 0..S-1){ pv2=0.0; cuMemcpyDtoH_v2(loc(pv2),LOS+kk*8,8); ll = ll + log(pv2) }
+        lsc<Float> = (0.0 - ll) / (S as Float)
+        println("HEAD loss = "+lsc.to_string())
+        match(open_write("native/out/head_loss_vyb.txt")){ w->{ write_str(w,lsc.to_string()) } ?->{ } }
+        # --- dh = dlog @ emb ---
+        cuMemcpyHtoD_v2(PP+0,loc(DLG),8); cuMemcpyHtoD_v2(PP+8,loc(EMB),8); cuMemcpyHtoD_v2(PP+16,loc(DH),8)
+        cuMemcpyHtoD_v2(PP+24,loc(S),8); cuMemcpyHtoD_v2(PP+32,loc(V),8); cuMemcpyHtoD_v2(PP+40,loc(D),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(hb)),(S*D+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        # --- dxo = drmsnorm(xo, ON, dh) ---
+        cuMemcpyHtoD_v2(PP+0,loc(XO),8); cuMemcpyHtoD_v2(PP+8,loc(ON),8); cuMemcpyHtoD_v2(PP+16,loc(DH),8); cuMemcpyHtoD_v2(PP+24,loc(DXO),8)
+        cuMemcpyHtoD_v2(PP+40,loc(S),8); cuMemcpyHtoD_v2(PP+48,loc(D),8); cuMemcpyHtoD_v2(PP+56,loc(EPS),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(drn)),(S*D+255)/256,1,1,256,1,1,PP,0,0,0); cuCtxSynchronize()
+        e=dumpf(LS,S*V,"native/out/head_vyb_logits.txt")
+        e=dumpf(DLG,S*V,"native/out/head_vyb_dlg.txt")
+        e=dumpf(DH,S*D,"native/out/head_vyb_dh.txt")
+        e=dumpf(DXO,S*D,"native/out/head_vyb_dxo.txt")
+        e=dumpf(LOS,S,"native/out/head_vyb_plab.txt")
+    }
+    println("HEAD_PROBE_DONE")
+    return 0
+}

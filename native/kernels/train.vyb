@@ -774,3 +774,76 @@ f32expand(p<Int>) -> {
         st_f64(dst + gid * 8, v)
     }
 }
+
+// ---- Corpus-CE head (M2e-3-CE): token_embd embed, tied lm_head gemm, softmax CE + dlog, head back ----
+// embed: OUT[s*D+d] = EMB[ids[s]*D+d]  (EMB f64 [VOCAB,D], ids f64-width Int per row).
+// Params: +0 EMB +8 IDS +16 OUT +24 S +32 D.
+embed(p<Int>) -> {
+    EMB<Int> = ld_i64(p + 0); IDS<Int> = ld_i64(p + 8); OUT<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24); D<Int> = ld_i64(p + 32)
+    tot<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < tot) {
+        s<Int> = gid / D; d<Int> = gid % D
+        id<Int> = ld_i64(IDS + s * 8)
+        st_f64(OUT + gid * 8, ld_f64(EMB + (id * D + d) * 8))
+    }
+}
+
+// hgemm: LS[s*V+v] = sum_d H[s*D+d] * EMB[v*D+d]  (tied head: logits = h @ emb^T).
+// Params: +0 H +8 EMB +16 LS +24 S +32 D +40 V. Grid S*V, each loops D.
+hgemm(p<Int>) -> {
+    H<Int> = ld_i64(p + 0); EMB<Int> = ld_i64(p + 8); LS<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24); D<Int> = ld_i64(p + 32); V<Int> = ld_i64(p + 40)
+    tot<Int> = S * V
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < tot) {
+        s<Int> = gid / V; v<Int> = gid % V
+        acc<Float> = 0.0; d2<Int> = 0
+        for (d2 in 0..D - 1) { acc = acc + ld_f64(H + (s * D + d2) * 8) * ld_f64(EMB + (v * D + d2) * 8) }
+        st_f64(LS + gid * 8, acc)
+    }
+}
+
+// cefwd: per-row softmax over LS [S,V]; writes P_lab[s]=softmax at label to LOS[s] (for host CE loss,
+// loss_s = -log(P_lab[s])) and dlog[s,v]=(softmax - onehot)/S to DLG. Params +0 LS +8 DLG +16 LOS
+// +24 LAB +32 S +40 V. Grid = S threads (one per row, loops V).
+cefwd(p<Int>) -> {
+    LS<Int> = ld_i64(p + 0); DLG<Int> = ld_i64(p + 8); LOS<Int> = ld_i64(p + 16); LAB<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 32); V<Int> = ld_i64(p + 40)
+    s2<Int> = blk_x() * dim_x() + tid_x()
+    if (s2 < S) {
+        mx<Float> = ld_f64(LS + (s2 * V + 0) * 8)
+        v2<Int> = 1
+        for (v2 in 1..V - 1) { xv<Float> = ld_f64(LS + (s2 * V + v2) * 8); if (xv > mx) { mx = xv } }
+        se<Float> = 0.0
+        for (v2 in 0..V - 1) { se = se + vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) }
+        inv<Float> = 1.0 / se
+        lab<Int> = ld_i64(LAB + s2 * 8)
+        pl<Float> = vexp(ld_f64(LS + (s2 * V + lab) * 8) - mx) * inv
+        st_f64(LOS + s2 * 8, pl)
+        nd<Float> = 1.0 / (S as Float)
+        for (v2 in 0..V - 1) {
+            pv<Float> = vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) * inv
+            dg<Float> = pv * nd
+            if (v2 == lab) { dg = dg - nd }
+            st_f64(DLG + (s2 * V + v2) * 8, dg)
+        }
+    }
+}
+
+// hback: DH[s*D+d] = sum_v DLG[s*V+v] * EMB[v*D+d]  (dL/dh = dlog @ emb).
+// Params: +0 DLG +8 EMB +16 DH +24 S +32 V +40 D. Grid S*D, each loops V.
+hback(p<Int>) -> {
+    DLG<Int> = ld_i64(p + 0); EMB<Int> = ld_i64(p + 8); DH<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24); V<Int> = ld_i64(p + 32); D<Int> = ld_i64(p + 40)
+    tot<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < tot) {
+        s<Int> = gid / D; d<Int> = gid % D
+        acc<Float> = 0.0; v3<Int> = 0
+        for (v3 in 0..V - 1) { acc = acc + ld_f64(DLG + (s * V + v3) * 8) * ld_f64(EMB + (v3 * D + d) * 8) }
+        st_f64(DH + gid * 8, acc)
+    }
+}
+

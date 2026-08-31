@@ -54,24 +54,22 @@ def rope_adj(gr):
     return go
 
 # ---- fixed tiny corpus slice: use record-0 assistant next-token ids (deterministic) ----
-def load_tokens(n=S+1):
-    # Use a fixed, deterministic token slice from the corpus tokenizer (artifacts tokenizer).
-    try:
-        from transformers import AutoTokenizer as _T
-        tok=_T.from_pretrained(os.path.join(repo,"artifacts","vybos-configurator-lora"))
-        import json
-        with open(os.path.join(repo,"data/vybos-configurator-train.jsonl")) as fh:
-            rec0=json.loads(fh.readlines()[0])
-        content=rec0["messages"][-1]["content"]
-        ids=tok.encode(content, add_special_tokens=False)
-    except Exception as e:
-        # fallback: a small fixed id seed (deterministic) so the ref runs without transformers
-        rng=np.random.default_rng(5); ids=(rng.randint(100,10000,size=64)).tolist()
-    return ids
-TOK = load_tokens()
-INPUT_IDS = np.array(TOK[0:S], dtype=np.int64)         # positions 0..S-1
-LABELS    = np.array(TOK[1:S+1], dtype=np.int64)        # next token at each position (all valid)
+# ---- fixed tiny corpus slice: use the COMMITTED canonical ids/labels (m2e3ce_*.txt) so the
+# numpy oracle and the GPU driver provably train on the identical 4-token slice. ----
+_CAN_IDS = os.path.join(out, "m2e3ce_input_ids.txt")
+_CAN_LAB = os.path.join(out, "m2e3ce_labels.txt")
+if os.path.exists(_CAN_IDS) and os.path.exists(_CAN_LAB):
+    INPUT_IDS = np.loadtxt(_CAN_IDS, dtype=np.int64)
+    LABELS = np.loadtxt(_CAN_LAB, dtype=np.int64)
+else:
+    TOK = load_tokens()
+    INPUT_IDS = np.array(TOK[0:S], dtype=np.int64)
+    LABELS = np.array(TOK[1:S + 1], dtype=np.int64)
 print("input_ids", INPUT_IDS.tolist(), "labels", LABELS.tolist())
+# write int64 .bin that the GPU driver (train_full_ce.vyb) loads; regenerate every run so the
+# GPU provably trains on the identical slice. (native/out is gitignored.)
+INPUT_IDS.astype(np.int64).tofile(os.path.join(out, "m2e3ce_input_ids.bin"))
+LABELS.astype(np.int64).tofile(os.path.join(out, "m2e3ce_labels.bin"))
 
 # ---- token_embd dequant once ----
 te = tens["token_embd.weight"]
@@ -187,6 +185,8 @@ for st in range(1,NSTP+1):
     for L in range(35,-1,-1):
         c,xin = cc[L]
         gu, dG = backward_layer(L, dG.copy(), c, xin)
+        if st==1 and L in (35,17,0):
+            np.savetxt(os.path.join(out,f"m2e3ce_dbg_L{L}_dUq_ref.txt"), gu["dU_q"].reshape(-1)[:64], fmt="%.9g")
         for nm in proj_shapes:
             adamw(Lo[L][nm][0], gu["dU_"+nm], mU[L][nm], vU[L][nm], st)
             adamw(Lo[L][nm][1], gu["dV_"+nm], mV[L][nm], vV[L][nm], st)

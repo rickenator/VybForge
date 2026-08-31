@@ -178,6 +178,16 @@ train-full-loop-pkd: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full_loop_pkd.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_loop.py
 
+# M2e-3-CE: the PRODUCTION corpus objective on GPU — teacher-forced next-token CE over a real
+# record-0 slice (S=4): embed via token_embd, 36-layer LoRA forward, output_norm, TIED lm_head
+# (h @ token_embd.T), softmax CE + head-back -> the 36-layer backward -> AdamW on all U/V.
+# Finite head gradient -> real descent (CE 15.49->0.697). Gate = verify_ce.py (per-step loss
+# vs the numpy oracle + L0 Uq final parity).
+train-ce-loop: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/train_corpus_ce_ref.py
+	cd $(ROOT) && $(VYB) native/train/train_full_ce.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_ce.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
