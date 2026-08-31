@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""Generate train_full_ce.vyb (S=4 corpus-CE) from the packed S=2 driver.
+"""Regenerate train_full_ce.vyb for a target sequence length TS, from the S=4 CE driver.
 
-The S=2 literals 5120(S*D)/8192(S*NQ)/2048(S*NKV)/19456(S*FF) appear BOTH as S-dependent
-working-buffer sizes/ASLB offsets AND as S-independent LoRA adapter numels (Uq=5120, Vq=8192,
-Uo=8192, Vg=19456, ...) used by AdamW / adapter loads. So we PROTECT S-independent lines
-(those touching LSLB/MSLB/VSLB slabs, AW+ AdamW params, or m2e_l* adapter .bin loads) and only
-transform S-dependent lines. All numeric replacements use ONE regex pass (no cascading).
-ASLB per-layer offsets recomputed for S=4. Also flips S:2->4.
-Run: python native/train/_gen_ce.py"""
-import re
-SRC = "native/train/train_full_loop_pkd.vyb"
+The S=4 train_full_ce.vyb keeps every sequence-scaled size as an S-proportional literal and
+the LoRA `s` intermediates as SYMBOLIC `S*R` (they auto-scale). So generalizing 4->TS only
+needs to rescale the S=4 numeric literals by f=TS/4:
+  - S-dependent element counts (S*D=10240, S*NQ=16384, S*NKV=4096, S*FF=38912)
+  - ASLB per-activation byte offsets and per-layer stride 2163136 (all S-proportional)
+Use ONLY the S=4 literal set (never global 5120/8192/... which collide with S-independent
+adapter numels), and PROTECT S-independent lines (LSLB/MSLB/VSLB/AdamW/adapter loads) whose
+40960/8192/19456/... are adapter offsets that must NOT rescale.
+
+Run: python native/train/_gen_ce.py <TS> [NSTP]   [writes native/train/train_full_ce.vyb]
+"""
+import re, sys
+TS = int(sys.argv[1]) if len(sys.argv) > 1 else 84
+NSTP = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+f = TS / 4.0
+BASE = "native/train/train_full_ce.vyb"   # S=4 baseline WITH CE wiring
 DST = "native/train/train_full_ce.vyb"
-text = open(SRC).read()
+text = open(BASE).read()
 
-# S-dependent literal -> S=4 value
-rep = {"5120": "10240", "8192": "16384", "2048": "4096", "19456": "38912",
-       "1081568": "2163136"}
-# ASLB per-activation offsets S=2 -> S=4
-for a, b in [
-    (0,0),(40960,81920),(81920,163840),(147456,294912),(163840,327680),(180224,360448),
-    (245760,491520),(262144,524288),(327680,655360),(344064,688128),(409600,819200),
-    (450560,901120),(491520,983040),(532480,1064960),(688128,1376256),(843776,1687552),
-    (999424,1998848),(1040384,2080768),(1081344,2162688),(1081376,2162752),(1081408,2162816),
-    (1081440,2162880),(1081472,2162944),(1081504,2163008),(1081536,2163072),
-]:
-    rep[str(a)] = str(b)
-
-# longest-first so e.g. 81920 matches before 8192
+# S=4 literals -> TS
+rep = {"10240": str(int(10240 * f)), "16384": str(int(16384 * f)),
+       "4096": str(int(4096 * f)), "38912": str(int(38912 * f)), "2163136": str(int(2163136 * f))}
+rep["77872896"] = str(int(77872896 * f))   # 36 * ASLB per-layer stride (S=4 total)
+s4off = [0,81920,163840,294912,327680,360448,491520,524288,655360,688128,819200,901120,
+         983040,1064960,1376256,1687552,1998848,2080768,2162688,2162752,2162816,2162880,
+         2162944,2163008,2163072]
+rep.update({str(o): str(int(o * f)) for o in s4off})
 pattern = re.compile(r"(?<!\d)(" + "|".join(sorted(rep, key=len, reverse=True)) + r")(?!\d)")
 
 def protect(line):
@@ -38,14 +39,9 @@ def sub_m(m):
 
 out = []
 for line in text.split("\n"):
-    if protect(line):
-        out.append(line)
-    else:
-        out.append(pattern.sub(sub_m, line))
+    out.append(line if protect(line) else pattern.sub(sub_m, line))
 new = "\n".join(out)
-# S constant 2 -> 4 (defined in main sig)
-new = new.replace("S<Int> = 2", "S<Int> = 4")
-# NSTP 5 -> 6 (CE overfit; keep moderate — will regenerate ref to match)
-new = new.replace("NSTP<Int> = 5", "NSTP<Int> = 6")
+new = new.replace("S<Int> = 4", "S<Int> = %d" % TS)
+new = re.sub(r"NSTP<Int> = \d+", "NSTP<Int> = %d" % NSTP, new)
 open(DST, "w").write(new)
-print("wrote", DST, "lines:", new.count("\n")+1, "| S->4 applied:", "S<Int> = 4" in new)
+print("wrote", DST, "S=%d (f=%.2f) NSTP=%d lines=%d" % (TS, f, NSTP, new.count(chr(10)) + 1))
