@@ -39,15 +39,41 @@ cache. This cheap reference validates the mechanism before scaling the context t
 ## Concrete state
 - `native/train/kvctx_ref.py` — numpy per-layer roped-K/V for the 9-token goal context (VERIFIED,
   writes kvctx_L{L}_{DKr,DV}_ref.bin; 9*1024 f64 per layer). Also kvctx_ctx_ids (goal token ids).
-- `native/train/kvctx.vyb` — WIP GPU context-build (reuses run_layer, captures CK/CV, dumps) —
-  UNVERIFIED; do not treat as correct. Known TODO: dispatch the mixed Q4/Q6 dequant for `attn_v`
-  and `ffn_down` by PTY (layers 0-3 & 31-35 are Q6_K) — my draft hardcoded q4fn/q6fn.
+- `native/train/kvctx.vyb` — GPU context-KV-cache build. **VERIFIED (KVCTX_VERIFY: OK)**: per-layer
+  roped-K/DKr and V/DV match numpy to ~3-4e-6 (corr 1.0) at L0/8/17/26/35. Fixes baked in:
+  q4kdeq/q6kdeq take 4 DIRECT args (a0=packed,a1=out,a2=numel,a3=0) via `deq_w` which also
+  dispatches the mixed Q4/Q6 for attn_v/ffn_down by PTY; W buffers are f64 (wq_nl*8).
+- NEXT (from here): the KV-aware LoRA response forward (per-token, run_kv-style attending to the
+  cached CK/CV) then the frozen-context backward.
 
-## Next steps (next session, order)
-1. Fix kvctx.vyb: type-dispatch dequant (q4fn/q6fn by PTY) for all 7 weights + f32expand norms;
-   verify the GPU context-build CK/CV == kvctx_ref per-layer (maxrel gate).
-2. Add the KV-aware LoRA `run_kv` per-token response forward; verify response logits/loss == the
-   validated full-sequence S=93 result (no new oracle).
-3. Add the frozen-context backward (zero/adjust context-region dattn grads) + AdamW; verify descent
-   == the masked goal-conditioned oracle (committed ref).
+## Response forward — implementation notes (found by drafting it; READ BEFORE CODING)
+The per-token response forward (`resp_layer_kv`-style, modeled on kv_driver.run_kv + LoRA on all 7
+projections) must get these RIGHT or it silently corrupts:
+1. **Row-P addressing, not row 0.** The per-token q/k/v/o/g/u/d projections and roped activations
+   must write to ROW P of each buffer (e.g. `DQ + P*NQ*8`, `DK + P*NKV*8`), like run_kv does. The
+   context-build working buffers (sized S=ctx) are TOO SMALL for response positions P=ctx+t — use
+   dedicated per-token buffers sized [ctx+resp, ...] (or [MAXS,...]) for HB (hidden base), DQ/DK/
+   DV/DQN/DKN/DQr/DKr/DCtx/DO/X1/X1N/Gr/Up/Hu/M2.
+2. **residual x1 = input-hidden-row-P + DO** (the skip from the token's OWN previous hidden), NOT
+   the q buffer. (A draft bug used DQr row P as the residual input — wrong.)
+3. **Attention over the combined cache**: attn(Q=DQr, K=CK[L], V=CV[L], Sctx=P+1) with grid
+   Sctx*H; only DCtx row P is read (other rows recompute garbage — discard). The response q must
+   live at row P of DQr so output row P = that token's attention over rows 0..P. Before attn, store
+   this position's roped-K (DKr row P) -> CK[L] row P and V (DV row P) -> CV[L] row P.
+4. **Absolute rope position P** (qwen3rope +224 = P, S=1), matching how the context rows were roped
+   at their positions and how run_kv / the full-sequence forward rope response tokens.
+5. Loop order: token t (P=ctx+t, Sctx=ctx+t+1) outside, LAYER inside (dequant that layer's
+   weights/norms once per L, reuse across the 84 tokens for that layer), then move to next L. Cache
+   the response hidden h[t] after layer 36.
+6. Head/validation: rmsnorm(h)->HO, hgemm(HO,EMB)->logits, cefwd(masked, NV=resp)->CE loss. The
+   goal-context S=93 full-sequence forward is ALREADY validated (committed 1e5b605) — the KV-cache
+   response forward MUST reproduce its response hidden + masked CE loss (GPU 15.93 / oracle 15.96)
+   — no new oracle needed. Optionally dump per-position response logits to diff directly.
+
+## Next steps
+1. [DONE] GPU context-KV-cache build VERIFIED (4b43568).
+2. KV-aware LoRA `run_kv` per-token response forward (attend to cached CK/CV + response-so-far);
+   verify response logits/loss == the validated full-sequence S=93 result (no new oracle).
+3. Frozen-context backward (zero/adjust context-region dattn grads) + AdamW; verify descent == the
+   masked goal-conditioned oracle (committed ref).
 4. Scale the context to the full manifest (369 tokens); confirm per-step cost stays ~response-only.
