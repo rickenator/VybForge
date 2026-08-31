@@ -589,6 +589,8 @@ main()<Int> -> {
         cuMemcpyHtoD_v2(HPP + 0, loc(EMB), 8); cuMemcpyHtoD_v2(HPP + 8, loc(RIDS), 8); cuMemcpyHtoD_v2(HPP + 16, loc(HB + S * D * 8), 8)
         cuMemcpyHtoD_v2(HPP + 24, loc(RESP), 8); cuMemcpyHtoD_v2(HPP + 32, loc(D), 8)
         cuda_launch4i(from<loc<CVoid>>(addr(emb2)), (RESP * D + 255) / 256, 1, 1, 256, 1, 1, HPP, 0, 0, 0); cuCtxSynchronize()
+        # dump response embedding rows S..S+2 for verification
+        e = dumpf(HB + S * D * 8, 3 * D, "native/out/kvresp_emb_gpu.txt"); if (e != 0) { return 79 }
         # ---- response forward: layer-major (deq once per L), token-minor ----
         HBin<Int> = HB; HBout<Int> = XO2
         L6<Int> = 0
@@ -610,6 +612,7 @@ main()<Int> -> {
             cuMemcpyHtoD_v2(PF + 0, loc(PKD + POF.get(L6 * 11 + 10)), 8); cuMemcpyHtoD_v2(PF + 8, loc(N2), 8); cuMemcpyHtoD_v2(PF + 16, loc(PNL.get(L6 * 11 + 10)), 8)
             cuda_launch4i(from<loc<CVoid>>(addr(efn)), (PNL.get(L6 * 11 + 10) + 255) / 256, 1, 1, 256, 1, 1, PF, 0, 0, 0)
             cuCtxSynchronize()
+            if (L6 == 0) { e = dumpf(N1, D, "native/out/kvresp_L0_n1_gpu.txt"); if (e != 0) { return 81 } }
             slabCK<Int> = CK + L6 * 96 * NKV * 8; slabCV<Int> = CV + L6 * 96 * NKV * 8
             UqP2<Int> = LSLB + L6 * 917504 + 0; VqP2<Int> = LSLB + L6 * 917504 + 40960
             UkP2<Int> = LSLB + L6 * 917504 + 106496; VkP2<Int> = LSLB + L6 * 917504 + 147456
@@ -629,7 +632,13 @@ main()<Int> -> {
                                   RSLO, RSHI)
                 if (e != 0) { return 80 }
             }
-            if (L6 == 0) { e = dumpf(HBout + S * D * 8, RESP * D, "native/out/kvresp_L0_gpu.txt"); if (e != 0) { return 74 } }
+            if (L6 == 0) {
+                e = dumpf(HBout + S * D * 8, RESP * D, "native/out/kvresp_L0_gpu.txt"); if (e != 0) { return 74 }
+                e = dumpf(rXN + S * D * 8, D, "native/out/kvresp_L0_xn_gpu.txt"); if (e != 0) { return 77 }
+                e = dumpf(rDQN + S * NQ * 8, NQ, "native/out/kvresp_L0_dqn_gpu.txt"); if (e != 0) { return 78 }
+                e = dumpf(rDQr + S * NQ * 8, NQ, "native/out/kvresp_L0_q_gpu.txt"); if (e != 0) { return 75 }
+                e = dumpf(rDCtx + S * NQ * 8, NQ, "native/out/kvresp_L0_ctx_gpu.txt"); if (e != 0) { return 76 }
+            }
             tc2<Int> = HBin; HBin = HBout; HBout = tc2
         }
         # final response hiddens: HBin rows S..S+RESP-1 -> HALL rows 0..RESP-1

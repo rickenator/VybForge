@@ -47,8 +47,23 @@ cache. This cheap reference validates the mechanism before scaling the context t
   cached CK/CV) then the frozen-context backward.
 
 ## Response forward — implementation notes (found by drafting it; READ BEFORE CODING)
-The per-token response forward (`resp_layer_kv`-style, modeled on kv_driver.run_kv + LoRA on all 7
-projections) must get these RIGHT or it silently corrupts:
+**LoRA IS A 3-GEMM + ADDSCALED PATTERN (critical, was my root-cause of HALL corr ~0):** the
+validated run_layer does NOT do `gemmf(a,W,o)` then `addscaled(o,U,V,AR)`. It does, per projection:
+  (1) `gemmf(a, W, out)` -> out = a@W
+  (2) `gemmf(a, U, s)`   -> s  = a@U            (LoRA low-rank A; s is [S,R])
+  (3) `gemmf(s, V, e)`   -> e  = s@V            (LoRA low-rank B; e is [S,dim])
+  (4) `addscaled(out, e, AR, n)` -> out[i] += AR*e[i]   (addscaled(A,B,c,n) = elementwise A+=c*B,
+      params +0=A,+8=B,+16=c(Float),+24=n — NOT a matmul!)
+My first resp_layer_kv wrongly did `addscaled(C, U, V, AR, S)` (treated V as a vector with n=1) ->
+every projection corrupted -> response hiddens corr ~0 vs numpy. FIXED in kvrespfwd via `proj_lor`
+helper (the 3-gemm+addscaled, per-token row-P with slo [S,R]/shi [S,FF] scratch buffers).
+**STATUS: still FAILING (final HALL corr ~0). Localizing with per-stage layer-0 dumps.**
+DIAGNOSTIC TRAP (cost a session): the layer-0 stage dumps (XN/DQN/DQr/DCtx) were read from the
+CONTEXT working buffers (same names, S=9 sized) instead of the RESPONSE buffers (rXN/rDQN/rDQr/
+rDCtx <- what resp_layer_kv actually writes). So they showed garbage regardless of correctness;
+emb (correct, corr 1.0) and N1 (correct) confirmed the inputs, but the stage values must be read
+from the r* buffers. FIXED the dumps to rXN/rDQN/rDQr/rDCtx.
+The per-token forward must get these RIGHT or it silently corrupts:
 1. **Row-P addressing, not row 0.** The per-token q/k/v/o/g/u/d projections and roped activations
    must write to ROW P of each buffer (e.g. `DQ + P*NQ*8`, `DK + P*NKV*8`), like run_kv does. The
    context-build working buffers (sized S=ctx) are TOO SMALL for response positions P=ctx+t — use
