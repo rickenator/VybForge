@@ -18,31 +18,37 @@ D, H, KVH, HD, FF = 2560, 32, 8, 128, 9728
 NQ, NKV = H*HD, KVH*HD
 R, alpha_r = 2, 2.0
 VOCAB = 151936
-# S derived from the encoded goal-desktop whole-stack record (train rec 6: 'I want a Hyprland
-# desktop workstation' -> manifest-v<3 SUMMARY response, 84 tokens). Encode the assistant content
-# with the same tokenizer the Vyb decoder uses (transformers artifacts), then S = len(response)-1,
-# input = response[0:S], labels = response[1:S+1] (teacher-forced next-token).
+# goal-conditioned whole-stack objective: context prefix = the user GOAL (I want a Hyprland
+# desktop workstation), padded by the assistant response; CE loss/backprop ONLY on response
+# positions (context rows ignored / LABELS=-1). Full sequence S = ctx + resp.
 def _load_record():
     import json
-    rec = None
+    msgs = None
     with open(os.path.join(repo, "data/vybos-configurator-train.jsonl")) as fh:
         for line in fh:
             d = json.loads(line)
             u = " ".join(m["content"] for m in d["messages"] if m["role"] == "user")
             if "Hyprland desktop workstation" in u:
-                rec = [m["content"] for m in d["messages"] if m["role"] == "assistant"][-1]
+                msgs = d["messages"]
                 break
-    if rec is None:
+    if msgs is None:
         raise SystemExit("goal-desktop record not found in train corpus")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(os.path.join(repo, "artifacts", "vybos-configurator-lora"))
-    return np.array(tok.encode(rec, add_special_tokens=False), dtype=np.int64)
+    usr = [m["content"] for m in msgs if m["role"] == "user"][0]
+    asst = [m["content"] for m in msgs if m["role"] == "assistant"][-1]
+    return (np.array(tok.encode(usr, add_special_tokens=False), dtype=np.int64),
+            np.array(tok.encode(asst, add_special_tokens=False), dtype=np.int64))
 
-_ids = _load_record()
-S = int(_ids.shape[0]) - 1          # 84 tokens -> S=83 labeled positions
-INPUT_IDS = _ids[:S]                 # response[0:S]
-LABELS = _ids[1:S + 1]               # response[1:S+1]  (next token at each position)
-print("whole-stack goal-desktop record: S =", S, " input", INPUT_IDS[:8].tolist(), "...")
+_ctx, _resp = _load_record()
+NCTX = int(_ctx.shape[0])
+S = NCTX + int(_resp.shape[0])       # context + response, teacher-forced
+INPUT_IDS = np.concatenate([_ctx, _resp])             # positions 0..NCTX-1 = context (ignored)
+LABELS = np.full(S, -1, dtype=np.int64)               # context rows ignored (no loss/backprop)
+for k in range(len(_resp) - 1):
+    LABELS[NCTX + k] = _resp[k + 1]                   # response[i] predicts response[i+1]
+NV = int((LABELS >= 0).sum())
+print("goal-conditioned whole-stack: S =", S, " ctx(resp) =", NCTX, "valid labels =", NV)
 seq = np.arange(S)
 tens = l0.parse_tsv()
 proj_shapes = {"q":(D,NQ),"k":(D,NKV),"v":(D,NKV),"o":(NQ,D),"g":(D,FF),"u":(D,FF),"d":(FF,D)}
@@ -167,21 +173,25 @@ def backward_layer(L, dG, c, xin):
     return gu, dx
 
 def ce_loss_and_headgrad(xo):
-    """output_norm -> tied lm_head; returns loss, dL/d(xo) [S,D] (before output_norm back)."""
+    """output_norm -> tied lm_head; returns masked CE loss, dL/d(xo) [S,D].
+    Loss/backprop ONLY over rows with LABELS>=0 (context prefix rows are ignored)."""
     h = rms(xo, ON)                     # [S,D]
-    logits = h @ emb.T                  # [S,VOCAB]
+    logits = h @ emb.T                      # [S,VOCAB]
     lse = logits.max(axis=-1, keepdims=True)
     e = np.exp(logits - lse)
     soft = e / e.sum(axis=-1, keepdims=True)
-    # CE, target-shifted, per token
-    loss = -np.log(soft[np.arange(S), LABELS]+1e-30).mean()
-    # dL/dlogits = (soft - onehot)
-    dlog = soft.copy(); dlog[np.arange(S), LABELS] -= 1.0; dlog /= S   # mean reduction
-    # back through logits = h @ emb.T -> dL/dh = dlog @ emb
+    mask = LABELS >= 0
+    NV = int(mask.sum())
+    # masked CE (mean over valid rows only)
+    loss = float(-np.log(soft[np.arange(S), LABELS][mask] + 1e-30).mean())
+    # dlog = (soft - onehot)/NV for valid rows, 0 for ignored (context) rows
+    dlog = np.where(mask[:, None], soft / NV, 0.0)
+    onehot = np.zeros_like(soft)
+    onehot[np.arange(S), LABELS] = 1.0
+    dlog = np.where(mask[:, None], (soft - onehot) / NV, 0.0)
     dh = dlog @ emb                     # [S,D]
-    # back through output_norm -> dL/dxo
-    dxo = np.zeros((S,D))
-    for s_ in range(S): dxo[s_]=rmsnorm_layer(xo[s_], dh[s_], ON, D)
+    dxo = np.zeros((S, D))
+    for s_ in range(S): dxo[s_] = rmsnorm_layer(xo[s_], dh[s_], ON, D)
     return float(loss), dxo, logits, soft
 
 NSTP=4; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0

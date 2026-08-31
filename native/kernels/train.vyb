@@ -806,28 +806,36 @@ hgemm(p<Int>) -> {
 }
 
 // cefwd: per-row softmax over LS [S,V]; writes P_lab[s]=softmax at label to LOS[s] (for host CE loss,
-// loss_s = -log(P_lab[s])) and dlog[s,v]=(softmax - onehot)/S to DLG. Params +0 LS +8 DLG +16 LOS
-// +24 LAB +32 S +40 V. Grid = S threads (one per row, loops V).
+// loss_s = -log(P_lab[s])) and dlog[s,v]=(softmax - onehot)/NV to DLG. LAB==-1 rows are IGNORED
+// (context prefix / padding): LOS=1.0 (contributes 0 to the host -log sum) and DLG row = 0 (no
+// gradient). NV = number of non-ignored rows (normalization). Params +0 LS +8 DLG +16 LOS +24 LAB
+// +32 S +40 V +48 NV. Grid = S threads (one per row, loops V).
 cefwd(p<Int>) -> {
     LS<Int> = ld_i64(p + 0); DLG<Int> = ld_i64(p + 8); LOS<Int> = ld_i64(p + 16); LAB<Int> = ld_i64(p + 24)
-    S<Int> = ld_i64(p + 32); V<Int> = ld_i64(p + 40)
+    S<Int> = ld_i64(p + 32); V<Int> = ld_i64(p + 40); NV<Int> = ld_i64(p + 48)
     s2<Int> = blk_x() * dim_x() + tid_x()
     if (s2 < S) {
-        mx<Float> = ld_f64(LS + (s2 * V + 0) * 8)
-        v2<Int> = 1
-        for (v2 in 1..V - 1) { xv<Float> = ld_f64(LS + (s2 * V + v2) * 8); if (xv > mx) { mx = xv } }
-        se<Float> = 0.0
-        for (v2 in 0..V - 1) { se = se + vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) }
-        inv<Float> = 1.0 / se
         lab<Int> = ld_i64(LAB + s2 * 8)
-        pl<Float> = vexp(ld_f64(LS + (s2 * V + lab) * 8) - mx) * inv
-        st_f64(LOS + s2 * 8, pl)
-        nd<Float> = 1.0 / (S as Float)
-        for (v2 in 0..V - 1) {
-            pv<Float> = vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) * inv
-            dg<Float> = pv * nd
-            if (v2 == lab) { dg = dg - nd }
-            st_f64(DLG + (s2 * V + v2) * 8, dg)
+        if (lab < 0) {
+            st_f64(LOS + s2 * 8, 1.0)
+            v2<Int> = 0
+            for (v2 in 0..V - 1) { st_f64(DLG + (s2 * V + v2) * 8, 0.0) }
+        } else {
+            mx<Float> = ld_f64(LS + (s2 * V + 0) * 8)
+            v2<Int> = 1
+            for (v2 in 1..V - 1) { xv<Float> = ld_f64(LS + (s2 * V + v2) * 8); if (xv > mx) { mx = xv } }
+            se<Float> = 0.0
+            for (v2 in 0..V - 1) { se = se + vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) }
+            inv<Float> = 1.0 / se
+            pl<Float> = vexp(ld_f64(LS + (s2 * V + lab) * 8) - mx) * inv
+            st_f64(LOS + s2 * 8, pl)
+            nd<Float> = 1.0 / (NV as Float)
+            for (v2 in 0..V - 1) {
+                pv<Float> = vexp(ld_f64(LS + (s2 * V + v2) * 8) - mx) * inv
+                dg<Float> = pv * nd
+                if (v2 == lab) { dg = dg - nd }
+                st_f64(DLG + (s2 * V + v2) * 8, dg)
+            }
         }
     }
 }

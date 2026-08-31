@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
-"""Regenerate train_full_ce.vyb for a target sequence length TS, from the S=4 CE driver.
+"""Regenerate train_full_ce.vyb for a target sequence length TS (masks/CE wiring preserved).
 
-The S=4 train_full_ce.vyb keeps every sequence-scaled size as an S-proportional literal and
-the LoRA `s` intermediates as SYMBOLIC `S*R` (they auto-scale). So generalizing 4->TS only
-needs to rescale the S=4 numeric literals by f=TS/4:
-  - S-dependent element counts (S*D=10240, S*NQ=16384, S*NKV=4096, S*FF=38912)
-  - ASLB per-activation byte offsets and per-layer stride 2163136 (all S-proportional)
-Use ONLY the S=4 literal set (never global 5120/8192/... which collide with S-independent
-adapter numels), and PROTECT S-independent lines (LSLB/MSLB/VSLB/AdamW/adapter loads) whose
-40960/8192/19456/... are adapter offsets that must NOT rescale.
+Base-S AGNOSTIC: reads the CURRENT S from the file, computes the full ASLB per-layer byte layout
+for the current and target S from the activation dims, and rescales every S-proportional literal
+(current_S value -> target_S value). The LoRA `s` intermediates and head grids are SYMBOLIC
+(S*R / S*D / S*VOCAB) so they auto-scale. PROTECTS S-independent lines (LSLB/MSLB/VSLB slabs,
+AW+ AdamW, m2e_l* adapter loads) whose literal sizes are adapter numels that must NOT rescale.
 
-Run: python native/train/_gen_ce.py <TS> [NSTP]   [writes native/train/train_full_ce.vyb]
+Run: python native/train/_gen_ce.py <TS> [NSTP]
 """
 import re, sys
-TS = int(sys.argv[1]) if len(sys.argv) > 1 else 84
+TS = int(sys.argv[1]) if len(sys.argv) > 1 else 93
 NSTP = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-f = TS / 4.0
-BASE = "native/train/train_full_ce.vyb"   # S=4 baseline WITH CE wiring
+BASE = "native/train/train_full_ce.vyb"
 DST = "native/train/train_full_ce.vyb"
 text = open(BASE).read()
+cur = int(re.search(r"S<Int> = (\d+)", text).group(1))
 
-# S=4 literals -> TS
-rep = {"10240": str(int(10240 * f)), "16384": str(int(16384 * f)),
-       "4096": str(int(4096 * f)), "38912": str(int(38912 * f)), "2163136": str(int(2163136 * f))}
-rep["77872896"] = str(int(77872896 * f))   # 36 * ASLB per-layer stride (S=4 total)
-s4off = [0,81920,163840,294912,327680,360448,491520,524288,655360,688128,819200,901120,
-         983040,1064960,1376256,1687552,1998848,2080768,2162688,2162752,2162816,2162880,
-         2162944,2163008,2163072]
-rep.update({str(o): str(int(o * f)) for o in s4off})
+# per-activation cache ORDER (elements), for a given S
+def layout(S):
+    D, NQ, NKV, FF, R = 2560, 4096, 1024, 9728, 2
+    seq = [S*D, S*D, S*NQ, S*NKV, S*NKV, S*NQ, S*NKV, S*NQ, S*NKV, S*NQ, S*D, S*D, S*D,
+           S*FF, S*FF, S*FF, S*D, S*D, S*R, S*R, S*R, S*R, S*R, S*R, S*R]
+    offs = []; acc = 0
+    for el in seq:
+        offs.append(acc); acc += el * 8
+    return offs, acc   # offsets (bytes) + per-layer stride (bytes)
+
+cur_offs, cur_stride = layout(cur)
+tgt_offs, tgt_stride = layout(TS)
+# element-count literals (S-dependent working-buffer sizes / grids)
+rep = {}
+for dim, name in [(2560, "D"), (4096, "NQ"), (1024, "NKV"), (9728, "FF")]:
+    rep[str(cur * dim)] = str(TS * dim)
+# ASLB per-activation offsets + stride + 36*stride
+for a, b in zip(cur_offs, tgt_offs):
+    rep[str(a)] = str(b)
+rep[str(cur_stride)] = str(tgt_stride)
+rep[str(36 * cur_stride)] = str(36 * tgt_stride)
 pattern = re.compile(r"(?<!\d)(" + "|".join(sorted(rep, key=len, reverse=True)) + r")(?!\d)")
 
 def protect(line):
@@ -37,11 +47,10 @@ def protect(line):
 def sub_m(m):
     return rep[m.group(1)]
 
-out = []
-for line in text.split("\n"):
-    out.append(line if protect(line) else pattern.sub(sub_m, line))
+out = [line if protect(line) else pattern.sub(sub_m, line) for line in text.split("\n")]
 new = "\n".join(out)
-new = new.replace("S<Int> = 4", "S<Int> = %d" % TS)
+# replace ONLY the line-start S constant decl (not LOS<Int>/IDS<Int>, which end in "...S<Int>")
+new = re.sub(r"^(\s*)S<Int> = \d+;", r"\1S<Int> = %d;" % TS, new, flags=re.MULTILINE)
 new = re.sub(r"NSTP<Int> = \d+", "NSTP<Int> = %d" % NSTP, new)
 open(DST, "w").write(new)
-print("wrote", DST, "S=%d (f=%.2f) NSTP=%d lines=%d" % (TS, f, NSTP, new.count(chr(10)) + 1))
+print("wrote", DST, "S %d->%d NSTP=%d lines=%d" % (cur, TS, NSTP, new.count(chr(10)) + 1))
