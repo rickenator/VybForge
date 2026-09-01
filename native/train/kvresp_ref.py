@@ -57,6 +57,11 @@ for L in range(36):
     kn = rms(k.reshape(S, KVH, HD), ALL_LN[L]["attn_k_norm"])
     qr, kr = l0.rope(qn, kn, seq)
     ctx = l0.gqa(qr, kr, v.reshape(S, KVH, HD))
+    if L == 0:
+        qr[NCTX:S].reshape(-1).astype("<f8").tofile(os.path.join(out, "kvresp_L0_q_ref.bin"))
+        ctx[NCTX:S].reshape(-1).astype("<f8").tofile(os.path.join(out, "kvresp_L0_ctx_ref.bin"))
+        xn[NCTX:S].reshape(-1).astype("<f8").tofile(os.path.join(out, "kvresp_L0_xn_ref.bin"))
+        qn[NCTX:S].reshape(-1).astype("<f8").tofile(os.path.join(out, "kvresp_L0_dqn_ref.bin"))
     o = lproj(ctx.reshape(S, NQ), "o", L)
     x1 = x + o
     x1n = rms(x1, ALL_LN[L]["ffn_norm"])
@@ -69,6 +74,8 @@ for L in range(36):
 resp_hidden = x[NCTX:S].astype("<f8")     # [84, D]
 resp_hidden.tofile(os.path.join(out, "kvresp_hidden_ref.bin"))
 np.savetxt(os.path.join(out, "kvresp_hidden_ref_head.txt"), resp_hidden.reshape(-1)[:256], fmt="%.9g")
+np.asarray(emb[resp_ids[:3]], dtype=np.float64).reshape(-1).tofile(os.path.join(out, "kvresp_emb_ref.bin"))
+np.asarray(ALL_LN[0]["attn_norm"], dtype=np.float64).reshape(-1).tofile(os.path.join(out, "kvresp_L0_n1_ref.bin"))
 for k in ["l1", "l9", "l18", "l27"]:
     if k in saved:
         saved[k].astype("<f8").tofile(os.path.join(out, f"kvresp_L{k}_ref.bin"))
