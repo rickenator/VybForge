@@ -260,11 +260,9 @@ resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<
         cuMemcpyHtoD_v2(RN + 0, loc(dkP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nk), 8); cuMemcpyHtoD_v2(RN + 16, loc(dknP), 8)
         cuMemcpyHtoD_v2(RN + 24, loc(KVH), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
         cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NKV + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-        # rope via PROVEN base-pointer batch mode: rows 0..P, POS=0 -> row s roped at position s.
-        # (row P is the response token -> correctly roped at absolute position P; earlier rows recompute garbage, discarded)
-        cuMemcpyHtoD_v2(ROP + 80, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN), 8); cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr), 8)
-        cuMemcpyHtoD_v2(ROP + 176, loc(DFf), 8); cuMemcpyHtoD_v2(ROP + 184, loc(SPb), 8); cuMemcpyHtoD_v2(ROP + 200, loc(HDf), 8); cuMemcpyHtoD_v2(ROP + 208, loc(Hf), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVHf), 8); cuMemcpyHtoD_v2(ROP + 224, loc(ZR), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(rp)), (SPb * (Hf + KVHf) * HDf + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        cuMemcpyHtoD_v2(ROP + 80, loc(dqnP), 8); cuMemcpyHtoD_v2(ROP + 88, loc(dknP), 8); cuMemcpyHtoD_v2(ROP + 96, loc(dqrP), 8); cuMemcpyHtoD_v2(ROP + 104, loc(dkrP), 8)
+        cuMemcpyHtoD_v2(ROP + 176, loc(DFf), 8); cuMemcpyHtoD_v2(ROP + 184, loc(one), 8); cuMemcpyHtoD_v2(ROP + 200, loc(HDf), 8); cuMemcpyHtoD_v2(ROP + 208, loc(Hf), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVHf), 8); cuMemcpyHtoD_v2(ROP + 224, loc(Pp), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rp)), (NQf + NKVf + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
         cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CK + P * NKV * 8, dkrP, NKV, 0)
         cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CV + P * NKV * 8, dvP, NKV, 0)
         cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(CK), 8); cuMemcpyHtoD_v2(ATT + 96, loc(CV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
@@ -488,6 +486,9 @@ main()<Int> -> {
             }
         }
         cuCtxSynchronize()
+        # *** FIX: load RoPE invfreq into DF (was never loaded -> rope read garbage -> identity) ***
+        fbi<String> = read_bin("native/out/layer0_invfreq.bin"); if (fbi.len() < 64 * 8) { println("DF_MISSING"); return 37 }
+        e = download(fbi, DF, 64 * 8); if (e != 0) { return 47 }
         # ---- context build: run run_layer over (rotating) input, capture DKr/DV per layer into CK/CV ----
         XIc<Int> = XI; XOc<Int> = XO
         L5<Int> = 0
