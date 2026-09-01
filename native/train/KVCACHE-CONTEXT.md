@@ -1,6 +1,7 @@
 # KV-Cache Context-Prefix Training (full-manifest conditioning)
 
-Status: **architected; numpy reference built & verified; GPU build in progress (kvctx.vyb WIP).**
+Status: **response forward VERIFIED (2be728e); frozen-context training numpy ORACLE done & verified
+(3435de0); GPU training driver kvresp_train.vyb = NEXT (not yet built).**
 Parent context: HANDOFF-NEXT-SESSION.md, training/CORPUS-STRATEGY.md, native/train/train_full_ce.vyb,
 native/host/kv_driver.vyb.
 
@@ -100,8 +101,16 @@ The per-token forward must get these RIGHT or it silently corrupts:
 
 ## Next steps
 1. [DONE] GPU context-KV-cache build VERIFIED (4b43568).
-2. KV-aware LoRA `run_kv` per-token response forward (attend to cached CK/CV + response-so-far);
-   verify response logits/loss == the validated full-sequence S=93 result (no new oracle).
-3. Frozen-context backward (zero/adjust context-region dattn grads) + AdamW; verify descent == the
-   masked goal-conditioned oracle (committed ref).
+2. [DONE] KV-aware LoRA `run_kv` per-token response forward (attend to cached CK/CV + response-so-far) VERIFIED (RESPONSE FORWARD, commit 2be728e): final HALL corr 1.0, loss 15.93 == full-seq.
+3. [numpy] FROZEN-CONTEXT backward + AdamW = full-seq backward with context-row (0..NCTX-1)
+   attention q/k/v grads ZEROED and context LoRA frozen. **numpy ORACLE DONE & VERIFIED
+   (commit 3435de0): `native/train/kvresp_train_ref.py`** — masked CE on response only,
+   per-step loss 15.957->15.495->14.841->14.095 (DESCENDS), response-row grads provably
+   identical to the FD-validated full-seq chain (context queries never attend response rows).
+   Writes the GPU target: kvresp_train_loss_ref.txt + kvresp_train_DUQ/DVQ_L{0,17,35}_ref.bin.
+   `make kvresp-train-oracle` reproduces it.
+   **GPU driver `kvresp_train.vyb` = NEXT** (not yet built): repo of kvrespfwd.vyb + cached
+   per-layer response activations + batched backward with dattn over the COMBINED cache and
+   context-region zeroing + AdamW. Gate = per-step CE loss reproduces kvresp_train_loss_ref.txt
+   and step-1 dU_q/dV_q match the *_ref.bin at ~e-4.
 4. Scale the context to the full manifest (369 tokens); confirm per-step cost stays ~response-only.
