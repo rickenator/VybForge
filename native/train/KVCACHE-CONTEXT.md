@@ -63,18 +63,19 @@ CONTEXT working buffers (same names, S=9 sized) instead of the RESPONSE buffers 
 rDCtx <- what resp_layer_kv actually writes). So they showed garbage regardless of correctness;
 emb (correct, corr 1.0) and N1 (correct) confirmed the inputs, but the stage values must be read
 from the r* buffers. FIXED the dumps to rXN/rDQN/rDQr/rDCtx.
-**Status: STILL FAILING (final HALL corr ~0). Isolated to the response qwen3rope producing IDENTITY.**
-- XN (rmsnorm), DQN (pre-rope q) are CORRECT; DQr (post-rope q) == DQN exactly.
-- Confirmed via device read-back that ROP+224 (POS) = 9 and ROP+176 (FR/DF ptr) = valid for the
-  response rope — so the params reach the buffer correctly, yet the SAME qwen3rope kernel that
-  rotates the context (positions 0..8, base pointers, batch) produces NO rotation for the response
-  (single row at row-offset pointer, S=1, POS of P). Suspected kernel-level: qwen3rope with row-
-  offset input+output pointers (Q=dqnP, Qd=dqrP) + S=1 does not apply the rotation. Isolation
-  probe kvrope_probe.vyb intended to confirm in ~2 min (no weight load) ; per Rick's protocol file
-  an isolated rickenator/Vyb issue if reproducible, else find the remaining driver cause. A
-  defensive driver workaround candidate: rope with a NON row-offset base + S such that s indexes
-  the absolute row (e.g., pass base DQN and S=absolute row count, POS=0), or compute roped q/k with
-  the SIMPLE `rope` kernel (no POS) applied per concatenated position.
+**Status: RESPONSE FORWARD VERIFIED (2026-08-30) — final HALL corr 1.0 / |g|=|r| / max|g-r| 1.66e-4.**
+**Resolution — TWO real driver bugs (NOT a kernel bug):**
+1. **DF (RoPE invfreq) was never loaded** into the 64-slot device buffer -> the qwen3rope read
+   all-zero FR -> angle 0 -> identity (DQr==DQN). Fixed by loading native/out/layer0_invfreq.bin
+   into DF BEFORE the context build. A standalone probe (kvrope_probe.vyb) proved the kernel+call
+   pattern (row-offset + S=1 + POS=9) rotates correctly with a real FR — no rickenator/Vyb issue.
+2. **Cache-slab STRIDE mismatch**: the context build wrote each layer’s roped-K/V at
+   `CK + L*S*NKV*8` (S=9 rows/layer) but the response reads them at `CK + L*96*NKV*8`
+   (96 rows/layer) — coincident only at layer 0, so layers >=1 read garbage context K/V (layer-0
+   corr 1.0, layer-1 corr 0.16). Fixed the context build to the same 96-row stride.
+With both fixes, layer-0..35 response hiddens all match numpy (final corr 1.0, max|g-r| 1.66e-4).
+The KV-aware LoRA response forward is VERIFIED. NEXT: wrap it into the full context-manifest
+training (response attended forward is done; add the frozen-context backward), then decode.
 The per-token forward must get these RIGHT or it silently corrupts:
 1. **Row-P addressing, not row 0.** The per-token q/k/v/o/g/u/d projections and roped activations
    must write to ROW P of each buffer (e.g. `DQ + P*NQ*8`, `DK + P*NKV*8`), like run_kv does. The
