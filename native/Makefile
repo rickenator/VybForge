@@ -205,6 +205,14 @@ kvresp-train: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/kvresp_train.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
 
+# TRUE per-token KV trainer (kvresp_train_kv.vyb): context built once per-token, response forward
+# per-token attending the combined roped-k/v cache, unchanged S=93 frozen backward + AdamW.
+# Same oracle gate. (nv only: kvresp_train_kv shares output files with kvresp_train.)
+kvresp-train-kv: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/kvresp_train_ref.py
+	cd $(ROOT) && $(VYB) native/train/kvresp_train_kv.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
