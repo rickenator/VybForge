@@ -529,13 +529,11 @@ main()<Int> -> {
                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M2,
                           sq, sk, sv, so, sg, su, sd, eq, ek, ev, eo, eg, eu, ed)
             cuCtxSynchronize()
-            # capture roped-K (DKr) and V (DV) into CK/CV slab L5
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (S * NKV + 255) / 256, 1, 1, 256, 1, 1, CK + L5 * S * NKV * 8, DKr, S * NKV, 0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (S * NKV + 255) / 256, 1, 1, 256, 1, 1, CV + L5 * S * NKV * 8, DV, S * NKV, 0)
+            # capture roped-K (DKr) and V (DV) into CK/CV slab L5 — use the SAME 96-row stride the
+            # response uses (CK + L*96*NKV*8), so layer L>=1 context K/V lands where the response reads them.
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (S * NKV + 255) / 256, 1, 1, 256, 1, 1, CK + L5 * 96 * NKV * 8, DKr, S * NKV, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (S * NKV + 255) / 256, 1, 1, 256, 1, 1, CV + L5 * 96 * NKV * 8, DV, S * NKV, 0)
             cuCtxSynchronize()
-            # dump first-32 of this layer's DKr & DV
-            e = dumpf(CK + L5 * S * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DKr_gpu.txt"); if (e != 0) { return 70 }
-            e = dumpf(CV + L5 * S * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DV_gpu.txt"); if (e != 0) { return 71 }
             # rotate input/output
             tc<Int> = XIc; XIc = XOc; XOc = tc
         }
@@ -645,6 +643,12 @@ main()<Int> -> {
                 e = dumpf(rDCtx + S * NQ * 8, NQ, "native/out/kvresp_L0_ctx_gpu.txt"); if (e != 0) { return 76 }
             }
             tc2<Int> = HBin; HBin = HBout; HBout = tc2
+            if (L6 == 8) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L9_gpu.txt"); if (e != 0) { return 84 } }
+            if (L6 == 1) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L2_gpu.txt"); if (e != 0) { return 87 } }
+            if (L6 == 2) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L3_gpu.txt"); if (e != 0) { return 88 } }
+            if (L6 == 3) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L4_gpu.txt"); if (e != 0) { return 89 } }
+            if (L6 == 17) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L18_gpu.txt"); if (e != 0) { return 85 } }
+            if (L6 == 26) { e = dumpf(HBin + S * D * 8, RESP * D, "native/out/kvresp_L27_gpu.txt"); if (e != 0) { return 86 } }
         }
         # final response hiddens: HBin rows S..S+RESP-1 -> HALL rows 0..RESP-1
         t3<Int> = 0

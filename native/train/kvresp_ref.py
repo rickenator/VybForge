@@ -69,14 +69,14 @@ for L in range(36):
     m = lproj((g / (1 + np.exp(-g))) * up, "d", L)
     x = x1 + m
     if L == 0: saved["l0"] = x[NCTX:S].copy()
-    if L in (0, 8, 17, 26): saved[f"l{L+1}"] = x[NCTX:S].copy()
+    if L in (0, 1, 2, 3, 4, 8, 17, 26): saved[f"l{L+1}"] = x[NCTX:S].copy()
 # response hidden = layer-36 output rows NCTX..S-1
 resp_hidden = x[NCTX:S].astype("<f8")     # [84, D]
 resp_hidden.tofile(os.path.join(out, "kvresp_hidden_ref.bin"))
 np.savetxt(os.path.join(out, "kvresp_hidden_ref_head.txt"), resp_hidden.reshape(-1)[:256], fmt="%.9g")
 np.asarray(emb[resp_ids[:3]], dtype=np.float64).reshape(-1).tofile(os.path.join(out, "kvresp_emb_ref.bin"))
 np.asarray(ALL_LN[0]["attn_norm"], dtype=np.float64).reshape(-1).tofile(os.path.join(out, "kvresp_L0_n1_ref.bin"))
-for k in ["l1", "l9", "l18", "l27"]:
+for k in ["l1", "l2", "l3", "l4", "l5", "l9", "l18", "l27"]:
     if k in saved:
-        saved[k].astype("<f8").tofile(os.path.join(out, f"kvresp_L{k}_ref.bin"))
+        np.asarray(saved[k], dtype=np.float64).tofile(os.path.join(out, f"kvresp_Ll{k}_ref.bin"))
 print("kvresp_ref done S=", S, "NCTX=", NCTX, "resp_hidden", resp_hidden.shape, "norm=", float(np.linalg.norm(resp_hidden.reshape(-1)) ** 2))
