@@ -1,0 +1,63 @@
+// STANDALONE probe: does qwen3rope rotate a single row at absolute POS=9 when the input/output
+// are ROW-OFFSET pointers (Q=dqnP=base+P*NQ*8, Qd=dqrP) with S=1? Fills a [NR,NQ] DQN buffer with a
+// known value where row P=9 = cos-like pattern, calls qwen3rope(POS=9,S=1,row-offset), reads DQr row 9.
+// If DQr != DQN(row9), the kernel rotates correctly (host driver bug elsewhere); if DQr==DQN(row9),
+// the kernel fails to apply angle 9 for the single-row row-offset case (kernel bug).
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gx<CUInt>, gy<CUInt>, gz<CUInt>, bx<CUInt>, by<CUInt>, bz<CUInt>, a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+read_bin(p<String>)<String>  -> { r<String>=""; match(open_read(p)){ f -> { match(read_all(f)){ s -> { r=s } ? -> { r="" } } close(f) } ? -> { r="" } }; return r }
+u8(s<String>,o<Int> )  -> { return (s.char_at(o) as Int)&255 }
+dl(data<String>,dst<Int>,n<Int> )  -> { freedom { npb<Int> =n-(n%8); ci<Int> =0; for(ci in 0..(npb/8)-1){ o8<Int> =ci*8; ch<Int> =0; bj<Int> =0; for(bj in 0..7){ bv<Int> =u8(data,o8+bj); ch=ch|(bv<<(bj*8)) }; if(cuMemcpyHtoD_v2(dst+o8,loc(ch),8)!=0){ return 15 } }; tj<Int> =npb; while(tj<n){ bv<Int> =u8(data,tj); if(cuMemcpyHtoD_v2(dst+tj,loc(bv),1)!=0){ return 15 }; tj=tj+1 }; return 0 }; return 0 }
+main( )  -> {
+    D<Int> =2560; H<Int> =32; HD<Int> =128; KVH<Int> =8; NQ<Int> =H*HD; NR<Int> =16; P<Int> =9
+    freedom { cuInit(0); var<CInt> nd=0; cuDeviceGetCount(loc(nd)); var<CInt> dv=0; cuDeviceGet(loc(dv),0); ctx<loc<CVoid>> =from<loc<CVoid>>(0); cuCtxCreate_v2(loc(ctx),0,dv) }
+    m<loc<CVoid>> =from<loc<CVoid>>(0); rc<CInt> =-1; t4<Int> =0
+    freedom { for(t4 in 0..5){ if(rc!=0){ m=from<loc<CVoid>>(0); rc=cuModuleLoadData(loc(m),read_bin("native/build/train.ptx")) } } }
+    if(rc!=0){ println("MODLOAD_FAIL"); return 9 }
+    rp<loc<CVoid>> =from<loc<CVoid>>(0); ROP<Int> =0
+    freedom {
+        if(cuModuleGetFunction(loc(rp),m,"qwen3rope")!=0){ return 10 }
+        if(cuMemAlloc_v2(loc(ROP),232)!=0){ return 11 }
+        DQN<Int> =0; DQr<Int> =0; FR<Int> =0
+        if(cuMemAlloc_v2(loc(DQN),NR*NQ*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DQr),NR*NQ*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(FR),2560*8)!=0){ return 11 }
+        # fill DQN row P with a known pattern v[i]=cos(0.001*i) (must be distinct per i so rotation is visible)
+        mf<Float> =0.0; kk<Int> =0
+        for(kk in 0..(P*NQ)-1){ mf=0.0; if(cuMemcpyHtoD_v2(DQN+kk*8,loc(mf),8)!=0){ return 20 } }
+        for(kk in P*NQ..(P+1)*NQ-1){ mf=0.001*((kk-P*NQ) as Float); if(cuMemcpyHtoD_v2(DQN+kk*8,loc(mf),8)!=0){ return 21 } }
+        for(kk in (P+1)*NQ..NR*NQ-1){ mf=0.0; if(cuMemcpyHtoD_v2(DQN+kk*8,loc(mf),8)!=0){ return 20 } }
+        # invfreq: read layer0_invfreq.bin (first 64)
+        frb<String>=read_bin("native/out/layer0_invfreq.bin")
+        if(frb.len()<64*8){ println("FR_MISSING"); return 30 }
+        if(dl(frb,FR,64*8)!=0){ return 31 }
+        # call qwen3rope with row-offset (dqnp = DQN + P*NQ*8) and S=1
+        dqnP<Int> =DQN+P*NQ*8; dqrP<Int> =DQr+P*NQ*8; one<Int> =1
+        cuMemcpyHtoD_v2(ROP+80,loc(dqnP),8); cuMemcpyHtoD_v2(ROP+88,loc(dqnP),8); cuMemcpyHtoD_v2(ROP+96,loc(dqrP),8); cuMemcpyHtoD_v2(ROP+104,loc(dqrP),8)
+        cuMemcpyHtoD_v2(ROP+176,loc(FR),8); cuMemcpyHtoD_v2(ROP+184,loc(one),8)
+        cuMemcpyHtoD_v2(ROP+200,loc(HD),8); cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8)
+        cuMemcpyHtoD_v2(ROP+224,loc(P),8)
+        cuCtxSynchronize()
+        cuda_launch4i(from<loc<CVoid>>(addr(rp)),(NQ+KVH*HD+255)/256,1,1,256,1,1,ROP,0,0,0)
+        cuCtxSynchronize()
+        # read back DQN row P (input) and DQr row P (output) first-4
+        f0<Float> =0.0; o0<Float> =0.0; f1<Float> =0.0; o1<Float> =0.0
+        cuMemcpyDtoH_v2(loc(f0),DQN+P*NQ*8,8); cuMemcpyDtoH_v2(loc(o0),DQr+P*NQ*8,8)
+        cuMemcpyDtoH_v2(loc(f1),DQN+P*NQ*8+8,8); cuMemcpyDtoH_v2(loc(o1),DQr+P*NQ*8+8,8)
+        println("ROPE in[0]="+f0.to_string()+" -> out[0]="+o0.to_string()+" | in[1]="+f1.to_string()+" -> out[1]="+o1.to_string())
+        println("ROPE_PROBE_DONE (if out==in -> kernel identity; if out!=in -> kernel rotates)")
+    }
+    return 0
+}

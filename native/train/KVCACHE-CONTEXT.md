@@ -63,6 +63,18 @@ CONTEXT working buffers (same names, S=9 sized) instead of the RESPONSE buffers 
 rDCtx <- what resp_layer_kv actually writes). So they showed garbage regardless of correctness;
 emb (correct, corr 1.0) and N1 (correct) confirmed the inputs, but the stage values must be read
 from the r* buffers. FIXED the dumps to rXN/rDQN/rDQr/rDCtx.
+**Status: STILL FAILING (final HALL corr ~0). Isolated to the response qwen3rope producing IDENTITY.**
+- XN (rmsnorm), DQN (pre-rope q) are CORRECT; DQr (post-rope q) == DQN exactly.
+- Confirmed via device read-back that ROP+224 (POS) = 9 and ROP+176 (FR/DF ptr) = valid for the
+  response rope — so the params reach the buffer correctly, yet the SAME qwen3rope kernel that
+  rotates the context (positions 0..8, base pointers, batch) produces NO rotation for the response
+  (single row at row-offset pointer, S=1, POS of P). Suspected kernel-level: qwen3rope with row-
+  offset input+output pointers (Q=dqnP, Qd=dqrP) + S=1 does not apply the rotation. Isolation
+  probe kvrope_probe.vyb intended to confirm in ~2 min (no weight load) ; per Rick's protocol file
+  an isolated rickenator/Vyb issue if reproducible, else find the remaining driver cause. A
+  defensive driver workaround candidate: rope with a NON row-offset base + S such that s indexes
+  the absolute row (e.g., pass base DQN and S=absolute row count, POS=0), or compute roped q/k with
+  the SIMPLE `rope` kernel (no POS) applied per concatenated position.
 The per-token forward must get these RIGHT or it silently corrupts:
 1. **Row-P addressing, not row 0.** The per-token q/k/v/o/g/u/d projections and roped activations
    must write to ROW P of each buffer (e.g. `DQ + P*NQ*8`, `DK + P*NKV*8`), like run_kv does. The
