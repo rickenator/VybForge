@@ -195,6 +195,16 @@ train-ce-loop: $(ROOT)/native/build/train.ptx
 kvresp-train-oracle:
 	cd $(ROOT) && .venv/bin/python native/train/kvresp_train_ref.py
 
+# FROZEN-CONTEXT KV TRAINING on GPU (kvresp_train.vyb): reuses the validated batched S=93
+# forward+backward+AdamW engine (train_full_ce.vyb) with the context-region (rows 0..NCctx-1)
+# attention q/k/v grads ZEROED after dattn -- context K/V frozen, response-only LoRA updates.
+# Gate = KVRESP_TRAIN_VERIFY: step-1 dU_q/dV_q (L0/17/35) match the numpy oracle to ~e-6,
+# per-step CE loss matches kvresp_train_loss_ref.txt (15.957->14.095) and descends.
+kvresp-train: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/kvresp_train_ref.py
+	cd $(ROOT) && $(VYB) native/train/kvresp_train.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
