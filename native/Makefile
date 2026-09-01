@@ -188,6 +188,13 @@ train-ce-loop: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full_ce.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_ce.py
 
+# Frozen-context KV training ORACLE (numpy): caches the 9-token goal context per-layer roped-K/V
+# once; per-token response forward == full-sequence; masked CE on response only; FROZEN-CONTEXT
+# backward (context-row q/k/v attention grads zeroed, context LoRA frozen); AdamW on response LoRA.
+# Writes the GPU target (kvresp_train_loss_ref.txt + step-1 dU_q/dV_q refs). Must descend.
+kvresp-train-oracle:
+	cd $(ROOT) && .venv/bin/python native/train/kvresp_train_ref.py
+
 decode: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
 	cd $(ROOT) && python3 native/tools/verify_decode.py
