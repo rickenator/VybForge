@@ -1,14 +1,14 @@
 # HANDOFF — RESUME HERE (untracked; do not commit)
 
 **Project:** VybForge — repo `rickenator/VybForge`, local checkout
-`/home/rick/Projects/VybAIConf`, branch `main`. Talk to the user as "Rick".
-**Model:** `~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf` (2.5GB, real). **Compiler:**
-`~/Projects/Vyb/build/vyb` (now includes #209 fix). GPU: RTX 3090. venv `.venv`.
+`<VybForge checkout>`, branch `main`. Address the user neutrally.
+**Model:** `<model path>` (2.5GB, real). **Compiler:**
+`<Vyb checkout>/build/vyb` (now includes #209 fix). GPU: RTX 3090. venv `.venv`.
 Conventions unchanged (runtime pure Vyb; handoffs = GitHub issues on rickenator/Vyb).
 
 ## Status of the two issues filed earlier
 - **rickenator/Vyb#209** (cuModuleLoadData intermittent INVALID_PTX / String→CString
-  NUL hazard) — REAL compiler bug, **FIXED by Rick**. Drivers already carry the
+  NUL hazard) — REAL compiler bug, **fixed upstream**. Drivers already carry the
   bounded retry; safe to keep.
 - **rickenator/Vyb#210** (claimed "launch-drop") — **NOT a Vyb bug, CLOSED.** Root
   cause was MY driver: a `freedom{... return 0}` inside the `emb_dequant` chunked
@@ -71,7 +71,7 @@ Key files:
    K/V, reads ctx row P). `make decode-kv` → DECODE_REAL_MATCH: OK, same tokens as recompute/numpy.
    GOTCHA: single-row rmsnorm/rope S-param is **1**, not 0 — S=0 launches zero threads and collapses the
    stream to a constant token (61619 everywhere).
-3. **TRAINING PHASE (NEW DIRECTION, 2026-08-28):** Rick wants the LoRA training itself to be Vyb-native
+3. **TRAINING PHASE (NEW DIRECTION, 2026-08-28):** the current direction requires the LoRA training itself to be Vyb-native
    on the 3090 (no torch) — the true no-Python path — full Qwen3-4B research-scale, PLUS an expanded
    interview corpus. Design doc `training/CORPUS-STRATEGY.md`: **facts live in context (a capabilities
    manifest in the system prompt), behavior lives in the weights**, so a new VybOS capability = edit the

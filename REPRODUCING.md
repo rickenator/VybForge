@@ -82,7 +82,7 @@ retraining and overwrites the local adapter path.
 
 The launcher copies only `data/` and `training/`, creates a target `.venv`,
 installs the pinned Python dependencies, checks CUDA, and writes logs/artifacts
-under the target's `~/Projects/VybAIConf/`. It runs only with this explicit flag.
+under the target's `<VybForge checkout>/`. It runs only with this explicit flag.
 
 To test the included adapter on CUDA:
 

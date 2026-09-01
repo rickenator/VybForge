@@ -63,7 +63,7 @@ G-json → (independent) · G-tokenizer → (independent) · G-gguf-data →
 G-tensor → G-decode. G-json/G-tokenizer and G-gguf-data can run in parallel.
 
 ## Next: swap-in (slice → real Qwen3) — phased
-Central model store `~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf` (2.5GB, 24GB VRAM; see
+Central model store `<model path>` (2.5GB, 24GB VRAM; see
 `MODELS.md`). Ground truth captured by `native/gguf/dump_qwen3_meta.py` (gguf-py):
 arch qwen3, 36 layers, D=2560, FF=9728, 32/8 heads (GQA 4), eps 1e-6, ctx
 262144, file_type 15 = Q4_K_M, 398 tensors (`blk.N.attn_q/k/v/output`,
@@ -125,7 +125,7 @@ token_embd; Q4_K=12 / Q6_K=14 / F32=0). Saved to `native/out/qwen3_4b_tensors.ts
    on-GPU, pure Vyb. NOTE: the earlier "launch-drop" (#210) was MY bug — a
    `freedom{... return 0}` inside the chunk loop returned after chunk 0, so only
    ~26 token_embd rows dequantized; fixed by returning only after the loop. #209
-   (cuModuleLoadData/CString) was a real compiler bug, fixed by Rick.
+   (cuModuleLoadData/CString) was a real compiler bug, fixed upstream.
    **DECODE (greedy autoregressive) FULLY DONE & VERIFIED**: `native/host/decode_driver.vyb`
    keeps all 36 layers packed-resident, dequants per layer per step (handling MIXED
    per-layer quant — attn_v/ffn_down are Q6_K on 0-3 & 31-35, Q4_K elsewhere) and loads

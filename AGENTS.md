@@ -16,7 +16,7 @@ not build, install, activate, deploy, or modify one.
 - `config/mock-system.json` is a fictional review fixture, never the active
   host configuration.
 - Never write to, build in, invoke tooling from, or otherwise alter
-  `~/Projects/VybOS`.
+  `<VybOS checkout>`.
 - Never execute shell commands, install packages, download artifacts, call
   remote-control services, edit host configuration, or apply a generated
   configuration.

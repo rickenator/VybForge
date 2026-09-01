@@ -86,7 +86,7 @@ layout (`A,B,C,M,N,K,alpha,beta` at offsets 0..56).
 
 ## Vyb vs python reference note
 
-End-state goal (per Rick): the production pipeline must contain **no
+End-state goal (as a project goal): the production pipeline must contain **no
 Python/torch/Ollama** — Vyb runs the model on-GPU. Python is acceptable only as
 a reference-verification harness, which is why the drivers compare against
 host libm (`exp`/`sin`/`cos`) where convenient. The GPU kernels themselves never

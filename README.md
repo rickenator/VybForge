@@ -7,7 +7,7 @@ and **Infer**, a Vyb-native, on-GPU model-inference and compute substrate.
 
 Everything here **drafts desired state only.** It never builds, realizes,
 activates, deploys, or edits VybOS or the host, and it never touches the
-`~/Projects/VybOS` tree.
+`<VybOS checkout>` tree.
 
 ## Spec — desired-state interviewer
 
