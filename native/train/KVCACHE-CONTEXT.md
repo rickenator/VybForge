@@ -1,8 +1,7 @@
 # KV-Cache Context-Prefix Training (full-manifest conditioning)
 
-Status: **response forward VERIFIED (2be728e); frozen-context training VERIFIED on GPU
-(0d03267, KVRESP_TRAIN_VERIFY OK); NEXT = true per-token KV trainer (per-step cost = response
-length) then full manifest (369) then decode.**
+Status: **response forward VERIFIED (2be728e); frozen-context training VERIFIED on GPU (0d03267);
+TRUE PER-TOKEN KV TRAINER VERIFIED (ad56579, KVRESP_TRAIN_VERIFY OK); NEXT = full manifest (369) then decode.**
 Parent context: HANDOFF-NEXT-SESSION.md, training/CORPUS-STRATEGY.md, native/train/train_full_ce.vyb,
 native/host/kv_driver.vyb.
 
@@ -122,4 +121,16 @@ The per-token forward must get these RIGHT or it silently corrupts:
    restricted to response rows with dattn over the combined cache + context-region zeroing. Gate = same
    kvresp_train_ref.py oracle. Then scale the context to the full 369-token manifest, then decode to emit
    the agent-response JSON end-to-end.
-4. Scale the context to the full manifest (369 tokens); confirm per-step cost stays ~response-only.
+   **[DONE] TRUE PER-TOKEN KV TRAINER (commit ad56579, kvresp_train_kv.vyb, `make kvresp-train-kv`):**
+   context built once + per-token response forward into the combined S=93 ASLB cache + unchanged frozen
+   backward + AdamW. ROOT CAUSE (found via L35 chain instruments): frope/drope are orthonormal and only
+   need fwd/bwd consistency — batched rope+derope at (POS+s)=(93+s); per-token forward roped each token
+   at absolute Pp but backward drope used 93+s -> a net -93 rotation never cancels, corrupting
+   dQn2->dq2->all grads (L35 corr 0.71 -> L0 corr 0.37). FIX: backward drope passes BPP=0. VERIFIED:
+   step-1 grads corr 1.0 / ~2e-6; CE descends 15.932->15.481->14.666->13.953 == oracle (rel 1.1e-2,
+   corr 0.998); KVRESP_TRAIN_VERIFY OK. (Final L0 Uq 4-step adapter accumulation is informational —
+   steps-2+ per-token rounding drifts ~30% while loss/descent/step-1 grads all match.)
+4. [NEXT] Scale the context to the full manifest (369 tokens); confirm per-step cost stays ~response-only
+   (forward is already response-only; the S=93 batched backward keeps it S-cost until the R-restricted
+   backward is built, so true per-step saving at 369 needs the response-row backward). Then decode to emit
+   the agent-response JSON end-to-end.
