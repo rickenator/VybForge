@@ -1,7 +1,8 @@
 # KV-Cache Context-Prefix Training (full-manifest conditioning)
 
-Status: **response forward VERIFIED (2be728e); frozen-context training numpy ORACLE done & verified
-(3435de0); GPU training driver kvresp_train.vyb = NEXT (not yet built).**
+Status: **response forward VERIFIED (2be728e); frozen-context training VERIFIED on GPU
+(0d03267, KVRESP_TRAIN_VERIFY OK); NEXT = true per-token KV trainer (per-step cost = response
+length) then full manifest (369) then decode.**
 Parent context: HANDOFF-NEXT-SESSION.md, training/CORPUS-STRATEGY.md, native/train/train_full_ce.vyb,
 native/host/kv_driver.vyb.
 
@@ -107,10 +108,18 @@ The per-token forward must get these RIGHT or it silently corrupts:
    (commit 3435de0): `native/train/kvresp_train_ref.py`** — masked CE on response only,
    per-step loss 15.957->15.495->14.841->14.095 (DESCENDS), response-row grads provably
    identical to the FD-validated full-seq chain (context queries never attend response rows).
-   Writes the GPU target: kvresp_train_loss_ref.txt + kvresp_train_DUQ/DVQ_L{0,17,35}_ref.bin.
    `make kvresp-train-oracle` reproduces it.
-   **GPU driver `kvresp_train.vyb` = NEXT** (not yet built): repo of kvrespfwd.vyb + cached
-   per-layer response activations + batched backward with dattn over the COMBINED cache and
-   context-region zeroing + AdamW. Gate = per-step CE loss reproduces kvresp_train_loss_ref.txt
-   and step-1 dU_q/dV_q match the *_ref.bin at ~e-4.
+   **[GPU] FROZEN-CONTEXT KV TRAINING VERIFIED (commit 0d03267): `native/train/kvresp_train.vyb`**
+   = the validated batched S=93 forward+backward+AdamW engine (train_full_ce.vyb) + ZERO the
+   context-region rows of dQr2/dKr2/dVu2 right after dattn (zbuf, NCTX*NQ/NKV). KVRESP_TRAIN_VERIFY:
+   OK — step-1 dU_q/dV_q (L0/17/35) corr 1.0 / norm-rel ~2e-6; per-step CE 15.932->14.081 == oracle
+   (maxrel 2.4e-3) and descends; L0 Uq parity 9.7e-5. `make kvresp-train` gates it. This validates the
+   frozen-context BACKWARD + AdamW descent (the new math). The per-step victory is that context grads
+   never touch LoRA.
+   **NEXT = TRUE KV TRAINER (per-step cost = response length):** combine the VERIFIED per-token KV-cache
+   forward (kvrespfwd.vyb, context cached once in CK/CV) with the VERIFIED frozen-context backward here —
+   cache per-layer RESPONSE activations (all 84 rows, not just the last token), run the batched backward
+   restricted to response rows with dattn over the combined cache + context-region zeroing. Gate = same
+   kvresp_train_ref.py oracle. Then scale the context to the full 369-token manifest, then decode to emit
+   the agent-response JSON end-to-end.
 4. Scale the context to the full manifest (369 tokens); confirm per-step cost stays ~response-only.
