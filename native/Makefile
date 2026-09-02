@@ -230,6 +230,11 @@ decode-kv: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/n
 	cd $(ROOT) && $(VYB) native/host/kv_driver.vyb
 	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
 
+# b1: LoRA-applied autoregressive decode of the goal context (m2e_l*.bin seed
+# adapters) -> native/out/loradec_tokens.txt. The interviewer-runtime first pass.
+loradec: $(ROOT)/native/build/train.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && $(VYB) native/host/loradec_driver.vyb
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="

@@ -1,0 +1,54 @@
+// b2 gather: detokenize native/out/loradec_tokens.txt (the LoRA-autoregressive
+// decode of the goal context) into the generated response TEXT and print it, so
+// a downstream verifier can gate it against the agent-response JSON contract.
+// Run from repo root with --module-path native/gdecode --module-path native/tokenizer.
+import io::{open_read, read_all, open_write, write_str, close}
+import tokenizer::{decode}
+
+read_ints(path<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> {
+                    cur<Int> = 0
+                    in_num<Int> = 0
+                    i<Int> = 0
+                    n<Int> = s.len()
+                    while (i < n) {
+                        c<Int> = (s.char_at(i) as Int) & 255
+                        if (c >= 48) {
+                            if (c <= 57) { cur = cur * 10 + (c - 48); in_num = 1 }
+                        } else {
+                            if (in_num == 1) { out.push(cur) }
+                            cur = 0
+                            in_num = 0
+                        }
+                        i = i + 1
+                    }
+                    if (in_num == 1) { out.push(cur) }
+                }
+                ? -> { }
+            }
+            close(f)
+        }
+        ? -> { }
+    }
+    return out
+}
+
+main()<Int> -> {
+    toks<Vec<Int>> = read_ints("native/out/loradec_tokens.txt")
+    txt<String> = ""
+    if (toks.len() > 0) { txt = decode(toks) }
+    match (open_write("native/out/loradec_text.txt")) {
+        w -> { match (write_str(w, txt)) { q -> { } ? -> { } } close(w) }
+        ? -> { return 2 }
+    }
+    println("LORADEC_TOKENS=")
+    println_int(toks.len())
+    println(" LORADEC_TEXT=<")
+    println(txt)
+    println(">")
+    return 0
+}
