@@ -56,3 +56,18 @@ and the honest caveat is now empirically confirmed:
   adapters learn to emit `{kind,message,...}`), then re-run `loradec` + `verify_loradec.py`.
   This is the "short RL-style/next-token fine-tune" the plan named.
 
+## b1+b2 STATUS-2 (2026-09-01/02) — ROOT CAUSE + PERSISTENCE FIX (now unblocked by Vyb #213)
+The reason b1 decoded incoherently: loradec_driver loaded the SEED `m2e_l*.bin` adapters, but the
+CONTRACT-TRAINED adapters live only in GPU memory (LSLB) and kvresp_train_kv NEVER persisted them
+(only 128-wide text slices of L0/17/35 for the parity gate). Filed **`rickenator/Vyb#213`** = stdlib/io
+raw-binary write (write_bytes/write_at/read_bytes/read_bytes_at, Vec<UInt8> carrier). **CLOSED + rebuilt**
+(toolchain = Vyb 0.7.4; verified `IO_RAW_BINARY_ROUNDTRIP_OK`, LE f64 == numpy '<f8').
+- **kvresp_train_kv.vyb now PERSISTS** all 36 layers x 14 U/V tensors from LSLB -> `kvresp_l{L}_{T}.bin`
+  (raw LE f64, pure Vyb via dump_bin + write_bytes), after the training steps. Base 917504 bytes/layer
+  matches loradec's LSLB layout exactly.
+- **loradec_driver.vyb now LOADS `kvresp_l*.bin`** (the trained set) instead of m2e_l*.bin.
+- RUN: `make -f native/Makefile kvresp-train-kv` (training + persist), then `make loradec` +
+  `loradec_emit.vyb` + `verify_loradec.py` (jsonschema gate). If 4 NSTP isn't enough for fluent
+  contract emission, bump NSTP and re-run.
+
+

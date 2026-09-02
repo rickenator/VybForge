@@ -2,7 +2,7 @@
 // Consumes the M2e-1 cached activations (.bin) + per-layer weights + LoRA U/V from
 // native/out/m2e_L{layer}_* , plus upstream grad m2e_dG.bin. Produces per-layer dU/dV
 // (m2e_L{layer}_dU{nm}_vyb.txt / dV) and chains dx. Uses train.ptx (single-module).
-import io::{open_read, read_at, read_all, open_write, write_str, close}
+import io::{open_read, read_at, read_all, open_write, write_str, write_bytes, close}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -39,6 +39,30 @@ download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
 read_model(path<String>, off<Int>, nbytes<Int>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_at(f,off,nbytes)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
+
+// #213: dump `count` f64 elements from device buffer `src` to a RAW LE .bin file
+// (pure Vyb, no Python). Reads each 8-byte f64 as a raw 64-bit pattern into an
+// Int, extracts its little-endian bytes into a Vec<UInt8>, and write_bytes them
+// verbatim -- byte-identical to the numpy '<f8' .bin the decoder reloads.
+dump_bin(src<Int>, count<Int>, path<String>)<Int> -> {
+    data<Vec<UInt8>> = Vec<UInt8>()
+    k<Int> = 0
+    for (k in 0..count-1){
+        iv<Int> = 0
+        freedom { if (cuMemcpyDtoH_v2(loc(iv), src+k*8, 8) != 0) { return 15 } }
+        bj<Int> = 0
+        for (bj in 0..7){ by<Int> = (iv >> (bj*8)) & 255; data.push(by as UInt8) }
+    }
+    match (open_write(path)) {
+        w -> {
+            match (write_bytes(w, data)) { n -> { if (n != count*8) { close(w); return 19 } } ? -> { close(w); return 19 } }
+            close(w)
+        }
+        ? -> { return 18 }
+    }
+    return 0
+}
+
 load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path,off,nb); if(data.len()<nb){ return 32 }
     freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,0); if(rc!=0){ return 33 }; return 0 }
@@ -1230,6 +1254,30 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
         }
         # CE parity: final L0 Uq slice (vs oracle kvresp_train_UQ_L0_stepN_ref.txt)
         e=dumpf(LSLB+0*917504+0,128,"native/out/kvresp_train_UQ_L0_stepN_gpu.txt"); if(e!=0){ return 93 }
+        # ---- PERSIST the trained contract adapters (all 36 layers x 14 U/V) as raw LE .bin (pure
+        #      Vyb via #213). These are the decode-loadable trained set loradec_driver consumes; the
+        #      seed m2e_l*.bin are NOT contract-trained. Base 917504 bytes/layer matches loradec. ----
+        eps<Int> = 0
+        PP<Int> = 0
+        for (PP in 0..MAXL-1){
+            # offsets/sizes (bytes, f64 count = size/8) match the LSLB layout in the load loop above.
+            eps=dump_bin(LSLB+PP*917504+0,       5120, "native/out/kvresp_l"+PP.to_string()+"_Uq.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+40960,   8192, "native/out/kvresp_l"+PP.to_string()+"_Vq.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+106496,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uk.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+147456,  2048, "native/out/kvresp_l"+PP.to_string()+"_Vk.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+163840,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uv.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+204800,  2048, "native/out/kvresp_l"+PP.to_string()+"_Vv.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+221184,  8192, "native/out/kvresp_l"+PP.to_string()+"_Uo.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+286720,  5120, "native/out/kvresp_l"+PP.to_string()+"_Vo.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+327680,  5120, "native/out/kvresp_l"+PP.to_string()+"_Ug.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+368640,  19456,"native/out/kvresp_l"+PP.to_string()+"_Vg.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+524288,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uu.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+565248,  19456,"native/out/kvresp_l"+PP.to_string()+"_Vu.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+720896,  19456,"native/out/kvresp_l"+PP.to_string()+"_Ud.bin"); if(eps!=0){ return 95 }
+            eps=dump_bin(LSLB+PP*917504+876544,  5120, "native/out/kvresp_l"+PP.to_string()+"_Vd.bin"); if(eps!=0){ return 95 }
+            if (PP % 6 == 0) { println("ADAPTER_PERSIST layer "+PP.to_string()+"/"+MAXL.to_string()) }
+        }
+        println("ADAPTER_PERSIST_DONE")
         freedom { match(open_write("native/out/kvresp_train_loss_gpu.txt")){ w->{ write_str(w,losstr); close(w) } ?->{ return 71 } } }
         println("KVRESP_TRAIN_DONE steps="+NSTP.to_string())
         return 0
