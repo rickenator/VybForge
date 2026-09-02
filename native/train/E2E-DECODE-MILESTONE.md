@@ -70,4 +70,46 @@ raw-binary write (write_bytes/write_at/read_bytes/read_bytes_at, Vec<UInt8> carr
   `loradec_emit.vyb` + `verify_loradec.py` (jsonschema gate). If 4 NSTP isn't enough for fluent
   contract emission, bump NSTP and re-run.
 
+## b1+b2 STATUS-3 (2026-09-02) — persistence DONE + verified; generation still NOT fluent
+- Pure-Vyb adapter persistence is now VERIFIED: kvresp_train_kv dumps all 36x14 trained U/V ->
+  `kvresp_l{L}_{T}.bin` (raw LE f64 via #213 write_bytes; dump_bin matches numpy '<f8' byte-for-byte).
+  Trainer still descends 15.93->13.95 == oracle (`KVRESP_TRAIN_VERIFY: OK`). loradec_driver now loads
+  the trained `kvresp_l*.bin`.
+- EMPIRICAL RESULT: decode with the 4-step-trained adapters STILL yields `LORADEC_VERIFY:
+  NO_JSON_CONTRACT` (different garbage than the seed, but no schema-valid JSON).
+- WHY: 4 teacher-forced CE steps move the adapters only ~1e-4 abs (relative % looks big only because
+  adapter values are tiny near zero) — not enough to reshape the model into emitting fluent,
+  self-consistent JSON from scratch. This confirms the plan's deeper caveat: teacher-forced next-token
+  CE on one goal->84-token response, run a few steps, does NOT yield generation-capable decoding.
+- REAL GAP for closing b: either (a) many more training steps so the adapter actually learns to
+  reproduce the contract response sequence ARGMAX-wise, or (b) a DECODE-CONDITIONED objective — feed
+  the model's OWN sampled/argmax previous token into the context during training (scheduled sampling /
+  student-forcing) so it learns to recover from its own prefixes, matching the autoregressive decode
+  distribution. (b) is the faithful "RL-style/next-token fine-tune" the plan named and is the likely
+  correct fix. It changes the RESPONSE forward's next-token input from ground-truth to model-sample
+  (with annealing prob), a new but bounded edit to kvresp_train_kv.
+
+## b1+b2 STATUS-4 (2026-09-02) — decode-conditioned oracle: OPEN-LOOP injection does NOT descend
+Built `kvresp_train_dm_ref.py` (numpy oracle for the decode-conditioned objective, deterministic
+no-RNG schedule) and ran it 8 steps:
+  dm-oracle loss: [15.9566, 15.4951, 16.1554, 15.6201, 16.2223, 15.8696, 15.6099, 15.5742]
+Steps 1-2 are teacher-forced (descend 15.96->15.50, the known good floor). Step 3+ turns on OPEN-LOOP
+student injection (~80% of response positions fed the model's own argmax token) — and the loss RISES
+back to ~16.2 and oscillates, NEVER going below the step-2 teacher-forced floor.
+WHY: the injected argmax tokens are STILL model-garbage (the adapter isn't fluent yet), so the model
+gets nonsense prefixes and the CE target becomes inconsistent -> training destabilizes. Open-loop
+injection (argmax from the PREVIOUS truth-conditioned forward) is NOT the right student-forcing form.
+REAL form of (b): CLOSED-LOOP student-forcing — the response forward must become GENUINELY
+AR autoregressive (decode-shaped, token-major: feed the model's own PREVIOUS-STEP generated token into
+the next position through the actual decode loop), not a one-shot batched forward that injects the
+previous forward's argmax. That is a real re-architecture of the trainer's response forward + a
+matching closed-loop oracle, a much larger build with 40-60 min GPU cycles.
+DECISION POINT (for Rick): (i) closed-loop student-forcing (the faithful fix, big new
+forward/backward + oracle + many GPU runs, uncertain convergence), (ii) many more teacher-forced steps
+(option a, cheap, keeps verified gate, heuristic: helps argmax-reproduce the single contract),
+(iii) accept that tiny-LoRA teacher-forced fine-tune is not the generation path and pivot to a
+different training objective/scale for the interviewer runtime.
+
+
+
 
