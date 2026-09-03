@@ -1,0 +1,13 @@
+import tokenizer::{encode, decode_ids, encode_str}
+main()<Int> -> {
+    s<String> = "Hello"
+    ids<Vec<Int>> = encode(s)
+    back<String> = decode_ids(ids)
+    println("ids:")
+    println(encode_str(s))
+    println("back=<")
+    println(back)
+    println(">")
+    if (back == s) { println("RT_OK") } else { println("RT_BAD") }
+    return 0
+}

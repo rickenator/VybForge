@@ -2,7 +2,7 @@
 // Consumes the M2e-1 cached activations (.bin) + per-layer weights + LoRA U/V from
 // native/out/m2e_L{layer}_* , plus upstream grad m2e_dG.bin. Produces per-layer dU/dV
 // (m2e_L{layer}_dU{nm}_vyb.txt / dV) and chains dx. Uses train.ptx (single-module).
-import io::{open_read, read_at, read_all, open_write, write_str, write_bytes, close}
+import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -39,27 +39,6 @@ download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
 read_model(path<String>, off<Int>, nbytes<Int>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_at(f,off,nbytes)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
-// dump_bin: raw little-endian f64 binary write (ported verbatim from kvresp_train_kv.vyb, #213):
-// read each 8-byte f64 as a 64-bit Int, push its LE bytes as Vec<UInt8>, write_bytes.
-// Byte-identical to the numpy '<f8' .bin the loradec decoder reloads.
-dump_bin(src<Int>, count<Int>, path<String>)<Int> -> {
-    data<Vec<UInt8>> = Vec<UInt8>()
-    k<Int> = 0
-    for (k in 0..count-1){
-        iv<Int> = 0
-        freedom { if (cuMemcpyDtoH_v2(loc(iv), src+k*8, 8) != 0) { return 15 } }
-        bj<Int> = 0
-        for (bj in 0..7){ by<Int> = (iv >> (bj*8)) & 255; data.push(by as UInt8) }
-    }
-    match (open_write(path)) {
-        w -> {
-            match (write_bytes(w, data)) { n -> { if (n != count*8) { close(w); return 19 } } ? -> { close(w); return 19 } }
-            close(w)
-        }
-        ? -> { return 18 }
-    }
-    return 0
-}
 load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path,off,nb); if(data.len()<nb){ return 32 }
     freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,0); if(rc!=0){ return 33 }; return 0 }
@@ -249,9 +228,93 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
     return 0
 }
 
+proj_lor(xa<Int>, W<Int>, out<Int>, U<Int>, V<Int>, slo<Int>, shi<Int>,
+         M<Int>, N<Int>, K<Int>, R2<Int>, AR<Float>,
+         gf<loc<CVoid>>, ads<loc<CVoid>>, GM<Int>, PB<Int>)<Int> -> {
+    freedom {
+        AF<Float> = 1.0; BF<Float> = 0.0
+        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(W),8); cuMemcpyHtoD_v2(GM+16,loc(out),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(U),8); cuMemcpyHtoD_v2(GM+16,loc(slo),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(R2),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*R2+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(GM+0,loc(slo),8); cuMemcpyHtoD_v2(GM+8,loc(V),8); cuMemcpyHtoD_v2(GM+16,loc(shi),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(R2),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(PB+0,loc(out),8); cuMemcpyHtoD_v2(PB+8,loc(shi),8); cuMemcpyHtoD_v2(PB+16,loc(AR),8); cuMemcpyHtoD_v2(PB+24,loc(M*N),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(ads)),(M*N+255)/256,1,1,256,1,1,PB,0,0,0)
+        return 0
+    }
+    return 0
+}
+
+// resp_layer_kv: per-token KV forward helper (ported from verified kvrespfwd). One response/context
+// token at absolute position P through ONE layer, LoRA on all 7 projections. Writes per-token
+// activations into the passed buffer args at row P; stores this position's roped-K (DKr) and V (DV)
+// into CK/CV row P; runs attention over the combined cache (rows 0..P). Modified vs kvrespfwd to
+// keep a SEPARATE LoRA low-rank A output per projection (sqB..sdB) so the backward gets sq..sd.
+resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
+              R2<Int>, EPS<Float>, AR<Float>, HB<Int>, XO<Int>, CK<Int>, CV<Int>,
+              gf<loc<CVoid>>, ads<loc<CVoid>>, rn<loc<CVoid>>, rp<loc<CVoid>>, att<loc<CVoid>>,
+              sl<loc<CVoid>>, rs<loc<CVoid>>, dcp<loc<CVoid>>, GM<Int>, RN<Int>, ROP<Int>, ATT<Int>, PB<Int>,
+              N1<Int>, Wq<Int>, Wk<Int>, Wv<Int>, Nq<Int>, Nk<Int>, DF<Int>, Wo<Int>, N2<Int>,
+              Wg<Int>, Wu<Int>, Wd<Int>, Uq<Int>, Vq<Int>, Uk<Int>, Vk<Int>, Uv<Int>, Vv<Int>,
+              Uo<Int>, Vo<Int>, Ug<Int>, Vg<Int>, Uu<Int>, Vu<Int>, Ud<Int>, Vd<Int>,
+              XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
+              DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M2<Int>,
+              sqB<Int>, skB<Int>, svB<Int>, soB<Int>, sgB<Int>, suB<Int>, sdB<Int>, shi<Int>)<Int> -> {
+    Pp<Int> = P; DFf<Int> = DF; Hf<Int> = H; HDf<Int> = HD; KVHf<Int> = KVH; Df2<Int> = D; NQf<Int> = NQ; NKVf<Int> = NKV
+    one<Int> = 1
+    freedom {
+        e2<Int> = 0
+        hbP<Int> = HB + P * D * 8; xoP<Int> = XO + P * D * 8
+        xnP<Int> = XN + P * D * 8
+        dqP<Int> = DQ + P * NQ * 8; dkP<Int> = DK + P * NKV * 8; dvP<Int> = DV + P * NKV * 8
+        dqnP<Int> = DQN + P * NQ * 8; dknP<Int> = DKN + P * NKV * 8
+        dqrP<Int> = DQr + P * NQ * 8; dkrP<Int> = DKr + P * NKV * 8
+        dctxP<Int> = DCtx + P * NQ * 8; doP<Int> = DO + P * D * 8
+        x1P<Int> = X1 + P * D * 8; x1nP<Int> = X1N + P * D * 8
+        grP<Int> = Gr + P * FF * 8; upP<Int> = Up + P * FF * 8; huP<Int> = Hu + P * FF * 8; m2P<Int> = M2 + P * D * 8
+        sqP<Int> = sqB + P * R2 * 8; skP<Int> = skB + P * R2 * 8; svP<Int> = svB + P * R2 * 8
+        soP<Int> = soB + P * R2 * 8; sgP<Int> = sgB + P * R2 * 8; suP<Int> = suB + P * R2 * 8; sdP<Int> = sdB + P * R2 * 8
+        shiP<Int> = shi + P * FF * 8
+        cuMemcpyHtoD_v2(RN + 0, loc(hbP), 8); cuMemcpyHtoD_v2(RN + 8, loc(N1), 8); cuMemcpyHtoD_v2(RN + 16, loc(xnP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        e2 = proj_lor(xnP, Wq, dqP, Uq, Vq, sqP, shiP, one, NQ, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 90 }
+        e2 = proj_lor(xnP, Wk, dkP, Uk, Vk, skP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 91 }
+        e2 = proj_lor(xnP, Wv, dvP, Uv, Vv, svP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 92 }
+        cuMemcpyHtoD_v2(RN + 0, loc(dqP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nq), 8); cuMemcpyHtoD_v2(RN + 16, loc(dqnP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(H), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NQ + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        cuMemcpyHtoD_v2(RN + 0, loc(dkP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nk), 8); cuMemcpyHtoD_v2(RN + 16, loc(dknP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(KVH), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NKV + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        cuMemcpyHtoD_v2(ROP + 80, loc(dqnP), 8); cuMemcpyHtoD_v2(ROP + 88, loc(dknP), 8); cuMemcpyHtoD_v2(ROP + 96, loc(dqrP), 8); cuMemcpyHtoD_v2(ROP + 104, loc(dkrP), 8)
+        cuMemcpyHtoD_v2(ROP + 176, loc(DFf), 8); cuMemcpyHtoD_v2(ROP + 184, loc(one), 8); cuMemcpyHtoD_v2(ROP + 200, loc(HDf), 8); cuMemcpyHtoD_v2(ROP + 208, loc(Hf), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVHf), 8); cuMemcpyHtoD_v2(ROP + 224, loc(Pp), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rp)), (NQf + NKVf + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CK + P * NKV * 8, dkrP, NKV, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CV + P * NKV * 8, dvP, NKV, 0)
+        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(CK), 8); cuMemcpyHtoD_v2(ATT + 96, loc(CV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
+        cuMemcpyHtoD_v2(ATT + 184, loc(Sctx), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8); cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(att)), (Sctx * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        e2 = proj_lor(dctxP, Wo, doP, Uo, Vo, soP, shiP, one, D, NQ, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 93 }
+        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, hbP, doP, x1P, D)
+        cuMemcpyHtoD_v2(RN + 0, loc(x1P), 8); cuMemcpyHtoD_v2(RN + 8, loc(N2), 8); cuMemcpyHtoD_v2(RN + 16, loc(x1nP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        e2 = proj_lor(x1nP, Wg, grP, Ug, Vg, sgP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 94 }
+        e2 = proj_lor(x1nP, Wu, upP, Uu, Vu, suP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 95 }
+        cuda_launch4i(from<loc<CVoid>>(addr(sl)), (FF + 255) / 256, 1, 1, 256, 1, 1, grP, upP, huP, FF)
+        e2 = proj_lor(huP, Wd, m2P, Ud, Vd, sdP, shiP, one, D, FF, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 96 }
+        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, x1P, m2P, xoP, D)
+        cuCtxSynchronize()
+        return 0
+    }
+    return 0
+}
+
 main()<Int> -> {
-    S<Int> = 93; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2; NCTX<Int> = 9
-    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 93
+    S<Int> = 513; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2; NCTX<Int> = 429
+    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 513; BPP<Int> = 0
     MAXL<Int> = 36; NSTP<Int> = 4; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
     VOCAB<Int> = 151936
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -392,7 +455,7 @@ main()<Int> -> {
         dNkb<Int> = 0
         dG<Int> = 0
         TGT<Int> = 0
-        ASLB<Int> = 0
+        ASLB<Int> = 0; CK<Int> = 0; CV<Int> = 0; RSHI<Int> = 0
         LSLB<Int> = 0
         MSLB<Int> = 0
         VSLB<Int> = 0
@@ -422,26 +485,26 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(Nk),HD*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(N2),D*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(DF),64*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(XI),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(XA),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(XIN),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(XO),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(XN),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DQ),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DK),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DV),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DQN),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DKN),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DQr),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DKr),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DCtx),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DO),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(X1),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(X1N),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(Gr),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(Up),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(Hu),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(M2),238080*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XI),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XA),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XIN),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XO),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(XN),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DQ),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DK),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DV),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DQN),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DKN),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DQr),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DKr),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DCtx),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DO),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(X1),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(X1N),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(Gr),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(Up),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(Hu),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(M2),1313280*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(sq),S*R*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(sk),S*R*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(sv),S*R*8)!=0){ return 11 }
@@ -449,73 +512,77 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(sg),S*R*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(su),S*R*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(sd),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DX1),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(DM),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dHu),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dgate),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dup),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dUo2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dVp2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dCtx2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dX1n2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dX1la),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvd),238080*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DX1),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(DM),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dHu),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dgate),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dup),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dUo2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dVp2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dCtx2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dX1n2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dX1la),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvd),1313280*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_d),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_d2),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_d2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxld),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbd),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvg),904704*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_d2),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_d2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxld),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbd),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvg),4990464*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_g),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_g2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_g2),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlg),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbg),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvu),904704*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_g2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_g2),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlg),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbg),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvu),4990464*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_u),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_u2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_u2),904704*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlu),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbu),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvo),238080*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_u2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_u2),4990464*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlu),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbu),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvo),1313280*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_o2),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_o2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_o2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlo),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbo),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvq),380928*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_o2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_o2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlo),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbo),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvq),2101248*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_q),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_q2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_q2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlq),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbq),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvk),95232*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_q2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_q2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlq),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbq),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvk),525312*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_k),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_k2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_k2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlk),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbk),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(gvv),95232*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_k2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_k2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlk),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbk),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(gvv),525312*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ds_v),S*R*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dU_v2),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dV_v2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxlv),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dxbv),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dQr2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dKr2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dVu2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dQn2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dKn2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dq2),380928*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dk2),95232*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dXN2),238080*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dU_v2),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dV_v2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxlv),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dxbv),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dQr2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dKr2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dVu2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dQn2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dKn2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dq2),2101248*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dk2),525312*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dXN2),1313280*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(dN1b),2560*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(dN2b),2560*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(dNqb),128*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(dNkb),128*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(dG),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(TGT),238080*8)!=0){ return 11 }
-        if(cuMemAlloc_v2(loc(ASLB),1810544832)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(dG),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(TGT),1313280*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(ASLB),9987198912)!=0){ return 11 }
+        # per-token KV caches: combined roped-k/v per layer [36][93][NKV]; RSHI=[93,FF] addscaled scratch
+        if(cuMemAlloc_v2(loc(CK),36*513*NKV*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(CV),36*513*NKV*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(RSHI),513*FF*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(LSLB),33030144)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(MSLB),33030144)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(VSLB),33030144)!=0){ return 11 }
@@ -659,6 +726,45 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         stp_d<Int> = 1
         SHP<Int> = S*H; SKP<Int> = S*KVH
         b1tc<Float> = 1.0; b2tc<Float> = 1.0
+        # ============ CONTEXT BUILD (ONCE): forward the 9 context tokens (positions 0..8), caching
+        # each layer's roped-K/V into CK/CV rows 0..8 AND its activations into ASLB rows 0..8, so the
+        # response forward (per step) attentions and the frozen backward read a stable context. ============
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,XA,XIN,S*D,0); cuCtxSynchronize()
+        XIc<Int> = XA; XOc<Int> = XO
+        Lc<Int> = 0
+        for (Lc in 0..MAXL-1){
+            e=deq_cached(PKD,POF.get(Lc*11+0),PNL.get(Lc*11+0),PTY.get(Lc*11+0),Wq,q4fn,q6fn,efn,PF); if(e!=0){ return 60 }
+            e=deq_cached(PKD,POF.get(Lc*11+1),PNL.get(Lc*11+1),PTY.get(Lc*11+1),Wk,q4fn,q6fn,efn,PF); if(e!=0){ return 61 }
+            e=deq_cached(PKD,POF.get(Lc*11+2),PNL.get(Lc*11+2),PTY.get(Lc*11+2),Wv,q4fn,q6fn,efn,PF); if(e!=0){ return 62 }
+            e=deq_cached(PKD,POF.get(Lc*11+3),PNL.get(Lc*11+3),PTY.get(Lc*11+3),Wo,q4fn,q6fn,efn,PF); if(e!=0){ return 63 }
+            e=deq_cached(PKD,POF.get(Lc*11+4),PNL.get(Lc*11+4),PTY.get(Lc*11+4),Wg,q4fn,q6fn,efn,PF); if(e!=0){ return 64 }
+            e=deq_cached(PKD,POF.get(Lc*11+5),PNL.get(Lc*11+5),PTY.get(Lc*11+5),Wu,q4fn,q6fn,efn,PF); if(e!=0){ return 65 }
+            e=deq_cached(PKD,POF.get(Lc*11+6),PNL.get(Lc*11+6),PTY.get(Lc*11+6),Wd,q4fn,q6fn,efn,PF); if(e!=0){ return 66 }
+            e=deq_cached(PKD,POF.get(Lc*11+7),PNL.get(Lc*11+7),PTY.get(Lc*11+7),N1,q4fn,q6fn,efn,PF); if(e!=0){ return 67 }
+            e=deq_cached(PKD,POF.get(Lc*11+8),PNL.get(Lc*11+8),PTY.get(Lc*11+8),Nq,q4fn,q6fn,efn,PF); if(e!=0){ return 68 }
+            e=deq_cached(PKD,POF.get(Lc*11+9),PNL.get(Lc*11+9),PTY.get(Lc*11+9),Nk,q4fn,q6fn,efn,PF); if(e!=0){ return 69 }
+            e=deq_cached(PKD,POF.get(Lc*11+10),PNL.get(Lc*11+10),PTY.get(Lc*11+10),N2,q4fn,q6fn,efn,PF); if(e!=0){ return 70 }
+            UqP<Int> = LSLB+Lc*917504+0; VqP<Int> = LSLB+Lc*917504+40960; UkP<Int> = LSLB+Lc*917504+106496; VkP<Int> = LSLB+Lc*917504+147456; UvP<Int> = LSLB+Lc*917504+163840; VvP<Int> = LSLB+Lc*917504+204800; UoP<Int> = LSLB+Lc*917504+221184; VoP<Int> = LSLB+Lc*917504+286720; UgP<Int> = LSLB+Lc*917504+327680; VgP<Int> = LSLB+Lc*917504+368640; UuP<Int> = LSLB+Lc*917504+524288; VuP<Int> = LSLB+Lc*917504+565248; UdP<Int> = LSLB+Lc*917504+720896; VdP<Int> = LSLB+Lc*917504+876544
+            cKk<Int> = CK+Lc*513*NKV*8; cVv<Int> = CV+Lc*93*NKV*8; cAa<Int> = ASLB+Lc*277422192
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(9*D+255)/256,1,1,256,1,1,cAa+0,XIc,429*D,0)
+            tc0<Int> = 0
+            for (tc0 in 0..428){
+                e = resp_layer_kv(tc0, tc0+1, D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,XIc,XOc,cKk,cVv,
+                                  gf,ads,rn,rp,att,sl,rs,dcp,GM,RN,ROP,ATT,PB,
+                                  N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,
+                                  UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
+                                  cAa+10506240, cAa+21012480, cAa+37822464, cAa+42024960,
+                                  cAa+46227456, cAa+63037440, cAa+67239936, cAa+84049920,
+                                  cAa+88252416, cAa+105062400, cAa+115568640, cAa+126074880,
+                                  cAa+136581120, cAa+176504832, cAa+216428544, cAa+256352256,
+                                  cAa+277364736, cAa+277372944, cAa+277381152, cAa+277389360,
+                                  cAa+277397568, cAa+277405776, cAa+277413984, RSHI); if(e!=0){ return 80 }
+            }
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(9*D+255)/256,1,1,256,1,1,cAa+266858496,XOc,9*D,0)
+            cuCtxSynchronize()
+            tc1<Int> = XIc; XIc = XOc; XOc = tc1
+        }
+        println("CTX_BUILD_DONE")
         while(stp_d<=NSTP){
         b1tc = b1tc * B1; b2tc = b2tc * B2
         cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,XA,XIN,S*D,0)  # refill scratch from pristine input (XA is clobbered by layer swaps)
@@ -685,32 +791,26 @@ UqP<Int> = LSLB+L3*917504+0; VqP<Int> = LSLB+L3*917504+40960; UkP<Int> = LSLB+L3
                 UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
                 XN,DQ,DK,DV,DQN,DKN,DQr,DKr,DCtx,DO,X1,X1N,Gr,Up,Hu,M2,
                 sq,sk,sv,so,sg,su,sd,eq,ek,ev,eo,eg,eu,ed); if(e!=0){ return 80 }
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+0,XI,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+1904640,XN,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+3809280,DQ,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+6856704,DK,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+7618560,DV,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+8380416,DQN,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+11427840,DKN,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+12189696,DQr,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+15237120,DKr,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+15998976,DCtx,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+19046400,DO,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+20951040,X1,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+22855680,X1N,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+24760320,Gr,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+31997952,Up,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+39235584,Hu,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+46473216,M2,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+48377856,XOcur,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50282496,sq,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50283984,sk,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50285472,sv,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50286960,so,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50288448,sg,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50289936,su,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50291424,sd,S*R,0)
-            tl2<Int> = XI; XI = XOcur; XOcur = tl2
+                # ---- per-token KV response forward: layer-major, token-minor ----
+                # each response token P=9+t attends combined slabK/slabV (context rows 0..8 cached once +
+                # response-so-far), writes its per-layer activations DIRECTLY into slabA (==ASLB+L3*SLAYOUT)
+                # so the UNCHANGED S=93 frozen backward reads them. LoRA low-rank A outputs land in the
+                # per-projection sq..sd slabs of ASLB for the backward.
+                RESP<Int> = 84
+                slabK<Int> = CK+L3*513*NKV*8; slabV<Int> = CV+L3*93*NKV*8; slabA<Int> = ASLB+L3*277422192
+                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((513-429)*D+255)/256,1,1,256,1,1,slabA+0+429*D*8,XI+429*D*8,(513-429)*D,0)
+                t2<Int> = 0
+                for (t2 in 0..RESP-1){
+                    e = resp_layer_kv(429+t2, 430+t2, D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,XI,XOcur,slabK,slabV,
+                                      gf,ads,rn,rp,att,sl,rs,dcp,GM,RN,ROP,ATT,PB,
+                                      N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,
+                                      UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
+                                      slabA+10506240,slabA+21012480,slabA+37822464,slabA+42024960,slabA+46227456,slabA+63037440,slabA+67239936,slabA+84049920,slabA+88252416,slabA+105062400,slabA+115568640,slabA+126074880,slabA+136581120,slabA+176504832,slabA+216428544,slabA+256352256,
+                                      slabA+277364736,slabA+277372944,slabA+277381152,slabA+277389360,slabA+277397568,slabA+277405776,slabA+277413984, RSHI); if(e!=0){ return 80 }
+                }
+                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((513-429)*D+255)/256,1,1,256,1,1,slabA+266858496+429*D*8,XOcur+429*D*8,(513-429)*D,0)
+                cuCtxSynchronize()
+                tl2<Int> = XI; XI = XOcur; XOcur = tl2
         }
 
 
@@ -759,27 +859,27 @@ UqP<Int> = LSLB+L3*917504+0; VqP<Int> = LSLB+L3*917504+40960; UkP<Int> = LSLB+L3
             e=deq_cached(PKD,POF.get(Lb*11+9),PNL.get(Lb*11+9),PTY.get(Lb*11+9),Nk,q4fn,q6fn,efn,PF); if(e!=0){ return 69 }
             e=deq_cached(PKD,POF.get(Lb*11+10),PNL.get(Lb*11+10),PTY.get(Lb*11+10),N2,q4fn,q6fn,efn,PF); if(e!=0){ return 70 }
 UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb*917504+106496; VkP<Int> = LSLB+Lb*917504+147456; UvP<Int> = LSLB+Lb*917504+163840; VvP<Int> = LSLB+Lb*917504+204800; UoP<Int> = LSLB+Lb*917504+221184; VoP<Int> = LSLB+Lb*917504+286720; UgP<Int> = LSLB+Lb*917504+327680; VgP<Int> = LSLB+Lb*917504+368640; UuP<Int> = LSLB+Lb*917504+524288; VuP<Int> = LSLB+Lb*917504+565248; UdP<Int> = LSLB+Lb*917504+720896; VdP<Int> = LSLB+Lb*917504+876544
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,x,ASLB+Lb*50292912+0,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,XN,ASLB+Lb*50292912+1904640,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,DQ,ASLB+Lb*50292912+3809280,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,DK,ASLB+Lb*50292912+6856704,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,DV,ASLB+Lb*50292912+7618560,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,DQr,ASLB+Lb*50292912+12189696,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,DKr,ASLB+Lb*50292912+15237120,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,DCtx,ASLB+Lb*50292912+15998976,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,X1,ASLB+Lb*50292912+20951040,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,X1N,ASLB+Lb*50292912+22855680,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,Gr,ASLB+Lb*50292912+24760320,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,Up,ASLB+Lb*50292912+31997952,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,Hu,ASLB+Lb*50292912+39235584,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,M2,ASLB+Lb*50292912+46473216,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sq,ASLB+Lb*50292912+50282496,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sk,ASLB+Lb*50292912+50283984,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sv,ASLB+Lb*50292912+50285472,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,so,ASLB+Lb*50292912+50286960,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sg,ASLB+Lb*50292912+50288448,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,su,ASLB+Lb*50292912+50289936,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sd,ASLB+Lb*50292912+50291424,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(1313280+255)/256,1,1,256,1,1,x,ASLB+Lb*277422192+0,1313280,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(1313280+255)/256,1,1,256,1,1,XN,ASLB+Lb*277422192+10506240,1313280,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(2101248+255)/256,1,1,256,1,1,DQ,ASLB+Lb*277422192+21012480,2101248,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(525312+255)/256,1,1,256,1,1,DK,ASLB+Lb*277422192+37822464,525312,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(525312+255)/256,1,1,256,1,1,DV,ASLB+Lb*277422192+42024960,525312,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(2101248+255)/256,1,1,256,1,1,DQr,ASLB+Lb*277422192+67239936,2101248,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(525312+255)/256,1,1,256,1,1,DKr,ASLB+Lb*277422192+84049920,525312,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(2101248+255)/256,1,1,256,1,1,DCtx,ASLB+Lb*277422192+88252416,2101248,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(1313280+255)/256,1,1,256,1,1,X1,ASLB+Lb*277422192+115568640,1313280,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(1313280+255)/256,1,1,256,1,1,X1N,ASLB+Lb*277422192+126074880,1313280,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(4990464+255)/256,1,1,256,1,1,Gr,ASLB+Lb*277422192+136581120,4990464,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(4990464+255)/256,1,1,256,1,1,Up,ASLB+Lb*277422192+176504832,4990464,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(4990464+255)/256,1,1,256,1,1,Hu,ASLB+Lb*277422192+216428544,4990464,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(1313280+255)/256,1,1,256,1,1,M2,ASLB+Lb*277422192+256352256,1313280,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sq,ASLB+Lb*277422192+277364736,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sk,ASLB+Lb*277422192+277372944,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sv,ASLB+Lb*277422192+277381152,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,so,ASLB+Lb*277422192+277389360,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sg,ASLB+Lb*277422192+277397568,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,su,ASLB+Lb*277422192+277405776,S*R,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,sd,ASLB+Lb*277422192+277413984,S*R,0)
             Uq = LSLB+Lb*917504+0
             Vq = LSLB+Lb*917504+40960
             Uk = LSLB+Lb*917504+106496
@@ -923,8 +1023,9 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
                 # 10) rope adjoint
                 cuMemcpyHtoD_v2(ROP+80,loc(dQr2),8); cuMemcpyHtoD_v2(ROP+88,loc(dKr2),8); cuMemcpyHtoD_v2(ROP+96,loc(dQn2),8); cuMemcpyHtoD_v2(ROP+104,loc(dKn2),8)
                 cuMemcpyHtoD_v2(ROP+176,loc(DF),8); cuMemcpyHtoD_v2(ROP+184,loc(S),8); cuMemcpyHtoD_v2(ROP+200,loc(HD),8)
-                cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8); cuMemcpyHtoD_v2(ROP+224,loc(POS),8)
+                cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8); cuMemcpyHtoD_v2(ROP+224,loc(BPP),8)
                 cuda_launch4i(from<loc<CVoid>>(addr(drp)),(SHP*HD+SKP*HD+255)/256,1,1,256,1,1,ROP,0,0,0)
+                cuCtxSynchronize()
                 # 11) q,norm,k,norm backward
                 cuMemcpyHtoD_v2(GM+0,loc(DQ),8); cuMemcpyHtoD_v2(GM+8,loc(Nq),8); cuMemcpyHtoD_v2(GM+16,loc(dQn2),8)
                 cuMemcpyHtoD_v2(GM+24,loc(dq2),8); cuMemcpyHtoD_v2(GM+32,loc(dNqb),8)
@@ -1035,72 +1136,72 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+0),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+0),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+40960),8); cuMemcpyHtoD_v2(AW+8,loc(dV_q2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+40960),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+40960),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(8192),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(380928+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(2101248+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+106496),8); cuMemcpyHtoD_v2(AW+8,loc(dU_k2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+106496),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+106496),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+147456),8); cuMemcpyHtoD_v2(AW+8,loc(dV_k2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+147456),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+147456),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(2048),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(95232+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(525312+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+163840),8); cuMemcpyHtoD_v2(AW+8,loc(dU_v2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+163840),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+163840),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+204800),8); cuMemcpyHtoD_v2(AW+8,loc(dV_v2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+204800),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+204800),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(2048),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(95232+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(525312+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+221184),8); cuMemcpyHtoD_v2(AW+8,loc(dU_o2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+221184),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+221184),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(8192),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(380928+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(2101248+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+286720),8); cuMemcpyHtoD_v2(AW+8,loc(dV_o2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+286720),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+286720),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+327680),8); cuMemcpyHtoD_v2(AW+8,loc(dU_g2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+327680),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+327680),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+368640),8); cuMemcpyHtoD_v2(AW+8,loc(dV_g2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+368640),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+368640),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(19456),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(904704+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(4990464+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+524288),8); cuMemcpyHtoD_v2(AW+8,loc(dU_u2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+524288),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+524288),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+565248),8); cuMemcpyHtoD_v2(AW+8,loc(dV_u2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+565248),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+565248),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(19456),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(904704+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(4990464+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+720896),8); cuMemcpyHtoD_v2(AW+8,loc(dU_d2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+720896),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+720896),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(19456),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(904704+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(4990464+255)/256,1,1,256,1,1,AW,0,0,0)
             cuMemcpyHtoD_v2(AW+0,loc(LSLB+Lb*917504+876544),8); cuMemcpyHtoD_v2(AW+8,loc(dV_d2),8)
             cuMemcpyHtoD_v2(AW+16,loc(MSLB+Lb*917504+876544),8); cuMemcpyHtoD_v2(AW+24,loc(VSLB+Lb*917504+876544),8)
             cuMemcpyHtoD_v2(AW+32,loc(LR),8); cuMemcpyHtoD_v2(AW+40,loc(B1),8); cuMemcpyHtoD_v2(AW+48,loc(B2),8); cuMemcpyHtoD_v2(AW+56,loc(EPP),8)
             cuMemcpyHtoD_v2(AW+64,loc(WDD),8); cuMemcpyHtoD_v2(AW+72,loc(b1tc),8); cuMemcpyHtoD_v2(AW+80,loc(b2tc),8); cuMemcpyHtoD_v2(AW+88,loc(5120),8)
-            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(238080+255)/256,1,1,256,1,1,AW,0,0,0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aw2)),(1313280+255)/256,1,1,256,1,1,AW,0,0,0)
 
         }
         # ---- chain dx -> dG for next (lower) layer ----
@@ -1119,7 +1220,7 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
         sj<Int> = 0
         for (sj in 0..SELN-1){
             LL<Int> = SELV.get(sj)
-            # Uq slice (238080 f64 = 1904640 B at LORA_BYTES*LL + 0); dump first 128 f64
+            # Uq slice (1313280 f64 = 1904640 B at LORA_BYTES*LL + 0); dump first 128 f64
             e=dumpf(LSLB+LL*917504+0,128,"native/out/m2e3_L"+LL.to_string()+"_Uq_U_final_vyb.txt"); if(e!=0){ return 92 }
             e=dumpf(LSLB+LL*917504+40960,128,"native/out/m2e3_L"+LL.to_string()+"_Vq_V_final_vyb.txt"); if(e!=0){ return 92 }
             e=dumpf(MSLB+LL*917504+0,128,"native/out/m2e3_L"+LL.to_string()+"_Uq_mU_vyb.txt"); if(e!=0){ return 92 }
@@ -1129,29 +1230,6 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
         }
         # CE parity: final L0 Uq slice (vs oracle kvresp_train_UQ_L0_stepN_ref.txt)
         e=dumpf(LSLB+0*917504+0,128,"native/out/kvresp_train_UQ_L0_stepN_gpu.txt"); if(e!=0){ return 93 }
-        # ---- PERSIST the trained contract adapters (all 36 layers x 14 U/V) as raw LE .bin (pure
-        #      Vyb via #213). Byte-identical LSLB layout to kvresp_train_kv (917504/layer, same order);
-        #      these are the decode-loadable trained set loradec_driver consumes. ----
-        eps<Int> = 0
-        PP<Int> = 0
-        for (PP in 0..MAXL-1){
-            eps=dump_bin(LSLB+PP*917504+0,       5120, "native/out/kvresp_l"+PP.to_string()+"_Uq.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+40960,   8192, "native/out/kvresp_l"+PP.to_string()+"_Vq.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+106496,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uk.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+147456,  2048, "native/out/kvresp_l"+PP.to_string()+"_Vk.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+163840,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uv.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+204800,  2048, "native/out/kvresp_l"+PP.to_string()+"_Vv.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+221184,  8192, "native/out/kvresp_l"+PP.to_string()+"_Uo.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+286720,  5120, "native/out/kvresp_l"+PP.to_string()+"_Vo.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+327680,  5120, "native/out/kvresp_l"+PP.to_string()+"_Ug.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+368640,  19456,"native/out/kvresp_l"+PP.to_string()+"_Vg.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+524288,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uu.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+565248,  19456,"native/out/kvresp_l"+PP.to_string()+"_Vu.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+720896,  19456,"native/out/kvresp_l"+PP.to_string()+"_Ud.bin"); if(eps!=0){ return 95 }
-            eps=dump_bin(LSLB+PP*917504+876544,  5120, "native/out/kvresp_l"+PP.to_string()+"_Vd.bin"); if(eps!=0){ return 95 }
-            if (PP % 6 == 0) { println("ADAPTER_PERSIST layer "+PP.to_string()+"/"+MAXL.to_string()) }
-        }
-        println("ADAPTER_PERSIST_DONE")
         freedom { match(open_write("native/out/kvresp_train_loss_gpu.txt")){ w->{ write_str(w,losstr); close(w) } ?->{ return 71 } } }
         println("KVRESP_TRAIN_DONE steps="+NSTP.to_string())
         return 0

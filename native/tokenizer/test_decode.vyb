@@ -1,0 +1,27 @@
+import tokenizer::{encode, decode}
+main()<Int> -> {
+    tests<Vec<String>> = Vec()
+    tests.push("Hello world")
+    tests.push("configure VybOS")
+    tests.push("Rick's configurator")
+    tests.push("'  hello'")
+    tests.push("can't do that")
+    tests.push("x=1+y, yes/no")
+    tests.push("I want an ARM64 VybOS appliance image. What should we decide first?")
+    i<Int> = 0
+    bad<Int> = 0
+    for (i in 0..tests.len() - 1) {
+        ids<Vec<Int>> = encode(tests.get(i))
+        back<String> = decode(ids)
+        if (back == tests.get(i)) {
+            println("OK  ")
+        } else {
+            println("X   dr")
+            bad = bad + 1
+        }
+        println(" " + tests.get(i))
+    }
+    println("roundtrip bad=")
+    println_int(bad)
+    return 0
+}

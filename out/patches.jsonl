@@ -1,0 +1,3 @@
+{"path":"hostname","op":"replace","value":"vyb-appliance","reason":"Hostname is part of the machine identity in the SystemSpec."}
+{"path":"pkgs","op":"add","value":{"name":"openssh","version":"9.9p1","source":"upstream"},"reason":"A package in the desired state must have name, version, and source."}
+{"path":"services","op":"add","value":{"name":"sshd","command":"/usr/sbin/sshd -D"},"reason":"A service in the desired state must have name and command."}

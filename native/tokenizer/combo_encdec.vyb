@@ -1,0 +1,13 @@
+// Combo repro: encode() then decode_ids() in ONE process.
+// decode_ids alone works; encode alone works; the pair segfaults (hypothesis:
+// memory/string-registry pressure from the three ~151k map builds).
+import tokenizer::{encode, decode_ids, encode_str}
+main()<Int> -> {
+    s<String> = "Hello"
+    ids<Vec<Int>> = encode(s)
+    println("encoded ids:")
+    println(encode_str(s))
+    back<String> = decode_ids(ids)
+    println("decoded=<" + back + ">")
+    return 0
+}

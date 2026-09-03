@@ -1,0 +1,12 @@
+// Minimal driver for the decode_ids compiler-bug repro. decode_ids([0]) should
+// return "!" (token id 0 = "!") but segfaults at runtime.
+import tokenizer::{decode_ids}
+main()<Int> -> {
+    ids<Vec<Int>> = Vec()
+    ids.push(0)
+    back<String> = decode_ids(ids)
+    println("decode([0])=<")
+    println(back)
+    println(">")
+    return 0
+}

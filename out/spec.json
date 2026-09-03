@@ -1,0 +1,1 @@
+{"system":"x86_64-linux","hostname":"vyb-appliance","pkgs":[{"name":"openssh","version":"9.9p1","source":"upstream"}],"services":[{"name":"sshd","command":"/usr/sbin/sshd -D"}]}

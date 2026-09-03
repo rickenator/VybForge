@@ -1,0 +1,14 @@
+import tokenizer::{glyph2byte, byte_char, space_char}
+main()<Int> -> {
+    ex<Int> = glyph2byte("!")
+    println("glyph2byte(!)=")
+    println_int(ex)
+    sp<Int> = glyph2byte(space_char())
+    println("glyph2byte(space)=")
+    println_int(sp)
+    s<String> = "".concat(String::from_byte(33))
+    println("concat=<")
+    println(s)
+    println(">")
+    return 0
+}

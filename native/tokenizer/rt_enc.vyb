@@ -1,0 +1,8 @@
+// Driver A: encode one text and print its id string (1st of a pair of args:
+// the input text is a literal here; edit for each). Uses encode only.
+import tokenizer::{encode_str}
+main()<Int> -> {
+    s<String> = "I want an ARM64 VybOS appliance image. What should we decide first?"
+    println(encode_str(s))
+    return 0
+}

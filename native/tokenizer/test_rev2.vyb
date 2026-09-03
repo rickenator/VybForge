@@ -1,0 +1,16 @@
+import tokenizer::{encode, decode, build_revvocab}
+import collections
+main()<Int> -> {
+    rev<HashMap<Int, String>> = build_revvocab()
+    t0<String> = rev.get(0) else "?"
+    println("tok0 len=")
+    println_int(t0.len())
+    # decode a single known token id 0 (->"!")
+    ids0<Vec<Int>> = Vec()
+    ids0.push(0)
+    b0<String> = decode(ids0)
+    println("decode[0]=<")
+    println(b0)
+    println(">")
+    return 0
+}

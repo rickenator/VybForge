@@ -1,0 +1,8 @@
+// Single-map control B: only HashMap<Int,String> (decode's shape). Should work.
+import collections
+main()<Int> -> {
+    m<HashMap<Int, String>> = HashMap<Int, String>()
+    m.put(1, "a")
+    println(m.get(1) else "?")
+    return 0
+}

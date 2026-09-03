@@ -1,0 +1,8 @@
+// Single-map control A: only HashMap<String,Int> (encode's shape). Should work.
+import collections
+main()<Int> -> {
+    m<HashMap<String, Int>> = HashMap<String, Int>()
+    m.put("a", 1)
+    println_int(m.get("a") else -1)
+    return 0
+}

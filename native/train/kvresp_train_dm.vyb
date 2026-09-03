@@ -39,9 +39,11 @@ download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
 read_model(path<String>, off<Int>, nbytes<Int>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_at(f,off,nbytes)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
-// dump_bin: raw little-endian f64 binary write (ported verbatim from kvresp_train_kv.vyb, #213):
-// read each 8-byte f64 as a 64-bit Int, push its LE bytes as Vec<UInt8>, write_bytes.
-// Byte-identical to the numpy '<f8' .bin the loradec decoder reloads.
+
+// #213: dump `count` f64 elements from device buffer `src` to a RAW LE .bin file
+// (pure Vyb, no Python). Reads each 8-byte f64 as a raw 64-bit pattern into an
+// Int, extracts its little-endian bytes into a Vec<UInt8>, and write_bytes them
+// verbatim -- byte-identical to the numpy '<f8' .bin the decoder reloads.
 dump_bin(src<Int>, count<Int>, path<String>)<Int> -> {
     data<Vec<UInt8>> = Vec<UInt8>()
     k<Int> = 0
@@ -60,6 +62,7 @@ dump_bin(src<Int>, count<Int>, path<String>)<Int> -> {
     }
     return 0
 }
+
 load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path,off,nb); if(data.len()<nb){ return 32 }
     freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,0); if(rc!=0){ return 33 }; return 0 }
@@ -249,9 +252,93 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
     return 0
 }
 
+proj_lor(xa<Int>, W<Int>, out<Int>, U<Int>, V<Int>, slo<Int>, shi<Int>,
+         M<Int>, N<Int>, K<Int>, R2<Int>, AR<Float>,
+         gf<loc<CVoid>>, ads<loc<CVoid>>, GM<Int>, PB<Int>)<Int> -> {
+    freedom {
+        AF<Float> = 1.0; BF<Float> = 0.0
+        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(W),8); cuMemcpyHtoD_v2(GM+16,loc(out),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(U),8); cuMemcpyHtoD_v2(GM+16,loc(slo),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(R2),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*R2+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(GM+0,loc(slo),8); cuMemcpyHtoD_v2(GM+8,loc(V),8); cuMemcpyHtoD_v2(GM+16,loc(shi),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(R2),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)
+        cuMemcpyHtoD_v2(PB+0,loc(out),8); cuMemcpyHtoD_v2(PB+8,loc(shi),8); cuMemcpyHtoD_v2(PB+16,loc(AR),8); cuMemcpyHtoD_v2(PB+24,loc(M*N),8)
+        cuda_launch4i(from<loc<CVoid>>(addr(ads)),(M*N+255)/256,1,1,256,1,1,PB,0,0,0)
+        return 0
+    }
+    return 0
+}
+
+// resp_layer_kv: per-token KV forward helper (ported from verified kvrespfwd). One response/context
+// token at absolute position P through ONE layer, LoRA on all 7 projections. Writes per-token
+// activations into the passed buffer args at row P; stores this position's roped-K (DKr) and V (DV)
+// into CK/CV row P; runs attention over the combined cache (rows 0..P). Modified vs kvrespfwd to
+// keep a SEPARATE LoRA low-rank A output per projection (sqB..sdB) so the backward gets sq..sd.
+resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
+              R2<Int>, EPS<Float>, AR<Float>, HB<Int>, XO<Int>, CK<Int>, CV<Int>,
+              gf<loc<CVoid>>, ads<loc<CVoid>>, rn<loc<CVoid>>, rp<loc<CVoid>>, att<loc<CVoid>>,
+              sl<loc<CVoid>>, rs<loc<CVoid>>, dcp<loc<CVoid>>, GM<Int>, RN<Int>, ROP<Int>, ATT<Int>, PB<Int>,
+              N1<Int>, Wq<Int>, Wk<Int>, Wv<Int>, Nq<Int>, Nk<Int>, DF<Int>, Wo<Int>, N2<Int>,
+              Wg<Int>, Wu<Int>, Wd<Int>, Uq<Int>, Vq<Int>, Uk<Int>, Vk<Int>, Uv<Int>, Vv<Int>,
+              Uo<Int>, Vo<Int>, Ug<Int>, Vg<Int>, Uu<Int>, Vu<Int>, Ud<Int>, Vd<Int>,
+              XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
+              DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M2<Int>,
+              sqB<Int>, skB<Int>, svB<Int>, soB<Int>, sgB<Int>, suB<Int>, sdB<Int>, shi<Int>)<Int> -> {
+    Pp<Int> = P; DFf<Int> = DF; Hf<Int> = H; HDf<Int> = HD; KVHf<Int> = KVH; Df2<Int> = D; NQf<Int> = NQ; NKVf<Int> = NKV
+    one<Int> = 1
+    freedom {
+        e2<Int> = 0
+        hbP<Int> = HB + P * D * 8; xoP<Int> = XO + P * D * 8
+        xnP<Int> = XN + P * D * 8
+        dqP<Int> = DQ + P * NQ * 8; dkP<Int> = DK + P * NKV * 8; dvP<Int> = DV + P * NKV * 8
+        dqnP<Int> = DQN + P * NQ * 8; dknP<Int> = DKN + P * NKV * 8
+        dqrP<Int> = DQr + P * NQ * 8; dkrP<Int> = DKr + P * NKV * 8
+        dctxP<Int> = DCtx + P * NQ * 8; doP<Int> = DO + P * D * 8
+        x1P<Int> = X1 + P * D * 8; x1nP<Int> = X1N + P * D * 8
+        grP<Int> = Gr + P * FF * 8; upP<Int> = Up + P * FF * 8; huP<Int> = Hu + P * FF * 8; m2P<Int> = M2 + P * D * 8
+        sqP<Int> = sqB + P * R2 * 8; skP<Int> = skB + P * R2 * 8; svP<Int> = svB + P * R2 * 8
+        soP<Int> = soB + P * R2 * 8; sgP<Int> = sgB + P * R2 * 8; suP<Int> = suB + P * R2 * 8; sdP<Int> = sdB + P * R2 * 8
+        shiP<Int> = shi + P * FF * 8
+        cuMemcpyHtoD_v2(RN + 0, loc(hbP), 8); cuMemcpyHtoD_v2(RN + 8, loc(N1), 8); cuMemcpyHtoD_v2(RN + 16, loc(xnP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        e2 = proj_lor(xnP, Wq, dqP, Uq, Vq, sqP, shiP, one, NQ, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 90 }
+        e2 = proj_lor(xnP, Wk, dkP, Uk, Vk, skP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 91 }
+        e2 = proj_lor(xnP, Wv, dvP, Uv, Vv, svP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 92 }
+        cuMemcpyHtoD_v2(RN + 0, loc(dqP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nq), 8); cuMemcpyHtoD_v2(RN + 16, loc(dqnP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(H), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NQ + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        cuMemcpyHtoD_v2(RN + 0, loc(dkP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nk), 8); cuMemcpyHtoD_v2(RN + 16, loc(dknP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(KVH), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NKV + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        cuMemcpyHtoD_v2(ROP + 80, loc(dqnP), 8); cuMemcpyHtoD_v2(ROP + 88, loc(dknP), 8); cuMemcpyHtoD_v2(ROP + 96, loc(dqrP), 8); cuMemcpyHtoD_v2(ROP + 104, loc(dkrP), 8)
+        cuMemcpyHtoD_v2(ROP + 176, loc(DFf), 8); cuMemcpyHtoD_v2(ROP + 184, loc(one), 8); cuMemcpyHtoD_v2(ROP + 200, loc(HDf), 8); cuMemcpyHtoD_v2(ROP + 208, loc(Hf), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVHf), 8); cuMemcpyHtoD_v2(ROP + 224, loc(Pp), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rp)), (NQf + NKVf + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CK + P * NKV * 8, dkrP, NKV, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CV + P * NKV * 8, dvP, NKV, 0)
+        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(CK), 8); cuMemcpyHtoD_v2(ATT + 96, loc(CV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
+        cuMemcpyHtoD_v2(ATT + 184, loc(Sctx), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8); cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(att)), (Sctx * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        e2 = proj_lor(dctxP, Wo, doP, Uo, Vo, soP, shiP, one, D, NQ, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 93 }
+        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, hbP, doP, x1P, D)
+        cuMemcpyHtoD_v2(RN + 0, loc(x1P), 8); cuMemcpyHtoD_v2(RN + 8, loc(N2), 8); cuMemcpyHtoD_v2(RN + 16, loc(x1nP), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        e2 = proj_lor(x1nP, Wg, grP, Ug, Vg, sgP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 94 }
+        e2 = proj_lor(x1nP, Wu, upP, Uu, Vu, suP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 95 }
+        cuda_launch4i(from<loc<CVoid>>(addr(sl)), (FF + 255) / 256, 1, 1, 256, 1, 1, grP, upP, huP, FF)
+        e2 = proj_lor(huP, Wd, m2P, Ud, Vd, sdP, shiP, one, D, FF, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 96 }
+        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, x1P, m2P, xoP, D)
+        cuCtxSynchronize()
+        return 0
+    }
+    return 0
+}
+
 main()<Int> -> {
     S<Int> = 93; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2; NCTX<Int> = 9
-    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 93
+    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 93; BPP<Int> = 0
     MAXL<Int> = 36; NSTP<Int> = 4; LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
     VOCAB<Int> = 151936
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -392,7 +479,7 @@ main()<Int> -> {
         dNkb<Int> = 0
         dG<Int> = 0
         TGT<Int> = 0
-        ASLB<Int> = 0
+        ASLB<Int> = 0; CK<Int> = 0; CV<Int> = 0; RSHI<Int> = 0
         LSLB<Int> = 0
         MSLB<Int> = 0
         VSLB<Int> = 0
@@ -516,6 +603,10 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(dG),238080*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(TGT),238080*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(ASLB),1810544832)!=0){ return 11 }
+        # per-token KV caches: combined roped-k/v per layer [36][93][NKV]; RSHI=[93,FF] addscaled scratch
+        if(cuMemAlloc_v2(loc(CK),36*93*NKV*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(CV),36*93*NKV*8)!=0){ return 11 }
+        if(cuMemAlloc_v2(loc(RSHI),93*FF*8)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(LSLB),33030144)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(MSLB),33030144)!=0){ return 11 }
         if(cuMemAlloc_v2(loc(VSLB),33030144)!=0){ return 11 }
@@ -659,6 +750,45 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         stp_d<Int> = 1
         SHP<Int> = S*H; SKP<Int> = S*KVH
         b1tc<Float> = 1.0; b2tc<Float> = 1.0
+        # ============ CONTEXT BUILD (ONCE): forward the 9 context tokens (positions 0..8), caching
+        # each layer's roped-K/V into CK/CV rows 0..8 AND its activations into ASLB rows 0..8, so the
+        # response forward (per step) attentions and the frozen backward read a stable context. ============
+        cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,XA,XIN,S*D,0); cuCtxSynchronize()
+        XIc<Int> = XA; XOc<Int> = XO
+        Lc<Int> = 0
+        for (Lc in 0..MAXL-1){
+            e=deq_cached(PKD,POF.get(Lc*11+0),PNL.get(Lc*11+0),PTY.get(Lc*11+0),Wq,q4fn,q6fn,efn,PF); if(e!=0){ return 60 }
+            e=deq_cached(PKD,POF.get(Lc*11+1),PNL.get(Lc*11+1),PTY.get(Lc*11+1),Wk,q4fn,q6fn,efn,PF); if(e!=0){ return 61 }
+            e=deq_cached(PKD,POF.get(Lc*11+2),PNL.get(Lc*11+2),PTY.get(Lc*11+2),Wv,q4fn,q6fn,efn,PF); if(e!=0){ return 62 }
+            e=deq_cached(PKD,POF.get(Lc*11+3),PNL.get(Lc*11+3),PTY.get(Lc*11+3),Wo,q4fn,q6fn,efn,PF); if(e!=0){ return 63 }
+            e=deq_cached(PKD,POF.get(Lc*11+4),PNL.get(Lc*11+4),PTY.get(Lc*11+4),Wg,q4fn,q6fn,efn,PF); if(e!=0){ return 64 }
+            e=deq_cached(PKD,POF.get(Lc*11+5),PNL.get(Lc*11+5),PTY.get(Lc*11+5),Wu,q4fn,q6fn,efn,PF); if(e!=0){ return 65 }
+            e=deq_cached(PKD,POF.get(Lc*11+6),PNL.get(Lc*11+6),PTY.get(Lc*11+6),Wd,q4fn,q6fn,efn,PF); if(e!=0){ return 66 }
+            e=deq_cached(PKD,POF.get(Lc*11+7),PNL.get(Lc*11+7),PTY.get(Lc*11+7),N1,q4fn,q6fn,efn,PF); if(e!=0){ return 67 }
+            e=deq_cached(PKD,POF.get(Lc*11+8),PNL.get(Lc*11+8),PTY.get(Lc*11+8),Nq,q4fn,q6fn,efn,PF); if(e!=0){ return 68 }
+            e=deq_cached(PKD,POF.get(Lc*11+9),PNL.get(Lc*11+9),PTY.get(Lc*11+9),Nk,q4fn,q6fn,efn,PF); if(e!=0){ return 69 }
+            e=deq_cached(PKD,POF.get(Lc*11+10),PNL.get(Lc*11+10),PTY.get(Lc*11+10),N2,q4fn,q6fn,efn,PF); if(e!=0){ return 70 }
+            UqP<Int> = LSLB+Lc*917504+0; VqP<Int> = LSLB+Lc*917504+40960; UkP<Int> = LSLB+Lc*917504+106496; VkP<Int> = LSLB+Lc*917504+147456; UvP<Int> = LSLB+Lc*917504+163840; VvP<Int> = LSLB+Lc*917504+204800; UoP<Int> = LSLB+Lc*917504+221184; VoP<Int> = LSLB+Lc*917504+286720; UgP<Int> = LSLB+Lc*917504+327680; VgP<Int> = LSLB+Lc*917504+368640; UuP<Int> = LSLB+Lc*917504+524288; VuP<Int> = LSLB+Lc*917504+565248; UdP<Int> = LSLB+Lc*917504+720896; VdP<Int> = LSLB+Lc*917504+876544
+            cKk<Int> = CK+Lc*93*NKV*8; cVv<Int> = CV+Lc*93*NKV*8; cAa<Int> = ASLB+Lc*50292912
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(9*D+255)/256,1,1,256,1,1,cAa+0,XIc,9*D,0)
+            tc0<Int> = 0
+            for (tc0 in 0..8){
+                e = resp_layer_kv(tc0, tc0+1, D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,XIc,XOc,cKk,cVv,
+                                  gf,ads,rn,rp,att,sl,rs,dcp,GM,RN,ROP,ATT,PB,
+                                  N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,
+                                  UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
+                                  cAa+1904640, cAa+3809280, cAa+6856704, cAa+7618560,
+                                  cAa+8380416, cAa+11427840, cAa+12189696, cAa+15237120,
+                                  cAa+15998976, cAa+19046400, cAa+20951040, cAa+22855680,
+                                  cAa+24760320, cAa+31997952, cAa+39235584, cAa+46473216,
+                                  cAa+50282496, cAa+50283984, cAa+50285472, cAa+50286960,
+                                  cAa+50288448, cAa+50289936, cAa+50291424, RSHI); if(e!=0){ return 80 }
+            }
+            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(9*D+255)/256,1,1,256,1,1,cAa+48377856,XOc,9*D,0)
+            cuCtxSynchronize()
+            tc1<Int> = XIc; XIc = XOc; XOc = tc1
+        }
+        println("CTX_BUILD_DONE")
         while(stp_d<=NSTP){
         b1tc = b1tc * B1; b2tc = b2tc * B2
         cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*D+255)/256,1,1,256,1,1,XA,XIN,S*D,0)  # refill scratch from pristine input (XA is clobbered by layer swaps)
@@ -685,32 +815,26 @@ UqP<Int> = LSLB+L3*917504+0; VqP<Int> = LSLB+L3*917504+40960; UkP<Int> = LSLB+L3
                 UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
                 XN,DQ,DK,DV,DQN,DKN,DQr,DKr,DCtx,DO,X1,X1N,Gr,Up,Hu,M2,
                 sq,sk,sv,so,sg,su,sd,eq,ek,ev,eo,eg,eu,ed); if(e!=0){ return 80 }
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+0,XI,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+1904640,XN,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+3809280,DQ,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+6856704,DK,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+7618560,DV,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+8380416,DQN,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+11427840,DKN,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+12189696,DQr,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(95232+255)/256,1,1,256,1,1,ASLB+L3*50292912+15237120,DKr,95232,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(380928+255)/256,1,1,256,1,1,ASLB+L3*50292912+15998976,DCtx,380928,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+19046400,DO,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+20951040,X1,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+22855680,X1N,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+24760320,Gr,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+31997952,Up,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(904704+255)/256,1,1,256,1,1,ASLB+L3*50292912+39235584,Hu,904704,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+46473216,M2,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+48377856,XOcur,238080,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50282496,sq,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50283984,sk,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50285472,sv,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50286960,so,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50288448,sg,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50289936,su,S*R,0)
-            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(S*R+255)/256,1,1,256,1,1,ASLB+L3*50292912+50291424,sd,S*R,0)
-            tl2<Int> = XI; XI = XOcur; XOcur = tl2
+                # ---- per-token KV response forward: layer-major, token-minor ----
+                # each response token P=9+t attends combined slabK/slabV (context rows 0..8 cached once +
+                # response-so-far), writes its per-layer activations DIRECTLY into slabA (==ASLB+L3*SLAYOUT)
+                # so the UNCHANGED S=93 frozen backward reads them. LoRA low-rank A outputs land in the
+                # per-projection sq..sd slabs of ASLB for the backward.
+                RESP<Int> = 84
+                slabK<Int> = CK+L3*93*NKV*8; slabV<Int> = CV+L3*93*NKV*8; slabA<Int> = ASLB+L3*50292912
+                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((93-9)*D+255)/256,1,1,256,1,1,slabA+0+9*D*8,XI+9*D*8,(93-9)*D,0)
+                t2<Int> = 0
+                for (t2 in 0..RESP-1){
+                    e = resp_layer_kv(9+t2, 10+t2, D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,XI,XOcur,slabK,slabV,
+                                      gf,ads,rn,rp,att,sl,rs,dcp,GM,RN,ROP,ATT,PB,
+                                      N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,
+                                      UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,
+                                      slabA+1904640,slabA+3809280,slabA+6856704,slabA+7618560,slabA+8380416,slabA+11427840,slabA+12189696,slabA+15237120,slabA+15998976,slabA+19046400,slabA+20951040,slabA+22855680,slabA+24760320,slabA+31997952,slabA+39235584,slabA+46473216,
+                                      slabA+50282496,slabA+50283984,slabA+50285472,slabA+50286960,slabA+50288448,slabA+50289936,slabA+50291424, RSHI); if(e!=0){ return 80 }
+                }
+                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((93-9)*D+255)/256,1,1,256,1,1,slabA+48377856+9*D*8,XOcur+9*D*8,(93-9)*D,0)
+                cuCtxSynchronize()
+                tl2<Int> = XI; XI = XOcur; XOcur = tl2
         }
 
 
@@ -923,8 +1047,9 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
                 # 10) rope adjoint
                 cuMemcpyHtoD_v2(ROP+80,loc(dQr2),8); cuMemcpyHtoD_v2(ROP+88,loc(dKr2),8); cuMemcpyHtoD_v2(ROP+96,loc(dQn2),8); cuMemcpyHtoD_v2(ROP+104,loc(dKn2),8)
                 cuMemcpyHtoD_v2(ROP+176,loc(DF),8); cuMemcpyHtoD_v2(ROP+184,loc(S),8); cuMemcpyHtoD_v2(ROP+200,loc(HD),8)
-                cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8); cuMemcpyHtoD_v2(ROP+224,loc(POS),8)
+                cuMemcpyHtoD_v2(ROP+208,loc(H),8); cuMemcpyHtoD_v2(ROP+216,loc(KVH),8); cuMemcpyHtoD_v2(ROP+224,loc(BPP),8)
                 cuda_launch4i(from<loc<CVoid>>(addr(drp)),(SHP*HD+SKP*HD+255)/256,1,1,256,1,1,ROP,0,0,0)
+                cuCtxSynchronize()
                 # 11) q,norm,k,norm backward
                 cuMemcpyHtoD_v2(GM+0,loc(DQ),8); cuMemcpyHtoD_v2(GM+8,loc(Nq),8); cuMemcpyHtoD_v2(GM+16,loc(dQn2),8)
                 cuMemcpyHtoD_v2(GM+24,loc(dq2),8); cuMemcpyHtoD_v2(GM+32,loc(dNqb),8)
@@ -1130,11 +1255,12 @@ UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb
         # CE parity: final L0 Uq slice (vs oracle kvresp_train_UQ_L0_stepN_ref.txt)
         e=dumpf(LSLB+0*917504+0,128,"native/out/kvresp_train_UQ_L0_stepN_gpu.txt"); if(e!=0){ return 93 }
         # ---- PERSIST the trained contract adapters (all 36 layers x 14 U/V) as raw LE .bin (pure
-        #      Vyb via #213). Byte-identical LSLB layout to kvresp_train_kv (917504/layer, same order);
-        #      these are the decode-loadable trained set loradec_driver consumes. ----
+        #      Vyb via #213). These are the decode-loadable trained set loradec_driver consumes; the
+        #      seed m2e_l*.bin are NOT contract-trained. Base 917504 bytes/layer matches loradec. ----
         eps<Int> = 0
         PP<Int> = 0
         for (PP in 0..MAXL-1){
+            # offsets/sizes (bytes, f64 count = size/8) match the LSLB layout in the load loop above.
             eps=dump_bin(LSLB+PP*917504+0,       5120, "native/out/kvresp_l"+PP.to_string()+"_Uq.bin"); if(eps!=0){ return 95 }
             eps=dump_bin(LSLB+PP*917504+40960,   8192, "native/out/kvresp_l"+PP.to_string()+"_Vq.bin"); if(eps!=0){ return 95 }
             eps=dump_bin(LSLB+PP*917504+106496,  5120, "native/out/kvresp_l"+PP.to_string()+"_Uk.bin"); if(eps!=0){ return 95 }

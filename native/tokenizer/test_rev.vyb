@@ -1,0 +1,11 @@
+import tokenizer::{build_revvocab}
+import collections
+main()<Int> -> {
+    rev<HashMap<Int, String>> = build_revvocab()
+    println("built; size=")
+    t0<String> = rev.get(0) else "?"
+    println("tok[0]=<")
+    println(t0)
+    println(">")
+    return 0
+}

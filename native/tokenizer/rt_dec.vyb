@@ -1,0 +1,20 @@
+// Driver B: decode ids -> text (decode only; ids parsed from a literal).
+import tokenizer::{decode_ids}
+main()<Int> -> {
+    str<String> = "40 1366 458 30486 21 19 647 84307 3126 55354 2168 13 3555 1265 582 10279 1156 30"
+    ids<Vec<Int>> = Vec()
+    k<Int> = 0
+    cur<Int> = 0
+    in_num<Int> = 0
+    n<Int> = str.len()
+    while (k < n) {
+        c<Int> = (str.char_at(k) as Int) & 255
+        if (c == 32) { if (in_num == 1) { ids.push(cur); cur = 0; in_num = 0 } }
+        else { cur = cur * 10 + (c - 48); in_num = 1 }
+        k = k + 1
+    }
+    if (in_num == 1) { ids.push(cur) }
+    back<String> = decode_ids(ids)
+    println("decoded=<" + back + ">")
+    return 0
+}

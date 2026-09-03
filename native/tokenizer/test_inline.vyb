@@ -1,0 +1,28 @@
+import tokenizer::{build_revvocab, glyph2byte, lead_width}
+import collections
+main()<Int> -> {
+    rev<HashMap<Int, String>> = build_revvocab()
+    ids<Vec<Int>> = Vec()
+    ids.push(0)
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..ids.len() - 1) {
+        tk<String> = rev.get(ids.get(k)) else ""
+        println("got tk len=")
+        println_int(tk.len())
+        n2<Int> = tk.len()
+        ii<Int> = 0
+        while (ii < n2) {
+            lb<Int> = (tk.char_at(ii) as Int) & 255
+            lw<Int> = lead_width(lb)
+            g2<String> = tk.substring(ii, ii + lw)
+            ob<Int> = glyph2byte(g2)
+            out = out.concat(String::from_byte(ob))
+            ii = ii + lw
+        }
+    }
+    println("out=<")
+    println(out)
+    println(">")
+    return 0
+}
