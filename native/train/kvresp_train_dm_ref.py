@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""DECODE-CONDITIONED (scheduled-sampling / student-forcing) oracle — the authoritative GPU target
-for kvresp_train_dm.vyb. Milestone-b fix: teacher-forced next-token CE (kvresp_train_kv) does NOT
-make the adapters generation-capable (4 steps moved them only ~1e-4; decode still emits the seed's
-garbage). The faithful fix trains the model to produce the contract even from its OWN predicted
-prefixes --- i.e. it sees its argmax token in the response context.
+"""DECODE-CONDITIONED oracle v2 (objective i, corrected schedule) — authoritative GPU target for
+kvresp_train_dm.vyb.
 
-Open-loop scheduled sampling (deterministic, batched -- the bounded form that fits the verified
-kvresp_train_kv machinery):
-  * each step runs ONE batched S=93 forward whose RESPONSE input rows use a schedule-mixed sequence:
-      input[P] = teacher (true token P) with prob sched, else student = argmax of the PREVIOUS
-                  forward's logits at row P-1 (open-loop: conditioned on the true prefix, cheapest
-                  faithful proxy for closed-loop student forcing).
-  * masked CE/head-back, FROZEN-CONTEXT backward, AdamW on response LoRA --- all otherwise identical
-    to kvresp_train_ref.py, so the same gate files (loss trajectory + step-1 dU_q/dV_q at L0/17/35)
-    apply. Schedule is deterministic across steps so GPU must match the oracle exactly.
+The v1 oracle (kvresp_train_dm_ref.py) jumped to ~80% student injection from step 3 and FAILED to
+descend past the teacher-forced floor. Root cause: scheduled sampling (Bengio et al.) anneals the
+TEACHER probability eps_k from ~1.0 DOWN to ~0 over steps. Early steps are mostly teacher (model
+learns to generate the contract), late steps increasingly feed the model's own argmax tokens
+(learns to continue from its own prefix — the decode distribution). v1 effectively forced 80%
+student regardless of the anneal, so the model saw mostly-garbage prefixes early and CE destabilized.
 
-Deterministic schedule (pure function of step + position, no RNG):
-  NTF (teacher-force burn-in steps) = 2; afterwards free-run empirical epsilon 0.5 annealed:
-  emax=0.9 -> emin=0.0 by final step; keep a fixed per-position pattern so it is reproducible.
-Outputs (native/out, matching kvresp_train_* so the shared gate works):
-  kvresp_train_loss_ref.txt, kvresp_train_DUQ_L{L}_ref.bin / DVQ, kvresp_train_UQ_L0_stepN_ref.txt
+This v2 uses the standard inverse-sigmoid anneal: eps_k = teacher_prob(k) = emax - (emax-emin)*k/K.
+At each response position t (on the response forward of a given step) we inject the STUDENT token
+(argmax of the PREVIOUS forward's logits at row P-1) with per-position probability, via a pure
+deterministic hash (no RNG) so the Vyb driver reproduces the exact same mask.
+
+Frame: this is OPEN-LOOP scheduled sampling (inject from previous truth-conditioned forward's argmax),
+the bounded, batched form. It's the correct scheduled-sampling fix, not a full closed-loop decoder --
+adequate to close milestone b and cheap to verify.
+
+Outputs (native/out, for the shared gate): kvresp_train_loss_ref.txt, kvresp_train_DUQ/DVQ_L{L}_ref.bin,
+kvresp_train_UQ_L0_stepN_ref.txt  (DM driver will dump the same names).
 """
 import os, importlib.util, numpy as np
 
@@ -63,7 +63,7 @@ LABELS = np.full(S, -1, dtype=np.int64)
 for k in range(len(_resp) - 1):
     LABELS[NCTX + k] = _resp[k + 1]
 NV = int((LABELS >= 0).sum())
-print(f"decode-conditioned KV: S={S} ctx={NCTX} resp={len(_resp)} valid labels={NV}")
+print(f"decode-conditioned v2: S={S} ctx={NCTX} resp={len(_resp)} valid labels={NV}")
 seq = np.arange(S)
 tens = l0.parse_tsv()
 proj_shapes = {"q": (D, NQ), "k": (D, NKV), "v": (D, NKV), "o": (NQ, D), "g": (D, FF), "u": (D, FF), "d": (FF, D)}
@@ -181,7 +181,6 @@ def backward_layer(L, dG, c, xin):
     qr = c["qr"].reshape(S, H, HD); kr = c["kr"].reshape(S, KVH, HD); vv = c["v"].reshape(S, KVH, HD)
     scale = 1.0 / np.sqrt(HD)
     gq = np.zeros_like(qr); gk = np.zeros_like(kr); gv_ = np.zeros_like(vv)
-    # --------- FROZEN CONTEXT: only RESPONSE rows act as queries ---------
     for s_ in range(S):
         if CTXMASK[s_]:
             continue
@@ -235,8 +234,21 @@ def ce_loss_and_headgrad(xo):
 
 
 NSTP = 8; LR = 0.00005; B1 = 0.9; B2 = 0.999; EPP = 1e-8; WDD = 0.0
-NTF = 2          # teacher-force burn-in steps (no student injection)
-EMAX, EMIN = 0.9, 0.0   # student-injection prob anneals from 0.9 (mostly student) -> 0.0 over steps>NTF
+EMAX, EMIN = 0.95, 0.05     # teacher probability anneals 0.95 -> 0.05 over all 8 steps
+
+
+def teacher_prob(st):
+    # inverse anneal: high teacher early, low (mostly student) late. Pure function of step.
+    k = st - 1  # 0..NSTP-1
+    f = k / max(1, NSTP - 1)
+    return EMAX + (EMIN - EMAX) * f
+
+
+def inject_student(st, t):
+    # pure deterministic hash: student-inject response position t iff ((st*13+t*3)%100) <
+    # (100*(1-teacher_prob)). No RNG -- GPU reproduces it identically.
+    thresh = 100.0 * (1.0 - teacher_prob(st))
+    return ((st * 13 + t * 3) % 100) < float(thresh)
 
 
 def adamw(P, g, m, v, st):
@@ -244,34 +256,15 @@ def adamw(P, g, m, v, st):
     P[:] -= LR * (m / (1 - B1 ** st)) / (np.sqrt(v / (1 - B2 ** st)) + EPP)
 
 
-def sched_eps(st):
-    # deterministic pure function of step: burn-in -> annealed epsilon
-    if st <= NTF:
-        return 1.0
-    f = (st - NTF) / (NSTP - NTF)
-    return 1.0 - (EMAX + (EMIN - EMAX) * f)     # eps_teacher: 1.0 -> 1.0-emax -> 1.0-emin
-
-
-def response_use_student(st, t):
-    # PURE deterministic per-response-position injection mask (NO RNG) so the Vyb driver
-    # reproduces it exactly. After burn-in: inject the student (argmax of prev logits) at
-    # response position t iff ((st * 7 + t) % 5) < 4  (i.e. ~80% of positions are student).
-    if st <= NTF:
-        return False
-    return ((st * 7 + t) % 5) < 4
-
-
 x0 = emb[INPUT_IDS].astype("<f8")
-xoracle = None            # holds logits from the previous forward (open-loop student inject)
+xoracle = None
 losses = []
 for st in range(1, NSTP + 1):
     xin = x0.copy()
     if xoracle is not None:
-        # student inject: response row P uses embed(argmax_prev[P-1]) where response_use_student
-        # says so, else true token P. PURE deterministic (no RNG) -- GPU matches call-for-call.
         for t in range(1, len(_resp)):
             P = NCTX + t
-            if response_use_student(st, t):
+            if inject_student(st, t):
                 tok = int(np.argmax(xoracle[P - 1]))
                 xin[P] = emb[tok].astype("<f8")
     cc, xo = forward_layers(xin)
@@ -288,7 +281,7 @@ for st in range(1, NSTP + 1):
         for nm in proj_shapes:
             adamw(Lo[L][nm][0], gu["dU_" + nm], mU[L][nm], vU[L][nm], st)
             adamw(Lo[L][nm][1], gu["dV_" + nm], mV[L][nm], vV[L][nm], st)
-    print(f"step {st} CE loss {loss:.6f}", flush=True)
+    print(f"step {st} CE loss {loss:.6f} teacher_p={teacher_prob(st):.2f}", flush=True)
 np.savetxt(os.path.join(out, "kvresp_train_loss_ref.txt"), np.array(losses), fmt="%.10g")
 np.savetxt(os.path.join(out, "kvresp_train_UQ_L0_stepN_ref.txt"), Lo[0]["q"][0].reshape(-1)[:128], fmt="%.9g")
-print("KVRESP_DM_ORACLE_DONE steps", NSTP, "loss0", losses[0], "lossN", losses[-1], "descend", losses[-1] < losses[0])
+print("KVRESP_DM2_ORACLE_DONE steps", NSTP, "loss0", losses[0], "lossN", losses[-1], "descend", losses[-1] < losses[0])

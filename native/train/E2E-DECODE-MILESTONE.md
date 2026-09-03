@@ -110,6 +110,33 @@ forward/backward + oracle + many GPU runs, uncertain convergence), (ii) many mor
 (iii) accept that tiny-LoRA teacher-forced fine-tune is not the generation path and pivot to a
 different training objective/scale for the interviewer runtime.
 
+## STATUS-5 (2026-09-03) — open-loop scheduled-sampling: TWO forms both fail; running option-(ii) diagnostic
+The v2 oracle `kvresp_train_dm_ref.py` was corrected to the STANDARD Bengio inverse-anneal
+(teacher_prob 0.95 -> 0.05 across 8 steps; earlier v1 wrongly forced ~80% student from step 3).
+Ran to completion; trajectory:
+  v2 dm loss: [15.9566, 16.1877, 15.7636, 15.6989, 15.1875, 15.6352, 15.7201, 16.1439]
+  teacher_p:  0.95   0.82   0.69    0.56    0.44    0.31    0.18   0.05
+STEP 1 = 15.956607 EXACTLY matches the committed v1 step1 -> base machinery is faithful (not a bug).
+BUT: min 15.1875 @ step5, FINAL = 16.1439 > STEP-1 15.9566 -> the run OVERALL does NOT descend.
+Both open-loop forms now fail: v1 (fixed ~80% student) and v2 (properly annealed 5%->95% student).
+MECHANISM (why open-loop scheduled sampling cannot work here, not a tuning bug):
+  * the injected "student" tokens are the model's OWN argmax, which are GARBAGE before the adapter
+    is fluent. Feeding garbage prefixes + a teacher CE target is self-inconsistent -> the loss
+    oscillates around ~15.6-16.2 and never settles below the ~15.5 teacher floor.
+  * the dm open-loop loss is a CONTAMINATED metric: as the student fraction rises the INPUT
+    distribution worsens, so CE goes UP even if the model were improving — it is not a clean
+    "is the model learning" signal. Scheduled sampling's precondition (a student that already
+    approximates the target) is not met by a near-zero 4-step adapter.
+IMPLICATION: open-loop / batched student-forcing is NOT the path. The faithful form (i) is CLOSED-LOOP
+student-forcing (a genuinely autoregressive decode-shaped response forward), which is a large
+re-architecture. Before committing to that build, a CHEAP decisive diagnostic for option (ii) is
+running: `kvresp_tf_sweep_ref.py` (pure teacher-forced CE, 20 steps, NO injection) tracking
+  (a) teacher-forced CE and (b) ARGMAX-MATCH rate over the 83 response labels — the direct
+  "can the adapter actually reproduce the contract token-by-token" measure. If argmax-match stays
+  ~0 even as CE descends, teacher-forced fine-tune does NOT yield an emitting adapter (reinforces
+  pivot/iii or the closed-loop build); if it climbs, more steps is enough (cheap option ii).
+
+
 
 
 
