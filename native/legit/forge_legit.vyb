@@ -1,0 +1,189 @@
+// forge_legit.vyb — VybForge OS-package legitimization (one consumer of the
+// shared `chain` core from the Vyb stdlib).
+//
+// VybForge's role in the VybOS story: it legitimizes an OS PACKAGE. Given the
+// desired-state fixture (config/mock-system.json), it seals every SELECTED
+// package's identity — name, version, source, and its depends_on set — into a
+// hash-chained ledger rooted at the forge authority ("vybforge/forge-1"): one
+// genesis block of the package facts + an attestation block per package. The
+// result is a per-package legitimization token (the tip hash) plus persisted
+// receipts that `deserialize` + `verify` re-establish after any on-disk edit.
+//
+// Same core, same pattern as VybOS's boot legitimization (VybOS/modules/
+// bootlegit.vyb) and Vyb's smuggle receipt: the difference is the sealed FACTS
+// and the `origin` marker. A forged receipt (anyone can build one that
+// verifies) cannot be mistaken for the forge's — but a forge-origin receipt
+// whose facts were altered WILL fail `verify`. Integrity, not signature
+// (#204 freedom capability is the auth follow-on).
+//
+// Run (pure-Vyb JIT; the only I/O is reading the fixture and writing receipts):
+//   ./native/legit/run_forge_legit.sh [fixture.json] [receipt-dir]
+// The runner passes the two paths as an env-free preamble because Vyb's JIT
+// surface has no argv; see run_forge_legit.sh.
+
+import io::{open_read, read_all, close, open_write, write_str}
+import env::{env_get}
+import json_parse::{json_parse, JsonDoc}
+import chain::{new_chain, append, verify, tip_hash, contains, serialize,
+             deserialize, to_text, record_count, Record, Chain}
+
+# Path inputs via env (the runner exports FORGE_LEGIT_FIXTURE / FORGE_LEGIT_OUT);
+# sensible defaults when unset. Vyb's JIT surface has no argv.
+fixture_path()<String> -> {
+    return env_get("FORGE_LEGIT_FIXTURE") else "/home/rick/Projects/VybForge/config/mock-system.json"
+}
+receipt_dir()<String> -> {
+    return env_get("FORGE_LEGIT_OUT") else "/home/rick/Projects/VybForge/native/legit/receipts"
+}
+
+# Read a file's text ("" on failure).
+read_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { close(f); return s }
+                ? -> { close(f); return "" }
+            }
+        }
+        ? -> { return "" }
+    }
+}
+
+# Write text to a file (true on success).
+write_file(path<String>, content<String>)<Bool> -> {
+    match (open_write(path)) {
+        w -> {
+            n<Int> = write_str(w, content) else -1
+            close(w)
+            return n >= 0
+        }
+        ? -> { return false }
+    }
+}
+
+# The depends_on set rendered deterministically (array order) for sealing.
+# Order is part of the sealed content (the core is order-binding), and the
+# fixture's depends_on order is stable, so no re-sort is needed.
+deps_of(pkg_id<Int>, doc<JsonDoc>)<String> -> {
+    deps<Int> = doc.get(pkg_id, "depends_on")
+    if (deps < 0 || doc.kind(deps) != "array") { return "" }
+    n<Int> = doc.len(deps)
+    s<String> = ""
+    for (i in 0..n - 1) {
+        if (i > 0) { s = s + "," }
+        s = s + doc.hstr(doc.elem(deps, i))
+    }
+    return s
+}
+
+# Seal ONE selected package: a genesis block of its identity facts, plus an
+# attestation block. Returns the chain.
+seal_package(doc<JsonDoc>, pkg_id<Int>, forge_origin<String>)<Chain> -> {
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    src<String> = doc.hstr(doc.get(pkg_id, "source"))
+    deps<String> = deps_of(pkg_id, doc)
+    facts<Vec<Record>> = Vec()
+    facts.push(Record { label = "name", value = nm })
+    facts.push(Record { label = "version", value = ver })
+    facts.push(Record { label = "source", value = src })
+    facts.push(Record { label = "depends_on", value = deps })
+    base<Chain> = new_chain(forge_origin, facts)
+    att<Vec<Record>> = Vec()
+    att.push(Record { label = "attested_by", value = "vybforge" })
+    att.push(Record { label = "package", value = nm + "-" + ver })
+    return append(base, att)
+}
+
+check(cond<Bool>, label<String>)<Int> -> {
+    if (!cond) { println("  FAIL " + label); return 1 }
+    println("  ok   " + label)
+    return 0
+}
+
+main()<Int> -> {
+    fixture<String> = fixture_path()
+    outdir<String> = receipt_dir()
+
+    raw<String> = read_file(fixture)
+    if (raw.len() == 0) {
+        println("  FAIL cannot read fixture: " + fixture)
+        println("\nFORGE-PKG-LEGIT: MISSING FIXTURE")
+        return 1
+    }
+    match (json_parse(raw)) {
+        doc -> {
+            pkgarr<Int> = doc.get(doc.rootid(), "packages")
+            if (pkgarr < 0) {
+                println("  FAIL fixture has no 'packages' array")
+                println("\nFORGE-PKG-LEGIT: NO PACKAGES")
+                return 1
+            }
+            npkg<Int> = doc.len(pkgarr)
+            if (npkg == 0) {
+                println("  FAIL zero packages in fixture")
+                return 1
+            }
+            forge_origin<String> = "vybforge/forge-1"
+            fails<Int> = 0
+            tokens<String> = ""
+            nsealed<Int> = 0
+
+            for (k in 0..npkg - 1) {
+                pid<Int> = doc.elem(pkgarr, k)
+                if (doc.hstr(doc.get(pid, "selected")) != "true") { continue }
+                nm<String> = doc.hstr(doc.get(pid, "name"))
+                ver<String> = doc.hstr(doc.get(pid, "version"))
+                c<Chain> = seal_package(doc, pid, forge_origin)
+                if (verify(c) == false) {
+                    fails = fails + 1
+                    println("  FAIL " + nm + " chain does not verify")
+                    continue
+                }
+                nsealed = nsealed + 1
+                tk<String> = tip_hash(c)
+                tokens = tokens + "  " + nm + "-" + ver + " -> " + tk + "\n"
+                write_file(outdir + "/" + nm + "." + ver + ".receipt", serialize(c))
+            }
+
+            fails = fails + check(nsealed > 0, "sealed " + nsealed.to_string() + " selected package(s)")
+
+            # --- prove tamper detection on a real sealed package ---
+            first_id<Int> = -1
+            for (k in 0..npkg - 1) {
+                pid<Int> = doc.elem(pkgarr, k)
+                if (doc.hstr(doc.get(pid, "selected")) == "true") { first_id = pid; break }
+            }
+            if (first_id >= 0) {
+                nm<String> = doc.hstr(doc.get(first_id, "name"))
+                ver<String> = doc.hstr(doc.get(first_id, "version"))
+                c<Chain> = seal_package(doc, first_id, forge_origin)
+                good_token<String> = tip_hash(c)
+                rcpt<String> = serialize(c)
+                back<Chain> = deserialize(rcpt)
+                fails = fails + check(verify(back), "receipt round-trips + re-verifies")
+                fails = fails + check(tip_hash(back) == good_token, "receipt tip == token")
+                evil<String> = rcpt.replace(ver, "9.9.9-FORGED")
+                back_evil<Chain> = deserialize(evil)
+                fails = fails + check(!verify(back_evil), "tampered receipt (version) rejected")
+                fails = fails + check(contains(c, "name", nm), "chain contains sealed name=" + nm)
+                fails = fails + check(record_count(c) == 6, "sealed facts + attestation (6 records)")
+                fails = fails + check(verify(c), "unedited package chain still verifies")
+                write_file(outdir + "/forge-legit.tokens", tokens)
+                write_file(outdir + "/forge-legit." + nm + ".txt", to_text(c))
+            }
+
+            println(tokens)
+            sum<String> = "FORGE-PKG-LEGIT: PASS (" + nsealed.to_string() + " packages legitimized, tamper caught)"
+            if (fails > 0) { sum = fails.to_string() + " FAILURE(S)" }
+            println("\n" + sum)
+            if (fails == 0) { return 0 }
+            return 1
+        }
+        ? -> {
+            println("  FAIL fixture is not valid JSON")
+            println("\nFORGE-PKG-LEGIT: BAD JSON")
+            return 1
+        }
+    }
+}
