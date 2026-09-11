@@ -1,0 +1,49 @@
+// verify_vllm_sampler.vyb — checkpoint-2 probe: import filter_probs + the
+// tokenizer from the merged stdlib `vllm` module cross-repo, and confirm the
+// sampler still yields the exact reference (kept ids / renormalized probs).
+// Reference (VybForge local test_sampler.vyb): ids "15 14", probs
+// "0.894999 0.105001".
+import vllm::{filter_probs, SampleSet, encode_str}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+fmt_ids(ss<SampleSet>)<String> -> {
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..ss.ids.len() - 1) {
+        if (k > 0) { out = out + " " }
+        out = out + ss.ids.get(k).to_string()
+    }
+    return out
+}
+fmt_probs(ss<SampleSet>)<String> -> {
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..ss.probs.len() - 1) {
+        if (k > 0) { out = out + " " }
+        out = out + ss.probs.get(k).to_string()
+    }
+    return out
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    lv<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..15) { lv.push((i as Float) * 1.5 - 10.0) }
+    ss<SampleSet> = filter_probs(lv)
+    fails = fails + check(fmt_ids(ss) == "15 14", "sample kept ids -> '15 14'")
+    fails = fails + check(fmt_probs(ss) == "0.894999 0.105001", "sample renormalized probs -> '0.894999 0.105001'")
+    # tokenizer still resolves from the same module (both imports coexist)
+    fails = fails + check(encode_str("Hello world") == "9707 1879", "tokenizer still works alongside sampler in vllm")
+    if (fails == 0) {
+        println("VLLM-SAMPLER: PASS (stdlib vllm module — tokenizer + sampler, exact)")
+    } else {
+        println("VLLM-SAMPLER: " + fails.to_string() + " FAILURE(S)")
+    }
+    return fails
+}
