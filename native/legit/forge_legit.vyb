@@ -14,7 +14,10 @@
 // and the `origin` marker. A forged receipt (anyone can build one that
 // verifies) cannot be mistaken for the forge's — but a forge-origin receipt
 // whose facts were altered WILL fail `verify`. Integrity, not signature
-// (#204 freedom capability is the auth follow-on).
+// (#204 freedom capability is the auth follow-on). For AUTHENTIC package
+// provenance — every block Ed25519-signed, genesis signer == the forge key,
+// authorized key rotation — see the sibling module forge_legit_signed.vyb and
+// its proving entry build-forge-legit-signed.vyb (run_forge_legit_signed.sh).
 //
 // Run (pure-Vyb JIT; the only I/O is reading the fixture and writing receipts):
 //   ./native/legit/run_forge_legit.sh [fixture.json] [receipt-dir]

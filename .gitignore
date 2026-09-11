@@ -18,3 +18,6 @@ native/gguf/*.gguf
 native/gguf/parsed.txt
 
 native/gguf/qwen3-4b-head.bin
+
+# generated legitimization receipts
+native/legit/receipts/

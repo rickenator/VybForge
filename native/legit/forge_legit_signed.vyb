@@ -1,0 +1,75 @@
+// forge_legit_signed.vyb — VybForge AUTHENTIC package-provenance module
+// (VybChain signature layer, VybOS #8). Complements the plain forge_legit.vyb
+// by anchoring each SELECTED package's provenance to a REAL forge/registry key
+// instead of the forgeable "vybforge/forge-1" origin constant.
+//
+// Plain seal_package() chain = integrity only — anyone can build one that
+// verifies. The signed variants produce a SignedChain (stdlib/chain) where
+// every block is Ed25519-signed, the genesis signer must equal the forge's
+// public key, and in-ledger key rotation is authorized by the old key. The
+// module NEVER embeds key material — the caller supplies the forge seed
+// out-of-band.
+//
+// Run-free library (no main): consumed by forge_legit.vyb (signed path) and
+// native/legit/build-forge-legit-signed.vyb (proving entry). Requires
+// --module-path <repo>/native/json for the JsonDoc type.
+
+import json_parse::{JsonDoc}
+import chain::{signed_genesis, signed_append, signed_verify, contains, tip_hash,
+             sign_checkpoint, verify_checkpoint, Record, SignedChain}
+
+# The depends_on set rendered deterministically (array order) for sealing.
+# Order is part of the sealed content (the core is order-binding).
+share(all)
+deps_of(pkg_id<Int>, doc<JsonDoc>)<String> -> {
+    deps<Int> = doc.get(pkg_id, "depends_on")
+    if (deps < 0 || doc.kind(deps) != "array") { return "" }
+    n<Int> = doc.len(deps)
+    s<String> = ""
+    for (i in 0..n - 1) {
+        if (i > 0) { s = s + "," }
+        s = s + doc.hstr(doc.elem(deps, i))
+    }
+    return s
+}
+
+# Seal ONE selected package into a SIGNED chain: a signed genesis of its
+# identity facts plus a signed attestation block. Returns a SignedChain.
+share(all)
+seal_package_signed(doc<JsonDoc>, pkg_id<Int>, forge_origin<String>, seed<String>)<SignedChain> -> {
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    src<String> = doc.hstr(doc.get(pkg_id, "source"))
+    deps<String> = deps_of(pkg_id, doc)
+    facts<Vec<Record>> = Vec()
+    facts.push(Record { label = "name", value = nm })
+    facts.push(Record { label = "version", value = ver })
+    facts.push(Record { label = "source", value = src })
+    facts.push(Record { label = "depends_on", value = deps })
+    base<SignedChain> = signed_genesis(forge_origin, facts, seed)
+    att<Vec<Record>> = Vec()
+    att.push(Record { label = "attested_by", value = "vybforge" })
+    att.push(Record { label = "package", value = nm + "-" + ver })
+    return signed_append(base, att, seed, seed)
+}
+
+# True iff the signed package provenance is AUTHENTIC: signed_verify (integrity
+# + every block signature + genesis signer == the forge/registry key + authorized
+# rotation) AND a vybforge origin AND the attestation record.
+share(all)
+is_legit_signed(sc<SignedChain>, forge_pub<String>)<Bool> -> {
+    if (!signed_verify(sc, forge_pub)) { return false }
+    if (!sc.chain.origin.contains("vybforge")) { return false }
+    return contains(sc.chain, "attested_by", "vybforge")
+}
+
+# Forge/registry checkpoint over (seq, tip): an external verifier holding only
+# the forge's public key can confirm the package's tip at a sequence.
+share(all)
+sign_package_checkpoint(sc<SignedChain>, seed<String>)<String> -> {
+    return sign_checkpoint(tip_hash(sc.chain), sc.chain.blocks.len(), seed)
+}
+share(all)
+verify_package_checkpoint(tip<String>, seq<Int>, forge_pub<String>, sig<String>)<Bool> -> {
+    return verify_checkpoint(tip, seq, forge_pub, sig)
+}

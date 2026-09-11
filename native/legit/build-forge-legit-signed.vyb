@@ -1,0 +1,139 @@
+// build-forge-legit-signed.vyb — VybForge AUTHENTIC package-provenance proving
+// entry (VybChain signature layer, VybOS #8). Self-contained: reads the same
+// desired-state fixture as forge_legit.vyb, seals a real selected package into
+// a SignedChain via forge_legit's signed path, and proves AUTHENTICITY — not
+// just the integrity of the plain chain:
+//
+//   1. seal_package_signed(...) with the FORGE seed -> a SignedChain;
+//   2. is_legit_signed(sc, forge_pub)             -> TRUE (authentic package);
+//   3. wrong forge pubkey                          -> FALSE (root anchoring);
+//   4. a package record edited on disk, re-wrapped with the ORIGINAL
+//      signatures -> FALSE (the SIGNATURE gate).
+//   5. a package sealed by a DIFFERENT forge key  -> FALSE;
+//   6. an UNAUTHORIZED key rotation (old key != previous signer) -> FALSE,
+//      and an AUTHORIZED rotation -> still TRUE;
+//   7. forge/registry checkpoint (seq,tip): sign+verify TRUE; wrong seq -> FALSE.
+//
+// Key material (forge seed) is a fixed RFC 8032 TEST seed used ONLY by this
+// test scaffold — it never lives in the runtime modules.
+//
+// Run:
+//   VYB_STDLIB=$VYB_STDLIB $VYB native/legit/build-forge-legit-signed.vyb \
+//       --module-path native/legit --module-path native/json
+
+import io::{open_read, read_all, close}
+import env::{env_get}
+import json_parse::{json_parse, JsonDoc}
+import forge_legit_signed::{seal_package_signed, is_legit_signed, sign_package_checkpoint, verify_package_checkpoint}
+import chain::{tip_hash, serialize, deserialize, signed_append, Record, Chain, SignedChain}
+import crypto::{ed25519_publickey}
+
+fixture_path()<String> -> {
+    return env_get("FORGE_LEGIT_FIXTURE") else "/home/rick/Projects/VybForge/config/mock-system.json"
+}
+
+read_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { close(f); return s }
+                ? -> { close(f); return "" }
+            }
+        }
+        ? -> { return "" }
+    }
+}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+# Public key of a trustless "registry" holder for checkpoint verification.
+main()<Int> -> {
+    fails<Int> = 0
+    # forge/registry key (RFC 8032 TEST 1 seed) and two more for rotation
+    seed1<String> = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+    seed2<String> = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    seed3<String> = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"
+    forgePub<String> = ed25519_publickey(seed1)
+    otherPub<String> = ed25519_publickey(seed2)
+
+    # Load + parse the fixture; find the first selected package.
+    raw<String> = read_file(fixture_path())
+    if (raw.len() == 0) {
+        println("  FAIL cannot read fixture")
+        println("\nFORGE-PKG-LEGIT-SIGNED: MISSING FIXTURE")
+        return 1
+    }
+    match (json_parse(raw)) {
+        doc -> {
+            pkgarr<Int> = doc.get(doc.rootid(), "packages")
+            if (pkgarr < 0) {
+                println("\nFORGE-PKG-LEGIT-SIGNED: NO PACKAGES")
+                return 1
+            }
+            npkg<Int> = doc.len(pkgarr)
+            pid<Int> = -1
+            for (k in 0..npkg - 1) {
+                cand<Int> = doc.elem(pkgarr, k)
+                if (doc.hstr(doc.get(cand, "selected")) == "true") { pid = cand; break }
+            }
+            if (pid < 0) {
+                println("\nFORGE-PKG-LEGIT-SIGNED: NO SELECTED PACKAGE")
+                return 1
+            }
+            nm<String> = doc.hstr(doc.get(pid, "name"))
+            ver<String> = doc.hstr(doc.get(pid, "version"))
+            origin<String> = "vybforge/forge-1"
+
+            # 1. authentic signed package provenance (forge seed)
+            sc<SignedChain> = seal_package_signed(doc, pid, origin, seed1)
+            fails = fails + check(is_legit_signed(sc, forgePub), "signed package authentic (forge key): " + nm + "-" + ver)
+
+            # 2. wrong forge/registry root anchors nothing
+            fails = fails + check(!is_legit_signed(sc, otherPub), "wrong forge pubkey rejected")
+
+            # 3. SIGNATURE gate: tamper a record on disk, keep ORIGINAL sigs
+            txt<String> = serialize(sc.chain)
+            evil<String> = txt.replace(ver, "9.9.9-FORGED")
+            if (evil == txt) {
+                println("  FAIL could not locate version in serialized chain")
+                fails = fails + 1
+            } else {
+                tchain<Chain> = deserialize(evil)
+                forged<SignedChain> = SignedChain { chain = tchain, signers = sc.signers, sigs = sc.sigs, rotations = sc.rotations }
+                fails = fails + check(!is_legit_signed(forged, forgePub), "tampered package rejected (signature gate)")
+            }
+
+            # 4. a package sealed by a DIFFERENT forge key
+            sc_other<SignedChain> = seal_package_signed(doc, pid, origin, seed2)
+            fails = fails + check(!is_legit_signed(sc_other, forgePub), "package by wrong forge key rejected")
+
+            # 5. registry checkpoint round-trip + tamper
+            ck<String> = sign_package_checkpoint(sc, seed1)
+            fails = fails + check(verify_package_checkpoint(tip_hash(sc.chain), sc.chain.blocks.len(), forgePub, ck), "forge checkpoint verifies")
+            fails = fails + check(!verify_package_checkpoint(tip_hash(sc.chain), sc.chain.blocks.len() + 1, forgePub, ck), "checkpoint with wrong seq rejected")
+
+            # 6. key rotation: AUTHORIZED (k1 -> k2 with old_seed=k1) stays authentic
+            rot_facts<Vec<Record>> = Vec()
+            rot_facts.push(Record { label = "event", value = "key-rotation" })
+            rot<SignedChain> = signed_append(sc, rot_facts, seed2, seed1)
+            fails = fails + check(is_legit_signed(rot, forgePub), "authorized in-ledger key rotation still authentic")
+            # UNAUTHORIZED rotation (old_seed = k3, not the actual previous key) rejected
+            bad<SignedChain> = signed_append(sc, rot_facts, seed2, seed3)
+            fails = fails + check(!is_legit_signed(bad, forgePub), "unauthorized key rotation rejected")
+
+            sum<String> = "FORGE-PKG-LEGIT-SIGNED: PASS (authentic provenance, rotation, checkpoint)"
+            if (fails > 0) { sum = fails.to_string() + " FAILURE(S)" }
+            println("\n" + sum)
+            if (fails == 0) { return 0 }
+            return 1
+        }
+        ? -> {
+            println("\nFORGE-PKG-LEGIT-SIGNED: BAD JSON")
+            return 1
+        }
+    }
+}
