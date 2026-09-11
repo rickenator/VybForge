@@ -1,0 +1,54 @@
+// verify_vllm_model.vyb — verify the high-level `vllm::Model` facade (checkpoint
+// 4 / "higher-level llm") cross-repo from VybForge. Exercises the portable
+// model-agnostic CPU core with per-model state:
+//   1. model_load(name, dir) binds a tokenizer dir to a Model;
+//   2. model_encode uses THAT model's dir (not the process env) -> exact ids;
+//   3. model_decode round-trips back to text using the same model's vocab;
+//   4. model_sample stays the portable sampler (exact kept ids/probs).
+// The GPU forward is deliberately NOT here (bindings/cuda = the hardware seam).
+import vllm::{Model, model_load, model_encode, model_encode_str, model_decode,
+             model_sample, SampleSet}
+import env::{env_get}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    dir<String> = env_get("VYB_LLM_DIR") else "/home/rick/Projects/VybForge/artifacts/vybos-configurator-lora"
+    # 1. model_load + per-model dir binding
+    m<Model> = model_load("admin", dir)
+    fails = fails + check(m.name == "admin" && m.dir == dir, "model_load binds name + dir")
+
+    # 2. model_encode uses the model's dir -> exact reference ids
+    fails = fails + check(model_encode_str(m, "Hello world") == "9707 1879", "model_encode 'Hello world' exact")
+    fails = fails + check(model_encode_str(m, "configure VybOS") == "21002 647 84307 3126", "model_encode 'configure VybOS' exact")
+
+    # 3. model_decode round-trip: encode -> decode == original text
+    ids<Vec<Int>> = model_encode(m, "Hello world")
+    text<String> = model_decode(m, ids)
+    fails = fails + check(text == "Hello world", "model_decode round-trip -> 'Hello world'")
+
+    # 4. model_sample stays the portable sampler (exact kept ids/probs)
+    lv<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..15) { lv.push((i as Float) * 1.5 - 10.0) }
+    ss<SampleSet> = model_sample(lv)
+    idstr<String> = ""
+    k<Int> = 0
+    for (k in 0..ss.ids.len() - 1) {
+        if (k > 0) { idstr = idstr + " " }
+        idstr = idstr + ss.ids.get(k).to_string()
+    }
+    fails = fails + check(idstr == "15 14", "model_sample kept ids -> '15 14'")
+
+    if (fails == 0) {
+        println("VLLM-MODEL: PASS (portable Model facade — per-model tokenize/decode/sample exact)")
+    } else {
+        println("VLLM-MODEL: " + fails.to_string() + " FAILURE(S)")
+    }
+    return fails
+}
