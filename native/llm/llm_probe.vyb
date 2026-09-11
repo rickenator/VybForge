@@ -1,0 +1,74 @@
+// llm_probe.vyb — CPU leg of the llm:: facade (doc/LLM-FORWARD.md, F1).
+// Proves the stdlib/vllm head of llm_chat end-to-end with the REAL Qwen3 BPE
+// tokenizer (artifacts/vybos-configurator-lora): encode -> logits head ->
+// argmax -> decode, with deterministic assertions. The GPU forward that feeds
+// llm_head is verified separately on silicon (native/llm/llm_gpu.vyb).
+//
+// Run (from VybForge root):
+//   VYB_STDLIB=$VYB_STDLIB build/vyb native/llm/llm_probe.vyb \
+//       --module-path native/llm  (VYB_LLM_DIR defaults to artifacts/...)
+
+import collections
+import llm::{llm_load, llm_encode, llm_encode_str, llm_decode, llm_head,
+             llm_pick_argmax, llm_probs}
+import vllm::{Model}
+import env::{env_get}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    dir<String> = env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora"
+    m<Model> = llm_load("fixture", dir)
+
+    # 1. real tokenize -> decode round trip
+    ids<Vec<Int>> = llm_encode(m, "hello world")
+    deep<String> = llm_decode(m, ids)
+    fails = fails + check(ids.len() > 0, "tokenize('hello world') non-empty")
+    fails = fails + check(deep == "hello world", "encode -> decode round trip ('hello world')")
+
+    # 2. deterministic logits head: peak at a real token -> decode follows
+    ids_w<Vec<Int>> = llm_encode(m, "hello")
+    tgt<Int> = ids_w.get(0)                  # a real vocab id from the prompt
+    lg<Vec<Float>> = Vec()
+    k<Int> = 0
+    for (k in 0..tgt) { lg.push(-10.0) }     # length = tgt+1 (covers the peak)
+    lg.set(tgt, 100.0)
+    fails = fails + check(llm_pick_argmax(lg) == tgt, "greedy argmax picks the peaked token")
+    one_t<Vec<Int>> = Vec_single(tgt)
+    exp<String> = llm_decode(m, one_t)
+    fails = fails + check(llm_head(m, lg) == exp, "llm_head decodes the argmax token (exp='" + exp + "')")
+    fails = fails + check(exp.len() > 0, "decoded head token is non-empty")
+
+    # 3. head follows a DIFFERENT peak (tamper) -> decodes that token instead
+    ids_w2<Vec<Int>> = llm_encode(m, "world")
+    tgt2<Int> = ids_w2.get(0)
+    hi<Int> = 0
+    if (tgt2 > tgt) { hi = tgt2 } else { hi = tgt }
+    lg2<Vec<Float>> = Vec()
+    for (k in 0..hi) { lg2.push(-10.0) }
+    lg2.set(tgt2, 50.0)
+    exp2<String> = llm_decode(m, Vec_single(tgt2))
+    fails = fails + check(llm_head(m, lg2) == exp2 && exp2 != exp, "head follows a second peaked token")
+
+    # 4. sampler is exposed (stochastic head present)
+    ss = llm_probs(lg)
+    fails = fails + check(ss.ids.len() > 0, "stdlib/vllm sampler exposed (top_k/top_p kept set)")
+
+    sum<String> = "LLM-FORWARD CPU-LEG: PASS (encode -> logits head -> argmax -> decode on real tokenizer)"
+    if (fails > 0) { sum = fails.to_string() + " FAILURE(S)" }
+    println("\n" + sum)
+    if (fails == 0) { return 0 }
+    return 1
+}
+
+// single-id Vec helper (bare program helper resolves fine)
+Vec_single(id<Int>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec()
+    v.push(id)
+    return v
+}

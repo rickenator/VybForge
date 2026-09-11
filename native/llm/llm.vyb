@@ -1,0 +1,68 @@
+// llm.vyb — GPU-composing llm:: forward facade (CPU(stdlib/vllm) + GPU(bindings)).
+//
+// THE composition contract for the handoff item-2 forward (doc/LLM-FORWARD.md):
+//
+//   llm_chat(prompt)  =
+//       llm_encode(m, prompt)                 # stdlib/vllm CPU tokenizer (real BPE)
+//     -> [GPU transformer forward -> logits]  # injected by a host driver (freedom
+//                                             #  FFI in a main program; bindings/cuda
+//                                             #  + native kernels)
+//     -> llm_head(m, logits)                  # this module: sample + decode -> text
+//
+// The GPU forward is NOT in this module: it needs the unsafe freedom FFI + driver
+// handles, which live in a main driver (same seam discipline as the stdlib engine
+// being a portable CPU core). This module owns the REUSABLE typed head — the
+// CPU(vllm) half of the forward (encode / sample / decode) — which both VybOS and
+// VybForge consume.
+//
+// Determinism: `llm_head`/`llm_pick_argmax` are greedy top-1 (hard-verifiable
+// against a host argmax). `llm_probs` exposes the stdlib/vllm sampler
+// (temperature + top_k + top_p) for the stochastic path.
+//
+// Run-free library (no main); proven by native/llm/llm_probe.vyb (CPU leg) and
+// native/llm/llm_gpu.vyb (GPU leg, RTX 3090).
+
+import vllm::{model_load, model_encode, model_encode_str, model_decode, model_sample,
+              SampleSet, Model}
+
+// A Model bound to a tokenizer dir ({vocab.json, merges.txt}).
+share(all)
+llm_load(name<String>, dir<String>)<Model> -> { return model_load(name, dir) }
+
+// 1. tokenize a prompt -> token ids (CPU, real BPE vocab).
+share(all)
+llm_encode(m<Model>, prompt<String>)<Vec<Int>> -> { return model_encode(m, prompt) }
+share(all)
+llm_encode_str(m<Model>, prompt<String>)<String> -> { return model_encode_str(m, prompt) }
+
+// 4. decode token ids -> text (CPU, real reverse vocab).
+share(all)
+llm_decode(m<Model>, ids<Vec<Int>>)<String> -> { return model_decode(m, ids) }
+
+// The stdlib/vllm sampler (temp + top_k + top_p) — the stochastic head.
+share(all)
+llm_probs(logits<Vec<Float>>)<SampleSet> -> { return model_sample(logits) }
+
+// Greedy top-1 over raw logits (deterministic, host-verifiable argmax).
+share(all)
+llm_pick_argmax(logits<Vec<Float>>)<Int> -> {
+    best<Int> = -1
+    bv<Float> = -999999999.0
+    n<Int> = logits.len()
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        v<Float> = logits.get(i)
+        if (v > bv) { bv = v; best = i }
+    }
+    return best
+}
+
+// The full CPU head of llm_chat: GPU logits -> decoded response text (greedy).
+share(all)
+llm_head(m<Model>, logits<Vec<Float>>)<String> -> {
+    id<Int> = llm_pick_argmax(logits)
+    if (id < 0) { return "" }
+    one<Vec<Int>> = Vec()
+    one.push(id)
+    return llm_decode(m, one)
+}
