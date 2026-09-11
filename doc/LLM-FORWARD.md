@@ -1,13 +1,11 @@
 # llm:: — GPU-composing forward facade (CPU(vllm) + GPU(bindings)) — mapped plan
 
-> Status: F1 PARTIALLY DONE, both legs hardware/CPU-verified (2026-09-11).
-> `native/llm/llm.vyb` facade + `native/llm/llm_probe.vyb` (CPU leg): encode ->
-> logits head (argmax) -> decode on the REAL Qwen3 BPE tokenizer, 7/7 PASS.
-> GPU forward leg independently silicon-verified on the RTX 3090: GEMM_OK /
-> RMSNORM_OK / VMATH_OK / LAYER_VERIFY: OK / STACK_VERIFY: OK (4-layer, 6.7e-4).
-> Remaining F1 wiring (a driver that feeds a GPU fixture-forward's logits into
-> `llm_head` and verifies the decoded response == host reference) + F2 (real
-> Qwen3-4B via model_driver, needs the GGUF on the box).
+> Status: F1 DONE, hardware-verified (2026-09-11). `native/llm/llm.vyb` +
+> `native/llm/llm_probe.vyb` (CPU leg) + `native/llm/llm_gpu.vyb` (F1 wiring):
+> on the RTX 3090 a REAL `gemm` forward (layer.ptx) computes logits -> `llm_head`
+> -> decoded response == host reference (A->'A', B->'B', input-dependent), 4/4
+> PASS. CPU leg 7/7 on the real tokenizer. F2 (real Qwen3-4B via model_driver,
+> needs the GGUF on the box) remains the only open item.
 > Steering: VybOS issue #9.
 
 ## Goal

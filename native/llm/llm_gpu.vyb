@@ -1,0 +1,167 @@
+// llm_gpu.vyb — F1 wiring: a REAL GPU transformer-forward (the verified `gemm`
+// kernel from layer.vyb) computes logits that feed the llm:: facade head, and
+// the decoded RESPONSE is verified against the host reference — end to end on
+// the RTX 3090 (doc/LLM-FORWARD.md).
+//
+// Contract exercised: llm_encode (CPU, real Qwen3 BPE) -> [GPU gemm forward ->
+// logits] -> llm_head (argmax + decode). The fixture "model" is an ECHO-HEAD:
+// its LM projection peaks the logits at the first input token id, so the model
+// deterministically outputs that token — input-dependent and host-reproducible.
+//
+//   prompt "A" -> ids[0]=32 -> logits[0..32] peak at 32 -> decode 'A'  (GPU == host)
+//   prompt "B" -> ids[0]=33 -> decode 'B'  (a SECOND prompt proves input-dependence)
+//
+// GPU path (real on-silicon f64 gemm): upload hidden=1s + head W[K,L] (peak
+// column set) -> cuLaunchKernel gemm C=1xL -> cuMemcpyDtoH logits -> llm_head.
+//
+// Run (from VybForge root; layer.ptx built):
+//   VYB_STDLIB=$VYB_STDLIB build/vyb native/llm/llm_gpu.vyb
+//   (reads native/build/layer.ptx + artifacts/vybos-configurator-lora tokenizer)
+
+import llm::{llm_load, llm_encode, llm_decode, llm_head, llm_pick_argmax}
+import vllm::{Model}
+import env::{env_get}
+import io::{open_read, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_bin(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) { f -> {
+        match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+        close(f)
+    } ? -> { r = "" } }
+    return r
+}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+// Fixture LM-head weight W[K,L]: all 0, peak column T = 1 in every row.
+// logits[0,nn] = sum_k hidden[k]*W[k*L+nn] -> K at column T, 0 elsewhere.
+build_head(K<Int>, L<Int>, T<Int>)<Vec<Float>> -> {
+    w<Vec<Float>> = Vec()
+    q<Int> = 0
+    for (q in 0..K * L - 1) { w.push(0.0) }
+    r<Int> = 0
+    for (r in 0..K - 1) { w.set(r * L + T, 1.0) }
+    return w
+}
+
+Vec_one(id<Int>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec(); v.push(id)
+    return v
+}
+
+// Upload hidden/W_head, launch the gemm, read C[0..L] back into logits.
+gemm_forward(gfn<loc<CVoid>>, GM<Int>, dA<Int>, dB<Int>, dC<Int>,
+             hidden<Vec<Float>>, w<Vec<Float>>, K<Int>, L<Int>)<Vec<Float>> -> {
+    logits<Vec<Float>> = Vec()
+    freedom {
+        A<Float> = 1.0; B<Float> = 0.0
+        M<Int> = 1; N<Int> = L
+        i<Int> = 0
+        for (i in 0..K - 1) { xv<Float> = hidden.get(i); cuMemcpyHtoD_v2(dA + 8 * i, loc(xv), 8) }
+        i = 0
+        for (i in 0..K * L - 1) { yv<Float> = w.get(i); cuMemcpyHtoD_v2(dB + 8 * i, loc(yv), 8) }
+        cuMemcpyHtoD_v2(GM + 0, loc(dA), 8); cuMemcpyHtoD_v2(GM + 8, loc(dB), 8); cuMemcpyHtoD_v2(GM + 16, loc(dC), 8)
+        cuMemcpyHtoD_v2(GM + 24, loc(M), 8); cuMemcpyHtoD_v2(GM + 32, loc(N), 8); cuMemcpyHtoD_v2(GM + 40, loc(K), 8)
+        cuMemcpyHtoD_v2(GM + 48, loc(A), 8); cuMemcpyHtoD_v2(GM + 56, loc(B), 8)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (M * N + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        cuCtxSynchronize()
+        j<Int> = 0
+        for (j in 0..L - 1) {
+            fv<Float> = 0.0
+            cuMemcpyDtoH_v2(loc(fv), dC + 8 * j, 8)
+            logits.push(fv)
+        }
+        return logits
+    }
+    return logits
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    K<Int> = 8
+    LMAX<Int> = 40                       # fits "A"(33) and "B"(34) logits windows
+    dir<String> = env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora"
+    m<Model> = llm_load("fixture", dir)
+
+    # ---- host: tokenize both prompts, prepare fixture head + host reference ----
+    idsA<Vec<Int>> = llm_encode(m, "A")
+    idsB<Vec<Int>> = llm_encode(m, "B")
+    TA<Int> = idsA.get(0); TB<Int> = idsB.get(0)
+    LA<Int> = TA + 1; LB<Int> = TB + 1
+    wA<Vec<Float>> = build_head(K, LA, TA)
+    wB<Vec<Float>> = build_head(K, LB, TB)
+    expA<String> = llm_decode(m, Vec_one(TA))
+    expB<String> = llm_decode(m, Vec_one(TB))
+
+    dA<Int> = 0; dB<Int> = 0; dC<Int> = 0; GM<Int> = 0
+
+    freedom {
+        gfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+        hm<loc<CVoid>> = from<loc<CVoid>>(0)
+        rc<CInt> = -1
+        t2<Int> = 0
+        for (t2 in 0..5) { if (rc != 0) { hm = from<loc<CVoid>>(0); rc = cuModuleLoadData(loc(hm), read_bin("native/build/layer.ptx")) } }
+        if (rc != 0) { println("MODLOAD_FAIL layer.ptx"); return 9 }
+        if (cuModuleGetFunction(loc(gfn), hm, "gemm") != 0) { return 10 }
+
+        if (cuMemAlloc_v2(loc(dA), K * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dB), K * LMAX * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(dC), LMAX * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
+
+        # ---- run A ----
+        hidA<Vec<Float>> = Vec()
+        hi<Int> = 0
+        for (hi in 0..K - 1) { hidA.push(1.0) }
+        lgA<Vec<Float>> = gemm_forward(gfn, GM, dA, dB, dC, hidA, wA, K, LA)
+        respA<String> = llm_head(m, lgA)
+        fails = fails + check(respA == expA, "GPU forward -> llm_head -> decoded response == host ('" + respA + "')")
+        fails = fails + check(llm_pick_argmax(lgA) == TA, "GPU logits argmax == first token id (" + TA.to_string() + ")")
+
+        # ---- run B (different prompt -> different peak) ----
+        hidB<Vec<Float>> = Vec()
+        hi = 0
+        for (hi in 0..K - 1) { hidB.push(1.0) }
+        lgB<Vec<Float>> = gemm_forward(gfn, GM, dA, dB, dC, hidB, wB, K, LB)
+        respB<String> = llm_head(m, lgB)
+        fails = fails + check(respB == expB, "second prompt: GPU response == host ('" + respB + "')")
+        fails = fails + check(respB != respA, "responses differ across inputs (input-dependent forward)")
+
+        cuMemFree_v2(dA); cuMemFree_v2(dB); cuMemFree_v2(dC); cuMemFree_v2(GM)
+    }
+
+    sum<String> = "LLM-FORWARD GPU LEG (F1 wiring): PASS (real gemm on RTX 3090 -> llm_head -> decoded response == host reference)"
+    if (fails > 0) { sum = fails.to_string() + " FAILURE(S)" }
+    println("\n" + sum)
+    if (fails == 0) { return 0 }
+    return 1
+}
