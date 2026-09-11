@@ -1,0 +1,152 @@
+// validate_proposal.vyb — VybForge MODEL-BOUNDARY CLOSURE (issue #7).
+//
+// Consumes a model-emitted PatchProposal (the JSON value written by
+// tools/propose_repair.py) and runs it through the REAL VybOS repair core:
+//
+//   repair::{apply_diff, repair_step, should_accept}   (VybOS modules/repair.vyb)
+//   patchlife::{promote} + packagerealization::{seal_realization, ...}
+//
+// This closes the "model boundary" of #7: the in-OS model (VybForge) AUTHORS a
+// proposal, but VybOS OWNS apply/validate/promote/seal — the same deterministic
+// core that a live model's output would go through. We validate the emitted
+// JSON is a well-formed PatchProposal, apply it to the pristine source, run the
+// build/test + integration validation gates, apply the high-risk guardrail, and
+// seal the accepted patch into an authentic realization record. A real model is
+// NOT required — this runs the same code path a live proposal would hit.
+//
+// Inputs (env):
+//   PROP_PROPOSAL  path to a proposal JSON (the --out of propose_repair.py)
+//   PROP_PRISTINE  path to the pristine source text
+//   PROP_TESTS     "pass" | "fail"  (the build/test gate verdict)
+//   PROP_INTEGR    "pass" | "fail"  (the integration validation gate)
+//   PROP_RISK      "low" | "high"   (surface risk verdict -> guardrail)
+//
+// Output: ACCEPT (sealed realization) or REJECT (per-gate) + the verification
+// checks. Exit 0 on a coherent run; a REJECTED proposal is still a valid run.
+//
+// Run (from VybForge):
+//   VYB_STDLIB=$VYB_STDLIB build/vyb tools/validate_proposal.vyb \
+//       --module-path native/json --module-path ../VybOS/modules
+
+import env::{env_get}
+import io::{open_read, read_all, close}
+import json_parse::{json_parse, JsonDoc}
+import repair::{PatchProposal, repair_step, should_accept, split_lines}
+import patchlife::{ManagedPatch, promote}
+import packagerealization::{RealPatch, to_real_patch, is_legally_sealable,
+             realization_identity, seal_realization, is_legit_realization}
+import chain::{SignedChain}
+import crypto::{ed25519_publickey, sha256}
+
+read_text(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { close(f); return s }
+                ? -> { close(f); return "" }
+            }
+        }
+        ? -> { return "" }
+    }
+}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    ppath<String> = env_get("PROP_PROPOSAL") else ""
+    srcpath<String> = env_get("PROP_PRISTINE") else ""
+    gates_t<String> = env_get("PROP_TESTS") else "pass"
+    gates_i<String> = env_get("PROP_INTEGR") else "pass"
+    risk_s<String> = env_get("PROP_RISK") else "low"
+
+    if (ppath.len() == 0 || srcpath.len() == 0) {
+        println("  FAIL missing PROP_PROPOSAL/PROP_PRISTINE env")
+        println("\nVALIDATE-PROPOSAL: MISSING INPUT")
+        return 1
+    }
+    raw<String> = read_text(ppath)
+    pristine<String> = read_text(srcpath)
+    if (raw.len() == 0 || pristine.len() == 0) {
+        println("  FAIL cannot read proposal/pristine")
+        return 1
+    }
+    match (json_parse(raw)) {
+        doc -> {
+            cls<String> = doc.hstr(doc.get(doc.rootid(), "cls"))
+            diff<String> = doc.hstr(doc.get(doc.rootid(), "diff"))
+            reason<String> = doc.hstr(doc.get(doc.rootid(), "reason"))
+            gen<String> = doc.hstr(doc.get(doc.rootid(), "generator"))
+            matched_s<String> = doc.hstr(doc.get(doc.rootid(), "matched"))
+
+            fails = fails + check(cls == "generated" || cls == "curated" || cls == "upstream",
+                                  "proposal has a valid patch class (" + cls + ")")
+            fails = fails + check(diff.len() > 0, "proposal carries a diff")
+            fails = fails + check(reason.len() > 0, "proposal carries a reason")
+            okcls<Bool> = true
+            if (cls == "generated" && gen.len() == 0) { okcls = false }
+            fails = fails + check(okcls, "generated proposal names its generator")
+
+            pp<PatchProposal> = PatchProposal { cls = cls, diff = diff, reason = reason,
+                                                generator = gen, matched = matched_s == "true" }
+            tests_ok<Bool> = gates_t == "pass"
+            integ_ok<Bool> = gates_i == "pass"
+            r<Repair> = repair_step(pristine, pp, tests_ok, integ_ok)
+
+            fails = fails + check(r.tests_pass == tests_ok, "validation gate tests captured")
+            fails = fails + check(r.integration_pass == integ_ok, "validation gate integration captured")
+
+            # provenance: the patched source rehashed deterministically
+            fails = fails + check(r.source_hash == sha256("source:" + r.patched_source),
+                                  "patched-source identity deterministic (content-addressed)")
+
+            high_risk<Bool> = risk_s == "high"
+            acc<Bool> = should_accept(r, high_risk)
+
+            if (acc) {
+                # accept: promote through lifecycle and seal into realization record
+                seed1<String> = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+                forgePub<String> = ed25519_publickey(seed1)
+                managed<ManagedPatch> = ManagedPatch { id = "pp1", cls = cls, state = "experimental",
+                    highRisk = false, reason = reason, generator = gen }
+                reviewed<ManagedPatch> = promote(promote(managed, "validated-candidate"), "reviewed")
+                rp<RealPatch> = to_real_patch(reviewed, r.source_hash)
+                legally<Bool> = is_legally_sealable(rp)
+                if (legally) {
+                    pset<Vec<RealPatch>> = Vec(); pset.push(rp)
+                    ident<String> = realization_identity(pset)
+                    origin<String> = "vybforge/model-proposals"
+                    rc<SignedChain> = seal_realization("system", "0.1", "http://mirror", ident, pset, origin, seed1)
+                    fails = fails + check(is_legit_realization(rc, ident, forgePub),
+                                          "accepted model patch sealed into authentic realization")
+                    println("\nMODEL-BOUNDARY: ACCEPT (sealed realization; patched hash=" + r.source_hash.substring(0, 12) + ")")
+                } else {
+                    fails = fails + check(false, "accepted patch should be legally sealable")
+                    println("\nMODEL-BOUNDARY: ACCEPT (but cannot seal — lifecycle inconsistency)")
+                }
+            } else {
+                # reject path: report WHICH gate blocked it
+                if (high_risk) {
+                    println("\nMODEL-BOUNDARY: HUMAN-REQUIRED (high-risk surface routes to review)")
+                } else if (!r.accepted) {
+                    if (!tests_ok) { println("\nMODEL-BOUNDARY: REJECT (build/test gate failed)") }
+                    else if (!integ_ok) { println("\nMODEL-BOUNDARY: REJECT (integration gate failed)") }
+                    else { println("\nMODEL-BOUNDARY: REJECT (patch did not apply / no-op)") }
+                } else {
+                    println("\nMODEL-BOUNDARY: REJECT (guardrail) ")
+                }
+            }
+            if (fails == 0) { println("VALIDATE-PROPOSAL: PASS (" + cls + ")") ; return 0 }
+            println("VALIDATE-PROPOSAL: " + fails.to_string() + " FAILURE(S)")
+            return 1
+        }
+        ? -> {
+            println("\nVALIDATE-PROPOSAL: BAD PROPOSAL JSON")
+            return 1
+        }
+    }
+}

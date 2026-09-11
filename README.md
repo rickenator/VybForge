@@ -92,6 +92,12 @@ environment, never in the repo.
   cross-repo via `--module-path`). Run `./native/legit/run_forge_ledger.sh`
   (see also `native/legit/run_forge_legit_signed.sh` for the forge-local signed
   provenance path).
+- `tools/propose_repair.py` + `tools/validate_proposal.vyb` (`run_repair_proposal.sh`)
+  — **#7 model boundary**: `propose_repair` emits a schema-constrained
+  `PatchProposal` (mock/dead deterministic; live via ollama/openai-chat/
+  openai-responses); `validate_proposal.vyb` runs it through the REAL VybOS
+  repair core (apply → gates → guardrail → promote → seal) and reports
+  ACCEPT / REJECT / HUMAN-REQUIRED. Full boundary provable with no model/GPU.
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
   rules. Retrained/inferred on godzilla's RTX 3090.
 - The final LoRA adapter and tokenizer are committed under

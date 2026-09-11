@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cls", "diff", "reason", "generator", "matched"],
+  "properties": {
+    "cls": {"type": "string", "enum": ["curated", "upstream", "generated"]},
+    "diff": {"type": "string", "minLength": 1, "description": "Minimal unified-ish diff as ordered -old/+new full source lines (see prompts/repair.md)."},
+    "reason": {"type": "string", "minLength": 1, "description": "The repair objective: what is broken and why this minimal change fixes it."},
+    "generator": {"type": "string", "minLength": 1, "description": "Generator/model identity that authored this proposal; empty for curated/upstream is allowed only if cls is not generated."},
+    "matched": {"type": "boolean", "description": "Whether the diff's -old lines are expected to already exist verbatim in the pristine source."}
+  }
+}
