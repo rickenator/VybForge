@@ -1,0 +1,173 @@
+// build-forge-ledger.vyb — VybForge SHARED-LEDGER BUILD-RECORD POSTING proving
+// entry (VybOS #7/#8). Drives native/legit/forge_buildrecord.vyb: the forge
+// computes the deterministic artifact hash of each selected package, seals an
+// AUTHENTIC signed build record, and POSTS it to the SHARED registry ledger
+// (consumed cross-repo from VybOS modules/ledger.vyb via --module-path).
+//
+//  1. artifact_hash(busybox) is deterministic (same fixture -> same hash)
+//     and order-independent of package order;
+//  2. a signed build record for busybox is AUTHENTIC under the forge pubkey;
+//  3. posting busybox to the shared ledger -> is_legit_build_posted TRUE
+//     (ledger verifies under the registry pubkey AND replayed state contains
+//     a:busybox@1.37.0|<artifact-hash>);
+//  4. a build record sealed by a DIFFERENT forge key -> rejected;
+//  5. wrong registry pubkey anchoring -> rejected;
+//  6. SIGNATURE gate: tamper the artifact hash on disk, keep ORIGINAL sigs
+//     -> the ledger state root changes -> is_legit_ledger FALSE;
+//  7. all four selected packages posted -> state lists every a:<name>@<ver>;
+//  8. a ledger checkpoint over the posted state verifies (offline trust).
+//
+// Key material: RFC 8032 TEST seeds, scaffold-only — never in the runtime
+// modules or the ledger content.
+//
+// Run (from VybForge):
+//   VYB_STDLIB=$VYB_STDLIB $VYB native/legit/build-forge-ledger.vyb \
+//       --module-path native/legit --module-path native/json \
+//       --module-path ../VybOS/modules
+
+import io::{open_read, read_all, close}
+import env::{env_get}
+import json_parse::{json_parse, JsonDoc}
+import forge_buildrecord::{artifact_hash, build_record_signed, is_legit_build_record,
+             post_build_to_ledger, is_legit_build_posted, post_builds}
+import ledger::{registry_genesis, replay_state, state_root, is_legit_ledger,
+             sign_ledger_checkpoint, verify_ledger_checkpoint}
+import chain::{serialize, deserialize, tip_hash, Record, Chain, SignedChain}
+import crypto::{ed25519_publickey}
+
+fixture_path()<String> -> {
+    return env_get("FORGE_LEGIT_FIXTURE") else "/home/rick/Projects/VybForge/config/mock-system.json"
+}
+
+read_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { close(f); return s }
+                ? -> { close(f); return "" }
+            }
+        }
+        ? -> { return "" }
+    }
+}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    seed1<String> = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+    seed2<String> = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    forgePub<String> = ed25519_publickey(seed1)
+    otherPub<String> = ed25519_publickey(seed2)
+    origin<String> = "vybforge/build-ledger"
+    registry_id<String> = "vybforge-registry"
+
+    raw<String> = read_file(fixture_path())
+    if (raw.len() == 0) {
+        println("  FAIL cannot read fixture")
+        println("\nFORGE-LEDGER: MISSING FIXTURE")
+        return 1
+    }
+    match (json_parse(raw)) {
+        doc -> {
+            pkgarr<Int> = doc.get(doc.rootid(), "packages")
+            if (pkgarr < 0) {
+                println("\nFORGE-LEDGER: NO PACKAGES")
+                return 1
+            }
+            npkg<Int> = doc.len(pkgarr)
+            # collect selected package ids
+            ids<Vec<Int>> = Vec()
+            nms<Vec<String>> = Vec()
+            vers<Vec<String>> = Vec()
+            for (k in 0..npkg - 1) {
+                cand<Int> = doc.elem(pkgarr, k)
+                if (doc.hstr(doc.get(cand, "selected")) == "true") {
+                    ids.push(cand)
+                    nms.push(doc.hstr(doc.get(cand, "name")))
+                    vers.push(doc.hstr(doc.get(cand, "version")))
+                }
+            }
+            if (ids.len() == 0) {
+                println("\nFORGE-LEDGER: NO SELECTED PACKAGE")
+                return 1
+            }
+            first<Int> = ids.get(0)
+            fnm<String> = nms.get(0)
+            fver<String> = vers.get(0)
+
+            # 1. deterministic artifact hash
+            h1<String> = artifact_hash(first, doc)
+            h1b<String> = artifact_hash(first, doc)
+            fails = fails + check(h1 == h1b, "artifact_hash deterministic for " + fnm)
+            fails = fails + check(h1.len() == 64, "artifact hash is a 64-hex sha256")
+
+            # 2. authentic signed build record (forge key)
+            br<SignedChain> = build_record_signed(first, doc, h1, origin, seed1)
+            fails = fails + check(is_legit_build_record(br, forgePub), "signed build record authentic (forge key)")
+
+            # 4. build record by a DIFFERENT forge key -> rejected
+            br2<SignedChain> = build_record_signed(first, doc, h1, origin, seed2)
+            fails = fails + check(!is_legit_build_record(br2, forgePub), "build record by wrong forge key rejected")
+
+            # 3. post busybox to the SHARED ledger
+            ledger<SignedChain> = registry_genesis(registry_id, "vybchain-signed", seed1)
+            ledger = post_build_to_ledger(ledger, first, doc, seed1)
+            fails = fails + check(is_legit_build_posted(ledger, first, doc, forgePub),
+                                  "busybox build posted + authentic in shared ledger")
+            fails = fails + check(is_legit_ledger(ledger, state_root(ledger), forgePub),
+                                  "ledger authentic under registry pubkey")
+
+            # 5. wrong registry pubkey anchors nothing
+            fails = fails + check(!is_legit_ledger(ledger, state_root(ledger), otherPub),
+                                  "wrong registry pubkey rejected")
+
+            # 6. SIGNATURE gate: tamper the artifact hash, keep ORIGINAL sigs
+            txt<String> = serialize(ledger.chain)
+            evil<String> = txt.replace(h1, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            if (evil == txt) {
+                println("  FAIL could not locate artifact hash in serialized ledger")
+                fails = fails + 1
+            } else {
+                tchain<Chain> = deserialize(evil)
+                forged<SignedChain> = SignedChain { chain = tchain, signers = ledger.signers, sigs = ledger.sigs, rotations = ledger.rotations }
+                fails = fails + check(!is_legit_ledger(forged, state_root(forged), forgePub),
+                                      "tampered ledger rejected (signature gate)")
+            }
+
+            # 7. post ALL selected packages -> state lists every a:<name>@<ver>
+            allledger<SignedChain> = post_builds(doc, ids, registry_id, seed1)
+            state<String> = replay_state(allledger)
+            allok<Bool> = true
+            m<Int> = ids.len()
+            for (i in 0..m - 1) {
+                want<String> = "a:" + nms.get(i) + "@" + vers.get(i)
+                if (!state.contains(want)) { allok = false }
+            }
+            fails = fails + check(allok, "shared ledger lists every selected published package (" + m.to_string() + ")")
+            fails = fails + check(is_legit_ledger(allledger, state_root(allledger), forgePub),
+                                  "full shared ledger authentic under registry pubkey")
+
+            # 8. checkpoint over the posted shared ledger (offline trust)
+            ck<String> = sign_ledger_checkpoint(allledger, seed1)
+            fails = fails + check(verify_ledger_checkpoint(tip_hash(allledger.chain), allledger.chain.blocks.len(), forgePub, ck),
+                                  "ledger checkpoint verifies (offline trust)")
+            fails = fails + check(!verify_ledger_checkpoint(tip_hash(allledger.chain), allledger.chain.blocks.len() + 1, forgePub, ck),
+                                  "checkpoint with wrong seq rejected")
+
+            sum<String> = "FORGE-LEDGER: PASS (signed build records posted to the shared VybOS registry ledger)"
+            if (fails > 0) { sum = fails.to_string() + " FAILURE(S)" }
+            println("\n" + sum)
+            if (fails == 0) { return 0 }
+            return 1
+        }
+        ? -> {
+            println("\nFORGE-LEDGER: BAD JSON")
+            return 1
+        }
+    }
+}

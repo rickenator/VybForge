@@ -1,0 +1,139 @@
+// forge_buildrecord.vyb — VybForge SHARED-LEDGER BUILD-RECORD POSTING (VybOS #7/#8).
+//
+// The OTHER half of the provenance loop: VybOS owns the realization/lifecycle
+// core (modules/repair.vyb, packagerealization.vyb) and the registry DOMAIN
+// LEDGER (modules/ledger.vyb); VybForge OWNS THE BUILD. This module lets the
+// forge:
+//
+//   1. compute a DETERMINISTIC ARTIFACT HASH over a package's build identity
+//      (name@version | source | depends_on set) — the content-addressed
+//      identity of what was actually built;
+//   2. seal an AUTHENTIC signed BUILD RECORD (build_record_signed) binding that
+//      artifact hash + the forge's attestation — a SignedChain under the forge
+//      key, like the package-provenance path (forge_legit_signed.vyb);
+//   3. POST that build to the SHARED REGISTRY LEDGER (post_build_to_ledger):
+//      appends a `publish name@version|<artifact-hash>` PkgOp onto the VybOS
+//      ledger SignedChain (consumed cross-repo via --module-path ../VybOS/modules),
+//      signed by the registry/forge key;
+//   4. VERIFY the posted build is authentic (is_legit_build_posted): the ledger
+//      verifies under the registry pubkey AND its replayed state actually
+//      contains the published artifact carrying the same hash.
+//
+// So a package's provenance is no longer only "sealed somewhere it fork" —
+// it is PUBLICLY RECORDED in the shared ledger, so an installer (verifyinstall)
+// can trust the published artifact hash without holding every build record.
+//
+// Key material is NEVER embedded — seeds are caller-supplied (RFC 8032 TEST
+// seeds in the proving entry only).
+//
+// Run-free library (no main); proven by build-forge-ledger.vyb. Requires
+// --module-path <repo>/native/json (JsonDoc) AND --module-path <VybOS>/modules
+// (ledger) at the VybForge workspace.
+
+import json_parse::{JsonDoc}
+import chain::{signed_genesis, signed_append, signed_verify, contains, tip_hash,
+             sign_checkpoint, verify_checkpoint, Record, SignedChain}
+import crypto::{sha256, ed25519_publickey}
+import ledger::{registry_genesis, apply_op, PkgOp, replay_state, state_root,
+             is_legit_ledger, sign_ledger_checkpoint, verify_ledger_checkpoint}
+
+# The depends_on set rendered deterministically (array order) for hashing.
+share(all)
+deps_of(pkg_id<Int>, doc<JsonDoc>)<String> -> {
+    deps<Int> = doc.get(pkg_id, "depends_on")
+    if (deps < 0 || doc.kind(deps) != "array") { return "" }
+    n<Int> = doc.len(deps)
+    s<String> = ""
+    for (i in 0..n - 1) {
+        if (i > 0) { s = s + "," }
+        s = s + doc.hstr(doc.elem(deps, i))
+    }
+    return s
+}
+
+# Deterministic content-addressed identity of a package's BUILD: what name@version
+# of what source with what deps was actually built. Same inputs -> same hash, so
+# an installer and the forge agree on the artifact regardless of which side has
+# the fixture.
+share(all)
+artifact_hash(pkg_id<Int>, doc<JsonDoc>)<String> -> {
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    src<String> = doc.hstr(doc.get(pkg_id, "source"))
+    body<String> = nm + "@" + ver + "|" + src + "|" + deps_of(pkg_id, doc)
+    return sha256(body)
+}
+
+# Seal an AUTHENTIC signed BUILD RECORD: signed genesis of the package identity
+# facts + a signed attestation block carrying the artifact hash under the forge
+# key (genesis signer == that key, so only the actual forge can originate it).
+# Returns the SignedChain.
+share(all)
+build_record_signed(pkg_id<Int>, doc<JsonDoc>, art_h<String>, forge_origin<String>,
+                    seed<String>)<SignedChain> -> {
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    src<String> = doc.hstr(doc.get(pkg_id, "source"))
+    facts<Vec<Record>> = Vec()
+    facts.push(Record { label = "name", value = nm })
+    facts.push(Record { label = "version", value = ver })
+    facts.push(Record { label = "source", value = src })
+    facts.push(Record { label = "depends_on", value = deps_of(pkg_id, doc) })
+    base<SignedChain> = signed_genesis(forge_origin, facts, seed)
+    att<Vec<Record>> = Vec()
+    att.push(Record { label = "built_by", value = "vybforge" })
+    att.push(Record { label = "artifact", value = nm + "-" + ver })
+    att.push(Record { label = "artifact_hash", value = art_h })
+    return signed_append(base, att, seed, seed)
+}
+
+# True iff a sealed build record is AUTHENTIC: signed_verify under the forge pub
+# AND a vybforge build origin AND a recorded artifact_hash.
+share(all)
+is_legit_build_record(sc<SignedChain>, forge_pub<String>)<Bool> -> {
+    if (!signed_verify(sc, forge_pub)) { return false }
+    if (!sc.chain.origin.contains("vybforge")) { return false }
+    return contains(sc.chain, "built_by", "vybforge")
+}
+
+# POST one package's build to the SHARED REGISTRY LEDGER: append a signed
+# `publish name@version|<artifact-hash>` PkgOp onto the given ledger chain under
+# the registry/forge key. Returns the updated ledger (a new SignedChain).
+share(all)
+post_build_to_ledger(ledger<SignedChain>, pkg_id<Int>, doc<JsonDoc>, seed<String>)<SignedChain> -> {
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    op<PkgOp> = PkgOp { kind = "publish", name = nm, version = ver,
+                        stage = "", hash = artifact_hash(pkg_id, doc) }
+    return apply_op(ledger, op, seed)
+}
+
+# True iff a posted build is AUTHENTIC in the shared ledger: the ledger verifies
+# under the registry pubkey (signed_verify binds EVERY block — so the
+# artifact_hash recorded on that package's publish op is cryptographically
+# covered; tampering it breaks the signature gate, proven in the entry) AND its
+# replayed state actually lists the published artifact `a:<name>@<ver>`.
+# (replay_state surfaces the id; the hash lives in the signed publish op.)
+share(all)
+is_legit_build_posted(ledger<SignedChain>, pkg_id<Int>, doc<JsonDoc>, registry_pub<String>)<Bool> -> {
+    if (!is_legit_ledger(ledger, state_root(ledger), registry_pub)) { return false }
+    nm<String> = doc.hstr(doc.get(pkg_id, "name"))
+    ver<String> = doc.hstr(doc.get(pkg_id, "version"))
+    state<String> = replay_state(ledger)
+    return state.contains("a:" + nm + "@" + ver)
+}
+
+# Post BUILD RECORDS for a set of packages in one step, starting fresh from a
+# signed registry genesis (trust root = the forge/registry key). Returns the
+# ledger after all posts.
+share(all)
+post_builds(doc<JsonDoc>, pkg_ids<Vec<Int>>, registry_id<String>, seed<String>)<SignedChain> -> {
+    ledger<SignedChain> = registry_genesis(registry_id, "vybchain-signed", seed)
+    n<Int> = pkg_ids.len()
+    if (n > 0) {
+        for (i in 0..n - 1) {
+            ledger = post_build_to_ledger(ledger, pkg_ids.get(i), doc, seed)
+        }
+    }
+    return ledger
+}

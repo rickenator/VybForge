@@ -85,6 +85,13 @@ environment, never in the repo.
 - `config/` — default-state (real SystemSpec baseline) and response schemas.
 - `data/` — deterministic VybOS seed corpus: 216 train / 24 eval records.
 - `native/` — the Vyb-native on-GPU inference substrate (see `native/README.md`).
+- `native/legit/forge_buildrecord.vyb` + `run_forge_ledger.sh` — **shared-ledger
+  build-record posting**: the forge computes a deterministic artifact hash and
+  seals an AUTHENTIC signed build record per package, then POSTS it to the
+  shared VybOS registry ledger (`VybOS/modules/ledger.vyb`, consumed
+  cross-repo via `--module-path`). Run `./native/legit/run_forge_ledger.sh`
+  (see also `native/legit/run_forge_legit_signed.sh` for the forge-local signed
+  provenance path).
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
   rules. Retrained/inferred on godzilla's RTX 3090.
 - The final LoRA adapter and tokenizer are committed under
