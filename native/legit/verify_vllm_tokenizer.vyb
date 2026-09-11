@@ -1,0 +1,31 @@
+// verify_vllm_tokenizer.vyb — checkpoint-1 probe: import the tokenizer from the
+// NEW shared stdlib module `vllm` (Vyb/stdlib/vllm) cross-repo, and confirm the
+// relocated + path-decoupled module still encodes to the exact reference ids.
+//
+// Run from VybForge root (artifacts/vybos-configurator-lora present):
+//   VYB_STDLIB=/home/rick/Projects/Vyb/stdlib /home/rick/Projects/Vyb/build/vyb \
+//       <this file>
+import vllm::{encode, encode_str}
+
+check(c<Bool>, l<String>)<Int> -> {
+    if (!c) { println("  FAIL " + l); return 1 }
+    println("  ok   " + l)
+    return 0
+}
+
+main()<Int> -> {
+    fails<Int> = 0
+    # reference ids (transformers, Qwen3-4B configurator LoRA tokenizer),
+    # compared as encode_str space-separated strings (avoids Vec==array ICmp)
+    fails = fails + check(encode_str("Hello world") == "9707 1879", "Hello world -> 9707 1879")
+    fails = fails + check(encode_str("configure VybOS") == "21002 647 84307 3126", "configure VybOS")
+    fails = fails + check(encode_str("  hello") == "220 23811", "'  hello' -> 220 23811")
+    fails = fails + check(encode_str(",") == "11", "',' -> 11")
+    fails = fails + check(encode_str("x=1+y") == "87 28 16 43010", "x=1+y")
+    if (fails == 0) {
+        println("VLLM-TOKENIZER: PASS (stdlib vllm module, exact ids)")
+    } else {
+        println("VLLM-TOKENIZER: " + fails.to_string() + " FAILURE(S)")
+    }
+    return fails
+}
