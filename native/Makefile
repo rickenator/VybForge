@@ -321,3 +321,14 @@ chat-gen: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/na
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) $(VYB) native/host/decode_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_gen.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_chatgen.py
 
+# Resident throughput: decode_driver's model (packed weights, embedding, norms)
+# loads ONCE onto the GPU, then NRUNS follow-up interactions each run the proven
+# recompute-full-prefix gen loop (GEN tokens). Per-run wall time is printed and
+# averaged -> tokens/sec once the model is resident. No re-load per interaction.
+CHAT_GEN ?= 3
+RESIDENT_RUNS ?= 3
+resident-bench: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) VYB_RUNS=$(RESIDENT_RUNS) $(VYB) native/host/resident_driver.vyb --module-path native/llm 2>&1 | tee native/out/resident_bench.log
+	cd $(ROOT) && .venv/bin/python native/tools/verify_resident_bench.py
+
+

@@ -8,6 +8,7 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import llm::{llm_load, llm_decode}
 import vllm::{Model}
 import env::{env_get}
+import time::{time_mono_millis}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -273,6 +274,9 @@ main()<Int> -> {
     GEN<Int> = 6
     gn<String> = env_get("VYB_GEN") else ""
     if (gn.len() > 0) { GEN = parse_u(gn, 0, gn.len()) }
+    NRUNS<Int> = 1
+    rn<String> = env_get("VYB_RUNS") else ""
+    if (rn.len() > 0) { NRUNS = parse_u(rn, 0, rn.len()) }
     MAXS<Int> = SEEDLEN + GEN
     EPS<Float> = 0.000001
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -499,100 +503,121 @@ main()<Int> -> {
         e = load_norm(MODEL, PF, DPK, ON, on_off, on_nl, efn); if (e != 0) { return 84 }
         println("NORMS_LOADED")
 
-        # ---- seed EMB with the prompt rows (or [0,1]) ----
-        si<Int> = 0
-        for (si in 0..SEEDLEN - 1) {
-            if (copy_row(DE, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
-        }
+        # ---- resident interaction loop: seed + gen, repeated NRUNS times ----
+        # Each run re-seeds EMB from the prompt ids and runs the same proven
+        # recompute-full-prefix greedy gen loop (GEN tokens). The model weights,
+        # embedding and norms stay RESIDENT on-GPU from the load above, so this
+        # measures steady-state generation, not re-loading.
+        tot_ms<Int> = 0
+        tot_tok<Int> = 0
+        rn<Int> = 0
+        for (rn in 0..NRUNS - 1) {
+            t0<Int> = time_mono_millis()
 
-        # Prompt mode writes the FULL sequence (prompt ids + generated) to
-        # chatgen_ids_vyb.txt (the chat-gen verifier reads it); default mode
-        # keeps decode_ids_vyb.txt = [0,1,...] for the decode-real gate.
-        outnm<String> = "native/out/decode_ids_vyb.txt"
-        if (pf.len() > 0) { outnm = "native/out/chatgen_ids_vyb.txt" }
-
-        match (open_write(outnm)) {
-            w -> {
-                sj<Int> = 0
-                for (sj in 0..SEEDLEN - 1) {
-                    match (write_str(w, pids.get(sj).to_string() + "\n")) { q -> { } ? -> { return 17 } }
-                }
-                g<Int> = 0
-                Scur<Int> = 0
-                nxt<Int> = 0
-                rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
-                for (g in 0..GEN - 1) {
-                    Scur = SEEDLEN + g
-                    cur<Int> = EMB
-                    println("DECG step " + g.to_string() + " Scur=" + Scur.to_string())
-                    L = 0
-                    for (L in 0..NLAYER - 1) {
-                        println("DECG L" + L.to_string() + " deqstart")
-                        # per-layer RMSNorm weights (differ every layer — load layer L's)
-                        ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
-                        ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
-                        ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
-                        ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
-                        e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
-                        # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
-                        avt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-                        avq<loc<CVoid>> = q4fn
-                        if (avt == 14) { avq = q6fn }
-                        e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
-                        # ffn_down: kernel by this layer's real quant type
-                        fdt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-                        fdq<loc<CVoid>> = q4fn
-                        if (fdt == 14) { fdq = q6fn }
-                        e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
-                        println("DECG deqdone L" + L.to_string())
-                        tgt<Int> = HA
-                        if ((L % 2) == 1) { tgt = HB }
-                        e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
-                                      gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                      N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
-                                      XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
-                        if (e != 0) { return 71 }
-                        cur = tgt
-                        println("DECG layer " + L.to_string() + " done")
-                    }
-                    println("DECG forward done")
-                    rA = cur; rB = ON; rC = DH
-                    cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-                    cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-                    cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Scur * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-                    LCH<Int> = 16384
-                    s7<Int> = Scur - 1
-                    vs2<Int> = 0
-                    ve2<Int> = 0
-                    rc_sl<CInt> = 0
-                    while (vs2 < VOCAB) {
-                        ve2 = vs2 + LCH
-                        if (ve2 > VOCAB) { ve2 = VOCAB }
-                        cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
-                        cuMemcpyHtoD_v2(LSP + 24, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
-                        cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
-                        rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
-                        if (rc_sl != 0) { return 92 }
-                        vs2 = ve2
-                    }
-                    cuMemcpyHtoD_v2(A4 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
-                    cuMemcpyHtoD_v2(A4 + 16, loc(1), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
-                    cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
-                    cuCtxSynchronize()
-                    nxt = 0
-                    cuMemcpyDtoH_v2(loc(nxt), AO, 8)
-                    match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
-                    copy_row(DE, nxt, D, EMB + Scur * D * 8)
-                    println("GEN step " + g.to_string() + " token=" + nxt.to_string())
-                }
-                close(w)
+            # seed EMB with the prompt rows (or [0,1])
+            si<Int> = 0
+            for (si in 0..SEEDLEN - 1) {
+                if (copy_row(DE, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
             }
-            ? -> { return 17 }
+
+            # Prompt mode writes the FULL sequence (prompt ids + generated) to
+            # chatgen_ids_vyb.txt (the chat-gen verifier reads it); default mode
+            # keeps decode_ids_vyb.txt = [0,1,...] for the decode-real gate.
+            outnm<String> = "native/out/decode_ids_vyb.txt"
+            if (pf.len() > 0) { outnm = "native/out/chatgen_ids_vyb.txt" }
+
+            match (open_write(outnm)) {
+                w -> {
+                    sj<Int> = 0
+                    for (sj in 0..SEEDLEN - 1) {
+                        match (write_str(w, pids.get(sj).to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    }
+                    g<Int> = 0
+                    Scur<Int> = 0
+                    nxt<Int> = 0
+                    rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
+                    for (g in 0..GEN - 1) {
+                        Scur = SEEDLEN + g
+                        cur<Int> = EMB
+                        println("DECG step " + g.to_string() + " Scur=" + Scur.to_string())
+                        L<Int> = 0
+                        for (L in 0..NLAYER - 1) {
+                            println("DECG L" + L.to_string() + " deqstart")
+                            # per-layer RMSNorm weights (differ every layer — load layer L's)
+                            ii0<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e<Int> = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
+                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
+                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
+                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
+                            e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
+                            # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
+                            avt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
+                            avq<loc<CVoid>> = q4fn
+                            if (avt == 14) { avq = q6fn }
+                            e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
+                            # ffn_down: kernel by this layer's real quant type
+                            fdt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
+                            fdq<loc<CVoid>> = q4fn
+                            if (fdt == 14) { fdq = q6fn }
+                            e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
+                            println("DECG deqdone L" + L.to_string())
+                            tgt<Int> = HA
+                            if ((L % 2) == 1) { tgt = HB }
+                            e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
+                                          gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
+                                          N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
+                                          XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
+                            if (e != 0) { return 71 }
+                            cur = tgt
+                            println("DECG layer " + L.to_string() + " done")
+                        }
+                        println("DECG forward done")
+                        rA = cur; rB = ON; rC = DH
+                        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+                        cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+                        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Scur * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+                        LCH<Int> = 16384
+                        s7<Int> = Scur - 1
+                        vs2<Int> = 0
+                        ve2<Int> = 0
+                        rc_sl<CInt> = 0
+                        while (vs2 < VOCAB) {
+                            ve2 = vs2 + LCH
+                            if (ve2 > VOCAB) { ve2 = VOCAB }
+                            cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
+                            cuMemcpyHtoD_v2(LSP + 24, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
+                            cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
+                            rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
+                            if (rc_sl != 0) { return 92 }
+                            vs2 = ve2
+                        }
+                        cuMemcpyHtoD_v2(A4 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
+                        cuMemcpyHtoD_v2(A4 + 16, loc(1), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
+                        cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+                        cuCtxSynchronize()
+                        nxt = 0
+                        cuMemcpyDtoH_v2(loc(nxt), AO, 8)
+                        match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                        copy_row(DE, nxt, D, EMB + Scur * D * 8)
+                        println("GEN step " + g.to_string() + " token=" + nxt.to_string())
+                    }
+                    close(w)
+                }
+                ? -> { return 17 }
+            }
+
+            t1<Int> = time_mono_millis()
+            drun<Int> = t1 - t0
+            tot_ms = tot_ms + drun
+            tot_tok = tot_tok + GEN
+            println("RESIDENT_RUN=" + rn.to_string() + " ms=" + drun.to_string() + " tokens=" + GEN.to_string())
         }
+        tps<Float> = (tot_tok as Float) / ((tot_ms as Float) / 1000.0)
+        println("RESIDENT_RUNS=" + NRUNS.to_string() + " total_ms=" + tot_ms.to_string() + " total_tokens=" + tot_tok.to_string())
+        println("RESIDENT_AVG_TOKENS_PER_SEC=" + tps.to_string())
 
         # ---- prompt mode: decode the generated continuation (last GEN ids) ----
         # to a fluent String via the stdlib/vllm CPU head.
