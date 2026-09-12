@@ -280,8 +280,33 @@ layer0: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/nati
 	cd $(ROOT) && $(VYB) native/host/layer0_driver.vyb
 	cd $(ROOT) && .venv/bin/python native/tools/verify_layer0.py
 
-# Full-36-layer Qwen3-4B prefill + tied lm_head vs numpy reference (prefill gate)
+# Full-36-layer Qwen3-4B prefill + tied lm_head vs numpy reference (prefill gate).
+# model_driver now composes llm:: (stdlib/vllm CPU decode) as the closed-loop
+# real-model chat head, so it needs the llm module path + the stdlib vllm engine.
 prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && .venv/bin/python native/gguf/prefill_ref.py
-	cd $(ROOT) && $(VYB) native/host/model_driver.vyb
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm
 	cd $(ROOT) && .venv/bin/python native/tools/verify_prefill.py
+
+# Real-model llm.chat closed loop: full 36-layer forward -> tied lm_head argmax ->
+# stdlib/vllm CPU decode to text, on the RTX 3090. Requires the real GGUF + the
+# real BPE tokenizer dir (VYB_LLM_DIR, default artifacts/vybos-configurator-lora).
+# Gate: LLM_CHAT_RESPONSE present + top1 ids == the committed prefill gold [31784,31784].
+chat-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_real.log
+	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_real.py
+
+# Checkpoint B — arbitrary-prompt llm.chat: GPU token_embd gather embeds a real
+# prompt's ids (from the stdlib/vllm CPU tokenizer), full 36-layer forward, then
+# per-position lm_head argmax must equal the numpy gold token-for-token.
+# Regenerate the gold with `make chat-prompt-ref` when the prompt changes.
+CHAT_PROMPT ?= "The capital of France is"
+chat-prompt: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_PROMPT="$(CHAT_PROMPT)" VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_prompt.log
+	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_prompt.py
+
+chat-prompt-ref:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(CHAT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py
+	cd $(ROOT) && .venv/bin/python native/gguf/prompt_ref.py
+

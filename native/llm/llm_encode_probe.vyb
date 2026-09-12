@@ -1,0 +1,23 @@
+// Probe: run the stdlib/vllm CPU tokenizer over a prompt and print its ids,
+// so the numpy reference and the GPU driver both use the SAME deterministic ids.
+import llm::{llm_load, llm_encode_str, llm_encode}
+import vllm::{Model}
+import env::{env_get}
+
+main()<Int> -> {
+    dir<String> = env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora"
+    prompt<String> = env_get("VYB_PROMPT") else "Hello"
+    m<Model> = llm_load("qwen3", dir)
+    ids<Vec<Int>> = llm_encode(m, prompt)
+    out<String> = ""
+    i<Int> = 0
+    for (i in 0..ids.len() - 1) {
+        if (i > 0) { out = out + "," }
+        out = out + ids.get(i).to_string()
+    }
+    println("PROMPT=<" + prompt + ">")
+    println("PROMPT_IDS=" + out)
+    println("PROMPT_N=" + ids.len().to_string())
+    println("PROMPT_IDS_STR=" + llm_encode_str(m, prompt))
+    return 0
+}

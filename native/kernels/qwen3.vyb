@@ -123,6 +123,21 @@ logits_slice(p<Int>) -> {
         st_f64(Log + (s * V + vs) * 8, acc)
     }
 }
+// Token-embedding gather (Qwen3 token_embd): OUT[s*D+d] = EMB[ids[s]*D+d].
+// EMB f64 [VOCAB,D], ids f64-width Int per row (as stored in an Int device buf).
+// Params: +0 EMB +8 IDS +16 OUT +24 S +32 D. Grid = S*D.
+embed(p<Int>) -> {
+    EMB<Int> = ld_i64(p + 0); IDS<Int> = ld_i64(p + 8); OUT<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24); D<Int> = ld_i64(p + 32)
+    tot<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < tot) {
+        s<Int> = gid / D; d<Int> = gid % D
+        id<Int> = ld_i64(IDS + s * 8)
+        st_f64(OUT + gid * 8, ld_f64(EMB + (id * D + d) * 8))
+    }
+}
+
 // Per-token argmax over a [S,V] f64 logits buffer -> S ints (tied lm_head top-1).
 // Params: +0 C, +8 Out, +16 S, +24 V. Grid = S.
 argmax_row(p<Int>) -> {
