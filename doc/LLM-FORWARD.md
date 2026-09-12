@@ -1,11 +1,15 @@
 # llm:: — GPU-composing forward facade (CPU(vllm) + GPU(bindings)) — mapped plan
 
-> Status: F1 DONE, hardware-verified (2026-09-11). `native/llm/llm.vyb` +
-> `native/llm/llm_probe.vyb` (CPU leg) + `native/llm/llm_gpu.vyb` (F1 wiring):
-> on the RTX 3090 a REAL `gemm` forward (layer.ptx) computes logits -> `llm_head`
-> -> decoded response == host reference (A->'A', B->'B', input-dependent), 4/4
-> PASS. CPU leg 7/7 on the real tokenizer. F2 (real Qwen3-4B via model_driver,
-> needs the GGUF on the box) remains the only open item.
+> Status: F1 + F2 DONE, all hardware-verified (2026-09-11).
+> F1: `native/llm/*` facade (CPU(vllm) head, native/llm/llm.vyb + probes) — CPU
+> leg 7/7 on the real tokenizer; F1 wiring (llm_gpu.vyb) 4/4 on the RTX 3090
+> (real gemm -> llm_head -> decoded response == host).
+> F2: REAL Qwen3-4B forward gate PASSES on the RTX 3090 — 36-layer prefill
+> hidden maxrel 4.9e-6, tied lm_head top1 [31784,31784] exact vs the numpy oracle
+> (model_driver + verify_prefill). Model at /home/rick/Models/qwen3/.
+> A true real-model `llm.chat` (facade over the full 36-layer forward) is a
+> further extraction of model_driver's forward into a reusable main-less module
+> (next slice; the forward itself is verified).
 > Steering: VybOS issue #9.
 
 ## Goal
