@@ -39,7 +39,7 @@ the FFI hand over the String's raw contiguous {ptr,len} buffer (same mechanism
 entire tensor. `download()` now does ~10 bulk calls instead of ~327M
 per-8-byte ones.
 
-Measured (RTX 3090, godzilla; prove the LT fix, not a synthetic microbench):
+Measured on GPU (as tested on an RTX 3090, godzilla; prove the LT fix, not a synthetic microbench):
 - **Full model load + JIT + 1 gen: 4.26 s total wall** (load alone ~3.5 s;
   gen run 729 ms). Load went 13 min -> seconds, i.e. the ~10s class expected.
 - Resident throughput (`make resident-bench`, GEN=3 x RUNS=3): each follow-up

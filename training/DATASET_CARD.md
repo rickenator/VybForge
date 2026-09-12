@@ -50,5 +50,5 @@ change was applied.
 
 `generate-data.sh` only builds the Vyb generator and writes JSONL.
 `start-training.sh --start-training <host>` is the explicit submission gate
-(background GPU QLoRA for now; the target is Vyb-native LoRA training on the
-3090 per CORPUS-STRATEGY.md).
+(background GPU QLoRA for now; the target is Vyb-native LoRA training on
+GPU per CORPUS-STRATEGY.md).

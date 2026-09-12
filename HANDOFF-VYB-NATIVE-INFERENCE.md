@@ -25,7 +25,7 @@ lowers a `main`-less Vyb module to launchable PTX:
   `cuda_launch4i(..., a3<Int>)` (4th arg Int → RDI).
 
 **Kernel-mode device intrinsics (all verified — compile to ptxas-valid PTX, and the
-dequant/fp16 math is runtime-verified on the RTX 3090):**
+dequant/fp16 math is runtime-verified on GPU (as tested on an RTX 3090):**
 | Intrinsic | Meaning |
 |---|---|
 | `tid_x/y/z`, `blk_x/y/z`, `dim_x/y/z`, `grid_x/y`, `lane_id`, `warp_size` → `<Int>` | NVPTX special-register reads |

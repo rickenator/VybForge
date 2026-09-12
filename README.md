@@ -40,7 +40,7 @@ CPU fallback, `./run-vyb.sh` / `./vyb-run.sh` (Vyb + local Ollama).
 ## Infer — Vyb-native inference / compute substrate
 
 Under `native/`, the part of this repo that is the 6-month center of gravity:
-a **Vyb-native** decode of the Qwen3-4B configurator on an RTX 3090, with zero
+a **Vyb-native** decode of the Qwen3-4B configurator on GPU, with zero
 Python in the production pipeline (Python is reference-verification only).
 See `native/README.md` for the verified kernel table (GEMM, RMSNorm, exp/sin/cos,
 one transformer layer, GGUF reader + q4_0 dequant, JSON parser, Qwen3 BPE
@@ -99,7 +99,7 @@ environment, never in the repo.
   repair core (apply → gates → guardrail → promote → seal) and reports
   ACCEPT / REJECT / HUMAN-REQUIRED. Full boundary provable with no model/GPU.
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
-  rules. Retrained/inferred on godzilla's RTX 3090.
+  rules. Retrained/inferred on GPU (as tested on godzilla's RTX 3090).
 - The final LoRA adapter and tokenizer are committed under
   `artifacts/vybos-configurator-lora/`; the much larger public base model is
   pulled from Hugging Face when training or using the adapter.

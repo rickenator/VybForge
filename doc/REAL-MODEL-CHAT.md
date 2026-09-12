@@ -76,7 +76,7 @@ established.
   gate on tokens matching decode-driver gold; update plan status.
 
 ## Risks / notes
-- Full prefill is ~minutes on the 3090 for S=2 in this driver; keep S small for
+- Full prefill is ~minutes on GPU for S=2 in this driver (as tested on an RTX 3090); keep S small for
   iteration. Bigger S (S=83 corpus) is the training loop's proven regime.
 - Embed gather: confirm whether qwen3.ptx needs an `embed` kernel or reuse
   train.ptx (single-module rule: one .ptx per process).

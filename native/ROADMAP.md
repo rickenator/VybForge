@@ -10,8 +10,8 @@ Status legend: [x] done · [~] in progress · [ ] not started
 - [x] **P0 substrate on-GPU** — GEMM / RMSNorm / native exp·sin·cos verified
       (`GEMM_OK`, `RMSNORM_OK`, `VMATH_OK`); re-ran Vyb reference GPU tests.
 - [x] **One transformer layer forward** — RMSNorm→QKV→RoPE→GQA causal-softmax→
-      o_proj→residual→SiLU MLP→residual on the RTX 3090, verified
-      (`LAYER_VERIFY: OK`, ~5e-5). = handoff P0 go/no-go gate.
+      o_proj→residual→SiLU MLP→residual on GPU, verified
+      (`LAYER_VERIFY: OK`, ~5e-5). = handoff P0 go/no-go gate (as tested on an RTX 3090).
 - [x] **GGUF v3 reader** (header + metadata KV + tensor index) — Vyb-native,
       verified on a synthetic fixture (`GGUF_PARSE_VERIFY: OK`).
 - [x] **G-gguf-data** (serial): GGUF tensor DATA read by offset → device buffer

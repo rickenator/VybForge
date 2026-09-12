@@ -1,7 +1,7 @@
 # Native GPU inference substrate (VybForge)
 
 The handoff slice (HANDOFF-VYB-NATIVE-INFERENCE.md) — Vyb-native decode of the
-Qwen3-4B configurator on the RTX 3090, with **zero Python in the production
+Qwen3-4B configurator on GPU, with **zero Python in the production
 pipeline**. Python is used only for reference *verification*, never at runtime;
 every GPU kernel and the reference checks live in Vyb.
 
@@ -32,7 +32,7 @@ This directory is the P0 substrate that was blocked by the two language gaps
 
 The handoff **P0 go/no-go gate** (single layer) plus the **full vertical slice**
 (substrate → GGUF/JSON/tokenizer loaders → multi-layer stack → autoregressive
-decode → **stochastic sampling**) all run Vyb-native on the RTX 3090 and are
+decode → **stochastic sampling**) all run Vyb-native on GPU and are
 reference-verified. Remaining: G-decode (config-contract emission) and the rest
 of the `tensor::` wrapper (rope/attn/silu/resid ops moved behind it). See
 `ROADMAP.md`.

@@ -34,7 +34,7 @@ is "the fast responsive machine" (inference), independent of training throughput
 - a)  R-restricted backward (per FULLMANIFEST-MILESTONE.md) for 429-manifest training scale.
 
 ## b1+b2 STATUS (2026-09-01) — decode machinery VERIFIED on GPU; contract emission NOT yet
-The full LoRA-autoregressive decode pipeline is now built and RUNS cleanly on the 3090,
+The full LoRA-autoregressive decode pipeline is now built and RUNS cleanly on GPU,
 and the honest caveat is now empirically confirmed:
 - **b1 DONE (machinery):** `native/host/loradec_driver.vyb` (derived from the verified
   kvrespfwd.vyb LoRA-loading + per-token resp_layer_kv) + autoregressive gen loop: first

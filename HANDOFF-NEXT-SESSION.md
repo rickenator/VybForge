@@ -72,7 +72,7 @@ Key files:
    GOTCHA: single-row rmsnorm/rope S-param is **1**, not 0 — S=0 launches zero threads and collapses the
    stream to a constant token (61619 everywhere).
 3. **TRAINING PHASE (NEW DIRECTION, 2026-08-28):** the current direction requires the LoRA training itself to be Vyb-native
-   on the 3090 (no torch) — the true no-Python path — full Qwen3-4B research-scale, PLUS an expanded
+   on GPU (no torch) — the true no-Python path — full Qwen3-4B research-scale, PLUS an expanded
    interview corpus. Design doc `training/CORPUS-STRATEGY.md`: **facts live in context (a capabilities
    manifest in the system prompt), behavior lives in the weights**, so a new VybOS capability = edit the
    manifest, NOT a retrain. Also: goal-driven WHOLE-STACK interviews ("I want a Hyprland desktop" →
@@ -100,7 +100,7 @@ Key files:
    `adamw` (bias-corrected momentum + weight decay) — verified vs analytic (`make t4-lora`). Gotchas:
    `fn`/`at`/`as` reserved; single-module rule (load ONE .ptx per process); `grid-type>=` spacing.
    **T5 (LoRA training loop) DONE & VERIFIED (committed aaf6dbe):** `native/train/t5_probe.vyb` runs the full
-   training loop on the 3090 in pure Vyb (forward gemmf+addscaled -> MSE-grad sub+scalec -> LoRA backward
+   training loop on GPU in pure Vyb (forward gemmf+addscaled -> MSE-grad sub+scalec -> LoRA backward
    dgemm_at/bt -> AdamW on U/V, W frozen), computing its OWN loss: 3.2415->2.735->2.1126->1.4961->1.0303,
    matching numpy at every step; U/V ~4e-6 corr 1.0 (`make t5-lora`). The long "step-2 vU anomaly" was NOT
    a Vyb/kernel/compiler bug — the standalone repro confirmed the kernel exact; the real culprit was a BUG
@@ -221,7 +221,7 @@ Key files:
    POINTER alias, not a copy — re-source from a dedicated XIN (or re-download) each step.**
    **NEXT = swap the MSE-overfit target for the corpus next-token CE slice (train_corpus_ce_ref.py,
    committed f5045e7) — the production objective with a non-trivial head gradient -> actual descent +
-   real LoRA fine-tuning on the 3090, fully Vyb-native. Then whole-stack interview.**
+   real LoRA fine-tuning on GPU, fully Vyb-native (as tested on an RTX 3090). Then whole-stack interview.**
    **CORPUS-CE ON GPU: WIRED + step-1 gate GREEN (2026-08-30).** New head kernels in
    kernels/train.vyb: `embed` (token_embd[ids] gather), `hgemm` (logits = h @ emb^T, S=4 x V=151936),
    `cefwd` (softmax CE + dlog=(soft-onehot)/S + plab[s]), `hback` (dh = dlog @ emb) — validated
