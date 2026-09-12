@@ -66,12 +66,16 @@ find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
 
 download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
-        # Bulk HtoD (ONE driver call; srcHost declared CString = String's raw
-        # {ptr,len} buffer, distinct symbol cuMemcpyHtoDAsync_v2 so it doesn't
-        # collide with cuMemcpyHtoD_v2's scalar use). Previously ONE cuMemcpyHtoD
-        # per 8 bytes (~287M calls for the 2.3GB packed weights + ~40M-ish embed)
-        # = the ~13-minute load. Now n bytes in one call -> load in seconds.
+        # Bulk HtoD (srcHost declared CString = String's raw {ptr,len}). MUST be
+        # synchronous-in-effect: the caller reuses/frees the `pd` String right
+        # after download() returns, and cuMemcpyHtoDAsync_v2 on the null stream
+        # with a NON-PINNED (pageable) Vyb buffer does not guarantee the DMA read
+        # has finished before pd is reused -> async copies could step on each
+        # other / read freed memory and corrupt weights. cuCtxSynchronize() here
+        # makes the bulk copy ordered with the next tensor while keeping ONE
+        # driver call per tensor (the 13min->seconds win is call count, not async).
         if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
         return 0
     }
     return 0
