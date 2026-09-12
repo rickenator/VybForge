@@ -214,13 +214,13 @@ kvresp-train-kv: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
 
 decode: $(ROOT)/native/build/layer.ptx
-	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
 	cd $(ROOT) && python3 native/tools/verify_decode.py
 
 # Real Qwen3-4B greedy decode: token stream == numpy decode_ref.py (decode_ids_ref.txt)
 decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && .venv/bin/python native/gguf/decode_ref.py
-	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
 	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
 
 # KV-cache decode: builds the seed forward once (caching per-layer roped-K/V), then
@@ -252,7 +252,7 @@ verify: $(PTX)
 	@echo "== TENSOR:: WRAPPER (gemm + rmsnorm via module + cuLaunchKernel) =="
 	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
 	@echo "== GREEDY AUTOREGRESSIVE DECODE (numpy reference) =="
-	cd $(ROOT) && $(VYB) native/host/decode_driver.vyb
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
 	cd $(ROOT) && python3 native/tools/verify_decode.py
 	@echo "== STOCHASTIC SAMPLER (temp + top_k + top_p + LCG) =="
 	cd $(ROOT) && $(VYB) native/sampler/test_sampler.vyb --module-path native/sampler
@@ -309,4 +309,15 @@ chat-prompt-ref:
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(CHAT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
 	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py
 	cd $(ROOT) && .venv/bin/python native/gguf/prompt_ref.py
+
+# Checkpoint C — fluent autoregressive llm.chat over an arbitrary prompt.
+# decode_driver (VYB_PROMPT_IDS prompt mode) seeds the recompute-full-prefix
+# greedy gen loop from the prompt ids and writes the full generated stream; the
+# numpy autoregressive gold (chatgen_ref.py) is compared token-for-token, and the
+# generated continuation is decoded to a String via the stdlib/vllm CPU head.
+CHAT_GEN ?= 3
+chat-gen: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/chatgen_ref.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) $(VYB) native/host/decode_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_gen.log
+	cd $(ROOT) && .venv/bin/python native/tools/verify_chatgen.py
 

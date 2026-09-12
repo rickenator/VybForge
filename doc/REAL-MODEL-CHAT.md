@@ -12,6 +12,14 @@
 > `[785,6722,315,9625,374]`) gates the GPU per-position lm_head top1 against the
 > numpy gold from `prompt_ref.py` ([87054,62868,71961,27051,19151]) — MATCHED
 > token-for-token (CHAT-PROMPT: PASS). Regenerate gold via `make chat-prompt-ref`.
+> Checkpoint C DONE, hardware-verified (2026-09-11): `decode_driver.vyb` gained
+> an optional `VYB_PROMPT_IDS` prompt-seed path (default [0,1] keeps decode-real
+> green) that runs the proven recompute-full-prefix greedy GEN loop over a real
+> prompt and decodes the continuation to a String via the stdlib/vllm CPU head.
+> `make chat-gen` (default prompt + GEN=3) gates the GPU generated stream against
+> the numpy autoregressive gold `chatgen_ref.py` (full seq
+> [785,6722,315,9625,374,19151,87054,83376]) token-for-token, and asserts a
+> non-empty fluent response.
 > `model_driver.vyb` now composes `llm::` (stdlib/vllm CPU decode) on the real
 > Qwen3-4B: full 36-layer forward -> tied lm_head argmax `[31784,31784]` ->
 > stdlib/vllm CPU decode -> response `<CogCog>` (the model's deterministic
