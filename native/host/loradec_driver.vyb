@@ -49,10 +49,11 @@ read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{
 dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
 
 // dequant one quantized weight from a packed slab into a f64 buffer, dispatching q4/q6 by ty.
-deq_w(pkd<Int>, off<Int>, nl<Int>, ty<Int>, dout<Int>, q4<loc<CVoid>>, q6<loc<CVoid>>)<Int> -> {
+// inz = in-dim (orientation transpose) for 2D weights; 0 for 1D norms.
+deq_w(pkd<Int>, off<Int>, nl<Int>, ty<Int>, dout<Int>, q4<loc<CVoid>>, q6<loc<CVoid>>, inz<Int>)<Int> -> {
     freedom {
-        if (ty == 14) { if(cuda_launch4i(from<loc<CVoid>>(addr(q6)),(nl+255)/256,1,1,256,1,1,pkd+off,dout,nl,0)!=0){ return 33 } }
-        else { if(cuda_launch4i(from<loc<CVoid>>(addr(q4)),(nl+255)/256,1,1,256,1,1,pkd+off,dout,nl,0)!=0){ return 33 } }
+        if (ty == 14) { if(cuda_launch4i(from<loc<CVoid>>(addr(q6)),(nl+255)/256,1,1,256,1,1,pkd+off,dout,nl,inz)!=0){ return 33 } }
+        else { if(cuda_launch4i(from<loc<CVoid>>(addr(q4)),(nl+255)/256,1,1,256,1,1,pkd+off,dout,nl,inz)!=0){ return 33 } }
         return 0
     }
     return 0
@@ -539,13 +540,13 @@ main()<Int> -> {
             # (norms deq via f32expand into N1/Nq/Nk/N2; weights via q4/q6k into W*)
             # use deq inline
             deq1<Int> = 0
-            e = deq_w(PKD, POF.get(L5 * 11 + 0), PNL.get(L5 * 11 + 0), PTY.get(L5 * 11 + 0), Wq, q4fn, q6fn); if (e != 0) { return 60 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 1), PNL.get(L5 * 11 + 1), PTY.get(L5 * 11 + 1), Wk, q4fn, q6fn); if (e != 0) { return 61 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 2), PNL.get(L5 * 11 + 2), PTY.get(L5 * 11 + 2), Wv, q4fn, q6fn); if (e != 0) { return 62 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 3), PNL.get(L5 * 11 + 3), PTY.get(L5 * 11 + 3), Wo, q4fn, q6fn); if (e != 0) { return 63 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 4), PNL.get(L5 * 11 + 4), PTY.get(L5 * 11 + 4), Wg, q4fn, q6fn); if (e != 0) { return 64 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 5), PNL.get(L5 * 11 + 5), PTY.get(L5 * 11 + 5), Wu, q4fn, q6fn); if (e != 0) { return 65 }
-            e = deq_w(PKD, POF.get(L5 * 11 + 6), PNL.get(L5 * 11 + 6), PTY.get(L5 * 11 + 6), Wd, q4fn, q6fn); if (e != 0) { return 66 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 0), PNL.get(L5 * 11 + 0), PTY.get(L5 * 11 + 0), Wq, q4fn, q6fn, D); if (e != 0) { return 60 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 1), PNL.get(L5 * 11 + 1), PTY.get(L5 * 11 + 1), Wk, q4fn, q6fn, D); if (e != 0) { return 61 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 2), PNL.get(L5 * 11 + 2), PTY.get(L5 * 11 + 2), Wv, q4fn, q6fn, D); if (e != 0) { return 62 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 3), PNL.get(L5 * 11 + 3), PTY.get(L5 * 11 + 3), Wo, q4fn, q6fn, NQ); if (e != 0) { return 63 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 4), PNL.get(L5 * 11 + 4), PTY.get(L5 * 11 + 4), Wg, q4fn, q6fn, D); if (e != 0) { return 64 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 5), PNL.get(L5 * 11 + 5), PTY.get(L5 * 11 + 5), Wu, q4fn, q6fn, D); if (e != 0) { return 65 }
+            e = deq_w(PKD, POF.get(L5 * 11 + 6), PNL.get(L5 * 11 + 6), PTY.get(L5 * 11 + 6), Wd, q4fn, q6fn, FF); if (e != 0) { return 66 }
             # norms -> f32expand (attn_norm->N1, q_norm->Nq, k_norm->Nk, ffn_norm->N2)
             cuMemcpyHtoD_v2(PF + 0, loc(PKD + POF.get(L5 * 11 + 7)), 8); cuMemcpyHtoD_v2(PF + 8, loc(N1), 8); cuMemcpyHtoD_v2(PF + 16, loc(PNL.get(L5 * 11 + 7)), 8)
             cuda_launch4i(from<loc<CVoid>>(addr(efn)), (PNL.get(L5 * 11 + 7) + 255) / 256, 1, 1, 256, 1, 1, PF, 0, 0, 0)
@@ -649,13 +650,13 @@ main()<Int> -> {
                     HBin<Int> = HB; HBout<Int> = XO2
                     L6<Int> = 0
                     for (L6 in 0..35) {
-                        e = deq_w(PKD, POF.get(L6 * 11 + 0), PNL.get(L6 * 11 + 0), PTY.get(L6 * 11 + 0), Wq, q4fn, q6fn); if (e != 0) { return 60 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 1), PNL.get(L6 * 11 + 1), PTY.get(L6 * 11 + 1), Wk, q4fn, q6fn); if (e != 0) { return 61 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 2), PNL.get(L6 * 11 + 2), PTY.get(L6 * 11 + 2), Wv, q4fn, q6fn); if (e != 0) { return 62 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 3), PNL.get(L6 * 11 + 3), PTY.get(L6 * 11 + 3), Wo, q4fn, q6fn); if (e != 0) { return 63 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 4), PNL.get(L6 * 11 + 4), PTY.get(L6 * 11 + 4), Wg, q4fn, q6fn); if (e != 0) { return 64 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 5), PNL.get(L6 * 11 + 5), PTY.get(L6 * 11 + 5), Wu, q4fn, q6fn); if (e != 0) { return 65 }
-                        e = deq_w(PKD, POF.get(L6 * 11 + 6), PNL.get(L6 * 11 + 6), PTY.get(L6 * 11 + 6), Wd, q4fn, q6fn); if (e != 0) { return 66 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 0), PNL.get(L6 * 11 + 0), PTY.get(L6 * 11 + 0), Wq, q4fn, q6fn, D); if (e != 0) { return 60 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 1), PNL.get(L6 * 11 + 1), PTY.get(L6 * 11 + 1), Wk, q4fn, q6fn, D); if (e != 0) { return 61 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 2), PNL.get(L6 * 11 + 2), PTY.get(L6 * 11 + 2), Wv, q4fn, q6fn, D); if (e != 0) { return 62 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 3), PNL.get(L6 * 11 + 3), PTY.get(L6 * 11 + 3), Wo, q4fn, q6fn, NQ); if (e != 0) { return 63 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 4), PNL.get(L6 * 11 + 4), PTY.get(L6 * 11 + 4), Wg, q4fn, q6fn, D); if (e != 0) { return 64 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 5), PNL.get(L6 * 11 + 5), PTY.get(L6 * 11 + 5), Wu, q4fn, q6fn, D); if (e != 0) { return 65 }
+                        e = deq_w(PKD, POF.get(L6 * 11 + 6), PNL.get(L6 * 11 + 6), PTY.get(L6 * 11 + 6), Wd, q4fn, q6fn, FF); if (e != 0) { return 66 }
                         cuMemcpyHtoD_v2(PF + 0, loc(PKD + POF.get(L6 * 11 + 7)), 8); cuMemcpyHtoD_v2(PF + 8, loc(N1), 8); cuMemcpyHtoD_v2(PF + 16, loc(PNL.get(L6 * 11 + 7)), 8)
                         cuda_launch4i(from<loc<CVoid>>(addr(efn)), (PNL.get(L6 * 11 + 7) + 255) / 256, 1, 1, 256, 1, 1, PF, 0, 0, 0)
                         cuMemcpyHtoD_v2(PF + 0, loc(PKD + POF.get(L6 * 11 + 8)), 8); cuMemcpyHtoD_v2(PF + 8, loc(Nq), 8); cuMemcpyHtoD_v2(PF + 16, loc(PNL.get(L6 * 11 + 8)), 8)
