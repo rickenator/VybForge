@@ -47,25 +47,28 @@ def rope_adj(gr):
                 go[s_,xh,i]=c*di+sn*dj; go[s_,xh,i+HD_//2]=-sn*di+c*dj
     return go
 
+import os, sys
+NL=int(os.environ.get("M2E3_MAXL","36"))
+NSTP=int(os.environ.get("M2E3_NSTP","5"))
 # ---------- actual live LoRA (updated by AdamW) ----------
-Lo = {L: load_Lo(L) for L in range(36)}
-mU={L:{nm:np.zeros_like(U) for nm,(U,V) in Lo[L].items()} for L in range(36)}
-vU={L:{nm:np.zeros_like(U) for nm,(U,V) in Lo[L].items()} for L in range(36)}
-mV={L:{nm:np.zeros_like(V) for nm,(U,V) in Lo[L].items()} for L in range(36)}
-vV={L:{nm:np.zeros_like(V) for nm,(U,V) in Lo[L].items()} for L in range(36)}
+Lo = {L: load_Lo(L) for L in range(NL)}
+mU={L:{nm:np.zeros_like(U) for nm,(U,V) in Lo[L].items()} for L in range(NL)}
+vU={L:{nm:np.zeros_like(U) for nm,(U,V) in Lo[L].items()} for L in range(NL)}
+mV={L:{nm:np.zeros_like(V) for nm,(U,V) in Lo[L].items()} for L in range(NL)}
+vV={L:{nm:np.zeros_like(V) for nm,(U,V) in Lo[L].items()} for L in range(NL)}
 
 def lproj(a, nm, L):
     U,V=Lo[L][nm]; s=a@U; return a@ALL_W[L][WK[nm]]+alpha_r*(s@V), s
 
 
 # ---------- PRELOAD weights/lora once (do NOT re-read GGUF inside loops) ----------
-ALL_W  = [Wg(L) for L in range(36)]
-ALL_LN = [LN(L) for L in range(36)]
+ALL_W  = [Wg(L) for L in range(NL)]
+ALL_LN = [LN(L) for L in range(NL)]
 
 def forward_layers(x):
     cache = {}
     cur = x
-    for L in range(36):
+    for L in range(NL):
         c = {}
         W=ALL_W[L]; lnn=ALL_LN[L]
         xn = rms(cur, lnn["attn_norm"]); c["xn"]=xn
@@ -143,7 +146,7 @@ def load_x(L):
     return XCACHE[L]
 
 # hyperparams (match M2d + GPU)
-NSTP=5; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
+NSP=NSTP; NSTP=5 if not os.environ.get('M2E3_NSTP') else NSP; LR=0.00005; B1=0.9; B2=0.999; EPP=1e-8; WDD=0.0
 
 x0 = np.fromfile(os.path.join(out,"m2e_input.bin"),"<f8").reshape(S,D)
 tpath=os.path.join(out,"tl_t.bin")
@@ -162,13 +165,13 @@ for step in range(1,NSTP+1):
     XCACHE = {}
     cache, xo = forward_layers(x0)
     cur = x0
-    for L in range(36):
+    for L in range(NL):
         XCACHE[L] = cur
         cur = cache[L]["xo"]
     dG = xo - t
     loss = 0.5*np.mean(dG**2); losses.append(loss)
     dx = dG
-    for L in range(35,-1,-1):
+    for L in range(NL-1,-1,-1):
         gu, dx = backward_layer(L, dx, cache[L])
         for nm in proj_shapes:
             adamw(Lo[L][nm][0], gu["dU_"+nm], mU[L][nm], vU[L][nm], step)
@@ -180,7 +183,7 @@ for step in range(1,NSTP+1):
 np.savetxt(os.path.join(out,"m2e3_loss_ref.txt"), np.array(losses), fmt="%.10g")
 
 # ---- dump final U/V adapters + AdamW moments (for the parity gate: loss alone can hide bad updates) ----
-for L in range(36):
+for L in range(NL):
     for nm,(U,V) in Lo[L].items():
         U.tofile(os.path.join(out, f"m2e3_L{L}_{nm}_U_final.bin"))
         V.tofile(os.path.join(out, f"m2e3_L{L}_{nm}_V_final.bin"))
@@ -190,7 +193,7 @@ for L in range(36):
         vV[L][nm].tofile(os.path.join(out, f"m2e3_L{L}_{nm}_vV.bin"))
 
 # ---- matching GPU parity selection: first 128 f64 of Uq/Vq + moments for L in {0,17,35} ----
-for LL in (0,17,35):
+for LL in ([0,17,35] if NL>17 else (0,NL-1) if NL>1 else (0,)):
     U,V = Lo[LL]["q"]
     np.savetxt(os.path.join(out, f"m2e3_L{LL}_Uq_U_final_ref.txt"), U.reshape(-1)[:128], fmt="%.10g")
     np.savetxt(os.path.join(out, f"m2e3_L{LL}_Vq_V_final_ref.txt"), V.reshape(-1)[:128], fmt="%.10g")

@@ -178,6 +178,16 @@ train-full-loop-pkd: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/train_full_loop_pkd.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_train_full_loop.py
 
+# Fast reduced-mode repro for the packed full-loop (VybForge#12). Override layers/steps
+# via make vars M2E3_MAXL / M2E3_NSTP (default 4 layers / 2 steps => minutes, not 18h).
+# e.g.  make -f native/Makefile train-full-loop-pkd-fast M2E3_MAXL=2 M2E3_NSTP=1
+M2E3_MAXL ?= 4
+M2E3_NSTP ?= 2
+train-full-loop-pkd-fast: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && env M2E3_MAXL=$(M2E3_MAXL) M2E3_NSTP=$(M2E3_NSTP) .venv/bin/python native/train/train_full_loop_ref.py
+	cd $(ROOT) && env M2E3_MAXL=$(M2E3_MAXL) M2E3_NSTP=$(M2E3_NSTP) $(VYB) native/train/train_full_loop_pkd.vyb
+	cd $(ROOT) && env M2E3_MAXL=$(M2E3_MAXL) M2E3_NSTP=$(M2E3_NSTP) .venv/bin/python native/train/verify_train_full_loop.py
+
 # M2e-3-CE: the PRODUCTION corpus objective on GPU — teacher-forced next-token CE over a real
 # record-0 slice (S=4): embed via token_embd, 36-layer LoRA forward, output_norm, TIED lm_head
 # (h @ token_embd.T), softmax CE + head-back -> the 36-layer backward -> AdamW on all U/V.

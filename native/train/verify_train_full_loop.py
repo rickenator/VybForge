@@ -9,9 +9,12 @@ next-token CE with head-gradient is the production objective that will show real
 import numpy as np, os, sys
 out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "native", "out"))
 tol = 5e-3
+NL = int(os.environ.get("M2E3_MAXL", "36"))
+SEL = (0,17,35) if NL>=36 else (tuple(sorted({0, NL//2, NL-1})) if NL>2 else (0, max(NL-1,0)))
 
 g = np.loadtxt(os.path.join(out, "m2e3_loss.txt"))
 r = np.loadtxt(os.path.join(out, "m2e3_loss_ref.txt"))
+g = np.atleast_1d(g); r = np.atleast_1d(r)
 assert g.size == r.size, f"loss length mismatch {g.size} vs {r.size}"
 base = max(abs(r[0]), 1.0)
 rel = np.max(np.abs(g - r) / base)
@@ -26,7 +29,7 @@ print("(note: deep-stack vanishing gradient -> MSE-overfit descent is weak; see 
 # GPU writes m2e3_L{LL}_{A}_vyb.txt; oracle writes m2e3_L{LL}_{A}_ref.txt. Compare them.
 AT = ["Uq_U_final","Vq_V_final","Uq_mU","Uq_vU","Vq_mV","Vq_vV"]
 tot_t = 0; ok_t = 0
-for LL in (0,17,35):
+for LL in SEL:
     for A in AT:
         vp = os.path.join(out, f"m2e3_L{LL}_{A}_vyb.txt")
         rp = os.path.join(out, f"m2e3_L{LL}_{A}_ref.txt")
