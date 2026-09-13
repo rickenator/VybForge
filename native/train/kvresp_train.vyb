@@ -12,7 +12,8 @@ extern "C" {
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
-    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+        cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemFree_v2(dptr<Int>)<CInt>
     cuCtxSynchronize()<CInt>
@@ -30,8 +31,12 @@ find_nm(nmv<Vec<String>>, nm<String>)<Int> -> { i<Int> = 0; for (i in 0..nmv.len
 download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
         npb<Int> = nbytes-(nbytes%8); ci<Int> = 0
-        for (ci in 0..(npb/8)-1){ o8<Int> = ci*8; ch<Int> = 0; bj<Int> = 0; for (bj in 0..7){ bv<Int> = u8(data,o8+bj); ch=ch|(bv<<(bj*8)) }; if(cuMemcpyHtoD_v2(dst+o8,loc(ch),8)!=0){ return 15 } }
-        tj<Int> = npb; while(tj<nbytes){ by<Int> = u8(data,tj); if(cuMemcpyHtoD_v2(dst+tj,loc(by),1)!=0){ return 15 }; tj=tj+1 }
+        # Bulk HtoD from the String's raw {ptr,len} (srcHost declared CString); the
+        # per-8-byte loop was the DMA hotspot. Non-pinned Vyb buffer + null-stream
+        # async needs cuCtxSynchronize() to order DMA reads before `data` is reused
+        # (one driver call per tensor).
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
         return 0
     }
     return 0
@@ -80,11 +85,11 @@ stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<
 
 // Dequant one cached packed tensor: PKD+off -> dout(f64). off/numel/ty per slot.
 deq_cached(PKD<Int>, off<Int>, numel<Int>, ty<Int>, dout<Int>,
-           q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, PF<Int>)<Int> -> {
+           q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, PF<Int>, inz<Int>)<Int> -> {
     freedom {
         rc<CInt> = 0
-        if(ty==12){ rc = cuda_launch4i(from<loc<CVoid>>(addr(q4fn)),(numel+255)/256,1,1,256,1,1,PKD+off,dout,numel,0); if(rc!=0){ return 33 } }
-        else if(ty==14){ rc = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)),(numel+255)/256,1,1,256,1,1,PKD+off,dout,numel,0); if(rc!=0){ return 33 } }
+        if(ty==12){ rc = cuda_launch4i(from<loc<CVoid>>(addr(q4fn)),(numel+255)/256,1,1,256,1,1,PKD+off,dout,numel,inz); if(rc!=0){ return 33 } }
+        else if(ty==14){ rc = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)),(numel+255)/256,1,1,256,1,1,PKD+off,dout,numel,inz); if(rc!=0){ return 33 } }
         else { # norm f32 -> f64
             cuMemcpyHtoD_v2(PF+0,loc(PKD+off),8); cuMemcpyHtoD_v2(PF+8,loc(dout),8); cuMemcpyHtoD_v2(PF+16,loc(numel),8)
             rc = cuda_launch4i(from<loc<CVoid>>(addr(efn)),(numel+255)/256,1,1,256,1,1,PF,0,0,0); if(rc!=0){ return 33 }
@@ -667,17 +672,17 @@ if(cuMemAlloc_v2(loc(Wq),wq_nl*8)!=0){ return 11 }
         XOcur<Int> = XO
         L3<Int> = 0
         for (L3 in 0..MAXL-1){
-                        e=deq_cached(PKD,POF.get(L3*11+0),PNL.get(L3*11+0),PTY.get(L3*11+0),Wq,q4fn,q6fn,efn,PF); if(e!=0){ return 60 }
-            e=deq_cached(PKD,POF.get(L3*11+1),PNL.get(L3*11+1),PTY.get(L3*11+1),Wk,q4fn,q6fn,efn,PF); if(e!=0){ return 61 }
-            e=deq_cached(PKD,POF.get(L3*11+2),PNL.get(L3*11+2),PTY.get(L3*11+2),Wv,q4fn,q6fn,efn,PF); if(e!=0){ return 62 }
-            e=deq_cached(PKD,POF.get(L3*11+3),PNL.get(L3*11+3),PTY.get(L3*11+3),Wo,q4fn,q6fn,efn,PF); if(e!=0){ return 63 }
-            e=deq_cached(PKD,POF.get(L3*11+4),PNL.get(L3*11+4),PTY.get(L3*11+4),Wg,q4fn,q6fn,efn,PF); if(e!=0){ return 64 }
-            e=deq_cached(PKD,POF.get(L3*11+5),PNL.get(L3*11+5),PTY.get(L3*11+5),Wu,q4fn,q6fn,efn,PF); if(e!=0){ return 65 }
-            e=deq_cached(PKD,POF.get(L3*11+6),PNL.get(L3*11+6),PTY.get(L3*11+6),Wd,q4fn,q6fn,efn,PF); if(e!=0){ return 66 }
-            e=deq_cached(PKD,POF.get(L3*11+7),PNL.get(L3*11+7),PTY.get(L3*11+7),N1,q4fn,q6fn,efn,PF); if(e!=0){ return 67 }
-            e=deq_cached(PKD,POF.get(L3*11+8),PNL.get(L3*11+8),PTY.get(L3*11+8),Nq,q4fn,q6fn,efn,PF); if(e!=0){ return 68 }
-            e=deq_cached(PKD,POF.get(L3*11+9),PNL.get(L3*11+9),PTY.get(L3*11+9),Nk,q4fn,q6fn,efn,PF); if(e!=0){ return 69 }
-            e=deq_cached(PKD,POF.get(L3*11+10),PNL.get(L3*11+10),PTY.get(L3*11+10),N2,q4fn,q6fn,efn,PF); if(e!=0){ return 70 }
+                        e=deq_cached(PKD,POF.get(L3*11+0),PNL.get(L3*11+0),PTY.get(L3*11+0),Wq,q4fn,q6fn,efn,PF,D); if(e!=0){ return 60 }
+            e=deq_cached(PKD,POF.get(L3*11+1),PNL.get(L3*11+1),PTY.get(L3*11+1),Wk,q4fn,q6fn,efn,PF,D); if(e!=0){ return 61 }
+            e=deq_cached(PKD,POF.get(L3*11+2),PNL.get(L3*11+2),PTY.get(L3*11+2),Wv,q4fn,q6fn,efn,PF,D); if(e!=0){ return 62 }
+            e=deq_cached(PKD,POF.get(L3*11+3),PNL.get(L3*11+3),PTY.get(L3*11+3),Wo,q4fn,q6fn,efn,PF,NQ); if(e!=0){ return 63 }
+            e=deq_cached(PKD,POF.get(L3*11+4),PNL.get(L3*11+4),PTY.get(L3*11+4),Wg,q4fn,q6fn,efn,PF,D); if(e!=0){ return 64 }
+            e=deq_cached(PKD,POF.get(L3*11+5),PNL.get(L3*11+5),PTY.get(L3*11+5),Wu,q4fn,q6fn,efn,PF,D); if(e!=0){ return 65 }
+            e=deq_cached(PKD,POF.get(L3*11+6),PNL.get(L3*11+6),PTY.get(L3*11+6),Wd,q4fn,q6fn,efn,PF,FF); if(e!=0){ return 66 }
+            e=deq_cached(PKD,POF.get(L3*11+7),PNL.get(L3*11+7),PTY.get(L3*11+7),N1,q4fn,q6fn,efn,PF,0); if(e!=0){ return 67 }
+            e=deq_cached(PKD,POF.get(L3*11+8),PNL.get(L3*11+8),PTY.get(L3*11+8),Nq,q4fn,q6fn,efn,PF,0); if(e!=0){ return 68 }
+            e=deq_cached(PKD,POF.get(L3*11+9),PNL.get(L3*11+9),PTY.get(L3*11+9),Nk,q4fn,q6fn,efn,PF,0); if(e!=0){ return 69 }
+            e=deq_cached(PKD,POF.get(L3*11+10),PNL.get(L3*11+10),PTY.get(L3*11+10),N2,q4fn,q6fn,efn,PF,0); if(e!=0){ return 70 }
 UqP<Int> = LSLB+L3*917504+0; VqP<Int> = LSLB+L3*917504+40960; UkP<Int> = LSLB+L3*917504+106496; VkP<Int> = LSLB+L3*917504+147456; UvP<Int> = LSLB+L3*917504+163840; VvP<Int> = LSLB+L3*917504+204800; UoP<Int> = LSLB+L3*917504+221184; VoP<Int> = LSLB+L3*917504+286720; UgP<Int> = LSLB+L3*917504+327680; VgP<Int> = LSLB+L3*917504+368640; UuP<Int> = LSLB+L3*917504+524288; VuP<Int> = LSLB+L3*917504+565248; UdP<Int> = LSLB+L3*917504+720896; VdP<Int> = LSLB+L3*917504+876544
             e = run_layer(S,D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,POS,XI,XOcur,
                 gf,ads,rn,rp,att,sl,rs,GM,RN,ROP,ATT,PB,
@@ -747,17 +752,17 @@ UqP<Int> = LSLB+L3*917504+0; VqP<Int> = LSLB+L3*917504+40960; UkP<Int> = LSLB+L3
         Li2<Int> = 0
         for (Li2 in 0..MAXL-1){
             Lb<Int> = MAXL-1-Li2
-                        e=deq_cached(PKD,POF.get(Lb*11+0),PNL.get(Lb*11+0),PTY.get(Lb*11+0),Wq,q4fn,q6fn,efn,PF); if(e!=0){ return 60 }
-            e=deq_cached(PKD,POF.get(Lb*11+1),PNL.get(Lb*11+1),PTY.get(Lb*11+1),Wk,q4fn,q6fn,efn,PF); if(e!=0){ return 61 }
-            e=deq_cached(PKD,POF.get(Lb*11+2),PNL.get(Lb*11+2),PTY.get(Lb*11+2),Wv,q4fn,q6fn,efn,PF); if(e!=0){ return 62 }
-            e=deq_cached(PKD,POF.get(Lb*11+3),PNL.get(Lb*11+3),PTY.get(Lb*11+3),Wo,q4fn,q6fn,efn,PF); if(e!=0){ return 63 }
-            e=deq_cached(PKD,POF.get(Lb*11+4),PNL.get(Lb*11+4),PTY.get(Lb*11+4),Wg,q4fn,q6fn,efn,PF); if(e!=0){ return 64 }
-            e=deq_cached(PKD,POF.get(Lb*11+5),PNL.get(Lb*11+5),PTY.get(Lb*11+5),Wu,q4fn,q6fn,efn,PF); if(e!=0){ return 65 }
-            e=deq_cached(PKD,POF.get(Lb*11+6),PNL.get(Lb*11+6),PTY.get(Lb*11+6),Wd,q4fn,q6fn,efn,PF); if(e!=0){ return 66 }
-            e=deq_cached(PKD,POF.get(Lb*11+7),PNL.get(Lb*11+7),PTY.get(Lb*11+7),N1,q4fn,q6fn,efn,PF); if(e!=0){ return 67 }
-            e=deq_cached(PKD,POF.get(Lb*11+8),PNL.get(Lb*11+8),PTY.get(Lb*11+8),Nq,q4fn,q6fn,efn,PF); if(e!=0){ return 68 }
-            e=deq_cached(PKD,POF.get(Lb*11+9),PNL.get(Lb*11+9),PTY.get(Lb*11+9),Nk,q4fn,q6fn,efn,PF); if(e!=0){ return 69 }
-            e=deq_cached(PKD,POF.get(Lb*11+10),PNL.get(Lb*11+10),PTY.get(Lb*11+10),N2,q4fn,q6fn,efn,PF); if(e!=0){ return 70 }
+                        e=deq_cached(PKD,POF.get(Lb*11+0),PNL.get(Lb*11+0),PTY.get(Lb*11+0),Wq,q4fn,q6fn,efn,PF,D); if(e!=0){ return 60 }
+            e=deq_cached(PKD,POF.get(Lb*11+1),PNL.get(Lb*11+1),PTY.get(Lb*11+1),Wk,q4fn,q6fn,efn,PF,D); if(e!=0){ return 61 }
+            e=deq_cached(PKD,POF.get(Lb*11+2),PNL.get(Lb*11+2),PTY.get(Lb*11+2),Wv,q4fn,q6fn,efn,PF,D); if(e!=0){ return 62 }
+            e=deq_cached(PKD,POF.get(Lb*11+3),PNL.get(Lb*11+3),PTY.get(Lb*11+3),Wo,q4fn,q6fn,efn,PF,NQ); if(e!=0){ return 63 }
+            e=deq_cached(PKD,POF.get(Lb*11+4),PNL.get(Lb*11+4),PTY.get(Lb*11+4),Wg,q4fn,q6fn,efn,PF,D); if(e!=0){ return 64 }
+            e=deq_cached(PKD,POF.get(Lb*11+5),PNL.get(Lb*11+5),PTY.get(Lb*11+5),Wu,q4fn,q6fn,efn,PF,D); if(e!=0){ return 65 }
+            e=deq_cached(PKD,POF.get(Lb*11+6),PNL.get(Lb*11+6),PTY.get(Lb*11+6),Wd,q4fn,q6fn,efn,PF,FF); if(e!=0){ return 66 }
+            e=deq_cached(PKD,POF.get(Lb*11+7),PNL.get(Lb*11+7),PTY.get(Lb*11+7),N1,q4fn,q6fn,efn,PF,0); if(e!=0){ return 67 }
+            e=deq_cached(PKD,POF.get(Lb*11+8),PNL.get(Lb*11+8),PTY.get(Lb*11+8),Nq,q4fn,q6fn,efn,PF,0); if(e!=0){ return 68 }
+            e=deq_cached(PKD,POF.get(Lb*11+9),PNL.get(Lb*11+9),PTY.get(Lb*11+9),Nk,q4fn,q6fn,efn,PF,0); if(e!=0){ return 69 }
+            e=deq_cached(PKD,POF.get(Lb*11+10),PNL.get(Lb*11+10),PTY.get(Lb*11+10),N2,q4fn,q6fn,efn,PF,0); if(e!=0){ return 70 }
 UqP<Int> = LSLB+Lb*917504+0; VqP<Int> = LSLB+Lb*917504+40960; UkP<Int> = LSLB+Lb*917504+106496; VkP<Int> = LSLB+Lb*917504+147456; UvP<Int> = LSLB+Lb*917504+163840; VvP<Int> = LSLB+Lb*917504+204800; UoP<Int> = LSLB+Lb*917504+221184; VoP<Int> = LSLB+Lb*917504+286720; UgP<Int> = LSLB+Lb*917504+327680; VgP<Int> = LSLB+Lb*917504+368640; UuP<Int> = LSLB+Lb*917504+524288; VuP<Int> = LSLB+Lb*917504+565248; UdP<Int> = LSLB+Lb*917504+720896; VdP<Int> = LSLB+Lb*917504+876544
             cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,x,ASLB+Lb*50292912+0,238080,0)
             cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,XN,ASLB+Lb*50292912+1904640,238080,0)

@@ -13,7 +13,8 @@ extern "C" {
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
-    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+        cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemFree_v2(dptr<Int>)<CInt>
@@ -32,8 +33,12 @@ find_nm(nmv<Vec<String>>, nm<String>)<Int> -> { i<Int> = 0; for (i in 0..nmv.len
 download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
         npb<Int> = nbytes-(nbytes%8); ci<Int> = 0
-        for (ci in 0..(npb/8)-1){ o8<Int> = ci*8; ch<Int> = 0; bj<Int> = 0; for (bj in 0..7){ bv<Int> = u8(data,o8+bj); ch=ch|(bv<<(bj*8)) }; if(cuMemcpyHtoD_v2(dst+o8,loc(ch),8)!=0){ return 15 } }
-        tj<Int> = npb; while(tj<nbytes){ by<Int> = u8(data,tj); if(cuMemcpyHtoD_v2(dst+tj,loc(by),1)!=0){ return 15 }; tj=tj+1 }
+        # Bulk HtoD from the String's raw {ptr,len} (srcHost declared CString); the
+        # per-8-byte loop was the DMA hotspot. Non-pinned Vyb buffer + null-stream
+        # async needs cuCtxSynchronize() to order DMA reads before `data` is reused
+        # (one driver call per tensor).
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
         return 0
     }
     return 0
