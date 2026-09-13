@@ -124,6 +124,14 @@ def read_weight(t, shape):
     else:
         raise RuntimeError(f"unhandled type {t['type']}")
     assert w.size == t["numel"], (w.size, t["numel"])
+    # GGUF stores 2D weights out-major: ne=[in,out] with ne0 (in) innermost,
+    # so memory is [out, in]. We read flat in that order; reshaping as [in,out]
+    # would be a hidden whole-matrix transpose. Fix: read as [out,in] then return
+    # as [in,out] so callers keep x@W with W:[in,out] (see VybForge#11).
+    if len(shape) == 2:
+        inn, out = shape  # declared [in, out]
+        # flat memory is out-major [out, in]; read as [out,in] then transpose to [in,out]
+        return w.reshape(out, inn).T
     return w.reshape(shape)
 
 

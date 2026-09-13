@@ -139,13 +139,13 @@ dumpf(src<Int>, count<Int>, path<String>)<Int> -> {
     return 0
 }
 
-load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
     data<String> = read_model(path, off, nb)
     if (data.len() < nb) { return 32 }
     freedom {
         e<Int> = download(data, dpack, nb)
         if (e != 0) { return e }
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, inz)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -169,12 +169,12 @@ load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he
 
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
           nm<String>, dpk<Int>, pf<Int>, dout<Int>,
-          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>)<Int> -> {
+          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>)<Int> -> {
     idx<Int> = find_nm(nmv, nm)
     if (idx < 0) { return 60 }
     off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
-    if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn) }
-    if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn) }
+    if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn, inz) }
+    if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn, inz) }
     return load_norm(path, pf, dpk, dout, off, numel, efn)
 }
 
@@ -468,17 +468,17 @@ main()<Int> -> {
         e<Int> = 0
         L<Int> = 0
         for (L in 0..MAXL - 1) {
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn); if (e != 0) { return 70 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn); if (e != 0) { return 71 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn); if (e != 0) { return 72 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn); if (e != 0) { return 73 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn); if (e != 0) { return 74 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn); if (e != 0) { return 75 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn); if (e != 0) { return 76 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn); if (e != 0) { return 77 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn); if (e != 0) { return 78 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn); if (e != 0) { return 79 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn); if (e != 0) { return 80 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn, D); if (e != 0) { return 70 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn, D); if (e != 0) { return 71 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn, D); if (e != 0) { return 72 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn, NQ); if (e != 0) { return 73 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn, D); if (e != 0) { return 74 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn, D); if (e != 0) { return 75 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn, FF); if (e != 0) { return 76 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn, 0); if (e != 0) { return 77 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn, 0); if (e != 0) { return 78 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn, 0); if (e != 0) { return 79 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn, 0); if (e != 0) { return 80 }
 
             e = run_layer(S, D, H, KVH, HD, FF, NQ, NKV, EPS, XI, XO,
                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,

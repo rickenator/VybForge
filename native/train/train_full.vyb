@@ -40,9 +40,9 @@ download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
 read_model(path<String>, off<Int>, nbytes<Int>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_at(f,off,nbytes)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 read_bin(path<String>)<String> -> { r<String> = ""; match(open_read(path)){ f->{ match(read_all(f)){ s->{ r=s } ?->{ r="" } } close(f) } ?->{ r="" } }; return r }
 dumpf(src<Int>, count<Int>, path<String>)<Int> -> { freedom { match(open_write(path)){ w->{ rv<Float> = 0.0; k<Int> = 0; for (k in 0..count-1){ rv=0.0; cuMemcpyDtoH_v2(loc(rv),src+k*8,8); write_str(w,rv.to_string()+"\n") } close(w) } ?->{ return 17 } } }; return 0 }
-load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
     data<String> = read_model(path,off,nb); if(data.len()<nb){ return 32 }
-    freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,0); if(rc!=0){ return 33 }; return 0 }
+    freedom { e<Int> = download(data,dpack,nb); if(e!=0){ return e }; rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)),(numel+255)/256,1,1,256,1,1,dpack,dout,numel,inz); if(rc!=0){ return 33 }; return 0 }
     return 0
 }
 load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
@@ -50,11 +50,11 @@ load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he
     freedom { e<Int> = download(data,dpack,numel*4); if(e!=0){ return e }; cuMemcpyHtoD_v2(pf+0,loc(dpack),8); cuMemcpyHtoD_v2(pf+8,loc(dout),8); cuMemcpyHtoD_v2(pf+16,loc(numel),8); rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)),(numel+255)/256,1,1,256,1,1,pf,0,0,0); if(rc!=0){ return 33 }; return 0 }
     return 0
 }
-stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>, nm<String>, dpk<Int>, pf<Int>, dout<Int>, q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>)<Int> -> {
+stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>, nm<String>, dpk<Int>, pf<Int>, dout<Int>, q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>)<Int> -> {
     idx<Int> = find_nm(nmv,nm); if(idx<0){ return 60 }
     off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
-    if(ty==12){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q4fn) }
-    if(ty==14){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q6fn) }
+    if(ty==12){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q4fn,inz) }
+    if(ty==14){ return load_quant(path,dpk,dout,off,packed_bytes(numel,ty),numel,q6fn,inz) }
     return load_norm(path,pf,dpk,dout,off,numel,efn)
 }
 
@@ -364,17 +364,17 @@ main()<Int> -> {
             e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Ud.bin"),Ud,FF*R*8); if(e!=0){ return 112 }
             e=download(read_bin("native/out/m2e_l"+L.to_string()+"_Vd.bin"),Vd,R*D*8); if(e!=0){ return 113 }
             # layer weights (11)
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q.weight",DPK,PF,Wq,q4fn,q6fn,efn); if(e!=0){ return 60 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k.weight",DPK,PF,Wk,q4fn,q6fn,efn); if(e!=0){ return 61 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_v.weight",DPK,PF,Wv,q4fn,q6fn,efn); if(e!=0){ return 62 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_output.weight",DPK,PF,Wo,q4fn,q6fn,efn); if(e!=0){ return 63 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_gate.weight",DPK,PF,Wg,q4fn,q6fn,efn); if(e!=0){ return 64 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_up.weight",DPK,PF,Wu,q4fn,q6fn,efn); if(e!=0){ return 65 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_down.weight",DPK,PF,Wd,q4fn,q6fn,efn); if(e!=0){ return 66 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_norm.weight",DPK,PF,N1,q4fn,q6fn,efn); if(e!=0){ return 67 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q_norm.weight",DPK,PF,Nq,q4fn,q6fn,efn); if(e!=0){ return 68 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k_norm.weight",DPK,PF,Nk,q4fn,q6fn,efn); if(e!=0){ return 69 }
-            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_norm.weight",DPK,PF,N2,q4fn,q6fn,efn); if(e!=0){ return 70 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q.weight",DPK,PF,Wq,q4fn,q6fn,efn, D); if(e!=0){ return 60 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k.weight",DPK,PF,Wk,q4fn,q6fn,efn, D); if(e!=0){ return 61 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_v.weight",DPK,PF,Wv,q4fn,q6fn,efn, D); if(e!=0){ return 62 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_output.weight",DPK,PF,Wo,q4fn,q6fn,efn, NQ); if(e!=0){ return 63 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_gate.weight",DPK,PF,Wg,q4fn,q6fn,efn, D); if(e!=0){ return 64 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_up.weight",DPK,PF,Wu,q4fn,q6fn,efn, D); if(e!=0){ return 65 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_down.weight",DPK,PF,Wd,q4fn,q6fn,efn, FF); if(e!=0){ return 66 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_norm.weight",DPK,PF,N1,q4fn,q6fn,efn, 0); if(e!=0){ return 67 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_q_norm.weight",DPK,PF,Nq,q4fn,q6fn,efn, 0); if(e!=0){ return 68 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".attn_k_norm.weight",DPK,PF,Nk,q4fn,q6fn,efn, 0); if(e!=0){ return 69 }
+            e=stage_one(MODEL,nmv,ofv,nlv,tyv,"blk."+L.to_string()+".ffn_norm.weight",DPK,PF,N2,q4fn,q6fn,efn, 0); if(e!=0){ return 70 }
             e = run_layer(S,D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,POS,XI,XO,
                 gf,ads,rn,rp,att,sl,rs,GM,RN,ROP,ATT,PB,
                 N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,

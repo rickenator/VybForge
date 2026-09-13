@@ -728,7 +728,16 @@ q4kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         scf<Float> = sc as Float
         mf<Float> = m as Float
         nbf<Float> = (bqb) as Float
-        st_f64(o + gid * 8, d * scf * nbf - min * mf)
+        val<Float> = d * scf * nbf - min * mf
+        # GGUF dequant emits out-major; gemm needs [in,out] (VybForge#11). When
+        # z (= in-dim) > 0, write transposed (see q4k.vyb).
+        if (z > 0) {
+            rr<Int> = gid / z
+            cc<Int> = gid % z
+            st_f64(o + cc * n / z * 8 + rr * 8, val)
+        } else {
+            st_f64(o + gid * 8, val)
+        }
     }
 }
 
@@ -760,7 +769,16 @@ q6kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         qs<Int> = (nib | (hib << 4)) - 32
         sf<Float> = sc0 as Float
         qf<Float> = qs as Float
-        st_f64(o + gid * 8, d * sf * qf)
+        val<Float> = d * sf * qf
+        # GGUF dequant emits out-major; gemm needs [in,out] (VybForge#11). When
+        # z (= in-dim) > 0, write transposed (see q6k.vyb).
+        if (z > 0) {
+            rr<Int> = gid / z
+            cc<Int> = gid % z
+            st_f64(o + cc * n / z * 8 + rr * 8, val)
+        } else {
+            st_f64(o + gid * 8, val)
+        }
     }
 }
 

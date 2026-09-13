@@ -22,8 +22,9 @@ except FileNotFoundError:
     stream = []
 
 # Autoregressive gold for prompt_The capital of France is (prompt_ids.txt) with GEN=3.
-# decode_driver/chatgen_ref gold: continuation [19151,87054,83376].
-GOLD = [785, 6722, 315, 9625, 374, 19151, 87054, 83376]
+# Orientation-fixed forward (see VybForge#11): continuation [12095,11,323] = " Paris,".
+# (Old gold [19151,87054,83376] was the pre-fix token salad anieQN-cond; corrected.)
+GOLD = [785, 6722, 315, 9625, 374, 12095, 11, 323]
 
 runs = re.findall(r"RESIDENT_RUN=(\d+) ms=(\d+) tokens=(\d+)", log)
 secs = re.findall(r"RESIDENT_AVG_TOKENS_PER_SEC=([0-9.eE+-]+)", log)
