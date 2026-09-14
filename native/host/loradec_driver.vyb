@@ -296,7 +296,8 @@ resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<
 // kv_driver.lm_next but reads an arbitrary hidden row and uses single-row
 // DH (D*8) / DL (VOCAB*8) buffers.
 lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<Int>, DL<Int>, AO<Int>,
-        rfn<loc<CVoid>>, lsfn<loc<CVoid>>, arfn<loc<CVoid>>, RN<Int>, LSP<Int>, A4<Int>)<Int> -> {
+        rfn<loc<CVoid>>, lsfn<loc<CVoid>>, arfn<loc<CVoid>>, RN<Int>, LSP<Int>, A4<Int>,
+        HIS<Int>, NH<Int>, PEN<Float>)<Int> -> {
     freedom {
         one<Int> = 1
         zro<Int> = 0
@@ -316,6 +317,19 @@ lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<
             if (cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0) != 0) { return 92 }
             vs2 = ve2
         }
+        # repetition penalty: subtract PEN from the logit of every token in the recent
+        # history (device HIS[0..NH)); read-modify-write on the logits buffer DL.
+        if (NH > 0) {
+            h2<Int> = 0
+            for (h2 in 0..NH - 1) {
+                tx<Int> = 0
+                cuMemcpyDtoH_v2(loc(tx), HIS + h2 * 8, 8)
+                lv<Float> = 0.0
+                cuMemcpyDtoH_v2(loc(lv), DL + tx * 8, 8)
+                nv<Float> = lv - PEN
+                cuMemcpyHtoD_v2(DL + tx * 8, loc(nv), 8)
+            }
+        }
         cuMemcpyHtoD_v2(A4 + 0, loc(DL), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
         cuMemcpyHtoD_v2(A4 + 16, loc(one), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
         cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
@@ -329,7 +343,7 @@ lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<
 
 main()<Int> -> {
     S<Int> = 9; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
-    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
+    NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 0.5; POS<Int> = 0
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
@@ -591,9 +605,10 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(lsfn), mq, "logits_slice") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mq, "argmax_row") != 0) { return 10 }
         MAXR<Int> = 96; GEN<Int> = 48; VOCAB2<Int> = 151936
+        MAXH<Int> = 32; PEN2<Float> = 1000000000000000000000000000000.0
         # gen + head buffers
         HB<Int> = 0; XO2<Int> = 0; ONb<Int> = 0; DH<Int> = 0; DL<Int> = 0; AO<Int> = 0
-        LSP<Int> = 0; A4<Int> = 0; RIDS<Int> = 0
+        LSP<Int> = 0; A4<Int> = 0; RIDS<Int> = 0; HISTBUF<Int> = 0
         rXN<Int> = 0; rDQ<Int> = 0; rDK<Int> = 0; rDV<Int> = 0; rDQN<Int> = 0; rDKN<Int> = 0
         rDQr<Int> = 0; rDKr<Int> = 0; rDCtx<Int> = 0; rDO<Int> = 0; rX1<Int> = 0; rX1N<Int> = 0
         rGr<Int> = 0; rUp<Int> = 0; rHu<Int> = 0; rM2<Int> = 0
@@ -606,6 +621,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(LSP), 64)!=0){ return 11 }
         if (cuMemAlloc_v2(loc(A4), 32)!=0){ return 11 }
         if (cuMemAlloc_v2(loc(RIDS), MAXR*8)!=0){ return 11 }
+        if (cuMemAlloc_v2(loc(HISTBUF), MAXH*8)!=0){ return 11 }
         if (cuMemAlloc_v2(loc(rXN), MAXR*D*8)!=0){ return 11 }
         if (cuMemAlloc_v2(loc(rDQ), MAXR*NQ*8)!=0){ return 11 }
         if (cuMemAlloc_v2(loc(rDK), MAXR*NKV*8)!=0){ return 11 }
@@ -633,7 +649,8 @@ main()<Int> -> {
         cuda_launch4i(from<loc<CVoid>>(addr(efn)), (onn + 255) / 256, 1, 1, 256, 1, 1, HPP, 0, 0, 0); cuCtxSynchronize()
         # --- first response token predicted from the last context hidden ---
         # after the context build, XIc holds layer-35 output for context rows 0..S-1.
-        nxt<Int> = lm_next(XIc, S - 1, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4)
+        genh<Vec<Int>> = Vec()
+        nxt<Int> = lm_next(XIc, S - 1, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4, HISTBUF, 0, PEN2)
         # open output stream
         match (open_write("native/out/loradec_tokens.txt")) {
             w -> {
@@ -683,7 +700,14 @@ main()<Int> -> {
                         if (e != 0) { return 80 }
                         tc2<Int> = HBin; HBin = HBout; HBout = tc2
                     }
-                    nxt = lm_next(HBin, P, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4)
+                    # add the just-embedded token (current position, nxt) to the repetition window
+                    genh.push(nxt)
+                    k<Int> = 0
+                    gc<Int> = genh.len()
+                    if (gc > MAXH) { k = MAXH } else { k = gc }
+                    j3<Int> = 0
+                    for (j3 in 0..k - 1) { t1k<Int> = genh.get(gc - k + j3); cuMemcpyHtoD_v2(HISTBUF + j3 * 8, loc(t1k), 8) }
+                    nxt = lm_next(HBin, P, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4, HISTBUF, k, PEN2)
                     match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
                     println("LORADEC token P=" + P.to_string() + " nxt=" + nxt.to_string())
                 }
