@@ -293,6 +293,23 @@ resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<
 
 // lm_head single-row argmax: output_norm on hidden row `row` of hb, tied lm_head
 // (chunked logits_slice over EMB) -> argmax_row -> next token id. Mirrors
+// Return 1 if token id tx is a JSON structural token (which valid output reuses,
+// so the repetition penalty must NOT suppress it), else 0.
+// Covers both raw and leading-space BPE forms of  " : , { } [ ]  plus <0x0A>.
+jsonex(tx<Int>)<Int> -> {
+    // quote  "  : colons  , commas   { } braces   [ ] brackets
+    // raw tokenizer forms: '"'~1 ':'~25 ','~11 '{'~90 '}'~92 '['~58 ']'~60
+    // leading-space forms: '"'~330 ':'~549 ','~1154 '{'~314 '}'~335 '['~508 ']'~2279
+    if(tx==1){ return 1 }; if(tx==330){ return 1 }
+    if(tx==25){ return 1 }; if(tx==549){ return 1 }
+    if(tx==11){ return 1 }; if(tx==1154){ return 1 }
+    if(tx==90){ return 1 }; if(tx==314){ return 1 }
+    if(tx==92){ return 1 }; if(tx==335){ return 1 }
+    if(tx==58){ return 1 }; if(tx==508){ return 1 }
+    if(tx==60){ return 1 }; if(tx==2279){ return 1 }
+    return 0
+}
+
 // kv_driver.lm_next but reads an arbitrary hidden row and uses single-row
 // DH (D*8) / DL (VOCAB*8) buffers.
 lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<Int>, DL<Int>, AO<Int>,
@@ -318,16 +335,19 @@ lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<
             vs2 = ve2
         }
         # repetition penalty: subtract PEN from the logit of every token in the recent
-        # history (device HIS[0..NH)); read-modify-write on the logits buffer DL.
+        # history (device HIS[0..NH)) EXCEPT JSON structural tokens, which JSON reuses
+        # legitimately (" : , { } [ ]). read-modify-write on the logits buffer DL.
         if (NH > 0) {
             h2<Int> = 0
             for (h2 in 0..NH - 1) {
                 tx<Int> = 0
                 cuMemcpyDtoH_v2(loc(tx), HIS + h2 * 8, 8)
-                lv<Float> = 0.0
-                cuMemcpyDtoH_v2(loc(lv), DL + tx * 8, 8)
-                nv<Float> = lv - PEN
-                cuMemcpyHtoD_v2(DL + tx * 8, loc(nv), 8)
+                if (jsonex(tx) == 0) {
+                    lv<Float> = 0.0
+                    cuMemcpyDtoH_v2(loc(lv), DL + tx * 8, 8)
+                    nv<Float> = lv - PEN
+                    cuMemcpyHtoD_v2(DL + tx * 8, loc(nv), 8)
+                }
             }
         }
         cuMemcpyHtoD_v2(A4 + 0, loc(DL), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
