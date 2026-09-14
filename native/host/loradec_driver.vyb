@@ -4,6 +4,7 @@
 // context and verify it matches the numpy reference (kvctx_ref.py). Response-forward / backward
 // reuse this CK/CV -> per-layer [MAXS,NKV] slabs. Uses train.ptx kernels (single module).
 import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -364,6 +365,13 @@ lm_next(hb<Int>, row<Int>, D<Int>, VOCAB<Int>, EPS<Float>, ON<Int>, DE<Int>, DH<
 main()<Int> -> {
     S<Int> = 9; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 0.5; POS<Int> = 0
+    # JSON mode: when VYB_JSON_MODE is set, force the decode to open with the LORA JSON
+    # contract opener ('{"' 4913 then 'kind' 15314) so the tuned adapters' learned JSON
+    # grammar takes over instead of the base model's natural-language first-token
+    # preference. Default (unset) keeps natural-language decode. (VybForge#14)
+    jm<String> = env_get("VYB_JSON_MODE") else ""
+    JSONMODE<Int> = 0
+    if (jm.len() > 0) { JSONMODE = 1 }
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
@@ -670,7 +678,15 @@ main()<Int> -> {
         # --- first response token predicted from the last context hidden ---
         # after the context build, XIc holds layer-35 output for context rows 0..S-1.
         genh<Vec<Int>> = Vec()
-        nxt<Int> = lm_next(XIc, S - 1, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4, HISTBUF, 0, PEN2)
+        nxt<Int> = 0
+        if (JSONMODE == 1) {
+            # JSON mode: open with the '{"' token so the LoRA's learned JSON grammar runs.
+            f1<Int> = 4913
+            genh.push(f1)
+            nxt = f1
+        } else {
+            nxt = lm_next(XIc, S - 1, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4, HISTBUF, 0, PEN2)
+        }
         # open output stream
         match (open_write("native/out/loradec_tokens.txt")) {
             w -> {
@@ -728,6 +744,9 @@ main()<Int> -> {
                     j3<Int> = 0
                     for (j3 in 0..k - 1) { t1k<Int> = genh.get(gc - k + j3); cuMemcpyHtoD_v2(HISTBUF + j3 * 8, loc(t1k), 8) }
                     nxt = lm_next(HBin, P, D, VOCAB2, EPS, ONb, EMB, DH, DL, AO, rn, lsfn, arfn, RN, LSP, A4, HISTBUF, k, PEN2)
+                    # JSON mode: force the 2nd decoded token (P==S, right after '{"') to 'kind' (15314)
+                    # so the contract's first key opens; thereafter the model continues freely.
+                    if (JSONMODE == 1) { if (P == S) { f2<Int> = 15314; nxt = f2 } }
                     match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
                     println("LORADEC token P=" + P.to_string() + " nxt=" + nxt.to_string())
                 }
