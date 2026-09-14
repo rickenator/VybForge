@@ -245,6 +245,13 @@ decode-kv: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/n
 loradec: $(ROOT)/native/build/train.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && $(VYB) native/host/loradec_driver.vyb
 
+# #14: tuned decode -> text -> post-filter/repair + schema-coerce -> schema-valid
+# agent-response contract (writes native/out/contract_loradec.json). Coerce is
+# tolerant of truncated JSON (decode token budget often cuts mid-object).
+loradec-contract: loradec
+	cd $(ROOT) && $(VYB) native/gdecode/loradec_emit.vyb --module-path native/tokenizer
+	cd $(ROOT) && .venv/bin/python native/gdecode/coerce_contract.py
+
 # build all kernels then run every verified driver
 verify: $(PTX)
 	@echo "== GEMM =="
