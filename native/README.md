@@ -17,6 +17,7 @@ This directory is the P0 substrate that was blocked by the two language gaps
 | RMSNorm (native Newton sqrt) | `kernels/rmsnorm.vyb` | `RMSNORM_OK` bad=0 |
 | Native `exp` / `sin` / `cos` (pure arithmetic) | `kernels/vmath.vyb` | `VMATH_OK` exp<2.6e-10 rel, sin/cos<6e-12 abs |
 | **ONE transformer layer forward** (RMSNorm → GQA/RoPE → causal softmax attn → o_proj → residual → RMSNorm → SiLU MLP → residual) | `kernels/layer.vyb` | `LAYER_VERIFY: OK` — max diff ~5e-5 vs numpy ref at every stage (attn 5.3e-6) |
+| **GGUF v3 synthetic fixture generator** (Vyb-native: byte-buffer packers, computed `data_base`/offsets) | `gguf/mk_fixture.vyb` | byte-identical (208 B, sha256 `f23fc384…`) to the retired Python original; `GGUF_PARSE_VERIFY: OK` |
 | **GGUF v3 reader** (header, metadata KV, tensor index; little-endian binary parse) | `gguf/parse_gguf.vyb` | `GGUF_PARSE_VERIFY: OK` on synthetic fixture |
 | **Real Qwen3-4B GGUF metadata reader** (streams the 2.5 GB file's header/tensor index via stdlib `io::read_at` #207) | `gguf/read_real_meta.vyb` | `GGUF_META_VERIFY: OK` — all 398 tensors exact vs llama.cpp |
 | **q4_K dequant on-GPU** (real Q4_K_M weight block, ported from llama.cpp) | `kernels/q4k.vyb` | `Q4K_VERIFY: OK` — bad=0, maxerr ~5e-8 vs reference |

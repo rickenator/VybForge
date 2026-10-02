@@ -64,7 +64,9 @@ G-tensor → G-decode. G-json/G-tokenizer and G-gguf-data can run in parallel.
 
 ## Next: swap-in (slice → real Qwen3) — phased
 Central model store `<model path>` (2.5GB, 24GB VRAM; see
-`MODELS.md`). Ground truth captured by `native/gguf/dump_qwen3_meta.py` (gguf-py):
+`MODELS.md`). Ground truth was captured with gguf-py by `native/gguf/dump_qwen3_meta.py`
+— retired in the Python cleanup (P1.1) once `native/gguf/read_real_meta.vyb` read the
+live file directly and the TSV below was committed as the record:
 arch qwen3, 36 layers, D=2560, FF=9728, 32/8 heads (GQA 4), eps 1e-6, ctx
 262144, file_type 15 = Q4_K_M, 398 tensors (`blk.N.attn_q/k/v/output`,
 `attn_q_norm/attn_k_norm/attn_norm/ffn_norm`, `ffn_gate/up/down`, output_norm,

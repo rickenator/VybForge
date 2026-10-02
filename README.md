@@ -30,7 +30,10 @@ contract: `{path, op: add|replace|remove, value, reason}` targeting
 `system | hostname | pkgs | services` (the real VybOS `SystemSpec` shape).
 
 ```sh
-VYB_BIN="$HOME/Projects/Vyb-vybos/build/vyb" ./tools/apply_interview.py patches.jsonl
+# patches come from $VYBFORGE_PATCHES (default out/patches.jsonl); VYB_BIN (the
+# toolchain used to compile the rendered program) defaults to the same binary.
+VYB="$HOME/Projects/Vyb/build/vyb"
+VYBFORGE_PATCHES=patches.jsonl "$VYB" tools/apply_interview.vyb --module-path native/json
 ```
 
 Run the interviewer with `./run.sh` (GPU Ollama / OpenAI Responses /
@@ -78,9 +81,11 @@ environment, never in the repo.
 
 ## Included
 
-- `tools/apply.vyb` + `tools/apply_interview.py` — deterministic desired-state
-  applier (Vyb core, Python plumbing).
-- `app/configurator.py` + `run.sh` — backend-neutral interviewer launcher.
+- `tools/apply.vyb` + `tools/apply_interview.vyb` — deterministic desired-state
+  applier (Vyb core; the Python plumbing is gone).
+- `app/configurator.vyb` + `run.sh` — backend-neutral interviewer launcher
+  (Vyb-native; the Python original is gone). stdout carries one JSON contract per
+  answer, the banner/prompt go to stderr.
 - `src/main.vyb` — portable Linux Vyb client for local Ollama.
 - `config/` — default-state (real SystemSpec baseline) and response schemas.
 - `data/` — deterministic VybOS seed corpus: 216 train / 24 eval records.
@@ -92,12 +97,40 @@ environment, never in the repo.
   cross-repo via `--module-path`). Run `./native/legit/run_forge_ledger.sh`
   (see also `native/legit/run_forge_legit_signed.sh` for the forge-local signed
   provenance path).
-- `tools/propose_repair.py` + `tools/validate_proposal.vyb` (`run_repair_proposal.sh`)
+- `tools/propose_repair.vyb` + `tools/validate_proposal.vyb` (`run_repair_proposal.sh`)
   — **#7 model boundary**: `propose_repair` emits a schema-constrained
   `PatchProposal` (mock/dead deterministic; live via ollama/openai-chat/
   openai-responses); `validate_proposal.vyb` runs it through the REAL VybOS
   repair core (apply → gates → guardrail → promote → seal) and reports
   ACCEPT / REJECT / HUMAN-REQUIRED. Full boundary provable with no model/GPU.
+  Vyb-native driver: flags are `VYBFORGE_*` env vars (the JIT has no argv).
+- `native/legit/run_configurator_gate.sh` — **P1.4 port-fidelity gate** for
+  `app/configurator.vyb`: per-backend request path/Authorization/body are
+  byte-compared against the frozen Python-driver baseline
+  (`native/legit/fixtures/configurator-baseline/`) through the recording stub
+  `native/legit/stub_backend.py`, the emitted contract is compared by value and
+  validated against `config/agent-response.schema.json`.
+- `tools/configurator_repl.vyb` + `tools/interview_infer.vyb`
+  (`native/legit/run_interview_gate.sh`) — **P1.5**: the interview REPL and the
+  one-shot `proposed_changes` → JSONL appender, both Vyb-native over a served
+  model (the Python originals loaded base+LoRA with torch). The gate checks the
+  emitted patch lines are byte-identical to `json.dumps(..., separators=(",", ":"))`
+  and that `tools/apply_interview.vyb` consumes them into a spec.
+- `tools/{http_client,json_util,chat_request,reply_parse}.vyb` — the shared
+  driver plumbing (HTTP/TLS client with the drivers' 180 s timeout, JSON text
+  shaping, the backend-neutral chat request builder, one reply-unwrapping rule).
+  Drivers run with `--module-path tools --module-path native/json`.
+- `native/gdecode/coerce_contract.vyb` (`native/legit/run_coerce_gate.sh`) —
+  **P1.6**: the tuned-decode post-filter/repair that coerces whatever JSON the
+  decode produced (drifted kind, extra keys, truncated mid-object) into a
+  schema-valid agent-response contract, emitting
+  `native/out/contract_loradec.json`. The gate compares the port against frozen
+  Python baselines byte-for-byte on stdout, contract bytes and exit code over a
+  16-fixture corpus, cross-checks its own schema verdict against the jsonschema
+  oracle, and asserts `make loradec-contract` is all-Vyb with the whole contract
+  set still reporting `CONTRACT_VERIFY: ALL_OK`. Emission goes through
+  `native/json/json_emit.vyb` (a `json.dumps`-compatible emitter), so the artifact
+  is byte-identical to the Python original's.
 - `training/` — generator, QLoRA code, explicit job launcher, and handoff
   rules. Retrained/inferred on GPU (as tested on godzilla's RTX 3090).
 - The final LoRA adapter and tokenizer are committed under
