@@ -144,10 +144,11 @@ baseline of the oracle's own output instead.
 
 Landed so far: **P2.5a** `training/split_dataset.vyb` (the inline split heredoc is gone;
 `training/generate-data.sh` is Python-free), **P2.1a** `native/train/gen_kv_train.vyb`
-(driver parameterizer) and **P2.1b** `native/train/build_fullmanifest.vyb` (manifest +
-token ids, which also fixed a real pre-tokenizer bug — see `doc/P2-TRAINER-PLAN.md`). All
-gated byte-for-byte; `native/legit/run_phase2_battery.sh` runs them,
-`native/legit/run_phase1_battery.sh` stays the regression gate.
+(driver parameterizer), **P2.1b** `native/train/build_fullmanifest.vyb` (manifest + token
+ids, which also fixed a real pre-tokenizer bug — see `doc/P2-TRAINER-PLAN.md`) and
+**P2.1c** `native/train/_build_kv.vyb` (driver assembler). All gated byte-for-byte;
+`native/legit/run_phase2_battery.sh` runs them, `native/legit/run_phase1_battery.sh` stays
+the regression gate.
 
 Blocker recorded against P2.1b: the `encode-corpus` target's driver imports both
 `native/tokenizer` and `native/json`, which both define `hexval`, and the whole-module

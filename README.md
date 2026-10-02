@@ -205,6 +205,9 @@ gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
   punctuation-run rule `[^\s\p{L}\p{N}]+[\r\n]*` was not implemented, so `):\n` never
   merged): `native/tokenizer/test_pretok_boundary.vyb` now pins those boundaries
   (`native/legit/run_fullmanifest_gate.sh`).
+- `native/train/_build_kv.vyb` replaces the driver assembler (helper insertion, CK/CV/RSHI
+  allocations, per-token forward swap), byte-identical to it
+  (`native/legit/run_kvbuild_gate.sh`).
 
 ## Boundaries
 

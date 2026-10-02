@@ -119,8 +119,29 @@ repo is `native/tokenizer/test_pretok_boundary.vyb` plus the fullmanifest oracle
 neither of which goes through `encode_corpus.vyb`.
 
 **P2.1c — `_build_kv.vyb`**: the three-part source transform (helper insertion,
-CK/CV/RSHI allocations, per-token forward swap).
-Gate: byte-identical to a frozen baseline of today's Python output; output compiles.
+CK/CV/RSHI allocations, per-token forward swap). — **DONE 2026-10-02**
+`native/train/_build_kv.vyb` mirrors `_build_kv.py` step for step: the uniqueness asserts
+become explicit checks with distinct exit codes (2–8) instead of `AssertionError`, and
+`str.index(end, si)` becomes an `index_of` on the tail slice.
+
+Two details worth keeping:
+
+- **The ~7.8 KB helper block is extracted from the Python's own triple-quoted literal**, not
+  transcribed — the `.vyb` file was generated from it, so the driver code cannot drift by a
+  typo. `new_block` is the Python's f-string body with its four interpolations turned into
+  placeholders (`@@SLAYOUT@@`, `@@SARGS@@`, `@@SLOS@@`, `@@XOCUR@@`) filled at run time from
+  the same 25-entry `OFF` table, so the port keeps the Python's structure rather than baking
+  constants.
+- **No in-tree oracle exists for this one**: today's generator emits 1,247 lines and the
+  committed `kvresp_train_kv.vyb` has 1,291 (older source or edited afterwards). The baseline
+  is therefore pinned as a hash fixture, and the gate re-derives it from the live oracle when
+  `python3` is available — the oracle is stdlib-only, so that needs no venv.
+
+Gate: `native/legit/run_kvbuild_gate.sh` — byte-identical output vs the fixture hash
+(`e05a7cff…`, 103,817 B, 1,247 lines) plus the four stdout lines, `--emit-llvm` on the
+generated driver (semantic analysis + codegen; `--check` turned out to be a *formatting*
+check, not a semantic one), the live oracle cross-check, and a check that the committed driver
+is untouched.
 
 **P2.1d — `rbuild.py`**: decision — port as-is (gate: frozen baseline, partial-ness
 documented) or retire as superseded by P2.2's direct trainer. Blocks nothing else.

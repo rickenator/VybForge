@@ -1,0 +1,196 @@
+# _build_kv.vyb — rebuild kvresp_train_kv.vyb from the committed kvresp_train.vyb.
+#
+# Phase 2, P2.1c: a port of native/train/_build_kv.py. That script rewrites the verified
+# batched driver into the per-token KV driver by (A) inserting two per-token helpers
+# (proj_lor + resp_layer_kv) before main(), (B) extending the ASLB declaration and adding
+# the CK/CV/RSHI allocations, and (C) replacing the batched layer forward with the
+# per-token response loop. It uses direct open() so nothing truncates, and writes the
+# whole file in one go.
+#
+# The helper block below is extracted verbatim from the Python's own triple-quoted literal
+# (this file was generated from it), so ~7.8 KB of driver code cannot drift by
+# transcription. new_block is likewise the Python's f-string body with its four
+# interpolations turned into placeholders, filled here from the same OFF table.
+#
+# Known drift (recorded, not reconciled): a fresh run emits 1,247 lines while the committed
+# native/train/kvresp_train_kv.vyb has 1,291 — the committed file came from an older
+# revision of the source or was edited afterwards. The gate therefore pins the current
+# Python output as the frozen baseline, per the Oracle policy.
+#
+# Paths come from the environment (defaults are the Python's):
+#   VYBFORGE_KVBUILD_SRC  native/train/kvresp_train.vyb
+#   VYBFORGE_KVBUILD_DST  native/train/kvresp_train_kv.vyb
+#
+# Run:  "$VYB" native/train/_build_kv.vyb
+# Gate: native/legit/run_kvbuild_gate.sh
+import io::{open_read, read_all, open_write, write_str, close}
+import env::{env_get}
+import term::{eprintln}
+
+SLAYOUT<Int> = 50292912
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) {
+        f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+writef(p<String>, text<String>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) { f -> { write_str(f, text); close(f); rc = 0 } ? -> { rc = 1 } }
+    return rc
+}
+
+count_occ(s<String>, needle<String>)<Int> -> {
+    c<Int> = 0
+    rest<String> = s
+    while (rest.len() > 0) {
+        q<Int> = rest.index_of(needle)
+        if (q < 0) { rest = "" } else { c = c + 1; rest = rest.substring(q + needle.len(), rest.len()) }
+    }
+    return c
+}
+
+bool_str(b<Int>)<String> -> {
+    if (b != 0) { return "True" }
+    return "False"
+}
+
+chr10()<String> -> {
+    return String::from_byte(10)
+}
+
+# f64 byte offsets of the 25 ASLB fields, in the Python's OFF order.
+off_of(k<Int>)<Int> -> {
+    o<Vec<Int>> = Vec<Int>()
+    o.push(0)
+    o.push(1904640)
+    o.push(3809280)
+    o.push(6856704)
+    o.push(7618560)
+    o.push(8380416)
+    o.push(11427840)
+    o.push(12189696)
+    o.push(15237120)
+    o.push(15998976)
+    o.push(19046400)
+    o.push(20951040)
+    o.push(22855680)
+    o.push(24760320)
+    o.push(31997952)
+    o.push(39235584)
+    o.push(46473216)
+    o.push(48377856)
+    o.push(50282496)
+    o.push(50283984)
+    o.push(50285472)
+    o.push(50286960)
+    o.push(50288448)
+    o.push(50289936)
+    o.push(50291424)
+    return o.get(k)
+}
+
+# slabA+<offset> for the 16 activation slabs, in the Python's `acts` order.
+sargs()<String> -> {
+    o<Vec<Int>> = Vec<Int>()
+    o.push(1904640)
+    o.push(3809280)
+    o.push(6856704)
+    o.push(7618560)
+    o.push(8380416)
+    o.push(11427840)
+    o.push(12189696)
+    o.push(15237120)
+    o.push(15998976)
+    o.push(19046400)
+    o.push(20951040)
+    o.push(22855680)
+    o.push(24760320)
+    o.push(31997952)
+    o.push(39235584)
+    o.push(46473216)
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..o.len() - 1) {
+        if (k > 0) { out = out + "," }
+        out = out + "slabA+" + o.get(k).to_string()
+    }
+    return out
+}
+
+# slabA+<offset> for the 7 LoRA low-rank A slabs (sq..sd).
+slos_str()<String> -> {
+    o<Vec<Int>> = Vec<Int>()
+    o.push(50282496)
+    o.push(50283984)
+    o.push(50285472)
+    o.push(50286960)
+    o.push(50288448)
+    o.push(50289936)
+    o.push(50291424)
+    out<String> = ""
+    k<Int> = 0
+    for (k in 0..o.len() - 1) {
+        if (k > 0) { out = out + "," }
+        out = out + "slabA+" + o.get(k).to_string()
+    }
+    return out
+}
+
+helpers_block()<String> -> {
+    return "proj_lor(xa<Int>, W<Int>, out<Int>, U<Int>, V<Int>, slo<Int>, shi<Int>,\n         M<Int>, N<Int>, K<Int>, R2<Int>, AR<Float>,\n         gf<loc<CVoid>>, ads<loc<CVoid>>, GM<Int>, PB<Int>)<Int> -> {\n    freedom {\n        AF<Float> = 1.0; BF<Float> = 0.0\n        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(W),8); cuMemcpyHtoD_v2(GM+16,loc(out),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)\n        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)\n        cuMemcpyHtoD_v2(GM+0,loc(xa),8); cuMemcpyHtoD_v2(GM+8,loc(U),8); cuMemcpyHtoD_v2(GM+16,loc(slo),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(R2),8); cuMemcpyHtoD_v2(GM+40,loc(K),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)\n        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*R2+255)/256,1,1,256,1,1,GM,0,0,0)\n        cuMemcpyHtoD_v2(GM+0,loc(slo),8); cuMemcpyHtoD_v2(GM+8,loc(V),8); cuMemcpyHtoD_v2(GM+16,loc(shi),8); cuMemcpyHtoD_v2(GM+24,loc(M),8); cuMemcpyHtoD_v2(GM+32,loc(N),8); cuMemcpyHtoD_v2(GM+40,loc(R2),8); cuMemcpyHtoD_v2(GM+48,loc(AF),8); cuMemcpyHtoD_v2(GM+56,loc(BF),8)\n        cuda_launch4i(from<loc<CVoid>>(addr(gf)),(M*N+255)/256,1,1,256,1,1,GM,0,0,0)\n        cuMemcpyHtoD_v2(PB+0,loc(out),8); cuMemcpyHtoD_v2(PB+8,loc(shi),8); cuMemcpyHtoD_v2(PB+16,loc(AR),8); cuMemcpyHtoD_v2(PB+24,loc(M*N),8)\n        cuda_launch4i(from<loc<CVoid>>(addr(ads)),(M*N+255)/256,1,1,256,1,1,PB,0,0,0)\n        return 0\n    }\n    return 0\n}\n\n// resp_layer_kv: per-token KV forward helper (ported from verified kvrespfwd). One response/context\n// token at absolute position P through ONE layer, LoRA on all 7 projections. Writes per-token\n// activations into the passed buffer args at row P; stores this position's roped-K (DKr) and V (DV)\n// into CK/CV row P; runs attention over the combined cache (rows 0..P). Modified vs kvrespfwd to\n// keep a SEPARATE LoRA low-rank A output per projection (sqB..sdB) so the backward gets sq..sd.\nresp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,\n              R2<Int>, EPS<Float>, AR<Float>, HB<Int>, XO<Int>, CK<Int>, CV<Int>,\n              gf<loc<CVoid>>, ads<loc<CVoid>>, rn<loc<CVoid>>, rp<loc<CVoid>>, att<loc<CVoid>>,\n              sl<loc<CVoid>>, rs<loc<CVoid>>, dcp<loc<CVoid>>, GM<Int>, RN<Int>, ROP<Int>, ATT<Int>, PB<Int>,\n              N1<Int>, Wq<Int>, Wk<Int>, Wv<Int>, Nq<Int>, Nk<Int>, DF<Int>, Wo<Int>, N2<Int>,\n              Wg<Int>, Wu<Int>, Wd<Int>, Uq<Int>, Vq<Int>, Uk<Int>, Vk<Int>, Uv<Int>, Vv<Int>,\n              Uo<Int>, Vo<Int>, Ug<Int>, Vg<Int>, Uu<Int>, Vu<Int>, Ud<Int>, Vd<Int>,\n              XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,\n              DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M2<Int>,\n              sqB<Int>, skB<Int>, svB<Int>, soB<Int>, sgB<Int>, suB<Int>, sdB<Int>, shi<Int>)<Int> -> {\n    Pp<Int> = P; DFf<Int> = DF; Hf<Int> = H; HDf<Int> = HD; KVHf<Int> = KVH; Df2<Int> = D; NQf<Int> = NQ; NKVf<Int> = NKV\n    one<Int> = 1\n    freedom {\n        e2<Int> = 0\n        hbP<Int> = HB + P * D * 8; xoP<Int> = XO + P * D * 8\n        xnP<Int> = XN + P * D * 8\n        dqP<Int> = DQ + P * NQ * 8; dkP<Int> = DK + P * NKV * 8; dvP<Int> = DV + P * NKV * 8\n        dqnP<Int> = DQN + P * NQ * 8; dknP<Int> = DKN + P * NKV * 8\n        dqrP<Int> = DQr + P * NQ * 8; dkrP<Int> = DKr + P * NKV * 8\n        dctxP<Int> = DCtx + P * NQ * 8; doP<Int> = DO + P * D * 8\n        x1P<Int> = X1 + P * D * 8; x1nP<Int> = X1N + P * D * 8\n        grP<Int> = Gr + P * FF * 8; upP<Int> = Up + P * FF * 8; huP<Int> = Hu + P * FF * 8; m2P<Int> = M2 + P * D * 8\n        sqP<Int> = sqB + P * R2 * 8; skP<Int> = skB + P * R2 * 8; svP<Int> = svB + P * R2 * 8\n        soP<Int> = soB + P * R2 * 8; sgP<Int> = sgB + P * R2 * 8; suP<Int> = suB + P * R2 * 8; sdP<Int> = sdB + P * R2 * 8\n        shiP<Int> = shi + P * FF * 8\n        cuMemcpyHtoD_v2(RN + 0, loc(hbP), 8); cuMemcpyHtoD_v2(RN + 8, loc(N1), 8); cuMemcpyHtoD_v2(RN + 16, loc(xnP), 8)\n        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)\n        e2 = proj_lor(xnP, Wq, dqP, Uq, Vq, sqP, shiP, one, NQ, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 90 }\n        e2 = proj_lor(xnP, Wk, dkP, Uk, Vk, skP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 91 }\n        e2 = proj_lor(xnP, Wv, dvP, Uv, Vv, svP, shiP, one, NKV, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 92 }\n        cuMemcpyHtoD_v2(RN + 0, loc(dqP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nq), 8); cuMemcpyHtoD_v2(RN + 16, loc(dqnP), 8)\n        cuMemcpyHtoD_v2(RN + 24, loc(H), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NQ + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)\n        cuMemcpyHtoD_v2(RN + 0, loc(dkP), 8); cuMemcpyHtoD_v2(RN + 8, loc(Nk), 8); cuMemcpyHtoD_v2(RN + 16, loc(dknP), 8)\n        cuMemcpyHtoD_v2(RN + 24, loc(KVH), 8); cuMemcpyHtoD_v2(RN + 32, loc(HD), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (NKV + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)\n        cuMemcpyHtoD_v2(ROP + 80, loc(dqnP), 8); cuMemcpyHtoD_v2(ROP + 88, loc(dknP), 8); cuMemcpyHtoD_v2(ROP + 96, loc(dqrP), 8); cuMemcpyHtoD_v2(ROP + 104, loc(dkrP), 8)\n        cuMemcpyHtoD_v2(ROP + 176, loc(DFf), 8); cuMemcpyHtoD_v2(ROP + 184, loc(one), 8); cuMemcpyHtoD_v2(ROP + 200, loc(HDf), 8); cuMemcpyHtoD_v2(ROP + 208, loc(Hf), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVHf), 8); cuMemcpyHtoD_v2(ROP + 224, loc(Pp), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(rp)), (NQf + NKVf + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)\n        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CK + P * NKV * 8, dkrP, NKV, 0)\n        cuda_launch4i(from<loc<CVoid>>(addr(dcp)), (NKV + 255) / 256, 1, 1, 256, 1, 1, CV + P * NKV * 8, dvP, NKV, 0)\n        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(CK), 8); cuMemcpyHtoD_v2(ATT + 96, loc(CV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)\n        cuMemcpyHtoD_v2(ATT + 184, loc(Sctx), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8); cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(att)), (Sctx * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)\n        e2 = proj_lor(dctxP, Wo, doP, Uo, Vo, soP, shiP, one, D, NQ, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 93 }\n        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, hbP, doP, x1P, D)\n        cuMemcpyHtoD_v2(RN + 0, loc(x1P), 8); cuMemcpyHtoD_v2(RN + 8, loc(N2), 8); cuMemcpyHtoD_v2(RN + 16, loc(x1nP), 8)\n        cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)\n        cuda_launch4i(from<loc<CVoid>>(addr(rn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)\n        e2 = proj_lor(x1nP, Wg, grP, Ug, Vg, sgP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 94 }\n        e2 = proj_lor(x1nP, Wu, upP, Uu, Vu, suP, shiP, one, FF, D, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 95 }\n        cuda_launch4i(from<loc<CVoid>>(addr(sl)), (FF + 255) / 256, 1, 1, 256, 1, 1, grP, upP, huP, FF)\n        e2 = proj_lor(huP, Wd, m2P, Ud, Vd, sdP, shiP, one, D, FF, R2, AR, gf, ads, GM, PB); if (e2 != 0) { return 96 }\n        cuda_launch4i(from<loc<CVoid>>(addr(rs)), (D + 255) / 256, 1, 1, 256, 1, 1, x1P, m2P, xoP, D)\n        cuCtxSynchronize()\n        return 0\n    }\n    return 0\n}\n\n"
+}
+
+new_block()<String> -> {
+    return "                # ---- per-token KV response forward: layer-major, token-minor ----\n                # each response token P=9+t attends combined slabK/slabV (context rows 0..8 cached once +\n                # response-so-far), writes its per-layer activations DIRECTLY into slabA (==ASLB+L3*SLAYOUT)\n                # so the UNCHANGED S=93 frozen backward reads them. LoRA low-rank A outputs land in the\n                # per-projection sq..sd slabs of ASLB for the backward.\n                RESP<Int> = 84\n                slabK<Int> = CK+L3*93*NKV*8; slabV<Int> = CV+L3*93*NKV*8; slabA<Int> = ASLB+L3*@@SLAYOUT@@\n                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((93-9)*D+255)/256,1,1,256,1,1,slabA+0+9*D*8,XI+9*D*8,(93-9)*D,0)\n                t2<Int> = 0\n                for (t2 in 0..RESP-1){\n                    e = resp_layer_kv(9+t2, 10+t2, D,H,KVH,HD,FF,NQ,NKV,R,EPS,AR,XI,XOcur,slabK,slabV,\n                                      gf,ads,rn,rp,att,sl,rs,dcp,GM,RN,ROP,ATT,PB,\n                                      N1,Wq,Wk,Wv,Nq,Nk,DF,Wo,N2,Wg,Wu,Wd,\n                                      UqP,VqP,UkP,VkP,UvP,VvP,UoP,VoP,UgP,VgP,UuP,VuP,UdP,VdP,\n                                      @@SARGS@@,\n                                      @@SLOS@@, RSHI); if(e!=0){ return 80 }\n                }\n                cuda_launch4i(from<loc<CVoid>>(addr(dcp)),((93-9)*D+255)/256,1,1,256,1,1,slabA+@@XOCUR@@+9*D*8,XOcur+9*D*8,(93-9)*D,0)\n                cuCtxSynchronize()\n                tl2<Int> = XI; XI = XOcur; XOcur = tl2"
+}
+
+main()<Int> -> {
+    src_p<String> = env_get("VYBFORGE_KVBUILD_SRC") else "native/train/kvresp_train.vyb"
+    dst_p<String> = env_get("VYBFORGE_KVBUILD_DST") else "native/train/kvresp_train_kv.vyb"
+    src<String> = readf(src_p)
+    if (src.len() == 0) { eprintln("_build_kv: cannot read " + src_p); return 2 }
+
+    # ---- (A) helpers before main() ----
+    if (count_occ(src, "main()<Int> -> {") != 1) { eprintln("_build_kv: expected exactly one main()"); return 3 }
+    mi<Int> = src.index_of("main()<Int> -> {")
+    src = src.substring(0, mi) + helpers_block() + src.substring(mi, src.len())
+
+    # ---- (B) CK/CV/RSHI allocs + declarations ----
+    old_decl<String> = "        ASLB<Int> = 0"
+    if (count_occ(src, old_decl) != 1) { eprintln("_build_kv: ASLB decl not unique"); return 4 }
+    src = src.replace(old_decl, "        ASLB<Int> = 0; CK<Int> = 0; CV<Int> = 0; RSHI<Int> = 0")
+    old_alloc<String> = "        if(cuMemAlloc_v2(loc(ASLB),1810544832)!=0){ return 11 }"
+    if (count_occ(src, old_alloc) != 1) { eprintln("_build_kv: ASLB alloc not unique"); return 5 }
+    src = src.replace(old_alloc, old_alloc + "\n        # per-token KV caches: combined roped-k/v per layer [36][93][NKV]; RSHI=[93,FF] addscaled scratch\n        if(cuMemAlloc_v2(loc(CK),36*93*NKV*8)!=0){ return 11 }\n        if(cuMemAlloc_v2(loc(CV),36*93*NKV*8)!=0){ return 11 }\n        if(cuMemAlloc_v2(loc(RSHI),93*FF*8)!=0){ return 11 }")
+
+    # ---- (C) per-token forward replacing the batched forward ----
+    start_lit<String> = "            cuda_launch4i(from<loc<CVoid>>(addr(dcp)),(238080+255)/256,1,1,256,1,1,ASLB+L3*50292912+0,XI,238080,0)"
+    end_lit<String> = "            tl2<Int> = XI; XI = XOcur; XOcur = tl2"
+    si<Int> = src.index_of(start_lit)
+    if (si < 0) { eprintln("_build_kv: batched forward start not found"); return 6 }
+    tail<String> = src.substring(si, src.len())
+    t<Int> = tail.index_of(end_lit)
+    if (t < 0) { eprintln("_build_kv: response tail marker not found"); return 7 }
+    ei<Int> = si + t + end_lit.len()
+
+    nb<String> = new_block()
+    nb = nb.replace("@@SLAYOUT@@", SLAYOUT.to_string())
+    nb = nb.replace("@@SARGS@@", sargs())
+    nb = nb.replace("@@SLOS@@", slos_str())
+    nb = nb.replace("@@XOCUR@@", off_of(17).to_string())
+    src = src.substring(0, si) + nb + src.substring(ei, src.len())
+
+    if (writef(dst_p, src) != 0) { eprintln("_build_kv: cannot write " + dst_p); return 8 }
+    println("wrote " + dst_p + " lines " + count_occ(src, chr10()).to_string())
+    println("helpers ok: " + bool_str(src.index_of("resp_layer_kv(P<Int>") >= 0))
+    println("per-token fwd ok: " + bool_str(src.index_of("resp_layer_kv(9+t2") >= 0))
+    tail_ok<Int> = 0
+    if (src.strip().ends_with("}") && src.index_of("KVRESP_TRAIN_DONE") >= 0) { tail_ok = 1 }
+    println("tail ok: " + bool_str(tail_ok == 1))
+    return 0
+}
