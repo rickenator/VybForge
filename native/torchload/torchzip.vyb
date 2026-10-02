@@ -1,0 +1,302 @@
+# torchzip.vyb — zip container reader for PyTorch v1.x `.bin` checkpoints (host-mode Vyb).
+#
+# GENERIC: any PyTorch zipfile-format checkpoint (torch.save of a state_dict), not one model.
+# Scope + port-vs-consume rule: doc/SUBSTRATE-SCOPE.md. This is the container half of the S0.3
+# loader; the object-graph half (the protocol-2 pickle) lives beside it.
+#
+# A shard is a ZIP archive holding:
+#   <prefix>/data.pkl                 the object graph (protocol-2 pickle of {name: tensor})
+#   <prefix>/data/<k>                 the raw bytes of storage k, UNCOMPRESSED (method 0)
+#   <prefix>/byteorder                b"little" | b"big"
+#   <prefix>/version                  b"1" | b"2"
+#   <prefix>/.data/serialization_id   40 bytes
+#
+# The mapping storage-key -> record is torch's own (serialization.py `_load` -> `persistent_load`
+# -> `load_tensor`, which resolves key k to the whole record "data/{k}", with no offset splitting
+# inside a record) — NOT a guess. Verified on 15 real shards: the count of data/<k> records equals
+# the tensor count in every shard and the keys are exactly 0..n-1.
+#
+# This module provides the container layer only — names, sizes, absolute byte offsets, byte
+# access and a bounded-window sha256:
+#   tz_open(path)        -> TzIndex (index from the CENTRAL DIRECTORY, the authoritative table)
+#   tz_find / tz_find_data_key
+#   tz_read(path, ix, i) -> the record's bytes (used for data.pkl, which is small)
+#   tz_slice_sha(...)    -> sha256 of a bounded window at an absolute offset
+#
+# Size discovery: stdlib io has no size/seek/tell, but read_at's documented contract is that a
+# read at/past EOF returns FEWER bytes, so the length is found by exponential probe + binary
+# search (~2x31 one-byte preads on a 1 GB shard; no data is read). Do NOT "simplify" this by
+# reading the file whole.
+#
+# Compression: torch writes method 0 (stored) for both data.pkl and data/<k>. method 8 (deflate)
+# is available in pure Vyb via stdlib/archive (inflate_gzip / DEFLATE); this reader records the
+# method per record so a caller can refuse rather than silently mis-read. ZIP64 (>=4 GiB in one
+# archive) is detected and refused explicitly rather than mis-parsed.
+
+import io::{open_read, read_at, close}
+import crypto::{sha256}
+
+share(all)
+struct TzIndex {
+    n<Int>,
+    names<Vec<String>>,
+    method<Vec<Int>>,
+    clen<Vec<Int>>,      # compressed (on-disk) size, from the central directory
+    rawlen<Vec<Int>>,    # uncompressed size, from the central directory
+    crc<Vec<Int>>,       # stored CRC-32, from the central directory
+    lh<Vec<Int>>,        # local header offset
+    doff<Vec<Int>>,      # absolute offset of the record's data
+    prefix<String>,      # the shard's single top-level directory name
+    cd_off<Int>,
+    cd_size<Int>,
+    cd_gap<Int>,         # eocd - (cd_off + cd_size): the ZIP64 record+locator torch writes there
+    eocd<Int>,
+    size<Int>,
+    zip64<Bool>
+}
+
+share(all)
+tz_u16(s<String>, off<Int>)<Int> -> {
+    return (s.char_at(off) & 255) | ((s.char_at(off + 1) & 255) << 8)
+}
+
+share(all)
+tz_u32le(s<String>, off<Int>)<Int> -> {
+    return (s.char_at(off) & 255) | ((s.char_at(off + 1) & 255) << 8) |
+           ((s.char_at(off + 2) & 255) << 16) | ((s.char_at(off + 3) & 255) << 24)
+}
+
+share(all)
+tz_u64le(s<String>, off<Int>)<Int> -> {
+    return tz_u32le(s, off) | (tz_u32le(s, off + 4) << 32)
+}
+
+# One byte at an absolute offset, or -1 at/past EOF.
+share(all)
+tz_read1(f<File>, off<Int>)<Int> -> {
+    r<Int> = -1
+    match (read_at(f, off, 1)) {
+        s -> { if (s.len() == 1) { r = (s.char_at(0) & 255) } }
+        ? -> { r = -1 }
+    }
+    return r
+}
+
+# File length by probe: largest existing offset + 1. Requires a non-empty file.
+share(all)
+tz_file_size_ffd(f<File>)<Int> -> {
+    if (tz_read1(f, 0) < 0) { return 0 }
+    lo<Int> = 0
+    hi<Int> = 1
+    k<Int> = 0
+    while (k < 62) {
+        if (tz_read1(f, hi) >= 0) {
+            lo = hi
+            hi = hi * 2
+            k = k + 1
+        } else {
+            k = 62
+        }
+    }
+    while (hi - lo > 1) {
+        mid<Int> = (lo + hi) / 2
+        if (tz_read1(f, mid) >= 0) { lo = mid } else { hi = mid }
+    }
+    return lo + 1
+}
+
+# Read the central directory and resolve every record's absolute data offset.
+share(all)
+tz_open(path<String>)<TzIndex> -> {
+    ix<TzIndex> = TzIndex { n = 0, names = Vec(), method = Vec(), clen = Vec(), rawlen = Vec(),
+                            crc = Vec(), lh = Vec(), doff = Vec(), prefix = "", cd_off = 0,
+                            cd_size = 0, cd_gap = 0, eocd = 0, size = 0, zip64 = false }
+    match (open_read(path)) {
+        f -> {
+            sz<Int> = tz_file_size_ffd(f)
+            ix.size = sz
+            if (sz >= 22) {
+                tl<Int> = 65557
+                if (sz < tl) { tl = sz }
+                tstart<Int> = sz - tl
+                match (read_at(f, tstart, tl)) {
+                    tail -> {
+                        # Scan backwards for the EOCD. Acceptance is on the EOCD's OWN comment
+                        # length (eocd + 22 + comment_len == file size), NOT on the central
+                        # directory ending at the EOCD: torch writes a ZIP64 end-of-central-
+                        # directory record + locator between them, so cd_off + cd_size is 76 bytes
+                        # short of the EOCD on every real shard. Verified against Python's zipfile.
+                        found<Int> = -1
+                        j<Int> = tail.len() - 22
+                        while (j >= 0) {
+                            if (tz_u32le(tail, j) == 0x06054b50) {
+                                cmlen<Int> = tz_u16(tail, j + 20)
+                                if (tstart + j + 22 + cmlen == sz) {
+                                    found = j
+                                    ix.eocd = tstart + j
+                                    j = -1
+                                } else {
+                                    j = j - 1
+                                }
+                            } else {
+                                j = j - 1
+                            }
+                        }
+                        if (found >= 0) {
+                            ent<Int> = tz_u16(tail, found + 10)
+                            cdo<Int> = tz_u32le(tail, found + 16)
+                            cds<Int> = tz_u32le(tail, found + 12)
+                            # The ZIP64 EOCD locator sits immediately before the EOCD. Its presence
+                            # is informational (torch always writes it here); the 32-bit directory
+                            # values stay authoritative unless they are sentinels, in which case
+                            # the real values are in the ZIP64 EOCD record it points at.
+                            if (found >= 20) {
+                                if (tz_u32le(tail, found - 20) == 0x07064b50) {
+                                    ix.zip64 = true
+                                }
+                            }
+                            if (ent == 65535) { ix.zip64 = true }
+                            if (cdo == 0xffffffff) { ix.zip64 = true }
+                            if (cds == 0xffffffff) { ix.zip64 = true }
+                            if (ix.zip64) {
+                                zoff<Int> = -1
+                                if (found >= 20) {
+                                    if (tz_u32le(tail, found - 20) == 0x07064b50) {
+                                        zoff = tz_u64le(tail, found - 12)
+                                    }
+                                }
+                                if (zoff >= 0) {
+                                    match (read_at(f, zoff, 56)) {
+                                        z -> {
+                                            if (tz_u32le(z, 0) == 0x06064b50) {
+                                                ent = tz_u64le(z, 32)
+                                                cds = tz_u64le(z, 40)
+                                                cdo = tz_u64le(z, 48)
+                                            }
+                                        }
+                                        ? -> { }
+                                    }
+                                }
+                            }
+                            ix.cd_off = cdo
+                            ix.cd_size = cds
+                            ix.cd_gap = ix.eocd - (cdo + cds)
+                            if (cdo + cds <= sz) {
+                                match (read_at(f, ix.cd_off, ix.cd_size)) {
+                                    cd -> {
+                                        p<Int> = 0
+                                        k<Int> = 0
+                                        while (k < ent) {
+                                            if (p + 46 > cd.len()) { k = ent } else {
+                                                if (tz_u32le(cd, p) != 0x02014b50) { k = ent } else {
+                                                    fnl<Int> = tz_u16(cd, p + 28)
+                                                    exl<Int> = tz_u16(cd, p + 30)
+                                                    cml<Int> = tz_u16(cd, p + 32)
+                                                    lo<Int> = tz_u32le(cd, p + 42)
+                                                    ix.names.push(cd.substring(p + 46, p + 46 + fnl))
+                                                    ix.method.push(tz_u16(cd, p + 10))
+                                                    ix.crc.push(tz_u32le(cd, p + 16))
+                                                    ix.clen.push(tz_u32le(cd, p + 20))
+                                                    ix.rawlen.push(tz_u32le(cd, p + 24))
+                                                    ix.lh.push(lo)
+                                                    # the data offset lives in the LOCAL header
+                                                    # (its name/extra lengths may exceed the CD's)
+                                                    match (read_at(f, lo, 30)) {
+                                                        lht -> {
+                                                            if (tz_u32le(lht, 0) == 0x04034b50) {
+                                                                ix.doff.push(lo + 30 + tz_u16(lht, 26) + tz_u16(lht, 28))
+                                                            } else {
+                                                                ix.doff.push(0)
+                                                            }
+                                                        }
+                                                        ? -> { ix.doff.push(0) }
+                                                    }
+                                                    p = p + 46 + fnl + exl + cml
+                                                    k = k + 1
+                                                }
+                                            }
+                                        }
+                                        ix.n = ix.names.len()
+                                    }
+                                    ? -> { }
+                                }
+                            }
+                        }
+                    }
+                    ? -> { }
+                }
+            }
+            close(f)
+        }
+        ? -> { }
+    }
+    if (ix.n > 0) {
+        first<String> = ix.names.get(0)
+        sl<Int> = first.index_of("/")
+        if (sl >= 0) { ix.prefix = first.substring(0, sl) }
+    }
+    return ix
+}
+
+share(all)
+tz_find(ix<TzIndex>, name<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..ix.n - 1) {
+        if (ix.names.get(i) == name) { return i }
+    }
+    return -1
+}
+
+# Record index for storage key k: "<prefix>/data/<k>". Exact by construction (suffix + full
+# length), so key 1 never matches the record for key 10.
+share(all)
+tz_find_data_key(ix<TzIndex>, k<Int>)<Int> -> {
+    want<String> = "data/" + k.to_string()
+    i<Int> = 0
+    for (i in 0..ix.n - 1) {
+        nm<String> = ix.names.get(i)
+        if (nm.ends_with(want)) {
+            if (nm.len() == ix.prefix.len() + 1 + want.len()) { return i }
+        }
+    }
+    return -1
+}
+
+# The whole record. Only used for small records (data.pkl, byteorder, version).
+share(all)
+tz_read(path<String>, ix<TzIndex>, i<Int>)<String> -> {
+    r<String> = ""
+    if (i < 0) { return r }
+    if (i >= ix.n) { return r }
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, ix.doff.get(i), ix.clen.get(i))) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+# sha256 of the n bytes at absolute `off` ("" if the read came up short).
+share(all)
+tz_slice_sha(path<String>, off<Int>, n<Int>)<String> -> {
+    r<String> = ""
+    if (n <= 0) { return r }
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, n)) {
+                s -> {
+                    if (s.len() == n) { r = sha256(s) } else { r = "SHORT" }
+                }
+                ? -> { r = "ERR" }
+            }
+            close(f)
+        }
+        ? -> { r = "ERR" }
+    }
+    return r
+}

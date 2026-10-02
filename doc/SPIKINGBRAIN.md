@@ -167,13 +167,27 @@ vocab 151936 in **13** — so a second architecture otherwise edits those files 
 gate green. That re-expression is the generality proof and the guard against a substrate designed for
 imagined needs; no Qwen3 gate may regress.
 
-**S0.3 — loaders (this is S3's content, scheduled here).**
-`safetensors.vyb` (8-byte header length + JSON map via `native/json` + raw LE tensor bytes) and
-`torchbin.vyb` (torch.save zip container + minimal pickle subset), each producing a
-name → {dtype, shape, byte-buffer} index. Generic by construction — any safetensors or torch.save
-model, not this one. `.npy` too if it falls out cheaply.
-**Gate:** S3's gate below (name/shape/dtype match against the reference listing + sampled tensor bytes
-hash-match).
+**S0.3 — loaders (this is S3's content, scheduled here). LANDED 2026-10-02.**
+`native/torchload/` holds two container readers, both host-mode and model-agnostic:
+- **safetensors** — `safetensors.vyb` (8-byte LE header length + JSON map via `native/json` + raw LE
+  data region), driven by `st_probe.vyb`. Indexing reads only the prefix and header, so a 4 GB shard
+  costs one header read; tensor bytes are read on demand.
+- **torch `.bin`** — `torchzip.vyb` (zip central directory, data offsets resolved from local headers,
+  ZIP64 handled: torch writes a ZIP64 EOCD record + locator *before* the classic EOCD) plus
+  `torchpickle.vyb` (a protocol-2 pickle VM over a structure-of-arrays arena; one storage per
+  `data/<k>` record, so `persistent_load` needs no offset splitting), driven by `tb_zip_probe.vyb`
+  and `tb_pkl_probe.vyb`.
+
+Each yields name → {dtype, shape, stride, storage key, byte range} plus a bounded-window sha256, so a
+caller can stream tensor bytes without loading a shard whole.
+**Gates (both green):** `native/legit/run_safetensors_gate.sh` — byte-exact listing parity against an
+independent stdlib parse plus a `safetensors`-library cross-check by name; verified on a 66 MB adapter
+and 4.6 GB / 8.1 GB shards from three model families (incl. AWQ packed int32 + fp16 scales).
+`native/legit/run_torchbin_gate.sh` — container layer against Python's `zipfile` (whose SIZE comes from
+the OS, and which reads every hashed record twice), object graph against CPython's pickle VM, plus
+`torch.load(map_location='meta')` as the authoritative third side compared by name; verified on all 15
+SpikingBrain shards: 395 tensors (== the index's count), 0 mismatches, pickle STOP at the last byte.
+`.npy` is not needed by this model and is deferred — `.bin` + safetensors cover the queue.
 
 **S0.4 — attention family + KV/state abstraction.**
 One attention module with the causal mask as a *parameter*: full causal (Qwen3 today), sliding window

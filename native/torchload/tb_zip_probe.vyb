@@ -1,0 +1,165 @@
+# tb_zip_probe.vyb — S0.3 container-layer driver for PyTorch `.bin` checkpoints.
+#
+# Step 1 of the torchbin gate: enumerate the zip container of a shard through
+# native/torchload/torchzip.vyb and emit a canonical listing. The independent other side is
+# native/torchload/tb_ref.py (Python's own zipfile), and the object-graph step (the protocol-2
+# pickle -> tensors) is a separate listing produced by tb_pkl_probe.vyb.
+#
+#   VYBFORGE_TB_FILE   shard to read (default: ~/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin)
+#   VYBFORGE_TB_OUT    listing path (default: native/out/tb_zip_listing_vyb.txt)
+#
+# Run:  "$VYB" --module-path native/json native/torchload/tb_zip_probe.vyb
+# Gate: native/legit/run_torchbin_gate.sh
+#
+# SAMPLING RULE — tb_ref.py implements this identically; change both together.
+#   A record's sha column is the sha256 of its first `hlen` bytes, where
+#     hlen = its on-disk length                    if the FILE is <= 300,000,000 bytes
+#     hlen = min(on-disk length, 1,048,576)        otherwise
+#   and for files over the threshold only these records are hashed (indices, deduped ascending):
+#     {0, 1, n-2, n-1, argmin(bytes), argmax(bytes)}   (argmin/argmax = first occurrence)
+#   Unhashed records print "-". Same rule as the safetensors gate, so the two loaders' evidence
+#   is directly comparable.
+#
+# MISMATCH counts hard container invariants: the record's data must lie inside the file
+# (doff + clen <= size) and the local header signature must have been found (doff != 0 when the
+# record is non-empty). Method is reported per record so an inflate-requiring archive is visible
+# rather than silently mis-read.
+
+import io::{open_write, write_str, close}
+import env::{env_get}
+import torchzip
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+hexd(x<Int>)<String> -> {
+    dig<String> = "0123456789abcdef"
+    r<String> = ""
+    s<Int> = 28
+    while (s >= 0) {
+        r = r + dig.substring((x >> s) & 15, ((x >> s) & 15) + 1)
+        s = s - 4
+    }
+    return r
+}
+
+push_uniq(v<Vec<Int>>, x<Int>)<Vec<Int>> -> {
+    r<Vec<Int>> = Vec()
+    i<Int> = 0
+    for (i in 0..v.len() - 1) { r.push(v.get(i)) }
+    if (x < 0) { return r }
+    i = 0
+    for (i in 0..r.len() - 1) {
+        if (r.get(i) == x) { return r }
+    }
+    r.push(x)
+    return r
+}
+
+contains(v<Vec<Int>>, x<Int>)<Bool> -> {
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (v.get(i) == x) { return true }
+    }
+    return false
+}
+
+is_data_record(nm<String>)<Bool> -> {
+    if (nm.ends_with("/data.pkl")) { return false }
+    if (nm.ends_with("/byteorder")) { return false }
+    if (nm.ends_with("/version")) { return false }
+    if (nm.ends_with("/.data/serialization_id")) { return false }
+    return true
+}
+
+main()<Int> -> {
+    path<String> = env("VYBFORGE_TB_FILE", "/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
+    out<String> = env("VYBFORGE_TB_OUT", "native/out/tb_zip_listing_vyb.txt")
+    BIG<Int> = 300000000
+    WIN<Int> = 1048576
+
+    ix<TzIndex> = tz_open(path)
+    if (ix.n <= 0) {
+        println("TB_ZIP_FAIL records=0 path=" + path)
+        exit(1)
+    }
+    big<Bool> = (ix.size > BIG)
+
+    picked<Vec<Int>> = Vec()
+    if (big) {
+        picked = push_uniq(picked, 0)
+        picked = push_uniq(picked, 1)
+        picked = push_uniq(picked, ix.n - 2)
+        picked = push_uniq(picked, ix.n - 1)
+        imin<Int> = 0
+        imax<Int> = 0
+        i<Int> = 0
+        for (i in 0..ix.n - 1) {
+            if (ix.clen.get(i) < ix.clen.get(imin)) { imin = i }
+            if (ix.clen.get(i) > ix.clen.get(imax)) { imax = i }
+        }
+        picked = push_uniq(picked, imin)
+        picked = push_uniq(picked, imax)
+    }
+
+    r<String> = "RECORDS " + ix.n.to_string() + "\n"
+    r = r + "SIZE " + ix.size.to_string() + "\n"
+    r = r + "PREFIX " + ix.prefix + "\n"
+    r = r + "CD " + ix.cd_off.to_string() + " " + ix.cd_size.to_string() + "\n"
+    r = r + "CDGAP " + ix.cd_gap.to_string() + "\n"
+    r = r + "EOCD " + ix.eocd.to_string() + "\n"
+    r = r + "ZIP64 " + ix.zip64.to_string() + "\n"
+    r = r + "BIG " + big.to_string() + "\n"
+
+    bad<Int> = 0
+    hc<Int> = 0
+    data_recs<Int> = 0
+    i2<Int> = 0
+    for (i2 in 0..ix.n - 1) {
+        cl<Int> = ix.clen.get(i2)
+        do<Int> = ix.doff.get(i2)
+        if (do + cl > ix.size) { bad = bad + 1 }
+        if (cl > 0) { if (do <= 0) { bad = bad + 1 } }
+        # per-entry ZIP64 (a sentinel whose real value lives in the extra field) is refused, not
+        # guessed at — a wrong size would silently hash the wrong bytes
+        if (cl == 0xffffffff) { bad = bad + 1 }
+        if (ix.rawlen.get(i2) == 0xffffffff) { bad = bad + 1 }
+        if (ix.lh.get(i2) == 0xffffffff) { bad = bad + 1 }
+        if (is_data_record(ix.names.get(i2))) { data_recs = data_recs + 1 }
+        go<Bool> = true
+        hl<Int> = cl
+        if (big) {
+            go = contains(picked, i2)
+            if (cl > WIN) { hl = WIN }
+        }
+        sha<String> = "-"
+        if (go) {
+            sha = tz_slice_sha(path, do, hl)
+            if (sha.len() == 0) { sha = "ERR" } else { hc = hc + 1 }
+        }
+        r = r + ix.names.get(i2) + "|" + ix.method.get(i2).to_string() + "|" + cl.to_string() + "|" +
+            ix.rawlen.get(i2).to_string() + "|" + hexd(ix.crc.get(i2)) + "|" + do.to_string() + "|" + sha + "\n"
+    }
+    r = r + "DATARECS " + data_recs.to_string() + "\n"
+    r = r + "HASHED " + hc.to_string() + "\n"
+    r = r + "MISMATCH " + bad.to_string() + "\n"
+
+    wrc<Int> = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) {
+        println("TB_ZIP_FAIL write=" + out)
+        exit(1)
+    }
+    println("TB_ZIP_OK records=" + ix.n.to_string() + " datarecs=" + data_recs.to_string() +
+            " size=" + ix.size.to_string() + " hashed=" + hc.to_string() + " mismatch=" + bad.to_string() +
+            " out=" + out)
+    if (bad > 0) {
+        println("TB_ZIP_FAIL container invariant")
+        exit(1)
+    }
+    return 0
+}

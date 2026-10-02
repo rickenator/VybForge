@@ -1,0 +1,272 @@
+# tb_pkl_probe.vyb — S0.3 object-graph driver for PyTorch `.bin` checkpoints (step 2 of the torchbin gate).
+#
+# Reads a shard's container (native/torchload/torchzip.vyb), parses <prefix>/data.pkl
+# (native/torchload/torchpickle.vyb) and emits the tensor listing: name, dtype, shape, stride,
+# storage key/numel, storage offset, byte length, contiguity, and a bounded-window sha256 of the
+# tensor's bytes taken at the absolute file offset the container layer resolved.
+#
+#   VYBFORGE_TB_FILE   shard to read (default: the first SpikingBrain shard)
+#   VYBFORGE_TB_OUT    listing path (default: native/out/tb_pkl_listing_vyb.txt)
+#
+# Run:  "$VYB" --module-path native/json native/torchload/tb_pkl_probe.vyb
+# Gate: native/legit/run_torchbin_gate.sh
+#
+# SAMPLING RULE — tb_pkl_ref.py implements this identically; change both together.
+#   file <= 300,000,000 bytes : every tensor is hashed over its whole byte length.
+#   larger                    : a tensor is hashed if its own byte length <= 1,048,576 (hashed in
+#                               full) OR its index is in {0, 1, n-2, n-1, argmin(bytes),
+#                               argmax(bytes)} (hashed over its first 1,048,576 bytes). Others print
+#                               "-". Bounded, but still covers every small tensor in a shard plus
+#                               both ends and both extremes of the large ones.
+#
+# MISMATCH counts hard errors (must be 0): unknown dtype, missing storage record, record length !=
+# storage numel * element size, storage_offset + shape numel beyond the storage, or a shape/stride
+# rank disagreement. NONCONTIG counts tensors whose stride is not row-major-contiguous for their
+# shape — informational (0 for these checkpoints) and, like MISMATCH, compared by the gate.
+
+import io::{open_write, write_str, close}
+import env::{env_get}
+import torchzip::{tz_open, tz_find, tz_read, tz_slice_sha, TzIndex}
+import torchpickle::{pk_parse, pk_dtsize, PkOut}
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+csv_ints(v<Vec<Int>>)<String> -> {
+    r<String> = ""
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (i > 0) { r = r + "," }
+        r = r + v.get(i).to_string()
+    }
+    return r
+}
+
+contains(v<Vec<Int>>, x<Int>)<Bool> -> {
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (v.get(i) == x) { return true }
+    }
+    return false
+}
+
+push_uniq(v<Vec<Int>>, x<Int>)<Vec<Int>> -> {
+    r<Vec<Int>> = Vec()
+    i<Int> = 0
+    for (i in 0..v.len() - 1) { r.push(v.get(i)) }
+    if (x < 0) { return r }
+    i = 0
+    for (i in 0..r.len() - 1) {
+        if (r.get(i) == x) { return r }
+    }
+    r.push(x)
+    return r
+}
+
+main()<Int> -> {
+    path<String> = env("VYBFORGE_TB_FILE", "/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
+    out<String> = env("VYBFORGE_TB_OUT", "native/out/tb_pkl_listing_vyb.txt")
+    BIG<Int> = 300000000
+    WIN<Int> = 1048576
+
+    ix<TzIndex> = tz_open(path)
+    if (ix.n <= 0) {
+        println("TB_PKL_FAIL container records=0 path=" + path)
+        exit(1)
+    }
+    pklidx<Int> = tz_find(ix, ix.prefix + "/data.pkl")
+    if (pklidx < 0) {
+        println("TB_PKL_FAIL no data.pkl in " + path)
+        exit(1)
+    }
+    pkl<String> = tz_read(path, ix, pklidx)
+    if (pkl.len() == 0) {
+        println("TB_PKL_FAIL empty data.pkl in " + path)
+        exit(1)
+    }
+    po<PkOut> = pk_parse(pkl)
+    if (po.ok == false) {
+        println("TB_PKL_FAIL parse: err='" + po.err + "' bytes=" + po.bytes.to_string() +
+                " stop=" + po.stop.to_string() + " objects=" + po.ar.kinds.len().to_string() +
+                " nerr=" + po.ar.nerr.to_string() + " result=" + po.result.to_string())
+        exit(1)
+    }
+    did<Int> = po.result
+    if (po.ar.kinds.get(did) != 5) {
+        println("TB_PKL_FAIL top-level object is not a dict (kind " + po.ar.kinds.get(did).to_string() + ")")
+        exit(1)
+    }
+
+    nten<Int> = po.ar.klen.get(did) / 2
+    big<Bool> = (ix.size > BIG)
+
+    # index pass: byte length per tensor, for the argmin/argmax sampling
+    bytesv<Vec<Int>> = Vec()
+    p<Int> = 0
+    for (p in 0..nten - 1) {
+        tid<Int> = po.ar.kids.get(po.ar.koff.get(did) + 2 * p + 1)
+        nb<Int> = 0
+        if (tid >= 0) {
+            if (po.ar.kinds.get(tid) == 7) {
+                szid<Int> = po.ar.koff.get(tid)
+                cnt<Int> = po.ar.klen.get(tid)
+                numel<Int> = 1
+                k<Int> = 0
+                for (k in 0..cnt - 1) {
+                    eidx<Int> = po.ar.kids.get(szid + k)
+                    if (eidx >= 0) {
+                        if (po.ar.kinds.get(eidx) == 0) { numel = numel * po.ar.iv.get(eidx) }
+                    }
+                }
+                stoid<Int> = po.ar.iv.get(tid)
+                dt<String> = ""
+                if (stoid >= 0) { dt = po.ar.sv.get(stoid) }
+                nb = numel * pk_dtsize(dt)
+            }
+        }
+        bytesv.push(nb)
+    }
+    picked<Vec<Int>> = Vec()
+    if (big) {
+        picked = push_uniq(picked, 0)
+        picked = push_uniq(picked, 1)
+        picked = push_uniq(picked, nten - 2)
+        picked = push_uniq(picked, nten - 1)
+        imin<Int> = 0
+        imax<Int> = 0
+        q<Int> = 0
+        for (q in 0..nten - 1) {
+            if (bytesv.get(q) < bytesv.get(imin)) { imin = q }
+            if (bytesv.get(q) > bytesv.get(imax)) { imax = q }
+        }
+        picked = push_uniq(picked, imin)
+        picked = push_uniq(picked, imax)
+    }
+
+    r<String> = "TENSORS " + nten.to_string() + "\n"
+    r = r + "PKL " + pkl.len().to_string() + "\n"
+    r = r + "BIG " + big.to_string() + "\n"
+
+    bad<Int> = 0
+    noncontig<Int> = 0
+    hc<Int> = 0
+    t<Int> = 0
+    for (t in 0..nten - 1) {
+        nameid<Int> = po.ar.kids.get(po.ar.koff.get(did) + 2 * t)
+        tid<Int> = po.ar.kids.get(po.ar.koff.get(did) + 2 * t + 1)
+        nm<String> = ""
+        if (nameid >= 0) { nm = po.ar.sv.get(nameid) }
+        dts<String> = ""
+        dims<Vec<Int>> = Vec()
+        sds<Vec<Int>> = Vec()
+        soff<Int> = 0
+        skey<String> = ""
+        sloc<String> = ""
+        snumel<Int> = 0
+        if (tid >= 0) {
+            if (po.ar.kinds.get(tid) == 7) {
+                stoid<Int> = po.ar.iv.get(tid)
+                soff = po.ar.iv2.get(tid)
+                szid2<Int> = po.ar.koff.get(tid)
+                cnt2<Int> = po.ar.klen.get(tid)
+                k2<Int> = 0
+                for (k2 in 0..cnt2 - 1) {
+                    # a tuple's kids are OBJECT IDS: dereference through the int column
+                    eid<Int> = po.ar.kids.get(szid2 + k2)
+                    if (eid >= 0) {
+                        if (po.ar.kinds.get(eid) == 0) { dims.push(po.ar.iv.get(eid)) }
+                    }
+                }
+                sd2<Int> = po.ar.k2off.get(tid)
+                cnt3<Int> = po.ar.k2len.get(tid)
+                k3<Int> = 0
+                for (k3 in 0..cnt3 - 1) {
+                    eid2<Int> = po.ar.kids2.get(sd2 + k3)
+                    if (eid2 >= 0) {
+                        if (po.ar.kinds.get(eid2) == 0) { sds.push(po.ar.iv.get(eid2)) }
+                    }
+                }
+                if (stoid >= 0) {
+                    dts = po.ar.sv.get(stoid)
+                    skey = po.ar.sv2.get(stoid)
+                    sloc = po.ar.sv3.get(stoid)
+                    snumel = po.ar.iv.get(stoid)
+                }
+            }
+        }
+        numel2<Int> = 1
+        k4<Int> = 0
+        for (k4 in 0..dims.len() - 1) { numel2 = numel2 * dims.get(k4) }
+        dsz<Int> = pk_dtsize(dts)
+        nbytes<Int> = numel2 * dsz
+
+        # contiguity: row-major expected strides
+        contig<Bool> = true
+        acc<Int> = 1
+        w<Int> = dims.len() - 1
+        while (w >= 0) {
+            if (sds.get(w) != acc) { contig = false }
+            acc = acc * dims.get(w)
+            w = w - 1
+        }
+        if (contig == false) { noncontig = noncontig + 1 }
+        if (dims.len() != sds.len()) { bad = bad + 1 }
+
+        # tensor bytes live in the storage's record at storage_offset elements in
+        recname<String> = ix.prefix + "/data/" + skey
+        recidx<Int> = tz_find(ix, recname)
+        if (recidx < 0) { bad = bad + 1 } else {
+            if (dsz <= 0) { bad = bad + 1 } else {
+                if (ix.clen.get(recidx) != snumel * dsz) { bad = bad + 1 }
+                if (soff + numel2 > snumel) { bad = bad + 1 }
+            }
+        }
+
+        go<Bool> = true
+        hl<Int> = nbytes
+        if (big) {
+            go = contains(picked, t)
+            if (nbytes <= WIN) { go = true }
+            if (nbytes > WIN) { hl = WIN }
+        }
+        sha<String> = "-"
+        if (go) {
+            if (nbytes <= 0) {
+                sha = "ZERO"
+            } else {
+                if (recidx < 0) {
+                    sha = "ERR"
+                } else {
+                    sha = tz_slice_sha(path, ix.doff.get(recidx) + soff * dsz, hl)
+                    if (sha.len() == 0) { sha = "ERR" } else { hc = hc + 1 }
+                }
+            }
+        }
+        r = r + nm + "|" + dts + "|" + csv_ints(dims) + "|" + numel2.to_string() + "|" + csv_ints(sds) + "|" +
+            soff.to_string() + "|" + skey + "|" + snumel.to_string() + "|" + nbytes.to_string() + "|" +
+            contig.to_string() + "|" + sha + "\n"
+    }
+    r = r + "HASHED " + hc.to_string() + "\n"
+    r = r + "MISMATCH " + bad.to_string() + "\n"
+    r = r + "NONCONTIG " + noncontig.to_string() + "\n"
+
+    wrc<Int> = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) {
+        println("TB_PKL_FAIL write=" + out)
+        exit(1)
+    }
+    println("TB_PKL_OK tensors=" + nten.to_string() + " pkl=" + pkl.len().to_string() +
+            " stop=" + po.stop.to_string() + " objects=" + po.ar.kinds.len().to_string() +
+            " hashed=" + hc.to_string() + " mismatch=" + bad.to_string() +
+            " noncontig=" + noncontig.to_string() + " out=" + out)
+    if (bad > 0) {
+        println("TB_PKL_FAIL object-graph invariant")
+        exit(1)
+    }
+    return 0
+}

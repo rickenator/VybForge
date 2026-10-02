@@ -1,0 +1,795 @@
+# torchpickle.vyb — protocol-2 pickle reader for PyTorch `.bin` checkpoints (host-mode Vyb).
+#
+# GENERIC: implements the pickle opcodes torch's serialization actually emits, so the object graph
+# of any torch.save state_dict can be read without Python. Scope + port-vs-consume rule:
+# doc/SUBSTRATE-SCOPE.md.
+#
+# WHY a VM and not a pattern match: a torch shard's data.pkl is a pickle of
+#   OrderedDict([(name, torch._utils._rebuild_tensor_v2(storage, offset, size, stride, ...)), ...])
+# where each `storage` is a persistent id produced by torch.BFloat16Storage(...) + BINPERSID. The
+# graph is built by a stack machine, so it is read by a stack machine.
+#
+# Representation is structure-of-arrays (no Vec<Vec<T>>, which is a known Vyb crash family): every
+# pickled object is an index `oid` into parallel arrays in a PkArena. Object kinds:
+#   K_INT 0    iv = value                         (BININT/BININT1/BININT2/LONG1)
+#   K_STR 1    sv = text                          (BINUNICODE/SHORT_BINUNICODE)
+#   K_BOOL 2   iv = 0|1                           (NEWTRUE/NEWFALSE)
+#   K_TUPLE 3  koff/klen -> kids                  (MARK+TUPLE / TUPLE1..3 / EMPTY_TUPLE)
+#   K_CLASS 4  sv = "module.name"                 (GLOBAL/STACK_GLOBAL) — callable marker
+#   K_DICT 5   koff/klen -> kids as [k,v, k,v,..] (OrderedDict + SETITEM)
+#   K_STORAGE 6 iv = numel, iv2 = element size, sv = dtype, sv2 = key, sv3 = location (BINPERSID)
+#   K_TENSOR 7 iv = storage oid, iv2 = storage_offset, koff/klen -> size, k2off/k2len -> stride
+#   K_LIST 8   koff/klen -> kids
+#   K_BYTES 9  sv = raw bytes, iv = length
+#   K_NONE 10
+#   K_FLOAT 11 sv = raw 8 bytes (big-endian double), kept so the stream still parses
+#
+# Budgets: the arena grows only while the pickle is parsed; nothing here reads tensor bytes.
+# The dictionary is append-only via copy-on-write (pk_dict_set copies the pair region to the end of
+# `kids` before appending): a flat kid array with offsets would otherwise interleave one dict's
+# pairs with another object's children. The abandoned region is dead weight, not corruption.
+#
+# REDUCE is only allowed for the two callables torch emits (torch._utils._rebuild_tensor_v2 and
+# collections.OrderedDict); anything else is reported as an error rather than guessed at. Same for
+# an unknown opcode: the VM reports the offset and opcode so a failure is loud and located, never a
+# silently empty object graph.
+
+import torchzip::{tz_u16, tz_u32le}
+
+share(all)
+struct PkArena {
+    kinds<Vec<Int>>,
+    iv<Vec<Int>>,
+    iv2<Vec<Int>>,
+    sv<Vec<String>>,
+    sv2<Vec<String>>,
+    sv3<Vec<String>>,
+    koff<Vec<Int>>,
+    klen<Vec<Int>>,
+    kids<Vec<Int>>,
+    k2off<Vec<Int>>,
+    k2len<Vec<Int>>,
+    kids2<Vec<Int>>,
+    err<String>,
+    nerr<Int>,
+    ops<Int>
+}
+
+share(all)
+struct PkOut {
+    ok<Bool>,
+    err<String>,
+    result<Int>,
+    stop<Int>,
+    bytes<Int>,
+    ar<PkArena>
+}
+
+# Append a bare object. The single place that grows the arena's scalar columns.
+share(all)
+pk_new(a<their<PkArena>>, k<Int>, v<Int>, v2<Int>, s<String>, s2<String>, s3<String>)<Int> -> {
+    a.kinds.push(k)
+    a.iv.push(v)
+    a.iv2.push(v2)
+    a.sv.push(s)
+    a.sv2.push(s2)
+    a.sv3.push(s3)
+    a.koff.push(0)
+    a.klen.push(0)
+    a.k2off.push(0)
+    a.k2len.push(0)
+    a.ops = a.ops + 1
+    return a.kinds.len() - 1
+}
+
+# Tuple from an already-ordered element list.
+share(all)
+pk_tup(a<their<PkArena>>, elems<Vec<Int>>)<Int> -> {
+    a.kinds.push(3)
+    a.iv.push(elems.len())
+    a.iv2.push(0)
+    a.sv.push("")
+    a.sv2.push("")
+    a.sv3.push("")
+    a.koff.push(a.kids.len())
+    a.klen.push(elems.len())
+    a.k2off.push(0)
+    a.k2len.push(0)
+    i<Int> = 0
+    for (i in 0..elems.len() - 1) { a.kids.push(elems.get(i)) }
+    a.ops = a.ops + 1
+    return a.kinds.len() - 1
+}
+
+# dict[name] = value, copy-on-write so the object's pair region stays contiguous.
+share(all)
+pk_dict_set(a<their<PkArena>>, did<Int>, kid<Int>, vid<Int>)<Bool> -> {
+    if (did < 0) { return false }
+    if (did >= a.kinds.len()) { return false }
+    if (a.kinds.get(did) != 5) { return false }
+    cnt<Int> = a.klen.get(did)
+    src<Int> = a.koff.get(did)
+    newoff<Int> = a.kids.len()
+    i<Int> = 0
+    for (i in 0..cnt - 1) { a.kids.push(a.kids.get(src + i)) }
+    a.kids.push(kid)
+    a.kids.push(vid)
+    a.koff.set(did, newoff)
+    a.klen.set(did, cnt + 2)
+    return true
+}
+
+# list.append(value), same copy-on-write discipline.
+share(all)
+pk_list_push(a<their<PkArena>>, lid<Int>, vid<Int>)<Bool> -> {
+    if (lid < 0) { return false }
+    if (lid >= a.kinds.len()) { return false }
+    if (a.kinds.get(lid) != 8) { return false }
+    cnt<Int> = a.klen.get(lid)
+    src<Int> = a.koff.get(lid)
+    newoff<Int> = a.kids.len()
+    i<Int> = 0
+    for (i in 0..cnt - 1) { a.kids.push(a.kids.get(src + i)) }
+    a.kids.push(vid)
+    a.koff.set(lid, newoff)
+    a.klen.set(lid, cnt + 1)
+    return true
+}
+
+# Tensor descriptor from _rebuild_tensor_v2's arguments. size/stride are copied, not referenced, so
+# the descriptor does not depend on where the size tuple sits in the arena.
+share(all)
+pk_mk_tensor(a<their<PkArena>>, sid<Int>, soff<Int>, szid<Int>, stid<Int>)<Int> -> {
+    a.kinds.push(7)
+    a.iv.push(sid)
+    a.iv2.push(soff)
+    a.sv.push("")
+    a.sv2.push("")
+    a.sv3.push("")
+    a.koff.push(a.kids.len())
+    a.klen.push(0)
+    a.k2off.push(a.kids2.len())
+    a.k2len.push(0)
+    oid<Int> = a.kinds.len() - 1
+    if (szid >= 0) {
+        if (a.kinds.get(szid) == 3) {
+            cnt<Int> = a.klen.get(szid)
+            src<Int> = a.koff.get(szid)
+            i<Int> = 0
+            for (i in 0..cnt - 1) { a.kids.push(a.kids.get(src + i)) }
+            a.klen.set(oid, cnt)
+        }
+    }
+    if (stid >= 0) {
+        if (a.kinds.get(stid) == 3) {
+            cnt2<Int> = a.klen.get(stid)
+            # tuple elements live in `kids`; kids2 is the TENSOR's stride column (write target)
+            src2<Int> = a.koff.get(stid)
+            i2<Int> = 0
+            for (i2 in 0..cnt2 - 1) { a.kids2.push(a.kids.get(src2 + i2)) }
+            a.k2len.set(oid, cnt2)
+        }
+    }
+    a.ops = a.ops + 1
+    return oid
+}
+
+# dtype of a storage class name. "" means unrecognized (the driver then flags it).
+share(all)
+pk_dtype_of_class(cn<String>)<String> -> {
+    if (cn == "torch.BFloat16Storage") { return "BF16" }
+    if (cn == "torch.HalfStorage") { return "F16" }
+    if (cn == "torch.FloatStorage") { return "F32" }
+    if (cn == "torch.DoubleStorage") { return "F64" }
+    if (cn == "torch.ByteStorage") { return "U8" }
+    if (cn == "torch.CharStorage") { return "I8" }
+    if (cn == "torch.ShortStorage") { return "I16" }
+    if (cn == "torch.IntStorage") { return "I32" }
+    if (cn == "torch.LongStorage") { return "I64" }
+    if (cn == "torch.BoolStorage") { return "BOOL" }
+    if (cn == "torch.UntypedStorage") { return "U8" }
+    if (cn == "torch.Float8_e4m3fnStorage") { return "F8_E4M3" }
+    if (cn == "torch.Float8_e5m2Storage") { return "F8_E5M2" }
+    return ""
+}
+
+share(all)
+pk_dtsize(dt<String>)<Int> -> {
+    if (dt == "F64") { return 8 }
+    if (dt == "I64") { return 8 }
+    if (dt == "U64") { return 8 }
+    if (dt == "F32") { return 4 }
+    if (dt == "I32") { return 4 }
+    if (dt == "U32") { return 4 }
+    if (dt == "F16") { return 2 }
+    if (dt == "BF16") { return 2 }
+    if (dt == "I16") { return 2 }
+    if (dt == "U16") { return 2 }
+    if (dt == "I8") { return 1 }
+    if (dt == "U8") { return 1 }
+    if (dt == "BOOL") { return 1 }
+    if (dt == "F8_E4M3") { return 1 }
+    if (dt == "F8_E5M2") { return 1 }
+    return 0
+}
+
+# Opcode text for diagnostics. A raw number is ambiguous (the first version of this VM reported
+# "unhandled opcode 0x114" for what was really op 114 = 0x72, because the decimal value was printed
+# after a 0x prefix) — always show hex AND the character.
+share(all)
+pk_op_txt(o<Int>)<String> -> {
+    dig<String> = "0123456789abcdef"
+    h1<Int> = (o >> 4) & 15
+    h2<Int> = o & 15
+    r<String> = "0x" + dig.substring(h1, h1 + 1) + dig.substring(h2, h2 + 1)
+    if (o >= 32) {
+        if (o < 127) { r = r + " '" + String::from_byte(o) + "'" }
+    }
+    return r
+}
+
+# Index of the next b'\n' at or after `start` (or the string length). Pure.
+# (`from` is a reserved word in Vyb — hence `start`.)
+share(all)
+pk_line(s<String>, start<Int>)<Int> -> {
+    i<Int> = start
+    while (i < s.len()) {
+        if ((s.char_at(i) & 255) == 10) { return i }
+        i = i + 1
+    }
+    return s.len()
+}
+
+# Signed little-endian integer of `nb` bytes, sign-extended from the top byte.
+share(all)
+pk_le_signed(s<String>, off<Int>, nb<Int>)<Int> -> {
+    v<Int> = 0
+    i<Int> = 0
+    for (i in 0..nb - 1) {
+        v = v | ((s.char_at(off + i) & 255) << (8 * i))
+    }
+    if (nb > 0) {
+        if (nb < 8) {
+            if ((v & (1 << (8 * nb - 1))) != 0) { v = v - (1 << (8 * nb)) }
+        }
+    }
+    return v
+}
+
+# Parse a protocol-2 pickle. Returns the arena plus the id of the top-level object.
+share(all)
+pk_parse(data<String>)<PkOut> -> {
+    ar<PkArena> = PkArena { kinds = Vec(), iv = Vec(), iv2 = Vec(), sv = Vec(), sv2 = Vec(), sv3 = Vec(),
+                            koff = Vec(), klen = Vec(), kids = Vec(), k2off = Vec(), k2len = Vec(),
+                            kids2 = Vec(), err = "", nerr = 0, ops = 0 }
+    stk<Vec<Int>> = Vec()
+    memo<Vec<Int>> = Vec()
+    sp<Int> = 0
+    pos<Int> = 0
+    n<Int> = data.len()
+    failed<Bool> = false
+    result<Int> = -1
+    stop<Int> = 0
+    ndone<Bool> = false
+
+    while (pos < n) {
+        if (failed) { pos = n } else {
+            if (ndone) { pos = n } else {
+                op<Int> = data.char_at(pos) & 255
+
+                if (op == 0x80) {
+                    pos = pos + 2
+                } else {
+                if (op == 0x95) {
+                    pos = pos + 9
+                } else {
+                if (op == 0x63) {
+                    # GLOBAL: module\nname\n
+                    a1<Int> = pk_line(data, pos + 1)
+                    b1<Int> = pk_line(data, a1 + 1)
+                    cid<Int> = pk_new(borrow(ar), 4, 0, 0,
+                                      data.substring(pos + 1, a1) + "." + data.substring(a1 + 1, b1), "", "")
+                    pos = b1 + 1
+                    if (sp < stk.len()) { stk.set(sp, cid) } else { stk.push(cid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x93) {
+                    # STACK_GLOBAL: name, module
+                    nmid<Int> = -1
+                    moid<Int> = -1
+                    if (sp > 0) { nmid = stk.get(sp - 1); sp = sp - 1 }
+                    if (sp > 0) { moid = stk.get(sp - 1); sp = sp - 1 }
+                    cid2<Int> = -1
+                    if (ar.kinds.get(moid) == 1) {
+                        if (ar.kinds.get(nmid) == 1) {
+                            cid2 = pk_new(borrow(ar), 4, 0, 0, ar.sv.get(moid) + "." + ar.sv.get(nmid), "", "")
+                        }
+                    }
+                    if (cid2 < 0) {
+                        ar.err = "STACK_GLOBAL with non-string operands"
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        if (sp < stk.len()) { stk.set(sp, cid2) } else { stk.push(cid2) }
+                        sp = sp + 1
+                        pos = pos + 1
+                    }
+                } else {
+                if (op == 0x58) {
+                    # BINUNICODE: u32 length + bytes
+                    ln<Int> = tz_u32le(data, pos + 1)
+                    sid<Int> = pk_new(borrow(ar), 1, ln, 0, data.substring(pos + 5, pos + 5 + ln), "", "")
+                    pos = pos + 5 + ln
+                    if (sp < stk.len()) { stk.set(sp, sid) } else { stk.push(sid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x8c) {
+                    # SHORT_BINUNICODE: u8 length + bytes
+                    lnb<Int> = data.char_at(pos + 1) & 255
+                    sid2<Int> = pk_new(borrow(ar), 1, lnb, 0, data.substring(pos + 2, pos + 2 + lnb), "", "")
+                    pos = pos + 2 + lnb
+                    if (sp < stk.len()) { stk.set(sp, sid2) } else { stk.push(sid2) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x4a) {
+                    iid<Int> = pk_new(borrow(ar), 0, pk_le_signed(data, pos + 1, 4), 0, "", "", "")
+                    pos = pos + 5
+                    if (sp < stk.len()) { stk.set(sp, iid) } else { stk.push(iid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x4b) {
+                    iid2<Int> = pk_new(borrow(ar), 0, data.char_at(pos + 1) & 255, 0, "", "", "")
+                    pos = pos + 2
+                    if (sp < stk.len()) { stk.set(sp, iid2) } else { stk.push(iid2) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x4d) {
+                    iid3<Int> = pk_new(borrow(ar), 0, tz_u16(data, pos + 1), 0, "", "", "")
+                    pos = pos + 3
+                    if (sp < stk.len()) { stk.set(sp, iid3) } else { stk.push(iid3) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x8a) {
+                    # LONG1: u8 count + that many bytes, little-endian signed
+                    nb<Int> = data.char_at(pos + 1) & 255
+                    iid4<Int> = pk_new(borrow(ar), 0, pk_le_signed(data, pos + 2, nb), 0, "", "", "")
+                    pos = pos + 2 + nb
+                    if (sp < stk.len()) { stk.set(sp, iid4) } else { stk.push(iid4) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x47) {
+                    fid<Int> = pk_new(borrow(ar), 11, 0, 0, data.substring(pos + 1, pos + 9), "", "")
+                    pos = pos + 9
+                    if (sp < stk.len()) { stk.set(sp, fid) } else { stk.push(fid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x4e) {
+                    nid<Int> = pk_new(borrow(ar), 10, 0, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, nid) } else { stk.push(nid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x88) {
+                    tid<Int> = pk_new(borrow(ar), 2, 1, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, tid) } else { stk.push(tid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x89) {
+                    fid2<Int> = pk_new(borrow(ar), 2, 0, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, fid2) } else { stk.push(fid2) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x28) {
+                    # MARK: sentinel object id -1 on the stack
+                    if (sp < stk.len()) { stk.set(sp, -1) } else { stk.push(-1) }
+                    sp = sp + 1
+                    pos = pos + 1
+                } else {
+                if (op == 0x29) {
+                    eid<Int> = pk_new(borrow(ar), 3, 0, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, eid) } else { stk.push(eid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x7d) {
+                    did<Int> = pk_new(borrow(ar), 5, 0, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, did) } else { stk.push(did) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x5d) {
+                    lid<Int> = pk_new(borrow(ar), 8, 0, 0, "", "", "")
+                    pos = pos + 1
+                    if (sp < stk.len()) { stk.set(sp, lid) } else { stk.push(lid) }
+                    sp = sp + 1
+                } else {
+                if (op == 0x74) {
+                    # TUPLE: everything back to the most recent MARK.
+                    # The loop must stop at the mark even when entries remain below it, hence the
+                    # explicit `hit`/`okmark` pair rather than `while (sp > 0)`.
+                    tmp<Vec<Int>> = Vec()
+                    hit<Bool> = false
+                    okmark<Bool> = false
+                    while (hit == false) {
+                        if (sp > 0) {
+                            t<Int> = stk.get(sp - 1)
+                            sp = sp - 1
+                            if (t == -1) { hit = true; okmark = true } else { tmp.push(t) }
+                        } else {
+                            hit = true
+                        }
+                    }
+                    if (okmark) {
+                        rev<Vec<Int>> = Vec()
+                        i<Int> = tmp.len() - 1
+                        while (i >= 0) { rev.push(tmp.get(i)); i = i - 1 }
+                        tid2<Int> = pk_tup(borrow(ar), rev)
+                        if (sp < stk.len()) { stk.set(sp, tid2) } else { stk.push(tid2) }
+                        sp = sp + 1
+                    } else {
+                        ar.err = "TUPLE without MARK at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                    pos = pos + 1
+                } else {
+                if (op == 0x85) {
+                    tmp2<Vec<Int>> = Vec()
+                    if (sp > 0) { tmp2.push(stk.get(sp - 1)); sp = sp - 1 }
+                    tid3<Int> = pk_tup(borrow(ar), tmp2)
+                    if (sp < stk.len()) { stk.set(sp, tid3) } else { stk.push(tid3) }
+                    sp = sp + 1
+                    pos = pos + 1
+                } else {
+                if (op == 0x86) {
+                    tmp3<Vec<Int>> = Vec()
+                    e1<Int> = -1
+                    e0<Int> = -1
+                    had<Bool> = false
+                    if (sp >= 2) {
+                        e1 = stk.get(sp - 1)
+                        e0 = stk.get(sp - 2)
+                        sp = sp - 2
+                        had = true
+                    }
+                    if (had) {
+                        tmp3.push(e0)
+                        tmp3.push(e1)
+                        tid4<Int> = pk_tup(borrow(ar), tmp3)
+                        if (sp < stk.len()) { stk.set(sp, tid4) } else { stk.push(tid4) }
+                        sp = sp + 1
+                    } else {
+                        ar.err = "TUPLE2 underflow at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                    pos = pos + 1
+                } else {
+                if (op == 0x87) {
+                    tmp4<Vec<Int>> = Vec()
+                    if (sp >= 3) {
+                        tmp4.push(stk.get(sp - 3))
+                        tmp4.push(stk.get(sp - 2))
+                        tmp4.push(stk.get(sp - 1))
+                        sp = sp - 3
+                        tid5<Int> = pk_tup(borrow(ar), tmp4)
+                        if (sp < stk.len()) { stk.set(sp, tid5) } else { stk.push(tid5) }
+                        sp = sp + 1
+                    } else {
+                        ar.err = "TUPLE3 underflow at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                    pos = pos + 1
+                } else {
+                if (op == 0x71) {
+                    # BINPUT: object stays on the stack. Grow the memo TO the index (filling holes
+                    # with -1) rather than appending, so a skipped index cannot shift every later
+                    # slot — a silent mis-read, not a loud failure.
+                    mi<Int> = data.char_at(pos + 1) & 255
+                    while (memo.len() <= mi) { memo.push(-1) }
+                    memo.set(mi, stk.get(sp - 1))
+                    pos = pos + 2
+                } else {
+                if (op == 0x72) {
+                    # LONG_BINPUT: u32 memo index. Every shard with more than ~20 tensors uses this
+                    # (the memo passes 255), so it is required, not optional.
+                    ml<Int> = tz_u32le(data, pos + 1)
+                    while (memo.len() <= ml) { memo.push(-1) }
+                    memo.set(ml, stk.get(sp - 1))
+                    pos = pos + 5
+                } else {
+                if (op == 0x6a) {
+                    # LONG_BINGET: u32 memo index
+                    mg<Int> = tz_u32le(data, pos + 1)
+                    if (mg < memo.len()) {
+                        gid2<Int> = memo.get(mg)
+                        if (sp < stk.len()) { stk.set(sp, gid2) } else { stk.push(gid2) }
+                        sp = sp + 1
+                        pos = pos + 5
+                    } else {
+                        ar.err = "LONG_BINGET of empty memo slot " + mg.to_string() + " at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                } else {
+                if (op == 0x68) {
+                    mi2<Int> = data.char_at(pos + 1) & 255
+                    if (mi2 < memo.len()) {
+                        gid<Int> = memo.get(mi2)
+                        if (sp < stk.len()) { stk.set(sp, gid) } else { stk.push(gid) }
+                        sp = sp + 1
+                        pos = pos + 2
+                    } else {
+                        ar.err = "BINGET of empty memo slot " + mi2.to_string() + " at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                } else {
+                if (op == 0x51) {
+                    # BINPERSID: ('storage', <StorageClass>, key, location, numel)
+                    pid<Int> = -1
+                    if (sp > 0) { pid = stk.get(sp - 1); sp = sp - 1 }
+                    badness<Int> = 0
+                    if (pid < 0) { badness = 1 } else {
+                        if (ar.kinds.get(pid) != 3) { badness = 2 } else {
+                            if (ar.klen.get(pid) < 5) { badness = 3 }
+                        }
+                    }
+                    if (badness != 0) {
+                        ar.err = "BINPERSID with malformed pid at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        base<Int> = ar.koff.get(pid)
+                        tname<Int> = ar.kids.get(base + 0)
+                        cls<Int> = ar.kids.get(base + 1)
+                        keyid<Int> = ar.kids.get(base + 2)
+                        locid<Int> = ar.kids.get(base + 3)
+                        numid<Int> = ar.kids.get(base + 4)
+                        tns<Int> = 0
+                        if (tname >= 0) { if (ar.kinds.get(tname) == 1) { if (ar.sv.get(tname) == "storage") { tns = 1 } } }
+                        if (tns != 1) {
+                            ar.err = "BINPERSID typename != 'storage' at offset " + pos.to_string()
+                            ar.nerr = ar.nerr + 1
+                            failed = true
+                        } else {
+                            cname<String> = ""
+                            if (ar.kinds.get(cls) == 4) { cname = ar.sv.get(cls) }
+                            dtn<String> = pk_dtype_of_class(cname)
+                            kstr<String> = ""
+                            if (ar.kinds.get(keyid) == 1) { kstr = ar.sv.get(keyid) }
+                            lstr<String> = ""
+                            if (ar.kinds.get(locid) == 1) { lstr = ar.sv.get(locid) }
+                            num<Int> = 0
+                            if (ar.kinds.get(numid) == 0) { num = ar.iv.get(numid) }
+                            stoid<Int> = pk_new(borrow(ar), 6, num, pk_dtsize(dtn), dtn, kstr, lstr)
+                            if (sp < stk.len()) { stk.set(sp, stoid) } else { stk.push(stoid) }
+                            sp = sp + 1
+                            pos = pos + 1
+                        }
+                    }
+                } else {
+                if (op == 0x52) {
+                    # REDUCE: callable(args)
+                    aid<Int> = -1
+                    foid<Int> = -1
+                    rbad<Int> = 0
+                    if (sp >= 2) {
+                        aid = stk.get(sp - 1)
+                        foid = stk.get(sp - 2)
+                        sp = sp - 2
+                    } else {
+                        rbad = 1
+                    }
+                    if (rbad == 0) {
+                        if (ar.kinds.get(aid) != 3) { rbad = 2 } else {
+                            if (ar.kinds.get(foid) != 4) { rbad = 3 }
+                        }
+                    }
+                    if (rbad != 0) {
+                        ar.err = "REDUCE with malformed callable/args at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        fname<String> = ar.sv.get(foid)
+                        abase<Int> = ar.koff.get(aid)
+                        acnt<Int> = ar.klen.get(aid)
+                        if (fname == "collections.OrderedDict") {
+                            dj<Int> = pk_new(borrow(ar), 5, 0, 0, "", "", "")
+                            if (sp < stk.len()) { stk.set(sp, dj) } else { stk.push(dj) }
+                            sp = sp + 1
+                            pos = pos + 1
+                        } else {
+                            if (fname == "torch._utils._rebuild_tensor_v2") {
+                                if (acnt < 4) {
+                                    ar.err = "tensor rebuild with " + acnt.to_string() + " args at offset " + pos.to_string()
+                                    ar.nerr = ar.nerr + 1
+                                    failed = true
+                                } else {
+                                    stid<Int> = ar.kids.get(abase + 0)
+                                    ofid<Int> = ar.kids.get(abase + 1)
+                                    szid<Int> = ar.kids.get(abase + 2)
+                                    strid<Int> = ar.kids.get(abase + 3)
+                                    sofs<Int> = 0
+                                    if (ar.kinds.get(ofid) == 0) { sofs = ar.iv.get(ofid) }
+                                    toid<Int> = pk_mk_tensor(borrow(ar), stid, sofs, szid, strid)
+                                    if (sp < stk.len()) { stk.set(sp, toid) } else { stk.push(toid) }
+                                    sp = sp + 1
+                                    pos = pos + 1
+                                }
+                            } else {
+                                ar.err = "REDUCE of unsupported callable '" + fname + "' at offset " + pos.to_string()
+                                ar.nerr = ar.nerr + 1
+                                failed = true
+                            }
+                        }
+                    }
+                } else {
+                if (op == 0x73) {
+                    # SETITEM: value, key are popped; the DICT IS PEEKED (CPython's load_setitem
+                    # uses stack[-1]). Popping it too would drop the result object off the stack —
+                    # which is exactly how this VM first reported `stop=201, result=-1`.
+                    vid2<Int> = -1
+                    kid2<Int> = -1
+                    did2<Int> = -1
+                    sbad<Bool> = false
+                    if (sp >= 2) {
+                        vid2 = stk.get(sp - 1)
+                        kid2 = stk.get(sp - 2)
+                        sp = sp - 2
+                        if (sp > 0) { did2 = stk.get(sp - 1) } else { sbad = true }
+                    } else {
+                        sbad = true
+                    }
+                    if (sbad) {
+                        ar.err = "SETITEM stack underflow at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        ok2<Bool> = pk_dict_set(borrow(ar), did2, kid2, vid2)
+                        if (ok2 == false) {
+                            ar.err = "SETITEM into non-dict at offset " + pos.to_string()
+                            ar.nerr = ar.nerr + 1
+                            failed = true
+                        } else {
+                            pos = pos + 1
+                        }
+                    }
+                } else {
+                if (op == 0x75) {
+                    # SETITEMS: every pair back to the MARK at once; the dict is PEEKED (CPython's
+                    # load_setitems). Shards that set their whole dict in one go use this instead of
+                    # per-pair SETITEM — shard 2 (41 tensors) does, shard 1 (1 tensor) does not.
+                    tmpd<Vec<Int>> = Vec()
+                    hitd<Bool> = false
+                    okm<Bool> = false
+                    while (hitd == false) {
+                        if (sp > 0) {
+                            td<Int> = stk.get(sp - 1)
+                            sp = sp - 1
+                            if (td == -1) { hitd = true; okm = true } else { tmpd.push(td) }
+                        } else {
+                            hitd = true
+                        }
+                    }
+                    if (okm == false) {
+                        ar.err = "SETITEMS without MARK at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        if (sp <= 0) {
+                            ar.err = "SETITEMS with no dict on the stack at offset " + pos.to_string()
+                            ar.nerr = ar.nerr + 1
+                            failed = true
+                        } else {
+                            dids<Int> = stk.get(sp - 1)
+                            revd<Vec<Int>> = Vec()
+                            i9<Int> = tmpd.len() - 1
+                            while (i9 >= 0) { revd.push(tmpd.get(i9)); i9 = i9 - 1 }
+                            np<Int> = revd.len() / 2
+                            pi<Int> = 0
+                            pbad<Bool> = false
+                            for (pi in 0..np - 1) {
+                                okp<Bool> = pk_dict_set(borrow(ar), dids, revd.get(2 * pi), revd.get(2 * pi + 1))
+                                if (okp == false) { pbad = true }
+                            }
+                            if (pbad) {
+                                ar.err = "SETITEMS into non-dict at offset " + pos.to_string()
+                                ar.nerr = ar.nerr + 1
+                                failed = true
+                            } else {
+                                pos = pos + 1
+                            }
+                        }
+                    }
+                } else {
+                if (op == 0x61) {
+                    # APPEND: value is popped, the LIST IS PEEKED (CPython's load_append)
+                    av<Int> = -1
+                    al<Int> = -1
+                    abad<Bool> = false
+                    if (sp >= 1) {
+                        av = stk.get(sp - 1)
+                        sp = sp - 1
+                        if (sp > 0) { al = stk.get(sp - 1) } else { abad = true }
+                    } else {
+                        abad = true
+                    }
+                    if (abad) {
+                        ar.err = "APPEND stack underflow at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    } else {
+                        ok3<Bool> = pk_list_push(borrow(ar), al, av)
+                        if (ok3 == false) {
+                            ar.err = "APPEND into non-list at offset " + pos.to_string()
+                            ar.nerr = ar.nerr + 1
+                            failed = true
+                        } else {
+                            pos = pos + 1
+                        }
+                    }
+                } else {
+                if (op == 0x62) {
+                    # BUILD: state is popped, the INSTANCE IS PEEKED (CPython's load_build)
+                    if (sp >= 2) {
+                        sp = sp - 1
+                        pos = pos + 1
+                    } else {
+                        ar.err = "BUILD stack underflow at offset " + pos.to_string()
+                        ar.nerr = ar.nerr + 1
+                        failed = true
+                    }
+                } else {
+                if (op == 0x2e) {
+                    if (sp > 0) { result = stk.get(sp - 1) }
+                    stop = pos
+                    ndone = true
+                } else {
+                    ar.err = "unhandled opcode " + pk_op_txt(op) + " at offset " + pos.to_string()
+                    ar.nerr = ar.nerr + 1
+                    failed = true
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+            }
+        }
+    }
+
+    okk<Bool> = false
+    if (failed == false) { if (result >= 0) { okk = true } }
+    return PkOut { ok = okk, err = ar.err, result = result, stop = stop, bytes = n, ar = ar }
+}

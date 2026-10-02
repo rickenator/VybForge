@@ -1,0 +1,136 @@
+# st_probe.vyb — S0.3 driver: enumerate a safetensors file through native/torchload/safetensors.vyb
+# and emit a canonical listing for the gate.
+#
+# The independent other side is native/torchload/st_ref.py (its own parse, not this module's), and
+# native/torchload/st_libcheck.py cross-checks the file with the upstream `safetensors` library.
+# The three must agree byte-for-byte on the listing.
+#
+#   VYBFORGE_ST_FILE   file to read   (default artifacts/vybos-configurator-lora/adapter_model.safetensors)
+#   VYBFORGE_ST_OUT    listing path   (default native/out/st_listing_vyb.txt)
+#
+# Run:  "$VYB" --module-path native/json native/torchload/st_probe.vyb
+# Gate: native/legit/run_safetensors_gate.sh
+#
+# SAMPLING RULE — st_ref.py implements this identically; change both together.
+#   A tensor's sha column is the sha256 of its first `hlen` bytes, where
+#     hlen = its byte length                          if the file is <= 300,000,000 bytes
+#     hlen = min(byte length, 1,048,576)              otherwise
+#   and for files over the threshold only these tensors are hashed (indices, deduped, ascending):
+#     {0, 1, n-2, n-1, argmin(bytes), argmax(bytes)}   (argmin/argmax = first occurrence)
+#   Unhashed tensors print "-". This keeps the gate bounded on multi-GB shards while still
+#   comparing real bytes at both ends of the file, at the smallest and the largest tensor.
+
+import io::{open_write, write_str, close}
+import env::{env_get}
+import safetensors
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+push_uniq(v<Vec<Int>>, x<Int>)<Vec<Int>> -> {
+    r<Vec<Int>> = Vec()
+    i<Int> = 0
+    for (i in 0..v.len() - 1) { r.push(v.get(i)) }
+    if (x < 0) { return r }
+    i = 0
+    for (i in 0..r.len() - 1) {
+        if (r.get(i) == x) { return r }
+    }
+    r.push(x)
+    return r
+}
+
+contains(v<Vec<Int>>, x<Int>)<Bool> -> {
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (v.get(i) == x) { return true }
+    }
+    return false
+}
+
+main()<Int> -> {
+    path<String> = env("VYBFORGE_ST_FILE", "artifacts/vybos-configurator-lora/adapter_model.safetensors")
+    out<String> = env("VYBFORGE_ST_OUT", "native/out/st_listing_vyb.txt")
+    BIG<Int> = 300000000
+    WIN<Int> = 1048576
+
+    ix<StIndex> = st_open(path)
+    if (ix.n <= 0) {
+        println("ST_PROBE_FAIL tensors=0 path=" + path)
+        exit(1)
+    }
+    end<Int> = st_data_end(ix)
+    big<Bool> = (end > BIG)
+
+    picked<Vec<Int>> = Vec()
+    if (big) {
+        picked = push_uniq(picked, 0)
+        picked = push_uniq(picked, 1)
+        picked = push_uniq(picked, ix.n - 2)
+        picked = push_uniq(picked, ix.n - 1)
+        imin<Int> = 0
+        imax<Int> = 0
+        i<Int> = 0
+        for (i in 0..ix.n - 1) {
+            if (ix.dlen.get(i) < ix.dlen.get(imin)) { imin = i }
+            if (ix.dlen.get(i) > ix.dlen.get(imax)) { imax = i }
+        }
+        picked = push_uniq(picked, imin)
+        picked = push_uniq(picked, imax)
+    }
+
+    r<String> = "TENSORS " + ix.n.to_string() + "\n"
+    r = r + "HEADER " + ix.hlen.to_string() + "\n"
+    r = r + "DATABASE " + ix.data_base.to_string() + "\n"
+    r = r + "DATAEND " + end.to_string() + "\n"
+    r = r + "BIG " + big.to_string() + "\n"
+
+    bad<Int> = 0
+    nosize<Int> = 0
+    hc<Int> = 0
+    i2<Int> = 0
+    for (i2 in 0..ix.n - 1) {
+        dt<String> = ix.dtypes.get(i2)
+        nb<Int> = ix.dlen.get(i2)
+        sz<Int> = st_dtsize(dt)
+        if (sz > 0) {
+            if (st_numel(ix, i2) * sz != nb) { bad = bad + 1 }
+        } else {
+            nosize = nosize + 1
+        }
+        go<Bool> = true
+        hl<Int> = nb
+        if (big) {
+            go = contains(picked, i2)
+            if (nb > WIN) { hl = WIN }
+        }
+        sha<String> = "-"
+        if (go) {
+            sha = st_sha(path, ix.data_base + ix.doff.get(i2), hl)
+            if (sha.len() == 0) { sha = "ERR" } else { hc = hc + 1 }
+        }
+        r = r + ix.names.get(i2) + "|" + dt + "|" + st_shape_str(ix, i2) + "|" + nb.to_string() + "|" + sha + "\n"
+    }
+    r = r + "HASHED " + hc.to_string() + "\n"
+    r = r + "MISMATCH " + bad.to_string() + "\n"
+    r = r + "NOSIZE " + nosize.to_string() + "\n"
+
+    wrc<Int> = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) {
+        println("ST_PROBE_FAIL write=" + out)
+        exit(1)
+    }
+    println("ST_PROBE_OK tensors=" + ix.n.to_string() + " header=" + ix.hlen.to_string() +
+            " hashed=" + hc.to_string() + " mismatch=" + bad.to_string() + " nosize=" + nosize.to_string() +
+            " out=" + out)
+    if (bad > 0) {
+        println("ST_PROBE_FAIL numel*dtsize != data length")
+        exit(1)
+    }
+    return 0
+}

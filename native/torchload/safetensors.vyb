@@ -1,0 +1,233 @@
+# safetensors.vyb — native reader for the safetensors container format (host-mode Vyb).
+#
+# GENERIC: any safetensors file, not one model. Scope and the port-vs-consume rule:
+# doc/SUBSTRATE-SCOPE.md. This is the S0.3 loader the SpikingBrain/any-safetensors path reads through.
+#
+# Container layout (all lengths little-endian):
+#   bytes 0..7     u64 N     = length of the JSON header that follows
+#   bytes 8..8+N   JSON      = {"<tensor>": {"dtype": "BF16", "shape": [a, b],
+#                                            "data_offsets": [start, end]}, "__metadata__": {...}}
+#   bytes 8+N..    raw tensor bytes. A tensor occupies [start, end) RELATIVE to 8+N; the data
+#                  region is NOT padded or aligned, so every access is an explicit offset+length
+#                  read (no struct casts, no alignment assumptions).
+#
+# Indexing reads only the 8-byte prefix and the header, so building the index of a 4 GB shard
+# costs one header read. Tensor bytes are read on demand via st_sha (or by a consumer that keeps
+# the file open), never materialized wholesale.
+#
+# dtype strings are the safetensors spellings; st_dtsize returns 0 for anything not listed (a
+# consumer must then not assume a layout — the listing flags such tensors rather than guessing).
+
+import io::{open_read, read_at, close}
+import json_parse
+import crypto::{sha256}
+
+# Structure-of-arrays: no Vec<Vec<T>> anywhere (Vyb crash family). Shapes live flattened in
+# `shp` with (shp_off, shp_len) per tensor.
+share(all)
+struct StIndex {
+    n<Int>,
+    names<Vec<String>>,
+    dtypes<Vec<String>>,
+    shp_off<Vec<Int>>,
+    shp_len<Vec<Int>>,
+    shp<Vec<Int>>,
+    doff<Vec<Int>>,
+    dlen<Vec<Int>>,
+    hlen<Int>,
+    data_base<Int>,
+    path<String>
+}
+
+share(all)
+st_u8(s<String>, off<Int>)<Int> -> {
+    return (s.char_at(off) as Int) & 255
+}
+
+share(all)
+st_u64le(s<String>, off<Int>)<Int> -> {
+    return st_u8(s, off) | (st_u8(s, off + 1) << 8) | (st_u8(s, off + 2) << 16) | (st_u8(s, off + 3) << 24) |
+           (st_u8(s, off + 4) << 32) | (st_u8(s, off + 5) << 40) | (st_u8(s, off + 6) << 48) | (st_u8(s, off + 7) << 56)
+}
+
+share(all)
+st_dtsize(dt<String>)<Int> -> {
+    if (dt == "F64") { return 8 }
+    if (dt == "I64") { return 8 }
+    if (dt == "U64") { return 8 }
+    if (dt == "F32") { return 4 }
+    if (dt == "I32") { return 4 }
+    if (dt == "U32") { return 4 }
+    if (dt == "F16") { return 2 }
+    if (dt == "BF16") { return 2 }
+    if (dt == "I16") { return 2 }
+    if (dt == "U16") { return 2 }
+    if (dt == "I8") { return 1 }
+    if (dt == "U8") { return 1 }
+    if (dt == "BOOL") { return 1 }
+    if (dt == "F8_E4M3") { return 1 }
+    if (dt == "F8_E5M2") { return 1 }
+    return 0
+}
+
+# Numeric array reader. NOTE: json_parse's jgetarr() returns child NODE IDS, not values
+# (json_parse.vyb:641 pushes d.elem(cid, i)) — it is an id-list accessor for traversal, so an
+# array of numbers must be read through d.int(). Using jgetarr here yields small ascending
+# integers that look plausible (node ids) instead of an error, which is exactly how this cost
+# a gate run. Values, not ids.
+share(all)
+st_arr_ints(d<JsonDoc>, id<Int>, key<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    cid<Int> = d.get(id, key)
+    if (cid < 0) { return out }
+    nn<Int> = d.len(cid)
+    i<Int> = 0
+    while (i < nn) {
+        out.push(d.int(d.elem(cid, i)))
+        i = i + 1
+    }
+    return out
+}
+
+# Build the index. On any failure (missing file, short read, unparseable header) returns an
+# index with n == 0 — callers check n rather than inspecting a partial index.
+share(all)
+st_open(path<String>)<StIndex> -> {
+    ix<StIndex> = StIndex { n = 0, names = Vec(), dtypes = Vec(), shp_off = Vec(), shp_len = Vec(),
+                            shp = Vec(), doff = Vec(), dlen = Vec(), hlen = 0, data_base = 0, path = path }
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, 0, 8)) {
+                h8 -> {
+                    hl<Int> = st_u64le(h8, 0)
+                    ix.hlen = hl
+                    ix.data_base = 8 + hl
+                    match (read_at(f, 8, hl)) {
+                        hdr -> {
+                            match (json_parse(hdr)) {
+                                d -> {
+                                    rid<Int> = d.rootid()
+                                    ks<Vec<String>> = d.keys(rid)
+                                    k<Int> = 0
+                                    for (k in 0..ks.len() - 1) {
+                                        nm<String> = ks.get(k)
+                                        if (nm == "__metadata__") { } else {
+                                            tid<Int> = d.get(rid, nm)
+                                            if (tid >= 0) {
+                                                sh<Vec<Int>> = st_arr_ints(d, tid, "shape")
+                                                ofs<Vec<Int>> = st_arr_ints(d, tid, "data_offsets")
+                                                if (ofs.len() >= 2) {
+                                                    ix.names.push(nm)
+                                                    ix.dtypes.push(jgetstr(d, tid, "dtype"))
+                                                    ix.shp_off.push(ix.shp.len())
+                                                    ix.shp_len.push(sh.len())
+                                                    s2<Int> = 0
+                                                    for (s2 in 0..sh.len() - 1) { ix.shp.push(sh.get(s2)) }
+                                                    ix.doff.push(ofs.get(0))
+                                                    ix.dlen.push(ofs.get(1) - ofs.get(0))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ix.n = ix.names.len()
+                                }
+                                ? -> { }
+                            }
+                        }
+                        ? -> { }
+                    }
+                }
+                ? -> { }
+            }
+            close(f)
+        }
+        ? -> { }
+    }
+    return ix
+}
+
+share(all)
+st_find(ix<StIndex>, name<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..ix.n - 1) {
+        if (ix.names.get(i) == name) { return i }
+    }
+    return -1
+}
+
+share(all)
+st_rank(ix<StIndex>, i<Int>)<Int> -> {
+    if (i < 0) { return 0 }
+    if (i >= ix.n) { return 0 }
+    return ix.shp_len.get(i)
+}
+
+share(all)
+st_shape(ix<StIndex>, i<Int>)<Vec<Int>> -> {
+    sh<Vec<Int>> = Vec()
+    if (i < 0) { return sh }
+    if (i >= ix.n) { return sh }
+    o<Int> = ix.shp_off.get(i)
+    s2<Int> = 0
+    for (s2 in 0..ix.shp_len.get(i) - 1) { sh.push(ix.shp.get(o + s2)) }
+    return sh
+}
+
+share(all)
+st_numel(ix<StIndex>, i<Int>)<Int> -> {
+    if (i < 0) { return 0 }
+    if (i >= ix.n) { return 0 }
+    n<Int> = 1
+    o<Int> = ix.shp_off.get(i)
+    s2<Int> = 0
+    for (s2 in 0..ix.shp_len.get(i) - 1) { n = n * ix.shp.get(o + s2) }
+    return n
+}
+
+# Canonical shape text for the gate: dims joined with ',', empty string for a rank-0 tensor.
+share(all)
+st_shape_str(ix<StIndex>, i<Int>)<String> -> {
+    r<String> = ""
+    if (i < 0) { return r }
+    if (i >= ix.n) { return r }
+    o<Int> = ix.shp_off.get(i)
+    s2<Int> = 0
+    for (s2 in 0..ix.shp_len.get(i) - 1) {
+        if (s2 > 0) { r = r + "," }
+        r = r + ix.shp.get(o + s2).to_string()
+    }
+    return r
+}
+
+# One past the last data byte = 8 + header + max(data_offset + data_len). safetensors has no
+# trailing region, so this is the file size without a stat call.
+share(all)
+st_data_end(ix<StIndex>)<Int> -> {
+    m<Int> = 0
+    i<Int> = 0
+    for (i in 0..ix.n - 1) {
+        e<Int> = ix.doff.get(i) + ix.dlen.get(i)
+        if (e > m) { m = e }
+    }
+    return ix.data_base + m
+}
+
+# sha256 of n bytes at absolute offset `off`. Empty string on failure. This is the byte-parity
+# primitive the S0.3 gate samples tensors with; it is also what a consumer uses to verify a
+# tensor it is about to load.
+share(all)
+st_sha(path<String>, off<Int>, n<Int>)<String> -> {
+    r<String> = ""
+    if (n <= 0) { return r }
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, n)) {
+                s -> { r = sha256(s) }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
