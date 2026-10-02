@@ -8,14 +8,10 @@ mkdir -p "$root/bin" "$root/data"
 "$VYB" "$root/training/generate_dataset.vyb" --build "$root/bin/vybos-training-data" -O2
 # Native Vyb prints main()'s integer return after stdout. Keep only JSONL rows.
 "$root/bin/vybos-training-data" | sed -n '/^{/p' >"$root/data/vybos-configurator-all.jsonl"
-python3 - "$root/data/vybos-configurator-all.jsonl" "$root/data/vybos-configurator-train.jsonl" "$root/data/vybos-configurator-eval.jsonl" <<'PY'
-import json
-import sys
-
-source, train, evaluation = map(__import__('pathlib').Path, sys.argv[1:])
-rows = [json.loads(line) for line in source.read_text().splitlines() if line]
-for path, split in ((train, 'train'), (evaluation, 'eval')):
-    selected = [row for row in rows if row['metadata']['split'] == split]
-    path.write_text(''.join(json.dumps(row, separators=(',', ':')) + '\n' for row in selected))
-    print(f'{path.name}: {len(selected)} valid records')
-PY
+# Split into train/eval — Vyb-native since Phase 2 (P2.5a); the inline interpreter
+# heredoc it replaces is gone. Byte-parity with the committed splits is asserted by
+# native/legit/run_split_gate.sh.
+VYBFORGE_SPLIT_SRC="$root/data/vybos-configurator-all.jsonl" \
+VYBFORGE_SPLIT_TRAIN="$root/data/vybos-configurator-train.jsonl" \
+VYBFORGE_SPLIT_EVAL="$root/data/vybos-configurator-eval.jsonl" \
+    "$VYB" "$root/training/split_dataset.vyb" --module-path "$root/native/json"

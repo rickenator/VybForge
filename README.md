@@ -186,6 +186,17 @@ environment, verifies CUDA, and launches QLoRA in the background. Read
 `training/AGENTS.md` before changing the corpus or running training. `make -f
 native/Makefile verify` is the native-suite entry point.
 
+Phase 2 (torch → Vyb) is in progress; `doc/P2-TRAINER-PLAN.md` is the step map and
+the source of each step's gate. `native/legit/run_phase2_battery.sh` runs the Phase-2
+gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
+
+- `training/generate-data.sh` is Python-free: the corpus generator and the
+  train/eval split are both Vyb (`training/generate_dataset.vyb`,
+  `training/split_dataset.vyb`). The splitter reproduces the committed
+  `data/vybos-configurator-{train,eval}.jsonl` byte-for-byte, and the regenerated
+  corpus matches the committed `all.jsonl` byte-for-byte
+  (`native/legit/run_split_gate.sh`).
+
 ## Boundaries
 
 - Draft-only: no VybOS builds/realizes/execs/generations, no host edits.

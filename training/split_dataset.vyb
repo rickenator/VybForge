@@ -1,0 +1,132 @@
+# split_dataset.vyb — split the generated corpus into train/eval JSONL, Vyb-native.
+#
+# Phase 2, P2.5a: replaces the inline `python3 -` heredoc that used to live in
+# training/generate-data.sh. What Python did, and what this reproduces:
+#
+#   rows = [json.loads(line) for line in source.read_text().splitlines() if line]
+#   for path, split in ((train, 'train'), (eval, 'eval')):
+#       selected = [row for row in rows if row['metadata']['split'] == split]
+#       path.write_text(''.join(json.dumps(row, separators=(',', ':')) + "\n"
+#                               for row in selected))
+#
+# So: parse each row of the source JSONL, keep it by metadata.split, and re-emit it
+# compact — json_util::json_text is the json.dumps(separators=(',',':')) shape.
+# Rows whose metadata.split is neither train nor eval are dropped, in the source
+# order, exactly as the comprehension did. A row without metadata is skipped rather
+# than crashing (the Python would raise; nothing in the corpus depends on that).
+#
+# The JIT has no argv, so paths come from the environment:
+#   VYBFORGE_SPLIT_SRC    default data/vybos-configurator-all.jsonl
+#   VYBFORGE_SPLIT_TRAIN  default data/vybos-configurator-train.jsonl
+#   VYBFORGE_SPLIT_EVAL   default data/vybos-configurator-eval.jsonl
+#
+# Build/run (json_parse + json_emit live under native/json):
+#   "$VYB" training/split_dataset.vyb --module-path native/json
+#
+# Gate: native/legit/run_split_gate.sh — splitting the committed all.jsonl must
+# reproduce the committed train.jsonl and eval.jsonl byte-for-byte.
+import io::{open_read, read_all, open_write, write_str, close}
+import env::{env_get}
+import term::{eprintln}
+import json_parse
+# json_emit::json_text_tight is the json.dumps(separators=(',',':')) shape *including*
+# CPython's ensure_ascii escaping (json_escape_py); json_util::json_text is the
+# minimal-escaping variant used for model replies, which would leave non-ASCII bytes
+# raw and break byte-parity with the committed corpus.
+import json_emit::{json_text_tight}
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+writef(p<String>, text<String>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) {
+        f -> { write_str(f, text); close(f); rc = 0 }
+        ? -> { rc = 1 }
+    }
+    return rc
+}
+
+env(p<String>, d<String>)<String> -> {
+    return env_get(p) else d
+}
+
+# The split label of one parsed row: metadata.split, or "" when absent.
+row_split(rec<JsonDoc>)<String> -> {
+    meta<Int> = rec.get(rec.root, "metadata")
+    if (meta == -1) { return "" }
+    if (rec.kind(meta) != "object") { return "" }
+    s<Int> = rec.get(meta, "split")
+    if (s == -1) { return "" }
+    if (rec.kind(s) != "string") { return "" }
+    return rec.hstr(s)
+}
+
+main()<Int> -> {
+    src_p<String> = env("VYBFORGE_SPLIT_SRC", "data/vybos-configurator-all.jsonl")
+    trn_p<String> = env("VYBFORGE_SPLIT_TRAIN", "data/vybos-configurator-train.jsonl")
+    evl_p<String> = env("VYBFORGE_SPLIT_EVAL", "data/vybos-configurator-eval.jsonl")
+
+    src<String> = readf(src_p)
+    if (src.len() == 0) { eprintln("split_dataset: no input at " + src_p); return 2 }
+
+    trn<String> = ""
+    evl<String> = ""
+    ntrn<Int> = 0
+    nevl<Int> = 0
+    bad<Int> = 0
+
+    sl<Int> = src.len()
+    st<Int> = 0
+    k<Int> = 0
+    for (k in 0..sl - 1) {
+        if ((src.char_at(k) as Int) == 10) {
+            line<String> = src.substring(st, k)
+            st = k + 1
+            if (line.len() > 2) {
+                match (json_parse(line)) {
+                    rec -> {
+                        sp<String> = row_split(rec)
+                        if (sp == "train") {
+                            trn = trn + json_text_tight(rec, rec.root) + "\n"
+                            ntrn = ntrn + 1
+                        } else if (sp == "eval") {
+                            evl = evl + json_text_tight(rec, rec.root) + "\n"
+                            nevl = nevl + 1
+                        } else {
+                            bad = bad + 1
+                        }
+                    }
+                    ? -> { bad = bad + 1 }
+                }
+            }
+        }
+    }
+    # last line without a trailing newline
+    if (st < sl) {
+        line2<String> = src.substring(st, sl)
+        if (line2.len() > 2) {
+            match (json_parse(line2)) {
+                rec2 -> {
+                    sp2<String> = row_split(rec2)
+                    if (sp2 == "train") { trn = trn + json_text_tight(rec2, rec2.root) + "\n"; ntrn = ntrn + 1 }
+                    else if (sp2 == "eval") { evl = evl + json_text_tight(rec2, rec2.root) + "\n"; nevl = nevl + 1 }
+                    else { bad = bad + 1 }
+                }
+                ? -> { bad = bad + 1 }
+            }
+        }
+    }
+
+    e1<Int> = writef(trn_p, trn)
+    e2<Int> = writef(evl_p, evl)
+    if (e1 != 0 || e2 != 0) { eprintln("split_dataset: write failed"); return 3 }
+
+    println("train: " + ntrn.to_string() + " records -> " + trn_p)
+    println("eval:  " + nevl.to_string() + " records -> " + evl_p)
+    if (bad > 0) { println("skipped: " + bad.to_string() + " rows without a train/eval split") }
+    return 0
+}

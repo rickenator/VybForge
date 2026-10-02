@@ -134,6 +134,13 @@ code change.
 
 ## Phase 2 — Vyb-native QLoRA trainer (replaces torch pipeline)
 
+**Execution plan, per-step gates and progress live in `doc/P2-TRAINER-PLAN.md`** —
+read that first; the table below is the original shape of the work. Its P2.1 gate
+wording is superseded by the measured baselines in that doc: only the `(93, 9)`
+parameterization of `gen_kv_train.py` reproduces its committed driver byte-for-byte
+(`(513, 429)` and a fresh `_build_kv.py` run do not), so the byte-exact gate applies
+there and the other inputs are compile-checked or frozen-baseline gated.
+
 Replaces: `training/train_lora.py` (QLoRA, NF4 base), `training/smoke_adapter.py`,
 `training/start-training.sh`, `native/train/{build_fullmanifest,_build_kv,gen_kv_train,rbuild}.py`.
 
@@ -163,7 +170,7 @@ verification stays, production Python goes.
 | `native/legit/run_*.sh` gates (P1.1–P1.8) | verifier calls only, venv-preferred | reference verification | kept |
 | `native/gdecode/run_pipeline.sh` | stage D verifier (venv-preferred since P1.6) | reference verification | kept |
 | `run.sh`, `run-vyb.sh`, `vyb-run.sh` | **0** | production entry points | Vyb-only (`run.sh` drives `app/configurator.vyb` since P1.4) |
-| `training/generate-data.sh` | inline `python3 -` heredoc that synthesizes the train/eval JSONL | training path, not the Phase-1 production path | **deferred to Phase 2** (disappears with the torch pipeline, P2.5/P2.6) |
+| `training/generate-data.sh` | inline `python3 -` heredoc that synthesizes the train/eval JSONL | training path, not the Phase-1 production path | **DONE in P2.5a** — replaced by `training/split_dataset.vyb`, byte-verified against the committed splits and the regenerated corpus (`native/legit/run_split_gate.sh`); only the `start-training` venv bootstrap is still Python |
 | `training/start-training.sh` | `python3 -m venv` + torch bootstrap on the training host | training path | deferred to Phase 2 |
 | CI | this repo has no `.github/` workflows | — | nothing to update |
 
