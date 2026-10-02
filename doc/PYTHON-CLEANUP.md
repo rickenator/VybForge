@@ -241,6 +241,28 @@ script is judged by *what it does*, not that it exists. Reference verification
 (an oracle asserting a Vyb artifact against an independent implementation) is
 sanctioned and stays; production work done in Python is what the audit removes.
 
+## Status notes on the Python that stays
+
+Two kinds of Python stay, and they are recorded differently:
+
+1. **Oracles** — covered by the policy above. Held until the model sweep, comment-your-replacement
+   when retired.
+2. **WIP / dead-end scripts** — Python that is neither production nor an oracle, whose Vyb
+   replacement would be busywork over an artifact that never existed. These get a STATUS header
+   in the file itself, so the decision travels with the code instead of living only in a doc:
+
+   - `native/train/rbuild.py` — **P2.1d: left un-ported.** It assembles
+     `native/train/kvresp_train_r.vyb` (R-restricted per-token trainer for the 513-token
+     manifest), but that driver has never been generated and never existed in the repo
+     (`git log --all --diff-filter=A` for the path is empty), the script is self-declared
+     partial ("dattn combined-staging + buffer allocs still to splice"), and nothing builds it —
+     no Makefile target, no referencing script. It belongs to the from-scratch `kvresp_train`
+     line, not to P2.2's QLoRA port. Its S→R substitution is brittle by construction
+     (`replace(str(SD), str(RB))` rewrites any number containing those digits), so a faithful
+     port would carry a workaround into Vyb — which the dogfooding rule forbids. The
+     authoritative spec is the "CONCRETE BUILD PLAN" in `native/train/FULLMANIFEST-MILESTONE.md`;
+     if that trainer is ever needed, write it fresh in Vyb from that plan.
+
 ## Final invariant
 
 `make verify`, `schemacheck`, gdecode pipeline, apply pipeline, repair boundary,

@@ -143,8 +143,13 @@ generated driver (semantic analysis + codegen; `--check` turned out to be a *for
 check, not a semantic one), the live oracle cross-check, and a check that the committed driver
 is untouched.
 
-**P2.1d — `rbuild.py`**: decision — port as-is (gate: frozen baseline, partial-ness
-documented) or retire as superseded by P2.2's direct trainer. Blocks nothing else.
+**P2.1d — `rbuild.py`**: decision — **leave un-ported** (recorded 2026-10-02; STATUS header on
+the script + "Status notes on the Python that stays" in `doc/PYTHON-CLEANUP.md`). It assembles
+`kvresp_train_r.vyb`, a driver that has never existed in the repo; the script is self-declared
+partial, nothing builds it, and it belongs to the from-scratch `kvresp_train` line rather than to
+P2.2's QLoRA port. Its brittle raw-literal S→R substitution is not worth carrying into Vyb; the
+real deliverable is the transform spec in `native/train/FULLMANIFEST-MILESTONE.md`. Blocks
+nothing else.
 
 **P2.2 — the trainer** (the real project): frozen base (GGUF q4_0 dequant path), LoRA
 bf16 parameters, AdamW, multi-epoch over the 216-record corpus, per-step loss to disk.

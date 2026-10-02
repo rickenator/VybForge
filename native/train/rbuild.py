@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+# STATUS (recorded 2026-10-02, Phase 2 / P2.1d decision): WIP scratch — NOT converted, NOT
+# deleted, deliberately left as-is. Facts behind that call:
+#   * Its output native/train/kvresp_train_r.vyb has never been generated and never existed
+#     in the repo (git log --all --diff-filter=A for that path is empty): there is no verified
+#     artifact for this script, only the transform.
+#   * It is self-declared partial — the last line it prints is "dattn combined-staging +
+#     buffer allocs still to splice; THIS IS A PARTIAL BUILD for compile-checking the S->R
+#     transform only". Step 2c of the plan (combined-cache dattn, frozen-context zeroing,
+#     compact<->combined staging) is absent below.
+#   * Nothing builds it: no Makefile target and no script references it. It belongs to the
+#     from-scratch kvresp_train line (manifest-scale gradient engine), not to the Phase 2
+#     QLoRA port (P2.2 native/train/lora_train.vyb).
+#   * Its substitution is brittle by construction (e.g. replace(str(SD), str(RB)) rewrites any
+#     number containing those digits), so a faithful port would carry that brittleness into
+#     Vyb as a workaround — the dogfooding rule says don't.
+# The authoritative spec for the R-restricted trainer is the "CONCRETE BUILD PLAN" in
+# native/train/FULLMANIFEST-MILESTONE.md, which is the real deliverable here. If that trainer
+# is ever needed, write it fresh in Vyb from that plan rather than porting this script.
+# See doc/PYTHON-CLEANUP.md ("Status notes on the Python that stays").
 """Build native/train/kvresp_train_r.vyb: R-RESTRICTED per-token KV trainer.
 
 RELIABLE method: extract the COMMITTED (verified) S=93 backward `for (Li2..)` loop body and apply a
