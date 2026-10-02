@@ -19,6 +19,12 @@ Python is used only for reference *verification*, and never at runtime."
 | Superseded / ported | 7 | DELETE |
 | Torch training pipeline | 5 (+ start-training.sh) | CONVERT (Phase 2) |
 
+The oracle count grows by one in Phase 2: `native/train/render_chat_ref.py` (P2.2a) is a new
+*reference* oracle — llama.cpp's Jinja rendering of the GGUF's own chat template — not production
+code. It exists so `render_chat.vyb` has an independent implementation to be checked against, which
+is exactly what the Oracle policy asks for. It needs the repo `.venv` (llama_cpp) and the Qwen3-4B
+GGUF, so the gate falls back to the pinned hashes when either is absent.
+
 ## Phase 1 — production tooling → Vyb (checkpoint gates)
 
 | # | From (Python) | To (Vyb) | Gate |
@@ -145,8 +151,10 @@ baseline of the oracle's own output instead.
 Landed so far: **P2.5a** `training/split_dataset.vyb` (the inline split heredoc is gone;
 `training/generate-data.sh` is Python-free), **P2.1a** `native/train/gen_kv_train.vyb`
 (driver parameterizer), **P2.1b** `native/train/build_fullmanifest.vyb` (manifest + token
-ids, which also fixed a real pre-tokenizer bug — see `doc/P2-TRAINER-PLAN.md`) and
-**P2.1c** `native/train/_build_kv.vyb` (driver assembler). All gated byte-for-byte;
+ids, which also fixed a real pre-tokenizer bug — see `doc/P2-TRAINER-PLAN.md`),
+**P2.1c** `native/train/_build_kv.vyb` (driver assembler) and **P2.2a part 1**
+`native/train/render_chat.vyb` (corpus → Qwen3 chat-templated text, byte-parity with
+llama.cpp's Jinja on all 720 records plus 8 boundary cases). All gated byte-for-byte;
 `native/legit/run_phase2_battery.sh` runs them, `native/legit/run_phase1_battery.sh` stays
 the regression gate.
 

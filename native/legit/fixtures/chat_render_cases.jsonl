@@ -1,0 +1,8 @@
+{"messages": [{"role": "user", "content": "hello"}]}
+{"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "{\"kind\":\"question\"}"}]}
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "first"}, {"role": "assistant", "content": "first answer"}, {"role": "user", "content": "second"}, {"role": "assistant", "content": "second answer"}]}
+{"messages": [{"role": "user", "content": "go"}, {"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "assistant", "content": "done"}]}
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "q"}, {"role": "assistant", "content": "<think>\nreasoning here\n</think>\n\nfinal answer"}]}
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "q"}, {"role": "assistant", "content": "<think>\nmid reason\n</think>\n\nmid answer"}, {"role": "assistant", "content": "<think>\nlast reason\n</think>\n\nlast answer"}]}
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "\n\npadded user\n\n"}, {"role": "assistant", "content": "\n\npadded answer\n\n"}]}
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "héllo — ✓ 日本語"}, {"role": "assistant", "content": ""}]}

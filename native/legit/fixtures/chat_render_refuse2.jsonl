@@ -1,0 +1,1 @@
+{"messages": [{"role": "system", "content": "You are the VybOS configuration interviewer."}, {"role": "user", "content": "q"}, {"role": "assistant", "content": "x"}], "tools": [{"type": "function", "function": {"name": "f"}}]}

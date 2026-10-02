@@ -57,6 +57,14 @@ else
   step "P2.1c _build_kv.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# P2.2a — render_chat.vyb (corpus -> chat-templated text, Qwen3 template from GGUF metadata)
+out="$(./native/legit/run_chat_render_gate.sh 2>&1)"
+if echo "$out" | tail -1 | grep -q "PASS"; then
+  step "P2.2a render_chat.vyb" "720-record render byte-identical to the GGUF template"
+else
+  step "P2.2a render_chat.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

@@ -1,0 +1,266 @@
+# render_chat.vyb — P2.2a: render the configurator corpus into the chat-templated
+# training text, exactly the way the Qwen3 chat template in the GGUF metadata renders it
+# (add_generation_prompt=false), i.e. what training/train_lora.py gets from
+# `tokenizer.apply_chat_template(example['messages'], tokenize=False,
+#  add_generation_prompt=False)`.
+#
+# The template is not guessed: the GGUF metadata carries `tokenizer.chat_template`
+# (Qwen3-4B, 4,049 chars, sha256 3802169b…), pinned as
+# native/legit/fixtures/qwen3_chat_template.jinja. The gate renders every record through
+# that template with llama.cpp's Jinja (llama_chat_format.Jinja2ChatFormatter) and requires
+# byte-identical output.
+#
+# Implemented subset — the corpus (720 records) is uniformly {system, user, assistant} with
+# string contents, and the tool path is not requested. Rather than render *something* for
+# input it has not been shown, the program refuses what it does not implement:
+#   * `tools` / `tool_calls` present        -> error (the tool branch is not implemented)
+#   * a role other than system/user/assistant -> error
+#   * non-string `content`                  -> error
+# Everything else follows the template literally, including the pieces the corpus does not
+# exercise (the `</think>` reasoning split and the multi-step-tool query-index scan under
+# literal `\n`), which the gate covers with synthetic cases.
+#
+# Output is deliberately not JSON: the rendered text contains real newlines, so it is
+# written raw, with a companion index of cumulative byte offsets (one per record) so
+# consumers slice records without re-parsing the text.
+#   VYBFORGE_CHAT_SRC  data/vybos-configurator-all.jsonl
+#   VYBFORGE_CHAT_OUT  native/out/chat_render.txt
+#   VYBFORGE_CHAT_IDX  native/out/chat_render.idx
+#
+# Run:  "$VYB" --module-path native/json native/train/render_chat.vyb
+# Gate: native/legit/run_chat_render_gate.sh
+import io::{open_read, read_all, open_write, write_str, close}
+import env::{env_get}
+import term::{eprintln}
+import json_parse
+
+# ---- io ----
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) {
+        f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+writef(p<String>, text<String>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) { f -> { write_str(f, text); close(f); rc = 0 } ? -> { rc = 1 } }
+    return rc
+}
+
+# ---- string helpers (Vyb's String has strip(); the template wants \n-only variants) ----
+
+lstrip_nl(s<String>)<String> -> {
+    t<String> = s
+    while (t.len() > 0 && (t.char_at(0) as Int) == 10) { t = t.substring(1, t.len()) }
+    return t
+}
+
+strip_nl(s<String>)<String> -> {
+    t<String> = lstrip_nl(s)
+    while (t.len() > 0 && (t.char_at(t.len() - 1) as Int) == 10) { t = t.substring(0, t.len() - 1) }
+    return t
+}
+
+# index of the LAST occurrence, -1 when absent (the template uses split(...)[-1]).
+last_index_of(s<String>, needle<String>)<Int> -> {
+    found<Int> = -1
+    base<Int> = 0
+    going<Int> = 1
+    while (going == 1) {
+        rest<String> = s.substring(base, s.len())
+        q<Int> = rest.index_of(needle)
+        if (q < 0) { going = 0 } else {
+            found = base + q
+            base = base + q + needle.len()
+        }
+    }
+    return found
+}
+
+# ---- message inspection ----
+
+# -1 when the message is not an object with string role/content (rendering refuses those).
+str_field(rec<JsonDoc>, mid<Int>, key<String>)<Int> -> {
+    if (rec.kind(mid) != "object") { return -1 }
+    v<Int> = rec.get(mid, key)
+    if (v == -1) { return -1 }
+    if (rec.kind(v) != "string") { return -1 }
+    return v
+}
+
+# The template's reverse scan: the index of the last `user` message whose content is a string
+# and is not a <tool_response> wrapper. -1 when there is none.
+last_query_index(rec<JsonDoc>, msgs<Int>, n<Int>)<Int> -> {
+    lqi<Int> = -1
+    i<Int> = n - 1
+    while (i >= 0 && lqi < 0) {
+        mid<Int> = rec.elem(msgs, i)
+        r<Int> = str_field(rec, mid, "role")
+        c<Int> = str_field(rec, mid, "content")
+        if (r != -1 && c != -1) {
+            rs<String> = rec.hstr(r)
+            cs<String> = rec.hstr(c)
+            not_tr<Int> = 1
+            if (cs.index_of("<tool_response>") == 0 && cs.ends_with("</tool_response>")) { not_tr = 0 }
+            if (rs == "user" && not_tr == 1) { lqi = i }
+        }
+        i = i - 1
+    }
+    return lqi
+}
+
+# One record's refusal reason: "" when this program implements the record, else a phrase.
+unsupported(rec<JsonDoc>)<String> -> {
+    root_obj<Int> = 0
+    if (rec.kind(rec.root) != "object") { return "root is not an object" }
+    msgs<Int> = rec.get(rec.root, "messages")
+    if (msgs == -1) { return "no messages" }
+    if (rec.kind(msgs) != "array") { return "messages is not an array" }
+    if (rec.get(rec.root, "tools") != -1) { return "tools are not implemented" }
+    n<Int> = rec.len(msgs)
+    j<Int> = 0
+    for (j in 0..n - 1) {
+        mid<Int> = rec.elem(msgs, j)
+        if (rec.kind(mid) != "object") { return "message is not an object" }
+        r<Int> = str_field(rec, mid, "role")
+        if (r == -1) { return "message has no string role" }
+        rs<String> = rec.hstr(r)
+        if (rs != "system" && rs != "user" && rs != "assistant") { return "unsupported role: " + rs }
+        if (str_field(rec, mid, "content") == -1) { return "message has no string content" }
+        if (rec.get(mid, "tool_calls") != -1) { return "tool_calls are not implemented" }
+    }
+    return ""
+}
+
+# ---- the template ----
+
+# Qwen3 chat template, no tools, add_generation_prompt=false. Caller has checked `unsupported`.
+render(rec<JsonDoc>)<String> -> {
+    out<String> = ""
+    msgs<Int> = rec.get(rec.root, "messages")
+    n<Int> = rec.len(msgs)
+    lqi<Int> = last_query_index(rec, msgs, n)
+
+    # messages[0].role == 'system' -> prefix it, once (the loop then skips the first message)
+    if (n > 0) {
+        m0<Int> = rec.elem(msgs, 0)
+        r0<Int> = str_field(rec, m0, "role")
+        if (r0 != -1 && rec.hstr(r0) == "system") {
+            c0<Int> = str_field(rec, m0, "content")
+            out = out + "<|im_start|>system\n" + rec.hstr(c0) + "<|im_end|>\n"
+        }
+    }
+
+    j<Int> = 0
+    for (j in 0..n - 1) {
+        mid<Int> = rec.elem(msgs, j)
+        rs<String> = rec.hstr(str_field(rec, mid, "role"))
+        cs<String> = rec.hstr(str_field(rec, mid, "content"))
+        if (rs == "user" || (rs == "system" && j != 0)) {
+            out = out + "<|im_start|>" + rs + "\n" + cs + "<|im_end|>\n"
+        } else if (rs == "assistant") {
+            # reasoning_content: '' unless the content carries a </think> block
+            rc<String> = ""
+            body<String> = cs
+            dclose<Int> = cs.index_of("</think>")
+            if (dclose >= 0) {
+                head<String> = strip_nl(cs.substring(0, dclose))
+                body = lstrip_nl(cs.substring(dclose + 8, cs.len()))
+                to<Int> = last_index_of(head, "<think>")
+                if (to >= 0) { rc = lstrip_nl(head.substring(to + 7, head.len())) } else { rc = head }
+            }
+            if (j > lqi) {
+                if (j == n - 1 || rc.len() > 0) {
+                    out = out + "<|im_start|>" + rs + "\n<think>\n" + strip_nl(rc) + "\n</think>\n\n" + lstrip_nl(body)
+                } else {
+                    out = out + "<|im_start|>" + rs + "\n" + body
+                }
+            } else {
+                out = out + "<|im_start|>" + rs + "\n" + body
+            }
+            out = out + "<|im_end|>\n"
+        }
+        # system (loop.first) and any other role contributed nothing above; `role == tool`
+        # cannot appear here (refused by `unsupported`)
+    }
+    return out
+}
+
+main()<Int> -> {
+    src_p<String> = env("VYBFORGE_CHAT_SRC", "data/vybos-configurator-all.jsonl")
+    out_p<String> = env("VYBFORGE_CHAT_OUT", "native/out/chat_render.txt")
+    idx_p<String> = env("VYBFORGE_CHAT_IDX", "native/out/chat_render.idx")
+
+    src<String> = readf(src_p)
+    if (src.len() == 0) { eprintln("render_chat: no input at " + src_p); return 2 }
+
+    txt<String> = ""
+    idx<String> = ""
+    nrec<Int> = 0
+    nbad<Int> = 0
+    lineno<Int> = 0
+
+    sl<Int> = src.len()
+    st<Int> = 0
+    k<Int> = 0
+    for (k in 0..sl - 1) {
+        if ((src.char_at(k) as Int) == 10) {
+            line<String> = src.substring(st, k)
+            st = k + 1
+            lineno = lineno + 1
+            if (line.len() > 2) {
+                match (json_parse(line)) {
+                    rec -> {
+                        why<String> = unsupported(rec)
+                        if (why == "") {
+                            txt = txt + render(rec)
+                            idx = idx + txt.len().to_string() + "\n"
+                            nrec = nrec + 1
+                        } else {
+                            eprintln("render_chat: line " + lineno.to_string() + ": " + why)
+                            nbad = nbad + 1
+                        }
+                    }
+                    ? -> { eprintln("render_chat: line " + lineno.to_string() + ": not JSON"); nbad = nbad + 1 }
+                }
+            }
+        }
+    }
+    if (st < sl) {
+        line2<String> = src.substring(st, sl)
+        if (line2.len() > 2) {
+            lineno = lineno + 1
+            match (json_parse(line2)) {
+                rec2 -> {
+                    why2<String> = unsupported(rec2)
+                    if (why2 == "") {
+                        txt = txt + render(rec2)
+                        idx = idx + txt.len().to_string() + "\n"
+                        nrec = nrec + 1
+                    } else {
+                        eprintln("render_chat: line " + lineno.to_string() + ": " + why2)
+                        nbad = nbad + 1
+                    }
+                }
+                ? -> { eprintln("render_chat: line " + lineno.to_string() + ": not JSON"); nbad = nbad + 1 }
+            }
+        }
+    }
+
+    if (nbad > 0) { eprintln("render_chat: " + nbad.to_string() + " unsupported record(s)"); return 3 }
+    e1<Int> = writef(out_p, txt)
+    e2<Int> = writef(idx_p, idx)
+    if (e1 != 0 || e2 != 0) { eprintln("render_chat: write failed"); return 4 }
+
+    println("rendered: " + nrec.to_string() + " records -> " + out_p)
+    println("bytes: " + txt.len().to_string() + "; idx: " + idx_p)
+    return 0
+}

@@ -151,12 +151,46 @@ P2.2's QLoRA port. Its brittle raw-literal S→R substitution is not worth carry
 real deliverable is the transform spec in `native/train/FULLMANIFEST-MILESTONE.md`. Blocks
 nothing else.
 
-**P2.2 — the trainer** (the real project): frozen base (GGUF q4_0 dequant path), LoRA
-bf16 parameters, AdamW, multi-epoch over the 216-record corpus, per-step loss to disk.
-Reuses `train.ptx`, the bwd-lora probe, the fwd-cache/kvctx builders,
-`encode_corpus.vyb`.
-Gate: per-step loss matches the numpy oracle (`train_full_loop_ref` family) at S=93,
-then scales to the full corpus.
+**P2.2 — the trainer** (the real project): frozen base (GGUF q4_0 dequant path), LoRA bf16
+parameters, AdamW, multi-epoch over the corpus, per-step loss to disk. Reuses `train.ptx`, the
+bwd-lora probe, the fwd-cache/kvctx builders, `encode_corpus.vyb`.
+Gate: per-step loss matches the numpy oracle (`train_full_loop_ref` family) at S=93, then scales
+to the full corpus.
+
+Corpus reality (checked 2026-10-02): `data/vybos-configurator-all.jsonl` is 720 records, split
+468 train / 252 eval (all.jsonl == train+eval). The "216-record" figure this section used to carry
+was stale — same class as the `gen_kv_train` (513,429) drift.
+
+Environment reality (checked 2026-10-02): the repo's `.venv` has transformers, numpy, safetensors
+and llama_cpp, but **not torch** — `training/train_lora.py` and the torch-side oracles cannot run
+in this checkout at all; they need the GB10 host. The oracles that *do* run here (numpy, llama.cpp
+Jinja) are therefore the ones the gates should lean on.
+
+**P2.2a — corpus → training sequence** — *part 1 DONE 2026-10-02*
+Part 1: `native/train/render_chat.vyb` renders each record through the Qwen3 chat template, which
+is not guessed but read from the GGUF metadata (`tokenizer.chat_template`, 4,049 chars, sha256
+`3802169b…`, pinned as `native/legit/fixtures/qwen3_chat_template.jinja`). It implements the
+template literally — including the multi-step-tool query-index scan and the `</think>` reasoning
+split the corpus never exercises — and **refuses** what it does not implement (tools/tool_calls,
+non-string content, roles other than system/user/assistant) with a named reason rather than
+rendering something plausible. Output is raw text plus a cumulative byte-offset index; both pinned
+in `native/legit/fixtures/chat_render_baseline.sha256`. Gate `native/legit/run_chat_render_gate.sh`:
+baseline hash, 8 boundary cases (think split, multi-turn think-on-last-assistant-only,
+system-not-first, unicode, newline padding), the three refusal cases, and — when `.venv` and the
+GGUF are present — a live byte-for-byte cross-check against llama.cpp's own Jinja rendering of the
+same template (`native/train/render_chat_ref.py`).
+Part 2 (next): token ids per record, reusing `native/tokenizer`; gate vs the oracle's ids. Note the
+corpus contains 36 records with non-ASCII content, so the byte-level BPE path is exercised.
+
+**P2.2b — training blocks**: per-record response mask (loss on response tokens only, reusing the
+`kvresp` masking), `max_length` 2048, batch 1, gradient accumulation 16.
+
+**P2.2c — base + LoRA init**: frozen q4_0 dequant path, LoRA r=16/alpha=32/dropout=0.05. Dropout
+makes bitwise parity impossible, so parity gates run dropout=0 and the trained run uses 0.05 from a
+seedable RNG; say which mode a gate ran in, every time.
+
+**P2.2d — optimizer + loop**: AdamW (`adamw_repro.vyb` exists), lr 2e-4, 3 epochs, logging every 5,
+eval every 25, save every 25, per-step loss to disk. Needs a GPU run (see P2.4/P2.5).
 
 **P2.3 — adapter save/load** in a Vyb-native `.bin` (manifest + raw bf16).
 Gate: `loradec_driver.vyb` consumes a Vyb-trained adapter end-to-end → kvresp decode

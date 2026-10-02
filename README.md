@@ -208,6 +208,10 @@ gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
 - `native/train/_build_kv.vyb` replaces the driver assembler (helper insertion, CK/CV/RSHI
   allocations, per-token forward swap), byte-identical to it
   (`native/legit/run_kvbuild_gate.sh`).
+- `native/train/render_chat.vyb` renders the corpus through the Qwen3 chat template taken from the
+  GGUF metadata — the same text `train_lora.py` gets from `apply_chat_template` — byte-identical on
+  all 720 records and on 8 boundary cases that the corpus does not reach, with llama.cpp's Jinja as
+  the oracle (`native/legit/run_chat_render_gate.sh`); it refuses input it does not implement.
 
 ## Boundaries
 

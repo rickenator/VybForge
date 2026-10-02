@@ -1,0 +1,7 @@
+# corpus render (720 records, data/vybos-configurator-all.jsonl)
+b796e96b35b7a016b60f37c42f2896e8ff61afe8b6a05555db315f647f624fdd  1398720  native/out/chat_render.txt
+ca2aca4c7decc88786c68d0d11a4167623bdc203f0fc0343861e0fe7b355cf3c  5190  native/out/chat_render.idx
+# template carried in the Qwen3-4B GGUF metadata
+3802169b2a02b81e6adb7ab4f64f91ff02db753c8c3a64a01c35192d3a61d8d7  4049  native/legit/fixtures/qwen3_chat_template.jinja
+# boundary cases (native/legit/fixtures/chat_render_cases.jsonl)
+eb470d7cbf5a1a9a18f43ffa6a4dad7cc5ecd67e9cf838f81cbcb3e06ce56936  1340  cases.txt
