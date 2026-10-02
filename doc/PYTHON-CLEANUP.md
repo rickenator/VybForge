@@ -299,8 +299,12 @@ Vyb artifact, so they are *wiring* work, not deletion candidates:
 | `native/train/kvprobe_ref.py` | the per-token ASLB PROBE2 dumps |
 | `native/train/compare_kvprobe{,2,3,_b}.py` | PROBE1/2/3 and the L35 backward chain-link dumps |
 | `native/train/_corr_chain{,2,3}.py`, `_cmp_chain_ord.py` | the M2e chained-backward gradient check |
-| `native/train/m2c_fdcheck.py`, `m2c_fdq.py` | the M2c analytic backward (finite-difference checks) |
+| `native/train/m2c_fdq.py` | the M2c analytic backward (finite-difference checks) — its sibling `m2c_fdcheck.py` is doc-referenced, so it is not in this set |
 | `native/gguf/ref_hidden.py` | the gguf hidden-state path |
+
+Fifteen files in total. Of the 25 that the corrected pass calls unreferenced, 10 were the
+dump-diff debris deleted above and these 15 are references for kept artifacts — there is no
+third category.
 
 A reference check no battery invokes is invisible evidence: it cannot fail loudly, so it cannot catch
 anything. If the oracle list is to mean something at the sweep, these need battery wiring — or an
@@ -308,7 +312,7 @@ explicit "kept, not reproducible" note. That is open work, tracked here rather t
 
 **Lesson (cost two wrong answers in one sitting):** classify a file as unreferenced only by grepping
 its *stem* across the whole repo. A grep for the basename *with* `.py`, scoped to build files, labelled
-13 load-bearing oracles as orphans — including the oracle for `adamw_repro.vyb`. The same class of
+15 load-bearing oracles as orphans — including the oracle for `adamw_repro.vyb`. The same class of
 false negative came from `git check-ignore -q a b` (two pathnames is an error, not a "no"): it reported
 `native/out/` as unignored when `.gitignore:16` ignores it. When a verification command answers
 "unreferenced"/"no", check that the command itself is valid before believing the answer.
