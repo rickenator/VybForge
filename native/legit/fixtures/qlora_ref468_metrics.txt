@@ -1,0 +1,58 @@
+# QLoRA reference run — torch baseline for the Vyb trainer (P2.2d gate oracle)
+#
+# Reproduced on 2026-10-02 by the repo's own trainer, unchanged:
+#   host      godzilla (RTX 3090, 24.5 GB) — ~/Projects/VybAIConf
+#   venv      ~/Projects/VybAIConf/.venv  torch 2.6.0+cu124, transformers 4.57.6,
+#                                         peft 0.20.0, trl 0.29.1, bitsandbytes 0.50.1
+#   command   .venv/bin/python training/train_lora.py --model Qwen/Qwen3-4B \
+#               --output artifacts/ref-468 --epochs 3
+#   corpus    data/vybos-configurator-train.jsonl 468 records / eval 252
+#             (train_lora.py's shipped defaults: logging_steps=5, eval/save_steps=25)
+#   base      Qwen/Qwen3-4B from /usr/export/LLM/hf (HF_HOME; no download needed)
+#   log       artifacts/train-ref468.log sha256 6fae395e... (19,987 B; full log on the host)
+#   adapter   artifacts/ref-468/adapter_model.safetensors sha256 05efdc3e...
+#
+# Deterministic, and therefore assertable: 90 optimizer steps = ceil(468/16)*3, evals at
+# steps 25/50/75, 739.28 s wall, ~7.3 s/step, 4.5 GB VRAM peak.
+#
+# NOT assertable byte-for-byte: train_lora.py sets no seed and runs LoRA dropout 0.05, so a
+# repeat run gives different numbers. Treat this as a *curve/tolerance* oracle — the trainer
+# must land in the same place, not on the same digits. For a tight per-step gate, re-run with
+# dropout 0 and an explicit seed and pin that instead.
+#
+# Two things to know before anyone writes a loss gate against this:
+#   * train loss collapses to ~0.009 while eval_loss sits at ~0.78-0.88 — the recipe memorises
+#     the 468-record train split within 3 epochs. The eval number to match is ~0.86, NOT the
+#     0.069 in the older artifacts/train-v2.log: that was a different (216-record) corpus at a
+#     different point in its own schedule.
+#   * `eval_num_tokens` is a *cumulative* counter, not the eval set's size: it equals the train
+#     num_tokens of the same step (184207 / 362711 / 540965 across the three evals). Do not
+#     read it as an eval token count.
+#
+# That 42 = ceil(216/16)*3 versus 90 = ceil(468/16)*3 is also what proves the committed v1
+# adapter (artifacts/vybos-configurator-lora, sha256 2b2ba0d9...) came from a 216-record corpus.
+#
+# --- metric lines from the log, in order: loss every 5 steps, then each eval ---
+{'bos_token_id': None, 'pad_token_id': 151643}
+{'loss': 3.6435, 'grad_norm': 1.1328125, 'learning_rate': 0.00019111111111111114, 'entropy': 2.499135062098503, 'num_tokens': 36895.0, 'mean_token_accuracy': 0.4419446136802435, 'epoch': 0.17}
+{'loss': 1.963, 'grad_norm': 1.25, 'learning_rate': 0.00018, 'entropy': 2.5977522313594816, 'num_tokens': 73847.0, 'mean_token_accuracy': 0.6311956733465195, 'epoch': 0.34}
+{'loss': 0.6642, 'grad_norm': 0.81640625, 'learning_rate': 0.00016888888888888889, 'entropy': 0.7995232507586479, 'num_tokens': 110837.0, 'mean_token_accuracy': 0.8700545482337475, 'epoch': 0.51}
+{'loss': 0.2599, 'grad_norm': 0.53515625, 'learning_rate': 0.0001577777777777778, 'entropy': 0.26607850324362514, 'num_tokens': 147489.0, 'mean_token_accuracy': 0.9505768463015556, 'epoch': 0.68}
+{'loss': 0.1541, 'grad_norm': 0.52734375, 'learning_rate': 0.00014666666666666666, 'entropy': 0.18013380104675888, 'num_tokens': 184207.0, 'mean_token_accuracy': 0.9681295685470104, 'epoch': 0.85}
+{'eval_loss': 0.7824099063873291, 'eval_runtime': 29.6431, 'eval_samples_per_second': 8.501, 'eval_steps_per_second': 1.08, 'eval_entropy': 0.24966653948649764, 'eval_num_tokens': 184207.0, 'eval_mean_token_accuracy': 0.9004068057984114, 'epoch': 0.85}
+{'loss': 0.0811, 'grad_norm': 0.67578125, 'learning_rate': 0.00013555555555555556, 'entropy': 0.10238079677390702, 'num_tokens': 215320.0, 'mean_token_accuracy': 0.9847312911468393, 'epoch': 1.0}
+{'loss': 0.0378, 'grad_norm': 0.3359375, 'learning_rate': 0.00012444444444444444, 'entropy': 0.05678191431798041, 'num_tokens': 252373.0, 'mean_token_accuracy': 0.9925602547824383, 'epoch': 1.17}
+{'loss': 0.0211, 'grad_norm': 0.2265625, 'learning_rate': 0.00011333333333333334, 'entropy': 0.033854672615416345, 'num_tokens': 289258.0, 'mean_token_accuracy': 0.994254432618618, 'epoch': 1.34}
+{'loss': 0.0161, 'grad_norm': 0.2001953125, 'learning_rate': 0.00010222222222222222, 'entropy': 0.02181818666867912, 'num_tokens': 326168.0, 'mean_token_accuracy': 0.9944929338991642, 'epoch': 1.51}
+{'loss': 0.0142, 'grad_norm': 0.306640625, 'learning_rate': 9.111111111111112e-05, 'entropy': 0.013147012540139258, 'num_tokens': 362711.0, 'mean_token_accuracy': 0.995123216509819, 'epoch': 1.68}
+{'eval_loss': 0.8840300440788269, 'eval_runtime': 29.4771, 'eval_samples_per_second': 8.549, 'eval_steps_per_second': 1.086, 'eval_entropy': 0.13361968519166112, 'eval_num_tokens': 362711.0, 'eval_mean_token_accuracy': 0.9068814553320408, 'epoch': 1.68}
+{'loss': 0.0115, 'grad_norm': 0.13671875, 'learning_rate': 8e-05, 'entropy': 0.013677016494330018, 'num_tokens': 399420.0, 'mean_token_accuracy': 0.9958582378923893, 'epoch': 1.85}
+{'loss': 0.0119, 'grad_norm': 0.25390625, 'learning_rate': 6.88888888888889e-05, 'entropy': 0.014925546752398504, 'num_tokens': 430640.0, 'mean_token_accuracy': 0.9951723533518174, 'epoch': 2.0}
+{'loss': 0.0111, 'grad_norm': 0.1455078125, 'learning_rate': 5.7777777777777776e-05, 'entropy': 0.013671866746153682, 'num_tokens': 467500.0, 'mean_token_accuracy': 0.9957442499697209, 'epoch': 2.17}
+{'loss': 0.01, 'grad_norm': 0.10888671875, 'learning_rate': 4.666666666666667e-05, 'entropy': 0.013878253439906984, 'num_tokens': 504222.0, 'mean_token_accuracy': 0.9956979274749755, 'epoch': 2.34}
+{'loss': 0.01, 'grad_norm': 0.1396484375, 'learning_rate': 3.555555555555556e-05, 'entropy': 0.012935577728785574, 'num_tokens': 540965.0, 'mean_token_accuracy': 0.9951116211712361, 'epoch': 2.51}
+{'eval_loss': 0.8617939949035645, 'eval_runtime': 29.468, 'eval_samples_per_second': 8.552, 'eval_steps_per_second': 1.086, 'eval_entropy': 0.12820923351682723, 'eval_num_tokens': 540965.0, 'eval_mean_token_accuracy': 0.9071605205535889, 'epoch': 2.51}
+{'loss': 0.009, 'grad_norm': 0.07568359375, 'learning_rate': 2.4444444444444445e-05, 'entropy': 0.012088971957564355, 'num_tokens': 577801.0, 'mean_token_accuracy': 0.9957644604146481, 'epoch': 2.68}
+{'loss': 0.0088, 'grad_norm': 0.1005859375, 'learning_rate': 1.3333333333333333e-05, 'entropy': 0.012184037396218627, 'num_tokens': 614625.0, 'mean_token_accuracy': 0.9955695450305939, 'epoch': 2.85}
+{'loss': 0.0091, 'grad_norm': 0.2001953125, 'learning_rate': 2.2222222222222225e-06, 'entropy': 0.012705569895093931, 'num_tokens': 645960.0, 'mean_token_accuracy': 0.9957408861202353, 'epoch': 3.0}
+{'train_runtime': 739.2804, 'train_samples_per_second': 1.899, 'train_steps_per_second': 0.122, 'train_loss': 0.38534533633953993, 'epoch': 3.0}

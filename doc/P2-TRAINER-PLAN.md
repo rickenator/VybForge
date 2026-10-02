@@ -192,6 +192,28 @@ seedable RNG; say which mode a gate ran in, every time.
 **P2.2d — optimizer + loop**: AdamW (`adamw_repro.vyb` exists), lr 2e-4, 3 epochs, logging every 5,
 eval every 25, save every 25, per-step loss to disk. Needs a GPU run (see P2.4/P2.5).
 
+*Torch reference banked 2026-10-02* (fixture `native/legit/fixtures/qlora_ref468_metrics.txt`): the
+repo's own `train_lora.py`, unchanged, run against today's 468/252 corpus on godzilla (RTX 3090,
+`~/Projects/VybAIConf/.venv`, torch 2.6.0+cu124 / peft 0.20.0 / trl 0.29.1 / bnb 0.50.1, base model
+already in `HF_HOME=/usr/export/LLM/hf`).
+
+What that run pins down, and what it does not:
+
+- **Deterministic and assertable**: 90 optimizer steps (`ceil(468/16)*3`), evals at steps 25/50/75,
+  739.28 s wall, ~7.3 s/step, **4.5 GB VRAM peak** — so training fits beside other work far more
+  comfortably than the 23.7 GB the 27B server holds.
+- **Not byte-assertable**: `train_lora.py` sets no seed and runs LoRA dropout 0.05, so a repeat run
+  will not reproduce the digits. This is a curve/tolerance oracle. For a tight per-step gate, re-run
+  with dropout 0 and an explicit seed and pin that instead.
+- **The eval number to match is ~0.86, not the 0.069 in `artifacts/train-v2.log`.** Train loss
+  collapses to ~0.009 in 3 epochs while eval_loss sits at 0.78–0.88: this recipe memorises the
+  468-record split. Anyone gating on the old 0.069 would be gating on a different corpus.
+- **`eval_num_tokens` is cumulative, not the eval set's size** — it equals the train `num_tokens` of
+  the same step (184207 / 362711 / 540965). Don't read it as an eval token count.
+- **The committed adapter is a 216-record-era artifact.** 42 = `ceil(216/16)*3` steps in
+  `train-v2.log` versus 90 = `ceil(468/16)*3` now, which is what actually proves it. Decide
+  deliberately at P2.4 whether to retrain the torch baseline on 468 or compare against the old one.
+
 **P2.3 — adapter save/load** in a Vyb-native `.bin` (manifest + raw bf16).
 Gate: `loradec_driver.vyb` consumes a Vyb-trained adapter end-to-end → kvresp decode
 gate + schema-valid contract.
