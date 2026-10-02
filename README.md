@@ -196,6 +196,10 @@ gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
   `data/vybos-configurator-{train,eval}.jsonl` byte-for-byte, and the regenerated
   corpus matches the committed `all.jsonl` byte-for-byte
   (`native/legit/run_split_gate.sh`).
+- `native/train/gen_kv_train.vyb` replaces the `(S, NCTX)` driver parameterizer: it
+  rewrites the committed `kvresp_train_kv.vyb` template for another sequence length,
+  reproducing the Python's substitution sequence exactly
+  (`native/legit/run_kvgen_gate.sh`).
 
 ## Boundaries
 

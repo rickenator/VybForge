@@ -58,11 +58,23 @@ Finding worth keeping: the corpus round-trip needs `json_emit::json_text_tight`,
 non-ASCII bytes go out raw — which matched on the train split (ASCII) and broke only
 on eval (byte 5,911, line 3). `json_emit`'s escaping is CPython's `ensure_ascii`.
 
-**P2.1a — `gen_kv_train.vyb`**: the (S, NCTX) parameterizer — 12 substitution families
-plus the 25-field ASLB byte-layout table.
-Gate: (93,9) byte-identical to the committed `kvresp_train_kv.vyb`; (513,429)
-byte-identical to a frozen baseline of today's Python output; both outputs pass
-`--no-execute`.
+**P2.1a — `gen_kv_train.vyb`**: the (S, NCTX) parameterizer — the ordered substitution
+families plus the 25-field ASLB byte-layout table. — **DONE 2026-10-02**
+`native/train/gen_kv_train.vyb` mirrors `gen_kv_train.py` operation for operation, in
+the same order, with the same all-occurrences `replace` semantics — including the
+substitutions that are no-ops at S=93 (which is exactly why the regression round-trips)
+and the `+<old offset>` sweep that tangles at other S. Arguments and paths come from
+the environment (`VYBFORGE_KV_S`/`_NCTX`/`_SRC`/`_OUT`) since the JIT has no argv;
+defaults reproduce `gen_kv_train.py 93 9`.
+Gate: `native/legit/run_kvgen_gate.sh` — (93,9) rewrites the committed template back to
+itself byte-for-byte (107,836 B, sha256 `7f738e41…`); (513,429) equals the frozen
+baseline `native/legit/fixtures/kvresp_train_p429_S513_N429.vyb` (108,070 B, sha256
+`158a3402…`); an optional `python3` cross-check re-derives both and requires agreement;
+and the template hash is unchanged after the run.
+
+Measured: SLAYOUT = S × 67598 × 8 (50,292,912 at S=93, 277,422,192 at S=513) — that is
+where the committed `50292912` literal comes from, so the layout table is independently
+checkable by hand.
 
 **P2.1b — `build_fullmanifest.vyb`**: manifest text → tokenizer ids
 (`native/tokenizer`) → `native/out/fullmanifest.txt` + `<i8` ids binary.

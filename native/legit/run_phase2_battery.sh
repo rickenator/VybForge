@@ -33,6 +33,14 @@ else
   step "P2.5a split_dataset.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# P2.1a — gen_kv_train.py -> gen_kv_train.vyb (driver parameterization)
+out="$(./native/legit/run_kvgen_gate.sh 2>&1)"
+if echo "$out" | tail -1 | grep -q "PASS"; then
+  step "P2.1a gen_kv_train.vyb" "identity (93 9) + frozen baseline (513 429)"
+else
+  step "P2.1a gen_kv_train.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

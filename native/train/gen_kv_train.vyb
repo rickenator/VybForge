@@ -1,0 +1,229 @@
+# gen_kv_train.vyb — parameterize kvresp_train_kv.vyb to arbitrary (S, NCTX).
+#
+# Phase 2, P2.1a: a faithful port of native/train/gen_kv_train.py. That script is a
+# *source rewriter*: it reads the committed S=93 driver and applies an ordered list of
+# literal substitutions (plus one digit-run regex) to retarget it at another
+# (S, NCTX). It recomputes the per-layer ASLB byte layout (25 fields), every
+# S-proportional alloc size, CK/CV ([36][S][NKV]), the context-build row range, and the
+# response-forward row offsets.
+#
+# Fidelity rules kept deliberately:
+#   * the substitutions are applied in the same order as the Python, with the same
+#     all-occurrences semantics — including the ones that are no-ops at S=93 (which is
+#     why S=93 round-trips byte-for-byte) and the ones that tangle at other S (the
+#     Python's own "+<old offset>" sweep rewrites every "+0" in the file);
+#   * aslb_layout() reproduces the Python exactly: off[f] is the running *element*
+#     count * 8 before that field's own size is added, fields 18..24 (sq,sk,sv,so,sg,
+#     su,sd) default to R2=2, and SLAYOUT = S * 67598 * 8 (50,292,912 at S=93);
+#   * numbers are rendered with the same decimal text the Python's f-strings produce.
+#
+# The JIT has no argv, so the two positional arguments and the paths come from the
+# environment (defaults reproduce the invocation `gen_kv_train.py 93 9`):
+#   VYBFORGE_KV_S     93                                (S)
+#   VYBFORGE_KV_NCTX  9                                 (NC)
+#   VYBFORGE_KV_SRC   native/train/kvresp_train_kv.vyb  (template)
+#   VYBFORGE_KV_OUT   ""  -> native/train/kvresp_train_p<NC>.vyb
+#
+# Run:
+#   "$VYB" native/train/gen_kv_train.vyb
+#
+# Gate: native/legit/run_kvgen_gate.sh — S=93/NCTX=9 must rewrite the committed
+# template back to itself byte-for-byte, and a second parameterization must match the
+# frozen baseline of the Python it replaces.
+import io::{open_read, read_all, open_write, write_str, close}
+import env::{env_get}
+import term::{eprintln}
+
+# Dimensions, identical to the Python module constants.
+#   D=2560, H=32, KVH=8, HD=128, FF=9728, R2=2; NQ=H*HD=4096, NKV=KVH*HD=1024
+DIM_D<Int> = 2560
+DIM_FF<Int> = 9728
+DIM_R2<Int> = 2
+DIM_NQ<Int> = 4096
+DIM_NKV<Int> = 1024
+NFIELDS<Int> = 25
+NROWS<Int> = 18
+
+readf(p<String>)<String> -> {
+    r<String> = ""
+    match (open_read(p)) {
+        f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+writef(p<String>, text<String>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) {
+        f -> { write_str(f, text); close(f); rc = 0 }
+        ? -> { rc = 1 }
+    }
+    return rc
+}
+
+# Decimal parse of an env value; absent/empty/non-numeric -> the caller's default.
+parse_num(s<String>)<Int> -> {
+    n<Int> = 0
+    i<Int> = 0
+    if (s.len() == 0) { return -1 }
+    while (i < s.len()) {
+        c<Int> = s.char_at(i) as Int
+        if (c >= 48 && c <= 57) { n = n * 10 + (c - 48); i = i + 1 } else { i = s.len() }
+    }
+    return n
+}
+
+env_int(name<String>, dflt<Int>)<Int> -> {
+    raw<String> = env_get(name) else ""
+    if (raw.len() == 0) { return dflt }
+    v<Int> = parse_num(raw)
+    if (v < 0) { return dflt }
+    return v
+}
+
+# Rows for the 18 leading fields, in the Python's fld order:
+#   XI, XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M2, XOcur
+field_rows()<Vec<Int>> -> {
+    v<Vec<Int>> = Vec<Int>()
+    v.push(DIM_D)      # XI
+    v.push(DIM_D)      # XN
+    v.push(DIM_NQ)     # DQ
+    v.push(DIM_NKV)    # DK
+    v.push(DIM_NKV)    # DV
+    v.push(DIM_NQ)     # DQN
+    v.push(DIM_NKV)    # DKN
+    v.push(DIM_NQ)     # DQr
+    v.push(DIM_NKV)    # DKr
+    v.push(DIM_NQ)     # DCtx
+    v.push(DIM_D)      # DO
+    v.push(DIM_D)      # X1
+    v.push(DIM_D)      # X1N
+    v.push(DIM_FF)     # Gr
+    v.push(DIM_FF)     # Up
+    v.push(DIM_FF)     # Hu
+    v.push(DIM_D)      # M2
+    v.push(DIM_D)      # XOcur
+    return v
+}
+
+# aslb_layout(S): byte offset of each of the 25 fields, then SLAYOUT bytes.
+# The Python returns (offsets, slayout); Vyb functions return one value, so the
+# offsets come back here and the total is layout_bytes().
+layout_off(s<Int>)<Vec<Int>> -> {
+    rows<Vec<Int>> = field_rows()
+    off<Vec<Int>> = Vec<Int>()
+    elem<Int> = 0
+    k<Int> = 0
+    for (k in 0..NFIELDS - 1) {
+        off.push(elem * 8)
+        r<Int> = DIM_R2
+        if (k <= NROWS - 1) { r = rows.get(k) }
+        elem = elem + s * r
+    }
+    return off
+}
+
+layout_bytes(s<Int>)<Int> -> {
+    rows<Vec<Int>> = field_rows()
+    elem<Int> = 0
+    k<Int> = 0
+    for (k in 0..NFIELDS - 1) {
+        r<Int> = DIM_R2
+        if (k <= NROWS - 1) { r = rows.get(k) }
+        elem = elem + s * r
+    }
+    return elem * 8
+}
+
+is_digit(c<Int>)<Int> -> {
+    if (c >= 48 && c <= 57) { return 1 }
+    return 0
+}
+
+# re.sub(r"loc\(ASLB\),\d+\)", "loc(ASLB),<val>") over every occurrence.
+sub_aslb(s<String>, val<Int>)<String> -> {
+    marker<String> = "loc(ASLB),"
+    ml<Int> = marker.len()
+    out<String> = ""
+    rest<String> = s
+    while (rest.len() > 0) {
+        q<Int> = rest.index_of(marker)
+        if (q < 0) { out = out + rest; rest = "" } else {
+            out = out + rest.substring(0, q + ml)
+            after<String> = rest.substring(q + ml, rest.len())
+            j<Int> = 0
+            while (j < after.len() && is_digit(after.char_at(j) as Int) == 1) { j = j + 1 }
+            if (j > 0 && j < after.len() && (after.char_at(j) as Int) == 41) {
+                out = out + val.to_string()
+                rest = after.substring(j, after.len())
+            } else {
+                rest = after
+            }
+        }
+    }
+    return out
+}
+
+main()<Int> -> {
+    S<Int> = env_int("VYBFORGE_KV_S", 93)
+    NC<Int> = env_int("VYBFORGE_KV_NCTX", 9)
+    RESP<Int> = S - NC
+    src_p<String> = env_get("VYBFORGE_KV_SRC") else "native/train/kvresp_train_kv.vyb"
+    out_p<String> = env_get("VYBFORGE_KV_OUT") else ""
+    if (out_p.len() == 0) { out_p = "native/train/kvresp_train_p" + NC.to_string() + ".vyb" }
+
+    src<String> = readf(src_p)
+    if (src.len() == 0) { eprintln("gen_kv_train: cannot read template " + src_p); return 2 }
+
+    slayout<Int> = layout_bytes(S)
+    off_new<Vec<Int>> = layout_off(S)
+    off_old<Vec<Int>> = layout_off(93)
+
+    # 1. the S/NCTX constants line
+    src = src.replace(
+        "S<Int> = 93; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2; NCTX<Int> = 9",
+        "S<Int> = " + S.to_string() + "; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2; NCTX<Int> = " + NC.to_string())
+    # 2. position constant
+    src = src.replace("POS<Int> = 93; BPP<Int> = 0", "POS<Int> = " + S.to_string() + "; BPP<Int> = 0")
+    # 3./4. CK/CV and RSHI alloc sizes
+    src = src.replace("36*93*NKV*8", "36*" + S.to_string() + "*NKV*8")
+    src = src.replace("93*FF*8", S.to_string() + "*FF*8")
+    # 5. ASLB alloc total (36 * SLAYOUT)
+    src = sub_aslb(src, 36 * slayout)
+    # 6.-9. workspace alloc literals: S*D, S*NQ, S*NKV, S*FF
+    src = src.replace("238080", (S * 2560).to_string())
+    src = src.replace("380928", (S * DIM_NQ).to_string())
+    src = src.replace("95232", (S * DIM_NKV).to_string())
+    src = src.replace("904704", (S * DIM_FF).to_string())
+    # 10. per-layer SLAYOUT literal everywhere
+    src = src.replace("50292912", slayout.to_string())
+    # 11. ASLB field byte offsets, in fld order (at S=93 every pair is identical,
+    #     which is why the regression round-trips; at other S the Python's own sweep
+    #     rewrites every "+0" in the file and this mirrors it)
+    k<Int> = 0
+    for (k in 0..NFIELDS - 1) {
+        o<Int> = off_old.get(k)
+        n<Int> = off_new.get(k)
+        src = src.replace("+" + o.to_string(), "+" + n.to_string())
+    }
+    # 12.-15. context-build row literals (NC-token forward)
+    src = src.replace("for (tc0 in 0..8)", "for (tc0 in 0.." + (NC - 1).to_string() + ")")
+    src = src.replace("cAa+0,XIc,9*D,0", "cAa+0,XIc," + NC.to_string() + "*D,0")
+    src = src.replace("cAa+48377856,XOc,9*D,0", "cAa+" + off_new.get(17).to_string() + ",XOc," + NC.to_string() + "*D,0")
+    src = src.replace("48377856", off_new.get(17).to_string())
+    # 16.-22. response-forward row literals
+    src = src.replace("RESP<Int> = 84", "RESP<Int> = " + RESP.to_string())
+    src = src.replace("9+t2", NC.to_string() + "+t2")
+    src = src.replace("10+t2", (NC + 1).to_string() + "+t2")
+    src = src.replace("(93-9)*D", "(" + S.to_string() + "-" + NC.to_string() + ")*D")
+    src = src.replace("9*D*8", NC.to_string() + "*D*8")
+    src = src.replace("slabK<Int> = CK+L3*93*NKV*8", "slabK<Int> = CK+L3*" + S.to_string() + "*NKV*8")
+    src = src.replace("cKk<Int> = CK+Lc*93*NKV*8", "cKk<Int> = CK+Lc*" + S.to_string() + "*NKV*8")
+
+    rc<Int> = writef(out_p, src)
+    if (rc != 0) { eprintln("gen_kv_train: cannot write " + out_p); return 3 }
+    println("generated " + out_p + ": S=" + S.to_string() + " NCTX=" + NC.to_string()
+        + " RESP=" + RESP.to_string() + " SLAYOUT=" + slayout.to_string())
+    return 0
+}

@@ -138,8 +138,14 @@ code change.
 read that first; the table below is the original shape of the work. Its P2.1 gate
 wording is superseded by the measured baselines in that doc: only the `(93, 9)`
 parameterization of `gen_kv_train.py` reproduces its committed driver byte-for-byte
-(`(513, 429)` and a fresh `_build_kv.py` run do not), so the byte-exact gate applies
-there and the other inputs are compile-checked or frozen-baseline gated.
+(`(513, 429)` and a fresh `_build_kv.py` run do not — pre-existing generator/artifact
+drift, recorded not reconciled), so the `(513, 429)` case is gated against a frozen
+baseline of the oracle's own output instead.
+
+Landed so far: **P2.5a** `training/split_dataset.vyb` (the inline split heredoc is gone;
+`training/generate-data.sh` is Python-free) and **P2.1a** `native/train/gen_kv_train.vyb`
+(driver parameterizer). Both gated byte-for-byte; `native/legit/run_phase2_battery.sh`
+runs them, `native/legit/run_phase1_battery.sh` stays the regression gate.
 
 Replaces: `training/train_lora.py` (QLoRA, NF4 base), `training/smoke_adapter.py`,
 `training/start-training.sh`, `native/train/{build_fullmanifest,_build_kv,gen_kv_train,rbuild}.py`.
