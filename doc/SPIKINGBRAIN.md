@@ -4,6 +4,12 @@
 > inference in pure Vyb on the RTX 3090, plus a shared spike core adopted into VybFly's
 > fly-brain simulation. Step order is checkpointed: every step has a gate, and the tree
 > is green at each gate before the next starts.
+>
+> **Resequenced 2026-10-02 (Rick): substrate first.** A new **S0** phase (first subsection of
+> section 4) builds the pieces two architectures both need — dtype, tensor/config contract,
+> loaders, attention family — in *general* form, so SpikingBrain is the second instance that
+> proves the substrate instead of a second copy of the Qwen3-shaped code. Scope, evidence, the
+> port-vs-consume rule and the park-list: `doc/SUBSTRATE-SCOPE.md`.
 
 Source: "SpikingBrain: Spiking Brain-inspired Large Models", arXiv 2509.05276
 (accepted TMLR 2026), BICLab (CAS Institute of Automation) + HK PolyU / Beihang /
@@ -100,6 +106,12 @@ Zhongguancun Academy / MetaX / et al. Code: github.com/BICLab/SpikingBrain-7B.
 4. **76B / SpikingBrain 2.0 = deferred note (step 8)**, after the 7B line is done.
 5. Host: RTX 3090 (24 GB). bf16 7B (~14 GB) fits (native bf16 on sm_86);
    W8ASpike fits with room for the long-context benchmark.
+6. **Substrate first (2026-10-02).** The pieces both architectures need are built in general form
+   in S0 and consumed by the later steps; nothing gets built "just for this model" when the general
+   form is the same work. Bounded deliberately — an S0 item must be **forced by a model in the
+   queue**, and each lands with its oracle + gate plus proof that the existing Qwen3 gates stay
+   green (generality demonstrated by not regressing instance #1). Park-list and reasoning:
+   `doc/SUBSTRATE-SCOPE.md`.
 
 ---
 
@@ -108,7 +120,7 @@ Zhongguancun Academy / MetaX / et al. Code: github.com/BICLab/SpikingBrain-7B.
 | Asset (verified) | From | Used for |
 |---|---|---|
 | GEMM / RMSNorm / vmath kernels + `tensor::` wrapper | VybForge `native/kernels`, `native/tensor` | all projections, GLA state updates, SWA |
-| GQA causal-softmax layer kernel (LAYER_VERIFY ~5e-5) | VybForge `native/kernels/layer.vyb` | SWA kernel base (window + 4K sliding KV) |
+| GQA causal-softmax layer kernel (LAYER_VERIFY ~5e-5) | VybForge `native/kernels/layer.vyb` | generalised in **S0.4** into an attention family (the window becomes a parameter); its Qwen3 gate must stay green through that change |
 | RoPE kernel | VybForge `native/kernels/qwen3.vyb` | both attention types (theta 1e6) |
 | Multi-layer stack + greedy decode + stochastic sampler | VybForge `native/llm`, `native/sampler` | the 7B model driver |
 | Qwen BPE tokenizer + detokenizer (stdlib/vllm) | VybForge / stdlib | identical vocab path (Qwen2.5 tokenizer ships with the model) |
@@ -131,6 +143,53 @@ asserted**, so the retired oracle's expectations stay traceable. Full statement:
 
 ## 4. Steps (each gate must pass before the next starts)
 
+### S0 — substrate (added 2026-10-02; precedes S1, blocks S2 and S4)
+
+Why: every requirement SpikingBrain adds lands on a *general* gap rather than a model-specific one, so
+the same work written generally serves this model, the previous one, and the next. Evidence, the
+port-vs-consume rule and the park-list: `doc/SUBSTRATE-SCOPE.md`. This is the work order.
+
+**S0.1 — dtypes: bf16 + f16 storage, fp32 accumulation.**
+`native/` today has zero occurrences of bf16/fp16 (kernels run f32/f64; the only `f16` mentions are
+comments describing GGUF block layout). Add a dtype enum, the store/load path and the conversion in
+the tensor/kernel layer, with the accumulation policy stated per op (this model: bf16 weights, fp32
+accumulate). General because every model after Qwen3 is half-precision.
+**Gate:** dtype round-trip and conversion vs numpy/torch on fixed vectors *and* on real tensors from a
+sharded checkpoint; all existing f32 gates unchanged.
+
+**S0.2 — tensor core + model config contract (audit G1).**
+Host-side tensor layer (shape/strides/dtype/alloc, broadcast) plus a **config contract**: model dims
+(layers, hidden, heads, kv heads, head_dim, ffn, vocab, rope theta, eps, tied/untied) read from the
+model's own config instead of literals. Need is measured, not assumed: Qwen3-4B's values are
+hardcoded across the tree — hidden 2560 in **25 files**, 36 layers in **34**, ffn 9728 in **24**,
+vocab 151936 in **13** — so a second architecture otherwise edits those files or forks them.
+**Gate:** re-express ONE existing Qwen3 driver through the config contract + tensor layer and keep its
+gate green. That re-expression is the generality proof and the guard against a substrate designed for
+imagined needs; no Qwen3 gate may regress.
+
+**S0.3 — loaders (this is S3's content, scheduled here).**
+`safetensors.vyb` (8-byte header length + JSON map via `native/json` + raw LE tensor bytes) and
+`torchbin.vyb` (torch.save zip container + minimal pickle subset), each producing a
+name → {dtype, shape, byte-buffer} index. Generic by construction — any safetensors or torch.save
+model, not this one. `.npy` too if it falls out cheaply.
+**Gate:** S3's gate below (name/shape/dtype match against the reference listing + sampled tensor bytes
+hash-match).
+
+**S0.4 — attention family + KV/state abstraction.**
+One attention module with the causal mask as a *parameter*: full causal (Qwen3 today), sliding window
+(SWA), and a state path for recurrent attention (GLA, in S2) — plus a KV/state abstraction covering
+dense KV, rolling window and per-layer recurrent state, so S2/S4 do not grow a third copy of the
+attention plumbing.
+**Gate:** SWA ≡ full-softmax-on-windowed-mask; a window of ∞ ≡ the existing full causal path; the
+existing Qwen3 layer gate stays green (LAYER_VERIFY ~5e-5 unchanged).
+
+**Park-list — explicitly NOT in S0:** autograd generality, generic optimizers, ONNX/OpenCV/PaddleOCR,
+BLAS/FFT/reduce-scan surfaces, Unicode property classes (risk 7). Entry requirement remains "forced by
+a model in the queue".
+
+**Ordering:** S0.1 and S0.2 are the front (S2 and S4 both wait on them). **S1 is host-only and
+independent of all of S0** — it can go first or in parallel. S0.3 blocks S4 only.
+
 ### S1 — Spike core in Vyb (`spike.vyb`)
 
 Pure host Vyb module, no GPU:
@@ -148,13 +207,16 @@ from a real 7B forward (any layer set; stats are per-linear-layer).
 
 ### S2 — GLA + SWA kernels (NVPTX, `native/kernels/`)
 
+**Consumes:** S0.1 (bf16 storage / fp32 accumulate) and S0.4 (the SWA window is a *parameter* of the
+attention family, not a fork of `layer.vyb`). GLA is genuinely new work either way.
+
 - `gla.vyb`:
   1. fused-recurrent decode first (S = diag(g).S + k v^T; o = q S; per-head
      RMSNorm; o_proj) — correctness gate;
   2. chunked parallel prefill (intra-chunk causal linear attention with per-token
      gate decay + inter-chunk state scan) — TTFT path.
 - `swa.vyb`: windowed causal softmax (4K), GQA 7:1, RoPE, sliding KV cache of one
-  window (no full KV growth).
+  window (no full KV growth) — S0.4's windowed path, instantiated for this model's 4K window.
 - GQA, ReLU-on-q/k, logsigmoid/16 gate, per-head RMSNorm all per the repo code.
 - Weights bf16 (3090 has native bf16); accumulation fp32, noted per gate.
 
@@ -164,6 +226,9 @@ full-softmax-on-windowed-mask equivalence. Tolerance 1e-4 relative (bf16/fp32 mi
 noted per gate).
 
 ### S3 — Native weight loaders
+
+**Timing:** scheduled inside S0 as **S0.3** (2026-10-02). The content below is unchanged — it moved
+earlier because it is generic and blocks S4.
 
 - `safetensors.vyb`: header length + JSON map (via `native/json`) + raw LE tensor
   reads via `io`. Generic, reusable for any safetensors model.
@@ -181,6 +246,9 @@ weights + scales layout before finalizing the model wiring; if it carries fp32
 tensors too, note them).
 
 ### S4 — SpikingBrain-7B forward in Vyb
+
+**Consumes:** S0.2 (dims from the config contract, not literals), S0.3 (loaders), S0.4 (attention
+family + state abstraction).
 
 - Model driver (`native/llm/spikingbrain.vyb`, main-less module + thin runner):
   embed -> 28 layers (even: SWA, odd: GLA) -> final RMSNorm -> lm_head -> logits;
@@ -340,11 +408,21 @@ models; (d) `stdlib/spike` green in the Vyb suite.
 6. **S7 plasticity compatibility**: the MB learning rule (Phase 8) is weight-based
    on LIF; signed/bitwise events must keep the rule's inputs equivalent — the
    fixture spike-for-spike gate is designed to catch any behavior change.
+7. **Tokenizer non-ASCII fidelity (added 2026-10-02).** The reused Qwen BPE pre-tokenizer is exact on
+   ASCII and *approximate* on non-ASCII, because Vyb has no Unicode-property-class regex — the ported
+   splitter classifies remapped byte-glyphs by glyph identity (see `doc/SUBSTRATE-SCOPE.md` and
+   `native/tokenizer/` for the divergence trail). S4's byte-BPE equivalence gate against HF will hit
+   this. Either accept and document the divergence for the classes that actually occur, or add Unicode
+   property classes to `stdlib/regex` — a Vyb-repo task, to be filed upstream rather than worked
+   around here.
 
 ---
 
 ## 8. File layout (where things land)
 
+- VybForge `native/tensor/` — dtype + tensor core + config contract (S0.1/S0.2);
+  `native/torchload/{safetensors,torchbin}.vyb` — loaders (S0.3);
+  `native/kernels/attn.vyb` — the attention family (S0.4).
 - VybForge `native/spike/spike.vyb` (+ probes) — S1 core (promoted to
   `stdlib/spike` in S7d).
 - VybForge `native/kernels/gla.vyb`, `native/kernels/swa.vyb`,
