@@ -21,10 +21,13 @@ Set `VYBHOME` to your Vyb checkout; nothing in this repo needs a path literal.
 | `VYB_STDLIB` | `$VYBHOME/stdlib` |
 | `VYBOS` / `VYBOSHOME` | the sibling VybOS checkout (repair + ledger gates) |
 
-Resolution order: `$VYBHOME/SOURCEME_VYB` (sourced first, if it exists — Vyb's
-build is expected to publish the environment there, rickenator/Vyb#424), then
-`$VYBHOME`, then a derived home from an explicit `$VYB_BIN`/`$VYB`, then
-`$HOME/Projects/Vyb`. With none of those, the scripts stop with the exact `export`
+Resolution order, the same rule as Vyb's own `SOURCEME_VYB` (rickenator/Vyb#424,
+shipped at the checkout toplevel): `$VYBHOME/SOURCEME_VYB` is sourced when
+`VYBHOME` already names a checkout; then `VYBHOME` itself — canonical, with `VYB`
+and `VYB_STDLIB` derived from it. A stale exported `VYB` deliberately does *not*
+win, so one checkout's binary can never be mixed with another's stdlib. Then an
+explicit `$VYB_BIN`/`$VYB`, used only to *derive* the home, then
+`$HOME/Projects/Vyb`. With none of those the scripts stop with the exact `export`
 line to run — never a silent build against the wrong toolchain. One line in your
 shell replaces all of it:
 
