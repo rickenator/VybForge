@@ -44,7 +44,7 @@ change was applied.
 - `make -f native/Makefile schemacheck` (Vyb) validates mock-system domains, the
   agent-response schema contract, and every corpus record (kind + exact
   `{path,op,value,reason}` items).
-- Reference verifier `tests/test_schema.py` (Python) must stay green.
+- Reference verifier `tests/test_schema.vyb` (`make schemacheck`) must stay green.
 
 ## Training
 

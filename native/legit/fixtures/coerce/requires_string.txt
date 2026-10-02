@@ -1,0 +1,1 @@
+{"kind": "confirm", "message": "m", "requires_confirmation": "Yes"}

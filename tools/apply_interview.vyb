@@ -1,0 +1,212 @@
+# apply_interview.vyb — deterministic VybOS desired-state pipeline driver.
+#
+# Vyb-native port of the former Python plumbing (tools/apply_interview.py).
+# The validation/merge/render logic lives in tools/apply.vyb; this driver:
+#   1. reads the baseline from config/default-state.json,
+#   2. feeds confirmed patches (JSONL) to tools/apply.vyb over stdin,
+#   3. splits the applier output into issue list / SPEC / rendered PROGRAM,
+#   4. writes out/spec.json (the machine-contract) and out/system.vyb, and
+#   5. compiles + runs the rendered program to PROVE it reproduces spec.json.
+#
+# Vyb's JIT surface has no argv, so the patches path comes from the
+# VYBFORGE_PATCHES env var (default out/patches.jsonl). Run from the repo root
+# with the toolchain binary in VYB_BIN (default /home/rick/Projects/Vyb):
+#   VYB_BIN=... $VYB tools/apply_interview.vyb --module-path native/json
+#
+# NOTE (this toolchain build): a match over JsonDoc? can bind its value arm by
+# ptr, which the free jget* helpers reject ("Expected JsonDoc but got ptr").
+# The aspect methods (d.get / d.len / d.elem / d.kind / d.hstr, bound on
+# their<JsonDoc>) accept the ptr and work everywhere. Array lengths are
+# therefore read via d.get(root, key) + d.len(nid), as in native/json/test_json.vyb.
+
+import env::{env_get}
+import io::{open_read, read_all, open_write, write_str, close}
+import process::{exec_output, exec_status}
+import term::{eprintln}
+import json_parse::{json_parse, jgetstr}
+
+# Split `s` on "\n" into a Vec<String> (no trailing empty piece for a final \n).
+split_lines(s<String>)<Vec<String>> -> {
+    out<Vec<String>> = Vec<String>()
+    start<Int> = 0
+    n<Int> = s.len()
+    while (start < n) {
+        # index_of has no start offset: search the suffix and map back.
+        tail<String> = s.substring(start, n)
+        q<Int> = tail.index_of("\n")
+        if (q < 0) {
+            out.push(s.substring(start, n))
+            start = n
+        } else {
+            end<Int> = start + q
+            out.push(s.substring(start, end))
+            start = end + 1
+        }
+    }
+    return out
+}
+
+# Trim ASCII whitespace from both ends.
+trim(s<String>)<String> -> {
+    a<Int> = 0
+    b<Int> = s.len()
+    while (a < b) {
+        c<Int> = s.char_at(a) as Int
+        if (c == 32 || c == 9 || c == 10 || c == 13) { a = a + 1 } else { break }
+    }
+    while (b > a) {
+        c<Int> = s.char_at(b - 1) as Int
+        if (c == 32 || c == 9 || c == 10 || c == 13) { b = b - 1 } else { break }
+    }
+    return s.substring(a, b)
+}
+
+# Single-quote for POSIX sh (values come from config/default-state.json).
+shq(s<String>)<String> -> {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+read_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> { match (read_all(f)) { t -> { close(f); return t } ? -> { close(f); return "" } } }
+        ? -> { return "" }
+    }
+}
+
+write_file(path<String>, data<String>)<Int> -> {
+    match (open_write(path)) {
+        w -> { match (write_str(w, data)) { q -> { close(w); return 0 } ? -> { close(w); return 1 } } }
+        ? -> { return 1 }
+    }
+}
+
+main()<Int> -> {
+    # Vyb JIT has no argv: patches path via env (default out/patches.jsonl).
+    patches<String> = env_get("VYBFORGE_PATCHES") else "out/patches.jsonl"
+    # The toolchain binary to re-invoke (Makefile VYB / repo default).
+    vyb<String> = env_get("VYB_BIN") else "/home/rick/Projects/Vyb/build/vyb"
+
+    baseline<String> = read_file("config/default-state.json")
+    if (baseline.len() == 0) { eprintln("no baseline: config/default-state.json"); return 2 }
+    system<String> = ""
+    hostname<String> = ""
+    match (json_parse(baseline)) {
+        d -> {
+            system = jgetstr(d, d.root, "system")
+            hostname = jgetstr(d, d.root, "hostname")
+        }
+        ? -> { eprintln("config/default-state.json is not valid JSON"); return 2 }
+    }
+    if (system.len() == 0 || hostname.len() == 0) {
+        eprintln("baseline missing system/hostname fields")
+        return 2
+    }
+    patches_text<String> = read_file(patches)
+    if (patches_text.len() == 0) { eprintln("no patches file: " + patches); return 2 }
+
+    # Run the Vyb applier with baseline scalar fields injected, patches on stdin.
+    cmd<String> = "APP_SYSTEM=" + shq(system) + " APP_HOSTNAME=" + shq(hostname) +
+                  " " + vyb + " tools/apply.vyb < " + shq(patches)
+    raw<String> = ""
+    freedom { raw = (exec_output(cmd + " 2>&1") else "") }
+    rc<Int> = exec_status()
+    if (rc != 0) {
+        eprintln("applier failed (exit " + rc.to_string() + "):")
+        eprintln(raw)
+        return 1
+    }
+
+    # Split stdout into ISSUES:: / SPEC:: / PROGRAM:: sections.
+    issues<String> = ""
+    spec<String> = ""
+    prog<String> = ""
+    cur<String> = ""
+    lines<Vec<String>> = split_lines(raw)
+    i<Int> = 0
+    for (i in 0..lines.len() - 1) {
+        line<String> = lines.get(i)
+        if (line.starts_with("ISSUES::")) { cur = "ISSUES" }
+        else if (line.starts_with("SPEC::")) { cur = "SPEC" }
+        else if (line.starts_with("PROGRAM::")) { cur = "PROGRAM" }
+        else if (cur == "ISSUES") { issues = issues + line + "\n" }
+        else if (cur == "SPEC") { if (trim(line).len() > 0) { spec = spec + line + "\n" } }
+        else if (cur == "PROGRAM") {
+            t<String> = trim(line)
+            if (t.len() > 0 && t != "0") { prog = prog + line + "\n" }
+        }
+    }
+    if (issues.len() > 0) {
+        eprintln("applier validation issues:")
+        eprintln(issues)
+        return 1
+    }
+    spec = trim(spec)
+    prog = trim(prog)
+    if (spec.len() == 0 || prog.len() == 0) {
+        eprintln("applier output missing SPEC or PROGRAM section")
+        return 1
+    }
+
+    # Validate the spec and pull the summary fields (must be a top-level match
+    # in main for value binding — see the note at the top of this file).
+    pkgs_n<Int> = -1
+    svc_n<Int> = -1
+    spec_system<String> = ""
+    spec_hostname<String> = ""
+    spec_ok<Bool> = false
+    match (json_parse(spec)) {
+        d -> {
+            pkid<Int> = d.get(d.root, "pkgs")
+            svcid<Int> = d.get(d.root, "services")
+            if (pkid >= 0) { pkgs_n = d.len(pkid) }
+            if (svcid >= 0) { svc_n = d.len(svcid) }
+            spec_system = jgetstr(d, d.root, "system")
+            spec_hostname = jgetstr(d, d.root, "hostname")
+            spec_ok = true
+        }
+        ? -> { }
+    }
+    if (!spec_ok) { eprintln("applier emitted invalid spec JSON"); return 1 }
+
+    # Write the machine-contract and the rendered program.
+    if (write_file("out/spec.json", spec + "\n") != 0) { eprintln("cannot write out/spec.json"); return 1 }
+    if (write_file("out/system.vyb", prog + "\n") != 0) { eprintln("cannot write out/system.vyb"); return 1 }
+
+    # PROVE the rendered system.vyb reproduces the spec when compiled + run.
+    build<String> = ""
+    freedom { build = (exec_output(vyb + " out/system.vyb --build out/system-vyb-bin -O2 2>&1") else "") }
+    brc<Int> = exec_status()
+    if (brc != 0) {
+        eprintln("rendered system.vyb failed to compile (exit " + brc.to_string() + "):")
+        eprintln(build)
+        return 1
+    }
+    run2<String> = ""
+    freedom { run2 = (exec_output("out/system-vyb-bin 2>&1") else "") }
+    r2rc<Int> = exec_status()
+    if (r2rc != 0) {
+        eprintln("rendered system.vyb failed to run (exit " + r2rc.to_string() + "):")
+        eprintln(run2)
+        return 1
+    }
+    # First line of the program's output that starts with '{' must equal spec.
+    spec_line<String> = ""
+    l2<Vec<String>> = split_lines(run2)
+    j<Int> = 0
+    for (j in 0..l2.len() - 1) {
+        lt<String> = trim(l2.get(j))
+        if (lt.starts_with("{")) { spec_line = lt; break }
+    }
+    if (spec_line != spec) {
+        eprintln("VERIFY FAIL: rendered program output != merged spec")
+        eprintln("  spec : " + spec)
+        eprintln("  prog : " + spec_line)
+        return 1
+    }
+
+    println("merged spec : " + spec)
+    println("src         : " + pkgs_n.to_string() + " pkgs, " + svc_n.to_string() + " services, " +
+            "system=" + shq(spec_system) + ", hostname=" + shq(spec_hostname))
+    println("wrote out/spec.json and out/system.vyb; rendered program compiled and reproduces spec")
+    return 0
+}

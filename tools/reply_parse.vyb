@@ -1,0 +1,63 @@
+# reply_parse.vyb — reply-shape extraction shared by the VybForge model drivers.
+#
+# Every driver (propose_repair, configurator, configurator_repl) posts to the
+# same three backend families and each family wraps the model's text
+# differently. Keeping the unwrapping here means the drivers agree on one
+# behaviour, including the rule that matters most:
+#
+#   Responses replies: prefer a top-level `output_text` string, else the first
+#   content item typed `output_text`. Reasoning-first endpoints (llama-server,
+#   vLLM) put a `reasoning` item at output[0], so taking output[0].content[0]
+#   blindly would hand back the model's thinking instead of its answer.
+#
+#   import reply_parse::{reply_text}
+#   body = reply_text("openai-responses", raw_http_body)   # "" when absent
+
+import json_parse::{json_parse}
+
+# The contract text out of a backend reply ("" when the reply carries none).
+share(all)
+reply_text(backend<String>, raw<String>)<String> -> {
+    content<String> = ""
+    match (json_parse(raw)) {
+        d -> {
+            if (backend == "ollama") {
+                m1<Int> = d.get(d.root, "message")
+                if (m1 >= 0) { content = d.hstr(d.get(m1, "content")) }
+            } else if (backend == "openai-chat") {
+                ch<Int> = d.get(d.root, "choices")
+                if (ch >= 0 && d.len(ch) > 0) {
+                    c0<Int> = d.elem(ch, 0)
+                    m1<Int> = d.get(c0, "message")
+                    if (m1 >= 0) { content = d.hstr(d.get(m1, "content")) }
+                }
+            } else {
+                ot<Int> = d.get(d.root, "output_text")
+                if (ot >= 0 && d.kind(ot) == "string") { content = d.hstr(ot) }
+                if (content.len() == 0) {
+                    ol<Int> = d.get(d.root, "output")
+                    if (ol >= 0 && d.len(ol) > 0) {
+                        i<Int> = 0
+                        for (i in 0..d.len(ol) - 1) {
+                            item<Int> = d.elem(ol, i)
+                            cs<Int> = d.get(item, "content")
+                            if (cs >= 0 && d.len(cs) > 0) {
+                                j<Int> = 0
+                                for (j in 0..d.len(cs) - 1) {
+                                    c<Int> = d.elem(cs, j)
+                                    if (d.hstr(d.get(c, "type")) == "output_text") {
+                                        content = d.hstr(d.get(c, "text"))
+                                        break
+                                    }
+                                }
+                            }
+                            if (content.len() > 0) { break }
+                        }
+                    }
+                }
+            }
+        }
+        ? -> { }
+    }
+    return content
+}

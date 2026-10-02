@@ -1,0 +1,17 @@
+{
+  "kind": "proposal",
+  "message": "Add curl",
+  "missing_fields": [],
+  "proposed_changes": [
+    {
+      "path": "pkgs",
+      "op": "add",
+      "value": {
+        "name": "curl",
+        "version": "8.5.0"
+      },
+      "reason": "needed to fetch the payload"
+    }
+  ],
+  "requires_confirmation": false
+}

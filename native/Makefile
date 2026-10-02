@@ -34,9 +34,15 @@ layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py
 
-gguf:
-	mkdir -p $(ROOT)/native/gguf
-	python3 $(ROOT)/native/gguf/mk_fixture.py
+# The synthetic GGUF fixture, written by the Vyb port (P1.7). It is git-ignored
+# and generated on demand, so `verify` depends on it explicitly rather than
+# assuming a previous `make gguf` left it behind. Gate (byte parity against the
+# Python original's output): native/legit/run_gguf_gate.sh
+$(ROOT)/native/gguf/test.gguf: $(ROOT)/native/gguf/mk_fixture.vyb
+	@mkdir -p $(ROOT)/native/gguf
+	cd $(ROOT) && $(VYB) native/gguf/mk_fixture.vyb
+
+gguf: $(ROOT)/native/gguf/test.gguf
 	cd $(ROOT) && $(VYB) native/gguf/parse_gguf.vyb
 	python3 $(ROOT)/native/gguf/verify_gguf.py
 
@@ -75,7 +81,7 @@ gdecode:
 gdecode-pipeline:
 	cd $(ROOT) && ./native/gdecode/run_pipeline.sh
 
-# Vyb port of tests/test_schema.py (schema + corpus agreement guard) in the runtime language
+# Schema + corpus agreement guard in the runtime language (Vyb port of the former Python verifier)
 schemacheck:
 	cd $(ROOT) && $(VYB) tests/test_schema.vyb --module-path native/json
 
@@ -249,13 +255,15 @@ loradec: $(ROOT)/native/build/train.ptx $(ROOT)/native/build/qwen3.ptx
 # agent-response contract (writes native/out/contract_loradec.json). Runs decode
 # in JSON mode (VYB_JSON_MODE=1) so it opens with the '{"' contract opener; the
 # coerce is tolerant of truncated JSON (decode token budget often cuts mid-object).
+# All three stages are Vyb; the independent jsonschema verification of the result
+# lives in native/legit/run_coerce_gate.sh (verification-only, never in this path).
 loradec-contract: $(ROOT)/native/build/train.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && VYB_JSON_MODE=1 $(VYB) native/host/loradec_driver.vyb
 	cd $(ROOT) && $(VYB) native/gdecode/loradec_emit.vyb --module-path native/tokenizer
-	cd $(ROOT) && .venv/bin/python native/gdecode/coerce_contract.py
+	cd $(ROOT) && $(VYB) native/gdecode/coerce_contract.vyb --module-path native/json
 
 # build all kernels then run every verified driver
-verify: $(PTX)
+verify: $(PTX) $(ROOT)/native/gguf/test.gguf
 	@echo "== GEMM =="
 	cd $(ROOT) && $(VYB) native/host/gemm_driver.vyb
 	@echo "== RMSNORM =="

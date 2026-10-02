@@ -1,0 +1,1 @@
+{bad json} then {"kind": "proposal", "message": "ok", "proposed_changes": [], "missing_fields": [], "requires_confirmation": true}

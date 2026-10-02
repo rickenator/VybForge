@@ -1,0 +1,1 @@
+{"kind": "Machine Configuration", "name": "Machine Configuration", "description": "This configuration is for the current machine.", "parameters": {"machineType": "server"}}

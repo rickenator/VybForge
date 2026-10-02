@@ -1,7 +1,7 @@
 // validate_proposal.vyb — VybForge MODEL-BOUNDARY CLOSURE (issue #7).
 //
 // Consumes a model-emitted PatchProposal (the JSON value written by
-// tools/propose_repair.py) and runs it through the REAL VybOS repair core:
+// tools/propose_repair.vyb) and runs it through the REAL VybOS repair core:
 //
 //   repair::{apply_diff, repair_step, should_accept}   (VybOS modules/repair.vyb)
 //   patchlife::{promote} + packagerealization::{seal_realization, ...}
@@ -15,7 +15,7 @@
 // NOT required — this runs the same code path a live proposal would hit.
 //
 // Inputs (env):
-//   PROP_PROPOSAL  path to a proposal JSON (the --out of propose_repair.py)
+//   PROP_PROPOSAL  path to a proposal JSON (the VYBFORGE_OUT of propose_repair.vyb)
 //   PROP_PRISTINE  path to the pristine source text
 //   PROP_TESTS     "pass" | "fail"  (the build/test gate verdict)
 //   PROP_INTEGR    "pass" | "fail"  (the integration validation gate)

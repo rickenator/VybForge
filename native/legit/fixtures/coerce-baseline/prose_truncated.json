@@ -1,0 +1,26 @@
+{
+  "kind": "proposal",
+  "message": "m",
+  "missing_fields": [],
+  "proposed_changes": [
+    {
+      "path": "pkgs",
+      "op": "add",
+      "value": {
+        "nested": {
+          "deep": [
+            1,
+            2,
+            {
+              "k": "v"
+            }
+          ]
+        },
+        "empty": {},
+        "e2": []
+      },
+      "reason": "r"
+    }
+  ],
+  "requires_confirmation": false
+}

@@ -1,0 +1,205 @@
+# http_client.vyb — shared HTTP/1.1 client for the VybForge model drivers.
+#
+# Extracted from propose_repair.vyb so the driver family (propose_repair,
+# configurator, configurator_repl) shares one client instead of inlining a copy each.
+#
+#   import http_client::{PostResp, http_post}   # json_escape lives in json_util.vyb
+#   pr<PostResp> = http_post(endpoint, "/v1/chat/completions", headers, body)
+#
+# `endpoint` keeps its path prefix (http://host:8888/v1 + /responses ->
+# /v1/responses), matching the Python drivers' endpoint.rstrip("/") + path.
+
+import network::{socket_close, socket_connect, socket_open, socket_resolve, socket_set_timeout, Socket}
+import http::{http_send_all, http_read_line, http_read_rest, http_close}
+import https::{tls_read_line, tls_read_exact, tls_read_chunked}
+import tls::{tls_client_context, tls_stream, tls_connect, tls_write, tls_read, tls_close, tls_free_context}
+
+share(all)
+struct PostResp { status<Int>, body<String> }
+
+share(all)
+build_request(method_path<String>, host<String>, port<Int>, headers<Vec<String>>, body<String>)<String> -> {
+    req<String> = "POST " + method_path + " HTTP/1.1\r\nHost: " + host + ":" + port.to_string() + "\r\n"
+    i<Int> = 0
+    for (i in 0..headers.len() - 1) { req = req + headers.get(i) + "\r\n" }
+    req = req + "Content-Length: " + body.len().to_string() + "\r\nConnection: close\r\n\r\n" + body
+    return req
+}
+
+# Plain HTTP/1.1 POST (local Ollama / trusted-LAN gateways).
+share(all)
+post_plain(host<String>, port<Int>, path<String>, headers<Vec<String>>, body<String>)<PostResp> -> {
+    ip<String> = socket_resolve(host) else ""
+    if (ip.len() == 0) { return PostResp { status = -1, body = "resolve failed: " + host } }
+    fd<Int> = socket_open(Socket::AF_INET, Socket::SOCK_STREAM, Socket::IPPROTO_TCP) else -1
+    if (fd < 0) { return PostResp { status = -1, body = "socket open failed" } }
+    if (!(socket_connect(fd, ip, port) else false)) { socket_close(fd); return PostResp { status = -1, body = "connect failed: " + host } }
+    # The Python drivers use a 180 s socket timeout; without it a slow or
+    # half-dead backend blocks the CLI forever.
+    tmo<Bool> = socket_set_timeout(fd, 180000) else false
+    req<String> = build_request(path, host, port, headers, body)
+    if (http_send_all(fd, req) != req.len()) { socket_close(fd); return PostResp { status = -1, body = "incomplete request to " + host } }
+    line<String> = http_read_line(fd)
+    sp<Int> = line.index_of(" ")
+    code<Int> = -1
+    if (sp >= 0) {
+        rest<String> = line.substring(sp + 1, line.len())
+        sp2<Int> = rest.index_of(" ")
+        if (sp2 >= 0) {
+            numtxt<String> = rest.substring(0, sp2)
+            d<Int> = 0
+            ok<Bool> = true
+            k<Int> = 0
+            for (k in 0..numtxt.len() - 1) {
+                c<Int> = numtxt.char_at(k) as Int
+                if (c < 48 || c > 57) { ok = false; break }
+                d = d * 10 + (c - 48)
+            }
+            if (ok) { code = d }
+        }
+    }
+    hdr<String> = http_read_line(fd)
+    while (hdr.len() > 0) { hdr = http_read_line(fd) }
+    resp<String> = http_read_rest(fd, 64 * 1048576)
+    http_close(fd)
+    return PostResp { status = code, body = resp }
+}
+
+# HTTPS/1.1 POST over an UNVERIFIED client context (self-signed / loopback
+# gateways) — mirrors the request/response shape of https/mod.vyb's fetch.
+share(all)
+post_tls(host<String>, port<Int>, path<String>, headers<Vec<String>>, body<String>)<PostResp> -> {
+    ip<String> = socket_resolve(host) else ""
+    if (ip.len() == 0) { return PostResp { status = -1, body = "resolve failed: " + host } }
+    fd<Int> = socket_open(Socket::AF_INET, Socket::SOCK_STREAM, Socket::IPPROTO_TCP) else -1
+    if (fd < 0) { return PostResp { status = -1, body = "socket open failed" } }
+    if (!(socket_connect(fd, ip, port) else false)) { socket_close(fd); return PostResp { status = -1, body = "connect failed: " + host } }
+    # Same 180 s bound as post_plain (and the Python drivers).
+    tmo<Bool> = socket_set_timeout(fd, 180000) else false
+    # NOTE: value arm first in every match — a leading `?` arm makes this build
+    # bind the value arm by ptr (see apply_interview.vyb header note).
+    match (tls_client_context()) {
+        c -> {
+            match (tls_stream(c, fd, host)) {
+                s0 -> {
+                    match (tls_connect(s0)) {
+                        s -> {
+                            req<String> = build_request(path, host, port, headers, body)
+                            w<Int> = 0
+                            match (tls_write(s, req)) { q -> { w = q } ? -> { w = -1 } }
+                            if (w != req.len()) { tls_close(s); socket_close(fd); tls_free_context(c); return PostResp { status = -1, body = "incomplete request to " + host } }
+                            line<String> = tls_read_line(s)
+                            sp<Int> = line.index_of(" ")
+                            code<Int> = -1
+                            if (sp >= 0) {
+                                rest<String> = line.substring(sp + 1, line.len())
+                                sp2<Int> = rest.index_of(" ")
+                                if (sp2 >= 0) {
+                                    numtxt<String> = rest.substring(0, sp2)
+                                    d<Int> = 0
+                                    ok<Bool> = true
+                                    k<Int> = 0
+                                    for (k in 0..numtxt.len() - 1) {
+                                        c2<Int> = numtxt.char_at(k) as Int
+                                        if (c2 < 48 || c2 > 57) { ok = false; break }
+                                        d = d * 10 + (c2 - 48)
+                                    }
+                                    if (ok) { code = d }
+                                }
+                            }
+                            length<Int> = 0
+                            has_len<Bool> = false
+                            chunked<Bool> = false
+                            h<String> = tls_read_line(s)
+                            while (h.len() > 0) {
+                                lv<String> = h
+                                if (h.index_of("content-length:") >= 0) {
+                                    p2<Int> = h.index_of(":")
+                                    if (p2 >= 0) {
+                                        vtxt<String> = h.substring(p2 + 1, h.len())
+                                        # trim
+                                        a3<Int> = 0
+                                        while (a3 < vtxt.len() && (vtxt.char_at(a3) as Int) == 32) { a3 = a3 + 1 }
+                                        vtxt = vtxt.substring(a3, vtxt.len())
+                                        d2<Int> = 0
+                                        ok2<Bool> = true
+                                        k2<Int> = 0
+                                        for (k2 in 0..vtxt.len() - 1) {
+                                            c3<Int> = vtxt.char_at(k2) as Int
+                                            if (c3 < 48 || c3 > 57) { ok2 = false; break }
+                                            d2 = d2 * 10 + (c3 - 48)
+                                        }
+                                        if (ok2 && vtxt.len() > 0) { length = d2; has_len = true }
+                                    }
+                                }
+                                if (h.to_lower().index_of("transfer-encoding: chunked") >= 0) { chunked = true }
+                                h = tls_read_line(s)
+                            }
+                            resp<String> = ""
+                            if (chunked) { resp = tls_read_chunked(s) }
+                            else if (has_len) { resp = tls_read_exact(s, length) }
+                            else {
+                                while (true) {
+                                    match (tls_read(s, 65536)) {
+                                        chunk -> {
+                                            if (chunk.len() == 0) { break }
+                                            resp = resp.concat(chunk)
+                                        }
+                                        ? -> { break }
+                                    }
+                                }
+                            }
+                            tls_close(s)
+                            socket_close(fd)
+                            tls_free_context(c)
+                            return PostResp { status = code, body = resp }
+                        }
+                        ? -> { tls_close(s0); socket_close(fd); tls_free_context(c); return PostResp { status = -1, body = "tls handshake failed" } }
+                    }
+                }
+                ? -> { socket_close(fd); tls_free_context(c); return PostResp { status = -1, body = "tls stream failed" } }
+            }
+        }
+        ? -> { socket_close(fd); return PostResp { status = -1, body = "tls client context failed" } }
+    }
+}
+
+# Parse endpoint "scheme://host[:port]" and dispatch POST to http or https.
+share(all)
+http_post(endpoint<String>, path<String>, headers<Vec<String>>, body<String>)<PostResp> -> {
+    rest<String> = endpoint
+    tls<Bool> = false
+    defport<Int> = 80
+    if (endpoint.starts_with("https://")) { rest = endpoint.substring(8, endpoint.len()); tls = true; defport = 443 }
+    else if (endpoint.starts_with("http://")) { rest = endpoint.substring(7, endpoint.len()) }
+    hostport<String> = rest
+    base<String> = ""
+    sl<Int> = rest.index_of("/")
+    if (sl >= 0) {
+        hostport = rest.substring(0, sl)
+        base = rest.substring(sl, rest.len())
+        # rstrip trailing slashes, matching the Python driver's endpoint.rstrip("/")
+        while (base.len() > 1 && base.substring(base.len() - 1, base.len()) == "/") {
+            base = base.substring(0, base.len() - 1)
+        }
+    }
+    req_path<String> = base + path
+    host<String> = hostport
+    port<Int> = defport
+    cl<Int> = hostport.index_of(":")
+    if (cl >= 0) {
+        host = hostport.substring(0, cl)
+        ptxt<String> = hostport.substring(cl + 1, hostport.len())
+        d<Int> = 0
+        ok<Bool> = true
+        i<Int> = 0
+        for (i in 0..ptxt.len() - 1) {
+            c<Int> = ptxt.char_at(i) as Int
+            if (c < 48 || c > 57) { ok = false; break }
+            d = d * 10 + (c - 48)
+        }
+        if (ok && ptxt.len() > 0) { port = d }
+    }
+    if (tls) { return post_tls(host, port, req_path, headers, body) }
+    return post_plain(host, port, req_path, headers, body)
+}

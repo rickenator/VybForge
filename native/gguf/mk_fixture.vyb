@@ -1,0 +1,199 @@
+// mk_fixture.vyb — Vyb port of native/gguf/mk_fixture.py (P1.7).
+//
+// Reference tooling: writes a small deterministic GGUF v3 file for testing the
+// Vyb-native GGUF reader AND the q4_0 tensor-data dequant slice.
+// Tensors: t0 = u8 [2,3]; t1 = f32 [4] = {1,2,3,4}; t2 = Q4_0 [32] (1 block).
+// Q4_0 block = [f16 scale][32x4-bit]; scale=1.0 and nibble_i = i =>
+//   dequant_i = (i - 8) * 1.0.
+// Tensor DATA is placed AFTER the entire info region (data_base) — the offsets
+// are computed, not hand-guessed.
+//
+// Output is byte-identical to the Python original's (gate:
+// native/legit/run_gguf_gate.sh compares against the frozen baseline in
+// native/legit/fixtures/gguf/). The report line is byte-identical too, which is
+// why `out` is absolute: the Python printed
+// os.path.join(os.path.dirname(__file__), "test.gguf") while the Makefile invoked
+// it by absolute path from the repo root, so PWD + the relative path reproduces
+// that string. Run it from the repo root, like every other tool.
+//
+// Vyb note: a by-value `Vec` parameter cannot be mutated, so the packers below
+// each return their own buffer and the caller `concat`s them.
+//
+//   cd <repo root> && $VYB native/gguf/mk_fixture.vyb
+
+import io::{open_write, write_bytes, close}
+import env::{env_get}
+
+// ---- little-endian packers ----
+
+le32(v<Int>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec<UInt8>()
+    i<Int> = 0
+    for (i in 0..3) { b.push(((v >> (i * 8)) & 255) as UInt8) }
+    return b
+}
+
+le64(v<Int>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec<UInt8>()
+    i<Int> = 0
+    for (i in 0..7) { b.push(((v >> (i * 8)) & 255) as UInt8) }
+    return b
+}
+
+// Raw bytes of a string, no length prefix. Every string in this fixture is
+// ASCII, so `len()` (characters) is the byte count the format wants.
+ascii_bytes(s<String>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec<UInt8>()
+    i<Int> = 0
+    for (i in 0..s.len() - 1) { b.push(s.char_at(i) as UInt8) }
+    return b
+}
+
+// GGUF string: u64 byte length + the raw bytes.
+gguf_str(s<String>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = le64(s.len())
+    return b.concat(ascii_bytes(s))
+}
+
+// ---- small Vec<Int> builders (dim lists and literal byte lists) ----
+
+ivec1(a<Int>)<Vec<Int>> -> { v<Vec<Int>> = Vec<Int>(); v.push(a); return v }
+ivec2(a<Int>, b<Int>)<Vec<Int>> -> { v<Vec<Int>> = Vec<Int>(); v.push(a); v.push(b); return v }
+ivec4(a<Int>, b<Int>, c<Int>, d<Int>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec<Int>()
+    v.push(a); v.push(b); v.push(c); v.push(d)
+    return v
+}
+
+u8list(vals<Vec<Int>>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec<UInt8>()
+    i<Int> = 0
+    for (i in 0..vals.len() - 1) { b.push((vals.get(i) & 255) as UInt8) }
+    return b
+}
+
+// ---- fixture metadata ----
+
+// One tensor as the format stores it: name, dims (the GGUF info field), the ggml
+// type id, and the data offset (patched once data_base is known).
+struct TInfo {
+    name<String>,
+    dims<Vec<Int>>,
+    ty<Int>,
+    oset<Int>
+}
+
+// The Q4_0 block: f16 scale 1.0 (= 0x3C00, little-endian 0x00 0x3C), then 16
+// packed nibble bytes, byte s holding elements 2s and 2s+1: nibble_i = i, so
+// byte s = (2s & 0xF) | (((2s+1) & 0xF) << 4).
+q4_block()<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec<UInt8>()
+    b.push(0 as UInt8)
+    b.push(60 as UInt8)
+    s<Int> = 0
+    for (s in 0..15) {
+        e<Int> = s * 2
+        b.push(((e & 15) | (((e + 1) & 15) << 4)) as UInt8)
+    }
+    return b
+}
+
+main() -> {
+    // ----- header + kv -----
+    // head = "GGUF" + u32 version(3) + u64 n_tensors(3) + u64 n_kv(1)
+    head<Vec<UInt8>> = ascii_bytes("GGUF")
+    head = head.concat(le32(3))
+    head = head.concat(le64(3))
+    head = head.concat(le64(1))
+
+    // kv = s("general.name") + u32(8) + s("tiny")
+    kv<Vec<UInt8>> = gguf_str("general.name")
+    kv = kv.concat(le32(8))
+    kv = kv.concat(gguf_str("tiny"))
+
+    // ----- tensor bodies, in file order -----
+    t0b<Vec<UInt8>> = u8list(ivec4(1, 2, 3, 4))
+    // t1: struct.pack("<4f", 1.0, 2.0, 3.0, 4.0) — the IEEE-754 single bits of
+    // 1.0 / 2.0 / 3.0 / 4.0, little-endian.
+    t1b<Vec<UInt8>> = le32(0x3F800000)
+    t1b = t1b.concat(le32(0x40000000))
+    t1b = t1b.concat(le32(0x40400000))
+    t1b = t1b.concat(le32(0x40800000))
+    q4b<Vec<UInt8>> = q4_block()
+
+    // ----- tensor infos (offsets patched after data_base) -----
+    infos<Vec<TInfo>> = Vec<TInfo>()
+    infos.push(TInfo { name = "t0", dims = ivec2(2, 3), ty = 0, oset = 0 })
+    infos.push(TInfo { name = "t1", dims = ivec1(4), ty = 6, oset = 0 })
+    infos.push(TInfo { name = "t2", dims = ivec1(32), ty = 2, oset = 0 })
+
+    lens<Vec<Int>> = Vec<Int>()
+    lens.push(t0b.len()); lens.push(t1b.len()); lens.push(q4b.len())
+
+    // data_base = 24 (header) + kv + the whole info region, where one info is
+    // u64 namelen + name + u32 n_dims + dims u64s + u32 type + u64 offset.
+    itotal<Int> = 0
+    ti<Int> = 0
+    for (ti in 0..infos.len() - 1) {
+        t<TInfo> = infos.get(ti)
+        itotal = itotal + (8 + t.name.len() + 4 + t.dims.len() * 8 + 4 + 8)
+    }
+    data_base<Int> = 24 + kv.len() + itotal
+
+    // ----- assign the offsets sequentially -----
+    cursor<Int> = data_base
+    k<Int> = 0
+    for (k in 0..infos.len() - 1) {
+        old<TInfo> = infos.get(k)
+        infos.set(k, TInfo { name = old.name, dims = old.dims, ty = old.ty, oset = cursor })
+        cursor = cursor + lens.get(k)
+    }
+
+    // ----- assemble -----
+    b<Vec<UInt8>> = head
+    b = b.concat(kv)
+    i<Int> = 0
+    for (i in 0..infos.len() - 1) {
+        t2<TInfo> = infos.get(i)
+        b = b.concat(gguf_str(t2.name))
+        b = b.concat(le32(t2.dims.len()))
+        di<Int> = 0
+        for (di in 0..t2.dims.len() - 1) { b = b.concat(le64(t2.dims.get(di))) }
+        b = b.concat(le32(t2.ty))
+        b = b.concat(le64(t2.oset))
+    }
+    if (b.len() != data_base) {
+        println("mk_fixture: info region ends at " + b.len().to_string() + ", expected " + data_base.to_string())
+        exit(2)
+    }
+    b = b.concat(t0b)
+    b = b.concat(t1b)
+    b = b.concat(q4b)
+
+    // ----- write -----
+    out<String> = (env_get("PWD") else "") + "/native/gguf/test.gguf"
+    wrote<Int> = 0
+    match (open_write(out)) {
+        w -> {
+            match (write_bytes(w, b)) {
+                n -> { wrote = n }
+                ? -> { wrote = -1 }
+            }
+            close(w)
+        }
+        ? -> {
+            println("mk_fixture: cannot open " + out + " for writing")
+            exit(3)
+        }
+    }
+    if (wrote != b.len()) {
+        println("mk_fixture: wrote " + wrote.to_string() + " of " + b.len().to_string() + " bytes to " + out)
+        exit(4)
+    }
+
+    i0<TInfo> = infos.get(0)
+    i1<TInfo> = infos.get(1)
+    i2<TInfo> = infos.get(2)
+    println("wrote " + out + " (" + b.len().to_string() + " bytes; data_base=" + data_base.to_string()
+        + "; t0@" + i0.oset.to_string() + " t1@" + i1.oset.to_string() + " t2@" + i2.oset.to_string() + ")")
+}

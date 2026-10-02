@@ -1,0 +1,11 @@
+VybForge configurator using openai-chat / qwen3-test. Ctrl-D exits; no changes are applied.
+you> {
+  "kind": "question",
+  "message": "Which hostname should the appliance use?",
+  "missing_fields": [
+    "hostname"
+  ],
+  "proposed_changes": [],
+  "requires_confirmation": false
+}
+you> 

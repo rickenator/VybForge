@@ -1,0 +1,12 @@
+{
+  "kind": "summary",
+  "message": "m",
+  "missing_fields": [
+    "a",
+    "3",
+    "true",
+    "2.5"
+  ],
+  "proposed_changes": [],
+  "requires_confirmation": false
+}

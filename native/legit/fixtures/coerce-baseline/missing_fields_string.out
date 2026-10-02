@@ -1,0 +1,17 @@
+---- emit JSON (best-effort coerce) ----
+{
+  "kind": "summary",
+  "message": "m",
+  "missing_fields": "just one"
+}
+---- coerced contract ----
+{
+  "kind": "summary",
+  "message": "m",
+  "missing_fields": [
+    "just one"
+  ],
+  "proposed_changes": [],
+  "requires_confirmation": false
+}
+COERCE_CONTRACT: SCHEMA_OK

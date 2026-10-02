@@ -16,6 +16,9 @@ files = {
     "summary":  ("native/out/contract_summary.json", "summary"),
     "proposal": ("native/out/contract_proposal.json", "proposal"),
     "pipeline": ("native/out/contract_pipeline.json", "summary"),
+    # The tuned-decode coerce picks the kind itself (it maps the model's drifted
+    # kind onto the enum), so only schema validity is asserted here.
+    "loradec":  ("native/out/contract_loradec.json", None),
 }
 allok = True
 for label, (rel, expkind) in files.items():
@@ -26,12 +29,12 @@ for label, (rel, expkind) in files.items():
         continue
     doc = json.load(open(path))
     errs = list(validator.iter_errors(doc))
-    ok = (doc.get("kind") == expkind) and not errs
+    ok = ((expkind is None) or (doc.get("kind") == expkind)) and not errs
     if errs:
         print(f"CONTRACT_VERIFY: {label} FAIL")
         for e in errs:
             print("   ", e.message)
-    elif doc.get("kind") != expkind:
+    elif expkind is not None and doc.get("kind") != expkind:
         print(f"CONTRACT_VERIFY: {label} FAIL (kind mismatch: {doc.get('kind')})")
     else:
         print(f"CONTRACT_VERIFY: {label} OK")

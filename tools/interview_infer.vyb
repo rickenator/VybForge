@@ -1,0 +1,131 @@
+# interview_infer.vyb — VybForge configurator one-shot (P1.5 port of
+# tools/interview_infer.py).
+#
+# Sends one VybOS goal to the served configurator model, takes the
+# `proposed_changes` out of its JSON contract, and APPENDS one compact JSONL
+# patch line per change — the request set the deterministic applier
+# (tools/apply_interview.vyb) consumes.
+#
+# Python original: loaded the base model + LoRA adapter with torch on the 3090.
+# The Vyb port talks to a served model instead (same backend set as the other
+# drivers); the emitted JSONL is byte-identical to the original's.
+#
+# Vyb's JIT surface has no argv: flags are env vars, same names as elsewhere
+# (the Python flag in parentheses):
+#   VYBFORGE_PROMPT_IN  (--prompt, REQUIRED: the VybOS goal)
+#   VYBFORGE_OUT        (--out, default out/patches.jsonl)
+#   VYBFORGE_BACKEND (ollama) / VYBFORGE_ENDPOINT (http://127.0.0.1:11434) /
+#   VYBFORGE_MODEL (qwen3:8b) / VYBFORGE_API_KEY / VYBFORGE_STRUCTURED_OUTPUT
+#   VYBFORGE_MAX_TOKENS (512, informational: the served model owns generation)
+#
+# Run from the repo root:
+#   VYBFORGE_PROMPT_IN="set hostname to vyb-appliance-2" \
+#     $VYB tools/interview_infer.vyb --module-path tools --module-path native/json
+
+import env::{env_get}
+import io::{open_read, read_all, open_append, write_str, close}
+import term::{eprintln}
+import json_parse::{json_parse}
+import reply_parse::{reply_text}
+import chat_request::{post_chat, api_key_from_env}
+import http_client::{PostResp}
+import json_util::{json_text}
+
+# System prompt — verbatim from tools/interview_infer.py.
+system_prompt()<String> -> {
+    return "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, " +
+           "message, missing_fields, proposed_changes, and requires_confirmation. VybOS builds a " +
+           "machine from a minimal SystemSpec: system, hostname, pkgs, services. Each proposed_changes " +
+           "item is {path, op, value, reason}; paths are system|hostname|pkgs|services and values must " +
+           "be schema-conformant. For pkgs, op add has value {\"name\":..,\"version\":..,\"source\":..}; " +
+           "for services, op add has value {\"name\":..,\"command\":..}; hostname/system use op replace " +
+           "with a plain string value. Emit only valid JSON."
+}
+
+# Append-or-create, matching the Python original's Path.open("a").
+# Vyb#419 (open_append composed APPEND|CREATE with no access mode, so the fd was
+# read-only and every write failed with EBADF) is fixed in main — 17270c7, PR #422.
+append_change(out_path<String>, line<String>)<Int> -> {
+    match (open_append(out_path)) {
+        w -> { match (write_str(w, line)) { q -> { close(w); return 0 } ? -> { close(w); return 1 } } }
+        ? -> { return 1 }
+    }
+}
+
+main() -> {
+    prompt<String> = env_get("VYBFORGE_PROMPT_IN") else ""
+    out_path<String> = env_get("VYBFORGE_OUT") else "out/patches.jsonl"
+    backend<String> = env_get("VYBFORGE_BACKEND") else "ollama"
+    endpoint<String> = env_get("VYBFORGE_ENDPOINT") else "http://127.0.0.1:11434"
+    model<String> = env_get("VYBFORGE_MODEL") else "qwen3:8b"
+    mode<String> = env_get("VYBFORGE_STRUCTURED_OUTPUT") else "prompt"
+    key_env<String> = env_get("VYBFORGE_API_KEY_ENV") else ""
+    if (prompt.len() == 0) {
+        eprintln("VYBFORGE_PROMPT_IN is required (the VybOS goal)")
+        return
+    }
+
+    roles<Vec<String>> = Vec<String>()
+    contents<Vec<String>> = Vec<String>()
+    roles.push("system")
+    contents.push(system_prompt())
+    roles.push("user")
+    contents.push(prompt)
+    api_key<String> = api_key_from_env(key_env)
+    # No structured-output schema here: the original describes the contract in the
+    # system prompt and lets the model emit text ("" leaves `format` off ollama).
+    pr<PostResp> = post_chat(backend, endpoint, model, mode, "", roles, contents, api_key)
+    if (pr.status != 200) {
+        eprintln("backend error: HTTP " + pr.status.to_string() + " from " + backend + ": " + pr.body)
+        return
+    }
+    text<String> = reply_text(backend, pr.body)
+    if (text.len() == 0) {
+        eprintln("backend error: " + backend + " reply carried no content")
+        return
+    }
+    println("RAW: " + text)
+
+    match (json_parse(text)) {
+        d -> {
+            kind<String> = "<none>"
+            kk<Int> = d.get(d.root, "kind")
+            if (kk >= 0) { kind = d.hstr(kk) }
+            ch<Int> = d.get(d.root, "proposed_changes")
+            if (ch < 0 || d.len(ch) == 0) {
+                println("no proposed_changes in response (kind=" + kind + "); nothing appended")
+                return
+            }
+            n<Int> = 0
+            i<Int> = 0
+            for (i in 0..d.len(ch) - 1) {
+                item<Int> = d.elem(ch, i)
+                pn<Int> = d.get(item, "path")
+                on<Int> = d.get(item, "op")
+                vn<Int> = d.get(item, "value")
+                rn<Int> = d.get(item, "reason")
+                if (pn < 0 || on < 0 || vn < 0 || rn < 0) {
+                    eprintln("proposed_changes item " + i.to_string() + " is missing path|op|value|reason; skipped")
+                } else {
+                    # Exactly the original's canonical line:
+                    #   json.dumps({"path":..,"op":..,"value":..,"reason":..},
+                    #              separators=(",", ":"))
+                    line<String> = "{\"path\":" + json_text(d, pn) +
+                                   ",\"op\":" + json_text(d, on) +
+                                   ",\"value\":" + json_text(d, vn) +
+                                   ",\"reason\":" + json_text(d, rn) + "}\n"
+                    if (append_change(out_path, line) != 0) {
+                        eprintln("cannot append to " + out_path)
+                        return
+                    }
+                    n = n + 1
+                }
+            }
+            println("appended " + n.to_string() + " proposed_change(s) -> " + out_path)
+        }
+        ? -> {
+            eprintln("model reply is not valid JSON")
+            return
+        }
+    }
+}

@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
+# run.sh — backend-neutral launcher for the VybForge desired-state interviewer
+# (Vyb-native driver: app/configurator.vyb; the Python original is gone).
+#
+# Extra settings are env vars, not argv (the Vyb JIT has no argv surface):
+#   VYBFORGE_STRUCTURED_OUTPUT=json_schema|json_object|prompt
+#   VYBFORGE_SCHEMA / VYBFORGE_RESPONSE_SCHEMA / VYBFORGE_CONFIG / VYBFORGE_PROMPT
+#   VYBFORGE_API_KEY / VYBFORGE_API_KEY_ENV for hosted providers
 set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VYB="${VYB:-/home/rick/Projects/Vyb/build/vyb}"
+VYB_STDLIB="${VYB_STDLIB:-/home/rick/Projects/Vyb/stdlib}"
 
 backend="${VYBFORGE_BACKEND:-ollama}"
 case "$backend" in
@@ -21,11 +32,14 @@ case "$backend" in
     ;;
 esac
 
-exec python3 app/configurator.py \
-  --backend "$backend" \
-  --endpoint "$endpoint" \
-  --model "$model" \
-  --schema config/mock-system.schema.json \
-  --response-schema config/agent-response.schema.json \
-  --config config/mock-system.json \
-  "$@"
+export VYBFORGE_BACKEND="$backend"
+export VYBFORGE_ENDPOINT="$endpoint"
+export VYBFORGE_MODEL="$model"
+export VYBFORGE_SCHEMA="${VYBFORGE_SCHEMA:-config/mock-system.schema.json}"
+export VYBFORGE_RESPONSE_SCHEMA="${VYBFORGE_RESPONSE_SCHEMA:-config/agent-response.schema.json}"
+export VYBFORGE_CONFIG="${VYBFORGE_CONFIG:-config/mock-system.json}"
+export VYBFORGE_PROMPT="${VYBFORGE_PROMPT:-prompts/system.md}"
+
+cd "$root"
+exec env VYB_STDLIB="$VYB_STDLIB" \
+  "$VYB" app/configurator.vyb --module-path tools --module-path native/json

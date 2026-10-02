@@ -1,0 +1,1 @@
+{"kind": "proposal", "message": "Add curl", "changes": [{"path": "pkgs", "op": "ADD", "value": {"name": "curl", "version": "8.5.0"}, "reason": "needed to fetch the payload"}, {"op": "add", "value": "x"}, "junk", {"path": "", "op": "remove"}]}

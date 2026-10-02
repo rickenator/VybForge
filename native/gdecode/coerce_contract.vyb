@@ -1,0 +1,571 @@
+// coerce_contract.vyb — Vyb port of native/gdecode/coerce_contract.py (VybForge#14).
+//
+// Post-filter/repair the loradec tuned decode into a schema-valid agent-response
+// contract. The decode generalizes but drifts on the kind enum and invents extra
+// keys; this takes whatever readable JSON it produced, extracts it, and coerces
+// it toward config/agent-response.schema.json:
+//   - kind      -> valid enum (question|proposal|summary)
+//   - message   -> model message (best effort), else a reviewable stand-in
+//   - missing_fields / proposed_changes / requires_confirmation -> coerced to shape
+// and it ALWAYS emits a schema-valid contract (defaulting unparseable fields) so
+// the gate reflects "did we get a reviewable contract" rather than aborting on
+// drift. Tolerant of truncated JSON: the decode is capped at a finite token
+// budget and often stops mid-object.
+//
+// Port notes:
+//   * parsing uses json_parse_strict (json.loads's own strictness) so the
+//     candidate scan agrees with the Python original about whether a span parses
+//     at all; the lenient parser is for model drivers, not for this.
+//   * emission goes through native/json/json_emit.vyb (json.dumps-compatible), so
+//     native/out/contract_loradec.json is byte-identical to the Python's.
+//   * the schema verdict is a structural check of the emitted text (the schema is
+//     fixed); the independent jsonschema oracle lives in the gate that runs this
+//     (native/legit/run_coerce_gate.sh), and the two must agree.
+//
+//   cd <repo root> && $VYB native/gdecode/coerce_contract.vyb --module-path native/json
+import io::{open_read, read_all, open_write, write_str, close}
+import json_parse::{json_parse_strict, JsonDoc}
+import json_emit::{json_pretty, emit_value, json_text_py, json_escape_py}
+
+# ---- small text helpers ----
+
+# k closing braces (Python's "}" * k).
+braces_k(k<Int>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    for (i in 0..k - 1) { out = out + "}" }
+    return out
+}
+
+isws_byte(c<Int>)<Bool> -> {
+    if (c == 32) { return true }
+    if (c == 9) { return true }
+    if (c == 10) { return true }
+    if (c == 13) { return true }
+    if (c == 11) { return true }
+    if (c == 12) { return true }
+    return false
+}
+
+# Index just past the last non-whitespace byte (0 when the text is all space).
+end_of_non_ws(s<String>)<Int> -> {
+    e<Int> = s.len()
+    more<Bool> = true
+    while (more) {
+        if (e <= 0) { more = false }
+        else {
+            if (isws_byte((s.char_at(e - 1) as Int) & 255)) { e = e - 1 }
+            else { more = false }
+        }
+    }
+    return e
+}
+
+# re.sub(r",\s*$", "", s) — a trailing comma (with any trailing whitespace) drops.
+strip_trailing_comma_ws(s<String>)<String> -> {
+    e<Int> = end_of_non_ws(s)
+    if (e <= 0) { return s }
+    if (((s.char_at(e - 1) as Int) & 255) == 44) { return s.substring(0, e - 1) }
+    return s
+}
+
+# re.sub(r'["\\,]?\s*$', "", s) — trailing whitespace, plus one " \ or , before it.
+strip_trailing_one(s<String>)<String> -> {
+    e<Int> = end_of_non_ws(s)
+    if (e <= 0) { return "" }
+    c<Int> = (s.char_at(e - 1) as Int) & 255
+    if (c == 34 || c == 92 || c == 44) { return s.substring(0, e - 1) }
+    return s.substring(0, e)
+}
+
+max_of(a<Int>, b<Int>)<Int> -> {
+    if (a > b) { return a }
+    return b
+}
+
+# ---- JSON extraction ----
+
+first_brace(text<String>)<Int> -> {
+    n<Int> = text.len()
+    i<Int> = 0
+    while (i < n) {
+        if (((text.char_at(i) as Int) & 255) == 123) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+# Strict scan: every `{` opens a balanced-brace candidate; the first one that
+# parses as a whole document wins (Python's find_json).
+find_json(text<String>)<JsonDoc?> -> {
+    n<Int> = text.len()
+    i<Int> = 0
+    while (i < n) {
+        if (((text.char_at(i) as Int) & 255) == 123) {
+            depth<Int> = 0
+            j<Int> = i
+            closed<Int> = -1
+            done<Bool> = false
+            while (done == false) {
+                if (j >= n) { done = true }
+                else {
+                    cj<Int> = (text.char_at(j) as Int) & 255
+                    if (cj == 123) { depth = depth + 1; j = j + 1 }
+                    else if (cj == 125) {
+                        depth = depth - 1
+                        if (depth == 0) { closed = j; done = true }
+                        else { j = j + 1 }
+                    }
+                    else { j = j + 1 }
+                }
+            }
+            if (closed >= 0) {
+                cand<String> = text.substring(i, closed + 1)
+                match (json_parse_strict(cand)) {
+                    d -> { return JsonDoc?(d) }
+                    ? -> { }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return JsonDoc?()
+}
+
+# Tolerant scan: the strict pass first, then progressive closure from the first
+# `{`, trying each appeasement and each trailing-junk trim in the Python order.
+find_json_tolerant(text<String>)<JsonDoc?> -> {
+    match (find_json(text)) {
+        d -> { return JsonDoc?(d) }
+        ? -> { }
+    }
+    st<Int> = first_brace(text)
+    if (st < 0) { return JsonDoc?() }
+    tail<String> = text.substring(st, text.len())
+    extra<Int> = 0
+    while (extra < 14) {
+        cand<String> = tail + braces_k(extra)
+        match (json_parse_strict(cand)) {
+            d1 -> { return JsonDoc?(d1) }
+            ? -> { }
+        }
+        variant<String> = strip_trailing_comma_ws(cand)
+        match (json_parse_strict(variant)) {
+            d2 -> { return JsonDoc?(d2) }
+            ? -> { }
+        }
+        c2<String> = strip_trailing_one(tail) + braces_k(max_of(extra, 1))
+        match (json_parse_strict(c2)) {
+            d3 -> { return JsonDoc?(d3) }
+            ? -> { }
+        }
+        extra = extra + 1
+    }
+    return JsonDoc?()
+}
+
+# ---- value helpers (Python semantics) ----
+
+# _s(v): strings as-is, null/absent as "", everything else as json.dumps(v).
+node_s(d<JsonDoc>, nid<Int>)<String> -> {
+    if (nid < 0) { return "" }
+    k<String> = d.kind(nid)
+    if (k == "string") { return d.hstr(nid) }
+    if (k == "null") { return "" }
+    return json_text_py(d, nid)
+}
+
+# Python truthiness: null, false, 0, "", [] and {} are falsy.
+py_truthy(d<JsonDoc>, nid<Int>)<Bool> -> {
+    if (nid < 0) { return false }
+    k<String> = d.kind(nid)
+    if (k == "null") { return false }
+    if (k == "false") { return false }
+    if (k == "string") { return d.hstr(nid).len() > 0 }
+    if (k == "number") { return d.num(nid) != 0.0 }
+    if (k == "array") { return d.len(nid) > 0 }
+    if (k == "object") { return d.len(nid) > 0 }
+    return true
+}
+
+# str/int/float only — the filter Python applies to missing_fields entries
+# (bool is an int subclass there, so true/false are kept as "true"/"false").
+keepable_scalar(d<JsonDoc>, nid<Int>)<Bool> -> {
+    k<String> = d.kind(nid)
+    if (k == "string") { return true }
+    if (k == "number") { return true }
+    if (k == "true") { return true }
+    if (k == "false") { return true }
+    return false
+}
+
+# ---- coercion ----
+
+kind_map(k<String>)<String> -> {
+    if (k == "question") { return "question" }
+    if (k == "proposal") { return "proposal" }
+    if (k == "configuration") { return "proposal" }
+    if (k == "confirm") { return "question" }
+    return "summary"
+}
+
+coerce_kind(d<JsonDoc>)<String> -> {
+    v<String> = node_s(d, d.get(d.rootid(), "kind"))
+    if (v.len() == 0) { return "summary" }
+    return kind_map(v.trim().to_lower())
+}
+
+descriptive_keys()<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    out.push("description")
+    out.push("name")
+    out.push("disposition")
+    out.push("summary")
+    return out
+}
+
+# message: the model's own 'message', else the first truthy of the descriptive
+# keys, else a reviewable stand-in.
+coerce_message(d<JsonDoc>)<String> -> {
+    rid<Int> = d.rootid()
+    m<String> = node_s(d, d.get(rid, "message"))
+    if (m.len() > 0) { return m }
+    keys<Vec<String>> = descriptive_keys()
+    i<Int> = 0
+    for (i in 0..keys.len() - 1) {
+        nid<Int> = d.get(rid, keys.get(i))
+        if (py_truthy(d, nid)) {
+            t<String> = node_s(d, nid)
+            if (t.len() > 0) { return t }
+        }
+    }
+    return "Desired-state summary (coerced from tuned decode)."
+}
+
+missing_field_texts(d<JsonDoc>)<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    nid<Int> = d.get(d.rootid(), "missing_fields")
+    if (nid < 0) { return out }
+    if (d.kind(nid) == "array") {
+        cnt<Int> = d.len(nid)
+        i<Int> = 0
+        for (i in 0..cnt - 1) {
+            e<Int> = d.elem(nid, i)
+            if (keepable_scalar(d, e)) { out.push(node_s(d, e)) }
+        }
+        return out
+    }
+    if (py_truthy(d, nid)) {
+        if (keepable_scalar(d, nid)) { out.push(node_s(d, nid)) }
+    }
+    return out
+}
+
+# proposed_changes, falling back to the model's 'changes' key; non-list values
+# become a one-element list; non-object entries are dropped.
+change_nodes(d<JsonDoc>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    rid<Int> = d.rootid()
+    nid<Int> = d.get(rid, "proposed_changes")
+    if (nid < 0) { nid = d.get(rid, "changes") }
+    if (nid < 0) { return out }
+    if (d.kind(nid) == "array") {
+        cnt<Int> = d.len(nid)
+        i<Int> = 0
+        for (i in 0..cnt - 1) {
+            e<Int> = d.elem(nid, i)
+            if (d.kind(e) == "object") { out.push(e) }
+        }
+        return out
+    }
+    if (py_truthy(d, nid)) {
+        if (d.kind(nid) == "object") { out.push(nid) }
+    }
+    return out
+}
+
+# Changes with no path are dropped (after coercion, as in the Python).
+change_ids(d<JsonDoc>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    raw<Vec<Int>> = change_nodes(d)
+    i<Int> = 0
+    for (i in 0..raw.len() - 1) {
+        nid<Int> = raw.get(i)
+        if (node_s(d, d.get(nid, "path")).len() > 0) { out.push(nid) }
+    }
+    return out
+}
+
+change_op(d<JsonDoc>, nid<Int>)<String> -> {
+    op<String> = node_s(d, d.get(nid, "op")).to_lower()
+    if (op == "add" || op == "replace" || op == "remove") { return op }
+    return "add"
+}
+
+coerce_requires(d<JsonDoc>)<Bool> -> {
+    nid<Int> = d.get(d.rootid(), "requires_confirmation")
+    if (nid < 0) { return false }
+    if (d.kind(nid) == "string") {
+        t<String> = d.hstr(nid).trim().to_lower()
+        if (t == "true" || t == "yes" || t == "1") { return true }
+        return false
+    }
+    return py_truthy(d, nid)
+}
+
+bool_text(v<Bool>)<String> -> {
+    if (v) { return "true" }
+    return "false"
+}
+
+# ---- contract emission (json.dump(contract, indent=2)) ----
+
+emit_string_list(items<Vec<String>>)<String> -> {
+    if (items.len() == 0) { return "[]" }
+    out<String> = "[\n"
+    i<Int> = 0
+    for (i in 0..items.len() - 1) {
+        if (i > 0) { out = out + ",\n" }
+        out = out + "    \"" + json_escape_py(items.get(i)) + "\""
+    }
+    return out + "\n  ]"
+}
+
+emit_change(d<JsonDoc>, nid<Int>)<String> -> {
+    path<String> = node_s(d, d.get(nid, "path"))
+    op<String> = change_op(d, nid)
+    reason<String> = node_s(d, d.get(nid, "reason"))
+    vnode<Int> = d.get(nid, "value")
+    value_text<String> = "\"\""
+    if (vnode >= 0) { value_text = emit_value(d, vnode, true, 3) }
+    out<String> = "    {\n"
+    out = out + "      \"path\": \"" + json_escape_py(path) + "\",\n"
+    out = out + "      \"op\": \"" + json_escape_py(op) + "\",\n"
+    out = out + "      \"value\": " + value_text + ",\n"
+    out = out + "      \"reason\": \"" + json_escape_py(reason) + "\"\n"
+    return out + "    }"
+}
+
+emit_change_list(d<JsonDoc>, ids<Vec<Int>>)<String> -> {
+    if (ids.len() == 0) { return "[]" }
+    out<String> = "[\n"
+    i<Int> = 0
+    for (i in 0..ids.len() - 1) {
+        if (i > 0) { out = out + ",\n" }
+        out = out + emit_change(d, ids.get(i))
+    }
+    return out + "\n  ]"
+}
+
+emit_contract(d<JsonDoc>)<String> -> {
+    mf<Vec<String>> = missing_field_texts(d)
+    ids<Vec<Int>> = change_ids(d)
+    out<String> = "{\n"
+    out = out + "  \"kind\": \"" + json_escape_py(coerce_kind(d)) + "\",\n"
+    out = out + "  \"message\": \"" + json_escape_py(coerce_message(d)) + "\",\n"
+    out = out + "  \"missing_fields\": " + emit_string_list(mf) + ",\n"
+    out = out + "  \"proposed_changes\": " + emit_change_list(d, ids) + ",\n"
+    out = out + "  \"requires_confirmation\": " + bool_text(coerce_requires(d)) + "\n"
+    return out + "}"
+}
+
+# ---- structural schema check (config/agent-response.schema.json) ----
+
+has_key(d<JsonDoc>, nid<Int>, key<String>)<Bool> -> {
+    return d.get(nid, key) >= 0
+}
+
+is_kind(d<JsonDoc>, nid<Int>)<Bool> -> {
+    if (d.kind(nid) != "string") { return false }
+    t<String> = d.hstr(nid)
+    if (t == "question" || t == "proposal" || t == "summary") { return true }
+    return false
+}
+
+is_op(d<JsonDoc>, nid<Int>)<Bool> -> {
+    if (d.kind(nid) != "string") { return false }
+    t<String> = d.hstr(nid)
+    if (t == "add" || t == "replace" || t == "remove") { return true }
+    return false
+}
+
+check_changes(d<JsonDoc>, pcid<Int>)<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    j<Int> = 0
+    for (j in 0..d.len(pcid) - 1) {
+        cid<Int> = d.elem(pcid, j)
+        if (d.kind(cid) != "object") {
+            out.push("'proposed_changes' items must be objects")
+        } else {
+            ckeys<Vec<String>> = d.keys(cid)
+            if (ckeys.len() != 4) { out.push("each proposed change needs exactly path, op, value, reason") }
+            if (has_key(d, cid, "path") == false) { out.push("'path' is a required property") }
+            if (has_key(d, cid, "op") == false) { out.push("'op' is a required property") }
+            if (has_key(d, cid, "value") == false) { out.push("'value' is a required property") }
+            if (has_key(d, cid, "reason") == false) { out.push("'reason' is a required property") }
+            if (has_key(d, cid, "path")) {
+                if (d.kind(d.get(cid, "path")) != "string") { out.push("'path' must be a string") }
+            }
+            if (has_key(d, cid, "op")) {
+                if (is_op(d, d.get(cid, "op")) == false) {
+                    out.push("'op' must be one of add, replace, remove")
+                }
+            }
+            if (has_key(d, cid, "reason")) {
+                if (d.kind(d.get(cid, "reason")) != "string") { out.push("'reason' must be a string") }
+            }
+        }
+    }
+    return out
+}
+
+# The emitted contract's violations (empty = schema-valid).
+check_contract(d<JsonDoc>, rid<Int>)<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    keys<Vec<String>> = d.keys(rid)
+    nk<Int> = keys.len()
+    if (nk != 5) { out.push("contract must have exactly the 5 schema keys") }
+    if (has_key(d, rid, "kind") == false) { out.push("'kind' is a required property") }
+    if (has_key(d, rid, "message") == false) { out.push("'message' is a required property") }
+    if (has_key(d, rid, "missing_fields") == false) { out.push("'missing_fields' is a required property") }
+    if (has_key(d, rid, "proposed_changes") == false) { out.push("'proposed_changes' is a required property") }
+    if (has_key(d, rid, "requires_confirmation") == false) { out.push("'requires_confirmation' is a required property") }
+    i<Int> = 0
+    for (i in 0..nk - 1) {
+        k<String> = keys.get(i)
+        if (k != "kind" && k != "message" && k != "missing_fields" && k != "proposed_changes" && k != "requires_confirmation") {
+            out.push("'" + k + "' is not an allowed property")
+        }
+    }
+    if (has_key(d, rid, "kind")) {
+        if (is_kind(d, d.get(rid, "kind")) == false) {
+            out.push("'kind' must be one of question, proposal, summary")
+        }
+    }
+    if (has_key(d, rid, "message")) {
+        mid<Int> = d.get(rid, "message")
+        if (d.kind(mid) != "string") { out.push("'message' must be a string") }
+        else if (d.hstr(mid).len() < 1) { out.push("'message' must not be empty") }
+    }
+    if (has_key(d, rid, "missing_fields")) {
+        mfid<Int> = d.get(rid, "missing_fields")
+        if (d.kind(mfid) != "array") { out.push("'missing_fields' must be an array") }
+        else {
+            j<Int> = 0
+            for (j in 0..d.len(mfid) - 1) {
+                if (d.kind(d.elem(mfid, j)) != "string") { out.push("'missing_fields' items must be strings") }
+            }
+        }
+    }
+    if (has_key(d, rid, "proposed_changes")) {
+        pcid<Int> = d.get(rid, "proposed_changes")
+        if (d.kind(pcid) != "array") { out.push("'proposed_changes' must be an array") }
+        else {
+            cerrs<Vec<String>> = check_changes(d, pcid)
+            jj<Int> = 0
+            for (jj in 0..cerrs.len() - 1) { out.push(cerrs.get(jj)) }
+        }
+    }
+    if (has_key(d, rid, "requires_confirmation")) {
+        rcid<Int> = d.get(rid, "requires_confirmation")
+        if (d.kind(rcid) != "true" && d.kind(rcid) != "false") {
+            out.push("'requires_confirmation' must be a boolean")
+        }
+    }
+    return out
+}
+
+# Validates the *emitted text* against the fixed schema: required keys, no
+# additional properties, enums, string types and minLength 1.
+schema_errors(text<String>)<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    match (json_parse_strict(text)) {
+        d -> {
+            rid<Int> = d.rootid()
+            if (d.kind(rid) != "object") {
+                out.push("contract root is not an object")
+                return out
+            }
+            errs<Vec<String>> = check_contract(d, rid)
+            k<Int> = 0
+            for (k in 0..errs.len() - 1) { out.push(errs.get(k)) }
+            return out
+        }
+        ? -> {
+            out.push("emitted contract does not parse as JSON")
+            return out
+        }
+    }
+}
+
+# ---- files ----
+
+# Absent when the file cannot be opened or read (distinguishes a missing file
+# from an empty one, as os.path.exists + open did in the Python).
+read_text(path<String>)<String?> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { close(f); return String?(s) }
+                ? -> { close(f); return String?() }
+            }
+        }
+        ? -> { return String?() }
+    }
+}
+
+write_text(path<String>, s<String>)<Int> -> {
+    match (open_write(path)) {
+        f -> {
+            match (write_str(f, s)) { q -> { } ? -> { close(f); return 1 } }
+            close(f)
+            return 0
+        }
+        ? -> { return 1 }
+    }
+}
+
+truncate(s<String>, n<Int>)<String> -> {
+    if (s.len() <= n) { return s }
+    return s.substring(0, n)
+}
+
+main() -> {
+    text_path<String> = "native/out/loradec_text.txt"
+    out_path<String> = "native/out/contract_loradec.json"
+    match (read_text(text_path)) {
+        raw -> {
+            text<String> = raw.trim()
+            match (find_json_tolerant(text)) {
+                d -> {
+                    contract<String> = emit_contract(d)
+                    if (write_text(out_path, contract + "\n") != 0) {
+                        println("COERCE: could not write " + out_path)
+                        exit(1)
+                    }
+                    println("---- emit JSON (best-effort coerce) ----")
+                    println(truncate(json_pretty(d, d.rootid()), 1500))
+                    println("---- coerced contract ----")
+                    println(contract)
+                    errs<Vec<String>> = schema_errors(contract)
+                    if (errs.len() == 0) {
+                        println("COERCE_CONTRACT: SCHEMA_OK")
+                        exit(0)
+                    }
+                    println("COERCE_CONTRACT: SCHEMA_FAIL")
+                    i<Int> = 0
+                    for (i in 0..errs.len() - 1) { println("    " + errs.get(i)) }
+                    exit(1)
+                }
+                ? -> {
+                    println("COERCE: NO_JSON (no object in decode) — no contract could be built")
+                    exit(1)
+                }
+            }
+        }
+        ? -> {
+            println("COERCE: MISSING loradec_text.txt")
+            exit(1)
+        }
+    }
+}

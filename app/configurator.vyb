@@ -1,0 +1,116 @@
+# configurator.vyb — VybForge schema-constrained, non-mutating VybOS desired-state
+# interview client. Vyb-native port of app/configurator.py (P1.4 of the
+# Python-cleanup plan, doc/PYTHON-CLEANUP.md).
+#
+# Vyb's JIT surface has no argv: flags are VYBFORGE_* env vars, same names as the
+# Python driver (defaults in parentheses):
+#   VYBFORGE_BACKEND (ollama)              VYBFORGE_ENDPOINT (http://127.0.0.1:11434)
+#   VYBFORGE_MODEL (qwen3:8b)              VYBFORGE_API_KEY_ENV ()
+#   VYBFORGE_STRUCTURED_OUTPUT (json_schema)  VYBFORGE_API_KEY ()
+#   VYBFORGE_SCHEMA (config/mock-system.schema.json)
+#   VYBFORGE_RESPONSE_SCHEMA (config/agent-response.schema.json)
+#   VYBFORGE_CONFIG (config/mock-system.json)  VYBFORGE_PROMPT (prompts/system.md)
+#
+# Run from the repo root (run.sh drives this in production):
+#   $VYB app/configurator.vyb --module-path tools --module-path native/json
+#
+# stdout carries one JSON contract per answer (so callers can capture it);
+# the banner, the "you> " prompt and diagnostics go to stderr. Nothing is ever
+# built, applied or modified.
+#
+# Parity notes vs app/configurator.py: the contract is printed as the model
+# returned it (the Python driver re-serializes with json.dumps(indent=2,
+# sort_keys=True); Vyb has no canonical writer yet, so key order/whitespace can
+# differ while the JSON value is identical). The prompt/banner go to stderr here
+# (Python writes them to stdout) — matching src/main.vyb's stdout-is-JSON rule.
+
+import env::{env_get}
+import io::{open_read, read_all, open_write, write_str, close}
+import term::{stdin_read_line, eprint, eprintln, flush}
+import json_parse::{json_parse}
+import reply_parse::{reply_text}
+import http_client::{PostResp}
+import chat_request::{post_chat, api_key_from_env}
+import json_util::{json_compact}
+
+read_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> { match (read_all(f)) { t -> { close(f); return t } ? -> { close(f); return "" } } }
+        ? -> { return "" }
+    }
+}
+
+write_file(path<String>, data<String>)<Int> -> {
+    match (open_write(path)) {
+        w -> { match (write_str(w, data)) { q -> { close(w); return 0 } ? -> { close(w); return 1 } } }
+        ? -> { return 1 }
+    }
+}
+
+
+
+main() -> {
+    backend<String> = env_get("VYBFORGE_BACKEND") else "ollama"
+    endpoint<String> = env_get("VYBFORGE_ENDPOINT") else "http://127.0.0.1:11434"
+    model<String> = env_get("VYBFORGE_MODEL") else "qwen3:8b"
+    key_env<String> = env_get("VYBFORGE_API_KEY_ENV") else ""
+    mode<String> = env_get("VYBFORGE_STRUCTURED_OUTPUT") else "json_schema"
+    schema_path<String> = env_get("VYBFORGE_SCHEMA") else "config/mock-system.schema.json"
+    response_schema_path<String> = env_get("VYBFORGE_RESPONSE_SCHEMA") else "config/agent-response.schema.json"
+    config_path<String> = env_get("VYBFORGE_CONFIG") else "config/mock-system.json"
+    prompt_path<String> = env_get("VYBFORGE_PROMPT") else "prompts/system.md"
+
+    schema_text<String> = read_file(schema_path)
+    if (schema_text.len() == 0) { eprintln("cannot read desired-state schema " + schema_path); return }
+    response_schema<String> = read_file(response_schema_path)
+    if (response_schema.len() == 0) { eprintln("cannot read response schema " + response_schema_path); return }
+    config_text<String> = read_file(config_path)
+    if (config_text.len() == 0) { eprintln("cannot read configuration " + config_path); return }
+    system_prompt<String> = read_file(prompt_path)
+    if (system_prompt.len() == 0) { eprintln("cannot read prompt " + prompt_path); return }
+
+    context<String> = "Desired-state schema:\n" + json_compact(schema_text) +
+                      "\n\nCurrent mock configuration:\n" + json_compact(config_text)
+    roles<Vec<String>> = Vec<String>()
+    contents<Vec<String>> = Vec<String>()
+    roles.push("system")
+    contents.push(system_prompt + "\n\n" + context)
+
+    api_key<String> = api_key_from_env(key_env)
+    if (backend == "openai-responses" && api_key.len() == 0) {
+        kname<String> = key_env
+        if (kname.len() == 0) { kname = "VYBFORGE_API_KEY" }
+        eprintln(backend + " requires $" + kname + " (or $OPENAI_API_KEY); credentials are never stored by VybForge")
+        return
+    }
+
+    eprintln("VybForge configurator using " + backend + " / " + model + ". Ctrl-D exits; no changes are applied.")
+    while (true) {
+        eprint("you> ")
+        flush()
+        raw_line<String> = stdin_read_line()
+        line<String> = raw_line.trim()
+        if (line.len() == 0) { eprintln(""); return }
+        roles.push("user")
+        contents.push(line)
+        pr<PostResp> = post_chat(backend, endpoint, model, mode, json_compact(response_schema), roles, contents, api_key)
+        dbg<String> = env_get("VYBFORGE_DEBUG") else ""
+        if (dbg.len() > 0) { write_file(dbg + ".reply.json", pr.body) }
+        if (pr.status != 200) {
+            eprintln("backend error: HTTP " + pr.status.to_string() + " from " + backend + ": " + pr.body)
+            return
+        }
+        answer<String> = reply_text(backend, pr.body)
+        if (answer.len() == 0) {
+            eprintln("backend error: " + backend + " reply carried no contract content")
+            return
+        }
+        match (json_parse(answer)) {
+            d -> { }
+            ? -> { eprintln("backend error: reply is not a JSON contract"); return }
+        }
+        println(answer)
+        roles.push("assistant")
+        contents.push(answer)
+    }
+}

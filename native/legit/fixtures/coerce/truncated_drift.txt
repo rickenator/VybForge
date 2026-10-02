@@ -1,0 +1,1 @@
+{"kind": "Configuration", "name":"Machine Configuration","description" : "This configuration is for the current machine. It will be applied to this specific instance of a server or client.", "parameters": {"machineType" : "server",

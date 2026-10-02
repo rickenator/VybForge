@@ -1,0 +1,117 @@
+# json_util.vyb — JSON text shaping shared by the VybForge model drivers.
+#
+# The Python drivers build payloads and patch lines with json.dumps(...), whose
+# default separators are (", ", ": ") — and whose tight form, used for the
+# applier's JSONL patch lines, is (",", ":") with no spaces. The Vyb ports embed
+# schema/config files verbatim and assemble bodies by hand, so they need both
+# normalizations plus the escaping rule, all in one place:
+#
+#   json_compact(text)        -> json.dumps(text)             {"a": 1, "b": [2, 3]}
+#   json_compact_tight(text)  -> json.dumps(..., separators=(",", ":"))
+#   json_text(doc, node)      -> the compact text of any parsed JSON value
+#   json_escape(value)        -> the escaping rule for JSON string contents
+#
+#   import json_util::{json_compact, json_compact_tight, json_text, json_escape}
+
+import json_parse::{JsonDoc}
+
+# ---- JSON string escaping (one definition for the whole driver family) ----
+
+share(all)
+json_escape(value<String>)<String> -> {
+    escaped<String> = value.replace("\\", "\\\\")
+    escaped = escaped.replace("\"", "\\\"")
+    escaped = escaped.replace("\n", "\\n")
+    escaped = escaped.replace("\r", "\\r")
+    return escaped.replace("\t", "\\t")
+}
+
+# ---- whitespace/separator normalization of JSON text ----
+
+# Whitespace outside string literals is dropped, then ", " / ": " are inserted
+# after structural commas and colons — the json.dumps default shape.
+share(all)
+json_compact(raw<String>)<String> -> {
+    return normalize(raw, true)
+}
+
+# Same, but no space after `,` / `:` — json.dumps(separators=(",", ":")), the
+# shape the applier's JSONL patch lines use.
+share(all)
+json_compact_tight(raw<String>)<String> -> {
+    return normalize(raw, false)
+}
+
+share(all)
+normalize(raw<String>, spaced<Bool>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    sep_comma<String> = ","
+    sep_colon<String> = ":"
+    if (spaced) { sep_comma = ", "; sep_colon = ": " }
+    n<Int> = raw.len()
+    in_str<Bool> = false
+    esc<Bool> = false
+    while (i < n) {
+        c<Int> = (raw.char_at(i) as Int) & 255
+        ch<String> = raw.substring(i, i + 1)
+        if (in_str) {
+            out = out + ch
+            if (esc) {
+                esc = false
+            } else if (c == 92) {
+                esc = true
+            } else if (c == 34) {
+                in_str = false
+            }
+            i = i + 1
+        } else if (c == 34) {
+            in_str = true
+            out = out + ch
+            i = i + 1
+        } else if (c == 32 || c == 9 || c == 10 || c == 13) {
+            i = i + 1
+        } else if (c == 44) {
+            out = out + sep_comma
+            i = i + 1
+        } else if (c == 58) {
+            out = out + sep_colon
+            i = i + 1
+        } else {
+            out = out + ch
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# ---- value emission from a parsed document ----
+
+# The compact text of any parsed JSON value (strings escaped, object keys in
+# document order). Numbers come out through the parser's own text form.
+share(all)
+json_text(d<JsonDoc>, nid<Int>)<String> -> {
+    k<String> = d.kind(nid)
+    if (k == "string") { return "\"" + json_escape(d.hstr(nid)) + "\"" }
+    if (k == "number") { return d.hstr(nid) }
+    if (k == "true") { return "true" }
+    if (k == "false") { return "false" }
+    if (k == "null") { return "null" }
+    if (k == "array") {
+        out<String> = "["
+        i<Int> = 0
+        for (i in 0..d.len(nid) - 1) {
+            if (i > 0) { out = out + "," }
+            out = out + json_text(d, d.elem(nid, i))
+        }
+        return out + "]"
+    }
+    ks<Vec<String>> = d.keys(nid)
+    out2<String> = "{"
+    j<Int> = 0
+    for (j in 0..ks.len() - 1) {
+        if (j > 0) { out2 = out2 + "," }
+        out2 = out2 + "\"" + json_escape(ks.get(j)) + "\":" + json_text(d, d.get(nid, ks.get(j)))
+    }
+    return out2 + "}"
+}

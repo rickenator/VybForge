@@ -13,10 +13,15 @@ ids="$("$VYB" native/gdecode/pipeline_encode.vyb --module-path native/tokenizer 
 echo "prompt ids: $ids"
 
 echo "== stage B: on-GPU decode (decode_driver) =="
-VYBFORGE_DECODE_PROMPT="$ids" "$VYB" native/host/decode_driver.vyb
+VYBFORGE_DECODE_PROMPT="$ids" VYB_STDLIB="${VYB_STDLIB:-/home/rick/Projects/Vyb/stdlib}" "$VYB" native/host/decode_driver.vyb --module-path native/llm
 
 echo "== stage C: detokenize -> agent-response contract =="
 "$VYB" native/gdecode/pipeline_emit.vyb --module-path native/gdecode --module-path native/tokenizer
 
 echo "== stage D: validate contract (jsonschema, verification-only) =="
-python3 native/gdecode/verify_contract.py
+# The oracle needs the repo venv (jsonschema); bare python3 does not have it.
+PY="${PY:-}"
+if [ -z "$PY" ]; then
+  if [ -x "$root/.venv/bin/python" ]; then PY="$root/.venv/bin/python"; else PY=python3; fi
+fi
+"$PY" native/gdecode/verify_contract.py

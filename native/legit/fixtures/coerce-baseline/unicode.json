@@ -1,0 +1,16 @@
+{
+  "kind": "summary",
+  "message": "caf\u00e9 \ud83d\ude00 \u2019quote\u2019",
+  "missing_fields": [
+    "caf\u00e9"
+  ],
+  "proposed_changes": [
+    {
+      "path": "p",
+      "op": "replace",
+      "value": "caf\u00e9",
+      "reason": "\u00e9"
+    }
+  ],
+  "requires_confirmation": true
+}

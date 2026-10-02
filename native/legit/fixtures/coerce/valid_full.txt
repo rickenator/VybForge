@@ -1,0 +1,1 @@
+{"kind": "question", "message": "Which architecture should this configuration support?", "missing_fields": ["system"], "proposed_changes": [], "requires_confirmation": false}

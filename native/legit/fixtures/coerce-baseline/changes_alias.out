@@ -1,0 +1,44 @@
+---- emit JSON (best-effort coerce) ----
+{
+  "kind": "proposal",
+  "message": "Add curl",
+  "changes": [
+    {
+      "path": "pkgs",
+      "op": "ADD",
+      "value": {
+        "name": "curl",
+        "version": "8.5.0"
+      },
+      "reason": "needed to fetch the payload"
+    },
+    {
+      "op": "add",
+      "value": "x"
+    },
+    "junk",
+    {
+      "path": "",
+      "op": "remove"
+    }
+  ]
+}
+---- coerced contract ----
+{
+  "kind": "proposal",
+  "message": "Add curl",
+  "missing_fields": [],
+  "proposed_changes": [
+    {
+      "path": "pkgs",
+      "op": "add",
+      "value": {
+        "name": "curl",
+        "version": "8.5.0"
+      },
+      "reason": "needed to fetch the payload"
+    }
+  ],
+  "requires_confirmation": false
+}
+COERCE_CONTRACT: SCHEMA_OK

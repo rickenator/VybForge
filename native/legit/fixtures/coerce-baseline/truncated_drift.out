@@ -1,0 +1,18 @@
+---- emit JSON (best-effort coerce) ----
+{
+  "kind": "Configuration",
+  "name": "Machine Configuration",
+  "description": "This configuration is for the current machine. It will be applied to this specific instance of a server or client.",
+  "parameters": {
+    "machineType": "server"
+  }
+}
+---- coerced contract ----
+{
+  "kind": "proposal",
+  "message": "This configuration is for the current machine. It will be applied to this specific instance of a server or client.",
+  "missing_fields": [],
+  "proposed_changes": [],
+  "requires_confirmation": false
+}
+COERCE_CONTRACT: SCHEMA_OK

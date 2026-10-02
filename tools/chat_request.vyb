@@ -1,0 +1,112 @@
+# chat_request.vyb — the backend-neutral chat/interview request builder shared by
+# the VybForge model drivers (propose_repair, configurator, configurator_repl,
+# interview_infer). Assembled once here so every driver posts the same shape to
+# ollama / openai-chat / openai-responses, with the same structured-output
+# fragments and the same json.dumps-style body text (json_compact).
+#
+#   import chat_request::{post_chat, api_key_from_env}
+#   pr<PostResp> = post_chat(backend, endpoint, model, mode, schema_text,
+#                            roles, contents, api_key)
+
+import env::{env_get}
+import json_util::{json_compact, json_escape}
+import http_client::{PostResp, http_post}
+
+# ---- structured-output shapes (mirrors configurator.py) ----
+
+# `response_format` fragment for the OpenAI chat shape; "" when mode is prompt.
+share(all)
+resp_format_chat(schema_text<String>, mode<String>)<String> -> {
+    if (mode == "prompt") { return "" }
+    if (mode == "json_object") { return "\"response_format\":{\"type\":\"json_object\"}" }
+    return "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"vybforge_response\",\"strict\":true,\"schema\":" +
+           schema_text + "}}"
+}
+
+# `text.format` fragment for the OpenAI Responses shape; "" when mode is prompt.
+share(all)
+resp_format_responses(schema_text<String>, mode<String>)<String> -> {
+    if (mode == "prompt") { return "" }
+    if (mode == "json_object") { return "\"text\":{\"format\":{\"type\":\"json_object\"}}" }
+    return "\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"vybforge_response\",\"strict\":true,\"schema\":" +
+           schema_text + "}}"
+}
+
+# ---- message rendering ----
+
+# The chat-completions `messages` array from parallel role/content vectors.
+share(all)
+msgs_json(roles<Vec<String>>, contents<Vec<String>>)<String> -> {
+    out<String> = "["
+    i<Int> = 0
+    for (i in 0..roles.len() - 1) {
+        if (i > 0) { out = out + "," }
+        out = out + "{\"role\":\"" + roles.get(i) + "\",\"content\":\"" + json_escape(contents.get(i)) + "\"}"
+    }
+    return out + "]"
+}
+
+# The flat transcript the Responses API takes ("ROLE:\n<content>" joined blank-line).
+share(all)
+responses_transcript(roles<Vec<String>>, contents<Vec<String>>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    for (i in 0..roles.len() - 1) {
+        if (i > 0) { out = out + "\n\n" }
+        out = out + roles.get(i).to_upper() + ":\n" + contents.get(i)
+    }
+    return out
+}
+
+# ---- credentials (never stored; env only) ----
+
+share(all)
+api_key_from_env(key_env<String>)<String> -> {
+    if (key_env.len() > 0) {
+        v<String> = env_get(key_env) else ""
+        if (v.len() > 0) { return v }
+        if (key_env != "OPENAI_API_KEY") { return env_get("OPENAI_API_KEY") else "" }
+        return ""
+    }
+    v2<String> = env_get("VYBFORGE_API_KEY") else ""
+    if (v2.len() > 0) { return v2 }
+    return env_get("OPENAI_API_KEY") else ""
+}
+
+# ---- one interview turn ----
+
+share(all)
+post_chat(backend<String>, endpoint<String>, model<String>, mode<String>, schema_text<String>,
+             roles<Vec<String>>, contents<Vec<String>>, api_key<String>)<PostResp> -> {
+    headers<Vec<String>> = Vec<String>()
+    headers.push("Content-Type: application/json")
+    # configurator.py passes the api key only to the OpenAI-shaped backends
+    if (api_key.len() > 0 && backend != "ollama") { headers.push("Authorization: Bearer " + api_key) }
+    path<String> = ""
+    body<String> = ""
+    if (backend == "ollama") {
+        path = "/api/chat"
+        body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":" +
+               msgs_json(roles, contents) + ",\"stream\":false"
+        # An empty schema_text means "no structured output" — the caller lets the
+        # model emit text (interview_infer mirrors its Python original that way).
+        if (schema_text.len() > 0) { body = body + ",\"format\":" + schema_text }
+        body = body + ",\"options\":{\"temperature\":0.2}}"
+    } else if (backend == "openai-chat") {
+        path = "/chat/completions"
+        rf<String> = resp_format_chat(schema_text, mode)
+        body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":" + msgs_json(roles, contents) + ",\"temperature\":0.2"
+        if (rf.len() > 0) { body = body + "," + rf }
+        body = body + "}"
+    } else if (backend == "openai-responses") {
+        path = "/responses"
+        rf<String> = resp_format_responses(schema_text, mode)
+        body = "{\"model\":\"" + json_escape(model) + "\",\"input\":\"" +
+               json_escape(responses_transcript(roles, contents)) + "\",\"store\":false,\"temperature\":0.2"
+        if (rf.len() > 0) { body = body + "," + rf }
+        body = body + "}"
+    } else {
+        return PostResp { status = -1, body = "unsupported backend: " + backend }
+    }
+    return http_post(endpoint, path, headers, json_compact(body))
+}
