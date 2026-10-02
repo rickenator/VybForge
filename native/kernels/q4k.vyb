@@ -1,5 +1,7 @@
 // GGUF block_q4_K dequant kernel (Q4_K_M model weights), ported faithfully from
 // llama.cpp ggml-quants.c dequantize_row_q4_K / get_scale_min_k4.
+// Derived from llama.cpp (MIT License, https://github.com/ggml-org/llama.cpp):
+// ggml-quants.c, dequantize_row_q4_K / get_scale_min_k4. See THIRD-PARTY.md.
 // block layout (144 B): d f16 @0, dmin f16 @2, scales[12] @4, qs[128] @16.
 //   256 values/block; 8 groups of 32; group is: sc,m = 6-bit scale & min packed
 //   in scales[]; element uses low (is even) or high (is odd) 4-bit nibble of qs.

@@ -82,6 +82,51 @@ limitation, not a tokenizer bug).
   capabilities that are general (tensor, dtypes, autograd, loaders, BLAS/reduce/scan class ops) versus
   work that is per-model specialisation.
 
+## Attribution & licensing
+
+Policy, recorded 2026-10-02 (Rick, verbatim direction): *"using these open source libraries,
+particularly Apache licensed, it is ok to port and do anything whatever you want, but if it is
+strongly derived then a line in the boilerplate comment should mention attribution. I don't think
+we have any need to adhere to any api or interface, but I'll leave that up to the investigation's
+findings."*
+
+In practice:
+
+- **Permissive licences (Apache-2.0, MIT, BSD, ISC) may be ported freely**, for any purpose. No
+  obligation to reproduce the upstream API, and no obligation to match its interfaces — a port is a
+  *semantic* port. Whether to mirror an upstream interface is an engineering finding from the
+  investigation (fidelity, verifiability, how much of the API we actually need), never a licensing
+  requirement.
+- **A strong derivation carries one boilerplate line** naming the attribution. The line goes at the
+  top of the derived file, in the file's own comment syntax:
+  `// Derived from llama.cpp (MIT License, https://github.com/ggml-org/llama.cpp): ggml-quants.c,`
+  `dequantize_row_q4_K / get_scale_min_k4. See THIRD-PARTY.md.` — upstream project, its licence, the
+  upstream file/function, and a pointer to `THIRD-PARTY.md` at the repo root, which is the ledger
+  that makes the per-file lines checkable. A weak derivation (same idea, own implementation, own
+  structure) needs no line; assert attribution where it is true rather than reflexively.
+- **Licence compatibility is checked at port time, not assumed.** Our own licence is Apache-2.0
+  (`LICENSE`, Copyright 2026 Aniviza LLC), so inbound code must be compatible with an Apache-2.0
+  outbound: **permissive is fine; copyleft (GPL/LGPL/AGPL) is consume-only, never ported into the
+  runtime**; **proprietary vendor libraries (cuBLAS, cuDNN, TensorRT, the CUDA toolkit) are
+  consume-only by construction** — they may be linked or called, never reimplemented from their
+  headers or shipped as derived source. Of the candidate list above, FFmpeg (LGPL/GPL — some
+  components), cuBLAS, cuDNN and TensorRT fall in that bucket; OpenCV (Apache-2.0 since 4.5.0),
+  PaddleOCR (Apache-2.0), Tesseract (Apache-2.0), numpy/PyTorch/scikit-learn/scipy/pandas (BSD),
+  llama.cpp (MIT), sentencepiece (Apache-2.0), tiktoken/onnxruntime (MIT), librosa (ISC) and
+  OpenBLAS (BSD) are portable.
+- **A library *used as a tool* is not derived from.** Consuming llama.cpp as an oracle, or a
+  Python library for reference verification, creates no derivation obligation — that is the
+  existing two-track arrangement, not a port.
+
+Current state: `native/kernels/q4k.vyb` and `native/kernels/q6k.vyb` carry the line (upgraded to the
+format above when the policy was recorded); `native/train/render_chat.vyb` already names llama.cpp's
+Jinja formatter as its oracle. **Under review, per the investigation's findings, not yet labelled:**
+`native/tokenizer/tokenizer.vyb` (byte-level BPE follows GPT-2/Qwen2 and HF `tokenizers` semantics)
+and `native/json/json_emit.vyb` (emission deliberately matches CPython `json.dumps`). Both are
+behavioural matches whose implementation structure is our own — the question is whether the match is
+strong enough to constitute derivation. Decide when either file is next touched, and record the
+answer in `THIRD-PARTY.md` either way.
+
 ## See also
 
 - `native/VYB-NATIVE-INFERENCE-AUDIT.md` — the capability audit and its G1–G5 gap ledger.

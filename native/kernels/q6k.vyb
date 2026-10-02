@@ -1,5 +1,7 @@
 // GGUF block_q6_K dequant kernel (Qwen3 attn_v / ffn_down / token_embd bodies),
 // ported from llama.cpp ggml-quants.c dequantize_row_q6_K.
+// Derived from llama.cpp (MIT License, https://github.com/ggml-org/llama.cpp):
+// ggml-quants.c, dequantize_row_q6_K. See THIRD-PARTY.md.
 // block layout (210 B): ql[128]@0 (low 4 bits), qh[64]@128 (upper 2 bits),
 // scales[16] int8 @192, d f16 @208. 256 values/block, 2x 128 groups.
 q6kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
