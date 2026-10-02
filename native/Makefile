@@ -21,10 +21,22 @@ PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 all: verify
 
 # Compile a kernel source to PTX via kernel mode (with vmath in scope).
-# $(VYB) is a prerequisite on purpose: a kernel is an artifact of the *compiler*, so a
-# rebuilt compiler must force every kernel to rebuild. Without this, a gate can compare
-# against a .ptx left over from a previous toolchain and report the wrong answer.
-$(KPTX): $(KSRC) $(VYB)
+# A kernel is an artifact of the compiler that emitted it, so the rule depends on a stamp of
+# WHICH toolchain last built it. An mtime prerequisite alone cannot tell that a .ptx came from
+# a different compiler -- and that is exactly the case when a gate is run against a second
+# checkout, where the kernel would otherwise be reused and the gate would certify the wrong
+# toolchain.
+TOOLSTAMP := $(ROOT)/native/build/.toolchain
+.PHONY: FORCE
+FORCE:
+$(TOOLSTAMP): FORCE
+	@mkdir -p $(ROOT)/native/build
+	@printf '%s %s %s\n' "$(VYB)" "$$(stat -c '%s %Y' '$(VYB)' 2>/dev/null || echo missing)" \
+	    "$$(sha256sum '$(VYB)' 2>/dev/null | cut -c1-16)" > $@.tmp
+	@cmp -s $@.tmp $@ || mv -f $@.tmp $@
+	@rm -f $@.tmp
+
+$(KPTX): $(KSRC) $(TOOLSTAMP)
 	@mkdir -p $(ROOT)/native/build $(ROOT)/native/out
 	cd $(ROOT)/native/build && $(VYB) --kernel ../kernels/$*.vyb --ptx $*.ptx $(MODPATH)
 
