@@ -83,6 +83,11 @@ environment, never in the repo.
 
 - `tools/apply.vyb` + `tools/apply_interview.vyb` — deterministic desired-state
   applier (Vyb core; the Python plumbing is gone).
+- `native/legit/run_phase1_battery.sh` + `run_*_gate.sh` — the verification
+  entry point: one command runs every Phase-1 acceptance check (schema, applier,
+  repair boundary, configurator, interview, coerce, GGUF fixture, JSON unit,
+  contract verifier, production-path audit) and prints one line per step. The
+  per-step gates are described in `doc/PYTHON-CLEANUP.md`.
 - `app/configurator.vyb` + `run.sh` — backend-neutral interviewer launcher
   (Vyb-native; the Python original is gone). stdout carries one JSON contract per
   answer, the banner/prompt go to stderr.

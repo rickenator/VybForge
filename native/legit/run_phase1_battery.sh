@@ -71,5 +71,12 @@ else
 fi
 
 echo
+# The P1.2/P1.5 steps exercise the real downstream path, which renders the tracked
+# example artifacts out/spec.json + out/system.vyb (and the compiled bin) from the
+# gate's fixture patches. Put them back so running the battery leaves the tree as it
+# found it — the evidence is the assertions above, not the example contents.
+if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$root" restore out/ 2>/dev/null || true
+fi
 if [ $fail -eq 0 ]; then echo "PHASE 1 BATTERY: PASS"; else echo "PHASE 1 BATTERY: FAIL"; fi
 exit $fail
