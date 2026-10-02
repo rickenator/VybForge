@@ -1,4 +1,8 @@
-# Vyb-native inference (Qwen3-4B configurator) — phase roadmap
+# Vyb-native substrate — phase roadmap (first instance: the Qwen3-4B configurator)
+
+**Scope:** this is a roadmap for a **general-purpose** inference/compute substrate. The Qwen3-4B
+configurator is its first instance and proving slice, not the target — read `doc/SUBSTRATE-SCOPE.md`
+before treating anything here as the whole job.
 
 Tracked here so phases can be worked serially and, where independent, in
 parallel. All GPU work lives under `native/`; the production pipeline is Vyb

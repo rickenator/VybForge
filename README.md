@@ -76,6 +76,10 @@ CPU fallback, `./run-vyb.sh` / `./vyb-run.sh` (Vyb + local Ollama).
 Under `native/`, the part of this repo that is the 6-month center of gravity:
 a **Vyb-native** decode of the Qwen3-4B configurator on GPU, with zero
 Python in the production pipeline (Python is reference-verification only).
+The substrate is **general purpose**: the bar is anything PyTorch can do, and the
+Qwen3-4B configurator is its first instance rather than its definition —
+`doc/SUBSTRATE-SCOPE.md` records that scope, the port-vs-consume rule, and the
+libraries under consideration (OpenCV, PaddleOCR and llama.cpp named as direction).
 See `native/README.md` for the verified kernel table (GEMM, RMSNorm, exp/sin/cos,
 one transformer layer, GGUF reader + q4_0 dequant, JSON parser, Qwen3 BPE
 tokenizer, multi-layer stack, autoregressive decode, stochastic sampler, and the
