@@ -200,6 +200,11 @@ gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
   rewrites the committed `kvresp_train_kv.vyb` template for another sequence length,
   reproducing the Python's substitution sequence exactly
   (`native/legit/run_kvgen_gate.sh`).
+- `native/train/build_fullmanifest.vyb` replaces the manifest/context builder. This step
+  also fixed a real pre-tokenizer bug found by the byte-for-byte comparison (the Qwen2
+  punctuation-run rule `[^\s\p{L}\p{N}]+[\r\n]*` was not implemented, so `):\n` never
+  merged): `native/tokenizer/test_pretok_boundary.vyb` now pins those boundaries
+  (`native/legit/run_fullmanifest_gate.sh`).
 
 ## Boundaries
 

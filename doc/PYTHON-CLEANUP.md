@@ -143,9 +143,15 @@ drift, recorded not reconciled), so the `(513, 429)` case is gated against a fro
 baseline of the oracle's own output instead.
 
 Landed so far: **P2.5a** `training/split_dataset.vyb` (the inline split heredoc is gone;
-`training/generate-data.sh` is Python-free) and **P2.1a** `native/train/gen_kv_train.vyb`
-(driver parameterizer). Both gated byte-for-byte; `native/legit/run_phase2_battery.sh`
-runs them, `native/legit/run_phase1_battery.sh` stays the regression gate.
+`training/generate-data.sh` is Python-free), **P2.1a** `native/train/gen_kv_train.vyb`
+(driver parameterizer) and **P2.1b** `native/train/build_fullmanifest.vyb` (manifest +
+token ids, which also fixed a real pre-tokenizer bug — see `doc/P2-TRAINER-PLAN.md`). All
+gated byte-for-byte; `native/legit/run_phase2_battery.sh` runs them,
+`native/legit/run_phase1_battery.sh` stays the regression gate.
+
+Blocker recorded against P2.1b: the `encode-corpus` target's driver imports both
+`native/tokenizer` and `native/json`, which both define `hexval`, and the whole-module
+import form fails to splice — pre-existing, filed as **Vyb#432**; no workaround applied.
 
 Replaces: `training/train_lora.py` (QLoRA, NF4 base), `training/smoke_adapter.py`,
 `training/start-training.sh`, `native/train/{build_fullmanifest,_build_kv,gen_kv_train,rbuild}.py`.

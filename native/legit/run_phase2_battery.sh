@@ -41,6 +41,14 @@ else
   step "P2.1a gen_kv_train.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# P2.1b — build_fullmanifest.py -> build_fullmanifest.vyb (+ pre-tokenizer boundaries)
+out="$(./native/legit/run_fullmanifest_gate.sh 2>&1)"
+if echo "$out" | tail -1 | grep -q "PASS"; then
+  step "P2.1b build_fullmanifest.vyb" "manifest parity (429 tokens) + pretok boundaries"
+else
+  step "P2.1b build_fullmanifest.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

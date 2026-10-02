@@ -77,8 +77,46 @@ where the committed `50292912` literal comes from, so the layout table is indepe
 checkable by hand.
 
 **P2.1b — `build_fullmanifest.vyb`**: manifest text → tokenizer ids
-(`native/tokenizer`) → `native/out/fullmanifest.txt` + `<i8` ids binary.
-Gate: byte-identical to frozen baselines; ids equal the tokenizer oracle's.
+(`native/tokenizer`) → `native/out/fullmanifest.{txt,_ids.bin}`. — **DONE 2026-10-02**
+The manifest literal is generated from the oracle's own output file rather than
+transcribed, so the prose cannot silently drift; the ids go out 8 bytes each,
+least-significant byte first (`numpy.array(ids, dtype="<i8").tobytes()` for
+non-negative ids).
+
+**This step found a real tokenizer bug** — and it is the reason P2.1b is worth more than
+its size suggests. `native/out/` is untracked, so the baseline was captured from the
+oracle: 429 tokens. The port produced **430**. The text was byte-identical, so it was the
+tokenizer: at token 51 transformers merges `):\n` into one token (id 982) and Vyb split it
+into `):` (1648) + `\n` (198), re-converging immediately after. Cause: the Qwen2
+pre-tokenizer's punctuation alternative is ` ?[^\s\p{L}\p{N}]+[\r\n]*` — a punctuation run
+absorbs the CR/LF run after it — but `segment_word` classified the remapped CR/LF
+byte-chars (`Ċ` = 0xC4 0x8A) as *letters* (their UTF-8 lead byte 196 is in the
+letter range), so the piece was cut at the newline and the merge `):` + `\n` → `):\n` was
+unreachable. Fixed in `native/tokenizer/tokenizer.vyb`: CR/LF/TAB/VT/FF glyphs get their
+own class, punctuation runs absorb trailing CR/LF, and a leading tab attaches to the
+following letter run (Qwen's `[^\r\n\p{L}\p{N}]?\p{L}+`). Verified against transformers on
+22 boundary cases (all match) and the full manifest now reproduces the oracle exactly.
+
+Why the existing oracle stayed green: `native/train/verify_encode_corpus.py` samples four
+corpus records, none of which contains a punctuation-then-newline boundary. The new
+`native/tokenizer/test_pretok_boundary.vyb` pins that class directly (expectations are
+transformers ids, frozen in the test) and runs in this gate. Worth doing at the model
+sweep: widen the corpus oracle's sample, or have it sweep every record's assistant text.
+
+Gate: `native/legit/run_fullmanifest_gate.sh` — both fixture files byte-for-byte plus the
+429-token count, the pre-tokenizer boundary test, and an optional `.venv` transformers
+cross-check that re-derives the fixture.
+
+**Known blocker (filed, not worked around)** — during P2.1b the `encode-corpus` make target
+turned out to be unrunnable: `native/train/encode_corpus.vyb` imports `tokenizer::{encode}`
+and `import json_parse`, and both modules define `hexval`, so the whole-module import fails
+with `Duplicate symbol after splice: 'hexval'`. Pre-existing (the committed revisions of both
+modules fail the same way on an unmodified `build/vyb`), so the corpus tokenizer oracle
+(`verify_encode_corpus.py`) cannot run at all right now. Filed as **Vyb#432** with a 3-file
+minimal repro and the import matrix; the consumer-side one-liner (`import json_parse::{parse}`)
+is deliberately *not* applied pending the call. Until then the tokenizer's coverage in this
+repo is `native/tokenizer/test_pretok_boundary.vyb` plus the fullmanifest oracle cross-check,
+neither of which goes through `encode_corpus.vyb`.
 
 **P2.1c — `_build_kv.vyb`**: the three-part source transform (helper insertion,
 CK/CV/RSHI allocations, per-token forward swap).

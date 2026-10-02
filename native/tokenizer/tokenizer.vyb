@@ -321,6 +321,60 @@ share(all) cls(b0<Int>)<Int> -> {
     return 2
 }
 
+// 3 = the remapped CR/LF/TAB/VT/FF byte-chars, which the Qwen2 pattern treats as
+// \s (or as the trailing [\r\n]* of a punctuation run) and NOT as letters. They are
+// the 2-byte glyphs 0xC4 0x89 (tab), 0x8A (LF), 0x8B (VT), 0x8C (FF), 0x8D (CR).
+// The space glyph 0xC4 0xA0 deliberately stays class 0: encode_with handles it
+// before segmentation, and the b0==196 leading-space branch below relies on it.
+share(all) cls_glyph(g<String>)<Int> -> {
+    if (g.len() == 0) { return 2 }
+    b0<Int> = (g.char_at(0) as Int) & 255
+    if (b0 == 196) {
+        if (g.len() >= 2) {
+            b1<Int> = (g.char_at(1) as Int) & 255
+            if (b1 == 137) { return 3 }
+            if (b1 == 138) { return 3 }
+            if (b1 == 139) { return 3 }
+            if (b1 == 140) { return 3 }
+            if (b1 == 141) { return 3 }
+        }
+    }
+    return cls(b0)
+}
+
+// Qwen2's punctuation alternative is ` ?[^\s\p{L}\p{N}]+[\r\n]*`: a punctuation run
+// absorbs the CR/LF run that follows it. Without this, "):\n" segments as [")
+// :","\n"] and misses the `):` + `\n` -> `):\n` merge (id 982), which is how the
+// full-manifest context came out 430 tokens against the oracle's 429.
+share(all) is_crlf_glyph(g<String>)<Int> -> {
+    if (g.len() < 2) { return 0 }
+    b0<Int> = (g.char_at(0) as Int) & 255
+    if (b0 != 196) { return 0 }
+    b1<Int> = (g.char_at(1) as Int) & 255
+    if (b1 == 138 || b1 == 141) { return 1 }
+    return 0
+}
+
+// Tab / VT / FF byte-chars: whitespace, but NOT the [\r\n] that Qwen's punctuation
+// alternative absorbs. They are the `[^\r\n\p{L}\p{N}]?` in `[^\r\n\p{L}\p{N}]?\p{L}+`,
+// so a single one attaches to the letter run that follows ("\ta" is one piece).
+share(all) is_tab_glyph(g<String>)<Int> -> {
+    if (g.len() < 2) { return 0 }
+    b0<Int> = (g.char_at(0) as Int) & 255
+    if (b0 != 196) { return 0 }
+    b1<Int> = (g.char_at(1) as Int) & 255
+    if (b1 == 137 || b1 == 139 || b1 == 140) { return 1 }
+    return 0
+}
+
+share(all) absorb_crlf(wc<Vec<String>>, rr<Int>, n<Int>)<Int> -> {
+    e<Int> = rr
+    while (e < n) {
+        if (is_crlf_glyph(wc.get(e)) == 1) { e = e + 1 } else { break }
+    }
+    return e
+}
+
 // Byte-BPE wc[a..b) (a contiguous slice of byte-chars) -> Vec of ids.
 share(all) bpe_chars(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>>, wc<Vec<String>>, a<Int>, b<Int>)<Vec<Int>> -> {
     sw<String> = ""
@@ -345,28 +399,47 @@ share(all) segment_word(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>
     while (i < n) {
         gx<String> = wc.get(i)
         b0<Int> = (gx.char_at(0) as Int) & 255
-        c0<Int> = cls(b0)
-        if (c0 == 0) {
+        c0<Int> = cls_glyph(gx)
+        if (c0 == 3) {
+            # standalone CR/LF run -> its own piece (Qwen `\s*[\r\n]+`), except that a
+            # tab/VT/FF attaches to a following letter run (Qwen `[^\r\nLN]?\p{L}+`)
+            nxt0<Int> = -1
+            if (i + 1 < n) { nxt0 = cls_glyph(wc.get(i + 1)) }
+            if (is_tab_glyph(gx) == 1 && nxt0 == 0) {
+                rr = i + 1
+                while (rr < n) {
+                    gL<String> = wc.get(rr)
+                    if (cls_glyph(gL) == 0) { rr = rr + 1 } else { break }
+                }
+            } else {
+                rr = i
+                while (rr < n) {
+                    gW<String> = wc.get(rr)
+                    if (cls_glyph(gW) == 3) { rr = rr + 1 } else { break }
+                }
+            }
+        } else if (c0 == 0) {
             if (b0 == 196) {
                 nx<Int> = -1
                 if (i + 1 < n) {
                     gN<String> = wc.get(i + 1)
                     bN<Int> = (gN.char_at(0) as Int) & 255
-                    nx = cls(bN)
+                    nx = cls_glyph(gN)
                 }
                 if (nx == 2) {
                     rr = i + 1
                     while (rr < n) {
                         gP<String> = wc.get(rr)
                         bP<Int> = (gP.char_at(0) as Int) & 255
-                        if (cls(bP) == 2) { rr = rr + 1 } else { break }
+                        if (cls_glyph(gP) == 2) { rr = rr + 1 } else { break }
                     }
+                    rr = absorb_crlf(wc, rr, n)
                 } else {
                     rr = i
                     while (rr < n) {
                         gA<String> = wc.get(rr)
                         bA<Int> = (gA.char_at(0) as Int) & 255
-                        if (cls(bA) == 0) { rr = rr + 1 } else { break }
+                        if (cls_glyph(gA) == 0) { rr = rr + 1 } else { break }
                     }
                 }
             } else {
@@ -374,7 +447,7 @@ share(all) segment_word(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>
                 while (rr < n) {
                     gA<String> = wc.get(rr)
                     bA<Int> = (gA.char_at(0) as Int) & 255
-                    if (cls(bA) == 0) { rr = rr + 1 } else { break }
+                    if (cls_glyph(gA) == 0) { rr = rr + 1 } else { break }
                 }
             }
         } else {
@@ -384,23 +457,24 @@ share(all) segment_word(vocab<HashMap<String, Int>>, merges<HashMap<String, Int>
                 if (i + 1 < n) {
                     gB<String> = wc.get(i + 1)
                     bB<Int> = (gB.char_at(0) as Int) & 255
-                    if (cls(bB) == 0) {
+                    if (cls_glyph(gB) == 0) {
                         rr = i + 1
                         while (rr < n) {
                             gC<String> = wc.get(rr)
                             bC<Int> = (gC.char_at(0) as Int) & 255
-                            if (cls(bC) == 0) { rr = rr + 1 } else { break }
+                            if (cls_glyph(gC) == 0) { rr = rr + 1 } else { break }
                         }
                     } else {
                         rr = i
                         while (rr < n) {
                             gD<String> = wc.get(rr)
                             bD<Int> = (gD.char_at(0) as Int) & 255
-                            if (cls(bD) == 2) { rr = rr + 1 } else { break }
+                            if (cls_glyph(gD) == 2) { rr = rr + 1 } else { break }
                         }
+                        rr = absorb_crlf(wc, rr, n)
                     }
                 } else {
-                    rr = i + 1
+                    rr = absorb_crlf(wc, i + 1, n)
                 }
             }
         }

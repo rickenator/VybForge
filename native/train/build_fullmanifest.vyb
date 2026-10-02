@@ -1,0 +1,75 @@
+# build_fullmanifest.vyb — build the full-manifest context for the goal-desktop record.
+#
+# Phase 2, P2.1b: a port of native/train/build_fullmanifest.py. That script embeds the
+# manifest text, tokenizes it with the Qwen3 tokenizer from the committed LoRA adapter
+# (transformers `AutoTokenizer`), prints the token count, and writes the manifest text
+# plus the ids as a little-endian <i8 array.
+#
+# The text below is byte-identical to the Python's triple-quoted literal: the file was
+# generated from the oracle's own native/out/fullmanifest.txt (sha256 5da822e8...), so a
+# transcription slip in the prose cannot hide. The gate re-checks it byte-for-byte.
+#
+# Tokenization uses the Vyb Qwen3 tokenizer (native/tokenizer), the same code path
+# encode_corpus.vyb uses and the same one native/train/verify_encode_corpus.py
+# cross-checks against transformers. Measured: 429 tokens (the milestone doc's "~369"
+# is stale).
+#
+# Ids are written 8 bytes each, least-significant byte first, matching
+# numpy.array(ids, dtype="<i8").tobytes() for non-negative ids (all of them).
+#
+# Paths come from the environment so the gate can write to scratch:
+#   VYBFORGE_FM_TXT  native/out/fullmanifest.txt
+#   VYBFORGE_FM_BIN  native/out/fullmanifest_ids.bin
+#
+# Build/run (same module paths as the encode-corpus target):
+#   "$VYB" native/train/build_fullmanifest.vyb \
+#       --module-path native/tokenizer --module-path native/json
+#
+# Gate: native/legit/run_fullmanifest_gate.sh
+import io::{open_read, read_all, open_write, write_str, write_bytes, close}
+import env::{env_get}
+import term::{eprintln}
+import tokenizer::{encode}
+
+manifest_text()<String> -> {
+    return "You are the VybOS configuration interviewer. Return exactly one JSON object with kind, message, missing_fields. Use only the capabilities manifest below plus the baseline; never invent or claim facts not listed.\n\nCAPABILITIES MANIFEST (VybOS, current):\n- Targets proven to boot to READY: x86_64 container rootfs via bwrap (unprivileged), docker, and x86_64 QEMU kernel+initramfs self-boot (TCG, virtual/virtio-gpu; forked Alpine netboot vmlinuz-virt kernel cached locally). ARM64 and RISC-V are NOT proven; mark as open decisions.\n- Derived toolchain: binutils 2.40, gcc 13.2.0 (C only, no libstdc++), gmp 6.2.1, mpfr 4.2.0, mpc 1.3.1, musl libc; --disable-multilib required. Target triple x86_64-linux-musl.\n- Linux kernel: 6.6 bzImage (out-of-tree build), kernel source pinned, modules/initramfs strategy configurable.\n- Available core packages (buildable, reviewed): busybox (static), heirloom-nvi / util-linux userspace, dropbear (ssh), dnsmasq, nginx, zlib, ncurses, toybox alternatives.\n- Services available: serial-getty on ttyS0, dropbear sshd (small-office gateway), nginx httpd, dnsmasq DNS/DHCP.\n- Image size / boot-time / attack-surface tradeoffs trackable per variant.\n- OPEN DECISIONS (do not fabricate): graphical desktop stack (Hyprland/Wayland/mesa) is NOT a derived capability; ARM64/RISC-V toolchain+rootfs; systemd vs busybox init unification; full reproducible byte-for-byte store.\n- Non-mutation rule: you only draft/review desired state; never claim host apply.\n\nUSER GOAL: I want a Hyprland desktop workstation."
+}
+
+writef(p<String>, text<String>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) { f -> { write_str(f, text); close(f); rc = 0 } ? -> { rc = 1 } }
+    return rc
+}
+
+writeb(p<String>, data<Vec<UInt8>>)<Int> -> {
+    rc<Int> = 1
+    match (open_write(p)) {
+        f -> { match (write_bytes(f, data)) { q -> { rc = 0 } ? -> { rc = 1 } } close(f) }
+        ? -> { rc = 1 }
+    }
+    return rc
+}
+
+main()<Int> -> {
+    txt_p<String> = env_get("VYBFORGE_FM_TXT") else "native/out/fullmanifest.txt"
+    bin_p<String> = env_get("VYBFORGE_FM_BIN") else "native/out/fullmanifest_ids.bin"
+    m<String> = manifest_text()
+    ids<Vec<Int>> = encode(m)
+    println("manifest context tokens = " + ids.len().to_string())
+
+    if (writef(txt_p, m) != 0) { eprintln("build_fullmanifest: cannot write " + txt_p); return 2 }
+
+    buf<Vec<UInt8>> = Vec<UInt8>()
+    k<Int> = 0
+    for (k in 0..ids.len() - 1) {
+        v<Int> = ids.get(k)
+        if (v < 0) { v = 0 - v }
+        j<Int> = 0
+        for (j in 0..7) {
+            buf.push((v % 256) as UInt8)
+            v = v / 256
+        }
+    }
+    if (writeb(bin_p, buf) != 0) { eprintln("build_fullmanifest: cannot write " + bin_p); return 3 }
+    return 0
+}

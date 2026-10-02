@@ -91,6 +91,12 @@ schemacheck:
 
 # T1 ground truth: tokenize real corpus responses -> token ids + CE labels with the
 # Vyb Qwen3 tokenizer, cross-checked against transformers (reference only).
+#
+# BLOCKED on Vyb#432: encode_corpus.vyb imports tokenizer::{encode} and `import
+# json_parse`, and both modules define `hexval`, so the whole-module import splice
+# fails ("Duplicate symbol after splice: 'hexval'"). Pre-existing — the committed
+# revisions of both modules fail identically. The consumer-side fix is one line
+# (`import json_parse::{parse}`); not applied pending the decision on the Vyb side.
 encode-corpus:
 	cd $(ROOT) && $(VYB) native/train/encode_corpus.vyb --module-path native/tokenizer --module-path native/json
 	cd $(ROOT) && .venv/bin/python native/train/verify_encode_corpus.py
