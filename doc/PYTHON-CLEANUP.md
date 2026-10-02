@@ -10,7 +10,11 @@ converted (per Rick's direction 2026-10-01: convert now, not deferred).
 Repo convention (native/README.md): "Zero Python in the production pipeline.
 Python is used only for reference *verification*, and never at runtime."
 
-## Inventory verdict (107 .py files, 7,277 lines)
+## Inventory verdict (107 .py files, 7,277 lines at audit time → 93 files, 6,287 lines after the 2026-10-02 prune)
+
+*The table below is the audit-time classification and drifts with every phase — re-derive it from
+`git ls-files '*.py'` rather than trusting it. Current: 103 files after the P1 deletions plus the
+P2.2a rendering oracle, 93 after the prune recorded in "Status notes on the Python that stays".*
 
 | Class | Files | Action |
 |---|---|---|
@@ -270,6 +274,44 @@ Two kinds of Python stay, and they are recorded differently:
      port would carry a workaround into Vyb — which the dogfooding rule forbids. The
      authoritative spec is the "CONCRETE BUILD PLAN" in `native/train/FULLMANIFEST-MILESTONE.md`;
      if that trainer is ever needed, write it fresh in Vyb from that plan.
+
+3. **Local dump-diff scratch** — **deleted** (2026-10-02 prune: 10 files, 87 lines). These are not
+   recorded per-file because there is nothing to record: 8–11 line scripts with no docstring, each a
+   `np.loadtxt` diff of one hardcoded dump-name list against `native/out/*.txt`:
+   `_cmp_ad_final, _cmp_ads2, _cmp_stp, _cmp_xo, _cmpall, _cmpl17, _cmpmom, _cmpq1, _cmpxo, _cmpxz`.
+   They read dumps that were never committed (`git ls-files native/out` = 0, and `native/out/` is
+   gitignored), so in a fresh clone they cannot run at all. The durable evidence for the same checks
+   is the committed numpy refs — `native/gguf/layer0_ref.py`, `native/train/train_full_loop_ref.py`
+   and the `*_ref.py` family — which all stay.
+
+### Kept, but not wired into any battery
+
+These are oracles by construction and nothing invokes them, which is exactly how a first
+classification pass mistook them for debris (see the lesson below). Each is the reference for a kept
+Vyb artifact, so they are *wiring* work, not deletion candidates:
+
+| Oracle (.py) | Reference for |
+|---|---|
+| `native/train/adamw_repro_ref.py` | `native/train/adamw_repro.vyb` — a P2.2d component |
+| `native/train/verify_t5.py` | the T5 training-step driver (self-described "Gate for T5") |
+| `native/train/verify_kvrespfwd.py` | `native/train/kvrespfwd.vyb` |
+| `native/train/kvresp_tf_sweep_lr2e4.py` | the `kvresp_train` line (self-described "authoritative GPU target") |
+| `native/train/kvprobe_ref.py` | the per-token ASLB PROBE2 dumps |
+| `native/train/compare_kvprobe{,2,3,_b}.py` | PROBE1/2/3 and the L35 backward chain-link dumps |
+| `native/train/_corr_chain{,2,3}.py`, `_cmp_chain_ord.py` | the M2e chained-backward gradient check |
+| `native/train/m2c_fdcheck.py`, `m2c_fdq.py` | the M2c analytic backward (finite-difference checks) |
+| `native/gguf/ref_hidden.py` | the gguf hidden-state path |
+
+A reference check no battery invokes is invisible evidence: it cannot fail loudly, so it cannot catch
+anything. If the oracle list is to mean something at the sweep, these need battery wiring — or an
+explicit "kept, not reproducible" note. That is open work, tracked here rather than guessed at.
+
+**Lesson (cost two wrong answers in one sitting):** classify a file as unreferenced only by grepping
+its *stem* across the whole repo. A grep for the basename *with* `.py`, scoped to build files, labelled
+13 load-bearing oracles as orphans — including the oracle for `adamw_repro.vyb`. The same class of
+false negative came from `git check-ignore -q a b` (two pathnames is an error, not a "no"): it reported
+`native/out/` as unignored when `.gitignore:16` ignores it. When a verification command answers
+"unreferenced"/"no", check that the command itself is valid before believing the answer.
 
 ## Final invariant
 
