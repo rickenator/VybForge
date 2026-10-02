@@ -2,7 +2,11 @@
 # Vyb-native host drivers. No Python in the runtime path; verification is done
 # inside Vyb (a numpy reference verifies the standalone single-layer forward).
 # Run `make -f native/Makefile verify` from the repo root.
-VYBDIR ?= /home/rick/Projects/Vyb
+# The Vyb checkout. VYBHOME is the canonical knob (VybForge#15); Vyb's build is
+# expected to publish it in $VYBHOME/SOURCEME_VYB (rickenator/Vyb#424). VYBDIR stays
+# as the make-level name the existing targets already use.
+VYBHOME ?= $(HOME)/Projects/Vyb
+VYBDIR  ?= $(VYBHOME)
 VYB     ?= $(VYBDIR)/build/vyb
 ROOT    := $(shell git -C "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))/.." rev-parse --show-toplevel 2>/dev/null || echo "$(abspath $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/..)")
 KSRC    := $(ROOT)/native/kernels/%.vyb

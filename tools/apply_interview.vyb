@@ -83,8 +83,17 @@ write_file(path<String>, data<String>)<Int> -> {
 main()<Int> -> {
     # Vyb JIT has no argv: patches path via env (default out/patches.jsonl).
     patches<String> = env_get("VYBFORGE_PATCHES") else "out/patches.jsonl"
-    # The toolchain binary to re-invoke (Makefile VYB / repo default).
-    vyb<String> = env_get("VYB_BIN") else "/home/rick/Projects/Vyb/build/vyb"
+    # The toolchain binary to re-invoke: $VYB_BIN, else $VYBHOME/build/vyb — Vyb
+    # publishes VYBHOME in $VYBHOME/SOURCEME_VYB (VybForge#15 / rickenator/Vyb#424).
+    vyb<String> = env_get("VYB_BIN") else ""
+    if (vyb.len() == 0) {
+        vhome<String> = env_get("VYBHOME") else ""
+        if (vhome.len() == 0) {
+            eprintln("set VYBHOME (or VYB_BIN) to the Vyb checkout: see VybForge#15 / rickenator/Vyb#424")
+            return 4
+        }
+        vyb = vhome + "/build/vyb"
+    }
 
     baseline<String> = read_file("config/default-state.json")
     if (baseline.len() == 0) { eprintln("no baseline: config/default-state.json"); return 2 }

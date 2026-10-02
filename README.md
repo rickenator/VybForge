@@ -9,6 +9,33 @@ Everything here **drafts desired state only.** It never builds, realizes,
 activates, deploys, or edits VybOS or the host, and it never touches the
 `<VybOS checkout>` tree.
 
+## Environment — one knob for the toolchain (VybForge#15)
+
+Set `VYBHOME` to your Vyb checkout; nothing in this repo needs a path literal.
+`vybenv.sh` — sourced by `run.sh`, every gate under `native/legit/`,
+`native/gdecode/run_pipeline.sh` and `training/generate-data.sh` — resolves
+
+| var | value |
+| --- | --- |
+| `VYB` | `$VYBHOME/build/vyb` |
+| `VYB_STDLIB` | `$VYBHOME/stdlib` |
+| `VYBOS` / `VYBOSHOME` | the sibling VybOS checkout (repair + ledger gates) |
+
+Resolution order: `$VYBHOME/SOURCEME_VYB` (sourced first, if it exists — Vyb's
+build is expected to publish the environment there, rickenator/Vyb#424), then
+`$VYBHOME`, then a derived home from an explicit `$VYB_BIN`/`$VYB`, then
+`$HOME/Projects/Vyb`. With none of those, the scripts stop with the exact `export`
+line to run — never a silent build against the wrong toolchain. One line in your
+shell replaces all of it:
+
+```sh
+. "$VYBHOME/SOURCEME_VYB"
+```
+
+Inside Vyb drivers the toolchain is resolved at use (`tools/apply_interview.vyb`
+re-invokes the compiler; `native/host/chat_server.vyb` spawns the decode driver) —
+same precedence, same failure mode.
+
 ## Spec — desired-state interviewer
 
 Spec turns a human OS-build goal into a reviewable **SystemSpec**. An LLM is
@@ -30,10 +57,11 @@ contract: `{path, op: add|replace|remove, value, reason}` targeting
 `system | hostname | pkgs | services` (the real VybOS `SystemSpec` shape).
 
 ```sh
-# patches come from $VYBFORGE_PATCHES (default out/patches.jsonl); VYB_BIN (the
-# toolchain used to compile the rendered program) defaults to the same binary.
-VYB="$HOME/Projects/Vyb/build/vyb"
-VYBFORGE_PATCHES=patches.jsonl "$VYB" tools/apply_interview.vyb --module-path native/json
+# patches come from $VYBFORGE_PATCHES (default out/patches.jsonl). The toolchain is
+# located from $VYBHOME (vybenv.sh; VybForge#15 — Vyb publishes it in
+# $VYBHOME/SOURCEME_VYB, rickenator/Vyb#424).
+export VYBHOME="$HOME/Projects/Vyb"        # or: . "$VYBHOME/SOURCEME_VYB"
+VYBFORGE_PATCHES=patches.jsonl "$VYBHOME/build/vyb" tools/apply_interview.vyb --module-path native/json
 ```
 
 Run the interviewer with `./run.sh` (GPU Ollama / OpenAI Responses /

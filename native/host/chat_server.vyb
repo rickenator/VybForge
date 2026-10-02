@@ -37,8 +37,9 @@ MODELDRV<String> = "native/host/decode_driver.vyb"
 LLMDIR<String> = "native/llm"
 PROMPT_IDS<String> = "native/out/prompt_ids.txt"
 CHATGEN_OUT<String> = "native/out/chatgen_ids_vyb.txt"
-VYB_BIN<String> = "/home/rick/Projects/Vyb/build/vyb"
-VYB_STDLIB<String> = "/home/rick/Projects/Vyb/stdlib"
+// The Vyb toolchain is resolved at use (VybForge#15): $VYB_BIN / $VYB_STDLIB, else
+// derived from $VYBHOME — which Vyb publishes in $VYBHOME/SOURCEME_VYB
+// (rickenator/Vyb#424). No path literals here.
 
 hexch(c<Int>)<Int> -> {
     if (c >= 48 && c <= 57) { return c - 48 }
@@ -133,8 +134,16 @@ untuned_response(prompt<String>)<String> -> {
     m<Model> = llm_load("qwen3", tdir)
     nids<Int> = write_prompt_ids(m, prompt)
     if (nids == 0) { return "ERR: prompt encoded to 0 tokens" }
-    cmd<String> = "VYB_STDLIB=" + VYB_STDLIB + " VYB_PROMPT_IDS=" + PROMPT_IDS +
-                  " VYB_GEN=" + GEN.to_string() + " " + VYB_BIN + " " + MODELDRV +
+    vhome<String> = env_get("VYBHOME") else ""
+    vyb<String> = env_get("VYB_BIN") else ""
+    vstd<String> = env_get("VYB_STDLIB") else ""
+    if (vhome.len() == 0 && (vyb.len() == 0 || vstd.len() == 0)) {
+        return "ERR: set VYBHOME to the Vyb checkout (VybForge#15 / rickenator/Vyb#424)"
+    }
+    if (vyb.len() == 0) { vyb = vhome + "/build/vyb" }
+    if (vstd.len() == 0) { vstd = vhome + "/stdlib" }
+    cmd<String> = "VYB_STDLIB=" + vstd + " VYB_PROMPT_IDS=" + PROMPT_IDS +
+                  " VYB_GEN=" + GEN.to_string() + " " + vyb + " " + MODELDRV +
                   " --module-path " + LLMDIR + " >/dev/null 2>&1"
     rc<Int> = free_exec(cmd)
     if (rc != 0) { return "ERR: decode_driver exit " + rc.to_string() }

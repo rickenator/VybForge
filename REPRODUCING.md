@@ -38,9 +38,9 @@ No launcher path calls VybOS.
 Install Vyb and Ollama on Linux. Ollama must listen locally at `127.0.0.1:11434`.
 
 ```sh
-export VYB_BIN="$HOME/Projects/Vyb/build/vyb"
+export VYBHOME="$HOME/Projects/Vyb"   # the toolchain is located from VYBHOME (vybenv.sh)
 mkdir -p bin
-"$VYB_BIN" src/main.vyb --build bin/vyb-configurator -O2
+"$VYBHOME/build/vyb" src/main.vyb --build bin/vyb-configurator -O2
 ollama pull qwen3:4b
 ./run-vyb.sh
 ```
@@ -52,7 +52,7 @@ VybOS.
 ## Recreate the corpus
 
 ```sh
-export VYB_BIN="$HOME/Projects/Vyb/build/vyb"
+export VYBHOME="$HOME/Projects/Vyb"   # generate-data.sh sources vybenv.sh too
 ./training/generate-data.sh
 python3 - <<'PY'
 import json

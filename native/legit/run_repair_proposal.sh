@@ -18,9 +18,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VYB="${VYB:-/home/rick/Projects/Vyb/build/vyb}"
-VYB_STDLIB="${VYB_STDLIB:-/home/rick/Projects/Vyb/stdlib}"
-VYBOS="${VYBOS:-/home/rick/Projects/VybOS}"
+. "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 fixture="$root/native/legit/fixtures/repair_pristine.c"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

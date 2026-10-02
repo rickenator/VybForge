@@ -16,8 +16,7 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VYB="${VYB:-/home/rick/Projects/Vyb/build/vyb}"
-VYB_STDLIB="${VYB_STDLIB:-/home/rick/Projects/Vyb/stdlib}"
+. "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 export VYB_STDLIB
 PY="${PY:-}"
 if [ -z "$PY" ]; then

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VYB="${VYB:-/home/rick/Projects/Vyb/build/vyb}"
+. "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 cd "$root"
 
 echo "== stage A: prompt -> token ids =="
@@ -13,7 +13,7 @@ ids="$("$VYB" native/gdecode/pipeline_encode.vyb --module-path native/tokenizer 
 echo "prompt ids: $ids"
 
 echo "== stage B: on-GPU decode (decode_driver) =="
-VYBFORGE_DECODE_PROMPT="$ids" VYB_STDLIB="${VYB_STDLIB:-/home/rick/Projects/Vyb/stdlib}" "$VYB" native/host/decode_driver.vyb --module-path native/llm
+VYBFORGE_DECODE_PROMPT="$ids" "$VYB" native/host/decode_driver.vyb --module-path native/llm
 
 echo "== stage C: detokenize -> agent-response contract =="
 "$VYB" native/gdecode/pipeline_emit.vyb --module-path native/gdecode --module-path native/tokenizer

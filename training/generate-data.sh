@@ -2,10 +2,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-vyb_bin="${VYB_BIN:-/home/rick/Projects/Vyb/build/vyb}"
+. "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 
 mkdir -p "$root/bin" "$root/data"
-"$vyb_bin" "$root/training/generate_dataset.vyb" --build "$root/bin/vybos-training-data" -O2
+"$VYB" "$root/training/generate_dataset.vyb" --build "$root/bin/vybos-training-data" -O2
 # Native Vyb prints main()'s integer return after stdout. Keep only JSONL rows.
 "$root/bin/vybos-training-data" | sed -n '/^{/p' >"$root/data/vybos-configurator-all.jsonl"
 python3 - "$root/data/vybos-configurator-all.jsonl" "$root/data/vybos-configurator-train.jsonl" "$root/data/vybos-configurator-eval.jsonl" <<'PY'

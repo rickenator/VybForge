@@ -9,7 +9,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VYB="${VYB:-/home/rick/Projects/Vyb/build/vyb}"
+. "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 
 fixture="${1:-$root/config/mock-system.json}"
 outdir="${2:-$root/native/legit/receipts}"
