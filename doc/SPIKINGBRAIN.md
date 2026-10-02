@@ -149,13 +149,34 @@ Why: every requirement SpikingBrain adds lands on a *general* gap rather than a 
 the same work written generally serves this model, the previous one, and the next. Evidence, the
 port-vs-consume rule and the park-list: `doc/SUBSTRATE-SCOPE.md`. This is the work order.
 
-**S0.1 — dtypes: bf16 + f16 storage, fp32 accumulation.**
-`native/` today has zero occurrences of bf16/fp16 (kernels run f32/f64; the only `f16` mentions are
-comments describing GGUF block layout). Add a dtype enum, the store/load path and the conversion in
-the tensor/kernel layer, with the accumulation policy stated per op (this model: bf16 weights, fp32
-accumulate). General because every model after Qwen3 is half-precision.
-**Gate:** dtype round-trip and conversion vs numpy/torch on fixed vectors *and* on real tensors from a
-sharded checkpoint; all existing f32 gates unchanged.
+**S0.1 — dtypes: bf16 + f16 storage, fp32 accumulation. LANDED 2026-10-02.**
+`native/dtype/dtype.vyb` is now the single place that names a dtype (container spelling → id,
+width, and the storage-vs-accumulate policy): a half is *stored* f16/bf16, read through the
+device intrinsic `ld_f16`/`ld_bf16` (exact widening), accumulated in Vyb `Float`, and written
+back through `st_f16`/`st_bf16` only at an explicit conversion point. The device intrinsics
+already existed (Vyb#203, `doc/CUDA.md`); what S0.1 adds is the policy, the single naming
+point, and the proof.
+**Gate:** `native/legit/run_dtype_gate.sh`. `native/kernels/dtcvt.vyb` converts on the GPU and
+compares every element **on the device** against expectations from numpy/torch
+(`native/dtype/dtcvt_ref.py`), so the corpora can be millions of values: all 65,536 f16 and
+bf16 encodings widened, 4,194,304 real values widened from two real checkpoints, and
+2,621,440 structured + 2,000,000 random f32 narrowed to f16 (every rounding branch of f16's
+10-bit mantissa, both signs, all 256 exponents). Result: widening byte-exact everywhere; f16
+narrowing has **0 value differences** against torch. NaN payload differences are reported
+separately rather than failed — IEEE 754 leaves payload propagation on a conversion
+implementation-defined — but a NaN that comes back as a *number* is a failure, which is what
+catches the bug below. The dtype module's table is also checked against the container
+readers' own tables so the two cannot drift.
+**Found by this gate:** `st_bf16` truncated instead of rounding — ~50% of values were one ulp
+off torch and a NaN could silently become Inf (`0x7f807fff` → `0x7f80`). Filed as **Vyb#441**
+and fixed in **rickenator/Vyb#443** (`cgen_expr_kernel.cpp`): round-to-nearest-even
+(`+ 0x7FFF + lsb` on the f32 pattern) plus an Inf/NaN guard, since the rounding constant
+carries out of the exponent — Inf passes through, a NaN gets the canonical quiet bit. All
+eight conversions gate now (0 value differences, was 6 of 8). The kernel Makefile rule depends
+on `$(VYB)` for the same reason the gate rebuilds from the current toolchain: a kernel is an
+artifact of the *compiler*, and a stale `.ptx` would have let the gate certify the previous
+toolchain. Importing `native/tensor` also makes a file's own `extern "C"` declarations
+unresolvable (**Vyb#442**), which is why the driver hand-wires its CUDA calls for now.
 
 **S0.2 — tensor core + model config contract (audit G1).**
 Host-side tensor layer (shape/strides/dtype/alloc, broadcast) plus a **config contract**: model dims

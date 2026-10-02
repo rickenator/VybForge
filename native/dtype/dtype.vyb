@@ -1,0 +1,152 @@
+// dtype — dtype identity, storage/accumulation policy and container-name mapping for
+// VybForge's native layer (S0.1).
+//
+// POLICY (the point of S0.1)
+//   * Storage may be F16 or BF16; accumulation is always F32/F64. A kernel reads a half
+//     through the device intrinsic ld_f16 / ld_bf16 (exact widening — no rounding), does
+//     its arithmetic in Vyb Float (f64), and writes a half back through st_f16 / st_bf16
+//     only when a half result is actually wanted.
+//   * Widening is lossless and may be done anywhere. NARROWING ROUNDS and is therefore
+//     only allowed at an explicit conversion point, never as a side effect of a load.
+//   * The intrinsics are kernel-mode only (Vyb doc/CUDA.md): ld_f16, ld_bf16, st_f16,
+//     st_bf16. There is no host-mode equivalent — host code moves bytes and the
+//     conversion happens in a kernel. A host path that needs f32 values from a half
+//     tensor must run a conversion kernel (native/kernels/dtcvt.vyb's neighbours will do
+//     this; the comparator itself is the gate).
+//
+// NAMES are the *container* spellings (safetensors dtype strings / torch storage names),
+// because the loaders in native/torchload classify by exactly these strings. dt_id() is
+// the single place that maps a container spelling to an id, so a new container dtype is
+// added here rather than in every reader.
+//
+// The ids are VybForge-local, NOT ggml/GGUF type ids — GGUF has its own numbering and the
+// GGUF reader keeps its own table (see native/gguf/parse_gguf.vyb). Keep these stable:
+// the tensor record (S0.2) stores them.
+
+share(all) dt_f32()<Int> -> { return 0 }
+share(all) dt_f16()<Int> -> { return 1 }
+share(all) dt_bf16()<Int> -> { return 2 }
+share(all) dt_f64()<Int> -> { return 3 }
+share(all) dt_i64()<Int> -> { return 4 }
+share(all) dt_u64()<Int> -> { return 5 }
+share(all) dt_i32()<Int> -> { return 6 }
+share(all) dt_u32()<Int> -> { return 7 }
+share(all) dt_i16()<Int> -> { return 8 }
+share(all) dt_u16()<Int> -> { return 9 }
+share(all) dt_i8()<Int> -> { return 10 }
+share(all) dt_u8()<Int> -> { return 11 }
+share(all) dt_bool()<Int> -> { return 12 }
+share(all) dt_f8e4m3()<Int> -> { return 13 }
+share(all) dt_f8e5m2()<Int> -> { return 14 }
+share(all) dt_unknown()<Int> -> { return -1 }
+
+// Canonical name for an id ("" when unknown). Round-trips with dt_id().
+share(all) dt_name(d<Int>)<String> -> {
+    if (d == 0) { return "F32" }
+    if (d == 1) { return "F16" }
+    if (d == 2) { return "BF16" }
+    if (d == 3) { return "F64" }
+    if (d == 4) { return "I64" }
+    if (d == 5) { return "U64" }
+    if (d == 6) { return "I32" }
+    if (d == 7) { return "U32" }
+    if (d == 8) { return "I16" }
+    if (d == 9) { return "U16" }
+    if (d == 10) { return "I8" }
+    if (d == 11) { return "U8" }
+    if (d == 12) { return "BOOL" }
+    if (d == 13) { return "F8_E4M3" }
+    if (d == 14) { return "F8_E5M2" }
+    return ""
+}
+
+// Bytes per element. 0 when unknown — callers must check, never assume 4.
+share(all) dt_bytes(d<Int>)<Int> -> {
+    if (d == 0) { return 4 }
+    if (d == 1) { return 2 }
+    if (d == 2) { return 2 }
+    if (d == 3) { return 8 }
+    if (d == 4) { return 8 }
+    if (d == 5) { return 8 }
+    if (d == 6) { return 4 }
+    if (d == 7) { return 4 }
+    if (d == 8) { return 2 }
+    if (d == 9) { return 2 }
+    if (d == 10) { return 1 }
+    if (d == 11) { return 1 }
+    if (d == 12) { return 1 }
+    if (d == 13) { return 1 }
+    if (d == 14) { return 1 }
+    return 0
+}
+
+// Container spelling -> id, or dt_unknown(). Accepts both the safetensors spelling and
+// the alternates the two container readers meet in practice.
+share(all) dt_id(name<String>)<Int> -> {
+    if (name == "F32") { return 0 }
+    if (name == "float32") { return 0 }
+    if (name == "float") { return 0 }
+    if (name == "F16") { return 1 }
+    if (name == "float16") { return 1 }
+    if (name == "half") { return 1 }
+    if (name == "BF16") { return 2 }
+    if (name == "bfloat16") { return 2 }
+    if (name == "F64") { return 3 }
+    if (name == "float64") { return 3 }
+    if (name == "double") { return 3 }
+    if (name == "I64") { return 4 }
+    if (name == "long") { return 4 }
+    if (name == "U64") { return 5 }
+    if (name == "I32") { return 6 }
+    if (name == "int32") { return 6 }
+    if (name == "int") { return 6 }
+    if (name == "U32") { return 7 }
+    if (name == "uint32") { return 7 }
+    if (name == "I16") { return 8 }
+    if (name == "int16") { return 8 }
+    if (name == "short") { return 8 }
+    if (name == "U16") { return 9 }
+    if (name == "uint16") { return 9 }
+    if (name == "I8") { return 10 }
+    if (name == "int8") { return 10 }
+    if (name == "U8") { return 11 }
+    if (name == "uint8") { return 11 }
+    if (name == "byte") { return 11 }
+    if (name == "BOOL") { return 12 }
+    if (name == "bool") { return 12 }
+    if (name == "F8_E4M3") { return 13 }
+    if (name == "F8_E5M2") { return 14 }
+    return dt_unknown()
+}
+
+// True for the half-precision storage types (the ones S0.1 is about).
+share(all) dt_is_half(d<Int>)<Bool> -> {
+    if (d == 1) { return true }
+    if (d == 2) { return true }
+    return false
+}
+
+// The dtype a half-storage op accumulates into. Halves accumulate in F32; everything else
+// keeps its own width (an integer op is not silently promoted here).
+share(all) dt_accum(d<Int>)<Int> -> {
+    if (d == 1) { return 0 }
+    if (d == 2) { return 0 }
+    return d
+}
+
+// Device intrinsic that widens this dtype to Float ("" when there is none).
+share(all) dt_widen_intrinsic(d<Int>)<String> -> {
+    if (d == 1) { return "ld_f16" }
+    if (d == 2) { return "ld_bf16" }
+    return ""
+}
+
+// Device intrinsic that narrows a Float to this dtype ("" when there is none).
+share(all) dt_narrow_intrinsic(d<Int>)<String> -> {
+    if (d == 1) { return "st_f16" }
+    if (d == 2) { return "st_bf16" }
+    return ""
+}
+
+// A model config's torch_dtype string -> id (S0.2's config contract hook).
+share(all) dt_of_config(s<String>)<Int> -> { return dt_id(s) }

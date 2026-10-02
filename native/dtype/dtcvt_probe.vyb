@@ -1,0 +1,251 @@
+// dtcvt_probe — host driver for the S0.1 conversion comparator (native/kernels/dtcvt.vyb).
+//
+// Reads a corpus and the expectations an independent authority (numpy/torch) produced for
+// it, runs the conversions ON THE GPU through the real dtype intrinsics, compares every
+// element on the device, and reports the mismatch count plus the first mismatches. Only a
+// few hundred bytes come back, so the corpus can be as large as the file system allows.
+//
+// env:
+//   VYBFORGE_DTCVT_IN    corpus (binary)
+//   VYBFORGE_DTCVT_EXP   expectations (binary)
+//   VYBFORGE_DTCVT_MODE  0 widen f16->f32, 1 widen bf16->f32,
+//                        2 narrow f32->f16, 3 narrow f32->bf16, 9 print the dtype table
+// Prints one summary line (grep-able) and one line per reported mismatch:
+//   DTCVT_OK mode=<m> n=<n> mismatches=<k> in=<file> exp=<file>
+//   DTCVT_MISMATCH i=<idx> got=0x<hex> exp=0x<hex>
+//
+// Run with: --module-path native/dtype   (the dtype module this driver exercises)
+//
+// The CUDA calls are declared here rather than imported from native/tensor: importing a
+// module that itself imports the CUDA bindings makes THIS file's own `extern "C"`
+// declarations unresolvable ("Undefined identifier: cuCtxSynchronize") — filed as
+// Vyb#442, with an 8-line repro. Hand-wiring is also what native/host/decode_driver.vyb
+// and native/train/train_full.vyb do. Delete this note when #442 is fixed.
+
+import io::{open_read, read_all, close}
+import env::{env_get}
+import dtype::{dt_name, dt_bytes}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+parse_u(s<String>)<Int> -> {
+    a<Int> = 0
+    i<Int> = 0
+    for (i in 0..s.len() - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+
+// Zero-filled String of `n` bytes, for zeroing the verdict buffer.
+zeros(n<Int>)<String> -> {
+    z<String> = ""
+    i<Int> = 0
+    for (i in 0..n - 1) { z = z + String::from_byte(0) }
+    return z
+}
+
+hex(v<Int>, digits<Int>)<String> -> {
+    dig<String> = "0123456789abcdef"
+    out<String> = ""
+    sh<Int> = (digits - 1) * 4
+    k<Int> = 0
+    for (k in 0..digits - 1) {
+        nib<Int> = (v >> (sh - k * 4)) & 15
+        out = out + dig.substring(nib, nib + 1)
+    }
+    return "0x" + out
+}
+
+// Device buffer alloc; 0 = failure.
+alloc(bytes<Int>)<Int> -> {
+    freedom {
+        dp<Int> = 0
+        if (cuMemAlloc_v2(loc(dp), bytes) != 0) { return 0 }
+        return dp
+    }
+    return 0
+}
+
+// Bulk HtoD straight from a String's raw bytes — one DMA, not a per-element loop
+// (the same shape native/train/train_full.vyb uses for its weights).
+bulk_up(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(dst, data, nbytes) != 0) { return 15 }
+        return 0
+    }
+    return 0
+}
+
+// Write one 8-byte word into device memory (the params buffer).
+wr64(p<Int>, v<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(p, loc(v), 8) != 0) { return 16 }
+        return 0
+    }
+    return 0
+}
+
+// Read one 8-byte word back as an Int.
+rd_i(p<Int>)<Int> -> {
+    freedom {
+        v<Int> = 0
+        if (cuMemcpyDtoH_v2(loc(v), p, 8) != 0) { return 0 }
+        return v
+    }
+    return 0
+}
+
+// Read one 8-byte word back as a Float (the mismatch counter is an f64).
+rd_f(p<Int>)<Float> -> {
+    freedom {
+        v<Float> = 0.0
+        if (cuMemcpyDtoH_v2(loc(v), p, 8) != 0) { return 0.0 }
+        return v
+    }
+    return 0.0
+}
+
+// Mode 9 is not a conversion: it prints the dtype table, so the gate can prove the module's
+// names and widths agree with the tables the container readers (native/torchload) use —
+// one place naming dtypes, not three.
+dt_table()<Int> -> {
+    d<Int> = 0
+    for (d in 0..14) {
+        println("DTCVT_DT id=" + d.to_string() + " name=" + dt_name(d) + " bytes=" + dt_bytes(d).to_string())
+    }
+    return 0
+}
+
+main()<Int> -> {
+    mode<Int> = parse_u(env_get("VYBFORGE_DTCVT_MODE") else "0")
+    if (mode == 9) { return dt_table() }
+    inpath<String> = env_get("VYBFORGE_DTCVT_IN") else ""
+    exppath<String> = env_get("VYBFORGE_DTCVT_EXP") else ""
+    if (mode > 3) { println("DTCVT_FAIL: bad mode"); return 1 }
+    inp<String> = read_bin(inpath)
+    expp<String> = read_bin(exppath)
+    if (inp.len() == 0) { println("DTCVT_FAIL: empty corpus " + inpath); return 2 }
+    iw<Int> = 4
+    ew<Int> = 2
+    if (mode < 2) { iw = 2; ew = 4 }
+    n<Int> = inp.len() / iw
+    if (n == 0) { println("DTCVT_FAIL: corpus too short"); return 2 }
+    if (expp.len() != n * ew) {
+        println("DTCVT_FAIL: expectations " + expp.len().to_string() + " bytes, want " + (n * ew).to_string())
+        return 2
+    }
+    ln<Int> = inp.len()
+    le<Int> = expp.len()
+    lm<Int> = n * 4
+    # CUDA handles cross this file as Int (from<> is freedom-only), the same convention
+    # native/tensor/tensor.vyb exposes.
+    hs<Int> = 0
+    dIN<Int> = 0
+    dEXP<Int> = 0
+    dOUT<Int> = 0
+    dP<Int> = 0
+    dVER<Int> = 0
+    freedom {
+        if (cuInit(0) != 0) { println("DTCVT_FAIL: cuInit"); return 3 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0) { println("DTCVT_FAIL: device count"); return 3 }
+        if (ndev < 1) { println("DTCVT_FAIL: no device"); return 3 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { println("DTCVT_FAIL: device get"); return 3 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { println("DTCVT_FAIL: ctx"); return 3 }
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        rcm<CInt> = -1
+        t<Int> = 0
+        # retry the module load: the first load after a fresh context can fail
+        # (NO_BINARY_FOR_GPU-once), the same loop decode_driver.vyb uses
+        for (t in 0..5) { if (rcm != 0) { hmod = from<loc<CVoid>>(0); rcm = cuModuleLoadData(loc(hmod), read_bin("native/build/dtcvt.ptx")) } }
+        if (rcm != 0) { println("DTCVT_FAIL: module load"); return 4 }
+        if (cuModuleGetFunction(loc(hf), hmod, "dtcmp") != 0) { println("DTCVT_FAIL: no dtcmp"); return 5 }
+        hs = addr(hf)
+    }
+    dIN = alloc(ln)
+    dEXP = alloc(le)
+    dOUT = alloc(lm)
+    dP = alloc(64)
+    dVER = alloc(1024)
+    if (dIN == 0) { println("DTCVT_FAIL: alloc in"); return 6 }
+    if (dEXP == 0) { println("DTCVT_FAIL: alloc exp"); return 6 }
+    if (dOUT == 0) { println("DTCVT_FAIL: alloc out"); return 6 }
+    if (dP == 0) { println("DTCVT_FAIL: alloc params"); return 6 }
+    if (dVER == 0) { println("DTCVT_FAIL: alloc verdict"); return 6 }
+    e0<Int> = bulk_up(inp, dIN, ln)
+    if (e0 != 0) { println("DTCVT_FAIL: upload corpus " + e0.to_string()); return 7 }
+    e1<Int> = bulk_up(expp, dEXP, le)
+    if (e1 != 0) { println("DTCVT_FAIL: upload expectations " + e1.to_string()); return 7 }
+    e2<Int> = bulk_up(zeros(1024), dVER, 1024)
+    if (e2 != 0) { println("DTCVT_FAIL: zero verdict " + e2.to_string()); return 7 }
+    # params buffer: the six words the kernel reads (native/kernels/dtcvt.vyb)
+    if (wr64(dP + 0, dIN) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    if (wr64(dP + 8, dEXP) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    if (wr64(dP + 16, dOUT) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    if (wr64(dP + 24, dVER) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    if (wr64(dP + 32, n) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    if (wr64(dP + 40, mode) != 0) { println("DTCVT_FAIL: params"); return 7 }
+    lb<Int> = (n + 255) / 256
+    rc<CInt> = -1
+    freedom {
+        rc = cuda_launch4i(from<loc<CVoid>>(hs), lb, 1, 1, 256, 1, 1, dP, 0, 0, 0)
+        cuCtxSynchronize()
+    }
+    if (rc != 0) { println("DTCVT_FAIL: launch " + (rc as Int).to_string()); return 8 }
+    cntf<Float> = rd_f(dVER + 0)
+    k<Int> = cntf as Int
+    npf<Float> = rd_f(dVER + 8)
+    npi<Int> = npf as Int
+    nxf<Float> = rd_f(dVER + 16)
+    nxi<Int> = nxf as Int
+    vdf<Float> = rd_f(dVER + 24)
+    vdi<Int> = vdf as Int
+    println("DTCVT_OK mode=" + mode.to_string() + " n=" + n.to_string() + " mismatches=" + k.to_string()
+            + " nan_payload=" + npi.to_string() + " nan_to_nonnan=" + nxi.to_string()
+            + " value_diff=" + vdi.to_string() + " in=" + inpath + " exp=" + exppath)
+    show<Int> = k
+    if (show > 16) { show = 16 }
+    j<Int> = 0
+    for (j in 0..show - 1) {
+        ix<Int> = rd_i(dVER + 32 + j * 32)
+        got<Int> = rd_i(dVER + 40 + j * 32)
+        ex<Int> = rd_i(dVER + 48 + j * 32)
+        println("DTCVT_MISMATCH i=" + ix.to_string() + " got=" + hex(got, ew * 2) + " exp=" + hex(ex, ew * 2))
+    }
+    freedom {
+        cuMemFree_v2(dIN)
+        cuMemFree_v2(dEXP)
+        cuMemFree_v2(dOUT)
+        cuMemFree_v2(dP)
+        cuMemFree_v2(dVER)
+    }
+    return 0
+}

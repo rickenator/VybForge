@@ -135,6 +135,17 @@ else
   else step "S0.3 torch .bin loader" "FAIL ($tb_bad/$tb_n shards)"; fail=1; fi
 fi
 
+# ── S0.1 — dtypes (f16/bf16 storage, fp32 accumulation) ─────────────────────────────
+# Gate: native/legit/run_dtype_gate.sh (doc/SPIKINGBRAIN.md S0.1). Eight conversions, both
+# directions, compared on the GPU against numpy/torch: widening byte-exact, and both f16
+# and bf16 narrowing at 0 value differences (bf16 needed the Vyb#441 rounding fix).
+out="$(./native/legit/run_dtype_gate.sh 2>&1)"
+if echo "$out" | grep -q "S0\.1 DTYPE GATE: PASS"; then
+  step "S0.1 dtype gate" "PASS ($(echo "$out" | grep -cE '^S0\.1 [a-z_0-9]+ +PASS') conversions vs numpy/torch)"
+else
+  step "S0.1 dtype gate" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

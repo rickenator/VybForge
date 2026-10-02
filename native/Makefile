@@ -13,15 +13,18 @@ KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
 
 all: verify
 
-# Compile a kernel source to PTX via kernel mode (with vmath in scope)
-$(KPTX): $(KSRC)
+# Compile a kernel source to PTX via kernel mode (with vmath in scope).
+# $(VYB) is a prerequisite on purpose: a kernel is an artifact of the *compiler*, so a
+# rebuilt compiler must force every kernel to rebuild. Without this, a gate can compare
+# against a .ptx left over from a previous toolchain and report the wrong answer.
+$(KPTX): $(KSRC) $(VYB)
 	@mkdir -p $(ROOT)/native/build $(ROOT)/native/out
 	cd $(ROOT)/native/build && $(VYB) --kernel ../kernels/$*.vyb --ptx $*.ptx $(MODPATH)
 

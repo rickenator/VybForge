@@ -1,0 +1,130 @@
+// dtcvt — half/bfloat16 conversion comparator kernel (S0.1).
+//
+// Compares Vyb's device half-precision conversions against an expectations buffer
+// produced by an independent authority (numpy/torch), ON THE DEVICE, so a corpus of
+// millions of values costs one small readback instead of a per-value DMA. The
+// comparison is byte-level on the encoded result, not on float values: NaN payloads
+// and signed zero are therefore compared exactly, and a NaN that silently becomes Inf
+// is caught rather than passing an `==` test.
+//
+// Encodings are assembled from BYTES, not from ld_i32/ld_i16. Those loads produce a
+// narrow value that the compiler warns about storing into an Int ("Storing i32 into
+// location of type i64"), i.e. the extension is implementation-defined; byte assembly
+// is exact and warning-free, and the comparison must not depend on a signedness
+// convention.
+//
+// Params buffer (48 B):
+//   +0  IN    input corpus     widen: N x 2 B (f16/bf16)   narrow: N x 4 B (f32)
+//   +8  EXP   expected output  widen: N x 4 B (f32)        narrow: N x 2 B (f16/bf16)
+//   +16 OUT   converted output (device scratch, same widths as EXP)
+// Verdict buffer (zeroed by the host):
+//   +0  f64 total mismatch count (atomic; exact to 2^53, so an exhaustive run over the
+//          whole f32 space cannot overflow — an i32 atomic could)
+//   +8  f64 mismatches whose input is NaN and whose output is also NaN. IEEE 754 leaves
+//          NaN payload propagation on a conversion implementation-defined, so these are
+//          reported but are NOT value errors.
+//   +16 f64 mismatches whose input is NaN and whose output is NOT NaN — the real hazard
+//          (a NaN silently becoming Inf or a number). Must be 0.
+//   +24 f64 mismatches on a non-NaN input. These are value errors. Must be 0 for a
+//          conversion that claims to match the reference frame.
+//   +32 + 32*k : i64 element index of the k-th mismatch (first 16 only)
+//                 +8 got, +16 exp
+//   +32 N     element count
+//   +40 MODE  0 = widen f16->f32   1 = widen bf16->f32
+//             2 = narrow f32->f16  3 = narrow f32->bf16
+//
+// The classification is done here, on the device, so it covers the WHOLE corpus rather
+// than the handful of examples a readback could carry.
+//
+// The narrow modes read the input as f32, so the f64 intermediate inside st_f16/st_bf16
+// starts from an exactly-representable value and its f64->f32 step is exact: the narrow
+// cases therefore measure ONE rounding, which is what the reference frame does when it
+// casts an f32. (Converting an arbitrary f64 would double-round; that is a separate
+// question and not the model's path.)
+
+// Assemble 4 bytes at `a` into an Int (little-endian, 0..2^32-1).
+share(all) dt_b32(a<Int>)<Int> -> {
+    b0<Int> = (ld_i8(a + 0) as Int) & 255
+    b1<Int> = (ld_i8(a + 1) as Int) & 255
+    b2<Int> = (ld_i8(a + 2) as Int) & 255
+    b3<Int> = (ld_i8(a + 3) as Int) & 255
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// Assemble 2 bytes at `a` into an Int (little-endian, 0..65535).
+share(all) dt_b16(a<Int>)<Int> -> {
+    c0<Int> = (ld_i8(a + 0) as Int) & 255
+    c1<Int> = (ld_i8(a + 1) as Int) & 255
+    return c0 + c1 * 256
+}
+
+dtcmp(p<Int>) -> {
+    IN<Int> = ld_i64(p + 0)
+    EXP<Int> = ld_i64(p + 8)
+    OUT<Int> = ld_i64(p + 16)
+    VER<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    MODE<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        # `w` = bytes per encoded value (4 for the widen modes, 2 for the narrow ones)
+        w<Int> = 2
+        if (MODE < 2) { w = 4 }
+        in_nan<Bool> = false
+        got_nan<Bool> = false
+        got<Int> = 0
+        exp<Int> = 0
+        if (MODE == 0) {
+            iv0<Int> = dt_b16(IN + gid * 2)
+            in_nan = (iv0 & 32767) > 31744
+            v0<Float> = ld_f16(IN + gid * 2)
+            st_f32(OUT + gid * 4, v0)
+        }
+        if (MODE == 1) {
+            iv1<Int> = dt_b16(IN + gid * 2)
+            in_nan = (iv1 & 32767) > 32640
+            v1<Float> = ld_bf16(IN + gid * 2)
+            st_f32(OUT + gid * 4, v1)
+        }
+        if (MODE == 2) {
+            iv2<Int> = dt_b32(IN + gid * 4)
+            in_nan = (iv2 & 2147483647) > 2139095040
+            x2<Float> = ld_f32(IN + gid * 4)
+            st_f16(OUT + gid * 2, x2)
+        }
+        if (MODE == 3) {
+            iv3<Int> = dt_b32(IN + gid * 4)
+            in_nan = (iv3 & 2147483647) > 2139095040
+            x3<Float> = ld_f32(IN + gid * 4)
+            st_bf16(OUT + gid * 2, x3)
+        }
+        if (w == 4) {
+            got = dt_b32(OUT + gid * 4)
+            exp = dt_b32(EXP + gid * 4)
+            got_nan = (got & 2147483647) > 2139095040
+        } else {
+            got = dt_b16(OUT + gid * 2)
+            exp = dt_b16(EXP + gid * 2)
+            if (MODE == 2) { got_nan = (got & 32767) > 31744 } else { got_nan = (got & 32767) > 32640 }
+        }
+        if (got != exp) {
+            tot<Float> = atomic_add_f64(VER + 0, 1.0)
+            # 1 = NaN in, NaN out (payload only)  2 = NaN in, number out (hazard)
+            # 3 = value mismatch on a non-NaN input
+            cat<Int> = 3
+            if (in_nan == true) {
+                cat = 1
+                if (got_nan == false) { cat = 2 }
+            }
+            if (cat == 1) { atomic_add_f64(VER + 8, 1.0) }
+            if (cat == 2) { atomic_add_f64(VER + 16, 1.0) }
+            if (cat == 3) { atomic_add_f64(VER + 24, 1.0) }
+            ks<Int> = tot as Int
+            if (ks < 16) {
+                st_i64(VER + 32 + ks * 32, gid)
+                st_i64(VER + 40 + ks * 32, got)
+                st_i64(VER + 48 + ks * 32, exp)
+            }
+        }
+    }
+}
