@@ -1,8 +1,8 @@
 // tensor:: wrapper test: init -> load gemm kernel -> dev buffers -> htod ->
 // gemm() -> dtoh, verify C against an in-Vyb host reference (no Python).
-// Run from repo root with the bindings module-path:
-//   <vyb> native/tensor/test_tensor.vyb \
-//         --module-path native/tensor --module-path /home/rick/Projects/Vyb/bindings/cuda
+// Run from repo root with the bindings module-path (toolchain via vybenv.sh):
+//   . ./vybenv.sh && "$VYB" native/tensor/test_tensor.vyb \
+//         --module-path native/tensor --module-path "$VYBHOME/bindings/cuda"
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, dev_free,
                 htod_vec, dtoh_vec, gemm, rmsnorm, sync}
 

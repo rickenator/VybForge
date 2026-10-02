@@ -2,7 +2,7 @@
 // transformers reference. Encodes ASCII strings and prints the id lists.
 //
 // Run from the repo root:
-//   cd ~/Projects/VybAIConf && ~/Projects/Vyb/build/vyb native/tokenizer/test_tokenizer.vyb --module-path native/tokenizer
+//   . ./vybenv.sh && "$VYB" native/tokenizer/test_tokenizer.vyb --module-path native/tokenizer
 //
 // Reference ids (transformers 4.57.6, artifacts/vybos-configurator-lora):
 //   "Hello world"         -> [9707, 1879]

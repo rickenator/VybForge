@@ -7,7 +7,7 @@
 #      (the full ~2.7 MB file exceeds Vyb's string-registry floor, so we parse
 #      only the leading tokens) and prints a few token -> id pairs.
 #
-# Run:  cd ~/Projects/VybAIConf && ~/Projects/Vyb/build/vyb native/json/test_json.vyb
+# Run:  . ./vybenv.sh && "$VYB" native/json/test_json.vyb --module-path native/json
 import io::{open_read, read_all, close}
 import json_parse
 
