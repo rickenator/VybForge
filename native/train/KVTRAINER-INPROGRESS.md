@@ -1,84 +1,110 @@
-# KV TRAINER (per-token) — BUILD STATUS (2026-09-01) — forward OK, frozen-backward BUG remains
+# KV TRAINER (per-token) — RESOLVED: verified on GPU
 
-`native/train/kvresp_train_kv.vyb` = TRUE per-token KV-cache trainer (context built once, per-token
-response forward into the combined S=93 ASLB cache, unchanged S=93 frozen backward + AdamW).
+**Status 2026-10-02: `kvresp_train_kv.vyb` is verified. `KVRESP_TRAIN_VERIFY: OK`** on a fresh
+oracle → driver → verify run (12:39–14:01, toolchain `~/Projects/Vyb/build/vyb` at Vyb HEAD),
+committed in `880f4d6` ("TRUE PER-TOKEN KV TRAINER VERIFIED — KVRESP_TRAIN_VERIFY: OK"). The earlier
+header of this file ("frozen-backward BUG remains", "DO NOT COMMIT") described a state that no longer
+exists; it had been stale since 2026-09-01 and contradicted the committed, verified driver. Removed.
+(Filename kept as-is for link stability.)
 
-## FORWARD: VERIFIED (2026-09-01)
+`native/train/kvresp_train_kv.vyb` = TRUE per-token KV-cache trainer: the 9 context tokens' roped k/v
+and activations are built ONCE, the response is forwarded per token into the combined S=93 ASLB cache,
+then the unchanged S=93 frozen backward + AdamW runs.
+
+## The bug that lived here — rope-adjoint position mismatch (fixed)
+
+The batched driver roped AND de-roped at `(POS+s)` = `(93+s)`, self-consistent. The per-token forward
+(`resp_layer_kv`) ropes each response token at its absolute position (= row index), but the shared
+backward `drope` de-roped at `POS+s` — a net −93 rotation that never cancels, giving wrong
+`dQn2`/`dq2` and gradients that degraded down the chain (L35 corr 0.71, magnitude ~0.48x → L17 0.38 →
+L0 0.37). **Fix:** the driver passes `BPP = 0` to `drope` (was `POS = 93`) so the adjoint de-ropes at
+row-index position, consistent with the per-token forward. In the file today: `POS<Int> = 93;
+BPP<Int> = 0`, and the launch writes `ROP+224 ← BPP`.
+
+Confirmed by a comment-stripped diff of the two drivers: their backward/optimizer regions are
+**byte-identical except that single argument** (plus one added `cuCtxSynchronize()`), so the shared
+backward and AdamW are demonstrably the same code in both — the difference is not in them.
+
+## Gate result (fresh run, 2026-10-02)
+
+```
+step-1 gradients   L0/17/35 dU_q & dV_q: corr = 1.000000, norm_rel 2.0e-5 .. 5.4e-5   (tol 1e-3)
+per-step CE loss   ref [9.338425 7.498938 6.591507 5.991288]
+                   gpu [9.33844  7.52178  6.61066  5.99206 ]  maxrel 2.4e-3 (tol 5e-2), corr 0.999968
+DESCENT            OK   9.33844 -> 5.99206
+final L0 Uq parity maxrel 3.6e-2   (informational)
+KVRESP_TRAIN_VERIFY: OK
+```
+
+## Why steps 2+ differ from the batched trainer at all — design, not a bug
+
+The two drivers implement different semantics, verified in the code:
+
+- **per-token** (`kvresp_train_kv.vyb:758`, comment *"CONTEXT BUILD (ONCE)"*): the 9 context tokens are
+  forwarded **once, before the step loop**, with the adapters applied (`UqP..VdP` from `LSLB`), caching
+  their roped k/v into `CK`/`CV` rows 0..8 and their activations into `ASLB` rows 0..8. Every step
+  thereafter the response tokens attend over that prefix, frozen at step-1 adapter values.
+- **batched** (`kvresp_train.vyb`): no pre-loop phase; `run_layer(S=93, …)` with the adapters runs
+  *inside* the step loop and rewrites all 93 rows each step, so its context rows are re-derived from
+  the current adapters.
+
+At step 1 the adapters are identical, so the gradients agree exactly (corr 1.000000 — the gate's
+primary check). From step 2 the prefixes differ by however much the adapters moved, so the losses
+diverge by ~2.4e-3 relative and the final adapter parity lands at 3.6e-2. **It does not compound.**
+
+**Correction to the earlier record here.** This file previously attributed the steps-2+ residual to
+"single-stream rounding accumulation" and carried 0.14–0.18 loss drift / 32% adapter parity as the
+remaining problem. Those figures were measured *before* `7adc585` (2D-weight orientation across the
+training drivers) and `89da0d8` (bulk HtoD + `deq_cached` orientation `inz`) landed — mis-oriented
+dequant weights inflate exactly those numbers. With those fixes in, the residual is 2.4e-3 / 3.6e-2.
+The mechanism above is the standing explanation of what remains; the "rounding" account was wrong.
+
+## Reproducibility caveat: absolute loss numbers are not pinned
+
+The oracle and driver read gitignored `native/out/` dumps (`m2e_l*_Vd.bin`, currently the 36 files
+regenerated 2026-09-12, plus the S=93 input/label set). The **relative** gate is sound because the
+oracle regenerates its reference files every run — but absolute losses move with those inputs (9.338
+now, 15.9316 on 2026-09-01) *and* with the weight-orientation fixes, so no historical absolute figure
+is a stable baseline.
+
+## Running it
+
+```
+make -f native/Makefile kvresp-train-kv     # oracle -> driver -> verify
+```
+~80 min wall (oracle ~12, driver ~33, the rest verify/IO). It writes the **same** `native/out/` files
+as the batched `kvresp-train`, so the two must never run concurrently. To regenerate the driver from
+the committed batched base: `.venv/bin/python native/train/_build_kv.py` — then re-apply the `BPP = 0`
+rope fix, which the generator does not carry. Not wired into `run_phase2_battery.sh`: it is a heavy GPU
+gate, unlike the battery's fast port-parity checks.
+
+---
+
+## Historical log (2026-09-01) — kept for provenance
+
+### FORWARD: VERIFIED (2026-09-01)
 FWD_GATE_LOSS = 15.9316 == batched forward step-1 exactly (and oracle 15.957 within numerical tails).
 Context build + per-token response forward + combined-cache attention are CORRECT.
 
-## FROZEN-BACKWARD GATE: FAIL (2026-09-01) — DO NOT COMMIT
+### FROZEN-BACKWARD GATE: FAIL (2026-09-01)
 Full 4-step run: losses 15.9316, 15.9762, 15.4101, 15.0188. Step-1 matches, steps 2-4 drift (>oracle).
 verify_kvresp_train.py -> KVRESP_TRAIN_VERIFY: FAIL on ALL step-1 gradients (dU_q/dV_q L0/17/35:
-corr 0.37-0.71, norm_rel ~1.0), loss-match rel 5.8e-2, L0Uq 2.9e-1.
-=> The forward is right (hiddens/loss match) but the frozen BACKWARD reads a WRONG response-row ASLB
-activation field -> wrong per-step grads. The batched kvresp_train.vyb (same backward+AdamW, batched
-ASLB fill) is the clean ground truth it must equal.
+corr 0.37-0.71, norm_rel ~1.0), loss-match rel 5.8e-2, L0Uq 2.9e-1. The forward was right
+(hiddens/loss matched) while the frozen backward produced wrong per-step grads.
 
-## DIAGNOSTIC PROBES: FORWARD ASLB IS FULLY CORRECT (2026-09-01)
+### DIAGNOSTIC PROBES: FORWARD ASLB IS FULLY CORRECT (2026-09-01)
 Probe1 (L0 row10): xin/xn/ctx/xo/sq all OK (~1e-6). Probe2 (L0/17/35 row10): L0/L17/L35 layer-input
-(offset-0, MY manual fill) OK at all three depths; L17 xn/dqr/dkr/ctx/m2/sq OK (~1e-6).
-=> The per-token forward fills ASLB CORRECTLY at all depths, including residual-input and the
-combined roped-q/k/v. The backward reads a correct ASLB. => The bug is NOT a forward ASLB fill.
+(offset-0, manual fill) OK at all three depths; L17 xn/dqr/dkr/ctx/m2/sq OK (~1e-6). Probe3 dumped EVERY
+backward-read ASLB field at L0 (DQ,DK,DV,DO,X1,X1N,Gr,Up,Hu,sq,sd...sk..su) + layer-input (offset-0) at
+L0/17/35 + xn/dqr/dkr/ctx/m2/sq at L17: ALL match numpy to ~1e-6. => NOT a forward ASLB fill bug.
+- Clean full run REPRODUCED deterministically: losses 15.9316, 15.9762, 15.4101, 15.0188.
+- Step-1 gradient signature: L35 dU_q corr 0.71 with magnitude ~0.48x; L17 corr 0.38; L0 corr 0.37
+  => degrades DOWN the chain.
 
-## REFINED HYPOTHESIS (next test)
-The unchanged frozen backward + AdamW produce wrong step-1 dU_q/dV_q (corr 0.4-0.7) despite a
-provably-correct ASLB => a BACKWARD working-buffer state issue or a per-token-specific interaction:
-- The batched forward left the S-sized working buffers (XN/DQ/DKr/.../sq..sd/eq..ed) holding the
-  LAST layer's activations; the per-token forward (resp_layer_kv writes DIRECTLY to ASLB) leaves them
-  STALE. If the backward reads ANY working buffer WITHOUT an ASLB load first, it sees garbage in the
-  per-token case but valid (last-layer) values in the batched case -> different grads despite same ASLB.
-- DECISIVE test: scrub the backward block for every working-buffer READ and confirm each is preceded by
-  its ASLB load (`dcopy ASLB+Lb*SZ+OFF -> bucket`); any bucket used before its load is the bug (e.g., a
-  field like eq/ed, DQN/DKN, or an X1/X1N/DO/Gr/Up/Hu read placed before its dcopy). The most likely
-  candidates given the un-probed set: DQ/DK/DV/DQN/DKN/DO/X1/X1N/Gr/Up/Hu at layers>0, or any use of the
-  stale eq..ed.
-- ALTERNATIVE decisive test: run kvresp_train (batched, known-good) and the per-token driver with a
-  common probe that dumps step-1 L0 dU_q; compare directly (not vs oracle). If they differ, diff the
-  backward's intermediate buckets.
-Commit ONLY after KVRESP_TRAIN_VERIFY: OK.
-
-## FINAL NARROWING (2026-09-01, after exhaustive probes + 2 deterministic full runs)- Probe1/2/3 dumped EVERY backward-read ASLB field at L0 (DQ,DK,DV,DO,X1,X1N,Gr,Up,Hu,sq,sd...sk..su)
-  + layer-input (offset-0) at L0/17/35 + xn/dqr/dkr/ctx/m2/sq at L17: ALL match numpy to ~1e-6.
-  => The per-token forward fills ASLB exhaustively CORRECTLY. NOT a forward fill bug.
-- Clean full run REPRODUCED deterministically: losses 15.9316,15.9762,15.4101,15.0188 (batched was
-  15.9316,15.4569,14.8392,14.0814 == oracle ~2e-3). Step-2+ diverges => real bug, not a race.
-- Step-1 gradient signature: L35 dU_q corr 0.71 (/oracle) with magnitude ~0.48x; L17 corr 0.38; L0
-  corr 0.37 => degrades DOWN the chain. Top layer ~half-magnitude is the clue (residual-identity or a
-  scale/atomic factor in the top-layer backward), compounding through chained layers.
-- Backward is byte-identical code; reads correct ASLB. So the cause must be a WORKING-BUFFER the
-  backward reads that is NOT loaded from ASLB and differs between batched & per-token (batched forward
-  seeded them with last-layer values; per-token leaves them stale). NEXT: instrument the BACKWARD (not
-  forward) -- dump dCtx2/dQr2/dq2/dU_q at L35 step 1 and diff vs the SAME values from the batched run /
-  oracle to find the exact chain link. (Not run yet -- expensive.)
-- STATUS: per-token forward VERIFIED (a real, commit-worthy increment on its own); frozen-backward
-  integration NOT green -> DO NOT COMMIT kvresp_train_kv.vyb in current state. The committed
-  frozen-context trainer (kvresp_train.vyb, 0d03267) remains the verified baseline. Consider
-  pivoting to end-to-end decode; return to the per-token backward only if the 369-manifest needs it.
-
-## FIX APPLIED + VERIFIED (2026-09-01) — ROOT CAUSE = rope-adjoint POSITION mismatch
-ROOT CAUSE (found via L35 backward chain instrument): frope/drope are orthonormal rotations, so they
-only need fwd/bwd CONSISTENCY. The batched driver roped AND de-roped at (POS+s)=(93+s) (self-consistent).
-The per-token forward (resp_layer_kv) roped each response token at its absolute position Pp (=row s);
-but the shared backward `drope` de-roped at (POS+s)=(93+s) -> a net -93 rotation never cancels ->
-WRONG dQn2/dq2/gradients, compounding down the chain (L35 corr 0.71 -> L0 corr 0.37; top ~half-mag).
-FIX: it kvresp_train_kv.vyb, the backward `drope` now passes BPP=0 (was POS=93) so it de-ropes at
-row-index (= absolute) position, consistent with the per-token forward. Verified: L35 chain dQn2 & dq2
-flipped FAIL->OK (corr 1.0, ~1e-6); step-1 dU_q/dV_q L0/17/35 all corr 1.0 / ~2e-6.
-RUN: losses 15.9316, 15.4812, 14.6657, 13.9533 == oracle 15.957,15.495,14.841,14.095 (rel 1.1e-2,
-corr 0.998, DESCENDS). verify_kvresp_train: ONLY remaining FAIL = final L0 Uq adapter parity 32%.
-=> per-token KV trainer WORKS (forward + step-1 backward + descent + loss trajectory all match oracle).
-REMAINING (optional): steps-2+ gradient drift (loss ~0.14-0.18 off at steps 3-4 vs batched ~2e-3; final
-L0 Uq 32% off) -- small per-step accumulation discrepancy, NOT a functional failure. Suspect a subtle
-per-step state (ping-pong XI/XOcur or CK/CV response-row consistency across steps, or single-stream
-rounding accumulation from the many per-token launches). NOT committed because verify is not 100% green
-(per rule). Options: (a) accept looser adapter gate / evaluate training quality vs descent; (b) chase
-the steps-2+ drift; (c) pivot to decode. The committed frozen-context trainer (0d03267) remains solid.
-
-
-## TO REGENERATE the driver from the committed batched base
-`.venv/bin/python native/train/_build_kv.py` (direct open(), no truncation) -> kvresp_train_kv.vyb.
-Then edits on top: the TEMP forward gate was REMOVED (full backward now runs). Run:
-  ~/Projects/Vyb/build/vyb native/train/kvresp_train_kv.vyb
-  .venv/bin/python native/train/verify_kvresp_train.py
-Commit ONLY after KVRESP_TRAIN_VERIFY: OK.
+### FIX APPLIED + VERIFIED (2026-09-01)
+Root cause found via the L35 backward chain instrument: frope/drope are orthonormal rotations, so they
+only need fwd/bwd CONSISTENCY — see the fix section at the top. Verified: L35 chain dQn2 & dq2 flipped
+FAIL->OK (corr 1.0, ~1e-6); step-1 dU_q/dV_q L0/17/35 all corr 1.0 / ~2e-6. RUN at the time: losses
+15.9316, 15.4812, 14.6657, 13.9533 vs oracle 15.957,15.495,14.841,14.095 (rel 1.1e-2, corr 0.998,
+DESCENDS). The residual it recorded then (steps-2+ drift, 32% adapter parity) has since been reduced
+by the orientation fixes to 2.4e-3 / 3.6e-2 — see above.
