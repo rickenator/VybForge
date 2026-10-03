@@ -16,11 +16,13 @@
 //
 // Run with: --module-path native/dtype   (the dtype module this driver exercises)
 //
-// The CUDA calls are declared here rather than imported from native/tensor: importing a
-// module that itself imports the CUDA bindings makes THIS file's own `extern "C"`
-// declarations unresolvable ("Undefined identifier: cuCtxSynchronize") — filed as
-// Vyb#442, with an 8-line repro. Hand-wiring is also what native/host/decode_driver.vyb
-// and native/train/train_full.vyb do. Delete this note when #442 is fixed.
+// The CUDA calls are declared here rather than imported from native/tensor. Importing a
+// module that itself imports the CUDA bindings used to make THIS file's own `extern "C"`
+// declarations unresolvable ("Undefined identifier: cuCtxSynchronize") — filed as Vyb#442
+// and FIXED (Vyb PR #449): this driver compiled and ran unchanged with `import tensor`
+// added. Hand-wiring is also what native/host/decode_driver.vyb and
+// native/train/train_full.vyb do, so the local declarations stay as they are — rewiring to
+// the imported seam is optional now, not a requirement of the bug.
 
 import io::{open_read, read_all, close}
 import env::{env_get}

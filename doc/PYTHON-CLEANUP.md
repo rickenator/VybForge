@@ -162,9 +162,11 @@ llama.cpp's Jinja on all 720 records plus 8 boundary cases). All gated byte-for-
 `native/legit/run_phase2_battery.sh` runs them, `native/legit/run_phase1_battery.sh` stays
 the regression gate.
 
-Blocker recorded against P2.1b: the `encode-corpus` target's driver imports both
+Blocker recorded against P2.1b, now RESOLVED: the `encode-corpus` target's driver imports both
 `native/tokenizer` and `native/json`, which both define `hexval`, and the whole-module
-import form fails to splice — pre-existing, filed as **Vyb#432**; no workaround applied.
+import form failed to splice — pre-existing, filed as **Vyb#432** and fixed in Vyb by PR #450.
+No consumer-side workaround was applied and none is needed; `make -C native encode-corpus`
+passes (`ENCODE_CORPUS_VERIFY: OK  (4/4 exact match, ids+lables derived)`).
 
 Replaces: `training/train_lora.py` (QLoRA, NF4 base), `training/smoke_adapter.py`,
 `training/start-training.sh`, `native/train/{build_fullmanifest,_build_kv,gen_kv_train,rbuild}.py`.
