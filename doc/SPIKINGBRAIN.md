@@ -175,8 +175,15 @@ carries out of the exponent — Inf passes through, a NaN gets the canonical qui
 eight conversions gate now (0 value differences, was 6 of 8). The kernel Makefile rule depends
 on `$(VYB)` for the same reason the gate rebuilds from the current toolchain: a kernel is an
 artifact of the *compiler*, and a stale `.ptx` would have let the gate certify the previous
-toolchain. Importing `native/tensor` also makes a file's own `extern "C"` declarations
-unresolvable (**Vyb#442**), which is why the driver hand-wires its CUDA calls for now.
+toolchain. Importing `native/tensor` also made a file's own `extern "C"` declarations
+unresolvable (**Vyb#442**) — **fixed 2026-10-02** in Vyb `2f1d5477` (`a module resolves its own
+extern "C" declarations after importing a binding`, + fixture conventions `e05cc7f1`), so the
+workaround is no longer needed. Verified from this tree, not taken on report: a file that does
+`import tensor` and declares its own `extern "C"` now JIT-runs (`TENSOR_REPRO_OK`, with
+`--module-path native/tensor --module-path ~/Projects/Vyb/bindings/cuda` — the binding lives in the
+compiler tree at `bindings/cuda/`, not under `native/tensor/`). The `native/tensor` module can
+therefore be imported by a driver alongside its own externs; the drivers still hand-wire for now,
+and switching them over is a simplification available, not a requirement.
 
 **S0.2 — tensor core + model config contract (audit G1). PLAN 2026-10-02.**
 Host-side tensor layer (shape/strides/dtype/alloc, broadcast) plus a **config contract**: model dims
@@ -212,9 +219,11 @@ Mapped steps (each one gated, in order):
 - **S0.2b — tensor core. LANDED 2026-10-02** (`native/tensor/core.vyb` + `dt_width` in
   `native/dtype`; gate `native/legit/run_tensor_gate.sh`). Shape, element strides, numel/byte size,
   contiguity, strided offsets and numpy's broadcast rules (right-aligned, stride-0 expansion,
-  incompatible shapes **refused**). Deliberately **pure — no CUDA and no allocation** (importing
-  `native/tensor/tensor.vyb` drags `cuda_binding` into the importer, Vyb#442, which a shape library
-  must not do to its consumers), which is also what makes it numpy-checkable on the CPU.
+  incompatible shapes **refused**). Deliberately **pure — no CUDA and no allocation**, for two
+  reasons: importing `native/tensor/tensor.vyb` dragged `cuda_binding` into the importer and made the
+  importer's own `extern "C"` decls unresolvable (Vyb#442 — **now fixed** in Vyb `2f1d5477`, so this
+  reason has expired), and because a shape library must be numpy-checkable on the CPU (this reason
+  stands).
   **Gate green: 586 cases vs numpy** (strides from real arrays, offsets from `np.ravel_multi_index`,
   contiguity from `.flags["C_CONTIGUOUS"]` on real views, broadcast from `np.broadcast_shapes` and
   `np.broadcast_to(...).strides`), including 24 refusal and 29 non-contiguous cases. The table is
@@ -248,27 +257,46 @@ Mapped steps (each one gated, in order):
   real-prompt gate (`chat-prompt`, "The capital of France is" → ` Paris`) is the semantic one.
 - **S0.2d — battery step + the no-regression sweep. LANDED 2026-10-02.** `run_config_gate.sh`,
   `run_tensor_gate.sh` and the S0.2c `make prefill` step are in `run_phase2_battery.sh`; the battery
-  is green. **Still open from this step:** five more drivers hand the dequant kernel a literal `0`
-  in-dim — `native/host/kv_driver.vyb`, `layer0_driver.vyb`, `wcheck_driver.vyb`,
-  `native/train/kvctx.vyb`, `kvrespfwd.vyb` — each needs the same per-weight in-dim treatment and its
-  own gate re-run; the sweep table for that is in `doc/SPIKINGBRAIN.md`'s S0.2d notes below.
+  is green.
 
-  Sweep for the remaining literal-`0` in-dim sites (grep the dequant helper *definition* for an
-  `inz` parameter, then the launch for a literal `0` in the 4th slot):
+  **The five-driver orientation sweep — DONE 2026-10-02.** Every remaining site that handed the
+  dequant kernel a literal `0` in-dim now passes the tensor's own in-dim (`Wq/Wk/Wv/Wg/Wu → D`,
+  `Wo → NQ`, `Wd → FF`, norms → 0), each with its own gate re-run:
 
-  | driver | helper | in-dim today | gate |
+  | driver | helper | fix | gate result |
   |---|---|---|---|
-  | `native/host/model_driver.vyb` | `load_quant` | **fixed** (per-weight) | `make prefill` green |
-  | `native/host/layer0_driver.vyb` | `load_quant` | `0` | `make layer0` |
-  | `native/host/kv_driver.vyb` | `dequant_gpu` | `0` | — |
-  | `native/host/wcheck_driver.vyb` | `dequant_gpu` | `0` | — |
-  | `native/train/kvctx.vyb` | `deq_w` | `0` | `make kvctx-*` |
-  | `native/train/kvrespfwd.vyb` | `deq_w` | `0` | `make kvrespfwd-*` |
-  | `native/host/decode_driver.vyb`, `resident_driver.vyb`, `loradec_driver.vyb`, all of `native/train/*` | — | fixed | green |
+  | `native/host/model_driver.vyb` | `load_quant` | per-weight in-dim | `make prefill` green (maxrel 3.4e-04) |
+  | `native/host/layer0_driver.vyb` | `load_quant` | 7 call sites | `make layer0` green — measured red→green: **maxrel 1.03e+03 → 4.86e-06**, bad 5115/5120 → 0 |
+  | `native/host/kv_driver.vyb` | `dequant_gpu` | 14 call sites | `make decode-kv` green (`DECODE_REAL_MATCH: OK`) |
+  | `native/host/wcheck_driver.vyb` | `dequant_gpu` | 6 call sites | **had no gate at all** — added `verify_wcheck.py` + `make wcheck`; green, all 5 tensors within 2e-6 of numpy |
+  | `native/train/kvctx.vyb` | `deq_w` | 7 call sites | **still red** — see (iii) |
+  | `native/train/kvrespfwd.vyb` | `deq_w` | 14 call sites | **cannot run** — see (ii) |
+
+  Two more real bugs surfaced while gating these, both pre-existing and neither a regression from the
+  in-dim change:
+  (i) `wcheck_driver` dequantized **layer 0's `attn_v` with the Q4 kernel while the tensor is type 14
+  (Q6_K)** — its own label printed `ty14` next to a `q4fn` launch — yielding values like `1.3e+06`.
+  It also compared its numbers to the reference **by eye**: there was no verifier, and `wcheck_ref.py`
+  read its numpy loader from a hardcoded `/home/rick/Projects/VybAIConf`, a tree this repo no longer
+  lives in.
+  (ii) `kvrespfwd` dies at the first response-forward dequant with **CUDA 700 (illegal address)** —
+  while the *same call succeeds 36 times* in that driver's own context build. The call's arguments
+  are correct (`nl` = 10,485,760 = `attn_q`'s [4096,2560], `inz` = D, valid src/dst), so the fault is
+  context state rather than the call: the two launches between the loops were unchecked, are now
+  checked, and are clean, leaving the unchecked `cuMemcpyHtoD_v2` sequence or something deeper.
+  Measured byte-identical with and without the in-dim fix.
+  (iii) `kvctx` is red for a reason that is **not** orientation: the fix moved it from
+  **corr −0.67…0.20 to 0.995…0.999** (a wrong layout cannot correlate at 0.999), but a diffuse
+  10–30% error remains across all 64 dumped values — not a rope-pair or transpose signature. The
+  driver's 9 context ids are byte-identical to the reference's, so the inputs agree; the divergence is
+  inside the build (LoRA fusing or rope application) and belongs to the interviewer-runtime workstream
+  rather than this sweep.
 
   (A missing `inz` parameter is not by itself proof of a bug — a helper can take the in-dim from a
-  per-weight lookup instead — so each row needs its gate run before it is called broken. The two rows
-  with a literal `0` in the launch and no lookup are the ones to treat as suspects.)
+  per-weight lookup instead — so each row needed its own gate run before being called broken. Every
+  row above was run; the reference `.bin` files for the two training drivers were absent from
+  `native/out/`, so `make kvctx` and `make kvrespfwd` now regenerate gold and driver output inside the
+  target — the same stale-gold trap that had let a frozen constant stay green for weeks.)
 
 ### Prompts: what the driver is given, and why the `[0,1]` run looks Chinese and gibberish
 

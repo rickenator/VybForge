@@ -88,9 +88,14 @@ read_bin(path<String>)<String> -> {
     return r
 }
 
-dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+// Dequant one quantized tensor into a f64 buffer. inz > 0 is the tensor's IN-dim:
+// the kernel then writes the transpose so the result is [in,out] for the gemm
+// (VybForge#11), matching numpy's read_weight, which reshapes GGUF rows [out,in]
+// to [in,out]. 0 leaves the raw GGUF out-major order and disagrees with every
+// numpy reference -- the bug that left `make layer0` red for three weeks.
+dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, inz<Int>, hq<loc<CVoid>>)<Int> -> {
     freedom {
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, pkb + off, dout, numel, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, pkb + off, dout, numel, inz)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -630,19 +635,19 @@ main()<Int> -> {
                     ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
                     ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
                     ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
-                    e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
-                    e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, D, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, D, q4fn); if (e != 0) { return 70 }
                     avt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
                     avq = q4fn
                     if (avt == 14) { avq = q6fn }
-                    e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
-                    e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
-                    e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
-                    e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, D, avq); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, NQ, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, D, q4fn); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, D, q4fn); if (e != 0) { return 70 }
                     fdt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
                     fdq = q4fn
                     if (fdt == 14) { fdq = q6fn }
-                    e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
+                    e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, FF, fdq); if (e != 0) { return 70 }
                     tgt = HA
                     if ((L % 2) == 1) { tgt = HB }
                     e = run_layer(SEEDLEN, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
@@ -671,19 +676,19 @@ main()<Int> -> {
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
                         ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
-                        e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, D, q4fn); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, D, q4fn); if (e != 0) { return 70 }
                         avt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
                         avq = q4fn
                         if (avt == 14) { avq = q6fn }
-                        e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn); if (e != 0) { return 70 }
-                        e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, D, avq); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, NQ, q4fn); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, D, q4fn); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, D, q4fn); if (e != 0) { return 70 }
                         fdt = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
                         fdq = q4fn
                         if (fdt == 14) { fdq = q6fn }
-                        e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq); if (e != 0) { return 70 }
+                        e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, FF, fdq); if (e != 0) { return 70 }
                         tgt = HA
                         if ((L % 2) == 1) { tgt = HB }
                         kcslab = KC + L * MAXS * NKV * 8

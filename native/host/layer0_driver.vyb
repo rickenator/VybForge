@@ -112,14 +112,18 @@ read_bin(path<String>)<String> -> {
     return r
 }
 
-// dequant one quantized (type 12/14) tensor: read packed, upload, launch kernel
-load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+// dequant one quantized (type 12/14) tensor: read packed, upload, launch kernel.
+// inz > 0 is the tensor's IN-dim: the kernel then writes the transpose so the
+// result is [in,out] for the gemm (VybForge#11), matching numpy's read_weight,
+// which reshapes GGUF rows [out,in] to [in,out]. Passing 0 leaves the raw GGUF
+// out-major order and silently disagrees with every numpy reference.
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, inz<Int>, hq<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path, off, nb)
     if (data.len() < nb) { return 32 }
     freedom {
         e<Int> = download(data, dpack, nb)
         if (e != 0) { return e }
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, inz)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -339,13 +343,13 @@ main()<Int> -> {
         download(fb, DF, 64 * 8)
 
         e<Int> = 0
-        e = load_quant(MODEL, DPK, DWq, wq_off, packed_bytes(wq_nl, wq_ty), wq_nl, q4fn); if (e != 0) { return 40 }
-        e = load_quant(MODEL, DPK, DWk, wk_off, packed_bytes(wk_nl, wk_ty), wk_nl, q4fn); if (e != 0) { return 41 }
-        e = load_quant(MODEL, DPK, DWv, wv_off, packed_bytes(wv_nl, wv_ty), wv_nl, q6fn); if (e != 0) { return 42 }
-        e = load_quant(MODEL, DPK, DWo, wo_off, packed_bytes(wo_nl, wo_ty), wo_nl, q4fn); if (e != 0) { return 43 }
-        e = load_quant(MODEL, DPK, DWg, wg_off, packed_bytes(wg_nl, wg_ty), wg_nl, q4fn); if (e != 0) { return 44 }
-        e = load_quant(MODEL, DPK, DWu, wu_off, packed_bytes(wu_nl, wu_ty), wu_nl, q4fn); if (e != 0) { return 45 }
-        e = load_quant(MODEL, DPK, DWd, wd_off, packed_bytes(wd_nl, wd_ty), wd_nl, q6fn); if (e != 0) { return 46 }
+        e = load_quant(MODEL, DPK, DWq, wq_off, packed_bytes(wq_nl, wq_ty), wq_nl, D, q4fn); if (e != 0) { return 40 }
+        e = load_quant(MODEL, DPK, DWk, wk_off, packed_bytes(wk_nl, wk_ty), wk_nl, D, q4fn); if (e != 0) { return 41 }
+        e = load_quant(MODEL, DPK, DWv, wv_off, packed_bytes(wv_nl, wv_ty), wv_nl, D, q6fn); if (e != 0) { return 42 }
+        e = load_quant(MODEL, DPK, DWo, wo_off, packed_bytes(wo_nl, wo_ty), wo_nl, NQ, q4fn); if (e != 0) { return 43 }
+        e = load_quant(MODEL, DPK, DWg, wg_off, packed_bytes(wg_nl, wg_ty), wg_nl, D, q4fn); if (e != 0) { return 44 }
+        e = load_quant(MODEL, DPK, DWu, wu_off, packed_bytes(wu_nl, wu_ty), wu_nl, D, q4fn); if (e != 0) { return 45 }
+        e = load_quant(MODEL, DPK, DWd, wd_off, packed_bytes(wd_nl, wd_ty), wd_nl, FF, q6fn); if (e != 0) { return 46 }
         println("WEIGHTS_DEQUANTED")
 
         e = load_norm(MODEL, PF, DPK, N1, n1_off, n1_nl, efn); if (e != 0) { return 47 }

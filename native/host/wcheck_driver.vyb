@@ -73,9 +73,13 @@ read_bin(path<String>)<String> -> {
     match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
     return r
 }
-dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+// inz > 0 is the tensor's IN-dim: the kernel then writes the transpose so the result
+// is [in,out] for the gemm (VybForge#11), matching numpy's read_weight, which reshapes
+// GGUF rows [out,in] to [in,out]. 0 leaves the raw GGUF out-major order, which is what
+// made this check disagree with wcheck_ref.py before the 09-13 orientation fix.
+dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, inz<Int>, hq<loc<CVoid>>)<Int> -> {
     freedom {
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, pkb + off, dout, numel, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, pkb + off, dout, numel, inz)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -94,6 +98,10 @@ dump6(base<Int>, tag<String>)<Int> -> {
 main()<Int> -> {
     NLAYS<Int> = 36
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    # attn_v is [nkv, D] and ffn_down is [D, FF] in the GGUF; the transpose divisor is
+    # the IN-dim of each. These match the model config (see native/config/model_config.vyb).
+    D<Int> = 2560
+    FF<Int> = 9728
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
     bff<String> = read_bin(TSV); ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
@@ -174,21 +182,22 @@ main()<Int> -> {
         }
         # dequant attn_v L4 (Q4) and L35 (Q6), ffn_down L4 (Q4) and L35 (Q6)
         t2<Int> = tyv.get(find_nm(nmv, "blk.4.attn_v.weight")); q2<loc<CVoid>> = q4fn; if (t2 == 14) { q2 = q6fn }
-        e2<Int> = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, q2); if (e2 != 0) { println("D1"); return 70 }
+        e2<Int> = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, D, q2); if (e2 != 0) { println("D1"); return 70 }
         t6b<Int> = tyv.get(find_nm(nmv, "blk.35.attn_v.weight")); q6b<loc<CVoid>> = q4fn; if (t6b == 14) { q6b = q6fn }
-        e2 = dequant_gpu(PK2, ov2.get(35), WA, wv_nl, q6b); if (e2 != 0) { println("D2"); return 70 }
+        e2 = dequant_gpu(PK2, ov2.get(35), WA, wv_nl, D, q6b); if (e2 != 0) { println("D2"); return 70 }
         cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L35 (@" + ov2.get(35).to_string() + ") ty" + t6b.to_string())
         t2 = tyv.get(find_nm(nmv, "blk.4.attn_v.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
-        e2 = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, q2); if (e2 != 0) { println("D3"); return 70 }
+        e2 = dequant_gpu(PK2, ov2.get(4), WA, wv_nl, D, q2); if (e2 != 0) { println("D3"); return 70 }
         cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L4 (@" + ov2.get(4).to_string() + ") ty" + t2.to_string())
-        e2 = dequant_gpu(PK2, ov2.get(0), WA, wv_nl, q4fn); if (e2 != 0) { println("D4"); return 70 }
-        cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L0 (@" + ov2.get(0).to_string() + ") ty14")
+        t2 = tyv.get(find_nm(nmv, "blk.0.attn_v.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
+        e2 = dequant_gpu(PK2, ov2.get(0), WA, wv_nl, D, q2); if (e2 != 0) { println("D4"); return 70 }
+        cuCtxSynchronize(); dump6(WA, "WCHECK attn_v L0 (@" + ov2.get(0).to_string() + ") ty" + t2.to_string())
         # ffn_down
         t2 = tyv.get(find_nm(nmv, "blk.35.ffn_down.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
-        e2 = dequant_gpu(PK6, ov6.get(35), WD, wd_nl, q2); if (e2 != 0) { println("D5"); return 70 }
+        e2 = dequant_gpu(PK6, ov6.get(35), WD, wd_nl, FF, q2); if (e2 != 0) { println("D5"); return 70 }
         cuCtxSynchronize(); dump6(WD, "WCHECK ffn_down L35 (@" + ov6.get(35).to_string() + ") ty" + t2.to_string())
         t2 = tyv.get(find_nm(nmv, "blk.4.ffn_down.weight")); q2 = q4fn; if (t2 == 14) { q2 = q6fn }
-        e2 = dequant_gpu(PK6, ov6.get(4), WD, wd_nl, q2); if (e2 != 0) { println("D6"); return 70 }
+        e2 = dequant_gpu(PK6, ov6.get(4), WD, wd_nl, FF, q2); if (e2 != 0) { println("D6"); return 70 }
         cuCtxSynchronize(); dump6(WD, "WCHECK ffn_down L4 (@" + ov6.get(4).to_string() + ") ty" + t2.to_string())
         return 0
     }

@@ -2,7 +2,9 @@
 """Reference for wcheck_driver.vyb: first 6 values of attn_v / ffn_down for
 layers 0,4,35 from the real GGUF via the shared layer0_ref loader."""
 import os, importlib.util, numpy as np
-repo = "/home/rick/Projects/VybAIConf"
+# repo-relative: this used to hardcode /home/rick/Projects/VybAIConf, a checkout this
+# repo no longer lives in, so the reference silently read another tree's loader.
+repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 spec = importlib.util.spec_from_file_location("l0", os.path.join(repo, "native/gguf/layer0_ref.py"))
 l0 = importlib.util.module_from_spec(spec); spec.loader.exec_module(l0)
 tens = l0.parse_tsv()

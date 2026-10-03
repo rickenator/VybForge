@@ -270,10 +270,27 @@ decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)
 
 # KV-cache decode: builds the seed forward once (caching per-layer roped-K/V), then
 # each gen step computes ONLY the new position. Must reproduce the same token stream
-# as decode-real (verified against the same numpy reference).
+# as decode-real (verified against the same numpy reference). The reference is
+# regenerated here -- this target used to rely on whatever decode_ref.py last wrote,
+# which is the stale-gold trap that hid the chat-prompt breakage.
 decode-kv: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/decode_ref.py
 	cd $(ROOT) && $(VYB) native/host/kv_driver.vyb
 	cd $(ROOT) && .venv/bin/python native/tools/verify_decode_real.py
+
+# kvctx: the per-layer roped-K/V context cache vs the numpy reference (kvctx_ref.py).
+# Both sides regenerated here, so a stale .bin cannot be what the driver is measured against.
+kvctx: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/kvctx_ref.py
+	cd $(ROOT) && $(VYB) native/train/kvctx.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_kvctx.py
+
+# kvrespfwd: the KV-cache response forward (S=93) vs the authoritative numpy full forward
+# (kvresp_ref.py, ~30-60 min: it is a 93-token CPU forward).
+kvrespfwd: $(ROOT)/native/build/train.ptx
+	cd $(ROOT) && .venv/bin/python native/train/kvresp_ref.py
+	cd $(ROOT) && $(VYB) native/train/kvrespfwd.vyb
+	cd $(ROOT) && .venv/bin/python native/train/verify_kvrespfwd.py
 
 # b1: LoRA-applied autoregressive decode of the goal context (m2e_l*.bin seed
 # adapters) -> native/out/loradec_tokens.txt. The interviewer-runtime first pass.
@@ -335,6 +352,14 @@ layer0: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/nati
 	cd $(ROOT) && .venv/bin/python native/gguf/layer0_ref.py
 	cd $(ROOT) && $(VYB) native/host/layer0_driver.vyb
 	cd $(ROOT) && .venv/bin/python native/tools/verify_layer0.py
+
+# wcheck: dequant attn_v (L0/L4/L35) and ffn_down (L4/L35) on the GPU and compare the
+# first 6 f64 values of each buffer against numpy's read_weight for the same tensors.
+# Both sides are regenerated here; the comparison is verify_wcheck.py, not eyeballing.
+wcheck: $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx
+	cd $(ROOT) && .venv/bin/python native/gguf/wcheck_ref.py > native/out/wcheck_ref.log 2>&1
+	cd $(ROOT) && $(VYB) native/host/wcheck_driver.vyb | tee native/out/wcheck_driver.log
+	cd $(ROOT) && .venv/bin/python native/tools/verify_wcheck.py
 
 # Full-36-layer Qwen3-4B prefill + tied lm_head vs numpy reference (prefill gate).
 # model_driver now composes llm:: (stdlib/vllm CPU decode) as the closed-loop
