@@ -107,16 +107,20 @@ Gate: `native/legit/run_fullmanifest_gate.sh` — both fixture files byte-for-by
 429-token count, the pre-tokenizer boundary test, and an optional `.venv` transformers
 cross-check that re-derives the fixture.
 
-**Known blocker (filed, not worked around)** — during P2.1b the `encode-corpus` make target
+**Blocker (filed as Vyb#432, now RESOLVED)** — during P2.1b the `encode-corpus` make target
 turned out to be unrunnable: `native/train/encode_corpus.vyb` imports `tokenizer::{encode}`
-and `import json_parse`, and both modules define `hexval`, so the whole-module import fails
-with `Duplicate symbol after splice: 'hexval'`. Pre-existing (the committed revisions of both
-modules fail the same way on an unmodified `build/vyb`), so the corpus tokenizer oracle
-(`verify_encode_corpus.py`) cannot run at all right now. Filed as **Vyb#432** with a 3-file
-minimal repro and the import matrix; the consumer-side one-liner (`import json_parse::{parse}`)
-is deliberately *not* applied pending the call. Until then the tokenizer's coverage in this
-repo is `native/tokenizer/test_pretok_boundary.vyb` plus the fullmanifest oracle cross-check,
-neither of which goes through `encode_corpus.vyb`.
+and `import json_parse`, and both modules define `hexval`, so the whole-module import failed
+with `Duplicate symbol after splice: 'hexval'` (pre-existing; the committed revisions of both
+modules failed the same way on an unmodified `build/vyb`). Filed as **Vyb#432** with a 3-file
+minimal repro and the import matrix, and fixed in Vyb by PR #450 (per-module identity for
+spliced declarations whose names collide). The consumer-side one-liner
+(`import json_parse::{parse}`) was deliberately never applied and is not needed.
+
+Verified against Vyb `74220c3` on 2026-10-03: `make -C native encode-corpus` now runs end to
+end — the driver emits the corpus and the independent oracle re-derives it,
+`ENCODE_CORPUS_VERIFY: OK  (4/4 exact match, ids+lables derived)`. The tokenizer's coverage
+therefore goes through `encode_corpus.vyb` as well as
+`native/tokenizer/test_pretok_boundary.vyb` and the fullmanifest oracle cross-check.
 
 **P2.1c — `_build_kv.vyb`**: the three-part source transform (helper insertion,
 CK/CV/RSHI allocations, per-token forward swap). — **DONE 2026-10-02**
