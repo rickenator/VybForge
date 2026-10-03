@@ -287,15 +287,28 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 }
 
 main()<Int> -> {
-    # ---- prompt source: VYB_PROMPT -> real tokenizer ids; else default [0,1] ----
+    # ---- prompt source --------------------------------------------------------
+    # VYB_PROMPT_RAW=1  -> the synthetic 2-token prefix [0,1]. No tokenizer, no chat
+    #   template, no text. This is what the NUMERIC gate uses (`make prefill`),
+    #   because its numpy reference (prefill_ref.py) is built for exactly that
+    #   prefix. Its decoded "response" is meaningless BY CONSTRUCTION: the input is
+    #   the two characters  !"  so the model is guessing with no context at all and
+    #   no language is being asked of it -- the argmax there is the top of a nearly
+    #   flat distribution (p ~= 0.015), so it can be a Chinese fragment or an
+    #   English word interchangeably. Read the hidden comparison, not the text.
+    # VYB_PROMPT=<text> -> a real prompt, ids from the model's own tokenizer.
+    # default           -> DEFAULT_PROMPT, a real English sentence, so a bare run
+    #                      and the chat gates read as an actual conversation.
     prids<Vec<Int>> = Vec()
-    pstr<String> = env_get("VYB_PROMPT") else ""
-    if (pstr.len() > 0) {
+    praw<String> = env_get("VYB_PROMPT_RAW") else ""
+    pstr<String> = env_get("VYB_PROMPT") else "The capital of France is"
+    if (praw.len() > 0) {
+        prids.push(0); prids.push(1)
+        println("PROMPT_MODE=synthetic PROMPT_N=2 PROMPT_NOTE=input is the characters !\" -- no tokenizer, no chat template; the decoded response is gibberish by construction, compare the hidden output instead")
+    } else {
         m0<Model> = llm_load("qwen3", env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora")
         prids = llm_encode(m0, pstr)
-        println("PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
-    } else {
-        prids.push(0); prids.push(1)
+        println("PROMPT_MODE=text PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
     }
     S<Int> = prids.len()
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"

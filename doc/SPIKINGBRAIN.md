@@ -270,6 +270,59 @@ Mapped steps (each one gated, in order):
   per-weight lookup instead — so each row needs its gate run before it is called broken. The two rows
   with a literal `0` in the launch and no lookup are the ones to treat as suspects.)
 
+### Prompts: what the driver is given, and why the `[0,1]` run looks Chinese and gibberish
+
+`model_driver.vyb` now takes its prompt three ways, and the choice is recorded in the log as
+`PROMPT_MODE`:
+
+  - **default** — a real English sentence (`The capital of France is`), ids from the model's own
+    tokenizer. A bare run and the chat gates read as an actual conversation.
+  - **`VYB_PROMPT=<text>`** — any other real prompt.
+  - **`VYB_PROMPT_RAW=1`** — the synthetic 2-token prefix `[0,1]`. No tokenizer, no chat template, no
+    text at all. **This is what `make prefill` uses**, because its numpy reference (`prefill_ref.py`)
+    is built for exactly that prefix, and the numeric gate should not depend on a tokenizer.
+
+What the synthetic prefix *is*: ids 0 and 1 detokenize to the two characters `!"`. So its
+`LLM_CHAT_RESPONSE` is not an answer to anything and no language is being requested of the model. The
+argmax there is the top of a nearly flat distribution — p = 0.015 at position 0, p = 0.046 with four
+tokens inside 0.005 logprob at position 1 — so the winner is decided by fp noise rather than by
+language: llama.cpp independently picks a Chinese-leaning token at position 0 too (a partial UTF-8
+byte fragment that can begin 开), and at position 1 the entire top-5 is English words (`" The"`,
+`" I"`, `" ("`, `" he"`, `" said"`). Read `PREFILL_HIDDEN_MATCH` / `PREFILL_TOP1_MATCH` for that run,
+never the decoded text.
+
+The real prompt is the opposite, and is the semantic check: for `The capital of France is`, llama.cpp
+(`-ngl 0`, greedy, same GGUF) returns **12095 = `" Paris"`** at logprob −0.435 against −2.748 for the
+runner-up — a decisive, correct English continuation, not a tie. Both the numpy reference and the GPU
+driver must reproduce that token-for-token (`make chat-prompt` / `make chat-real`). llama.cpp's
+`/tokenize` and the driver's own tokenizer also agree exactly on the prompt ids
+(`785, 6722, 315, 9625, 374` — `"The" " capital" " of" " France" " is"`), which is the independent
+check on the encoder path.
+
+Three dead gates were found and fixed while wiring this up — all the same failure mode, a check that
+cannot fail when it is wrong:
+
+  1. `verify_chat_real.py` hardcoded the gold `[31784, 31784]`, which was the *un-mirrored driver's
+     own output* (31784 = `"Cog"`, which is why the broken run printed `<CogCog>`). A gold captured
+     from the buggy forward cannot detect the bug. It now requires `PROMPT_MODE=text`, compares the
+     per-position top1 against the regenerated numpy gold, compares the final hidden against
+     `prompt_hidden_ref.txt`, and requires the decoded response to contain ASCII letters.
+  2. `prompt_top1_ref.txt` was dated **2026-09-11**, i.e. before the 09-13 orientation fix in the
+     numpy reference, and its ids were not even for `CHAT_PROMPT` (they belonged to another prompt,
+     "Add a package to a QEMU x86_64 boot test."). Combined with item 3 below, `chat-prompt` had
+     never compared anything at all: it could not run, and its gold was stale and unrelated. The gold
+     is now regenerated inside the `chat-prompt` / `chat-real` targets on every run, the way
+     `make prefill` always did. The gate that *was* green while wrong is item 1: `chat-real`, measured
+     against the frozen `[31784, 31784]` that the buggy forward itself had produced.
+  3. `make chat-prompt` could not run at all: `CHAT_PROMPT ?= "The capital of France is"` combined
+     with `VYB_PROMPT="$(CHAT_PROMPT)"` produced doubled quotes, and under `/bin/sh` the recipe ran
+     `capital` as a command (`/bin/sh: 1: capital: not found`). The variable is now unquoted. Related:
+     `native/out/prompt_ids.txt` held newline-separated ids for an unrelated prompt
+     ("Add a package to a QEMU x86_64 boot test."), so the committed gold never corresponded to
+     `CHAT_PROMPT`. `emit_prompt_ids.py` now requires the log's `PROMPT=<...>` line, refuses a log
+     whose prompt does not match the expected one, and rewrites the file in one canonical
+     comma-separated line.
+
 **S0.3 — loaders (this is S3's content, scheduled here). LANDED 2026-10-02.**
 `native/torchload/` holds two container readers, both host-mode and model-agnostic:
 - **safetensors** — `safetensors.vyb` (8-byte LE header length + JSON map via `native/json` + raw LE

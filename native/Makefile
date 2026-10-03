@@ -339,31 +339,54 @@ layer0: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/nati
 # Full-36-layer Qwen3-4B prefill + tied lm_head vs numpy reference (prefill gate).
 # model_driver now composes llm:: (stdlib/vllm CPU decode) as the closed-loop
 # real-model chat head, so it needs the llm module path + the stdlib vllm engine.
+# VYB_PROMPT_RAW=1 selects the synthetic 2-token prefix [0,1]: this gate is numeric
+# (hidden + per-position top1 vs prefill_ref.py, which is built for exactly that
+# prefix), so it stays tokenizer-free on purpose. The driver's decoded text is NOT
+# a result here -- with a 2-character punctuation input there is no language being
+# requested; read PREFILL_HIDDEN_MATCH / PREFILL_TOP1_MATCH. For an English
+# response see chat-real / chat-prompt below, which run a real prompt.
 prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && .venv/bin/python native/gguf/prefill_ref.py
-	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm
+	cd $(ROOT) && VYB_PROMPT_RAW=1 VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm
 	cd $(ROOT) && .venv/bin/python native/tools/verify_prefill.py
 
 # Real-model llm.chat closed loop: full 36-layer forward -> tied lm_head argmax ->
 # stdlib/vllm CPU decode to text, on the RTX 3090. Requires the real GGUF + the
 # real BPE tokenizer dir (VYB_LLM_DIR, default artifacts/vybos-configurator-lora).
-# Gate: LLM_CHAT_RESPONSE present + top1 ids == the committed prefill gold [31784,31784].
+# Runs a REAL prompt (CHAT_PROMPT), so LLM_CHAT_RESPONSE is a genuine English
+# continuation. The numpy gold is regenerated here (encode probe -> prompt_ids ->
+# prompt_ref.py) and the driver's per-position top1 must match it token-for-token:
+# a committed gold file must never be the thing that is trusted, because a stale
+# gold and a buggy forward can agree and leave the gate green.
 chat-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
-	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm 2>&1 | tee native/out/chat_real.log
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(CHAT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(CHAT_PROMPT)"
+	cd $(ROOT) && .venv/bin/python native/gguf/prompt_ref.py
+	cd $(ROOT) && VYB_PROMPT="$(CHAT_PROMPT)" VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm 2>&1 | tee native/out/chat_real.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_real.py
 
 # Checkpoint B — arbitrary-prompt llm.chat: GPU token_embd gather embeds a real
 # prompt's ids (from the stdlib/vllm CPU tokenizer), full 36-layer forward, then
 # per-position lm_head argmax must equal the numpy gold token-for-token.
-# Regenerate the gold with `make chat-prompt-ref` when the prompt changes.
-CHAT_PROMPT ?= "The capital of France is"
+# The gold is regenerated HERE on every run (encode probe -> prompt_ids ->
+# prompt_ref.py), because the prompt_top1_ref.txt sitting in native/out/ was dated
+# 2026-09-11 -- before the 09-13 orientation fix landed in the numpy reference --
+# and did not even correspond to CHAT_PROMPT (its ids were for another prompt
+# entirely). Together with the quoting bug below, that means this gate had never
+# compared anything. Regenerating in-target is what makes that impossible.
+CHAT_PROMPT ?= The capital of France is
 chat-prompt: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(CHAT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(CHAT_PROMPT)"
+	cd $(ROOT) && .venv/bin/python native/gguf/prompt_ref.py
 	cd $(ROOT) && VYB_PROMPT="$(CHAT_PROMPT)" VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm 2>&1 | tee native/out/chat_prompt.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_prompt.py
 
+# Manual alias kept for a quick gold-only refresh (the gate targets above already
+# regenerate it, so this is no longer needed to make chat-prompt/chat-real pass).
 chat-prompt-ref:
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(CHAT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
-	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(CHAT_PROMPT)"
 	cd $(ROOT) && .venv/bin/python native/gguf/prompt_ref.py
 
 # Checkpoint C — fluent autoregressive llm.chat over an arbitrary prompt.
