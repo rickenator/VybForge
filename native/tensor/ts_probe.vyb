@@ -1,0 +1,131 @@
+// ts_probe — reads the S0.2b case table (generated from numpy by native/tensor/ts_ref.py) and
+// prints this tensor core's answer for every case. Driven by native/legit/run_tensor_gate.sh.
+//
+// Case file, one case per line:
+//   <name> <op> <arg> [<arg> ...]
+// with `-` for a rank-0 (empty) vector and commas inside a vector. Ops:
+//   numel <dims> | nbytes <dims> <dtype> | strides <dims> | offset <dims> <strides> <coords>
+//   contig <dims> <strides> | bcast <dimsA> <dimsB> | bcaststrides <dims> <strides> <out>
+// Output: "TS <name> <answer>", plus TSDONE.
+
+import io::{open_read, read_all, close}
+import env::{env_get}
+import tshape::{tt_numel, tt_nbytes, tt_rowmajor_strides, tt_offset_of, tt_is_contig,
+             tt_bcastable, tt_bcast_shape, tt_bcast_strides}
+
+// "-" is an empty vector (rank 0); otherwise a comma-separated list.
+ts_ints(s<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    if (s == "-") { return out }
+    n<Int> = s.len()
+    if (n == 0) { return out }
+    acc<Int> = 0
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = s.char_at(i) as Int
+        if (c == 44) { out.push(acc); acc = 0 } else {
+            if (c >= 48) { if (c <= 57) { acc = acc * 10 + (c - 48) } }
+        }
+    }
+    out.push(acc)
+    return out
+}
+
+ts_render(v<Vec<Int>>)<String> -> {
+    if (v.len() == 0) { return "empty" }
+    s<String> = ""
+    i<Int> = 0
+    for (i in 0..v.len() - 1) {
+        if (i > 0) { s = s + "," }
+        s = s + v.get(i).to_string()
+    }
+    return s
+}
+
+// Split a line on spaces, collapsing runs.
+ts_fields(line<String>)<Vec<String>> -> {
+    out<Vec<String>> = Vec()
+    n<Int> = line.len()
+    if (n == 0) { return out }
+    cur<String> = ""
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = line.char_at(i) as Int
+        if (c == 32) {
+            if (cur.len() > 0) { out.push(cur); cur = "" }
+        } else {
+            cur = cur + line.substring(i, i + 1)
+        }
+    }
+    if (cur.len() > 0) { out.push(cur) }
+    return out
+}
+
+main()<Int> -> {
+    path<String> = env_get("TS_CASES") else ""
+    if (path == "") { println("TS_ERROR=TS_CASES not set"); return 2 }
+    txt<String> = ""
+    match (open_read(path)) {
+        f -> { match (read_all(f)) { s -> { txt = s } ? -> { println("TS_ERROR=read"); return 3 } } close(f) }
+        ? -> { println("TS_ERROR=open"); return 3 }
+    }
+    ln<Int> = txt.len()
+    st<Int> = 0
+    i<Int> = 0
+    for (i in 0..ln - 1) {
+        c<Int> = txt.char_at(i) as Int
+        if (c == 10) {
+            line<String> = txt.substring(st, i)
+            st = i + 1
+            if (line.len() > 0) { ts_one(line) }
+        }
+    }
+    if (st < ln) { ts_one(txt.substring(st, ln)) }
+    println("TSDONE")
+    return 0
+}
+
+ts_one(line<String>) -> {
+    fl<Vec<String>> = ts_fields(line)
+    if (fl.len() < 2) { return }
+    name<String> = fl.get(0)
+    op<String> = fl.get(1)
+    if (op == "numel") {
+        println("TS " + name + " " + tt_numel(ts_ints(fl.get(2))).to_string())
+        return
+    }
+    if (op == "nbytes") {
+        println("TS " + name + " " + tt_nbytes(ts_ints(fl.get(2)), ts_ints(fl.get(3)).get(0)).to_string())
+        return
+    }
+    if (op == "strides") {
+        println("TS " + name + " " + ts_render(tt_rowmajor_strides(ts_ints(fl.get(2)))))
+        return
+    }
+    if (op == "offset") {
+        println("TS " + name + " " + tt_offset_of(ts_ints(fl.get(2)), ts_ints(fl.get(3)), ts_ints(fl.get(4))).to_string())
+        return
+    }
+    if (op == "contig") {
+        if (tt_is_contig(ts_ints(fl.get(2)), ts_ints(fl.get(3)))) { println("TS " + name + " 1") }
+        else { println("TS " + name + " 0") }
+        return
+    }
+    if (op == "bcast") {
+        a<Vec<Int>> = ts_ints(fl.get(2))
+        b<Vec<Int>> = ts_ints(fl.get(3))
+        if (tt_bcastable(a, b)) { println("TS " + name + " " + ts_render(tt_bcast_shape(a, b))) }
+        else { println("TS " + name + " refuse") }
+        return
+    }
+    if (op == "bcaststrides") {
+        out<Vec<Int>> = ts_ints(fl.get(4))
+        if (out.len() == 0) { println("TS " + name + " empty") } else {
+            res<Vec<Int>> = tt_bcast_strides(ts_ints(fl.get(2)), ts_ints(fl.get(3)), out)
+            if (res.len() == 0) { println("TS " + name + " refuse") }
+            else { println("TS " + name + " " + ts_render(res)) }
+        }
+        return
+    }
+    println("TS " + name + " UNKNOWN_OP")
+}

@@ -1,0 +1,553 @@
+// model_config — the config contract (S0.2a): a model's dimensions come from the model's own
+// config, never from a literal at a call site.
+//
+// Two sources, one struct:
+//   * GGUF metadata — the .gguf we actually run. The `<arch>.` key namespace is taken from
+//     `general.architecture`, so a second GGUF architecture needs no change here. Dims a GGUF
+//     does not declare are TAKEN FROM THE TENSOR TABLE instead of guessed: vocab from
+//     token_embd.weight, feed-forward from blk.0.ffn_gate.weight, and `head_dim` from
+//     blk.0.attn_output.weight — because head_dim is NOT hidden/heads in general (Qwen3-4B is
+//     2560 hidden / 32 heads with head_dim 128, so hidden/heads = 80 would silently poison
+//     every downstream size). `tied` is decided by the tensor table: no `output.weight` means
+//     the output projection IS the embedding.
+//   * HF config.json — what every safetensors checkpoint ships, via native/json, with the
+//     aliases the ecosystem actually uses (rms_norm_eps | norm_eps | layer_norm_eps,
+//     num_hidden_layers | n_layer, num_key_value_heads | n_head_kv, intermediate_size |
+//     n_inner | ffn_dim, head_dim | absent, tie_word_embeddings | absent).
+//
+// Every field records HOW it was obtained. `defaulted` lists values the source did not state
+// (an assumption), `derived` lists values computed from another fact in the same file, and
+// `notes` carries disagreements between two of the file's own sources. A consumer must be
+// able to tell "the model says 1e-6" from "we assumed 1e-6", and a gate must be able to fail
+// on the difference. mc_check() validates the invariants (nq == heads*head_dim, heads divides
+// by kv_heads, the required dims are present).
+//
+// Consumers: native/host/model_driver.vyb (S0.2c) reads the dims that used to be literals.
+// Gate: native/legit/run_config_gate.sh, against llama.cpp's own gguf-dump, transformers'
+// AutoConfig, the GGUF's own tensor table, and a second real model.
+
+import io::{open_read, read_at, read_all, close}
+import json_parse
+
+share(all)
+struct ModelConfig {
+    source<String>,      // the path the config came from
+    kind<String>,        // "gguf" | "hf-json" | "error"
+    arch<String>,        // general.architecture (GGUF) | model_type (HF)
+    n_layers<Int>,
+    hidden<Int>,
+    heads<Int>,
+    kv_heads<Int>,
+    head_dim<Int>,
+    ffn<Int>,
+    vocab<Int>,
+    ctx<Int>,
+    rope_theta<Float>,
+    rms_eps<Float>,
+    tied<Int>,           // 1 tied, 0 untied, -1 not stated by the config (loader decides)
+    defaulted<String>,   // values the source did not state
+    derived<String>,     // values computed from another fact in the file
+    notes<String>        // disagreements / oddities worth surfacing
+}
+
+// ─────────────────────────── byte-level helpers (file-local) ───────────────────────────
+
+// Byte access is bounds-checked: a truncated or malformed file must produce missing fields
+// (and MC_NOTES), never a crash — the gate feeds this reader a deliberately truncated file.
+mc_u8(s<String>, o<Int>)<Int> -> {
+    if (o < 0) { return 0 }
+    if (o >= s.len()) { return 0 }
+    return (s.char_at(o) as Int) & 255
+}
+mc_u16(s<String>, o<Int>)<Int> -> { return mc_u8(s, o) | (mc_u8(s, o + 1) << 8) }
+mc_u32(s<String>, o<Int>)<Int> -> {
+    return mc_u8(s, o) | (mc_u8(s, o + 1) << 8) | (mc_u8(s, o + 2) << 16) | (mc_u8(s, o + 3) << 24)
+}
+mc_u64(s<String>, o<Int>)<Int> -> { return mc_u32(s, o) | (mc_u32(s, o + 4) << 32) }
+
+mc_rd(f<File>, off<Int>, n<Int>)<String> -> {
+    match (read_at(f, off, n)) { s -> { return s } ? -> { return "" } }
+}
+
+// GGUF scalar type sizes: 0 UINT8, 1 INT8, 2 UINT16, 3 INT16, 4 UINT32, 5 INT32,
+// 6 FLOAT32, 7 BOOL, 8 STRING, 9 ARRAY, 10 UINT64, 11 INT64, 12 FLOAT64.
+mc_tsz(ty<Int>)<Int> -> {
+    if (ty == 0) { return 1 }
+    if (ty == 1) { return 1 }
+    if (ty == 2) { return 2 }
+    if (ty == 3) { return 2 }
+    if (ty == 4) { return 4 }
+    if (ty == 5) { return 4 }
+    if (ty == 6) { return 4 }
+    if (ty == 7) { return 1 }
+    if (ty == 10) { return 8 }
+    if (ty == 11) { return 8 }
+    if (ty == 12) { return 8 }
+    return 0
+}
+
+// Advance past a metadata value of `ty` at `off` (strings and arrays recurse).
+mc_skip(f<File>, off<Int>, ty<Int>)<Int> -> {
+    if (ty == 8) {
+        l<Int> = mc_u64(mc_rd(f, off, 8), 0)
+        return off + 8 + l
+    }
+    if (ty == 9) {
+        et<Int> = mc_u32(mc_rd(f, off, 4), 0)
+        cnt<Int> = mc_u64(mc_rd(f, off + 4, 8), 0)
+        o<Int> = off + 12
+        if (cnt == 0) { return o }
+        i<Int> = 0
+        for (i in 0..cnt - 1) { o = mc_skip(f, o, et) }
+        return o
+    }
+    return off + mc_tsz(ty)
+}
+
+// A GGUF scalar as an Int (integer types only; floats go through mc_fval).
+mc_ival(f<File>, off<Int>, ty<Int>)<Int> -> {
+    if (ty == 0) { return mc_u8(mc_rd(f, off, 1), 0) }
+    if (ty == 1) { return mc_u8(mc_rd(f, off, 1), 0) }
+    if (ty == 2) { return mc_u16(mc_rd(f, off, 2), 0) }
+    if (ty == 3) { return mc_u16(mc_rd(f, off, 2), 0) }
+    if (ty == 4) { return mc_u32(mc_rd(f, off, 4), 0) }
+    if (ty == 5) { return mc_u32(mc_rd(f, off, 4), 0) }
+    if (ty == 10) { return mc_u64(mc_rd(f, off, 8), 0) }
+    if (ty == 11) { return mc_u64(mc_rd(f, off, 8), 0) }
+    return -1
+}
+
+// 2^k for the exponent range of an f32 (k in -149..127).
+mc_pow2(k<Int>)<Float> -> {
+    if (k == 0) { return 1.0 }
+    n<Int> = k
+    if (n < 0) { n = 0 - n }
+    v<Float> = 1.0
+    i<Int> = 0
+    for (i in 0..n - 1) { v = v * 2.0 }
+    if (k < 0) { return 1.0 / v }
+    return v
+}
+
+// f32 from its bit pattern, arithmetically: host Vyb has no Float32 bit-cast. Exact for every
+// finite value — normals as 2^(e-127) * (1 + m/2^23), subnormals as 2^-126 * (m/2^23).
+// Inf/NaN are not meaningful for a config field and decode to 0, which the gate would see.
+mc_f32(bits<Int>)<Float> -> {
+    neg<Int> = (bits >> 31) & 1
+    e<Int> = (bits >> 23) & 255
+    m<Int> = bits & 8388607
+    v<Float> = 0.0
+    if (e == 0) {
+        if (m != 0) { v = mc_pow2(-126) * ((m as Float) / 8388608.0) }
+    } else {
+        if (e != 255) { v = mc_pow2(e - 127) * (1.0 + ((m as Float) / 8388608.0)) }
+    }
+    if (neg == 1) { return 0.0 - v }
+    return v
+}
+
+mc_fval(f<File>, off<Int>, ty<Int>)<Float> -> {
+    if (ty == 6) { return mc_f32(mc_u32(mc_rd(f, off, 4), 0)) }
+    return 0.0
+}
+
+mc_add(list<String>, item<String>)<String> -> {
+    if (list == "") { return item }
+    return list + "," + item
+}
+
+mc_empty(source<String>, kind<String>, why<String>)<ModelConfig> -> {
+    return ModelConfig {
+        source = source, kind = kind, arch = "", n_layers = -1, hidden = -1, heads = -1,
+        kv_heads = -1, head_dim = -1, ffn = -1, vocab = -1, ctx = -1,
+        rope_theta = 0.0, rms_eps = 0.0, tied = -1,
+        defaulted = "", derived = "", notes = why
+    }
+}
+
+// Return the config as it stands plus a note: a truncated file degrades to "the derived dims
+// are missing" instead of a wrong answer or a crash.
+mc_out_note(cfg<ModelConfig>, msg<String>)<ModelConfig> -> {
+    return ModelConfig {
+        source = cfg.source, kind = cfg.kind, arch = cfg.arch, n_layers = cfg.n_layers,
+        hidden = cfg.hidden, heads = cfg.heads, kv_heads = cfg.kv_heads, head_dim = cfg.head_dim,
+        ffn = cfg.ffn, vocab = cfg.vocab, ctx = cfg.ctx, rope_theta = cfg.rope_theta,
+        rms_eps = cfg.rms_eps, tied = cfg.tied,
+        defaulted = cfg.defaulted, derived = cfg.derived, notes = mc_add(cfg.notes, msg)
+    }
+}
+
+// "blk.<n>." -> n, or -1 when the name is not that shape.
+mc_blk_index(name<String>)<Int> -> {
+    if (!name.starts_with("blk.")) { return -1 }   // see note in the gate if this form differs
+    d<Int> = 0
+    i<Int> = 4
+    n<Int> = name.len()
+    while (i < n) {
+        c<Int> = name.char_at(i) as Int
+        if (c < 48) { break }
+        if (c > 57) { break }
+        d = d * 10 + (c - 48)
+        i = i + 1
+    }
+    if (d == 0 && name.char_at(4) as Int != 48) { return -1 }
+    return d
+}
+
+// ─────────────────────────── GGUF source ───────────────────────────
+
+// Pass 1: the architecture, so every later key can be namespaced generically.
+mc_arch_of(f<File>)<String> -> {
+    head<String> = mc_rd(f, 0, 24)
+    if (head.len() < 24) { return "" }
+    nkv<Int> = mc_u64(head, 16)
+    off<Int> = 24
+    i<Int> = 0
+    for (i in 0..nkv - 1) {
+        raw<String> = mc_rd(f, off, 8)
+        if (raw.len() < 8) { return "" }
+        kl<Int> = mc_u64(raw, 0)
+        key<String> = mc_rd(f, off + 8, kl)
+        if (key.len() < kl) { return "" }
+        off = off + 8 + kl
+        tyraw<String> = mc_rd(f, off, 4)
+        if (tyraw.len() < 4) { return "" }
+        ty<Int> = mc_u32(tyraw, 0)
+        off = off + 4
+        if (key == "general.architecture") {
+            l0raw<String> = mc_rd(f, off, 8)
+            if (l0raw.len() < 8) { return "" }
+            l0<Int> = mc_u64(l0raw, 0)
+            s<String> = mc_rd(f, off + 8, l0)
+            if (s.len() < l0) { return "" }
+            return s
+        }
+        off = mc_skip(f, off, ty)
+    }
+    return ""
+}
+
+// Pass 2: the <arch>.* fields. `ap` is the arch with its trailing dot.
+mc_gguf_fields(f<File>, ap<String>)<ModelConfig> -> {
+    head<String> = mc_rd(f, 0, 24)
+    if (head.len() < 24) { return mc_empty("", "gguf", "truncated header") }
+    nkv<Int> = mc_u64(head, 16)
+    off<Int> = 24
+    blk<Int> = -1; embd<Int> = -1; ff<Int> = -1
+    heads<Int> = -1; kvh<Int> = -1; ctx<Int> = -1
+    hd<Int> = -1; voc<Int> = -1; tied<Int> = -1
+    theta<Float> = 0.0; eps<Float> = 0.0
+    defl<String> = ""; der<String> = ""; nts<String> = ""
+    i<Int> = 0
+    for (i in 0..nkv - 1) {
+        raw<String> = mc_rd(f, off, 8)
+        if (raw.len() < 8) { nts = mc_add(nts, "truncated in metadata"); break }
+        kl<Int> = mc_u64(raw, 0)
+        key<String> = mc_rd(f, off + 8, kl)
+        if (key.len() < kl) { nts = mc_add(nts, "truncated key"); break }
+        off = off + 8 + kl
+        tyraw<String> = mc_rd(f, off, 4)
+        if (tyraw.len() < 4) { nts = mc_add(nts, "truncated in metadata"); break }
+        ty<Int> = mc_u32(tyraw, 0)
+        off = off + 4
+        if (key == ap + "block_count") { blk = mc_ival(f, off, ty) }
+        if (key == ap + "embedding_length") { embd = mc_ival(f, off, ty) }
+        if (key == ap + "feed_forward_length") { ff = mc_ival(f, off, ty) }
+        if (key == ap + "attention.head_count") { heads = mc_ival(f, off, ty) }
+        if (key == ap + "attention.head_count_kv") { kvh = mc_ival(f, off, ty) }
+        if (key == ap + "attention.key_length") { hd = mc_ival(f, off, ty) }
+        if (key == ap + "context_length") { ctx = mc_ival(f, off, ty) }
+        if (key == ap + "vocab_size") { voc = mc_ival(f, off, ty) }
+        if (key == ap + "rope.freq_base") { theta = mc_fval(f, off, ty) }
+        if (key == ap + "attention.layer_norm_rms_epsilon") { eps = mc_fval(f, off, ty) }
+        if (key == ap + "tie_word_embeddings") { tied = mc_ival(f, off, ty) }
+        off = mc_skip(f, off, ty)
+    }
+    return ModelConfig {
+        source = "", kind = "gguf", arch = "", n_layers = blk, hidden = embd, heads = heads,
+        kv_heads = kvh, head_dim = hd, ffn = ff, vocab = voc, ctx = ctx,
+        rope_theta = theta, rms_eps = eps, tied = tied,
+        defaulted = defl, derived = der, notes = nts
+    }
+}
+
+// Pass 3: the tensor table. Everything here is a fact about the file that the metadata may not
+// state, so the derived dims are cross-checked against the declared ones.
+mc_gguf_tensors(f<File>, cfg<ModelConfig>)<ModelConfig> -> {
+    head<String> = mc_rd(f, 0, 24)
+    if (head.len() < 24) { return cfg }
+    nten<Int> = mc_u64(head, 8)
+    nkv<Int> = mc_u64(head, 16)
+    off<Int> = 24
+    i<Int> = 0
+    for (i in 0..nkv - 1) {
+        raw<String> = mc_rd(f, off, 8)
+        if (raw.len() < 8) { return cfg }
+        kl<Int> = mc_u64(raw, 0)
+        off = off + 8 + kl
+        tyraw<String> = mc_rd(f, off, 4)
+        if (tyraw.len() < 4) { return cfg }
+        ty<Int> = mc_u32(tyraw, 0)
+        off = off + 4
+        off = mc_skip(f, off, ty)
+    }
+    t_emb_hid<Int> = -1; t_emb_voc<Int> = -1
+    t_gate<Int> = -1; t_nq<Int> = -1; t_nkv<Int> = -1
+    t_out<Int> = 0
+    maxblk<Int> = -1
+    j<Int> = 0
+    for (j in 0..nten - 1) {
+        nlraw<String> = mc_rd(f, off, 8)
+        if (nlraw.len() < 8) { return mc_out_note(cfg, "truncated tensor index") }
+        nl<Int> = mc_u64(nlraw, 0)
+        name<String> = mc_rd(f, off + 8, nl)
+        if (name.len() < nl) { return mc_out_note(cfg, "truncated tensor name") }
+        off = off + 8 + nl
+        ndraw<String> = mc_rd(f, off, 4)
+        if (ndraw.len() < 4) { return mc_out_note(cfg, "truncated tensor index") }
+        nd<Int> = mc_u32(ndraw, 0)
+        off = off + 4
+        d0<Int> = -1; d1<Int> = -1
+        k<Int> = 0
+        for (k in 0..nd - 1) {
+            dv<Int> = mc_u64(mc_rd(f, off, 8), 0)
+            off = off + 8
+            if (k == 0) { d0 = dv }
+            if (k == 1) { d1 = dv }
+        }
+        off = off + 4          // ggml type
+        off = off + 8          // offset into the data region
+        if (name == "token_embd.weight") { t_emb_hid = d0; t_emb_voc = d1 }
+        if (name == "blk.0.ffn_gate.weight") { t_gate = d1 }
+        if (name == "blk.0.attn_output.weight") { t_nq = d0 }
+        // NOTE the axis differs per tensor: GGUF stores each 2-D weight in the layout the
+        // kernel consumes, so attn_output is [nq, hidden] (=4096,2560) while attn_k is
+        // [hidden, nkv] (=2560,1024). Reading dim0 here would report kv_heads=20.
+        if (name == "blk.0.attn_k.weight") { t_nkv = d1 }
+        if (name == "output.weight") { t_out = 1 }
+        bi<Int> = mc_blk_index(name)
+        if (bi > maxblk) { maxblk = bi }
+    }
+    // ---- derive what the metadata did not state, and cross-check what it did ----
+    out<ModelConfig> = cfg
+    out.hidden = cfg.hidden
+    if (cfg.head_dim <= 0) {
+        if (t_nq > 0 && cfg.heads > 0) {
+            out.head_dim = t_nq / cfg.heads
+            out.derived = mc_add(out.derived, "head_dim(attn_output/heads)")
+        }
+    }
+    if (cfg.vocab <= 0) {
+        if (t_emb_voc > 0) {
+            out.vocab = t_emb_voc
+            out.derived = mc_add(out.derived, "vocab(token_embd)")
+        }
+    }
+    if (cfg.ffn <= 0) {
+        if (t_gate > 0) {
+            out.ffn = t_gate
+            out.derived = mc_add(out.derived, "ffn(ffn_gate)")
+        }
+    }
+    if (cfg.n_layers <= 0) {
+        if (maxblk >= 0) {
+            out.n_layers = maxblk + 1
+            out.derived = mc_add(out.derived, "n_layers(blk count)")
+        }
+    }
+    if (cfg.kv_heads <= 0) {
+        if (t_nkv > 0 && cfg.head_dim > 0) {
+            out.kv_heads = t_nkv / cfg.head_dim
+            out.derived = mc_add(out.derived, "kv_heads(attn_k/head_dim)")
+        } else {
+            out.kv_heads = cfg.heads
+            out.defaulted = mc_add(out.defaulted, "kv_heads(=heads)")
+        }
+    }
+    if (cfg.tied < 0) {
+        if (t_out == 0) {
+            out.tied = 1
+            out.derived = mc_add(out.derived, "tied(no output.weight)")
+        } else {
+            out.tied = 0
+            out.derived = mc_add(out.derived, "tied(output.weight present)")
+        }
+    }
+    if (cfg.head_dim <= 0) {
+        if (cfg.hidden > 0 && cfg.heads > 0) {
+            out.head_dim = cfg.hidden / cfg.heads
+            out.defaulted = mc_add(out.defaulted, "head_dim(=hidden/heads)")
+        }
+    }
+    if (cfg.rope_theta <= 0.0) { out.rope_theta = 10000.0; out.defaulted = mc_add(out.defaulted, "rope_theta(10000)") }
+    if (cfg.rms_eps <= 0.0) { out.rms_eps = 0.000001; out.defaulted = mc_add(out.defaulted, "rms_eps(1e-6)") }
+    if (cfg.ctx <= 0) { out.defaulted = mc_add(out.defaulted, "ctx") }
+    // disagreements between the file's own two sources
+    if (t_emb_hid > 0 && cfg.hidden > 0 && t_emb_hid != cfg.hidden) {
+        out.notes = mc_add(out.notes, "hidden: metadata=" + cfg.hidden.to_string() + " token_embd=" + t_emb_hid.to_string())
+    }
+    if (t_nq > 0 && out.heads > 0 && out.head_dim > 0 && t_nq != out.heads * out.head_dim) {
+        out.notes = mc_add(out.notes, "nq: attn_output=" + t_nq.to_string() + " heads*head_dim=" + (out.heads * out.head_dim).to_string())
+    }
+    if (t_gate > 0 && cfg.ffn > 0 && t_gate != cfg.ffn) {
+        out.notes = mc_add(out.notes, "ffn: metadata=" + cfg.ffn.to_string() + " ffn_gate=" + t_gate.to_string())
+    }
+    if (maxblk >= 0 && cfg.n_layers > 0 && maxblk + 1 != cfg.n_layers) {
+        out.notes = mc_add(out.notes, "n_layers: metadata=" + cfg.n_layers.to_string() + " blk=" + (maxblk + 1).to_string())
+    }
+    return out
+}
+
+share(all) mc_from_gguf(path<String>)<ModelConfig> -> {
+    match (open_read(path)) {
+        f -> {
+            arch<String> = mc_arch_of(f)
+            ap<String> = arch + "."
+            cfg<ModelConfig> = mc_gguf_fields(f, ap)
+            full<ModelConfig> = mc_gguf_tensors(f, cfg)
+            close(f)
+            return ModelConfig {
+                source = path, kind = "gguf", arch = arch,
+                n_layers = full.n_layers, hidden = full.hidden, heads = full.heads,
+                kv_heads = full.kv_heads, head_dim = full.head_dim, ffn = full.ffn,
+                vocab = full.vocab, ctx = full.ctx, rope_theta = full.rope_theta,
+                rms_eps = full.rms_eps, tied = full.tied,
+                defaulted = full.defaulted, derived = full.derived, notes = full.notes
+            }
+        }
+        ? -> { return mc_empty(path, "error", "gguf open failed") }
+    }
+}
+
+// ─────────────────────────── HF config.json source ───────────────────────────
+
+mc_hf_read_int(d<JsonDoc>, key<String>, dflt<Int>)<Int> -> {
+    if (jexists(d, d.root, key)) { return jgetint(d, d.root, key) }
+    return dflt
+}
+mc_hf_read_num(d<JsonDoc>, key<String>, dflt<Float>)<Float> -> {
+    if (jexists(d, d.root, key)) { return jgetnum(d, d.root, key) }
+    return dflt
+}
+// First present key wins (the aliases the ecosystem actually uses).
+mc_hf_first_int(d<JsonDoc>, k1<String>, k2<String>, k3<String>, dflt<Int>)<Int> -> {
+    if (jexists(d, d.root, k1)) { return jgetint(d, d.root, k1) }
+    if (jexists(d, d.root, k2)) { return jgetint(d, d.root, k2) }
+    if (jexists(d, d.root, k3)) { return jgetint(d, d.root, k3) }
+    return dflt
+}
+
+share(all) mc_from_hf_json(path<String>)<ModelConfig> -> {
+    txt<String> = ""
+    match (open_read(path)) {
+        f -> { match (read_all(f)) { s -> { txt = s } ? -> { return mc_empty(path, "error", "hf json read failed") } } close(f) }
+        ? -> { return mc_empty(path, "error", "hf json open failed") }
+    }
+    match (json_parse(txt)) {
+        d -> {
+            arch<String> = jgetstr(d, d.root, "model_type")
+            n_layers<Int> = mc_hf_first_int(d, "num_hidden_layers", "n_layer", "num_layers", -1)
+            hidden<Int> = mc_hf_first_int(d, "hidden_size", "n_embd", "d_model", -1)
+            heads<Int> = mc_hf_first_int(d, "num_attention_heads", "n_head", "n_head", -1)
+            kvh<Int> = mc_hf_first_int(d, "num_key_value_heads", "n_head_kv", "n_head_kv", -1)
+            hd<Int> = mc_hf_first_int(d, "head_dim", "head_dim", "head_dim", -1)
+            ffn<Int> = mc_hf_first_int(d, "intermediate_size", "n_inner", "ffn_dim", -1)
+            voc<Int> = mc_hf_read_int(d, "vocab_size", -1)
+            ctx<Int> = mc_hf_read_int(d, "max_position_embeddings", -1)
+            theta<Float> = mc_hf_read_num(d, "rope_theta", 0.0)
+            eps<Float> = 0.0
+            if (jexists(d, d.root, "rms_norm_eps")) { eps = jgetnum(d, d.root, "rms_norm_eps") }
+            if (eps <= 0.0) {
+                if (jexists(d, d.root, "norm_eps")) { eps = jgetnum(d, d.root, "norm_eps") }
+            }
+            if (eps <= 0.0) {
+                if (jexists(d, d.root, "layer_norm_eps")) { eps = jgetnum(d, d.root, "layer_norm_eps") }
+            }
+            tied<Int> = -1
+            if (jexists(d, d.root, "tie_word_embeddings")) {
+                if (jgetint(d, d.root, "tie_word_embeddings") != 0) { tied = 1 } else { tied = 0 }
+            }
+            defl<String> = ""
+            der<String> = ""
+            nts<String> = ""
+            if (hd <= 0) {
+                if (hidden > 0 && heads > 0) {
+                    hd = hidden / heads
+                    der = mc_add(der, "head_dim(hidden/heads)")
+                }
+            }
+            if (kvh <= 0) {
+                kvh = heads
+                defl = mc_add(defl, "kv_heads(=heads)")
+            }
+            if (theta <= 0.0) { theta = 10000.0; defl = mc_add(defl, "rope_theta(10000)") }
+            if (eps <= 0.0) { eps = 0.000001; defl = mc_add(defl, "rms_eps(1e-6)") }
+            if (ctx <= 0) { defl = mc_add(defl, "ctx") }
+            if (tied < 0) { defl = mc_add(defl, "tied(loader decides)") }
+            return ModelConfig {
+                source = path, kind = "hf-json", arch = arch,
+                n_layers = n_layers, hidden = hidden, heads = heads, kv_heads = kvh,
+                head_dim = hd, ffn = ffn, vocab = voc, ctx = ctx,
+                rope_theta = theta, rms_eps = eps, tied = tied,
+                defaulted = defl, derived = der, notes = nts
+            }
+        }
+        ? -> { return mc_empty(path, "error", "hf json parse failed") }
+    }
+}
+
+// Dispatch on content, not on the file name: a GGUF begins with the magic "GGUF".
+share(all) mc_load(path<String>)<ModelConfig> -> {
+    magic<String> = ""
+    match (open_read(path)) {
+        f -> { magic = mc_rd(f, 0, 4); close(f) }
+        ? -> { return mc_empty(path, "error", "open failed") }
+    }
+    if (magic == "GGUF") { return mc_from_gguf(path) }
+    return mc_from_hf_json(path)
+}
+
+// ─────────────────────────── derived values and validation ───────────────────────────
+
+share(all) mc_nq(cfg<ModelConfig>)<Int> -> { return cfg.heads * cfg.head_dim }
+share(all) mc_nkv(cfg<ModelConfig>)<Int> -> { return cfg.kv_heads * cfg.head_dim }
+
+// 0 when every invariant holds; otherwise a bitmask of what is wrong.
+share(all) mc_check(cfg<ModelConfig>)<Int> -> {
+    bad<Int> = 0
+    if (cfg.n_layers <= 0) { bad = bad | 1 }
+    if (cfg.hidden <= 0) { bad = bad | 2 }
+    if (cfg.heads <= 0) { bad = bad | 4 }
+    if (cfg.head_dim <= 0) { bad = bad | 8 }
+    if (cfg.kv_heads <= 0) { bad = bad | 16 }
+    if (cfg.ffn <= 0) { bad = bad | 32 }
+    if (cfg.vocab <= 0) { bad = bad | 64 }
+    if (cfg.heads > 0 && cfg.kv_heads > 0 && cfg.heads % cfg.kv_heads != 0) { bad = bad | 128 }
+    if (cfg.kind == "error") { bad = bad | 256 }
+    return bad
+}
+share(all) mc_is_ok(cfg<ModelConfig>)<Bool> -> { return mc_check(cfg) == 0 }
+
+share(all) mc_print(cfg<ModelConfig>) -> {
+    println("MC_SOURCE=" + cfg.source)
+    println("MC_KIND=" + cfg.kind)
+    println("MC_ARCH=" + cfg.arch)
+    println("MC_LAYERS=" + cfg.n_layers.to_string())
+    println("MC_HIDDEN=" + cfg.hidden.to_string())
+    println("MC_HEADS=" + cfg.heads.to_string())
+    println("MC_KV_HEADS=" + cfg.kv_heads.to_string())
+    println("MC_HEAD_DIM=" + cfg.head_dim.to_string())
+    println("MC_FFN=" + cfg.ffn.to_string())
+    println("MC_VOCAB=" + cfg.vocab.to_string())
+    println("MC_CTX=" + cfg.ctx.to_string())
+    println("MC_ROPE_THETA=" + cfg.rope_theta.to_string())
+    println("MC_RMS_EPS=" + cfg.rms_eps.to_string())
+    println("MC_TIED=" + cfg.tied.to_string())
+    println("MC_NQ=" + mc_nq(cfg).to_string())
+    println("MC_NKV=" + mc_nkv(cfg).to_string())
+    println("MC_DEFAULTED=" + cfg.defaulted)
+    println("MC_DERIVED=" + cfg.derived)
+    println("MC_NOTES=" + cfg.notes)
+    println("MC_CHECK=" + mc_check(cfg).to_string())
+    println("MC_DONE")
+}

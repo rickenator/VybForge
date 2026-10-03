@@ -1,0 +1,22 @@
+// mc_probe — read a model's config through the S0.2a contract and print every field.
+//
+//   VYBFORGE_CONFIG=<path to a .gguf or a config.json> ./build/vyb native/config/mc_probe.vyb
+//
+// Exit code is mc_check() (0 = the dims are present and the invariants hold). The printed
+// MC_NOTE / MC_DEFAULTED / MC_DERIVED lines say what the model stated, what was assumed, and
+// what was computed from another fact in the same file — a consumer is never left guessing
+// which is which. Driven by native/legit/run_config_gate.sh.
+
+import env::{env_get}
+import model_config::{mc_load, mc_print, mc_check, ModelConfig}
+
+main()<Int> -> {
+    path<String> = env_get("VYBFORGE_CONFIG") else ""
+    if (path == "") {
+        println("MC_ERROR=VYBFORGE_CONFIG not set")
+        return 2
+    }
+    cfg<ModelConfig> = mc_load(path)
+    mc_print(cfg)
+    return mc_check(cfg)
+}

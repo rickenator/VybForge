@@ -12,6 +12,10 @@ ROOT    := $(shell git -C "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))/.." re
 KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
 MODPATH := --module-path $(ROOT)/native/kernels
+# S0.2 substrate modules: the model's own config (config + its json reader), the tensor core,
+# and the dtype table. All three are pure (no CUDA), so a driver declaring its own extern "C"
+# can import them (Vyb#442 keeps native/tensor/tensor.vyb itself off this list).
+S02MODS := --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype
 
 KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
@@ -337,7 +341,7 @@ layer0: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/nati
 # real-model chat head, so it needs the llm module path + the stdlib vllm engine.
 prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && .venv/bin/python native/gguf/prefill_ref.py
-	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm
 	cd $(ROOT) && .venv/bin/python native/tools/verify_prefill.py
 
 # Real-model llm.chat closed loop: full 36-layer forward -> tied lm_head argmax ->
@@ -345,7 +349,7 @@ prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/nat
 # real BPE tokenizer dir (VYB_LLM_DIR, default artifacts/vybos-configurator-lora).
 # Gate: LLM_CHAT_RESPONSE present + top1 ids == the committed prefill gold [31784,31784].
 chat-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
-	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_real.log
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm 2>&1 | tee native/out/chat_real.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_real.py
 
 # Checkpoint B — arbitrary-prompt llm.chat: GPU token_embd gather embeds a real
@@ -354,7 +358,7 @@ chat-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/n
 # Regenerate the gold with `make chat-prompt-ref` when the prompt changes.
 CHAT_PROMPT ?= "The capital of France is"
 chat-prompt: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
-	cd $(ROOT) && VYB_PROMPT="$(CHAT_PROMPT)" VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb --module-path native/llm 2>&1 | tee native/out/chat_prompt.log
+	cd $(ROOT) && VYB_PROMPT="$(CHAT_PROMPT)" VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm 2>&1 | tee native/out/chat_prompt.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_chat_prompt.py
 
 chat-prompt-ref:

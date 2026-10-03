@@ -146,6 +146,41 @@ else
   step "S0.1 dtype gate" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
+# ── S0.2a — config contract (the model's own dimensions, two sources) ───────────────
+# Gate: native/legit/run_config_gate.sh (doc/SPIKINGBRAIN.md S0.2a). One ModelConfig read from
+# a GGUF's metadata OR an HF config.json, every field checked against llama.cpp's gguf-dump and
+# the python gguf package, plus transformers.AutoConfig on a SECOND real model. Refuses a
+# truncated GGUF instead of inventing dimensions.
+out="$(./native/legit/run_config_gate.sh 2>&1)"
+if echo "$out" | grep -q "S0\\.2a CONFIG GATE: PASS"; then
+  step "S0.2a config contract" "PASS ($(echo "$out" | grep -o 'MCGATE_FIELDS_OK [0-9]*' | tr '\n' ' ' | sed 's/  */ /g'))"
+else
+  step "S0.2a config contract" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
+# ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────
+# Gate: native/legit/run_tensor_gate.sh (doc/SPIKINGBRAIN.md S0.2b). numpy IS the definition of
+# this behaviour, so the table's expectations come from numpy (array strides, ravel_multi_index,
+# C_CONTIGUOUS on real views, broadcast_shapes/broadcast_to). Includes refusal and
+# non-contiguous cases, and proves its checker can fail on a perturbed expectation.
+out="$(./native/legit/run_tensor_gate.sh 2>&1)"
+if echo "$out" | grep -q "S0.2b TENSOR GATE: PASS"; then
+  step "S0.2b tensor core" "PASS ($(echo "$out" | grep -o 'TSGATE_CASES_OK.*' | head -1))"
+else
+  step "S0.2b tensor core" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
+# ── S0.2c — the prefill driver re-expressed on both ─────────────────────────────────
+# Gate: `make prefill` (doc/SPIKINGBRAIN.md S0.2c). model_driver.vyb now reads its dimensions
+# from the model's own config and its buffer sizes from the tensor core, so this target IS the
+# generality proof: the same forward, gated, with no dimension literals left in the driver.
+out="$(make -f native/Makefile prefill 2>&1)"
+if echo "$out" | grep -q "PREFILL_HIDDEN_MATCH: OK" && echo "$out" | grep -q "PREFILL_TOP1_MATCH: OK"; then
+  step "S0.2c prefill on config dims" "PASS ($(echo "$out" | grep -oE 'maxrel = [0-9.e-]+' | head -1), top1 MATCH)"
+else
+  step "S0.2c prefill on config dims" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

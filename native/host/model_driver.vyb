@@ -11,6 +11,12 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import llm::{llm_load, llm_decode, llm_encode}
 import vllm::{Model}
 import env::{env_get}
+// S0.2: dimensions come from the model's own config, and buffer sizes from the tensor core.
+// Both are PURE (no CUDA, no allocation) — a module that pulls in cuda_binding cannot be
+// imported by a file declaring its own extern "C" (Vyb#442).
+import model_config::{mc_load, mc_nq, mc_nkv, mc_is_ok, ModelConfig}
+import tshape::{tt_nbytes}
+import dtype::{dt_f64, dt_bytes_for}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -122,13 +128,16 @@ read_bin(path<String>)<String> -> {
     return r
 }
 
-load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>)<Int> -> {
+// in-dim (the kernel's `z` arg): >0 transposes the whole-matrix write. GGUF stores 2D weights
+// out-major, so every real weight matrix needs its own in-dim here (Wq/Wk/Wv→D, Wo→NQ,
+// Wg/Wu→D, Wd→FF); 1D norms take the load_norm path and need nothing.
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
     data<String> = read_model(path, off, nb)
     if (data.len() < nb) { return 32 }
     freedom {
         e<Int> = download(data, dpack, nb)
         if (e != 0) { return e }
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, inz)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -152,12 +161,12 @@ load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he
 
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
           nm<String>, dpk<Int>, pf<Int>, dout<Int>,
-          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>)<Int> -> {
+          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>)<Int> -> {
     idx<Int> = find_nm(nmv, nm)
     if (idx < 0) { return 60 }
     off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
-    if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn) }
-    if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn) }
+    if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn, inz) }
+    if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn, inz) }
     return load_norm(path, pf, dpk, dout, off, numel, efn)
 }
 
@@ -288,11 +297,33 @@ main()<Int> -> {
     } else {
         prids.push(0); prids.push(1)
     }
-    S<Int> = prids.len(); D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728
-    NQ<Int> = H * HD; NKV<Int> = KVH * HD; VOCAB<Int> = 151936
-    MAXL<Int> = 36; DOLM<Int> = 1        # full 36 layers + tied lm_head
-    EPS<Float> = 0.000001
+    S<Int> = prids.len()
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    # ---- S0.2: every dimension is read from the model's OWN config, not spelled here ----
+    cfg<ModelConfig> = mc_load(MODEL)
+    if (!mc_is_ok(cfg)) {
+        println("CFG_FAIL=" + cfg.arch + " check=" + cfg.notes)
+        return 2
+    }
+    println("CFG_SRC=" + cfg.source + " arch=" + cfg.arch + " kind=" + cfg.kind)
+    println("CFG_DERIVED=<" + cfg.derived + "> CFG_DEFAULTED=<" + cfg.defaulted + ">")
+    if (cfg.notes.len() > 0) { println("CFG_NOTES=<" + cfg.notes + ">") }
+    D<Int> = cfg.hidden; H<Int> = cfg.heads; KVH<Int> = cfg.kv_heads; HD<Int> = cfg.head_dim
+    FF<Int> = cfg.ffn; NQ<Int> = mc_nq(cfg); NKV<Int> = mc_nkv(cfg); VOCAB<Int> = cfg.vocab
+    MAXL<Int> = cfg.n_layers; DOLM<Int> = 1     # full depth + tied lm_head
+    EPS<Float> = cfg.rms_eps
+    println("DIMS S=" + S.to_string() + " D=" + D.to_string() + " H=" + H.to_string()
+            + " KVH=" + KVH.to_string() + " HD=" + HD.to_string() + " FF=" + FF.to_string()
+            + " NQ=" + NQ.to_string() + " NKV=" + NKV.to_string() + " VOCAB=" + VOCAB.to_string()
+            + " MAXL=" + MAXL.to_string() + " EPS=" + EPS.to_string())
+    # Shapes (in elements) as the tensor core wants them; every buffer below is one call.
+    SD<Vec<Int>> = Vec(); SD.push(S); SD.push(D)
+    SQ<Vec<Int>> = Vec(); SQ.push(S); SQ.push(NQ)
+    SK<Vec<Int>> = Vec(); SK.push(S); SK.push(NKV)
+    SF<Vec<Int>> = Vec(); SF.push(S); SF.push(FF)
+    SV<Vec<Int>> = Vec(); SV.push(S); SV.push(VOCAB)
+    D1<Vec<Int>> = Vec(); D1.push(D)
+    S1<Vec<Int>> = Vec(); S1.push(S)
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     AF<Float> = 1.0; BF<Float> = 0.0
     rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
@@ -406,40 +437,41 @@ main()<Int> -> {
         DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DH<Int> = 0; DE<Int> = 0; DEt<Int> = 0; DL<Int> = 0; AO<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0; IDS<Int> = 0; EP<Int> = 0
-        if (cuMemAlloc_v2(loc(DWq), wq_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWk), wk_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWv), wv_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWo), wo_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWg), wg_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWu), wu_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DWd), wd_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(N1), n1_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Nq), nq_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Nk), nk_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(N2), n2_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(XA), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(XB), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(XN), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DQ), S * NQ * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DQN), S * NQ * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DQr), S * NQ * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DK), S * NKV * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DKN), S * NKV * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DKr), S * NKV * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DV), S * NKV * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DCtx), S * NQ * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DO), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(X1), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(X1N), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Gr), S * FF * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Up), S * FF * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Hu), S * FF * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(M), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DH), S * D * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DL), S * VOCAB * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(AO), S * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWq), dt_bytes_for(wq_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWk), dt_bytes_for(wk_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWv), dt_bytes_for(wv_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWo), dt_bytes_for(wo_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWg), dt_bytes_for(wg_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWu), dt_bytes_for(wu_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DWd), dt_bytes_for(wd_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(N1), dt_bytes_for(n1_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Nq), dt_bytes_for(nq_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Nk), dt_bytes_for(nk_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(N2), dt_bytes_for(n2_nl, dt_f64())) != 0) { return 11 }
+        # Activations: shape x element width, both from the layers above (S0.2b tensor core).
+        if (cuMemAlloc_v2(loc(ON), tt_nbytes(D1, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XA), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XB), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XN), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQ), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQN), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DQr), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DK), tt_nbytes(SK, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DKN), tt_nbytes(SK, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DKr), tt_nbytes(SK, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DV), tt_nbytes(SK, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DCtx), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DO), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X1), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X1N), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Gr), tt_nbytes(SF, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Up), tt_nbytes(SF, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Hu), tt_nbytes(SF, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(M), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DH), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DE), dt_bytes_for(te_nl, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DL), tt_nbytes(SV, dt_f64())) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(AO), tt_nbytes(S1, dt_f64())) != 0) { return 11 }
         i0 = find_nm(nmv, "blk.0.ffn_down.weight")
         pk_max<Int> = packed_bytes(nlv.get(i0), tyv.get(i0))
         if (cuMemAlloc_v2(loc(DPK), pk_max) != 0) { return 11 }
@@ -495,17 +527,17 @@ main()<Int> -> {
         e<Int> = 0
         L<Int> = 0
         for (L in 0..MAXL - 1) {
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn); if (e != 0) { return 70 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn); if (e != 0) { return 71 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn); if (e != 0) { return 72 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn); if (e != 0) { return 73 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn); if (e != 0) { return 74 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn); if (e != 0) { return 75 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn); if (e != 0) { return 76 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn); if (e != 0) { return 77 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn); if (e != 0) { return 78 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn); if (e != 0) { return 79 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn); if (e != 0) { return 80 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn, D); if (e != 0) { return 70 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn, D); if (e != 0) { return 71 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn, D); if (e != 0) { return 72 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn, NQ); if (e != 0) { return 73 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn, D); if (e != 0) { return 74 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn, D); if (e != 0) { return 75 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn, FF); if (e != 0) { return 76 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn, 0); if (e != 0) { return 77 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn, 0); if (e != 0) { return 78 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn, 0); if (e != 0) { return 79 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn, 0); if (e != 0) { return 80 }
 
             e = run_layer(S, D, H, KVH, HD, FF, NQ, NKV, EPS, XI, XO,
                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,

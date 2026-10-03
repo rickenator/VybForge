@@ -150,3 +150,31 @@ share(all) dt_narrow_intrinsic(d<Int>)<String> -> {
 
 // A model config's torch_dtype string -> id (S0.2's config contract hook).
 share(all) dt_of_config(s<String>)<Int> -> { return dt_id(s) }
+
+// Storage width in BYTES — the single place a dtype's width is named. The container readers
+// keep their own tables (safetensors.vyb's st_dtsize, the torch .bin reader), and the S0.1
+// gate checks this one against them and against numpy's itemsize for the same spelling: a
+// half is 2 bytes, not "half a float", and a width that disagrees with the container is how a
+// weight table silently loads shifted.
+share(all) dt_width(d<Int>)<Int> -> {
+    if (d == 0) { return 4 }      // F32
+    if (d == 1) { return 2 }      // F16
+    if (d == 2) { return 2 }      // BF16
+    if (d == 3) { return 8 }      // F64
+    if (d == 4) { return 8 }      // I64
+    if (d == 5) { return 8 }      // U64
+    if (d == 6) { return 4 }      // I32
+    if (d == 7) { return 4 }      // U32
+    if (d == 8) { return 2 }      // I16
+    if (d == 9) { return 2 }      // U16
+    if (d == 10) { return 1 }     // I8
+    if (d == 11) { return 1 }     // U8
+    if (d == 12) { return 1 }     // BOOL
+    if (d == 13) { return 1 }     // F8_E4M3
+    if (d == 14) { return 1 }     // F8_E5M2
+    return 0
+}
+
+// Bytes for n elements of this dtype (0 when the dtype is unknown, so a caller can tell a
+// missing dtype from a zero-sized tensor).
+share(all) dt_bytes_for(n<Int>, d<Int>)<Int> -> { return n * dt_width(d) }

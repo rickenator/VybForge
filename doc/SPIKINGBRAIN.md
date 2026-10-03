@@ -178,7 +178,7 @@ artifact of the *compiler*, and a stale `.ptx` would have let the gate certify t
 toolchain. Importing `native/tensor` also makes a file's own `extern "C"` declarations
 unresolvable (**Vyb#442**), which is why the driver hand-wires its CUDA calls for now.
 
-**S0.2 — tensor core + model config contract (audit G1).**
+**S0.2 — tensor core + model config contract (audit G1). PLAN 2026-10-02.**
 Host-side tensor layer (shape/strides/dtype/alloc, broadcast) plus a **config contract**: model dims
 (layers, hidden, heads, kv heads, head_dim, ffn, vocab, rope theta, eps, tied/untied) read from the
 model's own config instead of literals. Need is measured, not assumed: Qwen3-4B's values are
@@ -187,6 +187,88 @@ vocab 151936 in **13** — so a second architecture otherwise edits those files 
 **Gate:** re-express ONE existing Qwen3 driver through the config contract + tensor layer and keep its
 gate green. That re-expression is the generality proof and the guard against a substrate designed for
 imagined needs; no Qwen3 gate may regress.
+
+Mapped steps (each one gated, in order):
+
+- **S0.2a — config contract. LANDED 2026-10-02** (`native/config/model_config.vyb`, `mc_probe.vyb`;
+  gate `native/legit/run_config_gate.sh`). One `ModelConfig` (arch, layers, hidden, heads, kv heads,
+  head_dim, ffn, vocab, ctx, rope theta, rms eps, tied + derived `nq`/`nkv`) read from **either** a
+  **GGUF**'s own metadata (the `<arch>.` namespace comes from `general.architecture`; `vocab` falls
+  back to `token_embd.weight` when `<arch>.vocab_size` is absent; `tied` is decided by the tensor
+  table — no `output.weight` means tied) or an **HF `config.json`** (via `native/json`, with the
+  aliases in use: `rms_norm_eps` | `norm_eps`, `num_hidden_layers` | `n_layer`, no `head_dim` at
+  all). Every field records its provenance — `defaulted` (the source did not state it), `derived`
+  (computed from another fact in the same file), `notes` (the file's two sources disagree).
+  **Gate green** against: llama.cpp's own `gguf-dump` (**18 fields**, metadata *and* tensor table),
+  the python `gguf` package, `transformers.AutoConfig` on a **second real model**
+  (SpikingBrain-7B, 13 fields), and the rope_theta → invfreq table the kernels actually consume
+  (`max|diff| = 0`). Discrimination cases all fire: a mutated `hidden_size` is reported as mutated,
+  a removed `num_key_value_heads` triggers the labelled fallback, and a truncated GGUF is refused
+  (`check=64`, `notes=truncated in metadata`) instead of looking valid.
+  Two things this already caught: `head_dim` is **not** `hidden/heads` (Qwen3-4B is 2560/32 with
+  head_dim 128, so the naive derivation gives 80 and poisons every downstream size — it comes from
+  `attention.key_length` / the attention tensor instead), and GGUF stores each 2-D weight in the
+  layout its kernel consumes (`attn_output` is `[nq, hidden]` but `attn_k` is `[hidden, nkv]`).
+- **S0.2b — tensor core. LANDED 2026-10-02** (`native/tensor/core.vyb` + `dt_width` in
+  `native/dtype`; gate `native/legit/run_tensor_gate.sh`). Shape, element strides, numel/byte size,
+  contiguity, strided offsets and numpy's broadcast rules (right-aligned, stride-0 expansion,
+  incompatible shapes **refused**). Deliberately **pure — no CUDA and no allocation** (importing
+  `native/tensor/tensor.vyb` drags `cuda_binding` into the importer, Vyb#442, which a shape library
+  must not do to its consumers), which is also what makes it numpy-checkable on the CPU.
+  **Gate green: 586 cases vs numpy** (strides from real arrays, offsets from `np.ravel_multi_index`,
+  contiguity from `.flags["C_CONTIGUOUS"]` on real views, broadcast from `np.broadcast_shapes` and
+  `np.broadcast_to(...).strides`), including 24 refusal and 29 non-contiguous cases. The table is
+  *required* to contain refusals and non-contiguous cases, and the checker is fed a perturbed
+  expectation to prove it reports a mismatch. It earned that: two real bugs in the core were found
+  and fixed (a wrong `rank<=1 ⇒ contiguous` shortcut for rank-1 views, and a broadcast stride that
+  must be 0 on any source axis of length 1 even when the target axis matches).
+- **S0.2c — re-express `native/host/model_driver.vyb` through both. LANDED 2026-10-02.** The dim
+  literals (`D=2560; H=32; KVH=8; HD=128; FF=9728` + `VOCAB=151936` + `MAXL=36` + `EPS=0.000001`)
+  are gone: the driver loads `mc_load(MODEL)` and refuses to run on a config that does not check
+  (`CFG_FAIL`), prints `CFG_SRC`/`CFG_DERIVED`/`CFG_DEFAULTED` and its `DIMS` line, and takes every
+  buffer size from the tensor core — `tt_nbytes(SD|SQ|SK|SF|SV|D1|S1, dt_f64())` for activations and
+  `dt_bytes_for(numel, dt_f64())` for the weight/embedding buffers, replacing 39 hand-written
+  `S * D * 8`-style expressions. Gate `make prefill` (numpy `prefill_ref.py` vs the driver,
+  `verify_prefill.py`, TOL 2e-3): **`PREFILL_HIDDEN_MATCH: OK`, bad=0, maxrel 3.4e-4, top1 MATCH.**
+  `EPS` now comes from the model (9.99999997e-07, the f32 image of 1e-6) rather than a literal.
+  **This step uncovered a real pre-existing bug, which it also fixes.** `make prefill` had been RED
+  since **2026-09-13**: the 2D-weight orientation fix (`7adc585`) updated the numpy ``read_weight``
+  and `decode_driver.vyb` but **never touched `model_driver.vyb`**, whose `load_quant` hardcoded the
+  dequant kernel's in-dim argument to `0` (no transpose) — so for three weeks this gate compared a
+  corrected reference against a driver with a hidden whole-matrix transpose. The driver's own
+  embedding always agreed with the reference (5e-8), which is what localized the divergence to the
+  weight path. Mirroring the fix (`load_quant`/`stage_one` take `inz`; Wq/Wk/Wv→D, Wo→NQ, Wg/Wu→D,
+  Wd→FF, norms→0) takes the gate from `maxrel 5.4e3 / top1 MISMATCH` to `maxrel 3.4e-4 / MATCH`.
+  Two consequences to be aware of: (i) the pre-fix driver's frozen gold `[31784, 31784]` in
+  `native/tools/verify_chat_real.py` was captured from that wrong forward — its token does not appear
+  in llama.cpp's top 10 at either position — so `make chat-real` is now red against a stale constant
+  and needs re-blessing or a set/tolerance comparison; (ii) at the arbitrary ids this gate uses
+  (`[0,1]`) the next-token distribution is nearly flat (p≈0.04, four tokens within 0.04 logprob), so
+  a top1-argmax comparison is a coin flip: the *hidden* comparison is the meaningful one, and the
+  real-prompt gate (`chat-prompt`, "The capital of France is" → ` Paris`) is the semantic one.
+- **S0.2d — battery step + the no-regression sweep. LANDED 2026-10-02.** `run_config_gate.sh`,
+  `run_tensor_gate.sh` and the S0.2c `make prefill` step are in `run_phase2_battery.sh`; the battery
+  is green. **Still open from this step:** five more drivers hand the dequant kernel a literal `0`
+  in-dim — `native/host/kv_driver.vyb`, `layer0_driver.vyb`, `wcheck_driver.vyb`,
+  `native/train/kvctx.vyb`, `kvrespfwd.vyb` — each needs the same per-weight in-dim treatment and its
+  own gate re-run; the sweep table for that is in `doc/SPIKINGBRAIN.md`'s S0.2d notes below.
+
+  Sweep for the remaining literal-`0` in-dim sites (grep the dequant helper *definition* for an
+  `inz` parameter, then the launch for a literal `0` in the 4th slot):
+
+  | driver | helper | in-dim today | gate |
+  |---|---|---|---|
+  | `native/host/model_driver.vyb` | `load_quant` | **fixed** (per-weight) | `make prefill` green |
+  | `native/host/layer0_driver.vyb` | `load_quant` | `0` | `make layer0` |
+  | `native/host/kv_driver.vyb` | `dequant_gpu` | `0` | — |
+  | `native/host/wcheck_driver.vyb` | `dequant_gpu` | `0` | — |
+  | `native/train/kvctx.vyb` | `deq_w` | `0` | `make kvctx-*` |
+  | `native/train/kvrespfwd.vyb` | `deq_w` | `0` | `make kvrespfwd-*` |
+  | `native/host/decode_driver.vyb`, `resident_driver.vyb`, `loradec_driver.vyb`, all of `native/train/*` | — | fixed | green |
+
+  (A missing `inz` parameter is not by itself proof of a bug — a helper can take the in-dim from a
+  per-weight lookup instead — so each row needs its gate run before it is called broken. The two rows
+  with a literal `0` in the launch and no lookup are the ones to treat as suspects.)
 
 **S0.3 — loaders (this is S3's content, scheduled here). LANDED 2026-10-02.**
 `native/torchload/` holds two container readers, both host-mode and model-agnostic:
