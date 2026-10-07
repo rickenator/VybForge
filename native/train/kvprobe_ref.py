@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(os.path.join(repo, "artifacts", "vybos-configurator-lora"))
 for line in open(os.path.join(repo, "data/vybos-configurator-train.jsonl")):
     d = json.loads(line); msgs = d["messages"]
-    if "graphical desktop workstation" in " ".join(m["content"] for m in msgs if m["role"] == "user"):
+    if d.get("metadata", {}).get("topic") == "goal-desktop":
         usr = [m["content"] for m in msgs if m["role"] == "user"][0]
         asst = [m["content"] for m in msgs if m["role"] == "assistant"][-1]; break
 ctx_ids = np.array(tok.encode(usr, add_special_tokens=False), dtype=np.int64)   # 9

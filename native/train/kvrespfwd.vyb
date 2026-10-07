@@ -295,7 +295,14 @@ resp_layer_kv(P<Int>, Sctx<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<
 
 
 main()<Int> -> {
-    S<Int> = 9; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
+    # Goal-context length derived from the ids file, never hardcoded (#21): context and response
+    # share the per-layer [MAXS=96,NKV] slab, so the context rows are whatever the goal record
+    # tokenizes to.
+    cdh<String> = read_bin("native/out/kvctx_ctx_ids.bin")
+    S<Int> = cdh.len() / 8
+    if (S < 1) { println("GOAL_IDS_EMPTY native/out/kvctx_ctx_ids.bin (regenerate it with `make kvctx` from the corpus goal record)"); return 35 }
+    if (S > 96) { println("GOAL_TOO_LONG got=" + S.to_string() + " max=96 (MAXS: the per-layer slab must also hold the generated response rows)"); return 35 }
+    D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
     MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
@@ -433,11 +440,8 @@ main()<Int> -> {
         td<String> = read_model(MODEL, ofv.get(ite), tpb)
         e = download(td, TEPK, tpb); if (e != 0) { return 48 }
         cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (tnl + 255) / 256, 1, 1, 256, 1, 1, TEPK, EMB, tnl, 0); cuCtxSynchronize()
-        # context ids
-        cd<String> = read_bin("native/out/kvctx_ctx_ids.bin")
-        cdn<Int> = cd.len() / 8
-        if (cdn != S) { println("GOAL_LEN_MISMATCH expected=" + S.to_string() + " got=" + cdn.to_string() + " native/out/kvctx_ctx_ids.bin (the goal record's token count is load-bearing: S is a constant here, see VybForge#21)"); return 35 }
-        e = download(cd, IDS, S * 8); if (e != 0) { return 45 }
+        # context ids: read once at the top of main, where S was derived from them (#21)
+        e = download(cdh, IDS, S * 8); if (e != 0) { return 45 }
         # embed ctx -> XI
         cuMemcpyHtoD_v2(HPP + 0, loc(EMB), 8); cuMemcpyHtoD_v2(HPP + 8, loc(IDS), 8); cuMemcpyHtoD_v2(HPP + 16, loc(XI), 8)
         cuMemcpyHtoD_v2(HPP + 24, loc(S), 8); cuMemcpyHtoD_v2(HPP + 32, loc(D), 8)

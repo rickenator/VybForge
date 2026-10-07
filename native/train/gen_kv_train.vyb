@@ -167,7 +167,14 @@ sub_aslb(s<String>, val<Int>)<String> -> {
 
 main()<Int> -> {
     S<Int> = env_int("VYBFORGE_KV_S", 93)
-    NC<Int> = env_int("VYBFORGE_KV_NCTX", 9)
+    # The context length comes from an explicit override, else from the goal ids file itself —
+    # it used to default to a literal 9 that silently outlived the goal record's token count (#21).
+    NC<Int> = env_int("VYBFORGE_KV_NCTX", 0)
+    if (NC < 1) {
+        gbf<String> = readf("native/out/kvctx_ctx_ids.bin")
+        NC = gbf.len() / 8
+        if (NC < 1) { eprintln("gen_kv_train: no goal context length — run `make kvctx` first (native/out/kvctx_ctx_ids.bin), or set VYBFORGE_KV_NCTX"); return 35 }
+    }
     RESP<Int> = S - NC
     src_p<String> = env_get("VYBFORGE_KV_SRC") else "native/train/kvresp_train_kv.vyb"
     out_p<String> = env_get("VYBFORGE_KV_OUT") else ""
