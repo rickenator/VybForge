@@ -75,7 +75,7 @@ Key files:
    on GPU (no torch) — the true no-Python path — full Qwen3-4B research-scale, PLUS an expanded
    interview corpus. Design doc `training/CORPUS-STRATEGY.md`: **facts live in context (a capabilities
    manifest in the system prompt), behavior lives in the weights**, so a new VybOS capability = edit the
-   manifest, NOT a retrain. Also: goal-driven WHOLE-STACK interviews ("I want a Hyprland desktop" →
+   manifest, NOT a retrain. Also: goal-driven WHOLE-STACK interviews ("I want a graphical desktop" →
    decompose the full stack, manifest-grounded, surface unbuildable subsystems as open decisions).
    Pyright-note: tests are verification (stays Python); the SHIPPED runtime must be pure Vyb.
    **`tests/test_schema.py` → Vyb PORT DONE & passing** (`tests/test_schema.vyb`, `make schemacheck` →
@@ -253,7 +253,7 @@ Key files:
    **8-step full gate = `make train-ce-loop` (M2E3CE_VERIFY): per-step CE loss matches the committed
    oracle 15.49->0.697 + descends.**
    **WHOLE-STACK RECORD TRAINING (2026-08-30): moved OFF the 4-token toy to the real goal-desktop
-   record.** target = train rec 6 'I want a Hyprland desktop workstation' -> manifest-v<3 SUMMARY
+   record.** target = train rec 6 'I want to run a graphical desktop workstation' -> manifest-v<3 SUMMARY
    (gates desktop as open decision; 84 tokens). `_gen_ce.py` now parameterized by TS (rescale every
    S-proportional literal + ASLB offsets by TS/4 from the S=4 CE base; protects adapter numels; s-
    intermediates already SYMBOLIC S*R so they auto-scale). Regenerated train_full_ce.vyb at S=83
