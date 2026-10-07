@@ -558,6 +558,10 @@ main()<Int> -> {
                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
             if (e != 0) { return 81 }
             tl2<Int> = XI; XI = XO; XO = tl2
+            # Progress heartbeat. This 36-layer staging loop runs for minutes and was silent
+            # between EMBED_PROBE_DONE and PREFILL_HIDDEN_DONE, so a slow-but-working run was
+            # indistinguishable from a hang (it has been mistaken for one, and killed).
+            if (L % 4 == 3) { pnl<Int> = L + 1; println("PREFILL_LAYER " + pnl.to_string() + "/" + MAXL.to_string()) }
         }
 
         # ---- write final 36-layer hidden (now in XI) ----
