@@ -414,6 +414,11 @@ main()<Int> -> {
             }
         }
         cuCtxSynchronize()
+        # The rope kernel reads DF as its inv-freq table. This was never loaded: DF is freshly
+        # allocated device memory, so the rope was a no-op and every DKr came out unroped.
+        # kvrespfwd.vyb carries the same fix; it was missing here. VybForge#19.
+        fbi<String> = read_bin("native/out/layer0_invfreq.bin"); if (fbi.len() < 64 * 8) { println("DF_MISSING"); return 37 }
+        e = download(fbi, DF, 64 * 8); if (e != 0) { return 47 }
         # ---- context build: run run_layer over (rotating) input, capture DKr/DV per layer into CK/CV ----
         XIc<Int> = XI; XOc<Int> = XO
         L5<Int> = 0
@@ -461,6 +466,10 @@ main()<Int> -> {
             # dump first-32 of this layer's DKr & DV
             e = dumpf(CK + L5 * S * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DKr_gpu.txt"); if (e != 0) { return 70 }
             e = dumpf(CV + L5 * S * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DV_gpu.txt"); if (e != 0) { return 71 }
+            # row 3 as well: row 0 is token 0, whose rope angle is (POS+0)*freq = 0, so a row-0-only
+            # comparison cannot see the rope at all - it is the identity there by construction.
+            e = dumpf(CK + L5 * S * NKV * 8 + 3 * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DKr_r3_gpu.txt"); if (e != 0) { return 72 }
+            e = dumpf(CV + L5 * S * NKV * 8 + 3 * NKV * 8, 64, "native/out/kvctx_L" + L5.to_string() + "_DV_r3_gpu.txt"); if (e != 0) { return 73 }
             # rotate input/output
             tc<Int> = XIc; XIc = XOc; XOc = tc
         }

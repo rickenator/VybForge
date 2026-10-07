@@ -23,6 +23,14 @@ ctx_ids = np.array(tok.encode(usr, add_special_tokens=False), dtype=np.int64)   
 resp_ids = np.array(tok.encode(asst, add_special_tokens=False), dtype=np.int64)   # 84
 S = len(ctx_ids) + len(resp_ids)   # 93
 NCTX = len(ctx_ids)
+# The driver's inputs. Nothing wrote these before: the Phase-1 Python cleanup removed the producer
+# while kvrespfwd.vyb kept reading them, so read_bin returned a short buffer, download copied the
+# requested byte count out of it anyway and returned 0, and the response-embed kernel then indexed
+# the embedding table with a garbage token id (CUDA 700 illegal address - VybForge#17).
+# resp ids are the response tokens; labels are next-token targets for positions 0..82, with the
+# final position masked by the driver itself.
+resp_ids.astype("<i8").tofile(os.path.join(out, "kvresp_ids.bin"))
+resp_ids[1:].astype("<i8").tofile(os.path.join(out, "kvresp_labels.bin"))
 
 D, H, KVH, HD, FF = 2560, 32, 8, 128, 9728
 NQ, NKV, R, alpha_r, EPS = H * HD, KVH * HD, 2, 2.0, 1e-6

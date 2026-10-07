@@ -269,8 +269,8 @@ Mapped steps (each one gated, in order):
   | `native/host/layer0_driver.vyb` | `load_quant` | 7 call sites | `make layer0` green — measured red→green: **maxrel 1.03e+03 → 4.86e-06**, bad 5115/5120 → 0 |
   | `native/host/kv_driver.vyb` | `dequant_gpu` | 14 call sites | `make decode-kv` green (`DECODE_REAL_MATCH: OK`) |
   | `native/host/wcheck_driver.vyb` | `dequant_gpu` | 6 call sites | **had no gate at all** — added `verify_wcheck.py` + `make wcheck`; green, all 5 tensors within 2e-6 of numpy |
-  | `native/train/kvctx.vyb` | `deq_w` | 7 call sites | **still red** — see (iii) |
-  | `native/train/kvrespfwd.vyb` | `deq_w` | 14 call sites | **cannot run** — see (ii) |
+  | `native/train/kvctx.vyb` | `deq_w` | 7 call sites | **OK** — see (iii): the gate was blind to the rope and both KV drivers embedded a stale id file |
+  | `native/train/kvrespfwd.vyb` | `deq_w` | 14 call sites | **OK** — corr **1.000000**, `|g| = |r| = 6.92e+03`, `max|g-r| = 5.55e-04` (see (ii)) |
 
   Two more real bugs surfaced while gating these, both pre-existing and neither a regression from the
   in-dim change:
@@ -279,12 +279,30 @@ Mapped steps (each one gated, in order):
   It also compared its numbers to the reference **by eye**: there was no verifier, and `wcheck_ref.py`
   read its numpy loader from a hardcoded `/home/rick/Projects/VybAIConf`, a tree this repo no longer
   lives in.
-  (ii) `kvrespfwd` dies at the first response-forward dequant with **CUDA 700 (illegal address)** —
-  while the *same call succeeds 36 times* in that driver's own context build. The call's arguments
-  are correct (`nl` = 10,485,760 = `attn_q`'s [4096,2560], `inz` = D, valid src/dst), so the fault is
-  context state rather than the call: the two launches between the loops were unchecked, are now
-  checked, and are clean, leaving the unchecked `cuMemcpyHtoD_v2` sequence or something deeper.
-  Measured byte-identical with and without the in-dim fix.
+  (ii) `kvrespfwd` died at the first response-forward dequant with **CUDA 700 (illegal address)**,
+  and the cause was not in that call at all (VybForge#17): the driver reads
+  `native/out/kvresp_ids.bin` and `kvresp_labels.bin`, and **nothing in the tree writes them any
+  more** — the producer was Python, and the Phase-1 cleanup removed it while the Vyb driver kept
+  reading its outputs. `read_bin` on a missing path returns a short String, `download` copies the
+  requested byte count out of it anyway and returns 0 (the sibling ctx-ids read *is* length-checked;
+  this one was not), so `RIDS` held garbage, the response-embed kernel indexed the embedding table
+  with a garbage token id, and the resulting illegal address surfaced — asynchronously — at the next
+  *checked* API call. Ruled out one run at a time: a probe of the identical call placed earlier in
+  the process returns 0; all 26 response allocations check out; all nine unchecked memcpys were made
+  to report and return 0; both unchecked launches between the loops now report and return 0; skipping
+  the emb dump changes nothing; nothing is ever freed and the card was empty (131 MiB). The reported
+  call's arguments were sane throughout (`nl` = `attn_q`'s [4096,2560], `inz` = D, valid src/dst), and
+  behavior is byte-identical with and without the in-dim fix. `kvresp_ref.py` now writes both inputs
+  and the driver length-guards both reads, so a missing input reports `RESP_IDS_MISSING` rather than a
+  CUDA 700 fifty lines from its cause. With the inputs restored, the driver runs to completion
+  (`KVRESP masked CE loss = 8.28567`) and the gate returns its first real verdict: `FAIL`, with the
+  in-dim fix worth corr **-0.003884 → 0.775046** (|g| = 7.88e+03 vs |r| = 6.92e+03). This driver's
+  layout is therefore proven right as well, and its residual — corr 0.775 rather than 0.995+, with a
+  14% norm gap and a diffuse maxrel — is the same class of non-layout cause as (iii). Note that an
+  earlier A/B of this driver compared the fixed file against itself (the in-dim change was already
+  committed, so stashing the working tree reverted only the new guards) and printed bit-identical
+  numbers; the pre-change revision has to be checked out by SHA, which is what produced the figures
+  above.
   (iii) `kvctx` is red for a reason that is **not** orientation: the fix moved it from
   **corr −0.67…0.20 to 0.995…0.999** (a wrong layout cannot correlate at 0.999), but a diffuse
   10–30% error remains across all 64 dumped values — not a rope-pair or transpose signature. The
@@ -638,3 +656,25 @@ models; (d) `stdlib/spike` green in the Vyb suite.
 Cross-references: VybFly `PROJECT-VYBFLY.md` (Phase 1 later-candidates, sec 17
 energy model, sec 23 GPU scaling), VybFly `docs/VYB-PORT.md` (Vyb constraints +
 CUDA lessons), VybForge `doc/LLM-FORWARD.md` (facade pattern this extends).
+
+  **Resolution: all five drivers are green.** The two reds above turned out to share one root cause, and
+  finding it needed one gate improvement:
+
+  - **`kvctx_ctx_ids.bin` was stale.** Both KV drivers embed the context-token ids read from that
+    binary file; `kvctx_ref.py` wrote only the text form and tokenizes live. The file on disk held a
+    *different prompt* (`[28497, 419, …]` vs the reference's `[40, 1366, …]` — only the final id 13
+    agreed), so the context build forwarded different tokens than the reference and, because both sides
+    ran the same valid architecture, the outputs still correlated at 0.995–0.999 with a huge maxrel.
+    `kvresp` inherited it end to end, since it builds the cache its response forward attends to from
+    the same file. `kvctx_ref.py` now writes the `.bin` as well, so a `make kvctx` run regenerates it.
+  - **The gate could not see the rope.** Every comparison used the first 64 values of each `[S,NKV]`
+    dump — row 0, i.e. token 0 — whose rope angle is `(POS + 0) * freq = 0`, so the rope is the identity
+    there by construction. `kvctx`'s rope had never been loaded (`DF` uninitialized — see #19) and no
+    gate could tell. The gate now compares row 3 as well, which is genuinely rotated.
+  - With the ids current and the rope load in place, all 20 kvctx comparisons pass (`corr 1.00000`,
+    `maxrel` 2.5e-06–2.4e-04) and `kvrespfwd` passes at `corr 1.000000`, `|g| = |r| = 6.92e+03`,
+    `max|g-r| = 5.55e-04` — down from `corr 0.775046`, `|g| = 7.88e+03`, `max|g-r| = 4.21e+02`.
+
+  The lesson worth carrying: both reds *looked* like numeric drift and were input faults. A gate whose
+  sample point makes a whole stage a no-op (row 0 under a rotary) cannot fail that stage, and a
+  comparison that passes at 0.995 on wrong inputs is more dangerous than one that fails outright.

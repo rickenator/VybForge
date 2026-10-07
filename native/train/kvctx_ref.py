@@ -63,4 +63,8 @@ for L in range(36):
     all_dkr[L].tofile(os.path.join(out, f"kvctx_L{L}_DKr_ref.bin"))
     all_dv[L].tofile(os.path.join(out, f"kvctx_L{L}_DV_ref.bin"))
 np.savetxt(os.path.join(out, "kvctx_ctx_ids.txt"), ctx_ids, fmt="%d")
+# The driver embeds ctx_ids read from the BINARY form. Only the .txt was being written, so the .bin
+# was a stale leftover from an older prompt and both KV drivers (kvctx, kvrespfwd read the same file)
+# were building on the wrong tokens. Write it here so a make run regenerates it in-target.
+ctx_ids.astype("<i8").tofile(os.path.join(out, "kvctx_ctx_ids.bin"))
 print("kvctx ref done S=", S)

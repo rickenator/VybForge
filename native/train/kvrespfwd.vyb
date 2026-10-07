@@ -597,8 +597,13 @@ main()<Int> -> {
         rce<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(efn)), (onn + 255) / 256, 1, 1, 256, 1, 1, HPP, 0, 0, 0); cuCtxSynchronize()
         if (rce != 0) { println("RESPFWD_LAUNCH_FAIL output_norm(efn) rc=" + rce.to_string()); return 71 }
         # response ids -> RIDS; labels -> RLB (last row = -1)
-        e = download(read_bin("native/out/kvresp_ids.bin"), RIDS, RESP * 8); if (e != 0) { return 45 }
-        e = download(read_bin("native/out/kvresp_labels.bin"), RLB, (RESP - 1) * 8); if (e != 0) { return 46 }
+        # length-guarded like the ctx-ids read above: read_bin on a missing file yields a short
+        # buffer, download copies the requested byte count out of it and returns 0, and the embed
+        # kernel then faults on a garbage token id - a CUDA 700 surfacing far from its cause (#17).
+        ridb<String> = read_bin("native/out/kvresp_ids.bin"); if (ridb.len() < RESP * 8) { println("RESP_IDS_MISSING len=" + ridb.len().to_string()); return 43 }
+        e = download(ridb, RIDS, RESP * 8); if (e != 0) { return 45 }
+        rlbb<String> = read_bin("native/out/kvresp_labels.bin"); if (rlbb.len() < (RESP - 1) * 8) { println("RESP_LABELS_MISSING len=" + rlbb.len().to_string()); return 44 }
+        e = download(rlbb, RLB, (RESP - 1) * 8); if (e != 0) { return 46 }
         freedom { mn1<Int> = -1; cuMemcpyHtoD_v2(RLB + (RESP - 1) * 8, loc(mn1), 8) }
         # embed response tokens -> HB rows S..S+RESP-1
         cuMemcpyHtoD_v2(HPP + 0, loc(EMB), 8); cuMemcpyHtoD_v2(HPP + 8, loc(RIDS), 8); cuMemcpyHtoD_v2(HPP + 16, loc(HB + S * D * 8), 8)
