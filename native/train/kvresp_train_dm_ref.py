@@ -43,7 +43,7 @@ def _load_record():
         for line in fh:
             d = json.loads(line)
             u = " ".join(m["content"] for m in d["messages"] if m["role"] == "user")
-            if "Hyprland desktop workstation" in u:
+            if "graphical desktop workstation" in u:
                 msgs = d["messages"]; break
     if msgs is None:
         raise SystemExit("goal-desktop record not found")

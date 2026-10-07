@@ -29,7 +29,7 @@ manifest(v<Int>)<String> -> {
     m = m + "- source: real HTTPS fetch -> content-addressed store; realizable pkg sources: openssh, vim, nginx, busybox, linux, qemu\\n"
     if (v == 1) { m = m + "- rescue: serial-console rescue image PROVEN\\n" }
     if (v == 2) { m = m + "- aarch64: cross-toolchain + aarch64 linux kernel QEMU-boot PROVEN\\n" }
-    if (v == 3) { m = m + "- desktop: wayland desktop stack (hyprland compositor + wlroots + mesa/graphics + xdg-desktop-portal + display manager) DERIVED & booted PROVEN\\n" }
+    if (v == 3) { m = m + "- desktop: wayland desktop stack (compositor + wlroots + mesa/graphics + xdg-desktop-portal + display manager) DERIVED & booted PROVEN\\n" }
     m = m + "- OPEN: host deployment, root disk image, bootloader, gen-switch, non-stand-in userspace, ARM64"
     if (v < 3) { m = m + ", graphical/wayland desktop stack" }
     m = m + "\\n- NEVER apply anything to a host; desired state is review-only.\\n"
@@ -147,16 +147,16 @@ main()<Int> -> {
             answer = summary("I can draft and validate a desired state, but I will not apply it to a host. First choose the target, review the plan, and authorize a separate execution step.")
         } else if (topic == 9) {
             tname = "goal-desktop"
-            user = "I want a Hyprland desktop workstation."
+            user = "I want to run a graphical desktop workstation."
             if (v == 3) {
                 # desktop listed as proven -> propose the whole-stack decomposition
-                answer = proposal_multi("Desired-state for a Hyprland workstation: compositor + display deps, a session service, hostname, on the x86_64/QEMU-proven boot. Review-only; not applied.",
-                    item("pkgs", "add", "{\"name\":\"hyprland\",\"version\":\"0.43.0\",\"source\":\"upstream\"}", "The manifest lists a wayland desktop stack as derived; the compositor anchors it.") + "," +
+                answer = proposal_multi("Desired-state for a graphical desktop workstation: compositor + display deps, a session service, hostname, on the x86_64/QEMU-proven boot. Review-only; not applied.",
+                    item("pkgs", "add", "{\"name\":\"wlroots\",\"version\":\"0.18.0\",\"source\":\"upstream\"}", "The manifest lists a wayland desktop stack as derived; its compositor library anchors the stack.") + "," +
                     item("pkgs", "add", "{\"name\":\"mesa\",\"version\":\"25.0\",\"source\":\"upstream\"}", "Graphics driver for the wayland stack, listed as proven.") + "," +
-                    item("services", "add", "{\"name\":\"hyprland-session\",\"command\":\"Hyprland\"}", "Boots the compositor as the desktop session.") + "," +
+                    item("services", "add", "{\"name\":\"wayland-session\",\"command\":\"start-compositor\"}", "Boots the compositor as the desktop session.") + "," +
                     item("hostname", "replace", "\"vyb-desktop\"", "Workstation machine identity."))
             } else {
-                answer = summary("The manifest gates a graphical desktop as an open/not-derived subsystem, so I can't propose a Hyprland stack as buildable today. I can still plan the headless management pieces (e.g. sshd) and we treat the display/compositor/graphics stack as an open decision until derivation is proven.")
+                answer = summary("The manifest gates a graphical desktop as an open/not-derived subsystem, so I can't propose a graphical desktop stack as buildable today. I can still plan the headless management pieces (e.g. sshd) and we treat the display/compositor/graphics stack as an open decision until derivation is proven.")
             }
         } else if (topic == 10) {
             tname = "goal-kiosk"

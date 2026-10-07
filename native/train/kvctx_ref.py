@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(os.path.join(repo, "artifacts", "vybos-configurator-lora"))
 for line in open(os.path.join(repo, "data/vybos-configurator-train.jsonl")):
     d = json.loads(line)
-    if "Hyprland desktop workstation" in " ".join(m["content"] for m in d["messages"] if m["role"] == "user"):
+    if "graphical desktop workstation" in " ".join(m["content"] for m in d["messages"] if m["role"] == "user"):
         usr = [m["content"] for m in d["messages"] if m["role"] == "user"][0]
         break
 ctx_ids = np.array(tok.encode(usr, add_special_tokens=False), dtype=np.int64)

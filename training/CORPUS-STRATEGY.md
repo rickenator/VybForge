@@ -53,7 +53,7 @@ every VybOS commit.
 
 ## Goal-driven whole-stack interviews (the shape to train toward)
 
-The entry point is a **user goal**, not a field edit: *"I want a Hyprland desktop"* /
+The entry point is a **user goal**, not a field edit: *"I want a graphical desktop"* /
 *"a hardened CI runner"* / *"an offline kiosk"*. The interviewer must turn that goal into
 a **complete desired state across the whole SystemSpec surface** (packages + the stack they
 imply, services that run it, users/login, network, boot-to-graphical, storage), coordinated
@@ -68,11 +68,11 @@ Train two stable behaviors here:
    `proposed_changes` item or an explicit decision.
 2. **Stay manifest-grounded.** The manifest lists what VybOS can actually *derive/build*
    (today: base rootfs, toolchain, kernel, QEMU, core packages). If a goal needs a stack
-   VybOS cannot yet build — e.g. the Hyprland/mesa graphics stack is *not* a derived
+   VybOS cannot yet build — e.g. the Wayland/mesa graphics stack is *not* a derived
    capability — the correct answer is **not** to fabricate it: propose the parts that are
    real, and surface the missing subsystem as an open decision / capability question.
    This keeps the contract honest AND doubles as the no-retrain test (a future manifest
-   that *does* list Hyprland transfers without retraining).
+   that *does* list the graphical desktop stack transfers without retraining).
 
 The desired-state model these interviews produce will outgrow the four patch paths
 (`system|hostname|pkgs|services`); the deeper contract lives on the Spec side

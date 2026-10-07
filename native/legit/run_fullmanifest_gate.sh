@@ -6,10 +6,10 @@
 # tokenizes it with the Qwen3 tokenizer from the committed LoRA adapter, prints the token
 # count, and writes the text plus the ids as a little-endian <i8 array. native/out/ is
 # untracked, so the oracle's output is frozen under native/legit/fixtures/ (captured
-# 2026-10-02, sha256 5da822e8… text / f4169c69… ids):
+# 2026-10-02, refreshed 2026-10-07 after the corpus purge: sha256 82558693… text / c3efa262… ids):
 #
 #   1. PARITY      — the Vyb program must reproduce both fixture files byte-for-byte and
-#                    report the same 429 tokens.
+#                    report the same 425 tokens.
 #   2. PRETOK      — native/tokenizer/test_pretok_boundary.vyb: the Qwen2 pre-tokenizer
 #                    boundary cases (newline after punctuation, leading tab, CRLF, ...)
 #                    against transformers ids. This is the bug this step found: `):` + `\n`
@@ -47,8 +47,8 @@ else
   ok=1
   cmp -s "$WORK/fm.txt" "$fixture_txt" || { step "fullmanifest.txt byte parity" "FAIL"; ok=0; fail=1; }
   cmp -s "$WORK/fm.bin" "$fixture_bin" || { step "fullmanifest_ids.bin byte parity" "FAIL"; ok=0; fail=1; }
-  [ "$tok" = "429" ] || { step "token count" "FAIL (got ${tok:-none}, want 429)"; ok=0; fail=1; }
-  [ $ok -eq 1 ] && step "manifest parity" "byte-identical, 429 tokens ($(wc -c < "$fixture_txt") B + $(wc -c < "$fixture_bin") B)"
+  [ "$tok" = "425" ] || { step "token count" "FAIL (got ${tok:-none}, want 425)"; ok=0; fail=1; }
+  [ $ok -eq 1 ] && step "manifest parity" "byte-identical, 425 tokens ($(wc -c < "$fixture_txt") B + $(wc -c < "$fixture_bin") B)"
 fi
 
 # 2. pre-tokenizer boundary test (the bug class this step surfaced)

@@ -13,10 +13,10 @@ CAPABILITIES MANIFEST (VybOS, current):
 - Available core packages (buildable, reviewed): busybox (static), heirloom-nvi / util-linux userspace, dropbear (ssh), dnsmasq, nginx, zlib, ncurses, toybox alternatives.
 - Services available: serial-getty on ttyS0, dropbear sshd (small-office gateway), nginx httpd, dnsmasq DNS/DHCP.
 - Image size / boot-time / attack-surface tradeoffs trackable per variant.
-- OPEN DECISIONS (do not fabricate): graphical desktop stack (Hyprland/Wayland/mesa) is NOT a derived capability; ARM64/RISC-V toolchain+rootfs; systemd vs busybox init unification; full reproducible byte-for-byte store.
+- OPEN DECISIONS (do not fabricate): graphical desktop stack (Wayland/mesa) is NOT a derived capability; ARM64/RISC-V toolchain+rootfs; systemd vs busybox init unification; full reproducible byte-for-byte store.
 - Non-mutation rule: you only draft/review desired state; never claim host apply.
 
-USER GOAL: I want a Hyprland desktop workstation."""
+USER GOAL: I want to run a graphical desktop workstation."""
 ids = tok.encode(manifest, add_special_tokens=False)
 print("manifest context tokens =", len(ids))
 open("native/out/fullmanifest.txt", "w").write(manifest)

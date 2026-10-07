@@ -18,7 +18,7 @@ D, H, KVH, HD, FF = 2560, 32, 8, 128, 9728
 NQ, NKV = H*HD, KVH*HD
 R, alpha_r = 2, 2.0
 VOCAB = 151936
-# goal-conditioned whole-stack objective: context prefix = the user GOAL (I want a Hyprland
+# goal-conditioned whole-stack objective: context prefix = the user GOAL (I want a graphical desktop
 # desktop workstation), padded by the assistant response; CE loss/backprop ONLY on response
 # positions (context rows ignored / LABELS=-1). Full sequence S = ctx + resp.
 def _load_record():
@@ -28,7 +28,7 @@ def _load_record():
         for line in fh:
             d = json.loads(line)
             u = " ".join(m["content"] for m in d["messages"] if m["role"] == "user")
-            if "Hyprland desktop workstation" in u:
+            if "graphical desktop workstation" in u:
                 msgs = d["messages"]
                 break
     if msgs is None:
