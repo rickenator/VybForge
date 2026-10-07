@@ -59,6 +59,11 @@ a **complete desired state across the whole SystemSpec surface** (packages + the
 imply, services that run it, users/login, network, boot-to-graphical, storage), coordinated
 by dependencies — not a single add.
 
+> **The goal's token count is load-bearing.** The KV/decode drivers hold the goal context
+> length as a constant (`S<Int> = 9`), so a goal rephrased to a different token count fails the
+> context build — and it fails looking like a rope bug (roped rows mismatch, rope-free rows
+> pass). Keep the count when editing the goal text, or remove the constant: VybForge#21.
+
 Train two stable behaviors here:
 
 1. **Decompose the goal into the supporting stack.** E.g. a desktop goal implies:

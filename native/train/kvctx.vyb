@@ -353,7 +353,9 @@ main()<Int> -> {
         e = download(td, TEPK, tpb); if (e != 0) { return 48 }
         cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (tnl + 255) / 256, 1, 1, 256, 1, 1, TEPK, EMB, tnl, 0); cuCtxSynchronize()
         # context ids
-        cd<String> = read_bin("native/out/kvctx_ctx_ids.bin"); if (cd.len() < S * 8) { println("CTX_IDS_MISSING"); return 35 }
+        cd<String> = read_bin("native/out/kvctx_ctx_ids.bin")
+        cdn<Int> = cd.len() / 8
+        if (cdn != S) { println("GOAL_LEN_MISMATCH expected=" + S.to_string() + " got=" + cdn.to_string() + " native/out/kvctx_ctx_ids.bin (the goal record's token count is load-bearing: S is a constant here, see VybForge#21)"); return 35 }
         e = download(cd, IDS, S * 8); if (e != 0) { return 45 }
         # embed ctx -> XI
         cuMemcpyHtoD_v2(HPP + 0, loc(EMB), 8); cuMemcpyHtoD_v2(HPP + 8, loc(IDS), 8); cuMemcpyHtoD_v2(HPP + 16, loc(XI), 8)
