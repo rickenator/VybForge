@@ -558,7 +558,13 @@ main()<Int> -> {
         hgm<loc<CVoid>> = from<loc<CVoid>>(0); hcf<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(hgm), m, "hgemm")!=0){ return 28 }
         if (cuModuleGetFunction(loc(hcf), m, "cefwd")!=0){ return 29 }
-        RESP<Int> = 84; MAXR<Int> = 96; VOCAB2<Int> = 151936
+        # Response length DERIVED from the response-ids file, never hardcoded (#21): the
+        # goal-desktop answer's token count moves whenever the corpus wording moves, and a
+        # literal 84 went stale exactly that way — this driver's own guard caught it.
+        ridb<String> = read_bin("native/out/kvresp_ids.bin")
+        RESP<Int> = ridb.len() / 8
+        if (RESP < 2 || RESP > 96) { println("RESP_IDS_UNUSABLE len=" + ridb.len().to_string() + " native/out/kvresp_ids.bin"); return 43 }
+        MAXR<Int> = 96; VOCAB2<Int> = 151936
         # per-token + head buffers (all allocated here, after the context build)
         HB<Int> = 0; XO2<Int> = 0; HALL<Int> = 0; ONb<Int> = 0; HO<Int> = 0; LS2<Int> = 0; DLG<Int> = 0; LOS<Int> = 0; RIDS<Int> = 0; RLB<Int> = 0
         rXN<Int> = 0; rDQ<Int> = 0; rDK<Int> = 0; rDV<Int> = 0; rDQN<Int> = 0; rDKN<Int> = 0
@@ -606,7 +612,7 @@ main()<Int> -> {
         # length-guarded like the ctx-ids read above: read_bin on a missing file yields a short
         # buffer, download copies the requested byte count out of it and returns 0, and the embed
         # kernel then faults on a garbage token id - a CUDA 700 surfacing far from its cause (#17).
-        ridb<String> = read_bin("native/out/kvresp_ids.bin"); if (ridb.len() < RESP * 8) { println("RESP_IDS_MISSING len=" + ridb.len().to_string()); return 43 }
+        # response ids: read once above, where RESP was derived from them (#21)
         e = download(ridb, RIDS, RESP * 8); if (e != 0) { return 45 }
         rlbb<String> = read_bin("native/out/kvresp_labels.bin"); if (rlbb.len() < (RESP - 1) * 8) { println("RESP_LABELS_MISSING len=" + rlbb.len().to_string()); return 44 }
         e = download(rlbb, RLB, (RESP - 1) * 8); if (e != 0) { return 46 }

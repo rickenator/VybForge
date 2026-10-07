@@ -44,7 +44,7 @@ fi
 # P2.1b — build_fullmanifest.py -> build_fullmanifest.vyb (+ pre-tokenizer boundaries)
 out="$(./native/legit/run_fullmanifest_gate.sh 2>&1)"
 if echo "$out" | tail -1 | grep -q "PASS"; then
-  step "P2.1b build_fullmanifest.vyb" "manifest parity (429 tokens) + pretok boundaries"
+  step "P2.1b build_fullmanifest.vyb" "manifest parity (425 tokens) + pretok boundaries"
 else
   step "P2.1b build_fullmanifest.vyb" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
