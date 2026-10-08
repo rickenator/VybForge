@@ -113,7 +113,10 @@ def main():
                     indep = f"gguf-package=DIFFERS maxabs={md:.3e}"
                     differed += 1
 
-            vals = " ".join(f"{v:.17g}" for v in ours)
+            _sl = ours[:4096]
+            import struct as _bs
+            vals = " ".join(str(_q) for _q in
+                              _bs.unpack("<%dq" % len(_sl), np.asarray(_sl, dtype="<f8").tobytes()))
             fh.write(f"BF16 {name}@{t['off']} -> {vals}\n")
             print(f"BF16_REF {name} numel={ours.size} {indep}")
 

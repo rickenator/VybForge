@@ -98,10 +98,10 @@ find_row(rows<Vec<Row>>, nm<String>)<Int> -> {
     for (i in 0..rows.len() - 1) { if (rows.get(i).nm == nm) { return i } }
     return -1
 }
-dump6(base<Int>, tag<String>)<Int> -> {
+dump_all(base<Int>, tag<String>, count<Int>)<Int> -> {
     freedom {
-        rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
-        for (rj in 0..5) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8); acc = acc + rv.to_string() + " " }
+        iv<Int> = 0; acc<String> = ""; rj<Int> = 0
+        for (rj in 0..count - 1) { iv = 0; cuMemcpyDtoH_v2(loc(iv), base + rj * 8, 8); acc = acc + iv.to_string() + " " }
         println("Q8_0 " + tag + " -> " + acc)
     }
     return 0
@@ -164,7 +164,9 @@ main()<Int> -> {
             rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, PK, WA, nl, 0)
             if (rc != 0) { println("LAUNCH_FAIL"); return 33 }
             cuCtxSynchronize()
-            dump6(WA, nm)
+            ct<Int> = 4096
+            if (nl < ct) { ct = nl }
+            dump_all(WA, nm, ct)
         }
         cuMemFree_v2(PK); cuMemFree_v2(WA)
         println("Q8_0_DRIVER_DONE")

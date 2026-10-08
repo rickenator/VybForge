@@ -93,11 +93,11 @@ parse_ref(rows<String>)<Vec<RefLine>> -> {
 // numbers. The reference writes the same full list, so the gate compares all 4096 elements.
 dump_all(base<Int>, tag<String>, count<Int>)<Int> -> {
     freedom {
-        rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
+        iv<Int> = 0; acc<String> = ""; rj<Int> = 0
         for (rj in 0..count - 1) {
-            rv = 0.0
-            cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8)
-            acc = acc + rv.to_string() + " "
+            iv = 0
+            cuMemcpyDtoH_v2(loc(iv), base + rj * 8, 8)
+            acc = acc + iv.to_string() + " "
         }
         println("IQ2_S " + tag + " -> " + acc)
     }

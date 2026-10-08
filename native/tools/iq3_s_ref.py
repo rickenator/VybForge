@@ -169,7 +169,10 @@ def main():
                     indep = f"llama.cpp-C=DIFFERS maxabs={md:.3e}"
                     differed += 1
 
-            vals = " ".join(f"{v:.17g}" for v in ours)
+            _sl = ours[:4096]
+            import struct as _bs
+            vals = " ".join(str(_q) for _q in
+                              _bs.unpack("<%dq" % len(_sl), np.asarray(_sl, dtype="<f8").tobytes()))
             fh.write(f"IQ3_S {name}@{t['off']} -> {vals}\n")
             print(f"IQ3_S_REF {name} blocks={nbytes // BLOCK} numel={ours.size} {indep}")
 

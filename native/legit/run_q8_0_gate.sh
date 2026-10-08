@@ -9,13 +9,24 @@
 # mistake: two implementations sharing conventions can be wrong together.
 #
 # The compared values are the first 6 elements of four tensors. Tolerance is maxrel 1e-5: the
-# Tolerance maxrel 1e-5, and what that number actually measures: the DRIVER's dump carries SIX
-# significant digits (Vyb's Float printing), and the measured difference is EXACTLY the reference
-# rounded to those six digits — verified by reproducing the dump that way. So this gate resolves
-# layout, scale, ordering and table errors (all O(1) by nature) and CANNOT resolve an arithmetic
-# difference below ~1e-5. Tightening it means dumping the value's BITS instead of its decimal form.
+# Criterion: EXACT, element by element, over the first 4096 elements of each tensor.
+#
+# Neither side prints decimals any more. Each prints the signed 64-bit integer that the value's
+# f64 bits spell (the driver copies the 8 bytes of the output slot into a Vyb Int; the reference
+# unpacks '<q'), and native/tools/compare_bits.py compares those integers, reporting the number of
+# differing elements and the worst gap in ulp. Agreement is therefore identity, not "within a
+# rounding floor": a 1-ulp arithmetic difference is visible, and an O(1) layout/scale/table error
+# is impossible to miss.
+#
+# This replaced a 1e-5 maxrel criterion that measured the DUMPS rather than the kernels — the old
+# drivers printed six significant digits, so every gate reported ~4.5e-6 that was exactly the
+# reference rounded to six figures (exposed by BF16, which does no arithmetic at all). Measured
+# now: 65536 elements across the five quant types, ZERO differing, every tensor exact — which is
+# why 0 ulp is the default and not a hopeful tolerance. Triaging a toolchain change that moves the
+# last bit: VYBFORGE_MAXULP=<n>.
 
 set -u
+MAXULP="${VYBFORGE_MAXULP:-0}"   # 0 ulp = bit-exact (the measured result); raise only to triage
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$root/vybenv.sh" || exit 1
 
@@ -89,55 +100,23 @@ if ! grep -q "^Q8_0_DRIVER_DONE" "$drv_out"; then
   fail=1
 else
   cmp_out="$work/compare.txt"
-  env -u PYTHONPATH "$py" - "$drv_out" "$root/native/out/q8_0_ref.txt" "$cmp_out" <<'PY'
-import sys
-drv, ref, outp = sys.argv[1], sys.argv[2], sys.argv[3]
-def parse(p, tag):
-    got = {}
-    for line in open(p):
-        if line.startswith(tag + " "):
-            parts = line.split("->")
-            got[parts[0].split()[1]] = [float(x) for x in parts[1].split()]
-    return got
-d, r = parse(drv, "Q8_0"), parse(ref, "Q8_0")
-lines = []
-worst_rel = 0.0
-missing = [k for k in r if k not in d]
-extra = [k for k in d if k not in r]
-for k in sorted(r):
-    if k not in d:
-        continue
-    if len(d[k]) != len(r[k]):
-        lines.append(f"MISMATCH {k} len {len(d[k])} != {len(r[k])}")
-        continue
-    md = max(abs(a - b) for a, b in zip(d[k], r[k]))
-    rel = max(abs(a - b) / max(abs(b), 1e-12) for a, b in zip(d[k], r[k]))
-    worst_rel = max(worst_rel, rel)
-    lines.append(f"TENSOR {k} maxabs={md:.3e} maxrel={rel:.3e}")
-for k in missing:
-    lines.append(f"MISSING_IN_DRIVER {k}")
-for k in extra:
-    lines.append(f"EXTRA_IN_DRIVER {k}")
-lines.append(f"TENSORS_COMPARED {len(r) - len(missing)}")
-lines.append(f"WORST_REL {worst_rel:.3e}")
-open(outp, "w").write("\n".join(lines) + "\n")
-PY
+  "$py" "native/tools/compare_bits.py" "$drv_out" "native/out/q8_0_ref.txt" "Q8_0" "$cmp_out" >/dev/null
   cat "$cmp_out" | sed 's/^/      /'
   ncmp="$(grep -o '^TENSORS_COMPARED [0-9]*' "$cmp_out" | cut -d' ' -f2)"
-  worst="$(grep -o '^WORST_REL .*' "$cmp_out" | cut -d' ' -f2)"
-  if grep -qE "^(MISMATCH|MISSING_IN_DRIVER|EXTRA_IN_DRIVER)" "$cmp_out"; then
-    step "GPU kernel vs reference" "FAIL (tensor set or length mismatch)"
+  worst="$(grep -o '^WORST_ULP [0-9]*' "$cmp_out" | cut -d' ' -f2)"
+  if grep -qE "^(UNREADABLE|STALE_DUMP|LENGTH_MISMATCH|MISMATCH|MISSING_IN_DRIVER|EXTRA_IN_DRIVER)" "$cmp_out"; then
+    step "GPU kernel vs reference (exact bits)" "FAIL (tensor set or length mismatch)"
     fail=1
   elif [ "${ncmp:-0}" = "0" ]; then
-    step "GPU kernel vs reference" "FAIL (nothing compared)"
+    step "GPU kernel vs reference (exact bits)" "FAIL (nothing compared)"
     fail=1
   else
-    ok="$(env -u PYTHONPATH "$py" -c "import sys; w=float('$worst'); print('1' if w <= 1e-5 else '0')" 2>/dev/null)"
+    ok="$(env -u PYTHONPATH "$py" -c "import sys; w=int('$worst'); print('1' if w <= $MAXULP else '0')" 2>/dev/null)"
     if [ "$ok" = "1" ]; then
-      step "GPU kernel vs reference" "OK ($ncmp tensors, worst rel $worst <= 1e-5)"
+      step "GPU kernel vs reference (exact bits)" "OK ($ncmp tensors, worst $worst ulp <= $MAXULP)"
       proven=$((proven + 1))
     else
-      step "GPU kernel vs reference" "FAIL (worst rel $worst > 1e-5)"
+      step "GPU kernel vs reference (exact bits)" "FAIL (worst $worst ulp > $MAXULP)"
       fail=1
     fi
   fi

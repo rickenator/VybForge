@@ -367,13 +367,14 @@ Mapped steps (each one gated, in order):
   * the numpy reference `native/tools/q8_0_ref.py` is **bit-identical to the independent python
     `gguf` package's dequantizer on 4/4 tensors**; without that second implementation the
     comparison would only prove our code agrees with our code (the #22 lesson);
-  * the GPU kernel matches that reference to **maxrel 4.2e-6**. That figure is NOT the kernel's
-    arithmetic — it is the driver's dump precision: the Vyb-side dump carries **six significant
-    digits**, and the measured difference is exactly the reference rounded to those six (verified by
-    reproducing the dump that way). So these gates resolve layout, scale, ordering and table errors,
-    which are O(1) by nature, and cannot resolve an arithmetic difference below ~1e-5; dumping the
-    value's BITS instead of its decimal form is how to tighten them. The same caveat applies to the
-    measured figures in S0.5–S0.9.
+  * the GPU kernel is **BIT-EXACT to that reference**: 0 differing elements out of 16384 (4 tensors ×
+    the first 4096 elements), every tensor exact. Both sides now dump the signed 64-bit integer that
+    the value's f64 bits spell, and `native/tools/compare_bits.py` compares those integers — so the
+    criterion is identity, and a 1-ulp difference would show. This replaced a 1e-5 `maxrel` that was
+    measuring the DUMPS, not the kernels: the old drivers printed six significant digits, so every
+    gate reported ~4.5e-6 that was exactly the reference *rounded to six figures* — a defect a type
+    that does no arithmetic at all (BF16) finally exposed. Measured across the five quant types:
+    **65536 elements, zero differing**.
 
   Two producer bugs surfaced while wiring this up, both of the "looks fine, decodes to garbage"
   kind, and both are now fixed in `native/gguf/ridge_inventory.py`:
@@ -406,8 +407,8 @@ Mapped steps (each one gated, in order):
   the kernel now takes `(grid, q, o, n, z)` like any other and two tables can coexist in one
   kernel. Uploads became a single `cuMemcpyHtoD` per buffer instead of one 8-byte copy per element,
   which in turn let the GPU check stop sampling: it compares **every one of the 4096 elements** of
-  each slice against the reference, not the first six. Measured: GPU vs reference **maxrel 4.6e-6**
-  (see S0.5's caveat on what that number measures — the dump's six digits, not the arithmetic).
+  each slice against the reference, not the first six. Measured: **bit-exact — 0 differing out of
+  12288** (3 tensors × 4096).
   Verified on the new build: upstream's own
   `test/ffi/test_cuda_launch_n.vyb` passes on this box, and this gate passes with unchanged values.
 
@@ -429,8 +430,8 @@ Mapped steps (each one gated, in order):
   which is recorded in the tool: a shim must preserve LAYOUT, not merely compile.
 
   Measured: our numpy port vs llama.cpp's own compiled `dequantize_row_q5_K` **3/3 bit-identical**
-  on whole 4096-element slices; GPU kernel vs reference **maxrel 3.8e-6** (per S0.5's caveat: the
-  dump's six digits, not the arithmetic). Gate `native/legit/run_q5k_gate.sh` / `make q5k`, S0.7 in
+  on whole 4096-element slices; the GPU kernel is **bit-exact against that reference — 0 differing
+  of 12288**. Gate `native/legit/run_q5k_gate.sh` / `make q5k`, S0.7 in
   the Phase-2 battery. The
   descriptor's Ridge refusal is now down to **three** (IQ3_S, the GDN layer kind, MTP), with all
   three implemented types asserted absent from it.
@@ -448,8 +449,9 @@ Mapped steps (each one gated, in order):
   `native/out/iq3s_grid.bin` (2048 B, 512×4) for the kernel. The bit-identical agreement is what
   proves the two grids coincide — a wrong grid shows up as value differences, not as a crash.
   Measured: our numpy port vs llama.cpp's own compiled
-  `dequantize_row_iq3_s` **3/3 bit-identical** on whole 4096-element slices; GPU kernel vs
-  reference **maxrel 4.6e-6**. Gate `native/legit/run_iq3_s_gate.sh` / `make iq3_s`, S0.8 in the
+  `dequantize_row_iq3_s` **3/3 bit-identical** on whole 4096-element slices; the GPU kernel is
+  **bit-exact against that reference — 0 differing of 12288**. Gate `native/legit/run_iq3_s_gate.sh`
+  / `make iq3_s`, S0.8 in the
   Phase-2 battery.
 
   **With this, the Ridge TEXT type set is complete.** The descriptor's refusal is down to two
@@ -463,15 +465,15 @@ Mapped steps (each one gated, in order):
   f32, reinterpret), which is exactly ggml's definition. The reference is checked against the
   **independent python `gguf` package** on whole slices: **3/3 bit-identical**.
 
-  This is also where a defect in the OTHER gates surfaced, and it is worth recording rather than
-  quietly fixing: with no arithmetic at all, the GPU-vs-reference difference was still ~4.5e-6 —
-  the same figure every quant gate reported. The cause is not the kernels and not the "f32
-  multiply": **the Vyb-side dump prints six significant digits**, and the measured difference is
-  EXACTLY the reference rounded to those six (verified by reproducing the dump that way, per
-  tensor). The five quant gates' comments now say what their tolerance measures — layout, scale,
-  ordering and table errors, all O(1) — and that it cannot resolve arithmetic below ~1e-5, with
-  dumping the value's BITS named as the way to tighten it. What the gates still do not prove is
-  arithmetic fidelity finer than the dump; saying so is the point.
+  This is also where a defect in the OTHER gates surfaced, and fixing it is the second half of this
+  entry. With no arithmetic at all, the GPU-vs-reference difference was still ~4.5e-6 — the same
+  figure every quant gate reported. The cause was not the kernels and not the "f32 multiply": the
+  Vyb-side dump printed six significant digits, and the measured difference was EXACTLY the
+  reference rounded to those six (verified by reproducing the dump that way, per tensor). Those
+  gates were measuring their own printing. All five now dump the values' BITS and compare them
+  exactly (`native/tools/compare_bits.py`), with 0 ulp as the criterion: they went from "within
+  1e-5, cause unspecified" to **65536 elements compared, zero differing** — and a genuine 1-ulp
+  error, which would have been invisible before, now shows.
 
   Gate `native/legit/run_bf16_gate.sh` / `make bf16`, S0.9 in the Phase-2 battery. With BF16 in,
   the descriptor refuses the mmproj for **one** reason (vision itself) and the caps gate asserts

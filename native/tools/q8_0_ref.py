@@ -122,7 +122,10 @@ def main():
                     indep = f"gguf-package=DIFFERS max|d|={d:.3e}"
                     mismatched += 1
 
-            vals = " ".join(f"{v:.17g}" for v in ours[:6])
+            _sl = ours[:4096]
+            import struct as _bs
+            vals = " ".join(str(_q) for _q in
+                              _bs.unpack("<%dq" % len(_sl), np.asarray(_sl, dtype="<f8").tobytes()))
             line = f"Q8_0 {name} -> {vals}"
             fh.write(line + "\n")
             lines.append(line)
