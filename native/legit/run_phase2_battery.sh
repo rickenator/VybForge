@@ -274,6 +274,23 @@ else
   step "S0.4 decode oracle (llama.cpp)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.1 — Gated DeltaNet layer-op references (VybForge#10 phase 4, item 1) ─────────
+# Gate: native/legit/run_gdn_ops_gate.sh (doc/QWEN35-PHASE4.md). The recurrent layer's three
+# non-trivial pieces — the delta-rule recurrence + state read-out, the causal short convolution,
+# and the l2 norm / RMS norm / gated epilogue — each checked against the SAME libggml the local
+# llama.cpp is built with (a C harness links it and calls the real op), not against our own maths.
+# The norm and conv verifiers also report the opposite convention's error so the agreement is a
+# measurement, not a tolerance nothing could breach. SKIPs without the llama.cpp checkout.
+out="$(./native/legit/run_gdn_ops_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "GDN OPS GATE: PASS"; then
+  step "P4.1 Gated DeltaNet op refs" "PASS ($(echo "$last" | sed 's/GDN OPS GATE: PASS //; s/[()]//g'))"
+elif echo "$last" | grep -q "GDN OPS GATE: SKIP"; then
+  step "P4.1 Gated DeltaNet op refs" "SKIP ($(echo "$last" | sed 's/GDN OPS GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.1 Gated DeltaNet op refs" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

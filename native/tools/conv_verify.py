@@ -78,6 +78,7 @@ def main():
     print(f"CONV_VERIFY n={mine.size} maxabs={float(np.max(diff)):.3e} maxrel={rel:.3e} "
           f"(authority scale {float(np.max(np.abs(ref))):.3e})")
     if rel <= MAXREL:
+        print(f"CONV_VERIFY_SUMMARY maxrel={rel:.3e}")
         print(f"CONV_VERIFY_DONE within maxrel {MAXREL:g} of ggml's ssm_conv")
         return 0
     print(f"CONV_VERIFY_FAIL worse than maxrel {MAXREL:g}")

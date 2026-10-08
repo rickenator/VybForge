@@ -280,24 +280,47 @@ Both novel ops of a recurrent layer are now checked against the real implementat
 l2 normalisation and the gated RMS epilogue (ordinary ops, and closer to the existing prefill path),
 then the layer wiring, then the Vyb kernel and its gate.
 
-### Third unit (started): the l2 normalisation's exact form
+### Third unit: the l2 norm, the RMS norm and the gated epilogue, verified against ggml's own ops
 
 Read first-hand rather than taken from a summary, because the two variants differ by an ulp and a
-summary is not evidence. `ggml/src/ggml-cpu/ops.cpp:4198-4206`:
+summary is not evidence. `ggml/src/ggml-cpu/ops.cpp:4198-4206` (l2) and
+`ggml_compute_forward_rms_norm_f32` (rms):
 
-    ggml_float sum = 0.0;
-    for (i00 < ne00) sum += (ggml_float)(xi * xi);
-    const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+    l2 :  ggml_float sum = 0.0;  sum += (ggml_float)(xi * xi);   scale = 1.0f/fmaxf(sqrtf(sum), eps)
+    rms:  ggml_float sum = 0.0;  sum += (ggml_float)(x[i00]*x[i00]);
+          mean = sum/ne00;                                       scale = 1.0f/sqrtf(mean + eps)
 
-So eps is a FLOOR applied AFTER the square root — not a term inside it — and the accumulation is in
-double while the reciprocal is `sqrtf` (f32) with an f32 `fmaxf`. A port that puts eps inside the
-sqrt, or accumulates in f32, will disagree with the model on the values where the norm is small. The
-norm is taken per head over the 128 state dimensions (`qwen35.cpp:440-443`); the epilogue is
-`RMSNorm(output, ssm_norm) * SiLU(z)` (`qwen35.cpp:257-266`).
+So the two conventions are opposite, and both are easy to get wrong: for the l2 norm **eps is a FLOOR
+applied AFTER the sqrt**; for the RMS norm **eps is INSIDE the sqrt**. In both, the products `x*x` are
+f32, the accumulation is double, the narrowing to f32 happens once and the reciprocal is f32. A port
+that puts eps inside the l2 sqrt, or accumulates in f32, disagrees exactly where the norm is small.
 
-Still to do in this unit: an authority harness for `ggml_l2_norm` and `ggml_rms_norm` (both take
-`(x, eps)`, so one harness with two modes serves both) and the port, done the same way as the two
-above. Not started; recorded here so it is picked up with the semantics already pinned down.
+`native/tools/norm_authority.c` is one harness with three modes — `l2`, `rms`, and `epilogue` (the
+epilogue builds `RMSNorm(output, ssm_norm) * SiLU(z)` out of the same ops the model's graph uses,
+matching `qwen35.cpp build_norm_gated`); `native/tools/norm_verify.py` is the port and the check. At
+the model geometry (`n_col = 128`, l2 over 16 k-heads × 4 tokens, epilogue over 48 v-heads × 4
+tokens, `eps = f_norm_rms_eps = 1e-6`), and with a deliberately tiny-norm leading row so the two eps
+conventions are distinguishable:
+
+    NORM_VERIFY l2       n=8192  maxrel=0.000e+00   opposite convention 7.145e-02
+    NORM_VERIFY rms      n=24576 maxrel=0.000e+00   opposite convention 6.603e-03
+    NORM_VERIFY epilogue n=24576 maxrel=8.775e-08
+
+The l2 and RMS ports reproduce the authority **bit-exactly** (the f32/double split above is the whole
+of it), the epilogue is at the f32 floor (SiLU's `expf` against numpy's), and the opposite convention
+is off by 7e-2 and 7e-3 — so the check can fail, which is what makes the zeros mean something. The
+l2 norm is per head over 128 (`qwen35.cpp:440-443`) and the epilogue's weight (`ssm_norm`) is
+per-channel `{head_v_dim}`; both ops normalise along `ne0` only, so every trailing dim of the model's
+tensor is just another row in the harness.
+
+**All three units of item 1's reference work are now pinned to the real implementation**, and they no
+longer live only in the transcript: `native/legit/run_gdn_ops_gate.sh` runs all three verifiers and
+`native/legit/run_phase2_battery.sh` carries it as step **P4.1** (SKIP without the llama.cpp
+checkout, so a machine without one cannot quietly look green).
+
+Next, outward: the projections (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, `ssm_out` —
+ordinary `mul_mat`s, but they need an authority of their own, since no harness here calls
+`ggml_mul_mat` yet), then the layer wiring, then the Vyb kernel + driver + gate, then `eng_gdn()`.
 
 
 

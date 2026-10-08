@@ -123,6 +123,7 @@ def main():
             break
 
     if verdict == 0:
+        print(f"GDN_VERIFY_SUMMARY broadcast={mode} maxrel_out={ro:.3e} maxrel_state={rs:.3e}")
         print(f"GDN_VERIFY_DONE the port reproduces ggml's op within maxrel {MAXREL:g}")
     else:
         print("GDN_VERIFY_FAIL neither broadcast reproduces the op")
