@@ -111,11 +111,17 @@ schemacheck:
 # T1 ground truth: tokenize real corpus responses -> token ids + CE labels with the
 # Vyb Qwen3 tokenizer, cross-checked against transformers (reference only).
 #
-# BLOCKED on Vyb#432: encode_corpus.vyb imports tokenizer::{encode} and `import
-# json_parse`, and both modules define `hexval`, so the whole-module import splice
-# fails ("Duplicate symbol after splice: 'hexval'"). Pre-existing — the committed
-# revisions of both modules fail identically. The consumer-side fix is one line
-# (`import json_parse::{parse}`); not applied pending the decision on the Vyb side.
+# RESOLVED (Vyb#432, fixed by 1a9484b9 / merged 74220c3d): the whole-module import
+# splice now gives colliding declarations a per-module identity, so
+# `import tokenizer::{encode}` + `import json_parse` coexist as written — the
+# consumer-side one-liner (`import json_parse::{parse}`) was NOT needed and is not
+# applied. First green run 2026-10-05 against Vyb 7dd83764:
+# `ENCODE_CORPUS_VERIFY: OK  (4/4 exact match, ids+lables derived)`.
+# The oracle needs the repo's own `.venv` to be the numpy/transformers the process
+# actually imports: an ambient PYTHONPATH pointing at another environment's
+# site-packages makes it resolve a foreign numpy and the script SKIPs (reads as a
+# missing dependency when the real cause is the leak) -- invoke it with a clean
+# PYTHONPATH, e.g. `env -u PYTHONPATH make -f native/Makefile encode-corpus`.
 encode-corpus:
 	cd $(ROOT) && $(VYB) native/train/encode_corpus.vyb --module-path native/tokenizer --module-path native/json
 	cd $(ROOT) && .venv/bin/python native/train/verify_encode_corpus.py
