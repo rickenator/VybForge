@@ -57,16 +57,11 @@ read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
     match (open_read(path)) { f -> { match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
     return r
 }
-download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+// One call per buffer: `addr(String)` is the byte buffer itself (Vyb#476), so a whole tensor goes
+// up in a single cuMemcpyHtoD instead of one 8-byte copy per element.
+upload(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
-        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
-        for (ci in 0..(npb / 8) - 1) {
-            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
-            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
-            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
-        }
-        tj<Int> = npb
-        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        if (cuMemcpyHtoD_v2(dst, from<loc<CVoid>>(addr(data)), nbytes) != 0) { return 15 }
         return 0
     }
     return 0
@@ -164,7 +159,7 @@ main()<Int> -> {
             if (rows.get(ix).bytes != want) { println("Q8_0_FAIL " + nm + " bytes " + rows.get(ix).bytes.to_string() + " != " + want.to_string()); return 7 }
             pd<String> = read_model(MODEL, rows.get(ix).off, want)
             if (pd.len() < want) { println("Q8_0_SKIP_MODEL short read " + nm); return 0 }
-            ee<Int> = download(pd, PK, want)
+            ee<Int> = upload(pd, PK, want)
             if (ee != 0) { return 66 }
             rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, PK, WA, nl, 0)
             if (rc != 0) { println("LAUNCH_FAIL"); return 33 }

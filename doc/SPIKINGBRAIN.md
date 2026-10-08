@@ -394,13 +394,17 @@ Mapped steps (each one gated, in order):
   The grid table is never retyped: `native/tools/gen_iq2s_tables.py` extracts it into
   `native/gguf/iq2s_tables.py` (generated, with the upstream commit recorded).
 
-  **The grid rides in the packed buffer.** A 1024×8-byte table cannot be derived and the shared
-  launcher (`cuda_launch4i`) passes exactly four integers, so `q` points at an 8192-byte grid
-  prefix and the blocks start at `q + 8192`; `iq2_s_ref.py` writes the grid image so driver and
-  reference cannot disagree about it. Measured: GPU vs reference **maxrel 1.7e-6** (tolerance
-  1e-5, the f32 floor). This is a WORKAROUND for a runtime limit and is filed as **Vyb#476**
-  (kernel launches carry at most four scalar arguments) — when that lands, the kernel should take
-  the grid as an argument and the prefix convention can be deleted.
+  **The grid is a real fifth argument — and was a workaround for exactly one day.** While the
+  runtime's only launchers took four scalars, this kernel packed the 1024×8-byte table as an
+  8192-byte prefix of its own weight buffer and read its blocks at `q + 8192`. That was FILED as
+  **Vyb#476** rather than left implicit, and the fix landed the same day (`f1a7049d`: `addr()`
+  names any lvalue's storage — including a String's bytes — plus the generic `cuda_launch_n`), so
+  the kernel now takes `(grid, q, o, n, z)` like any other and two tables can coexist in one
+  kernel. Uploads became a single `cuMemcpyHtoD` per buffer instead of one 8-byte copy per element,
+  which in turn let the GPU check stop sampling: it compares **every one of the 4096 elements** of
+  each slice against the reference, not the first six. Measured: GPU vs reference **maxrel 4.6e-6**
+  (tolerance 1e-5, the f32 floor). Verified on the new build: upstream's own
+  `test/ffi/test_cuda_launch_n.vyb` passes on this box, and this gate passes with unchanged values.
 
   Gate `native/legit/run_iq2_s_gate.sh` / `make iq2_s`, S0.6 in the Phase-2 battery. With Q8_0 and
   IQ2_S implemented, the descriptor's Ridge refusal is down to **four** reasons (IQ3_S, Q5_K, the
@@ -410,8 +414,8 @@ Mapped steps (each one gated, in order):
   `native/kernels/q5k.vyb` (`q5kdeq`), 51 tensors / 0.80 GiB: the full-attention layers' q/k/v.
   Layout (176 B): `d` f16, `dmin` f16, `scales[12]` (6-bit scale/min pairs), `qh[32]`, `qs[128]`;
   each 64-value round takes two scale/min pairs and a `1 << (2t+half)` mask for the 5th bit from
-  `qh`. No codebook, so this is a plain four-argument kernel — unlike `iq2sdeq`, which carries an
-  extra 8192-byte grid prefix (Vyb#476).
+  `qh`. No codebook, so this kernel needs no table argument — and since Vyb#476 every kernel can
+  take a fifth argument anyway, so the question no longer arises.
 
   The shared authority gained a second spec here (`native/tools/ggml_dequant_authority.py`,
   spec `q5_K`) rather than a second extractor, and `iq2_s_ref.py` was migrated onto it and

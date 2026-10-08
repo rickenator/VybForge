@@ -24,6 +24,11 @@ extern "C" {
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
                   a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+    # Generic launcher (Vyb#476): no arity cap, no per-argument register class — the caller packs
+    # an array of argument-cell addresses and cuLaunchKernel takes the one pointer.
+    cuda_launch_n(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  kernelParams<Int>, nargs<Int>)<CInt>
 }
 
 u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
@@ -42,16 +47,13 @@ read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
     match (open_read(path)) { f -> { match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
     return r
 }
-download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+// One call per buffer: `addr(String)` is the byte buffer itself (Vyb#476), so a whole tensor or
+// grid image goes up in a single cuMemcpyHtoD. This used to loop one 8-byte copy per element —
+// ~3.5M calls for a full FFN tensor — which was a property of this driver's own declaration, not
+// of the runtime: passing `from<loc<CVoid>>(addr(data))` is enough.
+upload(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
-        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
-        for (ci in 0..(npb / 8) - 1) {
-            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
-            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
-            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
-        }
-        tj<Int> = npb
-        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        if (cuMemcpyHtoD_v2(dst, from<loc<CVoid>>(addr(data)), nbytes) != 0) { return 15 }
         return 0
     }
     return 0
@@ -86,10 +88,17 @@ parse_ref(rows<String>)<Vec<RefLine>> -> {
     }
     return out
 }
-dump6(base<Int>, tag<String>)<Int> -> {
+// Every value of the slice, not a sample: with one-call uploads (Vyb#476) the whole slice is
+// cheap to read back, and a mistake in any sub-group would otherwise hide behind six good
+// numbers. The reference writes the same full list, so the gate compares all 4096 elements.
+dump_all(base<Int>, tag<String>, count<Int>)<Int> -> {
     freedom {
         rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
-        for (rj in 0..5) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8); acc = acc + rv.to_string() + " " }
+        for (rj in 0..count - 1) {
+            rv = 0.0
+            cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8)
+            acc = acc + rv.to_string() + " "
+        }
         println("IQ2_S " + tag + " -> " + acc)
     }
     return 0
@@ -122,26 +131,39 @@ main()<Int> -> {
         fn8<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(fn8), m8, "iq2sdeq") != 0) { return 10 }
 
-        PK<Int> = 0; WA<Int> = 0
-        if (cuMemAlloc_v2(loc(PK), 8192 + SLICE * BB) != 0) { return 11 }
+        # Device buffers: the grid once, the weight bytes per tensor. With addr(String) these go
+        # up in ONE call each (Vyb#476) — no per-element loop.
+        GD<Int> = 0; PK<Int> = 0; WA<Int> = 0
+        if (cuMemAlloc_v2(loc(GD), 8192) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK), SLICE * BB) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(WA), SLICE * 256 * 8) != 0) { return 11 }
-        e0<Int> = download(grid, PK, 8192)
+        e0<Int> = upload(grid, GD, 8192)
         if (e0 != 0) { return 66 }
+        # The kernel's five arguments live in these cells and params[] holds their addresses; the
+        # values are read at launch, so the cells are assigned as work proceeds and params is
+        # built once, before the loop.
+        nl<Int> = SLICE * 256
+        zz<Int> = 0
+        params<[Int; 5]> = [0, 0, 0, 0, 0]
+        params[0] = addr(GD)
+        params[1] = addr(PK)
+        params[2] = addr(WA)
+        params[3] = addr(nl)
+        params[4] = addr(zz)
 
         ri<Int> = 0
         for (ri in 0..refs.len() - 1) {
             nm<String> = refs.get(ri).nm
             pd<String> = read_model(MODEL, refs.get(ri).off, SLICE * BB)
             if (pd.len() < SLICE * BB) { println("IQ2_S_SKIP_MODEL short read " + nm); return 0 }
-            ee<Int> = download(pd, PK + 8192, SLICE * BB)
+            ee<Int> = upload(pd, PK, SLICE * BB)
             if (ee != 0) { return 66 }
-            nl<Int> = SLICE * 256
-            rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, PK, WA, nl, 0)
+            rc<CInt> = cuda_launch_n(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, addr(params), 5)
             if (rc != 0) { println("LAUNCH_FAIL"); return 33 }
             cuCtxSynchronize()
-            dump6(WA, nm)
+            dump_all(WA, nm, nl)
         }
-        cuMemFree_v2(PK); cuMemFree_v2(WA)
+        cuMemFree_v2(GD); cuMemFree_v2(PK); cuMemFree_v2(WA)
         println("IQ2_S_DRIVER_DONE")
         return 0
     }

@@ -11,22 +11,19 @@
 //     idx = qs[4*ib32+l] | ((qh[ib32] << (8-2l)) & 768)      // 10 bits -> 1024 grid entries
 //     val = dl * grid[idx][j] * (sign bit j of qs[32+4*ib32+l] ? -1 : 1)
 //
-// THE GRID TABLE RIDES IN THE BUFFER. iq2s_grid is 1024 x 8 bytes of arbitrary data that cannot
-// be derived, and the shared launcher (cuda_launch4i) passes exactly four integers, so `q` points
-// at an 8192-byte grid prefix and the blocks begin at q + 8192. Callers must pack that prefix;
-// `native/tools/iq2_s_ref.py` writes the matching grid image so the driver and the reference
-// cannot disagree about it.
-// This convention is a WORKAROUND for a runtime limitation, not a design choice: filed as
-// Vyb#476 (kernel launches carry at most four scalar arguments). If that lands, this kernel
-// should take the grid as its own argument and the prefix can go away.
-// Thread = one output element (Float, 8 bytes). Launch via cuda_launch4i.
-iq2sdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+// `grid` is an ORDINARY FIFTH ARGUMENT: 8192 bytes (1024 entries x 8), uploaded once and passed by
+// pointer through the generic launcher `cuda_launch_n`, which packs a caller-built parameter
+// array. This kernel previously had to pack the grid as a PREFIX of its own weight buffer and read
+// its blocks at q + 8192, because the only launchers took four scalars (Vyb#476). That convention
+// is gone: with the table as a real argument, two different tables (IQ2_S's and IQ3_S's) can
+// coexist in one kernel, and no caller has to know a private buffer layout.
+// Thread = one output element (Float, 8 bytes).
+iq2sdeq(grid<Int>, q<Int>, o<Int>, n<Int>, z<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < n) {
-        blocks<Int> = q + 8192
         block<Int> = gid / 256
         e<Int> = gid % 256
-        bb<Int> = blocks + block * 82
+        bb<Int> = q + block * 82
         ib32<Int> = e / 32
         r<Int> = e % 32
         l<Int> = r / 8
@@ -39,7 +36,7 @@ iq2sdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         qsb<Int> = (ld_i8(bb + 2 + 4 * ib32 + l) as Int) & 255
         qhb<Int> = (ld_i8(bb + 66 + ib32) as Int) & 255
         idx<Int> = qsb | ((qhb << (8 - 2 * l)) & 768)
-        gv<Int> = (ld_i8(q + idx * 8 + j) as Int) & 255
+        gv<Int> = (ld_i8(grid + idx * 8 + j) as Int) & 255
         sb<Int> = (ld_i8(bb + 2 + 32 + 4 * ib32 + l) as Int) & 255
         sgn<Int> = (sb >> j) & 1
         val<Float> = dl * (gv as Float)

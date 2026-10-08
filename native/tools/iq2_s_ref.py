@@ -33,9 +33,10 @@ OUT = os.path.join(REPO, "native/out/iq2_s_ref.txt")
 QK_K = 256
 BLOCK = IQ2_S_BLOCK_BYTES
 
-# The checked slice length, in blocks. A full FFN tensor is ~28 MB and the Vyb driver uploads
-# host->device 8 bytes at a time, so the GPU check runs on a real SLICE of a real tensor rather
-# than a whole one. 16 blocks = 4096 elements; the layout work is identical at any length.
+# The checked slice length, in blocks. The GPU check compares EVERY value of the slice (16 blocks
+# = 4096 elements) against this reference, so a mistake in any sub-group shows up; the slice is
+# only a slice to keep the per-run cost low, not because anything about the upload forbids more
+# (Vyb#476 made a whole tensor a single cuMemcpyHtoD, if that is ever wanted).
 SLICE_BLOCKS = 16
 
 
@@ -176,7 +177,7 @@ def main():
                     indep = f"llama.cpp-C=DIFFERS maxabs={md:.3e}"
                     differed += 1
 
-            vals = " ".join(f"{v:.17g}" for v in ours[:6])
+            vals = " ".join(f"{v:.17g}" for v in ours)
             fh.write(f"IQ2_S {name}@{t['off']} -> {vals}\n")
             print(f"IQ2_S_REF {name} blocks={nbytes // BLOCK} numel={ours.size} {indep}")
 
