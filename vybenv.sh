@@ -88,6 +88,15 @@ _vybenv_inferred=""
 
 export VYBHOME VYB VYB_STDLIB
 
+# Model paths (#18): the drivers used to carry a literal /home/rick/Models/... each, which
+# fails silently on any other checkout (a missing file flows through read_bin/download as a
+# short buffer, per #17). Resolve them here, once, from $HOME — this is the only place that
+# needs to know where models live — and export, so `env_get("VYBFORGE_QWEN3_GGUF")` in a
+# driver is the normal path and VYBFORGE_MODELS relocates the whole tree.
+export VYBFORGE_MODELS="${VYBFORGE_MODELS:-${HOME}/Models}"
+export VYBFORGE_QWEN3_GGUF="${VYBFORGE_QWEN3_GGUF:-${VYBFORGE_MODELS}/qwen3/Qwen3-4B-Q4_K_M.gguf}"
+export VYBFORGE_SB_SHARD="${VYBFORGE_SB_SHARD:-${VYBFORGE_MODELS}/spikingbrain-v1-7b-base/pytorch_model-00001.bin}"
+
 # VybOS is a sibling checkout; only the repair and ledger gates use it, so an
 # unresolvable VybOS is left empty and those gates say what they need.
 if [ -z "${VYBOSHOME:-}" ]; then

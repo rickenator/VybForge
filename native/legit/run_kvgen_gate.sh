@@ -8,7 +8,7 @@
 #      to itself, byte-for-byte (sha256 7f738e41…, 107,836 B). That is the property the
 #      Python had and the only self-contained oracle in-tree.
 #   2. FROZEN BASELINE — `513 429` must produce exactly what the Python produced:
-#      native/legit/fixtures/kvresp_train_p429_S513_N429.vyb (158a3402…, 108,070 B),
+#      native/legit/fixtures/kvresp_train_p429_S513_N429.vyb (75ffccfd…, 108,165 B),
 #      captured from `python3 native/train/gen_kv_train.py 513 429 <out>` before the
 #      port. Every replacement in that path is a no-op-or-rewrite sequence, so a
 #      dropped or reordered substitution can only show up as a byte difference here.

@@ -379,7 +379,8 @@ main()<Int> -> {
     jm<String> = env_get("VYB_JSON_MODE") else ""
     JSONMODE<Int> = 0
     if (jm.len() > 0) { JSONMODE = 1 }
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
         if (cuInit(0) != 0) { println("SKIP"); return 0 }

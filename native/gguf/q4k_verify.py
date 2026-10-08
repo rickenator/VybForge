@@ -6,7 +6,7 @@
 import os, struct
 
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 TSV = os.path.join(repo, "native/out/qwen3_4b_tensors.tsv")
 BLK = os.path.join(repo, "native/out/q4k_block.bin")
 REF = os.path.join(repo, "native/out/q4k_ref.txt")

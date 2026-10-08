@@ -4,6 +4,7 @@
 // kernels, no H2D in the loop), runs the shared layer.vyb forward, then the tied
 // lm_head argmax -> next token id. Writes native/out/decode_ids_vyb.txt; the numpy
 // reference (native/gguf/decode_ref.py) must match it token-for-token.
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -388,7 +389,8 @@ main()<Int> -> {
     SEEDLEN<Int> = 2; GEN<Int> = 6
     MAXS<Int> = SEEDLEN + GEN
     EPS<Float> = 0.000001
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
 
     nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()

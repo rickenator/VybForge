@@ -29,7 +29,7 @@ import chain::{tip_hash, serialize, deserialize, signed_append, Record, Chain, S
 import crypto::{ed25519_publickey}
 
 fixture_path()<String> -> {
-    return env_get("FORGE_LEGIT_FIXTURE") else "/home/rick/Projects/VybForge/config/mock-system.json"
+    return env_get("FORGE_LEGIT_FIXTURE") else "config/mock-system.json"
 }
 
 read_file(path<String>)<String> -> {

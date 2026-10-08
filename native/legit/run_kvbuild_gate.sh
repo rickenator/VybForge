@@ -8,7 +8,7 @@
 #
 #   1. PARITY   — the port must reproduce the oracle's output byte-for-byte, pinned by
 #                 native/legit/fixtures/kvresp_train_kv_baseline.sha256
-#                 (e05a7cff…, 103,817 B, 1,247 lines), and report the same four stdout lines
+#                 (86256cd6…, 103,912 B, 1,249 lines), and report the same four stdout lines
 #                 (line count + the three structural checks all True).
 #   2. FRONT-END— `--emit-llvm` on the generated driver must complete semantic analysis
 #                 (codegen for the CUDA driver succeeds; linking is not attempted).
@@ -54,11 +54,11 @@ else
   for want in "helpers ok: True" "per-token fwd ok: True" "tail ok: True"; do
     grep -q "^$want\$" "$WORK/log" || { step "stdout: $want" "FAIL"; ok=0; fail=1; }
   done
-  [ "$got_lines" = "1247" ] || { step "stdout line count" "FAIL (got ${got_lines:-none}, want 1247)"; ok=0; fail=1; }
+  [ "$got_lines" = "1249" ] || { step "stdout line count" "FAIL (got ${got_lines:-none}, want 1249)"; ok=0; fail=1; }
   got_sha="$(sha256sum "$WORK/gen.vyb" | cut -d' ' -f1)"
   got_size="$(wc -c < "$WORK/gen.vyb")"
   if [ "$got_sha" = "$want_sha" ] && [ "$got_size" = "$want_size" ]; then
-    [ $ok -eq 1 ] && step "generated driver parity" "byte-identical ($got_size B, 1247 lines, ${got_sha:0:8}…)"
+    [ $ok -eq 1 ] && step "generated driver parity" "byte-identical ($got_size B, 1249 lines, ${got_sha:0:8}…)"
   else
     step "generated driver parity" "FAIL (got $got_size B ${got_sha:0:8}…, want $want_size B ${want_sha:0:8}…)"
     fail=1

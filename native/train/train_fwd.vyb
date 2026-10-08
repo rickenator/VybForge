@@ -7,6 +7,7 @@
 // (token_embd chunked-dequant -> trans_emb -> gemm -> argmax). Writes:
 //   prefill_hidden_vyb.txt  -- final 36-layer hidden [S,D]
 //   prefill_top1_vyb.txt    -- per-token argmax logit id (tied lm_head)
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -299,7 +300,8 @@ main()<Int> -> {
     NQ<Int> = H * HD; NKV<Int> = KVH * HD; VOCAB<Int> = 151936
     MAXL<Int> = 1; DOLM<Int> = 0        # T2: single training forward, cache activations (no lm_head yet)
     EPS<Float> = 0.000001
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     AF<Float> = 1.0; BF<Float> = 0.0
     rA<Int> = 0; rB<Int> = 0; rC<Int> = 0

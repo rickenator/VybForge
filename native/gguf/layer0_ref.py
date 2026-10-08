@@ -18,7 +18,7 @@ import os, struct
 import numpy as np
 
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 TSV = os.path.join(repo, "native/out/qwen3_4b_tensors.tsv")
 OUT_IN = os.path.join(repo, "native/out/layer0_input.txt")
 OUT_REF = os.path.join(repo, "native/out/layer0_ref.txt")

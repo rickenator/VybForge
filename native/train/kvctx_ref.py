@@ -35,7 +35,7 @@ def lproj(a, nm, L):
     U, V = Lo[L][nm]; return a @ ALL_W[L][WK[nm]] + alpha_r * ((a @ U) @ V)
 te = tens["token_embd.weight"]
 emb_m = None
-with open("/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf", "rb") as fh:
+with open(os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf")), "rb") as fh:
     fh.seek(te["off"]); emb_m = l0.dequant_q6k(fh.read(te["numel"] * 210 // 256)).reshape(te["shape"][1], D)
 INVF = np.fromfile(os.path.join(out, "layer0_invfreq.bin"), "<f8")
 freqs = lambda s_: s_ * INVF[:HD // 2]

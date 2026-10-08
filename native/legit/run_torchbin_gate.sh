@@ -26,7 +26,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$root/vybenv.sh" || exit 1
 
 cd "$root"
-file="${1:-/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin}"
+file="${1:-${VYBFORGE_SB_SHARD:-$HOME/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin}}"
 export VYBFORGE_TB_FILE="$file"
 vz="native/out/tb_zip_listing_vyb.txt"; rz="native/out/tb_zip_listing_ref.txt"
 vp="native/out/tb_pkl_listing_vyb.txt"; rp="native/out/tb_pkl_listing_ref.txt"

@@ -5,7 +5,7 @@
 import os, struct
 
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 ABSOFF = 332415936
 NB = 2048
 PBS = NB * 144

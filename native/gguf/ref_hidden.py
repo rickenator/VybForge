@@ -3,8 +3,8 @@
 for the decode seed [0,1] to native/out/decode_hidden_ref.txt, for comparison
 with the Vyb GPU decode's native/out/decode_hidden_vyb.txt."""
 import os, importlib.util, numpy as np
-repo = "/home/rick/Projects/VybAIConf"
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 spec = importlib.util.spec_from_file_location("l0", os.path.join(repo, "native/gguf/layer0_ref.py"))
 l0 = importlib.util.module_from_spec(spec); spec.loader.exec_module(l0)
 D, H, KVH, HD, FF = 2560, 32, 8, 128, 9728

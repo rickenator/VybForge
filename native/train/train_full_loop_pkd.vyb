@@ -240,7 +240,8 @@ main()<Int> -> {
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
     MAXL<Int> = parse_u(env_get("M2E3_MAXL") else "36",0,99); NSTP<Int> = parse_u(env_get("M2E3_NSTP") else "5",0,99)
     LR<Float> = 0.00005; B1<Float> = 0.9; B2<Float> = 0.999; EPP<Float> = 0.00000001; WDD<Float> = 0.0
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
         if(cuInit(0)!=0){ println("SKIP"); return 0 }

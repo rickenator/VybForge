@@ -3,7 +3,7 @@
 // relocated + path-decoupled module still encodes to the exact reference ids.
 //
 // Run from VybForge root (artifacts/vybos-configurator-lora present):
-//   VYB_STDLIB=/home/rick/Projects/Vyb/stdlib /home/rick/Projects/Vyb/build/vyb \
+//   VYB_STDLIB=$VYB_STDLIB $VYB \
 //       <this file>
 import vllm::{encode, encode_str}
 

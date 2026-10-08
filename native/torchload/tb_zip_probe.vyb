@@ -74,7 +74,7 @@ is_data_record(nm<String>)<Bool> -> {
 }
 
 main()<Int> -> {
-    path<String> = env("VYBFORGE_TB_FILE", "/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
+    path<String> = env("VYBFORGE_TB_FILE", env_get("HOME") + "/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
     out<String> = env("VYBFORGE_TB_OUT", "native/out/tb_zip_listing_vyb.txt")
     BIG<Int> = 300000000
     WIN<Int> = 1048576

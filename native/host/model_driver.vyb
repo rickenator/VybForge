@@ -311,7 +311,8 @@ main()<Int> -> {
         println("PROMPT_MODE=text PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
     }
     S<Int> = prids.len()
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     # ---- S0.2: every dimension is read from the model's OWN config, not spelled here ----
     cfg<ModelConfig> = mc_load(MODEL)
     if (!mc_is_ok(cfg)) {

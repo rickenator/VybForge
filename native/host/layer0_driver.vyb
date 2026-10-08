@@ -6,6 +6,7 @@
 // attn/silu/resid) + qwen3.vyb (split-half rope, f32expand). Packed stays
 // canonical; only this layer expands. Final output (f64) -> text for the numpy
 // contract verifier native/tools/verify_layer0.py.
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -151,7 +152,8 @@ main()<Int> -> {
     S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728
     NQ<Int> = H * HD; NKV<Int> = KVH * HD
     EPS<Float> = 0.000001
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     AF<Float> = 1.0; BF<Float> = 0.0
 

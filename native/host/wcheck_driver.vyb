@@ -3,6 +3,7 @@
 // (Q4_K on L4, Q6_K on L35) and ffn_down. Packs several layers contiguously
 // into one buffer at cumulative offsets (ov2/ov6), dequants with the per-layer
 // kernel, reads back first 6 f64. Compare native/gguf/wcheck_ref.py.
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -97,7 +98,8 @@ dump6(base<Int>, tag<String>)<Int> -> {
 
 main()<Int> -> {
     NLAYS<Int> = 36
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     # attn_v is [nkv, D] and ffn_down is [D, FF] in the GGUF; the transpose divisor is
     # the IN-dim of each. These match the model config (see native/config/model_config.vyb).
     D<Int> = 2560

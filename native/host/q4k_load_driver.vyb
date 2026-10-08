@@ -5,6 +5,7 @@
 // f64 (st_f64), so the expanded buffer is ELC*8 bytes — reported honestly.
 // H2D upload is chunked (8 bytes per CUDA call) and read_at length is checked.
 import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -30,7 +31,9 @@ main()<Int> -> {
     ELC<Int> = NB * 256
 
     data<String> = ""
-    match (open_read("/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf")) {
+    hm<String> = env_get("HOME") else "."
+    ggm<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    match (open_read(ggm)) {
         f -> {
             match (read_at(f, ABSOFF, PBS)) { s -> { data = s } ? -> { return 12 } }
             close(f)

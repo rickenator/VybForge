@@ -15,10 +15,11 @@ cumulative byte-offset index. Usage:
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
-GGUF = '/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf'
+GGUF = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 
 
 def main() -> int:

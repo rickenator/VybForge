@@ -13,7 +13,7 @@ except Exception:
 
 tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "artifacts", "vybos-configurator-lora"))
 out = subprocess.run(
-    ["/home/rick/Projects/Vyb/build/vyb",
+    [os.environ.get("VYB", os.path.expanduser("~/Projects/Vyb/build/vyb")),
      "native/tokenizer/test_tokenizer.vyb", "--module-path", "native/tokenizer"],
     capture_output=True, text=True, cwd=ROOT)
 n = ok = 0

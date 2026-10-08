@@ -283,7 +283,8 @@ main()<Int> -> {
     if (rn.len() > 0) { NRUNS = parse_u(rn, 0, rn.len()) }
     MAXS<Int> = SEEDLEN + GEN
     EPS<Float> = 0.000001
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
 
     nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()

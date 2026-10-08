@@ -3,6 +3,7 @@
 // pattern) + per-layer activation CACHE dumped to native/out/m2e_L{layer}_{t}.txt
 // (matches train_full_ref.py). Nets the full-stack LoRA forward the M2e-2 backward
 // consumes. Uses the combined training module train.ptx (single-module rule).
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -222,7 +223,8 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 main()<Int> -> {
     S<Int> = 2; D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0; MAXL<Int> = 36
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
         if(cuInit(0)!=0){ println("SKIP"); return 0 }

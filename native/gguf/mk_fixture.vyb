@@ -171,7 +171,7 @@ main() -> {
     b = b.concat(q4b)
 
     // ----- write -----
-    out<String> = (env_get("PWD") else "") + "/native/gguf/test.gguf"
+    out<String> = "native/gguf/test.gguf"
     wrote<Int> = 0
     match (open_write(out)) {
         w -> {

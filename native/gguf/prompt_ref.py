@@ -17,7 +17,7 @@ Writes:
 import os, importlib.util, numpy as np
 
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 TSV = os.path.join(repo, "native/out/qwen3_4b_tensors.tsv")
 
 spec = importlib.util.spec_from_file_location("l0", os.path.join(repo, "native/gguf/layer0_ref.py"))

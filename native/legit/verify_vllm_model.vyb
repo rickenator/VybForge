@@ -18,7 +18,7 @@ check(c<Bool>, l<String>)<Int> -> {
 
 main()<Int> -> {
     fails<Int> = 0
-    dir<String> = env_get("VYB_LLM_DIR") else "/home/rick/Projects/VybForge/artifacts/vybos-configurator-lora"
+    dir<String> = env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora"
     # 1. model_load + per-model dir binding
     m<Model> = model_load("admin", dir)
     fails = fails + check(m.name == "admin" && m.dir == dir, "model_load binds name + dir")

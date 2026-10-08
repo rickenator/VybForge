@@ -2,6 +2,7 @@
 // reader that streams the header/info region of the REAL 2.5 GB Qwen3 GGUF by
 // offset (never loads the whole file). Emits config + tensor list to
 // native/out/qwen3_4b_vyb.txt for cross-check vs dump_qwen3_meta.py ground truth.
+import env::{env_get}
 import io::{open_read, read_at, open_write, write_str, close}
 
 struct R8 { v<Int>, off<Int> }        // 8-byte little-endian int + new offset
@@ -55,7 +56,8 @@ skip_value(f<File>, off<Int>, ty<Int>)<Int> -> {
 }
 
 main()<Int> -> {
-    fpath<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    fpath<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     match (open_read(fpath)) {
         f -> {
             # ---- header (24 bytes) ----

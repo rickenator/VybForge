@@ -6,7 +6,7 @@ Writes LoRA bins (U/V per projection, r=2) + per-activation refs (train_layer_*.
 """
 import os, importlib.util, numpy as np
 repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+MODEL = os.environ.get("VYBFORGE_QWEN3_GGUF", os.path.expanduser("~/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"))
 out = os.path.join(repo, "native", "out")
 spec = importlib.util.spec_from_file_location("l0", os.path.join(repo, "native/gguf/layer0_ref.py"))
 l0 = importlib.util.module_from_spec(spec); spec.loader.exec_module(l0)

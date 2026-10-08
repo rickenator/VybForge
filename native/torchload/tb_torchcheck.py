@@ -47,7 +47,7 @@ def parse_listing(path):
 
 def main():
     meta, rows, order = parse_listing(LISTING)
-    path = os.environ.get("VYBFORGE_TB_FILE", "/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
+    path = os.environ.get("VYBFORGE_TB_FILE", os.path.expanduser("~/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin"))
     sd = torch.load(path, map_location="meta", weights_only=True)
     bad = []
     names = [n for n, _ in sd.items()]

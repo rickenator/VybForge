@@ -79,7 +79,7 @@ class Recorder(pickle.Unpickler):
 
 
 def main():
-    path = os.environ.get("VYBFORGE_TB_FILE", "/home/rick/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin")
+    path = os.environ.get("VYBFORGE_TB_FILE", os.path.expanduser("~/Models/spikingbrain-v1-7b-base/pytorch_model-00001.bin"))
     out = os.environ.get("VYBFORGE_TB_OUT", "native/out/tb_pkl_listing_ref.txt")
     size = os.path.getsize(path)
     zf = zipfile.ZipFile(path)

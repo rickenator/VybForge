@@ -10,7 +10,7 @@
 #
 # Vyb's JIT surface has no argv, so the patches path comes from the
 # VYBFORGE_PATCHES env var (default out/patches.jsonl). Run from the repo root
-# with the toolchain binary in VYB_BIN (default /home/rick/Projects/Vyb):
+# with the toolchain binary in VYB_BIN (default $VYB):
 #   VYB_BIN=... $VYB tools/apply_interview.vyb --module-path native/json
 #
 # NOTE (this toolchain build): a match over JsonDoc? can bind its value arm by

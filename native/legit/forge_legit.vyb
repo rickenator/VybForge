@@ -33,10 +33,10 @@ import chain::{new_chain, append, verify, tip_hash, contains, serialize,
 # Path inputs via env (the runner exports FORGE_LEGIT_FIXTURE / FORGE_LEGIT_OUT);
 # sensible defaults when unset. Vyb's JIT surface has no argv.
 fixture_path()<String> -> {
-    return env_get("FORGE_LEGIT_FIXTURE") else "/home/rick/Projects/VybForge/config/mock-system.json"
+    return env_get("FORGE_LEGIT_FIXTURE") else "config/mock-system.json"
 }
 receipt_dir()<String> -> {
-    return env_get("FORGE_LEGIT_OUT") else "/home/rick/Projects/VybForge/native/legit/receipts"
+    return env_get("FORGE_LEGIT_OUT") else "native/legit/receipts"
 }
 
 # Read a file's text ("" on failure).

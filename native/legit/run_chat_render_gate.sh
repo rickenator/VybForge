@@ -37,7 +37,7 @@ step() { printf '%-52s %s\n' "$1" "$2"; }
 cd "$root"
 fx="native/legit/fixtures"
 base="$fx/chat_render_baseline.sha256"
-GGUF="${VYBFORGE_QWEN3_GGUF:-/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf}"
+GGUF="${VYBFORGE_QWEN3_GGUF:-$HOME/Models/qwen3/Qwen3-4B-Q4_K_M.gguf}"
 if [ ! -s "$base" ]; then step "baseline fixture" "MISSING ($base)"; echo; echo "CHAT RENDER GATE: FAIL"; exit 1; fi
 want_txt_sha="$(awk '$3=="native/out/chat_render.txt"{print $1}' "$base")"
 want_txt_sz="$(awk '$3=="native/out/chat_render.txt"{print $2}' "$base")"

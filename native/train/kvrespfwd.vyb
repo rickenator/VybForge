@@ -3,6 +3,7 @@
 // re-forwarding the context every step. Here we build + dump the cache for the 9-token goal
 // context and verify it matches the numpy reference (kvctx_ref.py). Response-forward / backward
 // reuse this CK/CV -> per-layer [MAXS,NKV] slabs. Uses train.ptx kernels (single module).
+import env::{env_get}
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 
 extern "C" {
@@ -304,7 +305,8 @@ main()<Int> -> {
     if (S > 96) { println("GOAL_TOO_LONG got=" + S.to_string() + " max=96 (MAXS: the per-layer slab must also hold the generated response rows)"); return 35 }
     D<Int> = 2560; H<Int> = 32; KVH<Int> = 8; HD<Int> = 128; FF<Int> = 9728; R<Int> = 2
     NQ<Int> = H*HD; NKV<Int> = KVH*HD; EPS<Float> = 0.000001; AR<Float> = 2.0; POS<Int> = 0
-    MODEL<String> = "/home/rick/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
     TSV<String> = "native/out/qwen3_4b_tensors.tsv"
     freedom {
         if (cuInit(0) != 0) { println("SKIP"); return 0 }
