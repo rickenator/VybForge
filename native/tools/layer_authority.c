@@ -148,10 +148,17 @@ int main(int argc, char ** argv) {
     struct ggml_context * ctx = ggml_init(ip);
     if (!ctx) { fprintf(stderr, "LA_ERR ggml_init\n"); return 4; }
 
+    // The window/state blocks are OPTIONAL: a file without them is a first-token step (both zero),
+    // which keeps the older fixtures valid (unit 5 writes no window/state).
+    const size_t n_tail = n_win + n_st;
+    const size_t n_base = total - n_tail;
     float * buf = (float *) xmalloc(total * sizeof(float));
     FILE * f = fopen(argv[1], "rb");
     if (!f) { fprintf(stderr, "LA_ERR open %s\n", argv[1]); return 2; }
-    if (fread(buf, sizeof(float), total, f) != total) { fprintf(stderr, "LA_ERR short read\n"); return 3; }
+    if (fread(buf, sizeof(float), n_base, f) != n_base) { fprintf(stderr, "LA_ERR short read\n"); return 3; }
+    memset(buf + n_base, 0, n_tail * sizeof(float));
+    size_t got = fread(buf + n_base, sizeof(float), n_tail, f);   // short read => zeros, i.e. a fresh step
+    (void) got;
     fclose(f);
 
     size_t o = 0;
