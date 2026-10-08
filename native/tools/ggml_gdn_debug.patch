@@ -1,0 +1,68 @@
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 001e1ae..27ef4ca 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11,6 +11,8 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -10760,6 +10762,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const int64_t n_tokens = src_v->ne[2];
+     const int64_t n_seqs   = src_v->ne[3];
+ 
++    // TEMPORARY DEBUG (set GGML_GDN_DEBUG=1): dump what the graph actually hands the op.
++    if (getenv("GGML_GDN_DEBUG")) {
++        static int gdn_dbg_n = 0;
++        if (gdn_dbg_n < 3) {
++            gdn_dbg_n++;
++            fprintf(stderr, "GDN_DBG S_v=%lld H=%lld n_tokens=%lld n_seqs=%lld\n",
++                    (long long) S_v, (long long) H, (long long) n_tokens, (long long) n_seqs);
++            const char * nm[7] = { "q", "k", "v", "g", "beta", "state", "dst" };
++            const struct ggml_tensor * ts[7] = { src_q, src_k, src_v, src_g, src_beta, src_state, dst };
++            for (int i = 0; i < 7; i++) {
++                const struct ggml_tensor * t = ts[i];
++                fprintf(stderr,
++                        "GDN_DBG  %-5s ne=(%lld,%lld,%lld,%lld) nb=(%zu,%zu,%zu,%zu) contiguous=%d data=%p\n",
++                        nm[i], (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
++                        (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3],
++                        (int) ggml_is_contiguous(t), (void *) t->data);
++            }
++        }
++    }
++
+     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+@@ -10942,6 +10964,27 @@ void ggml_compute_forward_gated_delta_net(
+         ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+ 
++    // TEMPORARY DEBUG (set GGML_GDN_DEBUG=1): dump every tensor the op is handed, at the entry
++    // point that catches all paths. This answers "what layout does the op actually see?" directly.
++    if (getenv("GGML_GDN_DEBUG")) {
++        static int gdn_dbg_top = 0;
++        if (gdn_dbg_top < 3) {
++            gdn_dbg_top++;
++            fprintf(stderr, "GDN_DBG top: ith=%d nth=%d\n", params->ith, params->nth);
++            const char * nm[7] = { "q", "k", "v", "g", "beta", "state", "dst" };
++            for (int i = 0; i < 7; i++) {
++                const struct ggml_tensor * t = (i < 6) ? dst->src[i] : dst;
++                if (!t) { fprintf(stderr, "GDN_DBG  %-5s (null)\n", nm[i]); continue; }
++                fprintf(stderr,
++                        "GDN_DBG  %-5s type=%d ne=(%lld,%lld,%lld,%lld) nb=(%zu,%zu,%zu,%zu) contig=%d data=%p\n",
++                        nm[i], (int) t->type,
++                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
++                        (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3],
++                        (int) ggml_is_contiguous(t), (void *) t->data);
++            }
++        }
++    }
++
+     switch (src0->type) {
+         case GGML_TYPE_F32:
+             {

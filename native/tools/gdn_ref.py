@@ -82,15 +82,21 @@ def inputs(T, B, seed=20261008):
     return q, k, v, g, be, st
 
 
-def numpy_rule(q, k, v, g, be, st):
-    """The recurrence, indexing the state exactly as the CPU kernel does."""
+def numpy_rule(q, k, v, g, be, st, bcast="mod"):
+    """The recurrence, indexing the state exactly as the CPU kernel does.
+
+    The q/k head for a v-head is either interleaved (`h % H_k`, what ggml's kernel literally
+    computes) or tiled (`h // (H_v/H_k)`, the alternative ggml's header says it cannot yet select
+    between). Both are implemented so the comparison decides, rather than my assumption.
+    """
     T, B = q.shape[2], q.shape[3]
     state = st.astype(np.float64).copy()          # [j, i, h, b] with state[j,i] = S[i][j]
     out = np.zeros((S, H_V, T, B), dtype=np.float64)
+    rep = H_V // H_K
     for b in range(B):
         for t in range(T):
             for h in range(H_V):
-                hk = h % H_K
+                hk = (h % H_K) if bcast == "mod" else (h // rep)
                 kd = k[:, hk, t, b].astype(np.float64)
                 qd = q[:, hk, t, b].astype(np.float64)
                 vd = v[:, h, t, b].astype(np.float64)
@@ -145,7 +151,17 @@ def main():
     ref_out = np.fromfile(out_path, dtype="<f4").reshape(S, H_V, T, B).astype(np.float64)
     ref_st = np.fromfile(st_path, dtype="<f4").reshape(S, S, H_V, B).astype(np.float64)
 
-    my_out, my_st = numpy_rule(q, k, v, g, be, st)
+    # Which q/k-head broadcast does the op use? Let the data decide instead of my assumption.
+    best = None
+    for mode in ("mod", "tile"):
+        o, s = numpy_rule(q, k, v, g, be, st, bcast=mode)
+        ro = float(np.max(np.abs(o - ref_out)) / max(np.max(np.abs(ref_out)), 1e-30))
+        rs = float(np.max(np.abs(s - ref_st)) / max(np.max(np.abs(ref_st)), 1e-30))
+        print(f"GDN_REF broadcast={mode:4s} maxrel out={ro:.3e} state={rs:.3e}")
+        if best is None or max(ro, rs) < best[0]:
+            best = (max(ro, rs), mode, o, s)
+    worst_rel, mode, my_out, my_st = best
+    print(f"GDN_REF using broadcast={mode}")
 
     verdict = 0
     for name, mine, theirs in (("attention output", my_out, ref_out), ("final state", my_st, ref_st)):

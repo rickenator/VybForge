@@ -160,9 +160,48 @@ dumping the actual `src_state` / `src_g` / `src_beta` pointers and strides as th
 over. That establishes the ground truth directly instead of inferring it from arithmetic that both
 sides believe is right.
 
-Recorded because it is the state of the work, not a result: the probe was run as asked and it did
-NOT settle the question. The two probes and the harness are checked in, the reference still fails at
-model geometry on purpose, and nothing here should be read as agreement.
+### The instrumented run — and what it eliminated
+
+Done as the previous step proposed. A guarded dump was added to the op's entry point
+(`GGML_GDN_DEBUG=1`), ggml-cpu rebuilt, and the harness run against it. The dump is saved as
+`native/tools/ggml_gdn_debug.patch` (llama.cpp's source was then restored and rebuilt clean).
+
+It confirms — from inside the op, not by inference — that the tensors are exactly what the harness
+feeds:
+
+    GDN_DBG  state type=0 ne=(128,128,48,1) nb=(4,512,65536,3145728) contig=1
+    GDN_DBG  dst   type=0 ne=(6144,129,1,1)  nb=(4,24576,3170304,3170304) contig=1
+    GDN_DBG  v ne=(128,48,1,1)  g ne=(1,48,1,1)  beta ne=(1,48,1,1)  q,k ne=(128,16,1,1)
+
+So the state is contiguous in the (i, j, head) order the harness builds, `dst` is the scores
+followed by the state (6144 then 128×6144), and every input is shaped as assumed. **The tensor-layout
+hypothesis is dead** — the delta-function scan's oddities were being read through an output layout
+that is in fact correct, so that scan's inference (mine, not the op's) was the flawed part.
+
+Two corrections to the record, both mine:
+
+* the first instrumented runs printed nothing because `gdn_ref.py` captures the harness's stderr and
+  discards it — not because the op took a different path. The op's path (`one_chunk`) was right all
+  along.
+* the "24 of 32 slots land elsewhere" conclusion came from that same misread and should not be
+  trusted as evidence of anything on the op's side.
+
+### What is still unexplained, and the next step
+
+With layout eliminated, the remaining untested piece was the q/k→v head broadcast — the one thing
+ggml's header says it cannot yet select between (`ggml.h:2564`). Both candidates were implemented
+and both fail against the op: interleaved `h % H_k` gives maxrel 1.36, tiled `h // (H_v/H_k)` 1.23.
+So the broadcast is not the explanation either, and the port still disagrees at `H_v = 48`.
+
+The next step is not another black-box probe: it is to **instrument the kernel's own intermediates**
+(decay, the pre-update prediction, delta, and the first state row/column for head 0) for one call,
+and compare those against the port's same quantities. That localises the divergence to a specific
+line of arithmetic instead of to "the whole op", which is where five probes have now left it.
+
+Also noted, not touched: `src/models/qwen35.cpp` in that checkout carries 27 uncommitted lines that
+are not mine (the sibling `build-fastmtp` tree suggests MTP experimentation). They do not affect the
+harness, which links only libggml, but anyone reproducing this should know they are there.
+
 
 
 
