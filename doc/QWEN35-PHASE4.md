@@ -118,22 +118,53 @@ slots land where the documented layout says they should not** — the op behaves
 were `(i, head, j)` while its own asserts (`delta-net-base.cpp:399`) require
 `ne[0]=ne[1]=S_v, ne[2]=H_v`.
 
-### The likeliest explanation, and the next step
+### Where this stands after following the data path
 
-`qwen35.cpp:401-402` does not hand the op a fresh tensor:
+`build_rs` (`llama-graph.cpp:3361-3382`) reshapes the cache to `(state_size, s->ne[1])` and gathers
+rows via `get_state_rows`. With one sequence that gather is trivial, so the op receives the per-layer
+cache row in its NATURAL order — the same order the harness builds. Meanwhile the reshape in
+`qwen35.cpp:401-402` therefore does not reorder anything either.
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+So the two readings now contradict each other, and one of them is wrong:
 
-It RESHAPES a view of the flat per-layer cache. A reshape reinterprets flat memory, so the tensor's
-logical `ne` and its memory order need not agree — and the op's addressing follows the memory. My
-harness builds the state in the natural (S_v, S_v, H_v) order instead, which is why the asserts pass
-and the addressing still disagrees. The next step is therefore **to mirror the cache's actual order**
-(read how `ssm_states_all` is allocated and what order `build_rs` exposes) and only then re-run the
-scan; the port's geometry mapping can be settled against whatever the scan then shows.
+* the harness's INPUT is natural (just argued from the source), yet
+* the delta-function scan says the op's input addressing is not natural.
 
-Until that is done the reference keeps failing at model geometry on purpose: a harness that reported
-agreement here would be lying.
+The cheapest experiment that separates them, and the one to run first next: **test the OUTPUT
+layout, not the input.** Feed `q = e_j` for one `j` at a time with `state = identity` per head, and
+read both the score output and the state output. If the score output lights up at the slot the
+kernel's formula (`attn_out_base + (iv3*n_tokens*H + iv1)*S_v`, `ops.cpp:10839`) predicts, the
+input side is at fault; if it lights up transposed, the fault is in how the result buffer is read —
+which is the cheap possibility, since every conclusion drawn so far depends on that read.
+
+### And yet the source says both my input and my output read are correct
+
+Read one step further and the contradiction gets worse, which is worth stating plainly rather than
+leaving as a tidy story:
+
+* the kernel derives `S_v = src_v->ne[0]`, `H = src_v->ne[1]` (`ops.cpp:10758-10761`) — my tensors
+  give 4 and 2, as assumed;
+* the state is asserted contiguous and addressed `(iv3*H + iv1)*S_v*S_v` with the row walk
+  `j*S_v + i` (`ops.cpp:10835`, `10849-10850`) — i.e. flat layout `(i, j, head)`, which is exactly the
+  `(S_v, S_v, H_v)` tensor the harness builds;
+* the score output is addressed `attn_out_base + (iv3*n_tokens*H + iv1)*S_v` (`ops.cpp:10839`) — i.e.
+  head `h` at offset `h*S_v`, which is exactly how the harness reads it.
+
+So input layout, output layout and the recurrence all check out against the source, and the
+delta-function scan still says 24 of 32 slots land elsewhere. One of those two things is wrong and I
+have not found which; more probes on my own harness would only re-confirm my own assumptions.
+
+**The next step is therefore to stop probing the harness and have llama.cpp answer**: instrument the
+real path — a debug print in the op (or ggml's own debug facilities) under a real run of the model,
+dumping the actual `src_state` / `src_g` / `src_beta` pointers and strides as the graph hands them
+over. That establishes the ground truth directly instead of inferring it from arithmetic that both
+sides believe is right.
+
+Recorded because it is the state of the work, not a result: the probe was run as asked and it did
+NOT settle the question. The two probes and the harness are checked in, the reference still fails at
+model geometry on purpose, and nothing here should be read as agreement.
+
+
 
 
 ## The sequencing decision
