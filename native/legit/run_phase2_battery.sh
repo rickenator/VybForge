@@ -174,11 +174,15 @@ fi
 # Gate: `make prefill` (doc/SPIKINGBRAIN.md S0.2c). model_driver.vyb now reads its dimensions
 # from the model's own config and its buffer sizes from the tensor core, so this target IS the
 # generality proof: the same forward, gated, with no dimension literals left in the driver.
-out="$(make -f native/Makefile prefill 2>&1)"
+# Stream to a log as well as capturing it: this is the slowest step in the battery (~20 min on
+# this box) and model_driver prints a per-4-layer heartbeat. Without the tee that whole phase is
+# buffered in $out and a working run is indistinguishable from a hang to anyone watching.
+P2C_LOG="${TMPDIR:-/tmp}/phase2_prefill.log"
+out="$(make -f native/Makefile prefill 2>&1 | tee "$P2C_LOG")"
 if echo "$out" | grep -q "PREFILL_HIDDEN_MATCH: OK" && echo "$out" | grep -q "PREFILL_TOP1_MATCH: OK"; then
   step "S0.2c prefill on config dims" "PASS ($(echo "$out" | grep -oE 'maxrel = [0-9.e-]+' | head -1), top1 MATCH)"
 else
-  step "S0.2c prefill on config dims" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+  step "S0.2c prefill on config dims" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; echo "      (full log: $P2C_LOG)"; fail=1
 fi
 
 echo
