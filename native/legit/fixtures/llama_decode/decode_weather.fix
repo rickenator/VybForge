@@ -1,0 +1,10 @@
+# llama.cpp greedy oracle fixture (VybForge#22)
+# regenerate: env -u PYTHONPATH .venv/bin/python native/tools/llama_decode_capture.py
+# exact match; chosen for comfortable margins so it cannot flake on a near-tie
+mode exact
+prompt_text The weather today is sunny and
+prompt_ids 785 9104 3351 374 39698 323
+expect_ids 8205 11 323 279 9315 374 220 17
+expect_text warm, and the temperature is 2
+llama_version 0.3.35
+gguf_id 3a91e2825767

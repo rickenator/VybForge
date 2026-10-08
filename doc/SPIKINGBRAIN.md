@@ -316,6 +316,28 @@ Mapped steps (each one gated, in order):
   `native/out/`, so `make kvctx` and `make kvrespfwd` now regenerate gold and driver output inside the
   target — the same stale-gold trap that had let a frozen constant stay green for weeks.)
 
+- **S0.4 — an INDEPENDENT decode oracle: llama.cpp, per token. LANDED 2026-10-07 (VybForge#22).**
+  Every other inference gate here compares the GPU against the numpy reference, and both implement
+  the same conventions, so agreement proves self-consistency and not correctness — which is how #11
+  (token salad) stayed open while every hidden-state gate passed at 5e-6. This gate compares against
+  llama.cpp on the same GGUF instead, sharing no code with us. Fixtures
+  `native/legit/fixtures/llama_decode/*.fix` are captured by
+  `native/tools/llama_decode_capture.py` (`env -u PYTHONPATH .venv/bin/python …`; `llama-cli` cores
+  on `--help` in this environment, so the binding in the repo `.venv` is the route — token *ids* from
+  the low-level greedy loop, *probabilities* from `create_completion(logprobs=…)`, because
+  `llm.scores` comes back unfilled here). Gate `native/legit/run_decode_oracle_gate.sh`, wired into
+  the battery as S0.4 (SKIP-with-notice when `llama_cpp` or the GGUF is absent; a provenance change —
+  llama.cpp version or GGUF id — FAILS with a recapture instruction rather than letting a stale
+  fixture pass). Each fixture declares a mode: `exact`, or `membership` for a documented near-tie.
+  Measured 2026-10-07: `decode_weather` exact 8/8, `decode_capital_teacherforced` exact,
+  `decode_capital_neartie` membership — and at that tied step **llama.cpp's own two routes
+  disagree** (the low-level loop takes `.`, `create_completion` ranks `,` first by 0.25 logprob),
+  which is why the case asserts membership. That is the honest boundary: the gate proves agreement
+  wherever llama's decision is decisive, not bit-exactness of the distribution. Related and still
+  open: the stale gold `[31784, 31784]` in `native/tools/verify_chat_real.py` (S0.2c above) is the
+  same class of self-consistent constant this gate exists to replace.
+
+
 ### Prompts: what the driver is given, and why the `[0,1]` run looks Chinese and gibberish
 
 `model_driver.vyb` now takes its prompt three ways, and the choice is recorded in the log as

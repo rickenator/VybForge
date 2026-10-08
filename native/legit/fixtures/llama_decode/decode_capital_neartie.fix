@@ -1,0 +1,14 @@
+# llama.cpp greedy oracle fixture (VybForge#22)
+# regenerate: env -u PYTHONPATH .venv/bin/python native/tools/llama_decode_capture.py
+# documented near-tie at step 1, and the two llama.cpp routes agree there: the low-level greedy loop takes '.' while create_completion ranks ',' (lp -0.7092) over '.' (lp -0.9611), a 0.2519 logprob gap. Either side is accepted.
+mode membership
+prompt_text The capital of France is
+prompt_ids 785 6722 315 9625 374
+check_step 1
+allowed_ids 11 13
+low_level_ids 12095 13
+logprob_rank_ids 11 13
+min_gap 0.2519
+note both routes' argmax are accepted; this step is not a stable decision
+llama_version 0.3.35
+gguf_id 3a91e2825767

@@ -1,0 +1,10 @@
+# llama.cpp greedy oracle fixture (VybForge#22)
+# regenerate: env -u PYTHONPATH .venv/bin/python native/tools/llama_decode_capture.py
+# teacher-forced: seed = prompt + llama's own first three tokens, one token expected
+mode exact
+prompt_text The capital of France is Paris. The
+prompt_ids 785 6722 315 9625 374 12095 13 576
+expect_ids 6722
+expect_text capital
+llama_version 0.3.35
+gguf_id 3a91e2825767

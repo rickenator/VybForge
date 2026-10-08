@@ -185,6 +185,21 @@ else
   step "S0.2c prefill on config dims" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; echo "      (full log: $P2C_LOG)"; fail=1
 fi
 
+# ── S0.4 — the independent decode oracle (llama.cpp), VybForge#22 ────────────────────
+# Every other inference item here compares the GPU against the numpy reference, and both
+# implement the same conventions, so agreement proves self-consistency rather than correctness
+# (that is how #11 hid). This one compares against llama.cpp on the same GGUF, per token.
+# SKIP is a pass with a notice: the gate skips when llama_cpp or the GGUF is absent.
+out="$(./native/legit/run_decode_oracle_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "DECODE ORACLE GATE: PASS"; then
+  step "S0.4 decode oracle (llama.cpp)" "PASS ($(echo "$out" | grep -cE '[a-z_]+ +PASS \(') cases match llama.cpp)"
+elif echo "$last" | grep -q "DECODE ORACLE GATE: SKIP"; then
+  step "S0.4 decode oracle (llama.cpp)" "SKIP ($(echo "$out" | grep -m1 'SKIP' | sed 's/^ *[^ ]* *//'))"
+else
+  step "S0.4 decode oracle (llama.cpp)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail
