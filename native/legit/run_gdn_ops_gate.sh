@@ -11,10 +11,12 @@
 #   unit 1  native/tools/gdn_authority.c  + gdn_verify.py    recurrence + state read-out
 #   unit 2  native/tools/conv_authority.c + conv_verify.py   causal depthwise short convolution
 #   unit 3  native/tools/norm_authority.c + norm_verify.py   l2 norm, RMS norm, gated epilogue
+#   unit 4  native/tools/mm_authority.c   + mm_verify.py     the five projections + beta/alpha gates
 #
-# The norm and conv verifiers also report the OPPOSITE convention's error, because a check that
-# cannot fail proves nothing: eps-after-sqrt vs eps-inside-sqrt differ by 7e-2 and 7e-3 here, so the
-# 1e-6 agreement is a real measurement rather than a tolerance nothing could breach.
+# The norm, conv and projection verifiers also report the REJECTED alternative's error, because a
+# check that cannot fail proves nothing: eps-after-sqrt vs eps-inside-sqrt differ by 7e-2 and 7e-3,
+# a transposed mul_mat operand by ~1.2, and softplus without ggml's x > 20 threshold overflows to
+# inf — so the 1e-6 agreements are real measurements, not tolerances nothing could breach.
 #
 # The recurrence verifier refuses multi-token: with T>1 the op runs a second (chunked) kernel whose
 # buffer layout is not yet characterised — see doc/QWEN35-PHASE4.md.
@@ -64,7 +66,7 @@ run_unit() {
   env -u PYTHONPATH "$py" "$script" "$@" >"$log" 2>&1
   if grep -q "^$done_tok" "$log"; then
     local detail
-    detail="$(grep -oE '^(GDN|CONV|NORM)_VERIFY_SUMMARY .*' "$log" | sed 's/^[A-Z_]*SUMMARY //')"
+    detail="$(grep -oE '^(GDN|CONV|NORM|MM)_VERIFY_SUMMARY .*' "$log" | sed 's/^[A-Z_]*SUMMARY //')"
     step "$label" "OK ($detail)"
     proven=$((proven + 1))
   else
@@ -77,11 +79,18 @@ run_unit() {
 run_unit "unit1" native/tools/gdn_verify.py  GDN_VERIFY_DONE  "unit 1 recurrence + read-out" --tokens 1
 run_unit "unit2" native/tools/conv_verify.py CONV_VERIFY_DONE "unit 2 short convolution"
 run_unit "unit3" native/tools/norm_verify.py NORM_VERIFY_DONE "unit 3 l2 / rms / gated epilogue"
+run_unit "unit4" native/tools/mm_verify.py   MM_VERIFY_DONE   "unit 4 projections + beta/alpha gates"
 
-# The norm check's teeth: report the opposite convention's error so a silently-broken verifier is visible.
+# The checks' teeth: report the rejected alternative in each, so a silently-broken verifier is visible.
 if [ -f "$work/unit3.log" ]; then
   opp="$(grep -o 'opposite-convention maxrel=[0-9.e+-]*' "$work/unit3.log" | tr '\n' ' ' | sed 's/  */ /g')"
   [ -n "$opp" ] && step "unit 3 convention discrimination" "$opp (must be >> 1e-6)"
+fi
+if [ -f "$work/unit4.log" ]; then
+  opp="$(grep -o 'transposed-read maxrel=[0-9.e+-]*' "$work/unit4.log" | tr '\n' ' ' | sed 's/  */ /g')"
+  [ -n "$opp" ] && step "unit 4 axis discrimination" "$opp (must be >> 1e-6)"
+  opp="$(grep -oE 'alpha (log1p|no_threshold) +maxrel=(inf|[0-9.e+-]+)' "$work/unit4.log" | tr '\n' ' ' | sed 's/  */ /g')"
+  [ -n "$opp" ] && step "unit 4 softplus discrimination" "$opp (must be non-zero)"
 fi
 
 echo

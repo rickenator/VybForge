@@ -59,25 +59,43 @@ All three unit verifiers now live in a gate instead of only in a transcript:
 `native/legit/run_gdn_ops_gate.sh` (SKIPs without the llama.cpp checkout) is step **P4.1** of
 `native/legit/run_phase2_battery.sh`.
 
-## IMMEDIATE NEXT STEP (option 1)
+## Unit 4 — DONE (fourth unit, same session)
 
-**Unit 4: the linear-attention input wiring.** Read `src/models/qwen35.cpp`
-`build_layer_attn_linear` (~line 353-400) — it is NOT just `mul_mat`s:
+The five projections and the beta/alpha gates are verified against `ggml_mul_mat` / `ggml_sigmoid` /
+`ggml_softplus`: `native/tools/mm_authority.c` (+ `mm_verify.py`), at the 27B Ridge geometry read from
+the GGUF. Measured: the projections at 4.3e-07..5.3e-07 (the f32 floor of a K=5120 dot), beta
+2.7e-06, alpha 2.8e-07 against the real `blk.0.ssm_dt.bias` / `blk.0.ssm_a`.
 
-* `qkvz` = `build_qkvz(cur, il)` → `attn_qkv` (q|k|v concat) and `attn_gate` (`z`);
-* `beta = sigmoid(reshape(mul_mat(ssm_beta, cur), 1, H_v, T, B))`;
-* `alpha = mul_mat(ssm_alpha, cur)`, then `alpha = softplus(alpha + ssm_dt) * ssm_a`
-  (`ssm_a = -exp(A_log)`, computed at load), reshaped to `(1, H_v, T, B)`;
-* then the conv (unit 2), the l2 norm (unit 3), the recurrence (unit 1) and the epilogue (unit 3);
-* `ssm_out` is another `mul_mat` after the reshape back to `(n_embd, T*B)`.
+Three conventions pinned, each with its rejected alternative measured:
+* `ggml_mul_mat(w, x)` is `w^T x`, so a weight of ne (K, N) is a numpy (N, K) array. Written the other
+  way first, every projection came back at maxrel ~1.3 — the recurrence's axis trap, hit again, and
+  now caught by the verifier's transposed-read check (~1.2, must be large).
+* `softplus` is `(x > 20.0f) ? x : logf(1.0f + expf(x))` — threshold at 20, no `log1p`; both the
+  `log1p` and the threshold-less ports diverge to inf. Not a corner case here: the real `ssm_dt` bias
+  reaches 19.25 and 23/192 values land in the threshold branch.
+* `ssm_a` is stored pre-exponentiated (`SSM_A_NOSCAN`; qwen35.cpp comments it `-A_log.exp()`), so do
+  not re-apply the exp. The verifier reads it from the GGUF and asserts all-negative.
 
-So the new authority surface is `ggml_mul_mat` (no harness here calls it yet) plus `ggml_sigmoid`
-and `ggml_softplus` and the `ssm_dt` add — one harness with modes, as before. Note `build_lora_mm`
-takes an optional LoRA scale; the base model has none, so pass `nullptr`.
+`run_gdn_ops_gate.sh` now runs all four units (still step **P4.1** of the phase-2 battery).
 
-Then: the layer wiring, the Vyb kernel + driver + gate, and last the `eng_gdn()` flip.
+## IMMEDIATE NEXT STEP (unit 5)
 
-## After that (do not start before unit 4 closes)
+**The layer wiring.** Assemble the pieces in `build_layer_attn_linear`'s order —
+
+    input -> attn_norm -> [wqkv | wqkv_gate + ssm_beta/sigmoid | ssm_alpha/softplus*ssm_a]
+          -> conv_state + ssm_conv + silu -> split q|k|v -> l2_norm(q), l2_norm(k)
+          -> delta-net recurrence (state) -> RMSNorm*SiLU epilogue -> ssm_out
+          -> residual, then the block's ffn with attn_post_norm
+
+— as one reference and check it end to end against a captured layer (the existing
+`llama_decode_capture.py` / `verify_layer*.py` tools capture per-tensor dumps from this llama.cpp, so
+the wiring can be validated against the real graph rather than against its own parts). The pieces are
+already individually verified, so a wiring mismatch is the thing being looked for; expect the residual
+order and where `z` enters the epilogue to be the likely places for a mistake.
+
+Then: the Vyb kernel + driver + gate, and last the `eng_gdn()` flip.
+
+## After that (do not start before unit 5 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven

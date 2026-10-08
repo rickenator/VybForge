@@ -318,9 +318,52 @@ longer live only in the transcript: `native/legit/run_gdn_ops_gate.sh` runs all 
 `native/legit/run_phase2_battery.sh` carries it as step **P4.1** (SKIP without the llama.cpp
 checkout, so a machine without one cannot quietly look green).
 
-Next, outward: the projections (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, `ssm_out` —
-ordinary `mul_mat`s, but they need an authority of their own, since no harness here calls
-`ggml_mul_mat` yet), then the layer wiring, then the Vyb kernel + driver + gate, then `eng_gdn()`.
+### Fourth unit: the five projections and the beta/alpha gates, verified against ggml's ops
+
+`native/tools/mm_authority.c` (+ `mm_verify.py`) covers the rest of the layer's input path, at the 27B
+Ridge geometry read from the GGUF's own metadata (`n_embd = 5120`, `head_k_dim = head_v_dim = 128`,
+`n_k_heads = 16`, `n_v_heads = 48`, so `key_dim = 2048`, `value_dim = 6144`, `conv_dim = 10240`):
+
+    wqkv      5120 -> 10240
+    wqkv_gate 5120 ->  6144
+    ssm_beta  5120 ->    48      beta  = sigmoid(mm)
+    ssm_alpha 5120 ->    48      alpha = softplus(mm + ssm_dt) * ssm_a
+    ssm_out   6144 ->  5120
+
+Measured, against `ggml_mul_mat` / `ggml_sigmoid` / `ggml_softplus` called directly:
+
+    MM_VERIFY mm wqkv      maxrel=4.714e-07   transposed-read 1.355e+00
+    MM_VERIFY mm wqkv_gate maxrel=5.065e-07   transposed-read 1.344e+00
+    MM_VERIFY mm ssm_beta  maxrel=4.599e-07
+    MM_VERIFY mm ssm_alpha maxrel=4.304e-07
+    MM_VERIFY mm ssm_out   maxrel=5.331e-07   transposed-read 1.084e+00
+    MM_VERIFY beta         maxrel=2.742e-06
+    MM_VERIFY alpha exact  maxrel=2.797e-07   (scale 2.591e+02, real ssm_dt/ssm_a)
+    MM_VERIFY alpha log1p / no_threshold       inf
+
+5e-07 is the f32 accumulation floor of a K = 5120 dot product, not slack. Three conventions were
+pinned by this unit, and each has a rejection measurement to show the check bites:
+
+* **`ggml_mul_mat(w, x)` is `w^T x`**, so a weight of ne (K, N) has the memory of a numpy (N, K)
+  array. The harness was written the other way first and every projection came out at maxrel ~1.3 —
+  the same axis lesson as the recurrence port, now caught by the same "mis-read buffer" check the
+  verifier prints (transposed-read ~1.2, must be large).
+* **`softplus` is `(x > 20.0f) ? x : logf(1.0f + expf(x))`** (ggml-cpu/unary-ops.cpp `op_softplus`),
+  with the threshold and without `log1p`: the `log1p` port and the threshold-less port both diverge to
+  inf on this input. The threshold is not a corner case for this model either — the real `ssm_dt`
+  bias reaches 19.25, and 23 of 192 values in the check land in the threshold branch.
+* **`ssm_a` is already the exponential** (llama.cpp names it `SSM_A_NOSCAN` and multiplies by it;
+  qwen35.cpp comments it `-A_log.exp()`), so the port must not re-apply the exp. The verifier reads
+  `blk.0.ssm_a` from the GGUF and asserts it is all negative; measured `[-3.376e-01, -3.839e-03]`.
+
+So the layer's whole non-recurrent input path is now referenced: projections, both gates, and (from
+units 2-3) the convolution, the two norms and the epilogue. What is left before a Vyb kernel can be
+written is the layer wiring itself and the multi-token/prefill kernel noted below.
+
+Next, outward: **the layer wiring** — assembling conv → l2 norm → recurrence → epilogue → projections
+in the order `build_layer_attn_linear` uses, with the residual and the two norms
+(`attn_norm` / `attn_post_norm`) around it, checked end to end against a captured layer. Then the Vyb
+kernel + driver + gate, and last the `eng_gdn()` flip.
 
 
 
