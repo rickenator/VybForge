@@ -94,25 +94,42 @@ Not covered by unit 5: the FFN half of the block (dense path, already gated in p
 delta-net/conv state (one step from a fresh sequence only), and real weights (synthetic on purpose —
 op semantics are what is under test).
 
-## IMMEDIATE NEXT STEP (unit 6)
+## Unit 6 — DONE (sixth unit, same session): the kernels run on the GPU
 
-**The Vyb kernel for the recurrence + driver + gate.** The reference work for item 1 is complete:
-five units, all passing against the real ops. The next piece of the descriptor's blocker
-(`eng_gdn()` in `native/config/model_caps.vyb:140`) is Vyb code, not reference code:
+`native/kernels/gdn.vyb` (l2norm, delta_step, norm_gated) + `native/host/gdn_driver.vyb` +
+`native/tools/gdn_kernel_verify.py`, gated by `native/legit/run_gdn_kernel_gate.sh` (step **P4.2**,
+SKIP without CUDA/toolchain; `make -f native/Makefile gdn` also runs it). One token at the 27B
+geometry, fp64 both sides, all 802816 outputs compared element by element via raw bit patterns:
 
-1. the kernel (`native/kernels/`): the l2 norm, the delta-rule step and the gated epilogue are the
-   natural first targets — they are elementwise/reduction work with no matmul, so they exercise the
-   Vyb CUDA path without needing a GEMM; the projections and the conv can reuse the existing gemm and
-   FIR kernels (check what `native/kernels/` already has before writing anything).
-2. the driver (`native/host/`) + a `native/legit/run_*_gate.sh` in the shape of the quant gates
-   (SKIP without model/GPU, FAIL if it proved nothing), wired into the phase-2 battery as P4.2.
-3. then the layer wiring in the driver, then flip `eng_gdn()`.
+    q_norm 3.5e-16   k_norm 5.2e-16   gdn_out 6.3e-11   state_out 5.4e-11   epi 1.6e-11
 
-Gate discipline to reuse from the five units: compile/run against the LOCAL authority, dump results
-and compare per stage, and print the rejected alternative's error so a check that cannot fail is
-visible.
+The read-out axis is the trap here and it is now the printed negative: the op's read-out is `m @ q`
+(contraction on the state's SECOND axis), so `out[j] = scale*(gexp*sum_i state[j,i]*q[i] + delta[j]*kq)`.
+Contracting on the first axis instead gave maxrel 1.45e0 on every output while `state_out` stayed
+correct — the per-stage comparison localised it in one run. Gate prints it (plus a no-decay variant,
+1.98e-01) every run.
 
-## After that (do not start before unit 6 closes)
+Not covered by unit 6: no carry-over of state across calls (one token from a state read off disk),
+synthetic fp64 weights, no projections/conv (existing kernels), and no performance work (one thread
+per head).
+
+## IMMEDIATE NEXT STEP (unit 7)
+
+**The layer wiring in Vyb, then the `eng_gdn()` flip.** Now that all three non-gemm pieces run on the
+GPU, the recurrent block can be assembled in a driver the way unit 5's authority assembles it:
+
+1. a driver (`native/host/`) that wires, for one layer and one token: `attn_norm` (existing rmsnorm
+   kernel) → `wqkv`/`wqkv_gate`/`ssm_beta`/`ssm_alpha` (existing gemm + quant kernels; check what
+   `layer_driver.vyb`/`model_driver.vyb` already do for projections) → the gates (sigmoid/softplus —
+   reimplement from `vmath::vexp`, they are not in the kernel set yet) → conv (existing FIR path) →
+   `l2norm` → `delta_step` → `norm_gated` → `ssm_out` → residual;
+2. compare it stage by stage against unit 5's `layer_authority` dumps (the same per-stage discipline,
+   with the reference already written);
+3. then flip `eng_gdn()` in `native/config/model_caps.vyb:140` and re-run the caps gate, which asserts
+   the refusal list SHRINKS as well as the new count (see the skill's gate-and-probe §6) — and re-run
+   P4.1/P4.2 so the flip is not the only thing that changed.
+
+## After that (do not start before unit 7 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven

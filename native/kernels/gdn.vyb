@@ -1,0 +1,148 @@
+// Gated DeltaNet recurrent-layer kernels (phase 4 item 1, unit 6).
+//
+// The three pieces of a qwen35 linear-attention layer that are NOT gemms and therefore have no
+// existing kernel to reuse: the l2 normalisation on q/k, the delta-rule step itself, and the gated
+// RMS epilogue. Everything is fp64; the reference for the gate is therefore fp64 too, so the
+// comparison measures the kernels rather than a precision floor.
+//
+// Layouts are ggml's (ne0 fastest), all fp64, one token (T=1), one sequence (B=1) — the geometry the
+// op's sequential kernel covers:
+//   q, k : ne (S, H_k)      element (i, h)      at i + S*h
+//   v    : ne (S, H_v)      element (i, h)      at i + S*h
+//   gate, beta : ne (1, H_v) at h
+//   state: ne (S, S, H_v)   element (j, i, h)   at i + S*(j + S*h)      (i fastest, then j, then h)
+//   out  : ne (S, H_v)
+//
+// The maths, as established against ggml's own op in unit 1 (MAXREL 1.55e-07):
+//   dec[j,i] = gexp * state[j,i]                  gexp = exp(gate[h])
+//   delta[j] = (v[j] - sum_i dec[j,i] * k_hk[i]) * beta[h]
+//   state'[j,i] = dec[j,i] + delta[j] * k_hk[i]
+//   out[i] = scale * sum_j state'[j,i] * q_hk[j]        scale = 1/sqrt(S)
+// with the q/k -> v head broadcast k_hk = h % H_k (interleaved), established by data, not by reading
+// the header.
+//
+// Written out per head rather than per state element so the whole head is one thread's sequential
+// work — no cross-thread reduction, no barrier, no shared memory.
+//
+// The read-out contraction is the one place this kernel can silently transpose: the op computes
+// out = m @ q, contracting q with the state's SECOND axis (out lives on the first), and delta with
+// the same axis against k. Expanding it avoids a second state sweep and makes the axis explicit:
+//   kq = sum_i k[i]*q[i]
+//   out[j] = scale * (gexp * sum_i state[j,i]*q[i] + delta[j] * kq)
+import vmath::{vexp, vsqrt}
+
+// ---- l2 normalisation along ne0 (per head), eps as a FLOOR after the sqrt (ops.cpp:4198-4206) ----
+// Params (device, 40 B): +0 X, +8 Y, +16 rows, +24 D, +32 eps(Float).
+l2norm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    rows<Int> = ld_i64(p + 16)
+    D<Int> = ld_i64(p + 24)
+    eps<Float> = ld_f64(p + 32)
+    total<Int> = rows * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        rw<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            v<Float> = ld_f64(X + (rw * D + j) * 8)
+            ss = ss + v * v
+        }
+        s<Float> = vsqrt(ss, 40)
+        if (s < eps) { s = eps }
+        xv<Float> = ld_f64(X + (rw * D + d) * 8)
+        st_f64(Y + (rw * D + d) * 8, xv / s)
+    }
+}
+
+// ---- the delta-rule step, one thread per head ------------------------------------------------
+// Params (device, 104 B): +0 Q, +8 K, +16 V, +24 G, +32 BETA, +40 SIN, +48 SOUT, +56 OUT,
+//                         +64 DEL (scratch S*H_v), +72 S, +80 H_k, +88 H_v, +96 scale(Float).
+delta_step(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    K<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    DEL<Int> = ld_i64(p + 64)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    Hv<Int> = ld_i64(p + 88)
+    sc<Float> = ld_f64(p + 96)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < Hv) {
+        h<Int> = gid
+        hk<Int> = h % Hk
+        gexp<Float> = vexp(ld_f64(G + h * 8))
+        be<Float> = ld_f64(BE + h * 8)
+        stb<Int> = S * S * h
+        # kq = sum_i k[i]*q[i] — the scalar the state update contributes to the read-out
+        kq<Float> = 0.0
+        i<Int> = 0
+        for (i in 0..S - 1) {
+            kq = kq + ld_f64(K + (i + S * hk) * 8) * ld_f64(Q + (i + S * hk) * 8)
+        }
+        # pass A: for each output row j, the pre-update prediction over the state's second axis,
+        # delta, and the read-out row — all three from one sweep of that row.
+        j<Int> = 0
+        for (j in 0..S - 1) {
+            acc<Float> = 0.0
+            acq<Float> = 0.0
+            i = 0
+            for (i in 0..S - 1) {
+                sv<Float> = ld_f64(SIN + (stb + j * S + i) * 8)
+                acc = acc + sv * ld_f64(K + (i + S * hk) * 8)
+                acq = acq + sv * ld_f64(Q + (i + S * hk) * 8)
+            }
+            del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+            st_f64(DEL + (j + S * h) * 8, del)
+            st_f64(OUT + (j + S * h) * 8, sc * (gexp * acq + del * kq))
+        }
+        # pass B: the state update
+        j = 0
+        for (j in 0..S - 1) {
+            del2<Float> = ld_f64(DEL + (j + S * h) * 8)
+            i = 0
+            for (i in 0..S - 1) {
+                sv3<Float> = ld_f64(SIN + (stb + j * S + i) * 8)
+                kv3<Float> = ld_f64(K + (i + S * hk) * 8)
+                st_f64(SOUT + (stb + j * S + i) * 8, gexp * sv3 + del2 * kv3)
+            }
+        }
+    }
+}
+
+// ---- the gated RMS epilogue: y = RMSNorm(x, w) * SiLU(z), along ne0 --------------------------
+// Params (device, 56 B): +0 X, +8 Z, +16 W, +24 Y, +32 rows, +40 D, +48 eps(Float).
+norm_gated(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Z<Int> = ld_i64(p + 8)
+    W<Int> = ld_i64(p + 16)
+    Y<Int> = ld_i64(p + 24)
+    rows<Int> = ld_i64(p + 32)
+    D<Int> = ld_i64(p + 40)
+    eps<Float> = ld_f64(p + 48)
+    total<Int> = rows * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        rw<Int> = gid / D
+        d<Int> = gid % D
+        ss<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..D - 1) {
+            v<Float> = ld_f64(X + (rw * D + j) * 8)
+            ss = ss + v * v
+        }
+        r<Float> = 1.0 / vsqrt(ss / (D as Float) + eps, 40)
+        xv<Float> = ld_f64(X + (rw * D + d) * 8)
+        wv<Float> = ld_f64(W + d * 8)
+        zv<Float> = ld_f64(Z + (rw * D + d) * 8)
+        sg<Float> = 1.0 + vexp(0.0 - zv)
+        st_f64(Y + (rw * D + d) * 8, xv * r * wv * (zv / sg))
+    }
+}

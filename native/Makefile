@@ -17,7 +17,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 # can import them (Vyb#442 keeps native/tensor/tensor.vyb itself off this list).
 S02MODS := --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
@@ -52,6 +52,12 @@ rmsnorm: $(ROOT)/native/build/rmsnorm.ptx
 
 mathprobe: $(ROOT)/native/build/math_probe.ptx
 	cd $(ROOT) && $(VYB) native/host/math_probe_driver.vyb
+
+# The GDN recurrent layer's kernels (l2 norm, delta-rule step, gated RMS epilogue). The input fixture
+# is written by the verifier, which also does the comparison — so the gate is the entry point:
+#   ./native/legit/run_gdn_kernel_gate.sh
+gdn: $(ROOT)/native/build/gdn.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_kernel_verify.py
 
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb

@@ -1,0 +1,211 @@
+// GDN recurrent-layer kernel driver (phase 4 item 1, unit 6).
+//
+// Feeds native/build/gdn.ptx's three kernels with a single-token fixture at the 27B Ridge geometry
+// (S=128, H_k=16, H_v=48), reads every result back and prints it as the raw 64-bit pattern of each
+// fp64 element, so the comparison in native/tools/gdn_kernel_verify.py is exact rather than rounded
+// to the 6 significant digits Vyb's Float.to_string() prints.
+//
+// Prints SKIP and returns 0 when CUDA is absent; native/legit/run_gdn_kernel_gate.sh reports that as
+// a skip, not a pass.
+//
+// Input file native/build/gdn_in.bin, fp64, all ggml order (ne0 fastest), one token, one sequence:
+//   q      S*H_k   (i + S*h)                 k      S*H_k
+//   v      S*H_v                             gate   H_v          beta   H_v
+//   state  S*S*H_v  (i + S*(j + S*h))
+//   w_norm S                                 z      S*H_v
+import io::{open_read, read_at, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+// One driver call per slice: addr(String) is the byte buffer itself (Vyb#476).
+upload(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(dst, from<loc<CVoid>>(addr(data)), nbytes) != 0) { return 15 }
+        return 0
+    }
+    return 0
+}
+
+// read_at returns an optional; a short read is reported by the caller as an empty slice.
+read_slice(f<File>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+    return r
+}
+
+// Print a device buffer as one Int per element (the fp64 bit pattern), 64 per line.
+dump_section(base<Int>, count<Int>, nm<String>) -> {
+    println("DUMP " + nm + " " + count.to_string())
+    acc<String> = ""
+    i<Int> = 0
+    for (i in 0..count - 1) {
+        iv<Int> = 0
+        freedom {
+            cuMemcpyDtoH_v2(loc(iv), base + i * 8, 8)
+        }
+        acc = acc + iv.to_string() + " "
+        if (i % 64 == 63) { println(acc); acc = "" }
+    }
+    if (count % 64 != 0) { println(acc) }
+}
+
+// Copy a host Int / Float into a device params buffer word.
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom {
+        cuMemcpyHtoD_v2(PD + off, loc(v), 8)
+    }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom {
+        cuMemcpyHtoD_v2(PD + off, loc(v), 8)
+    }
+}
+
+main()<Int> -> {
+    S<Int> = 128
+    HK<Int> = 16
+    HV<Int> = 48
+    eps<Float> = 0.000001
+    sc<Float> = 0.08838834764831845      # 1/sqrt(128)
+
+    qs<String> = ""
+    ks<String> = ""
+    vs<String> = ""
+    gs<String> = ""
+    bs<String> = ""
+    ss<String> = ""
+    ws<String> = ""
+    zs<String> = ""
+    match (open_read("native/build/gdn_in.bin")) {
+        fh -> {
+            qs = read_slice(fh, 0, S * HK * 8)
+            ks = read_slice(fh, S * HK * 8, S * HK * 8)
+            vo<Int> = 2 * S * HK * 8
+            vs = read_slice(fh, vo, S * HV * 8)
+            go<Int> = vo + S * HV * 8
+            gs = read_slice(fh, go, HV * 8)
+            bo<Int> = go + HV * 8
+            bs = read_slice(fh, bo, HV * 8)
+            so<Int> = bo + HV * 8
+            ss = read_slice(fh, so, S * S * HV * 8)
+            wo<Int> = so + S * S * HV * 8
+            ws = read_slice(fh, wo, S * 8)
+            zo<Int> = wo + S * 8
+            zs = read_slice(fh, zo, S * HV * 8)
+            close(fh)
+        }
+        ? -> { println("GDNK_ERR no input file") ; return 13 }
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/gdn.ptx")) {
+        g -> { ptx = read_slice(g, 0, 65536) ; close(g) }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hmod), ptx) != 0) { return 9 }
+        hf_l2<loc<CVoid>> = from<loc<CVoid>>(0)
+        hf_ds<loc<CVoid>> = from<loc<CVoid>>(0)
+        hf_ng<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf_l2), hmod, "l2norm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hf_ds), hmod, "delta_step") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hf_ng), hmod, "norm_gated") != 0) { return 10 }
+
+        QD<Int> = 0; KD<Int> = 0; VD<Int> = 0; GD<Int> = 0; BED<Int> = 0
+        SIND<Int> = 0; SOUTD<Int> = 0; DELD<Int> = 0
+        QND<Int> = 0; KND<Int> = 0; OUTD<Int> = 0; WD<Int> = 0; ZD<Int> = 0; YD<Int> = 0
+        P1<Int> = 0; P2<Int> = 0; P3<Int> = 0
+        cuMemAlloc_v2(loc(QD), S * HK * 8)
+        cuMemAlloc_v2(loc(KD), S * HK * 8)
+        cuMemAlloc_v2(loc(VD), S * HV * 8)
+        cuMemAlloc_v2(loc(GD), HV * 8)
+        cuMemAlloc_v2(loc(BED), HV * 8)
+        cuMemAlloc_v2(loc(SIND), S * S * HV * 8)
+        cuMemAlloc_v2(loc(SOUTD), S * S * HV * 8)
+        cuMemAlloc_v2(loc(DELD), S * HV * 8)
+        cuMemAlloc_v2(loc(QND), S * HK * 8)
+        cuMemAlloc_v2(loc(KND), S * HK * 8)
+        cuMemAlloc_v2(loc(OUTD), S * HV * 8)
+        cuMemAlloc_v2(loc(WD), S * 8)
+        cuMemAlloc_v2(loc(ZD), S * HV * 8)
+        cuMemAlloc_v2(loc(YD), S * HV * 8)
+        cuMemAlloc_v2(loc(P1), 128)
+        cuMemAlloc_v2(loc(P2), 128)
+        cuMemAlloc_v2(loc(P3), 128)
+
+        upload(qs, QD, S * HK * 8)
+        upload(ks, KD, S * HK * 8)
+        upload(vs, VD, S * HV * 8)
+        upload(gs, GD, HV * 8)
+        upload(bs, BED, HV * 8)
+        upload(ss, SIND, S * S * HV * 8)
+        upload(ws, WD, S * 8)
+        upload(zs, ZD, S * HV * 8)
+
+        # ---- l2 norm on q and k ----
+        put_i(P1, 0, QD) ; put_i(P1, 8, QND) ; put_i(P1, 16, HK) ; put_i(P1, 24, S) ; put_f(P1, 32, eps)
+        rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf_l2)), 8, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+        put_i(P1, 0, KD) ; put_i(P1, 8, KND)
+        rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf_l2)), 8, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+        cuCtxSynchronize()
+        if (rc1 != 0) { println("GDNK_ERR l2 q launch"); println_int(rc1); return 12 }
+        if (rc2 != 0) { println("GDNK_ERR l2 k launch"); println_int(rc2); return 12 }
+
+        # ---- the delta-rule step ----
+        put_i(P2, 0, QND) ; put_i(P2, 8, KND) ; put_i(P2, 16, VD)
+        put_i(P2, 24, GD) ; put_i(P2, 32, BED) ; put_i(P2, 40, SIND)
+        put_i(P2, 48, SOUTD) ; put_i(P2, 56, OUTD) ; put_i(P2, 64, DELD)
+        put_i(P2, 72, S) ; put_i(P2, 80, HK) ; put_i(P2, 88, HV) ; put_f(P2, 96, sc)
+        rc3<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf_ds)), 1, 1, 1, 48, 1, 1, P2, 0, 0, 0)
+        cuCtxSynchronize()
+        if (rc3 != 0) { println("GDNK_ERR delta launch"); println_int(rc3); return 12 }
+
+        # ---- the gated RMS epilogue ----
+        put_i(P3, 0, OUTD) ; put_i(P3, 8, ZD) ; put_i(P3, 16, WD) ; put_i(P3, 24, YD)
+        put_i(P3, 32, HV) ; put_i(P3, 40, S) ; put_f(P3, 48, eps)
+        rc4<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf_ng)), 24, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        cuCtxSynchronize()
+        if (rc4 != 0) { println("GDNK_ERR epilogue launch"); println_int(rc4); return 12 }
+
+        dump_section(QND, S * HK, "q_norm")
+        dump_section(KND, S * HK, "k_norm")
+        dump_section(OUTD, S * HV, "gdn_out")
+        dump_section(YD, S * HV, "epi")
+        dump_section(SOUTD, S * S * HV, "state_out")
+
+        cuMemFree_v2(QD) ; cuMemFree_v2(KD) ; cuMemFree_v2(VD) ; cuMemFree_v2(GD) ; cuMemFree_v2(BED)
+        cuMemFree_v2(SIND) ; cuMemFree_v2(SOUTD) ; cuMemFree_v2(DELD)
+        cuMemFree_v2(QND) ; cuMemFree_v2(KND) ; cuMemFree_v2(OUTD) ; cuMemFree_v2(WD)
+        cuMemFree_v2(ZD) ; cuMemFree_v2(YD)
+        cuMemFree_v2(P1) ; cuMemFree_v2(P2) ; cuMemFree_v2(P3)
+    }
+    println("GDNK_DONE S=128 Hk=16 Hv=48")
+    return 0
+}

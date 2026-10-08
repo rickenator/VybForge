@@ -397,6 +397,48 @@ The reference work for item 1 is complete: all five units pass against the real 
 driver and gate, then the layer wiring in the driver, then the `eng_gdn()` flip. The two open risks to
 carry into that work are the ones recorded below: the multi-token/prefill kernel, and the MTP head.
 
+### Sixth unit: the layer's kernels, on the GPU
+
+`native/kernels/gdn.vyb` is the first Vyb code for the recurrent layer — the three pieces of a qwen35
+linear-attention block that are not gemms:
+
+    l2norm      q, k normalised along ne0 (128 per head), eps as a floor after the sqrt
+    delta_step  the recurrence: one thread per head, no barrier and no shared memory
+    norm_gated  the gated RMS epilogue: RMSNorm(out, ssm_norm) * SiLU(z)
+
+`native/host/gdn_driver.vyb` loads `native/build/gdn.ptx` and runs all three on one token at the 27B
+geometry; `native/tools/gdn_kernel_verify.py` writes the fixture, drives it, and compares **every**
+result element, read back as the raw 64-bit pattern of each fp64 value (so nothing hides in the six
+significant digits `Float.to_string()` prints — the lesson of the quant gates). Measured, 802816
+elements over five sections:
+
+    q_norm     2048    maxrel=3.494e-16        gdn_out    6144    maxrel=6.304e-11
+    k_norm     2048    maxrel=5.235e-16        state_out 786432  maxrel=5.421e-11
+    epi        6144    maxrel=1.609e-11
+
+The reference here is **fp64, matching the kernels**, because the subject is the kernels rather than a
+precision floor. (The pure-op gates do the opposite — they mirror ggml's f32 bodies — because there
+the authority IS f32.)
+
+The read-out axis is where this kernel was wrong first, and it is now the printed negative: the op's
+read-out is `out = m @ q`, contracting q with the state's SECOND axis, so
+
+    kq = sum_i k[i]*q[i];   out[j] = scale * (gexp * sum_i state[j,i]*q[i] + delta[j]*kq)
+
+Written with the contraction on the first axis instead (the natural reading of "the state is [j,i], so
+sum over j"), every output was off by maxrel 1.45e0 while `state_out` stayed correct to 5e-11 — the
+per-stage comparison is what localised it in one run. The gate reports that alternative (and a
+no-decay variant, 1.98e-01) on every run, so the check is visibly able to fail.
+
+Gate: `native/legit/run_gdn_kernel_gate.sh`, step **P4.2** of the phase-2 battery; `make -f
+native/Makefile gdn` builds the PTX and runs the verifier. SKIPs without a CUDA device or a Vyb
+toolchain.
+
+What unit 6 does NOT cover: one token from a state read off disk (no carry-over across calls, so the
+state is exercised as maths but not as a running sequence), synthetic fp64 weights (the engine will
+use quantized ones), the projections and the conv (existing gemm/quant kernels), and speed — one
+thread per head is the simplest correct mapping, not a fast one.
+
 
 
 

@@ -293,6 +293,23 @@ else
   step "P4.1 Gated DeltaNet op refs" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.2 — the GDN recurrent layer's GPU kernels (VybForge#10 phase 4, item 1) ───────
+# Gate: native/legit/run_gdn_kernel_gate.sh (doc/QWEN35-PHASE4.md). P4.1 pinned the reference to
+# ggml's own ops; this is the first Vyb code for the same layer — native/kernels/gdn.vyb implements
+# l2norm, the delta-rule step (one thread per head, no barrier or shared memory) and the gated RMS
+# epilogue, and the gate compares all 802816 outputs of one token at the 27B geometry against an fp64
+# reference, element by element (raw bit patterns, so nothing hides in a decimal dump). Reports the
+# rejected read-out axis (1.4e0) as well. SKIPs without CUDA or a Vyb toolchain.
+out="$(./native/legit/run_gdn_kernel_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "GDN KERNEL GATE: PASS"; then
+  step "P4.2 GDN GPU kernels" "PASS ($(echo "$out" | grep -oE 'elements=[0-9]+' | tail -1))"
+elif echo "$last" | grep -q "GDN KERNEL GATE: SKIP"; then
+  step "P4.2 GDN GPU kernels" "SKIP ($(echo "$last" | sed 's/GDN KERNEL GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.2 GDN GPU kernels" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail
