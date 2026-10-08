@@ -186,6 +186,33 @@ Two corrections to the record, both mine:
 * the "24 of 32 slots land elsewhere" conclusion came from that same misread and should not be
   trusted as evidence of anything on the op's side.
 
+### The intermediate diff, run self-contained
+
+`native/tools/gdn_diff.py` does the whole loop in one process — generate, write, run the harness with
+the op's dump, run the port, diff — because an earlier ad-hoc comparison of mine read a file that a
+later run had regenerated, and reported nonsense. That ad-hoc comparison, *including* its "the op's
+values sit at flat indices 0..3" search result, is void and should not be cited.
+
+What a clean run says, for head 0, first token:
+
+    decay  op=0.695724607  port=0.695724589     (agree, f32 vs f64)
+    beta   op=0.476222813  port=0.476222813     (identical)
+    i=0    k/q/v MATCH exactly; delta op=0.0349552184 port=0.0255914107; attn op=0.00426558638 port=0.00110170828
+    i=1    k op=-0.125186399 port=-0.0155698974 ; q op=-0.134002402 port=-0.0744439587
+    i=2    k op=-0.172529504 port=-0.0382126644 ; q op=0.198019758 port=-0.183470666
+    i=3    k op=0.00990023743 port=-0.0622620061 ; q op=-0.011945161 port=0.0357212573
+    whole-tensor maxrel out=1.356 state=5.364e-01
+
+So element 0 of the inputs agrees and elements 1+ do not — on the same buffer, with the op's own dump
+reporting `nb0 = 4` for k, q and v (contiguous). That is a stride/offset disagreement between the two
+readings, not a formula disagreement, and it is the first signal in this whole investigation that
+points at a specific place rather than at "the op".
+
+Next step: inside the same op call, print `src_k->data`, `src_k->nb[0..3]` and the first four floats
+at the pointer the op will use, *next to* the first four floats the harness wrote. That distinguishes
+"the harness handed over a different buffer than it wrote" from "one side's pointer arithmetic is not
+what the source reads as" — and it is a single run, not a probe series.
+
 ### What is still unexplained, and the next step
 
 With layout eliminated, the remaining untested piece was the q/k→v head broadcast — the one thing
