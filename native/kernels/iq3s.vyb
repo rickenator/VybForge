@@ -1,0 +1,65 @@
+// GGUF block_iq3_s dequant kernel — the edge layers' FFN type of Qwen3.8-27B Ridge (32 tensors,
+// 1.14 GiB: blk.0-3 and blk.60-63's ffn_gate/up/down).
+// Ported faithfully from llama.cpp ggml-quants.c dequantize_row_iq3_s.
+// Derived from llama.cpp (MIT License, https://github.com/ggml-org/llama.cpp):
+// ggml-quants.c, dequantize_row_iq3_s; ggml-common.h iq3s_grid/kmask_iq2xs. See THIRD-PARTY.md.
+//
+// block layout (110 B): d f16 @0, qs[64] @2, qh[8] @66, signs[32] @74, scales[4] @106.
+//   256 values/block as 4 groups of 64; a group is two 32-value halves, each with its own 4-bit
+//   multiplier from scales[g] (low nibble for the first half, high for the second) and its own qh
+//   byte supplying the 9th bit of the grid index. Per sub-group l (0..3) two bytes of qs select
+//   two 4-byte grid entries:
+//     db   = d * (1 + 2*nibble(scales[g], half))
+//     idx1 = qs[2l]   | ((qh[2g+half] << (8-2l)) & 256)
+//     idx2 = qs[2l+1] | ((qh[2g+half] << (7-2l)) & 256)
+//     val  = db * grid[idx][j] * (sign bit of signs[..l] ? -1 : 1)
+//
+// `grid` is iq3s_grid: 512 entries x 4 bytes (2048 bytes), passed as an ordinary argument through
+// the generic launcher (`cuda_launch_n`), like iq2sdeq's 8192-byte table — two tables can coexist
+// in one kernel now (Vyb#476).
+// Thread = one output element (Float, 8 bytes).
+iq3sdeq(grid<Int>, q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        e<Int> = gid % 256
+        bb<Int> = q + block * 110
+        g<Int> = e / 64                 # group 0..3
+        r<Int> = e % 64
+        half<Int> = r / 32              # 0 = low nibble of scales[g], 1 = high
+        rr<Int> = r % 32
+        l<Int> = rr / 8                 # sub-group 0..3
+        jj<Int> = rr % 8                # 0..3 read grid1, 4..7 read grid2
+        d<Float> = ld_f16(bb + 0)
+        sc<Int> = (ld_i8(bb + 106 + g) as Int) & 255
+        nib<Int> = 0
+        if (half == 0) { nib = sc & 15 } else { nib = sc >> 4 }
+        nf<Float> = nib as Float
+        db<Float> = d * (1.0 + 2.0 * nf)
+        qhb<Int> = (ld_i8(bb + 66 + 2 * g + half) as Int) & 255
+        qso<Int> = bb + 2 + 16 * g + 8 * half + 2 * l
+        idx<Int> = 0
+        jg<Int> = 0
+        if (jj < 4) {
+            idx = ((ld_i8(qso) as Int) & 255) | ((qhb << (8 - 2 * l)) & 256)
+            jg = jj
+        } else {
+            idx = ((ld_i8(qso + 1) as Int) & 255) | ((qhb << (7 - 2 * l)) & 256)
+            jg = jj - 4
+        }
+        gv<Int> = (ld_i8(grid + idx * 4 + jg) as Int) & 255
+        sb<Int> = (ld_i8(bb + 74 + 8 * g + 4 * half + l) as Int) & 255
+        sgn<Int> = (sb >> jj) & 1
+        val<Float> = db * (gv as Float)
+        if (sgn == 1) { val = 0.0 - val }
+        # GGUF dequant emits out-major; gemm needs [in,out] (VybForge#11). When z (= in-dim) > 0,
+        # write transposed (see q4kdeq's comment for why).
+        if (z > 0) {
+            r2<Int> = gid / z
+            c2<Int> = gid % z
+            st_f64(o + c2 * n / z * 8 + r2 * 8, val)
+        } else {
+            st_f64(o + gid * 8, val)
+        }
+    }
+}

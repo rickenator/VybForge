@@ -1,0 +1,145 @@
+// BF16 dequant on REAL vision-tower tensors (VybForge#10 phase 3).
+//
+// Reads the tensors named in native/out/bf16_ref.txt (written by native/tools/bf16_ref.py) so this
+// driver and the reference cannot drift onto different tensors, loads the first SLICE_ELEMS
+// elements of each straight from the mmproj, runs bf16deq on the GPU and dumps every value for the
+// gate to compare.
+//
+// No table and no blocks: BF16 is 2 bytes per element, so the kernel takes the plain four
+// arguments and the buffer is just the elements.
+// SKIPs (exit 0, printing SKIP) when CUDA or the model is absent.
+import env::{env_get}
+import io::{open_read, read_at, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) { if ((s.char_at(i) as Int) == nd) { return i } }
+    return -1
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+// One call per buffer via addr(String) (Vyb#476).
+upload(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(dst, from<loc<CVoid>>(addr(data)), nbytes) != 0) { return 15 }
+        return 0
+    }
+    return 0
+}
+struct RefLine { nm<String>, off<Int> }
+// "BF16 <name>@<off> -> ..." -> tensor name and absolute file offset.
+parse_ref(rows<String>)<Vec<RefLine>> -> {
+    out<Vec<RefLine>> = Vec()
+    ln<Int> = rows.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((rows.char_at(i) as Int) == 10) {
+            line<String> = rows.substring(st, i)
+            if (line.len() > 4) {
+                if (line.substring(0, 4) == "BF16") {
+                    atp<Int> = strchr(line, 64, 0)        # '@'
+                    arrow<Int> = strchr(line, 45, 0)      # '-'
+                    if (atp > 0) {
+                        if (arrow > atp) {
+                            nm<String> = line.substring(5, atp)
+                            os<Int> = 0
+                            dg<Int> = atp + 1
+                            while (dg < arrow) {
+                                c<Int> = line.char_at(dg) as Int
+                                if (c >= 48) { if (c <= 57) { os = os * 10 + (c - 48) } }
+                                dg = dg + 1
+                            }
+                            out.push(RefLine { nm = nm, off = os })
+                        }
+                    }
+                }
+            }
+            st = i + 1
+        }
+    }
+    return out
+}
+dump_all(base<Int>, tag<String>, count<Int>)<Int> -> {
+    freedom {
+        rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
+        for (rj in 0..count - 1) {
+            rv = 0.0
+            cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8)
+            acc = acc + rv.to_string() + " "
+        }
+        println("BF16 " + tag + " -> " + acc)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    SLICE<Int> = 4096                # elements; must match SLICE_ELEMS in native/tools/bf16_ref.py
+    EB<Int> = 2                      # bf16 is 2 bytes per element
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_MMPROJ_GGUF") else hm + "/Models/qwen38-27b-ridge/mmproj-Qwen3.8-27B-BF16.gguf"
+    refs<Vec<RefLine>> = parse_ref(read_bin("native/out/bf16_ref.txt"))
+    if (refs.len() == 0) { println("BF16_FAIL no reference lines (run native/tools/bf16_ref.py)"); return 4 }
+    println("BF16_REFS=" + refs.len().to_string())
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        m8<loc<CVoid>> = from<loc<CVoid>>(0)
+        rc8<CInt> = -1; t8<Int> = 0
+        for (t8 in 0..5) { if (rc8 != 0) { m8 = from<loc<CVoid>>(0); rc8 = cuModuleLoadData(loc(m8), read_bin("native/build/bf16.ptx")) } }
+        if (rc8 != 0) { println("MODLOAD_FAIL bf16"); return 9 }
+        fn8<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(fn8), m8, "bf16deq") != 0) { return 10 }
+
+        PK<Int> = 0; WA<Int> = 0
+        if (cuMemAlloc_v2(loc(PK), SLICE * EB) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WA), SLICE * 8) != 0) { return 11 }
+
+        ri<Int> = 0
+        for (ri in 0..refs.len() - 1) {
+            nm<String> = refs.get(ri).nm
+            pd<String> = read_model(MODEL, refs.get(ri).off, SLICE * EB)
+            if (pd.len() < SLICE * EB) { println("BF16_SKIP_MODEL short read " + nm); return 0 }
+            ee<Int> = upload(pd, PK, SLICE * EB)
+            if (ee != 0) { return 66 }
+            rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(fn8)), (SLICE + 255) / 256, 1, 1, 256, 1, 1, PK, WA, SLICE, 0)
+            if (rc != 0) { println("LAUNCH_FAIL"); return 33 }
+            cuCtxSynchronize()
+            dump_all(WA, nm, SLICE)
+        }
+        cuMemFree_v2(PK); cuMemFree_v2(WA)
+        println("BF16_DRIVER_DONE")
+        return 0
+    }
+    return 0
+}

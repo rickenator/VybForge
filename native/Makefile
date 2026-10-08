@@ -483,4 +483,16 @@ iq2_s: $(ROOT)/native/build/iq2s.ptx
 q5k: $(ROOT)/native/build/q5k.ptx
 	./native/legit/run_q5k_gate.sh
 
+# ── IQ3_S dequant (VybForge#10 phase 3, edge-layer FFN type) ────────────────────
+# 32 tensors / 1.14 GiB: blk.0-3 and blk.60-63's ffn_gate/up/down. Grid-based like IQ2_S (512
+# entries), with the table as an ordinary fifth argument.
+iq3_s: $(ROOT)/native/build/iq3s.ptx
+	./native/legit/run_iq3_s_gate.sh
+
+# ── BF16 dequant (VybForge#10 phase 3, the vision tower's weight type) ──────────
+# 110 tensors / 0.85 GiB in the mmproj. Not a block quant — 2 bytes per element, and the kernel
+# uses the language's own ld_bf16. Checked against the independent python gguf package.
+bf16: $(ROOT)/native/build/bf16.ptx
+	./native/legit/run_bf16_gate.sh
+
 

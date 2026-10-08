@@ -132,7 +132,9 @@ eng_type(id<Int>)<Int> -> {
     if (id == 12) { return 1 }     // Q4_K
     if (id == 13) { return 1 }     // Q5_K   (native/kernels/q5k.vyb, make q5k)
     if (id == 14) { return 1 }     // Q6_K
+    if (id == 21) { return 1 }     // IQ3_S  (native/kernels/iq3s.vyb, make iq3_s)
     if (id == 22) { return 1 }     // IQ2_S  (native/kernels/iq2s.vyb, make iq2_s)
+    if (id == 30) { return 1 }     // BF16   (native/kernels/bf16.vyb, make bf16)
     return 0
 }
 eng_gdn()<Int> -> { return 0 }     // Gated DeltaNet recurrent layers

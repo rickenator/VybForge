@@ -210,6 +210,28 @@ else
   step "S0.7 Q5_K dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# ── S0.8 — IQ3_S dequant on real Ridge tensors (VybForge#10 phase 3) ───────────────
+# Gate: native/legit/run_iq3_s_gate.sh — the edge layers' FFN type (32 tensors, 1.14 GiB), the
+# last missing text type. Grid-based like IQ2_S; the numpy port is checked against llama.cpp's own
+# compiled dequant on whole slices before it is used to judge the GPU kernel.
+out="$(./native/legit/run_iq3_s_gate.sh 2>&1)"
+if echo "$out" | grep -q "IQ3_S GATE: PASS"; then
+  step "S0.8 IQ3_S dequant (Ridge)" "$(echo "$out" | grep -o 'IQ3_S GATE: PASS.*' | head -1)"
+else
+  step "S0.8 IQ3_S dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
+# ── S0.9 — BF16 dequant on real vision-tower tensors (VybForge#10 phase 3) ─────────
+# Gate: native/legit/run_bf16_gate.sh. BF16 is the mmproj's weight type (110 tensors, 0.85 GiB) —
+# not a block quant, so the kernel is a conversion and the independent authority is the python gguf
+# package (which does implement BF16). SKIPs when the mmproj is absent.
+out="$(./native/legit/run_bf16_gate.sh 2>&1)"
+if echo "$out" | grep -q "BF16 GATE: PASS"; then
+  step "S0.9 BF16 dequant (vision)" "$(echo "$out" | grep -o 'BF16 GATE: PASS.*' | head -1)"
+else
+  step "S0.9 BF16 dequant (vision)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────
 # Gate: native/legit/run_tensor_gate.sh (doc/SPIKINGBRAIN.md S0.2b). numpy IS the definition of
 # this behaviour, so the table's expectations come from numpy (array strides, ravel_multi_index,

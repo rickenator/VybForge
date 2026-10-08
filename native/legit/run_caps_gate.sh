@@ -10,15 +10,15 @@
 #          cross-checked against an INDEPENDENT parser (native/gguf/ridge_inventory.py, Python,
 #          written separately from the Vyb reader) — two implementations must agree.
 #   Qwen3.8-27B Ridge (the #10 target)
-#       -> UNSUPPORTED, naming EXACTLY one missing quant type (IQ3_S), plus the Gated-DeltaNet
-#          layer kind and the MTP head — nothing more, nothing less — and the hybrid facts the
-#          phase-2 descriptor exists to express (64 text blocks = 16 attention + 48 recurrent,
-#          interval 4, ssm state_size 128, one nextn layer). Q8_0, Q5_K and IQ2_S are NOT in that
-#          list any more: they left it when their kernels landed, and the check asserts their
-#          absence.
+#       -> UNSUPPORTED for exactly TWO STRUCTURAL reasons — the Gated-DeltaNet layer kind and the
+#          MTP head — with every text quant type implemented (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_S,
+#          IQ3_S). The check asserts each of those types is ABSENT from the refusal list. It also
+#          pins the hybrid facts the phase-2 descriptor exists to express: 64 text blocks = 16
+#          attention + 48 recurrent, interval 4, ssm state_size 128, one nextn layer.
 #   mmproj-BF16.gguf (the vision tower)
-#       -> UNSUPPORTED: BF16 and vision, filed as a vision-encoder layout, NOT as a broken text
-#          model.
+#       -> UNSUPPORTED for ONE reason: vision itself. Its weight type (BF16) is implemented, so the
+#          check asserts BF16 is ABSENT from the refusal and that the tower is still filed as a
+#          vision-encoder layout, NOT as a broken text model.
 #   a truncated file
 #       -> UNSUPPORTED with a read reason and no crash. A metadata-intact, table-less file must
 #          never read as SUPPORTED — that is the worst output this module could produce.
@@ -164,14 +164,13 @@ else
     [ "$(cv ATTN_INTERVAL "$out")" = "4" ] || bad="$bad interval=$(cv ATTN_INTERVAL "$out")"
     [ "$(cv SSM_STATE_SIZE "$out")" = "128" ] || bad="$bad ssm_state=$(cv SSM_STATE_SIZE "$out")"
     [ "$(cv NEXTN_TENSORS "$out")" = "4" ] || bad="$bad nextn_tensors=$(cv NEXTN_TENSORS "$out")"
-    # the refusal list must be EXACTLY these three, each named, and no others. Q8_0, IQ2_S and
-    # Q5_K left this list when their kernels landed (make q8_0 / iq2_s / q5k), so the check
-    # asserts their ABSENCE too — a capability that silently stopped being reported would
-    # otherwise read as a passing gate.
+    # the refusal list must be EXACTLY these two, each named, and no others: the text model's quant
+    # types are all implemented now, so what remains is structural. Every type that LEFT the list
+    # (Q8_0, Q5_K, IQ2_S, IQ3_S) is asserted ABSENT, so a capability that silently stopped being
+    # reported cannot read as a passing gate.
     nreasons="$(tr ',' '\n' <<<"$uns" | sed '/^$/d' | wc -l | tr -d ' ')"
-    [ "$nreasons" = "3" ] || bad="$bad reasons=$nreasons"
+    [ "$nreasons" = "2" ] || bad="$bad reasons=$nreasons"
     for want in \
-      "UNSUPPORTED_QUANT_TYPE IQ3_S" \
       "UNSUPPORTED_LAYER_KIND gated-deltanet layers=48" \
       "UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1"; do
       grep -qF "$want" <<<"$uns" || bad="$bad missing[$want]"
@@ -179,12 +178,13 @@ else
     grep -qF "Q8_0" <<<"$uns" && bad="$bad Q8_0-still-refused"
     grep -qF "IQ2_S" <<<"$uns" && bad="$bad IQ2_S-still-refused"
     grep -qF "Q5_K" <<<"$uns" && bad="$bad Q5_K-still-refused"
+    grep -qF "IQ3_S" <<<"$uns" && bad="$bad IQ3_S-still-refused"
     if [ -n "$bad" ]; then
       step "Ridge text model (#10 target)" "FAIL:$bad"
       echo "      unsupported=[$uns]" | sed 's/^/      /'
       fail=1
     else
-      step "Ridge text model (#10 target)" "UNSUPPORTED with 3 named reasons (16 attn + 48 GDN = 64, MTP, IQ3_S; Q8_0 + Q5_K + IQ2_S implemented)"
+      step "Ridge text model (#10 target)" "UNSUPPORTED with 2 named reasons (GDN 48 layers, MTP; all five text quant types implemented)"
       proven=$((proven + 1))
     fi
     type_crosscheck "Ridge text model" "$out" "$ridge"
@@ -210,13 +210,18 @@ else
     [ "$(cv ARCH "$out")" = "clip" ] || bad="$bad arch=$(cv ARCH "$out")"
     [ "$(cv LAYOUT "$out")" = "vision-encoder" ] || bad="$bad layout=$(cv LAYOUT "$out")"
     [ "$(cv VISION "$out")" = "1" ] || bad="$bad vision=$(cv VISION "$out")"
-    grep -qF "UNSUPPORTED_QUANT_TYPE BF16" <<<"$uns" || bad="$bad no-BF16-reason"
+    # The tower's only remaining refusal is vision itself: its weight type (BF16) is implemented,
+    # so the type reason must be ABSENT. One reason, and it must be the capability one.
+    grepf="$(grep -oF 'BF16' <<<"$uns")"
+    [ -z "$grepf" ] || bad="$bad BF16-still-refused"
+    nreasons="$(tr ',' '\n' <<<"$uns" | sed '/^$/d' | wc -l | tr -d ' ')"
+    [ "$nreasons" = "1" ] || bad="$bad reasons=$nreasons"
     grep -qF "UNSUPPORTED_CAPABILITY vision" <<<"$uns" || bad="$bad no-vision-reason"
     if [ -n "$bad" ]; then
       step "vision tower (mmproj)" "FAIL:$bad"
       fail=1
     else
-      step "vision tower (mmproj)" "UNSUPPORTED (clip layout, BF16 + vision)"
+      step "vision tower (mmproj)" "UNSUPPORTED (clip layout, vision only — BF16 type implemented)"
       proven=$((proven + 1))
     fi
     type_crosscheck "vision tower" "$out" "$mmproj"

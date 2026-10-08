@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Q5_K dequant gate (VybForge#10 phase 3 — the full-attention layers' weight type).
+# IQ3_S dequant gate (VybForge#10 phase 3 — the edge layers' FFN type).
 #
-#  1. native/tools/q5k_ref.py dequantizes real tensors from the 12 GiB GGUF with our numpy port
-#     AND with llama.cpp's own `dequantize_row_q5_K` + `get_scale_min_k4`, extracted verbatim and
-#     compiled by the shared authority (native/tools/ggml_dequant_authority.py, spec "q5_K").
-#  2. native/host/q5k_load_driver.vyb runs the GPU kernel on the same tensors — it reads the
-#     tensor list from the reference's output, so the two cannot drift apart — and the values are
-#     compared here.
+# What it proves, in two independent steps:
+#
+#  1. native/tools/iq3_s_ref.py dequantizes real FFN tensors from the 12 GiB GGUF with our numpy
+#     port AND with llama.cpp's OWN dequantize_row_iq3_s — the upstream function body, struct and
+#     512-entry grid table copied verbatim out of the local checkout and compiled as-is by the
+#     shared extractor (native/tools/ggml_dequant_authority.py, spec "iq3_s"). The gguf package has
+#     no IQ3_S, so upstream C is the authority instead.
+#  2. native/host/iq3_s_load_driver.vyb runs the GPU kernel on the same tensors (it reads the
+#     tensor list from the reference's output, so the two cannot drift apart) and every value of
+#     each 4096-element slice is compared here.
 #
 # Tolerance maxrel 1e-5, and what that number actually measures: the DRIVER's dump carries SIX
 # significant digits (Vyb's Float printing), and the measured difference is EXACTLY the reference
@@ -22,43 +26,43 @@ fail=0
 proven=0
 step() { printf '%-46s %s\n' "$1" "$2"; }
 cd "$root"
-work="${VYBFORGE_Q5K_OUTDIR:-$root/native/out/q5_k}"
+work="${VYBFORGE_IQ2S_OUTDIR:-$root/native/out/iq3_s}"
 mkdir -p "$work"
 
 MODEL="${VYBFORGE_RIDGE_GGUF:-$HOME/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf}"
 py=""
-for cand in "${Q5K_PY:-}" "$root/.venv/bin/python" python3; do
+for cand in "${IQ3S_PY:-}" "$root/.venv/bin/python" python3; do
   if [ -n "$cand" ] && "$cand" -c 'import numpy' >/dev/null 2>&1; then py="$cand"; break; fi
 done
 
-echo "Q5_K dequant gate — $(date '+%F %T')"
+echo "IQ3_S dequant gate — $(date '+%F %T')"
 echo "toolchain: $VYB"
 echo
 
 if [ ! -f "$MODEL" ]; then
   step "model present" "SKIP (not on disk: $MODEL)"
-  echo; echo "Q5_K GATE: SKIP (no model — nothing to check)"
+  echo; echo "IQ3_S GATE: SKIP (no model — nothing to check)"
   exit 0
 fi
 if [ -z "$py" ]; then
   step "reference interpreter" "FAIL (no python with numpy)"
-  echo; echo "Q5_K GATE: FAIL"; exit 1
+  echo; echo "IQ3_S GATE: FAIL"; exit 1
 fi
 
 # ── 1. our port vs llama.cpp's own compiled dequant ──────────────────────────────────
 ref_out="$work/ref.log"
-env -u PYTHONPATH "$py" native/tools/q5k_ref.py >"$ref_out" 2>&1
-if ! grep -q "^Q5_K_REF_DONE" "$ref_out"; then
+env -u PYTHONPATH "$py" native/tools/iq3_s_ref.py >"$ref_out" 2>&1
+if ! grep -q "^IQ3_S_REF_DONE" "$ref_out"; then
   step "reference (numpy vs llama.cpp C)" "FAIL (did not complete)"
   tail -8 "$ref_out" | sed 's/^/      /'
-  echo; echo "Q5_K GATE: FAIL"; exit 1
+  echo; echo "IQ3_S GATE: FAIL"; exit 1
 fi
-ntens="$(grep -c '^Q5_K_REF blk' "$ref_out")"
+ntens="$(grep -c '^IQ3_S_REF blk' "$ref_out")"
 ident="$(grep -o 'identical=[0-9]*' "$ref_out" | tail -1 | cut -d= -f2)"
 differ="$(grep -o 'differing=[0-9]*' "$ref_out" | tail -1 | cut -d= -f2)"
 if [ "${differ:-1}" != "0" ]; then
   step "reference vs llama.cpp C" "FAIL ($ident identical, $differ differing)"
-  echo; echo "Q5_K GATE: FAIL"; exit 1
+  echo; echo "IQ3_S GATE: FAIL"; exit 1
 fi
 if [ "${ident:-0}" = "0" ]; then
   step "reference vs llama.cpp C" "WARN (no compiled authority; numpy is the only authority)"
@@ -69,19 +73,19 @@ proven=$((proven + 1))
 
 # ── 2. the GPU kernel on the same tensors ────────────────────────────────────────────
 drv_out="$work/driver.log"
-env -u PYTHONPATH "$VYB" native/host/q5k_load_driver.vyb >"$drv_out" 2>&1
-if grep -qE "^(SKIP|Q5_K_SKIP_MODEL)" "$drv_out"; then
-  step "GPU kernel (q5kdeq)" "SKIP (no CUDA device or model unreadable)"
-  echo; echo "Q5_K GATE: PASS ($proven case: reference only)"
+env -u PYTHONPATH "$VYB" native/host/iq3_s_load_driver.vyb >"$drv_out" 2>&1
+if grep -qE "^(SKIP|IQ3_S_SKIP_MODEL)" "$drv_out"; then
+  step "GPU kernel (iq3sdeq)" "SKIP (no CUDA device or model unreadable)"
+  echo; echo "IQ3_S GATE: PASS ($proven case: reference only)"
   exit 0
 fi
-if ! grep -q "^Q5_K_DRIVER_DONE" "$drv_out"; then
-  step "GPU kernel (q5kdeq)" "FAIL (driver did not complete)"
+if ! grep -q "^IQ3_S_DRIVER_DONE" "$drv_out"; then
+  step "GPU kernel (iq3sdeq)" "FAIL (driver did not complete)"
   tail -8 "$drv_out" | sed 's/^/      /'
   fail=1
 else
   cmp_out="$work/compare.txt"
-  env -u PYTHONPATH "$py" - "$drv_out" "$root/native/out/q5k_ref.txt" "$cmp_out" <<'PY'
+  env -u PYTHONPATH "$py" - "$drv_out" "$root/native/out/iq3_s_ref.txt" "$cmp_out" <<'PY'
 import sys
 drv, ref, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 def parse(p, tag):
@@ -91,7 +95,7 @@ def parse(p, tag):
             head, vals = line.split("->")
             got[head.split()[1].split("@")[0]] = [float(x) for x in vals.split()]
     return got
-d, r = parse(drv, "Q5_K"), parse(ref, "Q5_K")
+d, r = parse(drv, "IQ3_S"), parse(ref, "IQ3_S")
 lines, worst_rel = [], 0.0
 for k in sorted(r):
     if k not in d:
@@ -134,8 +138,8 @@ fi
 
 echo
 if [ "$fail" = "0" ]; then
-  echo "Q5_K GATE: PASS ($proven cases)"
+  echo "IQ3_S GATE: PASS ($proven cases)"
 else
-  echo "Q5_K GATE: FAIL"
+  echo "IQ3_S GATE: FAIL"
 fi
 exit $fail

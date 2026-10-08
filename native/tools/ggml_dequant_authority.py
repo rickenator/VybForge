@@ -43,12 +43,20 @@ SPECS = {
         funcs=["get_scale_min_k4", "dequantize_row_q5_K"],
         tables=[],
     ),
+    # 3-bit with a 512-entry grid, indexed by 9 bits (8 from qs, the 9th from qh); signs[] holds
+    # the sign bits, scales[4] the two 4-bit multipliers per 64-value group.
+    "iq3_s": dict(
+        struct="block_iq3_s", block=110,
+        funcs=["dequantize_row_iq3_s"],
+        tables=[("kmask_iq2xs", 8), ("iq3s_grid", 512)],
+    ),
 }
 
 SHIMS = r"""
 // ---- shims only: macros the upstream text expects from ggml's own headers ----
 #define QK_K 256
 #define K_SCALE_SIZE 12
+#define IQ3S_N_SCALE (QK_K/64)      // block_iq3_s scales[] length
 #define GGML_RESTRICT
 #define GGML_EXTENSION              // q5_K's scales/mins live in an anonymous union
 // ggml tags its anonymous aggregates for MSVC compatibility; left defined, the union stops being

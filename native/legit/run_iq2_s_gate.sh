@@ -12,10 +12,11 @@
 #     tensor list from the reference's output, so the two cannot drift apart) and the values are
 #     compared here.
 #
-# Tolerance maxrel 1e-5: device code multiplies in f32, the authority is f32 and the numpy port is
-# f64; the measured worst case is ~1.7e-6. A layout error in this type shows up as O(1).
-#
-# SKIPs (reported, not failed) when the model or CUDA is absent; a run that proves NOTHING fails.
+# Tolerance maxrel 1e-5, and what that number actually measures: the DRIVER's dump carries SIX
+# significant digits (Vyb's Float printing), and the measured difference is EXACTLY the reference
+# rounded to those six digits — verified by reproducing the dump that way. So this gate resolves
+# layout, scale, ordering and table errors (all O(1) by nature) and CANNOT resolve an arithmetic
+# difference below ~1e-5. Tightening it means dumping the value's BITS instead of its decimal form.
 
 set -u
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

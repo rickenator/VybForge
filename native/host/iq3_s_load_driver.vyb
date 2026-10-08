@@ -1,9 +1,9 @@
-// IQ2_S dequant on REAL Qwen3.8-27B Ridge tensors (VybForge#10 phase 3).
+// IQ3_S dequant on REAL Qwen3.8-27B Ridge tensors (VybForge#10 phase 3).
 //
-// Reads the tensors named in native/out/iq2_s_ref.txt (written by native/tools/iq2_s_ref.py)
+// Reads the tensors named in native/out/iq3_s_ref.txt (written by native/tools/iq3_s_ref.py)
 // so this driver and the reference cannot drift onto different tensors, loads the first
-// SLICE_BLOCKS blocks of each straight from the GGUF, prepends the 8192-byte grid image the
-// kernel expects, runs iq2sdeq on the GPU and dumps every value of the slice for the gate.
+// SLICE_BLOCKS blocks of each straight from the GGUF, prepends the 2048-byte grid image the
+// kernel expects, runs iq3sdeq on the GPU and dumps every value of the slice for the gate.
 //
 // SKIPs (exit 0, printing SKIP) when CUDA or the model is absent.
 import env::{env_get}
@@ -66,7 +66,7 @@ parse_ref(rows<String>)<Vec<RefLine>> -> {
     for (i in 0..ln - 1) {
         if ((rows.char_at(i) as Int) == 10) {
             line<String> = rows.substring(st, i)
-            if (line.substring(0, 5) == "IQ2_S") {
+            if (line.substring(0, 5) == "IQ3_S") {
                 atp<Int> = strchr(line, 64, 0)         # '@'
                 arrow<Int> = strchr(line, 45, 0)       # '-'
                 if (atp > 0) {
@@ -99,21 +99,21 @@ dump_all(base<Int>, tag<String>, count<Int>)<Int> -> {
             cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8)
             acc = acc + rv.to_string() + " "
         }
-        println("IQ2_S " + tag + " -> " + acc)
+        println("IQ3_S " + tag + " -> " + acc)
     }
     return 0
 }
 
 main()<Int> -> {
-    SLICE<Int> = 16                 # must match SLICE_BLOCKS in native/tools/iq2_s_ref.py
-    BB<Int> = 82
+    SLICE<Int> = 16                 # must match SLICE_BLOCKS in native/tools/iq3_s_ref.py
+    BB<Int> = 110
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_RIDGE_GGUF") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
-    refs<Vec<RefLine>> = parse_ref(read_bin("native/out/iq2_s_ref.txt"))
-    if (refs.len() == 0) { println("IQ2_S_FAIL no reference lines (run native/tools/iq2_s_ref.py)"); return 4 }
-    grid<String> = read_bin("native/out/iq2s_grid.bin")
-    if (grid.len() != 8192) { println("IQ2_S_FAIL grid image is " + grid.len().to_string() + " bytes, want 8192"); return 5 }
-    println("IQ2_S_REFS=" + refs.len().to_string())
+    refs<Vec<RefLine>> = parse_ref(read_bin("native/out/iq3_s_ref.txt"))
+    if (refs.len() == 0) { println("IQ3_S_FAIL no reference lines (run native/tools/iq3_s_ref.py)"); return 4 }
+    grid<String> = read_bin("native/out/iq3s_grid.bin")
+    if (grid.len() != 2048) { println("IQ3_S_FAIL grid image is " + grid.len().to_string() + " bytes, want 2048"); return 5 }
+    println("IQ3_S_REFS=" + refs.len().to_string())
 
     freedom {
         if (cuInit(0) != 0) { println("SKIP"); return 0 }
@@ -126,18 +126,18 @@ main()<Int> -> {
     freedom {
         m8<loc<CVoid>> = from<loc<CVoid>>(0)
         rc8<CInt> = -1; t8<Int> = 0
-        for (t8 in 0..5) { if (rc8 != 0) { m8 = from<loc<CVoid>>(0); rc8 = cuModuleLoadData(loc(m8), read_bin("native/build/iq2s.ptx")) } }
-        if (rc8 != 0) { println("MODLOAD_FAIL iq2s"); return 9 }
+        for (t8 in 0..5) { if (rc8 != 0) { m8 = from<loc<CVoid>>(0); rc8 = cuModuleLoadData(loc(m8), read_bin("native/build/iq3s.ptx")) } }
+        if (rc8 != 0) { println("MODLOAD_FAIL iq3s"); return 9 }
         fn8<loc<CVoid>> = from<loc<CVoid>>(0)
-        if (cuModuleGetFunction(loc(fn8), m8, "iq2sdeq") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(fn8), m8, "iq3sdeq") != 0) { return 10 }
 
         # Device buffers: the grid once, the weight bytes per tensor. With addr(String) these go
         # up in ONE call each (Vyb#476) — no per-element loop.
         GD<Int> = 0; PK<Int> = 0; WA<Int> = 0
-        if (cuMemAlloc_v2(loc(GD), 8192) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(GD), 2048) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(PK), SLICE * BB) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(WA), SLICE * 256 * 8) != 0) { return 11 }
-        e0<Int> = upload(grid, GD, 8192)
+        e0<Int> = upload(grid, GD, 2048)
         if (e0 != 0) { return 66 }
         # The kernel's five arguments live in these cells and params[] holds their addresses; the
         # values are read at launch, so the cells are assigned as work proceeds and params is
@@ -155,7 +155,7 @@ main()<Int> -> {
         for (ri in 0..refs.len() - 1) {
             nm<String> = refs.get(ri).nm
             pd<String> = read_model(MODEL, refs.get(ri).off, SLICE * BB)
-            if (pd.len() < SLICE * BB) { println("IQ2_S_SKIP_MODEL short read " + nm); return 0 }
+            if (pd.len() < SLICE * BB) { println("IQ3_S_SKIP_MODEL short read " + nm); return 0 }
             ee<Int> = upload(pd, PK, SLICE * BB)
             if (ee != 0) { return 66 }
             rc<CInt> = cuda_launch_n(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, addr(params), 5)
@@ -164,7 +164,7 @@ main()<Int> -> {
             dump_all(WA, nm, nl)
         }
         cuMemFree_v2(GD); cuMemFree_v2(PK); cuMemFree_v2(WA)
-        println("IQ2_S_DRIVER_DONE")
+        println("IQ3_S_DRIVER_DONE")
         return 0
     }
     return 0

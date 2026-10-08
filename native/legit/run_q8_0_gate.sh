@@ -9,12 +9,11 @@
 # mistake: two implementations sharing conventions can be wrong together.
 #
 # The compared values are the first 6 elements of four tensors. Tolerance is maxrel 1e-5: the
-# kernel multiplies in f32 (`Float` in device code) while the references are f64, and the
-# measured worst case is ~4.2e-6 relative. That is a rounding floor, not slack — a real bug in
-# the block layout shows up as O(1) differences, not 1e-6.
-#
-# SKIPs (reported, not failed) when the 12 GiB model or CUDA is absent; a run that proves
-# NOTHING fails.
+# Tolerance maxrel 1e-5, and what that number actually measures: the DRIVER's dump carries SIX
+# significant digits (Vyb's Float printing), and the measured difference is EXACTLY the reference
+# rounded to those six digits — verified by reproducing the dump that way. So this gate resolves
+# layout, scale, ordering and table errors (all O(1) by nature) and CANNOT resolve an arithmetic
+# difference below ~1e-5. Tightening it means dumping the value's BITS instead of its decimal form.
 
 set -u
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
