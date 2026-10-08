@@ -46,33 +46,38 @@ delta-function scan and an identical-heads test) were artefacts of exactly this 
 op was right all along. Full write-up: the `vybos-development` skill,
 `references/gate-and-probe-discipline.md` items 10 and 11.
 
+## Third unit — DONE (2026-10-08, commit 13fd444)
+
+The l2 norm, the RMS norm and the gated epilogue are verified against ggml's own ops:
+`native/tools/norm_authority.c` (modes `l2` / `rms` / `epilogue`) + `native/tools/norm_verify.py`.
+Measured at model geometry: l2 and rms **bit-exact** (`maxrel 0.000e+00`), epilogue `8.775e-08`
+(SiLU `expf` vs numpy). The two eps conventions are opposite — l2 floors eps AFTER `sqrtf(sum)`, rms
+puts eps INSIDE `sqrtf(mean+eps)` — and each verifier prints the opposite convention's error
+(7.1e-02 / 6.6e-03) so the agreement is a measurement, not a tolerance nothing could breach.
+
+All three unit verifiers now live in a gate instead of only in a transcript:
+`native/legit/run_gdn_ops_gate.sh` (SKIPs without the llama.cpp checkout) is step **P4.1** of
+`native/legit/run_phase2_battery.sh`.
+
 ## IMMEDIATE NEXT STEP (option 1)
 
-Finish the third unit: **the l2 normalisation and the gated RMS epilogue.** The semantics are already
-pinned down, read first-hand from `ggml/src/ggml-cpu/ops.cpp:4198-4206`:
+**Unit 4: the linear-attention input wiring.** Read `src/models/qwen35.cpp`
+`build_layer_attn_linear` (~line 353-400) — it is NOT just `mul_mat`s:
 
-    ggml_float sum = 0.0;
-    for (i00 < ne00) sum += (ggml_float)(xi * xi);
-    const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+* `qkvz` = `build_qkvz(cur, il)` → `attn_qkv` (q|k|v concat) and `attn_gate` (`z`);
+* `beta = sigmoid(reshape(mul_mat(ssm_beta, cur), 1, H_v, T, B))`;
+* `alpha = mul_mat(ssm_alpha, cur)`, then `alpha = softplus(alpha + ssm_dt) * ssm_a`
+  (`ssm_a = -exp(A_log)`, computed at load), reshaped to `(1, H_v, T, B)`;
+* then the conv (unit 2), the l2 norm (unit 3), the recurrence (unit 1) and the epilogue (unit 3);
+* `ssm_out` is another `mul_mat` after the reshape back to `(n_embd, T*B)`.
 
-i.e. **eps is a floor applied AFTER the sqrt**, the accumulation is in **double**, the reciprocal is
-`sqrtf` (f32) with an f32 `fmaxf`. A port that puts eps inside the sqrt, or accumulates in f32, will
-disagree exactly where the norm is small.
+So the new authority surface is `ggml_mul_mat` (no harness here calls it yet) plus `ggml_sigmoid`
+and `ggml_softplus` and the `ssm_dt` add — one harness with modes, as before. Note `build_lora_mm`
+takes an optional LoRA scale; the base model has none, so pass `nullptr`.
 
-Concretely, mirroring the two existing units:
+Then: the layer wiring, the Vyb kernel + driver + gate, and last the `eng_gdn()` flip.
 
-1. `native/tools/norm_authority.c` — one harness, two modes, because both ops take `(x, eps)`:
-   `ggml_l2_norm` (`ggml/include/ggml.h:1407`) and `ggml_rms_norm` (`:1381`). Copy the shape of
-   `conv_authority.c` (read floats from a file, build the tensor, call the op, `ggml_set_output`,
-   `ggml_new_graph` + `ggml_build_forward_expand` + `ggml_graph_compute_with_ctx`, write the result).
-2. `native/tools/norm_verify.py` — the port and the comparison, modelling the l2 norm **per head over
-   the 128 state dimensions** (`qwen35.cpp:440-443`) and the epilogue as
-   `RMSNorm(output, ssm_norm) * SiLU(z)` (`qwen35.cpp:257-266`).
-3. Then commit both, add a doc entry to `doc/QWEN35-PHASE4.md`, and continue outward: the projections
-   (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`, `ssm_out` — ordinary `mul_mat`s), then the layer
-   wiring, then the Vyb kernel + driver + gate, then flip `eng_gdn()`.
-
-## After that (do not start before item 1 closes)
+## After that (do not start before unit 4 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven
