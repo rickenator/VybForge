@@ -1,0 +1,478 @@
+// model_caps — the capability / layer descriptor (VybForge#10 phase 2).
+//
+// model_config answers "what are this model's DIMENSIONS". This answers "what does this model
+// REQUIRE of the engine", and decides whether this build can run it — so a load fails with a
+// named reason instead of mis-reading a tensor or silently skipping a layer.
+//
+// Facts come from two places, in this order of authority:
+//   * GGUF metadata: `<arch>.ssm.*` (recurrent state present), `<arch>.nextn_predict_layers`
+//     (a native draft head), `clip.*` (a vision tower), `tokenizer.*`.
+//   * the tensor table: layer kinds are counted from tensors — one `blk.N.ssm_alpha.weight`
+//     per recurrent layer, one `blk.N.attn_q.weight` per attention layer — and every quant
+//     type present is counted. Nothing is inferred from the architecture NAME.
+//
+// The metadata key namespace is `<general.architecture>.`, so a second GGUF architecture needs
+// no change here: a new arch shows up as unsupported DATA, not as a missing code path.
+//
+// Consumers: native/config/caps_probe.vyb, driven by native/legit/run_caps_gate.sh.
+// The capability table below (`eng_*`) is what "this build implements" means; the report and
+// the refusal both read it, so they cannot drift apart.
+
+import io::{open_read, read_at, close}
+import model_config::{mc_load, ModelConfig}
+
+// ─────────────────────────── byte-level helpers (file-local) ───────────────────────────
+// Deliberately bounds-checked like model_config's: a truncated file must yield missing fields
+// and a note, never a crash.
+
+cp_u8(s<String>, o<Int>)<Int> -> {
+    if (o < 0) { return 0 }
+    if (o >= s.len()) { return 0 }
+    return (s.char_at(o) as Int) & 255
+}
+cp_u16(s<String>, o<Int>)<Int> -> { return cp_u8(s, o) | (cp_u8(s, o + 1) << 8) }
+cp_u32(s<String>, o<Int>)<Int> -> {
+    return cp_u8(s, o) | (cp_u8(s, o + 1) << 8) | (cp_u8(s, o + 2) << 16) | (cp_u8(s, o + 3) << 24)
+}
+cp_u64(s<String>, o<Int>)<Int> -> { return cp_u32(s, o) | (cp_u32(s, o + 4) << 32) }
+
+cp_rd(f<File>, off<Int>, n<Int>)<String> -> {
+    match (read_at(f, off, n)) { s -> { return s } ? -> { return "" } }
+}
+
+// GGUF scalar type sizes: 0 UINT8, 1 INT8, 2 UINT16, 3 INT16, 4 UINT32, 5 INT32,
+// 6 FLOAT32, 7 BOOL, 8 STRING, 9 ARRAY, 10 UINT64, 11 INT64, 12 FLOAT64.
+cp_tsz(ty<Int>)<Int> -> {
+    if (ty == 0) { return 1 }
+    if (ty == 1) { return 1 }
+    if (ty == 2) { return 2 }
+    if (ty == 3) { return 2 }
+    if (ty == 4) { return 4 }
+    if (ty == 5) { return 4 }
+    if (ty == 6) { return 4 }
+    if (ty == 7) { return 1 }
+    if (ty == 10) { return 8 }
+    if (ty == 11) { return 8 }
+    if (ty == 12) { return 8 }
+    return 0
+}
+
+cp_skip(f<File>, off<Int>, ty<Int>)<Int> -> {
+    if (ty == 8) {
+        l<Int> = cp_u64(cp_rd(f, off, 8), 0)
+        return off + 8 + l
+    }
+    if (ty == 9) {
+        et<Int> = cp_u32(cp_rd(f, off, 4), 0)
+        cnt<Int> = cp_u64(cp_rd(f, off + 4, 8), 0)
+        o<Int> = off + 12
+        if (cnt == 0) { return o }
+        i<Int> = 0
+        for (i in 0..cnt - 1) { o = cp_skip(f, o, et) }
+        return o
+    }
+    return off + cp_tsz(ty)
+}
+
+cp_ival(f<File>, off<Int>, ty<Int>)<Int> -> {
+    if (ty == 0) { return cp_u8(cp_rd(f, off, 1), 0) }
+    if (ty == 1) { return cp_u8(cp_rd(f, off, 1), 0) }
+    if (ty == 2) { return cp_u16(cp_rd(f, off, 2), 0) }
+    if (ty == 3) { return cp_u16(cp_rd(f, off, 2), 0) }
+    if (ty == 4) { return cp_u32(cp_rd(f, off, 4), 0) }
+    if (ty == 5) { return cp_u32(cp_rd(f, off, 4), 0) }
+    if (ty == 10) { return cp_u64(cp_rd(f, off, 8), 0) }
+    if (ty == 11) { return cp_u64(cp_rd(f, off, 8), 0) }
+    return -1
+}
+
+// "blk.<n>." -> n, or -1. Shared shape with model_config's reader on purpose.
+cp_blk_index(name<String>)<Int> -> {
+    if (!name.starts_with("blk.")) { return -1 }
+    d<Int> = 0
+    i<Int> = 4
+    n<Int> = name.len()
+    while (i < n) {
+        c<Int> = name.char_at(i) as Int
+        if (c < 48) { break }
+        if (c > 57) { break }
+        d = d * 10 + (c - 48)
+        i = i + 1
+    }
+    if (d == 0 && name.char_at(4) as Int != 48) { return -1 }
+    return d
+}
+
+cp_has(h<String>, n<String>)<Bool> -> {
+    hl<Int> = h.len()
+    nl<Int> = n.len()
+    if (nl == 0) { return true }
+    if (nl > hl) { return false }
+    i<Int> = 0
+    while (i <= hl - nl) {
+        if (h.substring(i, i + nl) == n) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+cp_add(list<String>, item<String>)<String> -> {
+    if (list == "") { return item }
+    return list + "," + item
+}
+
+// ─────────────────────────── what THIS BUILD implements ───────────────────────────
+// One table. A missing type is reported from `eng_type`, and the same function decides the
+// verdict, so the printed report and the refusal cannot disagree.
+
+eng_type(id<Int>)<Int> -> {
+    if (id == 0) { return 1 }      // F32
+    if (id == 2) { return 1 }      // Q4_0
+    if (id == 12) { return 1 }     // Q4_K
+    if (id == 14) { return 1 }     // Q6_K
+    return 0
+}
+eng_gdn()<Int> -> { return 0 }     // Gated DeltaNet recurrent layers
+eng_mtp()<Int> -> { return 0 }     // native draft head
+eng_vision()<Int> -> { return 0 }  // vision tower / mmproj
+
+caps_tyname(id<Int>)<String> -> {
+    if (id == 0) { return "F32" }
+    if (id == 1) { return "F16" }
+    if (id == 2) { return "Q4_0" }
+    if (id == 3) { return "Q4_1" }
+    if (id == 6) { return "Q5_0" }
+    if (id == 7) { return "Q5_1" }
+    if (id == 8) { return "Q8_0" }
+    if (id == 9) { return "Q8_1" }
+    if (id == 10) { return "Q2_K" }
+    if (id == 11) { return "Q3_K" }
+    if (id == 12) { return "Q4_K" }
+    if (id == 13) { return "Q5_K" }
+    if (id == 14) { return "Q6_K" }
+    if (id == 15) { return "Q8_K" }
+    if (id == 16) { return "IQ2_XXS" }
+    if (id == 17) { return "IQ2_XS" }
+    if (id == 18) { return "IQ3_XXS" }
+    if (id == 19) { return "IQ1_S" }
+    if (id == 20) { return "IQ4_NL" }
+    if (id == 21) { return "IQ3_S" }
+    if (id == 22) { return "IQ2_S" }
+    if (id == 23) { return "IQ4_XS" }
+    if (id == 29) { return "IQ1_M" }
+    if (id == 30) { return "BF16" }
+    return "TYPE" + id.to_string()
+}
+
+// ─────────────────────────── the descriptor ───────────────────────────
+
+share(all)
+struct ModelCaps {
+    source<String>,
+    arch<String>,
+    layout<String>,          // "dense" | "hybrid-recurrent" | "vision-encoder" | "error"
+    n_layers<Int>,           // text blocks, excluding the draft head (metadata may include it)
+    attn_layers<Int>,        // layers that need conventional KV state
+    gdn_layers<Int>,         // layers that need recurrent state
+    mtp_layers<Int>,         // <arch>.nextn_predict_layers, 0 when absent
+    nextn_tensors<Int>,      // tensor-table evidence for the draft head
+    attn_interval<Int>,      // <arch>.full_attention_interval, 0 when absent
+    state_size<Int>, conv_kernel<Int>, group_count<Int>, time_step_rank<Int>, inner_size<Int>,
+    has_vision<Int>,
+    tok_model<String>,
+    has_chat_template<Int>,
+    ctx<Int>,
+    types<String>,           // every type present, "NAME:count,..." in a fixed order
+    unsupported<String>,     // the named refusal list, "" when everything is implemented
+    n_bad<Int>               // number of unsupported items
+}
+
+// A zeroed descriptor, so every construction path has to be explicit about what it knows.
+caps_empty(source<String>, arch<String>, layout<String>)<ModelCaps> -> {
+    return ModelCaps {
+        source = source, arch = arch, layout = layout,
+        n_layers = -1, attn_layers = 0, gdn_layers = 0,
+        mtp_layers = 0, nextn_tensors = 0, attn_interval = 0,
+        state_size = 0, conv_kernel = 0, group_count = 0, time_step_rank = 0, inner_size = 0,
+        has_vision = 0, tok_model = "", has_chat_template = 0, ctx = -1,
+        types = "", unsupported = "", n_bad = 0
+    }
+}
+
+// A read failure must be a REFUSAL WITH A REASON, not a profile full of zeros: a caller has to
+// be able to tell "this model needs IQ2_S" from "this file is malformed", and neither may be
+// mistaken for "fine".
+caps_err(source<String>, arch<String>, why<String>)<ModelCaps> -> {
+    e<ModelCaps> = caps_empty(source, arch, "error")
+    e.unsupported = "UNSUPPORTED_READ " + why
+    e.n_bad = 1
+    return e
+}
+
+// Struct copy with a few fields replaced. Vyb has no update syntax; this keeps the
+// "one explicit field per line" property that makes a descriptor reviewable.
+caps_with(a<ModelCaps>, b<ModelCaps>)<ModelCaps> -> {
+    return ModelCaps {
+        source = a.source, arch = a.arch, layout = a.layout,
+        n_layers = a.n_layers, attn_layers = a.attn_layers, gdn_layers = a.gdn_layers,
+        mtp_layers = a.mtp_layers, nextn_tensors = a.nextn_tensors, attn_interval = a.attn_interval,
+        state_size = a.state_size, conv_kernel = a.conv_kernel, group_count = a.group_count,
+        time_step_rank = a.time_step_rank, inner_size = a.inner_size,
+        has_vision = a.has_vision, tok_model = a.tok_model,
+        has_chat_template = a.has_chat_template, ctx = a.ctx,
+        types = a.types, unsupported = a.unsupported, n_bad = a.n_bad
+    }
+}
+
+// Metadata pass: the capability-shaped keys. Falls back to plain `arch.` namespacing, which is
+// what a GGUF does; `clip.` files carry the vision keys under their own arch.
+caps_meta(f<File>, cfg<ModelConfig>)<ModelCaps> -> {
+    out<ModelCaps> = caps_empty(cfg.source, cfg.arch, "dense")
+    out.n_layers = cfg.n_layers
+    out.ctx = cfg.ctx
+    head<String> = cp_rd(f, 0, 24)
+    if (head.len() < 24) { return caps_err(cfg.source, cfg.arch, "truncated metadata") }
+    nkv<Int> = cp_u64(head, 16)
+    ap<String> = cfg.arch + "."
+    off<Int> = 24
+    i<Int> = 0
+    for (i in 0..nkv - 1) {
+        raw<String> = cp_rd(f, off, 8)
+        if (raw.len() < 8) { return caps_err(cfg.source, cfg.arch, "truncated metadata") }
+        kl<Int> = cp_u64(raw, 0)
+        key<String> = cp_rd(f, off + 8, kl)
+        if (key.len() < kl) { return caps_err(cfg.source, cfg.arch, "truncated metadata") }
+        off = off + 8 + kl
+        ty<Int> = cp_u32(cp_rd(f, off, 4), 0)
+        off = off + 4
+
+        if (key == ap + "nextn_predict_layers") { out.mtp_layers = cp_ival(f, off, ty) }
+        if (key == ap + "full_attention_interval") { out.attn_interval = cp_ival(f, off, ty) }
+        if (key == ap + "ssm.state_size") { out.state_size = cp_ival(f, off, ty) }
+        if (key == ap + "ssm.conv_kernel") { out.conv_kernel = cp_ival(f, off, ty) }
+        if (key == ap + "ssm.group_count") { out.group_count = cp_ival(f, off, ty) }
+        if (key == ap + "ssm.time_step_rank") { out.time_step_rank = cp_ival(f, off, ty) }
+        if (key == ap + "ssm.inner_size") { out.inner_size = cp_ival(f, off, ty) }
+        if (key == "clip.has_vision_encoder") { out.has_vision = cp_ival(f, off, ty) }
+        if (key == "tokenizer.ggml.model") {
+            l<Int> = cp_u64(cp_rd(f, off, 8), 0)
+            out.tok_model = cp_rd(f, off + 8, l)
+        }
+        if (key == "tokenizer.chat_template") { out.has_chat_template = 1 }
+        off = cp_skip(f, off, ty)
+    }
+    // A tower declares itself either by arch or by its own flag; accept both, and never infer
+    // vision from the model name.
+    if (cfg.arch == "clip") { out.has_vision = 1 }
+    if (out.has_vision > 0) { out.layout = "vision-encoder" }
+    if (out.state_size > 0) {
+        if (out.has_vision > 0) { } else { out.layout = "hybrid-recurrent" }
+    }
+    return out
+}
+
+// Tensor-table pass: the layer kinds and the quant types actually present. Counting one
+// identifiable tensor per layer is deliberate — it cannot be fooled by a layer that merely
+// looks recurrent by name, and it costs one walk.
+caps_tensors(f<File>, caps<ModelCaps>)<ModelCaps> -> {
+    out<ModelCaps> = caps
+    head<String> = cp_rd(f, 0, 24)
+    if (head.len() < 24) { return caps }
+    nten<Int> = cp_u64(head, 8)
+    nkv<Int> = cp_u64(head, 16)
+    off<Int> = 24
+    i<Int> = 0
+    for (i in 0..nkv - 1) {
+        raw<String> = cp_rd(f, off, 8)
+        if (raw.len() < 8) { return caps_err(caps.source, caps.arch, "truncated metadata while seeking the tensor table") }
+        kl<Int> = cp_u64(raw, 0)
+        off = off + 8 + kl
+        ty<Int> = cp_u32(cp_rd(f, off, 4), 0)
+        off = off + 4
+        off = cp_skip(f, off, ty)
+    }
+    c_f32<Int> = 0; c_q4_0<Int> = 0; c_q8_0<Int> = 0; c_q4_k<Int> = 0; c_q5_k<Int> = 0
+    c_q6_k<Int> = 0; c_iq3_s<Int> = 0; c_iq2_s<Int> = 0; c_bf16<Int> = 0; c_other<Int> = 0
+    gdn<Int> = 0; attn<Int> = 0; nextn<Int> = 0
+    text_layers<Int> = caps.n_layers - caps.mtp_layers
+    j<Int> = 0
+    for (j in 0..nten - 1) {
+        nlraw<String> = cp_rd(f, off, 8)
+        if (nlraw.len() < 8) { return caps_err(caps.source, caps.arch, "truncated tensor index") }
+        nl<Int> = cp_u64(nlraw, 0)
+        name<String> = cp_rd(f, off + 8, nl)
+        if (name.len() < nl) { return caps_err(caps.source, caps.arch, "truncated tensor name") }
+        off = off + 8 + nl
+        nd<Int> = cp_u32(cp_rd(f, off, 4), 0)
+        off = off + 4
+        k<Int> = 0
+        for (k in 0..nd - 1) { off = off + 8 }
+        t<Int> = cp_u32(cp_rd(f, off, 4), 0)
+        off = off + 12          // ggml type (4) + offset into the data region (8)
+        if (t == 0) { c_f32 = c_f32 + 1 }
+        else {
+            if (t == 2) { c_q4_0 = c_q4_0 + 1 }
+            else {
+                if (t == 8) { c_q8_0 = c_q8_0 + 1 }
+                else {
+                    if (t == 12) { c_q4_k = c_q4_k + 1 }
+                    else {
+                        if (t == 13) { c_q5_k = c_q5_k + 1 }
+                        else {
+                            if (t == 14) { c_q6_k = c_q6_k + 1 }
+                            else {
+                                if (t == 21) { c_iq3_s = c_iq3_s + 1 }
+                                else {
+                                    if (t == 22) { c_iq2_s = c_iq2_s + 1 }
+                                    else {
+                                        if (t == 30) { c_bf16 = c_bf16 + 1 }
+                                        else { c_other = c_other + 1 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (cp_has(name, ".nextn.")) { nextn = nextn + 1 }
+        bi<Int> = cp_blk_index(name)
+        if (bi >= 0 && bi < text_layers) {
+            if (name == "blk." + bi.to_string() + ".ssm_alpha.weight") { gdn = gdn + 1 }
+            if (name == "blk." + bi.to_string() + ".attn_q.weight") { attn = attn + 1 }
+        }
+    }
+    out.gdn_layers = gdn
+    out.attn_layers = attn
+    out.nextn_tensors = nextn
+    if ((gdn > 0) && (out.has_vision == 0)) { out.layout = "hybrid-recurrent" }
+
+    // ---- the report, in a fixed order so two runs are comparable ----
+    ts<String> = ""
+    ms<String> = ""
+    if (c_f32 > 0) { ts = cp_add(ts, "F32:" + c_f32.to_string()) }
+    if (c_q4_0 > 0) { ts = cp_add(ts, "Q4_0:" + c_q4_0.to_string()) }
+    if (c_q8_0 > 0) {
+        ts = cp_add(ts, "Q8_0:" + c_q8_0.to_string())
+        if (eng_type(8) == 0) { ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE Q8_0 tensors=" + c_q8_0.to_string()) }
+    }
+    if (c_q4_k > 0) { ts = cp_add(ts, "Q4_K:" + c_q4_k.to_string()) }
+    if (c_q5_k > 0) {
+        ts = cp_add(ts, "Q5_K:" + c_q5_k.to_string())
+        if (eng_type(13) == 0) { ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE Q5_K tensors=" + c_q5_k.to_string()) }
+    }
+    if (c_q6_k > 0) { ts = cp_add(ts, "Q6_K:" + c_q6_k.to_string()) }
+    if (c_iq3_s > 0) {
+        ts = cp_add(ts, "IQ3_S:" + c_iq3_s.to_string())
+        if (eng_type(21) == 0) { ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE IQ3_S tensors=" + c_iq3_s.to_string()) }
+    }
+    if (c_iq2_s > 0) {
+        ts = cp_add(ts, "IQ2_S:" + c_iq2_s.to_string())
+        if (eng_type(22) == 0) { ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE IQ2_S tensors=" + c_iq2_s.to_string()) }
+    }
+    if (c_bf16 > 0) {
+        ts = cp_add(ts, "BF16:" + c_bf16.to_string())
+        if (eng_type(30) == 0) { ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE BF16 tensors=" + c_bf16.to_string()) }
+    }
+    if (c_other > 0) {
+        ts = cp_add(ts, "OTHER:" + c_other.to_string())
+        ms = cp_add(ms, "UNSUPPORTED_QUANT_TYPE OTHER tensors=" + c_other.to_string())
+    }
+    if (gdn > 0) {
+        if (eng_gdn() == 0) { ms = cp_add(ms, "UNSUPPORTED_LAYER_KIND gated-deltanet layers=" + gdn.to_string()) }
+    }
+    if (out.mtp_layers > 0) {
+        if (eng_mtp() == 0) { ms = cp_add(ms, "UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=" + out.mtp_layers.to_string()) }
+    }
+    if (out.has_vision > 0) {
+        if (eng_vision() == 0) { ms = cp_add(ms, "UNSUPPORTED_CAPABILITY vision has_vision_encoder=1") }
+    }
+    // A text profile that declares layers but identifies NONE of them is not a supported model:
+    // it is a file we could not read (a truncation that kept the metadata), and saying
+    // SUPPORTED there would be the worst outcome this module can produce. Only text layouts are
+    // checked — a tower's tensors legitimately match none of the layer names.
+    if ((out.layout == "dense") || (out.layout == "hybrid-recurrent")) {
+        if (out.n_layers > 0) {
+            if (out.attn_layers + out.gdn_layers == 0) {
+                ms = cp_add(ms, "UNSUPPORTED_PROFILE no layer tensors found for n_layers=" + out.n_layers.to_string())
+            }
+        }
+    }
+    out.types = ts
+    out.unsupported = ms
+    if (ms == "") { out.n_bad = 0 } else { out.n_bad = 1 }
+    return out
+}
+
+// Unknown arch: say so rather than guessing. A GGUF whose architecture this build has no
+// profile for is unsupported as a whole, even if every tensor type happens to be implemented.
+caps_known_arch(arch<String>)<Int> -> {
+    if (arch == "qwen3") { return 1 }        // dense, the engine's current target
+    if (arch == "qwen35") { return 1 }       // Qwen3.8 hybrid: known, but needs GDN + new types
+    if (arch == "clip") { return 1 }         // vision tower: known, needs BF16 + the tower
+    return 0
+}
+
+share(all) caps_load(path<String>)<ModelCaps> -> {
+    cfg<ModelConfig> = mc_load(path)
+    if (cfg.kind == "error") { return caps_err(path, "", "config unreadable") }
+    match (open_read(path)) {
+        f -> {
+            meta<ModelCaps> = caps_meta(f, cfg)
+            full<ModelCaps> = caps_tensors(f, meta)
+            close(f)
+            // Keep a reason if the read already produced one: "truncated tensor index" is more
+            // useful to a caller than a generic "unreadable", and it is the difference between
+            // fixing a download and fixing the reader.
+            if (full.layout == "error") {
+                if (full.unsupported == "") { return caps_err(path, cfg.arch, "unreadable") }
+                return full
+            }
+            if (caps_known_arch(cfg.arch) == 0) {
+                full.unsupported = cp_add(full.unsupported,
+                    "UNSUPPORTED_ARCH " + cfg.arch + " (no capability profile)")
+                full.n_bad = 1
+            }
+            return full
+        }
+        ? -> { return caps_empty(path, cfg.arch, "error") }
+    }
+}
+
+// 0 when this build can run the model; otherwise the number of refusing reasons (>=1).
+share(all) caps_check(caps<ModelCaps>)<Int> -> {
+    if (caps.layout == "error") { return 1 }
+    if (caps.unsupported != "") { return 1 }
+    return 0
+}
+
+share(all) caps_print(caps<ModelCaps>) -> {
+    println("CAPS_SOURCE=" + caps.source)
+    println("CAPS_ARCH=" + caps.arch)
+    println("CAPS_LAYOUT=" + caps.layout)
+    println("CAPS_N_LAYERS=" + caps.n_layers.to_string())
+    // The metadata's block_count may INCLUDE the draft head (Qwen3.8 declares 65 for 64 text
+    // blocks + blk.64), so state the text-block count explicitly rather than leaving a reader to
+    // reconcile "65 layers" against the 16 + 48 the layer kinds add up to.
+    txt<Int> = caps.n_layers - caps.mtp_layers
+    println("CAPS_TEXT_LAYERS=" + txt.to_string())
+    println("CAPS_ATTN_LAYERS=" + caps.attn_layers.to_string())
+    println("CAPS_GDN_LAYERS=" + caps.gdn_layers.to_string())
+    println("CAPS_MTP_LAYERS=" + caps.mtp_layers.to_string())
+    println("CAPS_NEXTN_TENSORS=" + caps.nextn_tensors.to_string())
+    println("CAPS_ATTN_INTERVAL=" + caps.attn_interval.to_string())
+    println("CAPS_SSM_STATE_SIZE=" + caps.state_size.to_string())
+    println("CAPS_SSM_CONV_KERNEL=" + caps.conv_kernel.to_string())
+    println("CAPS_SSM_GROUP_COUNT=" + caps.group_count.to_string())
+    println("CAPS_SSM_TIME_STEP_RANK=" + caps.time_step_rank.to_string())
+    println("CAPS_SSM_INNER_SIZE=" + caps.inner_size.to_string())
+    println("CAPS_VISION=" + caps.has_vision.to_string())
+    println("CAPS_TOK_MODEL=" + caps.tok_model)
+    println("CAPS_CHAT_TEMPLATE=" + caps.has_chat_template.to_string())
+    println("CAPS_CTX=" + caps.ctx.to_string())
+    println("CAPS_TYPES=" + caps.types)
+    println("CAPS_UNSUPPORTED=" + caps.unsupported)
+    println("CAPS_N_BAD=" + caps.n_bad.to_string())
+    if (caps_check(caps) == 0) { println("CAPS_VERDICT=SUPPORTED") } else { println("CAPS_VERDICT=UNSUPPORTED") }
+    println("CAPS_DONE")
+}

@@ -152,10 +152,24 @@ fi
 # the python gguf package, plus transformers.AutoConfig on a SECOND real model. Refuses a
 # truncated GGUF instead of inventing dimensions.
 out="$(./native/legit/run_config_gate.sh 2>&1)"
-if echo "$out" | grep -q "S0\\.2a CONFIG GATE: PASS"; then
+if echo "$out" | grep -q "S0\.2a CONFIG GATE: PASS"; then
   step "S0.2a config contract" "PASS ($(echo "$out" | grep -o 'MCGATE_FIELDS_OK [0-9]*' | tr '\n' ' ' | sed 's/  */ /g'))"
 else
   step "S0.2a config contract" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
+# ── S0.2e — capability / layer descriptor (VybForge#10 phase 2) ──────────────────────
+# Gate: native/legit/run_caps_gate.sh. model_caps.vyb decides whether this build can RUN a model
+# and refuses with a NAMED reason when it cannot; the gate checks that decision against the dense
+# model (SUPPORTED, type counts cross-checked against an independent Python parser), the Ridge
+# target (UNSUPPORTED with exactly six named reasons), the vision tower, and a truncated file.
+# The Ridge/mmproj cases SKIP when those files are not on disk, and the gate FAILS if it proved
+# nothing at all — a gate that skips everything has verified nothing.
+out="$(./native/legit/run_caps_gate.sh 2>&1)"
+if echo "$out" | grep -q "S0\.2e CAPABILITY GATE: PASS"; then
+  step "S0.2e capability descriptor" "PASS ($(echo "$out" | grep -o 'PASS ([0-9]* cases[^)]*)' | tail -1 | sed 's/^PASS (//; s/)$//'))"
+else
+  step "S0.2e capability descriptor" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
 # ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────

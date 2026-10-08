@@ -321,6 +321,42 @@ Mapped steps (each one gated, in order):
   `native/out/`, so `make kvctx` and `make kvrespfwd` now regenerate gold and driver output inside the
   target — the same stale-gold trap that had let a frozen constant stay green for weeks.)
 
+- **S0.2e — a capability / layer descriptor, and a NAMED refusal. LANDED 2026-10-08 (VybForge#10
+  phase 2).** `model_config.vyb` answers what a model's DIMENSIONS are; `native/config/model_caps.vyb`
+  answers what it REQUIRES of the engine — layer kinds and their state, the quant types present,
+  and the optional vision tower / MTP head / tokenizer — and refuses to run a model this build
+  cannot express. It reads the capability-shaped metadata (`<arch>.ssm.*`,
+  `<arch>.nextn_predict_layers`, `<arch>.full_attention_interval`, `clip.*`, `tokenizer.*`, all
+  namespaced by `general.architecture`, so a new architecture is unsupported DATA rather than a
+  missing code path) and counts layer kinds from the TENSOR TABLE — one `blk.N.ssm_alpha.weight`
+  per recurrent layer, one `blk.N.attn_q.weight` per attention layer — so a layer that merely
+  looks recurrent by name cannot fool it. The engine's own capability table (`eng_type`, `eng_gdn`,
+  `eng_mtp`, `eng_vision`) is what "this build implements" means, and the printed report and the
+  refusal both read it, so they cannot drift apart.
+
+  Measured, gate `native/legit/run_caps_gate.sh` / `make caps` (S0.2e in the Phase-2 battery):
+
+  * Qwen3-4B → **SUPPORTED**: dense, 36/36 attention layers, no GDN/MTP/vision, types
+    `F32:145,Q4_K:216,Q6_K:37`. The gate CROSS-CHECKS those counts against the independent Python
+    parser (`native/gguf/ridge_inventory.py`), so the two implementations must agree — a Vyb-only
+    check could be self-consistently wrong.
+  * Qwen3.8-27B Ridge → **UNSUPPORTED** with exactly six named reasons: IQ2_S(160), Q8_0(96),
+    Q5_K(51), IQ3_S(32), the Gated-DeltaNet layer kind (48 layers) and the MTP head
+    (`nextn_predict_layers=1`). It independently reproduces the hybrid layout the issue describes:
+    64 text blocks = 16 attention + 48 recurrent, every 4th block an attention layer,
+    `ssm.state_size 128`, `conv_kernel 4`, `group_count 16`, `time_step_rank 48`, `inner_size 6144`.
+  * mmproj → **UNSUPPORTED as a vision-encoder** (BF16 110 tensors + vision), not as a broken text
+    model — the layout field is what keeps those two failures distinguishable.
+  * a file truncated inside the metadata → **UNSUPPORTED with `UNSUPPORTED_READ …`**, never a
+    profile full of zeros. A prefix cut inside the DATA region still describes its model correctly;
+    that is deliberate, since the profile is a property of the metadata and tensor table, and the
+    gate's comment says so rather than implying the descriptor checks the weights.
+
+  Also settled here, because it decides how every gate reads a probe: **the JIT prints main()'s
+  return value and always exits 0** (`doc/PYTHON-CLEANUP.md`), so gates parse the `*_DONE` /
+  verdict lines and never trust `$?`. `mc_probe.vyb`'s header claimed its exit code was
+  `mc_check()`, which was never true — corrected.
+
 - **S0.4 — an INDEPENDENT decode oracle: llama.cpp, per token. LANDED 2026-10-07 (VybForge#22).**
   Every other inference gate here compares the GPU against the numpy reference, and both implement
   the same conventions, so agreement proves self-consistency and not correctness — which is how #11

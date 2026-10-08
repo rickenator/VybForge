@@ -2,7 +2,10 @@
 //
 //   VYBFORGE_CONFIG=<path to a .gguf or a config.json> ./build/vyb native/config/mc_probe.vyb
 //
-// Exit code is mc_check() (0 = the dims are present and the invariants hold). The printed
+// Exit code is mc_check() (0 = the dims are present and the invariants hold). NOTE: the JIT
+// PRINTS that return value and always exits 0 (doc/PYTHON-CLEANUP.md), so a caller must read
+// the output rather than `$?` — run_config_gate.sh does this by requiring the trailing
+// MC_DONE. The printed
 // MC_NOTE / MC_DEFAULTED / MC_DERIVED lines say what the model stated, what was assumed, and
 // what was computed from another fact in the same file — a consumer is never left guessing
 // which is which. Driven by native/legit/run_config_gate.sh.

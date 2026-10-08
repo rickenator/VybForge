@@ -1,0 +1,24 @@
+// caps_probe — print a model's capability descriptor (VybForge#10 phase 2).
+//
+//   VYBFORGE_MODEL=<path to a .gguf> ./build/vyb native/config/caps_probe.vyb \
+//       --module-path native/config --module-path native/json
+//
+// Exit code is caps_check(): 0 = this build can run the model, 1 = it cannot, and then the
+// CAPS_UNSUPPORTED line names every reason (missing quant types, a layer kind, a capability).
+// NOTE that the JIT PRINTS main's return value and always exits 0 (doc/PYTHON-CLEANUP.md), so
+// a caller reads CAPS_VERDICT / the trailing return line out of the output — not `$?`.
+// Driven by native/legit/run_caps_gate.sh.
+
+import env::{env_get}
+import model_caps::{caps_load, caps_print, caps_check, ModelCaps}
+
+main()<Int> -> {
+    path<String> = env_get("VYBFORGE_MODEL") else ""
+    if (path == "") {
+        println("CAPS_ERROR=VYBFORGE_MODEL not set")
+        return 2
+    }
+    caps<ModelCaps> = caps_load(path)
+    caps_print(caps)
+    return caps_check(caps)
+}

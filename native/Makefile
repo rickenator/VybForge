@@ -454,4 +454,12 @@ ridge-inventory:
 	cd $(ROOT) && .venv/bin/python native/gguf/ridge_inventory.py "$(RIDGE_GGUF)" \
 	  --tsv native/gguf/ridge-3.7bpw-inventory.tsv --meta native/out/ridge_meta.txt
 
+# ── S0.2e capability / layer descriptor gate (VybForge#10 phase 2) ───────────────
+# model_caps.vyb answers "what does this model REQUIRE of the engine" (layer kinds and their
+# state, the quant types present, vision/MTP/tokenizer) and refuses with a NAMED reason when
+# this build cannot run it. The gate checks the dense model, the Ridge target, the vision tower
+# and a truncated file. The Ridge/mmproj cases SKIP when those files are not on disk.
+caps:
+	./native/legit/run_caps_gate.sh
+
 
