@@ -1,0 +1,95 @@
+// mmnt_bench.vyb — time ONE mm_nt projection at the 27B Ridge geometry (5120 -> 10240, f64).
+//
+// Not a gate: a measurement. The layer check cannot be raised to model geometry until the projections
+// there are affordable, and "affordable" has to be a number, not an estimate. This runs the same
+// kernel the layer driver uses, once, on a 419 MB weight, and lets the caller time the process
+// (the upload is part of the wall clock; at ~0.2 s it is noise against the kernel).
+//
+// Usage: env -u PYTHONPATH $VYB native/host/mmnt_bench.vyb       (fixture: native/build/mmnt_bench_in.bin)
+import io::{open_read, read_at, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_slice(f<File>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+    return r
+}
+
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom {
+        cuMemcpyHtoD_v2(PD + off, loc(v), 8)
+    }
+}
+
+main()<Int> -> {
+    NE<Int> = 5120
+    NQ<Int> = 10240
+    ws<String> = ""
+    xs<String> = ""
+    match (open_read("native/build/mmnt_bench_in.bin")) {
+        fh -> {
+            ws = read_slice(fh, 0, NQ * NE * 8)
+            xs = read_slice(fh, NQ * NE * 8, NE * 8)
+            close(fh)
+        }
+        ? -> { println("BENCH_ERR no fixture") ; return 13 }
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA") ; return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device") ; return 0 }
+        var<CInt> dev = 0
+        cuDeviceGet(loc(dev), 0)
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        cuCtxCreate_v2(loc(ctx), 0, dev)
+
+        ptx<String> = ""
+        match (open_read("native/build/gdn.ptx")) {
+            g -> { ptx = read_slice(g, 0, 262144) ; close(g) }
+            ? -> { return 13 }
+        }
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hmod), ptx) != 0) { return 9 }
+        hmm<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hmm), hmod, "mm_nt") != 0) { return 10 }
+
+        DW<Int> = 0 ; DX<Int> = 0 ; DY<Int> = 0 ; P<Int> = 0
+        cuMemAlloc_v2(loc(DW), NQ * NE * 8)
+        cuMemAlloc_v2(loc(DX), NE * 8)
+        cuMemAlloc_v2(loc(DY), NQ * 8)
+        cuMemAlloc_v2(loc(P), 128)
+
+        println("BENCH_UPLOAD_BEGIN")
+        cuMemcpyHtoD_v2(DW, from<loc<CVoid>>(addr(ws)), NQ * NE * 8)
+        cuMemcpyHtoD_v2(DX, from<loc<CVoid>>(addr(xs)), NE * 8)
+        cuCtxSynchronize()
+        println("BENCH_KERNEL_BEGIN")
+        put_i(P, 0, DX) ; put_i(P, 8, DW) ; put_i(P, 16, DY)
+        put_i(P, 24, 1) ; put_i(P, 32, NQ) ; put_i(P, 40, NE)
+        blk<Int> = (NQ + 255) / 256
+        rcx<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hmm)), blk, 1, 1, 256, 1, 1, P, 0, 0, 0)
+        if (rcx != 0) { println("BENCH_ERR launch") ; return 12 }
+        cuCtxSynchronize()
+        println("BENCH_KERNEL_END")
+        cuMemFree_v2(DW) ; cuMemFree_v2(DX) ; cuMemFree_v2(DY) ; cuMemFree_v2(P)
+    }
+    println("BENCH_DONE 5120 -> 10240 f64")
+    return 0
+}
+

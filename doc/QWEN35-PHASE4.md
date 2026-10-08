@@ -514,14 +514,20 @@ uploads those bytes and runs the existing `q8_0deq` kernel to dequantise them on
 projection weights, and the authority is fed the same values dequantised in numpy. The Q8_0 math
 itself is already gated separately (S0.5, bit-exact against the `gguf` package).
 
-It is DORMANT, and the reason is geometry, not machinery: the model's tensors are `(48, 5120)` while
-this layer fixture is `(8, 512)` — the verifier refuses to feed a truncated slice and says so (there is
-no model tensor of the fixture's shape, so slicing is not an option). Activating it means running the
-layer check at the model's real geometry, and that is a decision to take deliberately: `mm_nt` is a
-naive one-thread-per-output kernel, so a single `5120 -> 10240` projection is ~270 GFLOP and the three
-big projections would dominate the gate's runtime. Either make `mm_nt` tiled (or route the projections
-through the quant gemm path the existing attention layers use, which is what the engine will do
-anyway) and then raise the fixture geometry — not raise the geometry first and wait.
+It is DORMANT because of geometry, not machinery: the model's tensors are `(48, 5120)` while this
+layer fixture is `(8, 512)` — the verifier refuses to feed a truncated slice and says so (there is no
+model tensor of the fixture's shape, so slicing is not an option). Activating it means raising the
+fixture to the model's geometry.
+
+**Measured, because the estimate was wrong**: `native/host/mmnt_bench.vyb` runs one `5120 -> 10240`
+f64 `mm_nt` on a real-sized 419 MB weight and the whole process — load, 419 MB upload, kernel — takes
+**0.53 s**. A single-token step is a matrix-VECTOR product (M=1: 52 M MACs, data-bound), so the three
+big projections cost about a second of I/O and the model-geometry layer check is affordable on this
+box. The FLOP estimate that made it look expensive (~270 GFLOP for that projection) describes a
+PREFILL, where M is the prompt length — that is the case that needs a tiled/gemm kernel and, for the
+largest runs, the DGX Sparks cluster rather than the single 3090. So: raise the fixture geometry and
+switch the real Q8_0 weights on for the decode-step check; keep the prefill case (unit 9b) as the one
+that needs the faster kernel and scheduled hardware.
 
 ### `eng_gdn()` stays 0 — and why
 

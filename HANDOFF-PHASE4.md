@@ -152,10 +152,17 @@ authority is fed the same values dequantised in numpy. Verified dormant: the ver
 model's `(48, 5120)` tensors at this fixture's `(8, 512)` geometry and SAYS so, rather than feeding a
 truncated slice, and the 26-stage check is unchanged (2.4e-07).
 
-Blocker, measured by reasoning rather than by a run: `mm_nt` is naive (one thread per output), so the
-`5120 -> 10240` projection alone is ~270 GFLOP and three such projections would dominate the gate.
-Activate it AFTER making the projections cheap — tile `mm_nt`, or route them through the quant gemm
-path the attention layers already use (`layer_driver.vyb`) — and then raise the fixture geometry.
+Blocker is only the fixture's geometry. **Measured** (`native/host/mmnt_bench.vyb`): one full-size
+`5120 -> 10240` f64 `mm_nt` — load + 419 MB upload + kernel — takes 0.53 s, because a single-token
+step is a matrix-vector product and is data-bound. So the model-geometry layer check is affordable on
+this box: raise the fixture geometry (NE 5120, S 128, H_k 16, H_v 48) and the real Q8_0 weights switch
+on by themselves. An earlier estimate of "~270 GFLOP, so minutes" was for a PREFILL (M = prompt
+length) — that is the case that needs a tiled/gemm projection and, if it grows, the DGX Sparks
+cluster; it is NOT the case this layer check runs.
+
+Scheduling note (from Rick, 2026-10-08): the dual DGX Sparks are shared with other agents, so a
+cluster run must be scheduled by hand. The main GPU (this box's 3090, 23.7 GB free at the time of
+writing) is the right place for the decode-step check and for any prefill measurement that fits.
 
 ## `eng_gdn()` is STILL 0, deliberately
 
