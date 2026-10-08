@@ -213,7 +213,40 @@ at the pointer the op will use, *next to* the first four floats the harness wrot
 "the harness handed over a different buffer than it wrote" from "one side's pointer arithmetic is not
 what the source reads as" — and it is a single run, not a probe series.
 
-### What is still unexplained, and the next step
+### The op is exonerated — the fault is on my side of the comparison
+
+The decisive diagnostic: the harness prints the k block it *intended* to load next to what is actually
+in the tensor it handed the op. Both read
+
+    0.00886083394 -0.125186399 -0.172529504 0.00990023743
+
+which is EXACTLY what the op printed for `k_d[0..3]`. So the op reads its inputs correctly, and the
+numbers my port printed for those same indices (k[1] = -0.0155698974, …) came from somewhere other
+than the array the script itself wrote out. The disagreement is therefore in my reference or in how
+the diff script feeds and prints it — not in ggml, and not in any stride or layout of the op.
+
+### ROOT CAUSE FOUND: numpy's fastest axis is the last one, ggml's is `ne0`
+
+    kd   = k[:,0,0,0]     = [ 0.00886083 -0.0155699  -0.03821266 -0.06226201]
+    flat = k.ravel()[:4]  = [ 0.00886083 -0.1251864  -0.1725295   0.00990024]
+
+`k` is (128,16,1,1), so `k[:,0,0,0]` steps 16 elements per sample, while the buffer's real element
+order is `ne0`-fastest. Every array the port reads this way has been transposed on its trailing axes;
+the op was right all along, and the delta-function scan's "24 of 32 slots land elsewhere" was my
+transposed view talking, not the op.
+
+This explains the whole shape of the investigation: the minimal geometry (S=4, H=1, T=1, B=1) has all
+strides equal to 1, so a transposed read coincides with a correct one — which is exactly why that case
+matched to 6e-8 while nothing at model geometry did. It also explains why the harness's dump agreed
+with every expectation: the tensors really were right; only the reference's *reading* of them was not.
+
+The fix is a convention, not a formula: build and index the inputs as ggml does — numpy shape
+`(B, T, H, S)` with the LAST axis being `ne0`, the state as `(B, H, S, S)` with the last two axes being
+`(i, j)` — and read the op's result buffer the same way (scores `(B, T, H_v, S)`, state
+`(B, H_v, S, S)`). `native/tools/gdn_ref.py`'s `inputs()` and `numpy_rule()` need that one change; no
+kernel-side conclusion in this document is affected, and llama.cpp needs no further instrumentation.
+
+
 
 With layout eliminated, the remaining untested piece was the q/k→v head broadcast — the one thing
 ggml's header says it cannot yet select between (`ggml.h:2564`). Both candidates were implemented

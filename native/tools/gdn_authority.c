@@ -88,6 +88,18 @@ int main(int argc, char ** argv) {
     struct ggml_tensor * st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H_v, B);
     memcpy(st->data, buf + off, n_s * sizeof(float)); off += n_s;
 
+    // TEMPORARY DEBUG: what the harness put into the k tensor vs what is actually in it. If these
+    // two disagree, the copy (not the op) is at fault; if they agree and the op still prints
+    // different numbers for k_d[0..3], the op's pointer arithmetic is not what the source reads as.
+    if (getenv("GGML_GDN_DEBUG")) {
+        const float * kint = buf + n_q;             // k is the second block in the file
+        const float * kten = (const float *) k->data;
+        fprintf(stderr, "GDN_HARNESS intended k[0..3]=%.9g %.9g %.9g %.9g\n",
+                (double) kint[0], (double) kint[1], (double) kint[2], (double) kint[3]);
+        fprintf(stderr, "GDN_HARNESS tensor   k[0..3]=%.9g %.9g %.9g %.9g   data=%p\n",
+                (double) kten[0], (double) kten[1], (double) kten[2], (double) kten[3], (void *) kten);
+    }
+
     struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, be, st, /*K=*/1);
     if (!result) { fprintf(stderr, "GDA_ERR op refused\n"); return 5; }
     ggml_set_output(result);
