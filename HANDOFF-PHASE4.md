@@ -144,6 +144,19 @@ Trap worth remembering: the fixture grew to two tokens but `DX` was still alloca
 8192-byte upload into a 4096-byte buffer clobbered its neighbours and made step 1 read zeros — no
 device error, just wrong numbers. Device allocation sizes must move with the fixture.
 
+## Unit 9 (started, DORMANT on purpose): real quantized weights
+
+The layer fixture can carry the model's own Q8_0 `ssm_alpha`/`ssm_beta` (raw GGUF bytes at the
+inventory offsets) and the driver dequantises them on the GPU with the existing `q8_0deq` kernel; the
+authority is fed the same values dequantised in numpy. Verified dormant: the verifier refuses the
+model's `(48, 5120)` tensors at this fixture's `(8, 512)` geometry and SAYS so, rather than feeding a
+truncated slice, and the 26-stage check is unchanged (2.4e-07).
+
+Blocker, measured by reasoning rather than by a run: `mm_nt` is naive (one thread per output), so the
+`5120 -> 10240` projection alone is ~270 GFLOP and three such projections would dominate the gate.
+Activate it AFTER making the projections cheap — tile `mm_nt`, or route them through the quant gemm
+path the attention layers already use (`layer_driver.vyb`) — and then raise the fixture geometry.
+
 ## `eng_gdn()` is STILL 0, deliberately
 
 Do not flip it yet. The descriptor's `eng_gdn()` decides whether the caps gate reports
@@ -156,9 +169,9 @@ capability the engine cannot deliver.
 
 State carry-over is done (unit 8). Three things remain before `eng_gdn()` can honestly flip:
 
-1. **Quantized weights**: the projections (wqkv, wqkv_gate, ssm_beta, ssm_alpha, ssm_out) must go
-   through the existing quant gemm path — `layer_driver.vyb`/`model_driver.vyb` show how the current
-   attention layers do it; `mm_nt` is the f64 form of the same product.
+1. **Quantized weights**: the mechanism is in place (unit 9, above); what is missing is a projection
+   kernel fast enough to run the layer check at the model's real geometry, or routing the projections
+   through the quant gemm path `layer_driver.vyb` already uses.
 2. **The multi-token/prefill path** — the op's chunked kernel, still uncharacterised (see below); a
    real prompt cannot run without it, and prefill is what makes 48 layers affordable.
 3. **Engine integration**: a recurrent branch in `model_driver.vyb`'s per-layer loop, then the flip and

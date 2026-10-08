@@ -505,6 +505,24 @@ neighbouring buffers and made the FIRST step read zeros — every stage then dif
 reported no error at all. Device allocation sizes must move with the fixture's sizes; the symptom of
 getting it wrong is wrong numbers, not a fault.
 
+### Ninth unit (started): real quantized weights, and what blocks them
+
+The engine's projections consume QUANTIZED weights, so the layer check should too. The mechanism is in
+place: the fixture can carry the model's own `blk.0.ssm_alpha.weight` / `blk.0.ssm_beta.weight` (the
+Q8_0 tensors of the gdn_state path — read RAW from the GGUF at the inventory's offsets), the driver
+uploads those bytes and runs the existing `q8_0deq` kernel to dequantise them on the GPU into the
+projection weights, and the authority is fed the same values dequantised in numpy. The Q8_0 math
+itself is already gated separately (S0.5, bit-exact against the `gguf` package).
+
+It is DORMANT, and the reason is geometry, not machinery: the model's tensors are `(48, 5120)` while
+this layer fixture is `(8, 512)` — the verifier refuses to feed a truncated slice and says so (there is
+no model tensor of the fixture's shape, so slicing is not an option). Activating it means running the
+layer check at the model's real geometry, and that is a decision to take deliberately: `mm_nt` is a
+naive one-thread-per-output kernel, so a single `5120 -> 10240` projection is ~270 GFLOP and the three
+big projections would dominate the gate's runtime. Either make `mm_nt` tiled (or route the projections
+through the quant gemm path the existing attention layers use, which is what the engine will do
+anyway) and then raise the fixture geometry — not raise the geometry first and wait.
+
 ### `eng_gdn()` stays 0 — and why
 
 The descriptor's `eng_gdn()` (native/config/model_caps.vyb:140) is what makes the caps gate report

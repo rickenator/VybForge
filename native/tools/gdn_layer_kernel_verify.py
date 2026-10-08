@@ -64,6 +64,48 @@ def real_gate_params(n):
                 (-np.exp(rng.normal(1.0, 0.5, size=n))).astype(np.float32), False)
 
 
+
+INVENTORY = os.path.join(REPO, "native/gguf/ridge-3.7bpw-inventory.tsv")
+
+
+def real_q8_weight(name):
+    """The RAW GGUF bytes and the numpy dequant of a Q8_0 tensor from the model, or (None, None).
+
+    The layer check uses the model's own ssm_alpha/ssm_beta here: those two are the Q8_0 tensors of
+    the gdn_state path, so the projections run on real quantized weights, dequantized on the GPU by
+    the existing q8_0deq kernel (gated separately in P2/S0.5) and in numpy here for the authority.
+    """
+    try:
+        off = size = None
+        for line in open(INVENTORY):
+            if line.startswith(name + "\t"):
+                f = line.split("\t")
+                off, size = int(f[5]), int(f[6])
+                break
+        if off is None:
+            raise KeyError(name)
+        with open(os.environ.get("VYBFORGE_RIDGE_GGUF",
+                                 os.path.expanduser("~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf")), "rb") as fh:
+            fh.seek(off)
+            raw = fh.read(size)
+        if len(raw) != size:
+            raise ValueError("short read")
+        blocks = np.frombuffer(raw, dtype=np.uint8).reshape(size // 34, 34)
+        d = blocks[:, :2].copy().view(np.float16).reshape(-1).astype(np.float32)      # f16 scale per block
+        q = blocks[:, 2:].copy().view(np.int8).astype(np.float32)                     # 32 signed quants
+        vals = (d[:, None] * q).reshape(-1)                                          # [n_out, n_in] ggml order
+        # The model's tensors are (48, 5120); this fixture is (H_V, NE) = (8, 512) so it can only use
+        # them if the geometry matches. Say so rather than feeding a truncated slice.
+        if vals.size != H_V * NE:
+            print(f"GDNL_VERIFY note: real {name} is {vals.size} values, this fixture's geometry wants "
+                  f"{H_V * NE} — synthetic weights here (raise NE/S/H_v to use the model's own)")
+            return None, None
+        return raw, vals
+    except Exception as e:      # noqa: BLE001
+        print(f"GDNL_VERIFY note: real {name} unavailable ({e.__class__.__name__}); synthetic")
+        return None, None
+
+
 def fixture():
     """One fixture, both precisions. Weights are ggml-order: a tensor of ne (K, N) is numpy (N, K)."""
     rng = np.random.default_rng(20261008)
@@ -74,6 +116,12 @@ def fixture():
     wgate = rng.normal(0.0, s, size=(VALUE, NE)).astype(np.float32)
     wbeta = rng.normal(0.0, s, size=(H_V, NE)).astype(np.float32)
     walpha = rng.normal(0.0, s, size=(H_V, NE)).astype(np.float32)
+    alpha_raw, alpha_deq = real_q8_weight("blk.0.ssm_alpha.weight")
+    beta_raw, beta_deq = real_q8_weight("blk.0.ssm_beta.weight")
+    quantised = alpha_raw is not None and beta_raw is not None
+    if quantised:
+        walpha = alpha_deq.astype(np.float32)     # the authority sees the same values the GPU will
+        wbeta = beta_deq.astype(np.float32)
     dt, a, real = real_gate_params(H_V)
     conv1d = rng.normal(0.0, 0.2, size=(QKV, DC)).astype(np.float32)
     ssm_norm = rng.normal(1.0, 0.05, size=S).astype(np.float32)
@@ -81,8 +129,9 @@ def fixture():
     zwindow = np.zeros(DC * QKV, dtype=np.float32)   # the conv buffer, window slots and all (ncs frames/channel)
     state = np.zeros(S * S * H_V, dtype=np.float32)  # a fresh sequence starts at zero
     return dict(x=x, attn_norm=attn_norm, wqkv=wqkv, wqkv_gate=wgate, ssm_beta=wbeta,
+                alpha_q8=(alpha_raw if quantised else b""), beta_q8=(beta_raw if quantised else b""),
                 ssm_alpha=walpha, ssm_dt=dt, ssm_a=a, ssm_conv1d=conv1d, ssm_norm=ssm_norm,
-                ssm_out=ssm_out, zwindow=zwindow, state=state), real
+                ssm_out=ssm_out, zwindow=zwindow, state=state), real, quantised
 
 
 def build_authority():
@@ -130,6 +179,8 @@ def run_driver(fx):
         for k in ("x", "attn_norm", "wqkv", "wqkv_gate", "ssm_beta", "ssm_alpha", "ssm_dt", "ssm_a",
                   "ssm_conv1d", "ssm_norm", "ssm_out", "zwindow", "state"):
             fh.write(np.ascontiguousarray(fx[k], dtype="<f8").tobytes())
+        for k in ("alpha_q8", "beta_q8"):
+            fh.write(bytes(fx[k]))                    # raw GGUF bytes, or nothing
     env = dict(os.environ, VYB_STDLIB=STDLIB)
     r = subprocess.run([VYB, "native/host/gdn_layer_driver.vyb"], cwd=REPO,
                        capture_output=True, text=True, env=env)
@@ -175,8 +226,9 @@ def main():
           f"key={KEY} value={VALUE} qkv={QKV}, steps=2")
     if not build_authority() or not build_ptx():
         return 1
-    fx, real = fixture()
+    fx, real, quantised = fixture()
     print(f"GDNL_VERIFY fixture {'real ssm_a/ssm_dt from blk.0' if real else 'synthetic ssm_a/ssm_dt'}, "
+          f"ssm_alpha/ssm_beta {'REAL Q8_0 tensors of blk.0 (dequantised on the GPU)' if quantised else 'synthetic'}, "
           f"state and conv window start at zero")
 
     # The authority runs the sequence as two single-token steps: step 2 gets step 1's conv window

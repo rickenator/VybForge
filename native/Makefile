@@ -62,7 +62,7 @@ gdn: $(ROOT)/native/build/gdn.ptx
 # The whole recurrent block wired on the GPU vs ggml's own graph, stage by stage. Needs the rmsnorm
 # kernel too (the driver imports attn_norm from it) and libggml for the authority:
 #   ./native/legit/run_gdn_layer_gate.sh
-gdn-layer: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/rmsnorm.ptx
+gdn-layer: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/rmsnorm.ptx $(ROOT)/native/build/q8_0.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_layer_kernel_verify.py
 
 layer: $(ROOT)/native/build/layer.ptx

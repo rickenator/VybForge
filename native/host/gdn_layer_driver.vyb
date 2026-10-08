@@ -91,6 +91,7 @@ main()<Int> -> {
     xs<String> = "" ; ans<String> = "" ; wqs<String> = "" ; wgs<String> = ""
     wbs<String> = "" ; was<String> = "" ; dts<String> = "" ; asa<String> = ""
     cws<String> = "" ; sns<String> = "" ; sos<String> = "" ; zws<String> = "" ; sts<String> = ""
+    aqs<String> = "" ; bqs<String> = ""
     match (open_read("native/build/gdn_layer_in.bin")) {
         fh -> {
             o<Int> = 0
@@ -106,7 +107,9 @@ main()<Int> -> {
             sns = read_slice(fh, o, S * 8)             ; o = o + S * 8
             sos = read_slice(fh, o, NE * VALUE * 8)    ; o = o + NE * VALUE * 8
             zws = read_slice(fh, o, DC * QKV * 8)          ; o = o + DC * QKV * 8
-            sts = read_slice(fh, o, S * S * HV * 8)
+            sts = read_slice(fh, o, S * S * HV * 8)    ; o = o + S * S * HV * 8
+            aqs = read_slice(fh, o, HV * NE * 34 / 32) ; o = o + HV * NE * 34 / 32   # Q8_0: 34 B / 32 values
+            bqs = read_slice(fh, o, HV * NE * 34 / 32)
             close(fh)
         }
         ? -> { println("GDNL_ERR no input file") ; return 13 }
@@ -132,12 +135,19 @@ main()<Int> -> {
         g -> { ptxR = read_slice(g, 0, 65536) ; close(g) }
         ? -> { return 13 }
     }
+    ptxQ<String> = ""
+    match (open_read("native/build/q8_0.ptx")) {
+        g -> { ptxQ = read_slice(g, 0, 65536) ; close(g) }
+        ? -> { return 13 }
+    }
 
     freedom {
         hmodG<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleLoadData(loc(hmodG), ptxG) != 0) { return 9 }
         hmodR<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleLoadData(loc(hmodR), ptxR) != 0) { return 9 }
+        hmodQ<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hmodQ), ptxQ) != 0) { return 9 }
 
         hRN<loc<CVoid>> = from<loc<CVoid>>(0)
         hMM<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -151,6 +161,7 @@ main()<Int> -> {
         hDS<loc<CVoid>> = from<loc<CVoid>>(0)
         hNG<loc<CVoid>> = from<loc<CVoid>>(0)
         hAD<loc<CVoid>> = from<loc<CVoid>>(0)
+        hQ8<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(hRN), hmodR, "rmsnorm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(hMM), hmodG, "mm_nt") != 0) { return 10 }
         if (cuModuleGetFunction(loc(hSG), hmodG, "sigmoid_k") != 0) { return 10 }
@@ -163,7 +174,9 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(hDS), hmodG, "delta_step") != 0) { return 10 }
         if (cuModuleGetFunction(loc(hNG), hmodG, "norm_gated") != 0) { return 10 }
         if (cuModuleGetFunction(loc(hAD), hmodG, "add_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hQ8), hmodQ, "q8_0deq") != 0) { return 10 }
 
+        DQ8A<Int> = 0 ; DQ8B<Int> = 0
         DX<Int> = 0 ; DAN<Int> = 0 ; DWQKV<Int> = 0 ; DWG<Int> = 0 ; DWB<Int> = 0 ; DWA<Int> = 0
         DDT<Int> = 0 ; DA<Int> = 0 ; DCW<Int> = 0 ; DSN<Int> = 0 ; DSO<Int> = 0
         DXN<Int> = 0 ; DQKV<Int> = 0 ; DCONV<Int> = 0 ; DCONVS<Int> = 0 ; DZ<Int> = 0 ; DBRAW<Int> = 0 ; DBETA<Int> = 0
@@ -171,6 +184,8 @@ main()<Int> -> {
         DSTATE<Int> = 0 ; DSTOUT<Int> = 0 ; DEL<Int> = 0 ; DOUT<Int> = 0 ; DEPI<Int> = 0
         DY<Int> = 0 ; DLO<Int> = 0
         P1<Int> = 0 ; P2<Int> = 0 ; P3<Int> = 0 ; P4<Int> = 0
+        cuMemAlloc_v2(loc(DQ8A), HV * NE * 34 / 32)
+        cuMemAlloc_v2(loc(DQ8B), HV * NE * 34 / 32)
         cuMemAlloc_v2(loc(DX), 2 * NE * 8)          # both tokens of this fixture
         cuMemAlloc_v2(loc(DAN), NE * 8)
         cuMemAlloc_v2(loc(DWQKV), QKV * NE * 8)
@@ -207,6 +222,19 @@ main()<Int> -> {
         upload(xs, DX, 2 * NE * 8) ; upload(ans, DAN, NE * 8)
         upload(wqs, DWQKV, QKV * NE * 8) ; upload(wgs, DWG, VALUE * NE * 8)
         upload(wbs, DWB, HV * NE * 8) ; upload(was, DWA, HV * NE * 8)
+        # ssm_alpha / ssm_beta: when the fixture carries the model's own Q8_0 tensors, dequantise them
+        # on the GPU with the existing q8_0deq kernel instead of using the f64 upload above.
+        rcq<CInt> = 0
+        if (aqs.len() > 0) {
+            upload(aqs, DQ8A, HV * NE * 34 / 32)
+            rcq = cuda_launch4i(from<loc<CVoid>>(addr(hQ8)), 960, 1, 1, 256, 1, 1, DQ8A, DWA, HV * NE, 0)
+            if (rcq != 0) { println("GDNL_ERR q8 alpha") ; return 12 }
+        }
+        if (bqs.len() > 0) {
+            upload(bqs, DQ8B, HV * NE * 34 / 32)
+            rcq = cuda_launch4i(from<loc<CVoid>>(addr(hQ8)), 960, 1, 1, 256, 1, 1, DQ8B, DWB, HV * NE, 0)
+            if (rcq != 0) { println("GDNL_ERR q8 beta") ; return 12 }
+        }
         upload(dts, DDT, HV * 8) ; upload(asa, DA, HV * 8)
         upload(cws, DCW, QKV * DC * 8) ; upload(sns, DSN, S * 8)
         upload(sos, DSO, NE * VALUE * 8) ; upload(zws, DCONV, DC * QKV * 8)
@@ -313,7 +341,7 @@ main()<Int> -> {
         dump_section(stin, S * S * HV, pf, "state_out")
         }
 
-        cuMemFree_v2(DX) ; cuMemFree_v2(DAN) ; cuMemFree_v2(DWQKV) ; cuMemFree_v2(DWG)
+        cuMemFree_v2(DX) ; cuMemFree_v2(DAN) ; cuMemFree_v2(DQ8A) ; cuMemFree_v2(DQ8B) ; cuMemFree_v2(DWQKV) ; cuMemFree_v2(DWG)
         cuMemFree_v2(DWB) ; cuMemFree_v2(DWA) ; cuMemFree_v2(DDT) ; cuMemFree_v2(DA)
         cuMemFree_v2(DCW) ; cuMemFree_v2(DSN) ; cuMemFree_v2(DSO)
         cuMemFree_v2(DXN) ; cuMemFree_v2(DQKV) ; cuMemFree_v2(DCONV) ; cuMemFree_v2(DCONVS) ; cuMemFree_v2(DZ)

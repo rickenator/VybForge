@@ -17,6 +17,12 @@
 # The check reports its own negatives: the same run also prints, for step 2, the residual taken on the
 # normed input (7.6e-2) and with no residual at all (9.1e-1), both against a 1e-4 bar.
 #
+# ssm_alpha and ssm_beta can be driven by the model's OWN Q8_0 tensors (raw GGUF bytes uploaded, then
+# dequantised on the GPU by the existing q8_0deq kernel) — the mechanism is in place and dormant,
+# because the model's tensors are (48, 5120) and this fixture's geometry is (8, 512); the verifier
+# says so instead of feeding a truncated slice. Activating it means running this gate at the model's
+# real geometry, which the naive mm_nt projections make expensive (see doc/QWEN35-PHASE4.md).
+#
 # SKIPs (never PASSes) without a Vyb toolchain, without libggml for the authority, or without CUDA.
 set -u
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
