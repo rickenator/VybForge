@@ -39,8 +39,21 @@ so the provenance convention carries over unchanged:
   tensor for the draft head), and `build_arch_graph`, which per layer picks
   `build_layer_attn_linear(...)` (recurrent) or `build_layer_attn(...)` (full attention) on the
   interval.
-* `llm_build_delta_net_base` — the Gated DeltaNet graph, shared with the other delta-net models.
+* `llm_build_delta_net_base` — the Gated DeltaNet graph, shared with the other delta-net models. The
+  file is `src/models/delta-net-base.cpp`: `build_delta_net_chunk`, `build_delta_net_auto`,
+  `build_delta_net_fuse`, `build_delta_net` and `build_conv_state` — a chunked, an auto-selecting
+  and a fused variant, so a reference must implement the one a plain CPU run actually uses.
 * `src/models/qwen35moe.cpp` — the MoE sibling; useful when reading the shared base.
+
+## Two build facts that decide how the reference is made
+
+* **A built libggml exists here** (`~/Projects/llama.cpp/build/bin/libggml.so`, `libggml-cpu.so`,
+  `libggml-base.so`), so an authority harness can LINK the same library llama.cpp runs rather than
+  recompiling ggml sources the way `ggml_dequant_authority.py` had to for the quant kernels. That is
+  the stronger option: the authority would execute the identical op implementations, not a copy.
+* **`llama-cli` dumps core on this box** (also known from earlier work — it cores on `--help`). The
+  working entry point to llama.cpp's own inference is `llama-server` + a completion request. Any
+  end-to-end oracle for phase 4 must go through the server, not the CLI.
 
 ## What the repo has today
 
