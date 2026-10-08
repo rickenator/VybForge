@@ -262,6 +262,25 @@ What this does NOT cover, and what follows: the multi-token/prefill path (the op
 the rest of the layer around the recurrence — the short convolution, the l2 normalisation, the gated
 RMS epilogue and the projections — before a Vyb kernel and its gate can be written.
 
+### Second unit: the short convolution, also verified against ggml's own op
+
+`native/tools/conv_authority.c` runs `GGML_OP_SSM_CONV` from the same libggml; `native/tools/conv_verify.py`
+is the port and the check. At the model's real width (`d_conv=4`, `d_inner=10240`, `n_t=5`, i.e. 51200
+values):
+
+    CONV_VERIFY n=51200 maxabs=5.971e-08 maxrel=7.606e-08 (authority scale 7.850e-01)
+    CONV_VERIFY_DONE within maxrel 1e-06 of ggml's ssm_conv
+
+So the causal depthwise convolution — `out[t,ch] = Σ_{j<4} s[t+j,ch] * w[j,ch]`, the reason the layer
+carries the last three frames as state — matches ggml's implementation. Note the numpy shapes are
+`(d_inner, ncs)` and `(d_inner, d_conv)` for exactly the ne0-fastest reason recorded above: reading
+them the other way is what cost the earlier investigation.
+
+Both novel ops of a recurrent layer are now checked against the real implementation. Next: the
+l2 normalisation and the gated RMS epilogue (ordinary ops, and closer to the existing prefill path),
+then the layer wiring, then the Vyb kernel and its gate.
+
+
 
 
 
