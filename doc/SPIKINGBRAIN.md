@@ -380,6 +380,30 @@ Mapped steps (each one gated, in order):
   After the fix all 866 offsets match the `gguf` package exactly, which is how the second bug was
   caught: the first symptom was NaN deltas, not an obviously broken inventory.
 
+- **S0.6 — IQ2_S dequant on real Ridge tensors. LANDED 2026-10-08 (VybForge#10 phase 3, the
+  largest type).** `native/kernels/iq2s.vyb` (`iq2sdeq`), 160 tensors / 4.25 GiB — the mid-stack
+  FFN, and the type that decides whether the 27B is runnable. Layout (82 B): `d` f16, `qs[64]`
+  (2-bit indices in the first 32 bytes, SIGN BITS in the rest), `qh[8]`, `scales[8]`; per 32-value
+  group a 10-bit index selects one of 1024 grid entries.
+
+  **The authority here is llama.cpp's own C, compiled.** The `gguf` package implements Q8_0 but
+  NOT IQ2_S, so `native/tools/iq2_s_c_authority.py` extracts `dequantize_row_iq2_s`, the
+  `block_iq2_s` struct and the 1024-entry `iq2s_grid` + `kmask_iq2xs` tables VERBATIM from the
+  local checkout (commit `4df29be4`), adds only macro shims, compiles it, and the reference must
+  agree with it on whole 4096-element slices of real tensors — measured: **3/3 bit-identical**.
+  The grid table is never retyped: `native/tools/gen_iq2s_tables.py` extracts it into
+  `native/gguf/iq2s_tables.py` (generated, with the upstream commit recorded).
+
+  **The grid rides in the packed buffer.** A 1024×8-byte table cannot be derived and the shared
+  launcher (`cuda_launch4i`) passes exactly four integers, so `q` points at an 8192-byte grid
+  prefix and the blocks start at `q + 8192`; `iq2_s_ref.py` writes the grid image so driver and
+  reference cannot disagree about it. Measured: GPU vs reference **maxrel 1.7e-6** (tolerance
+  1e-5, the f32 floor).
+
+  Gate `native/legit/run_iq2_s_gate.sh` / `make iq2_s`, S0.6 in the Phase-2 battery. With Q8_0 and
+  IQ2_S implemented, the descriptor's Ridge refusal is down to **four** reasons (IQ3_S, Q5_K, the
+  GDN layer kind, MTP), and the caps gate asserts both new types are absent from it.
+
 - **S0.4 — an INDEPENDENT decode oracle: llama.cpp, per token. LANDED 2026-10-07 (VybForge#22).**
   Every other inference gate here compares the GPU against the numpy reference, and both implement
   the same conventions, so agreement proves self-consistency and not correctness — which is how #11

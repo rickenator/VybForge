@@ -470,4 +470,11 @@ caps:
 q8_0: $(ROOT)/native/build/q8_0.ptx
 	./native/legit/run_q8_0_gate.sh
 
+# ── IQ2_S dequant (VybForge#10 phase 3, the largest Ridge type) ─────────────────
+# 160 tensors / 4.25 GiB of the mid-stack FFN. The authority is llama.cpp's own dequant, copied
+# verbatim out of the local checkout and compiled as-is (the gguf package has no IQ2_S), and the
+# grid table rides in the packed buffer because the shared launcher takes four arguments.
+iq2_s: $(ROOT)/native/build/iq2s.ptx
+	./native/legit/run_iq2_s_gate.sh
+
 

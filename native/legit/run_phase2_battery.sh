@@ -185,6 +185,19 @@ else
   step "S0.5 Q8_0 dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# ── S0.6 — IQ2_S dequant on real Ridge tensors (VybForge#10 phase 3) ────────────────
+# Gate: native/legit/run_iq2_s_gate.sh. The largest type in the file (160 tensors, 4.25 GiB of
+# mid-stack FFN). The gguf package implements Q8_0 but NOT IQ2_S, so the authority here is
+# llama.cpp's own dequantize_row_iq2_s, copied verbatim out of the local checkout, compiled
+# as-is, and required to agree with our numpy port on whole 4096-element slices before either is
+# used to judge the GPU kernel. SKIPs without the model; FAILS if it proved nothing.
+out="$(./native/legit/run_iq2_s_gate.sh 2>&1)"
+if echo "$out" | grep -q "IQ2_S GATE: PASS"; then
+  step "S0.6 IQ2_S dequant (Ridge)" "$(echo "$out" | grep -o 'IQ2_S GATE: PASS.*' | head -1)"
+else
+  step "S0.6 IQ2_S dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────
 # Gate: native/legit/run_tensor_gate.sh (doc/SPIKINGBRAIN.md S0.2b). numpy IS the definition of
 # this behaviour, so the table's expectations come from numpy (array strides, ravel_multi_index,

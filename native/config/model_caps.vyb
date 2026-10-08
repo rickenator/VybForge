@@ -128,9 +128,10 @@ cp_add(list<String>, item<String>)<String> -> {
 eng_type(id<Int>)<Int> -> {
     if (id == 0) { return 1 }      // F32
     if (id == 2) { return 1 }      // Q4_0
-    if (id == 8) { return 1 }      // Q8_0  (native/kernels/q8_0.vyb, gated by make q8_0)
+    if (id == 8) { return 1 }      // Q8_0   (native/kernels/q8_0.vyb, make q8_0)
     if (id == 12) { return 1 }     // Q4_K
     if (id == 14) { return 1 }     // Q6_K
+    if (id == 22) { return 1 }     // IQ2_S  (native/kernels/iq2s.vyb, make iq2_s)
     return 0
 }
 eng_gdn()<Int> -> { return 0 }     // Gated DeltaNet recurrent layers
