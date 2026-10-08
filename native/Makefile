@@ -462,4 +462,12 @@ ridge-inventory:
 caps:
 	./native/legit/run_caps_gate.sh
 
+# ── Q8_0 dequant (VybForge#10 phase 3, first Ridge kernel) ──────────────────────
+# The Gated-DeltaNet state path of Qwen3.8-27B Ridge (ssm_alpha/ssm_beta, 96 tensors).
+# Checks the GPU kernel against native/tools/q8_0_ref.py on real tensors, and that reference
+# against the INDEPENDENT python gguf dequantizer — so the comparison is not self-referential.
+# Needs the 12 GiB Ridge GGUF; reports SKIP without it.
+q8_0: $(ROOT)/native/build/q8_0.ptx
+	./native/legit/run_q8_0_gate.sh
+
 

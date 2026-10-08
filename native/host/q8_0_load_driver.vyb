@@ -1,0 +1,179 @@
+// Q8_0 dequant on REAL Qwen3.8-27B Ridge tensors (VybForge#10 phase 3).
+//
+// Reads the checked-in inventory (native/gguf/ridge-3.7bpw-inventory.tsv, absolute file
+// offsets), loads each selected Q8_0 tensor's bytes straight from the GGUF, runs the
+// q8_0deq kernel on the GPU and dumps the first 6 values. The expected values come from
+// native/tools/q8_0_ref.py, which computes the same dequant in numpy AND against the
+// independent python gguf package (both must agree), so this comparison is not
+// self-referential.
+//
+// Prints SKIP and returns 0 when CUDA or the model is absent; native/legit/run_q8_0_gate.sh
+// reports that as a skip rather than a failure.
+import env::{env_get}
+import io::{open_read, read_at, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) { if ((s.char_at(i) as Int) == nd) { return i } }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0; i<Int> = frm
+    for (i in frm..endp - 1) { c<Int> = (s.char_at(i) as Int); if (c >= 48) { if (c <= 57) { a = a * 10 + (c - 48) } } }
+    return a
+}
+// "5120x48" -> 245760
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1; seg<Int> = frm; i<Int> = frm
+    for (i in frm..endp - 1) { if ((s.char_at(i) as Int) == 120) { n = n * parse_u(s, seg, i); seg = i + 1 } }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8); ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8; ch<Int> = 0; bj<Int> = 0
+            for (bj in 0..7) { bv<Int> = u8(data, o8 + bj); ch = ch | (bv << (bj * 8)) }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) { by<Int> = u8(data, tj); if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }; tj = tj + 1 }
+        return 0
+    }
+    return 0
+}
+
+// One inventory row: name, dims, type id, type name, role, absolute offset, byte count.
+struct Row { nm<String>, dims<String>, ty<Int>, off<Int>, bytes<Int> }
+
+split_rows(tsv<String>)<Vec<Row>> -> {
+    rows<Vec<Row>> = Vec()
+    ln<Int> = tsv.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((tsv.char_at(i) as Int) == 10) {
+            if ((tsv.char_at(st) as Int) == 35) { } else {
+                t1<Int> = strchr(tsv, 9, st)
+                if (t1 >= st) {
+                    t2<Int> = strchr(tsv, 9, t1 + 1); if (t2 < 0) { t2 = i }
+                    t3<Int> = strchr(tsv, 9, t2 + 1); if (t3 < 0) { t3 = i }
+                    t4<Int> = strchr(tsv, 9, t3 + 1); if (t4 < 0) { t4 = i }
+                    t5<Int> = strchr(tsv, 9, t4 + 1); if (t5 < 0) { t5 = i }
+                    t6<Int> = strchr(tsv, 9, t5 + 1); if (t6 < 0) { t6 = i }
+                    rows.push(Row { nm = tsv.substring(st, t1), dims = tsv.substring(t1 + 1, t2),
+                                    ty = parse_u(tsv, t2 + 1, t3), off = parse_u(tsv, t5 + 1, t6),
+                                    bytes = parse_u(tsv, t6 + 1, i) })
+                }
+            }
+            st = i + 1
+        }
+    }
+    return rows
+}
+find_row(rows<Vec<Row>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..rows.len() - 1) { if (rows.get(i).nm == nm) { return i } }
+    return -1
+}
+dump6(base<Int>, tag<String>)<Int> -> {
+    freedom {
+        rv<Float> = 0.0; acc<String> = ""; rj<Int> = 0
+        for (rj in 0..5) { rv = 0.0; cuMemcpyDtoH_v2(loc(rv), base + rj * 8, 8); acc = acc + rv.to_string() + " " }
+        println("Q8_0 " + tag + " -> " + acc)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYBFORGE_RIDGE_GGUF") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
+    TSV<String> = "native/gguf/ridge-3.7bpw-inventory.tsv"
+    rows<Vec<Row>> = split_rows(read_bin(TSV))
+    println("Q8_0_ROWS=" + rows.len().to_string())
+    if (rows.len() == 0) { println("Q8_0_FAIL inventory empty"); return 4 }
+
+    # The same four tensors q8_0_ref.py checks: the GDN state path this type exists for.
+    names<Vec<String>> = Vec()
+    names.push("blk.0.ssm_alpha.weight"); names.push("blk.0.ssm_beta.weight")
+    names.push("blk.1.ssm_alpha.weight"); names.push("blk.1.ssm_beta.weight")
+    ni<Int> = 0
+    for (ni in 0..names.len() - 1) {
+        ix<Int> = find_row(rows, names.get(ni))
+        if (ix < 0) { println("Q8_0_FAIL missing row " + names.get(ni)); return 5 }
+        if (rows.get(ix).ty != 8) { println("Q8_0_FAIL " + names.get(ni) + " is type " + rows.get(ix).ty.to_string()); return 6 }
+    }
+    println("Q8_0_TSV_OK 4 tensors, type 8")
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP"); return 0 }
+        var<CInt> dev = 0; if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    freedom {
+        m8<loc<CVoid>> = from<loc<CVoid>>(0)
+        rc8<CInt> = -1; t8<Int> = 0
+        for (t8 in 0..5) { if (rc8 != 0) { m8 = from<loc<CVoid>>(0); rc8 = cuModuleLoadData(loc(m8), read_bin("native/build/q8_0.ptx")) } }
+        if (rc8 != 0) { println("MODLOAD_FAIL q8_0"); return 9 }
+        fn8<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(fn8), m8, "q8_0deq") != 0) { return 10 }
+
+        # largest tensor first so the buffers are sized once
+        mx<Int> = 0; ni = 0; ix<Int> = 0
+        for (ni in 0..names.len() - 1) { ix = find_row(rows, names.get(ni)); nl<Int> = parse_numel(rows.get(ix).dims, 0, rows.get(ix).dims.len()); if (nl > mx) { mx = nl } }
+        PK<Int> = 0; WA<Int> = 0
+        if (cuMemAlloc_v2(loc(PK), mx * 34 / 32 + 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WA), mx * 8) != 0) { return 11 }
+
+        ni = 0
+        for (ni in 0..names.len() - 1) {
+            ix = find_row(rows, names.get(ni))
+            nm<String> = rows.get(ix).nm
+            nl<Int> = parse_numel(rows.get(ix).dims, 0, rows.get(ix).dims.len())
+            want<Int> = nl * 34 / 32                 # block_q8_0 is 32 values / 34 bytes
+            if (rows.get(ix).bytes != want) { println("Q8_0_FAIL " + nm + " bytes " + rows.get(ix).bytes.to_string() + " != " + want.to_string()); return 7 }
+            pd<String> = read_model(MODEL, rows.get(ix).off, want)
+            if (pd.len() < want) { println("Q8_0_SKIP_MODEL short read " + nm); return 0 }
+            ee<Int> = download(pd, PK, want)
+            if (ee != 0) { return 66 }
+            rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(fn8)), (nl + 255) / 256, 1, 1, 256, 1, 1, PK, WA, nl, 0)
+            if (rc != 0) { println("LAUNCH_FAIL"); return 33 }
+            cuCtxSynchronize()
+            dump6(WA, nm)
+        }
+        cuMemFree_v2(PK); cuMemFree_v2(WA)
+        println("Q8_0_DRIVER_DONE")
+        return 0
+    }
+    return 0
+}

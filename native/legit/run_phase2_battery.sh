@@ -162,7 +162,7 @@ fi
 # Gate: native/legit/run_caps_gate.sh. model_caps.vyb decides whether this build can RUN a model
 # and refuses with a NAMED reason when it cannot; the gate checks that decision against the dense
 # model (SUPPORTED, type counts cross-checked against an independent Python parser), the Ridge
-# target (UNSUPPORTED with exactly six named reasons), the vision tower, and a truncated file.
+# target (UNSUPPORTED with exactly five named reasons), the vision tower, and a truncated file.
 # The Ridge/mmproj cases SKIP when those files are not on disk, and the gate FAILS if it proved
 # nothing at all — a gate that skips everything has verified nothing.
 out="$(./native/legit/run_caps_gate.sh 2>&1)"
@@ -170,6 +170,19 @@ if echo "$out" | grep -q "S0\.2e CAPABILITY GATE: PASS"; then
   step "S0.2e capability descriptor" "PASS ($(echo "$out" | grep -o 'PASS ([0-9]* cases[^)]*)' | tail -1 | sed 's/^PASS (//; s/)$//'))"
 else
   step "S0.2e capability descriptor" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
+# ── S0.5 — Q8_0 dequant on real Ridge tensors (VybForge#10 phase 3) ─────────────────
+# Gate: native/legit/run_q8_0_gate.sh. The first of the quant types the descriptor's refusal
+# list named, now implemented and checked on real tensors from the 12 GiB GGUF — with the
+# numpy reference cross-checked against the INDEPENDENT python gguf dequantizer, so the
+# comparison is not our code agreeing with our code. SKIPs without the model, and the gate
+# FAILS if it proved nothing.
+out="$(./native/legit/run_q8_0_gate.sh 2>&1)"
+if echo "$out" | grep -q "Q8_0 GATE: PASS"; then
+  step "S0.5 Q8_0 dequant (Ridge)" "$(echo "$out" | grep -o 'Q8_0 GATE: PASS.*' | head -1)"
+else
+  step "S0.5 Q8_0 dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
 # ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────

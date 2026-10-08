@@ -340,9 +340,10 @@ Mapped steps (each one gated, in order):
     `F32:145,Q4_K:216,Q6_K:37`. The gate CROSS-CHECKS those counts against the independent Python
     parser (`native/gguf/ridge_inventory.py`), so the two implementations must agree — a Vyb-only
     check could be self-consistently wrong.
-  * Qwen3.8-27B Ridge → **UNSUPPORTED** with exactly six named reasons: IQ2_S(160), Q8_0(96),
-    Q5_K(51), IQ3_S(32), the Gated-DeltaNet layer kind (48 layers) and the MTP head
-    (`nextn_predict_layers=1`). It independently reproduces the hybrid layout the issue describes:
+  * Qwen3.8-27B Ridge → **UNSUPPORTED** with exactly five named reasons: IQ2_S(160), Q5_K(51),
+    IQ3_S(32), the Gated-DeltaNet layer kind (48 layers) and the MTP head
+    (`nextn_predict_layers=1`). Q8_0 (96 tensors) left this list on 2026-10-08 when the kernel
+    landed — see S0.5. It independently reproduces the hybrid layout the issue describes:
     64 text blocks = 16 attention + 48 recurrent, every 4th block an attention layer,
     `ssm.state_size 128`, `conv_kernel 4`, `group_count 16`, `time_step_rank 48`, `inner_size 6144`.
   * mmproj → **UNSUPPORTED as a vision-encoder** (BF16 110 tensors + vision), not as a broken text
@@ -356,6 +357,28 @@ Mapped steps (each one gated, in order):
   return value and always exits 0** (`doc/PYTHON-CLEANUP.md`), so gates parse the `*_DONE` /
   verdict lines and never trust `$?`. `mc_probe.vyb`'s header claimed its exit code was
   `mc_check()`, which was never true — corrected.
+
+- **S0.5 — Q8_0 dequant on real Ridge tensors. LANDED 2026-10-08 (VybForge#10 phase 3, first
+  kernel).** `native/kernels/q8_0.vyb` (`q8_0deq`), the simplest of the quant family: 34-byte
+  blocks of one f16 delta plus 32 SIGNED int8 with no scale table and no min. It is the type the
+  Gated-DeltaNet state path needs (`ssm_alpha`/`ssm_beta`, 96 tensors in the file).
+
+  Gate `native/legit/run_q8_0_gate.sh` / `make q8_0`, on real tensors from the 12 GiB GGUF:
+  * the numpy reference `native/tools/q8_0_ref.py` is **bit-identical to the independent python
+    `gguf` package's dequantizer on 4/4 tensors**; without that second implementation the
+    comparison would only prove our code agrees with our code (the #22 lesson);
+  * the GPU kernel matches that reference to **maxrel 4.2e-6** (worst of four tensors), which is
+    the f32-multiply rounding floor — device code multiplies in f32 while the references are f64.
+    The gate's tolerance is 1e-5 for that reason, and a layout bug would show as O(1), not 1e-6.
+
+  Two producer bugs surfaced while wiring this up, both of the "looks fine, decodes to garbage"
+  kind, and both are now fixed in `native/gguf/ridge_inventory.py`:
+  1. offsets were emitted GGUF-relative while the repo's convention (and `layer0_ref.py`'s
+     `fh.seek`) is ABSOLUTE file offsets;
+  2. the data region starts at the table end rounded up to the file's alignment (32 by default,
+     `general.alignment` otherwise) — using the raw table end put every offset 12 bytes early.
+  After the fix all 866 offsets match the `gguf` package exactly, which is how the second bug was
+  caught: the first symptom was NaN deltas, not an obviously broken inventory.
 
 - **S0.4 — an INDEPENDENT decode oracle: llama.cpp, per token. LANDED 2026-10-07 (VybForge#22).**
   Every other inference gate here compares the GPU against the numpy reference, and both implement
