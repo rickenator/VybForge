@@ -250,8 +250,13 @@ Mapped steps (each one gated, in order):
   Wd→FF, norms→0) takes the gate from `maxrel 5.4e3 / top1 MISMATCH` to `maxrel 3.4e-4 / MATCH`.
   Two consequences to be aware of: (i) the pre-fix driver's frozen gold `[31784, 31784]` in
   `native/tools/verify_chat_real.py` was captured from that wrong forward — its token does not appear
-  in llama.cpp's top 10 at either position — so `make chat-real` is now red against a stale constant
-  and needs re-blessing or a set/tolerance comparison; (ii) at the arbitrary ids this gate uses
+  in llama.cpp's top 10 at either position — so it was REPLACED: `verify_chat_real.py` now compares the
+  driver's per-position top1 against a numpy reference regenerated on every run
+  (`native/gguf/prompt_ref.py` + `native/tools/emit_prompt_ids.py`), on the principle the Makefile
+  states at that target — "a committed gold file must never be the thing that is trusted, because a
+  stale gold and a buggy forward can agree and leave the gate green". The consequence to keep in mind
+  is that `make chat-real` is now a GPU-vs-numpy comparison and so proves self-consistency only; the
+  INDEPENDENT check for the same prompt is S0.4 below. (ii) at the arbitrary ids this gate uses
   (`[0,1]`) the next-token distribution is nearly flat (p≈0.04, four tokens within 0.04 logprob), so
   a top1-argmax comparison is a coin flip: the *hidden* comparison is the meaningful one, and the
   real-prompt gate (`chat-prompt`, "The capital of France is" → ` Paris`) is the semantic one.
@@ -333,10 +338,10 @@ Mapped steps (each one gated, in order):
   `decode_capital_neartie` membership — and at that tied step **llama.cpp's own two routes
   disagree** (the low-level loop takes `.`, `create_completion` ranks `,` first by 0.25 logprob),
   which is why the case asserts membership. That is the honest boundary: the gate proves agreement
-  wherever llama's decision is decisive, not bit-exactness of the distribution. Related and still
-  open: the stale gold `[31784, 31784]` in `native/tools/verify_chat_real.py` (S0.2c above) is the
-  same class of self-consistent constant this gate exists to replace.
-
+  whatever llama's decision is decisive, not bit-exactness of the distribution. Related: the stale
+  gold `[31784, 31784]` that S0.2c left in `native/tools/verify_chat_real.py` has since been replaced
+  by a regenerated numpy comparison, so `make chat-real` is green but self-consistent — this gate is
+  the independent check for that same prompt (`The capital of France is`, `decode_capital_*`).
 
 ### Prompts: what the driver is given, and why the `[0,1]` run looks Chinese and gibberish
 
