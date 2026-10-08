@@ -16,6 +16,9 @@
 // at an 8192-byte grid prefix and the blocks begin at q + 8192. Callers must pack that prefix;
 // `native/tools/iq2_s_ref.py` writes the matching grid image so the driver and the reference
 // cannot disagree about it.
+// This convention is a WORKAROUND for a runtime limitation, not a design choice: filed as
+// Vyb#476 (kernel launches carry at most four scalar arguments). If that lands, this kernel
+// should take the grid as its own argument and the prefix can go away.
 // Thread = one output element (Float, 8 bytes). Launch via cuda_launch4i.
 iq2sdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()

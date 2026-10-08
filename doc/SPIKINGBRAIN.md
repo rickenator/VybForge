@@ -398,7 +398,9 @@ Mapped steps (each one gated, in order):
   launcher (`cuda_launch4i`) passes exactly four integers, so `q` points at an 8192-byte grid
   prefix and the blocks start at `q + 8192`; `iq2_s_ref.py` writes the grid image so driver and
   reference cannot disagree about it. Measured: GPU vs reference **maxrel 1.7e-6** (tolerance
-  1e-5, the f32 floor).
+  1e-5, the f32 floor). This is a WORKAROUND for a runtime limit and is filed as **Vyb#476**
+  (kernel launches carry at most four scalar arguments) — when that lands, the kernel should take
+  the grid as an argument and the prefix convention can be deleted.
 
   Gate `native/legit/run_iq2_s_gate.sh` / `make iq2_s`, S0.6 in the Phase-2 battery. With Q8_0 and
   IQ2_S implemented, the descriptor's Ridge refusal is down to **four** reasons (IQ3_S, Q5_K, the
