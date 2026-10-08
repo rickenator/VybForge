@@ -5,21 +5,26 @@
 > `embed` kernel and `model_driver.vyb` now builds the layer-0 input via GPU
 > `embed(DE, prids, XA)` from the real token_embd instead of the baked
 > `layer0_input.bin`; the gather reproduces the [0,1] gold (max abs diff 5e-8)
-> and `make chat-real` PASSES (top1 [31784,31784], prefill hidden preserved).
+> and `make chat-real` PASSES at the time (top1 [31784,31784] on the synthetic
+> [0,1] seed; the gate now requires a text prompt — see Checkpoint C).
 > Arbitrary prompts: `model_driver` reads `VYB_PROMPT`, tokenizes via
 > stdlib/vllm `llm_encode`, embeds those ids, runs a variable-S forward, and
 > `make chat-prompt` (default "The capital of France is" = 5 tokens
 > `[785,6722,315,9625,374]`) gates the GPU per-position lm_head top1 against the
-> numpy gold from `prompt_ref.py` ([87054,62868,71961,27051,19151]) — MATCHED
-> token-for-token (CHAT-PROMPT: PASS). Regenerate gold via `make chat-prompt-ref`.
+> numpy gold from `prompt_ref.py` — MATCHED token-for-token (CHAT-PROMPT: PASS).
+> That gold is regenerated on every run, so no list belongs in this file as
+> current; the values measured on 2026-10-07 are `[220,315,279,374,12095]` (the
+> last is ` Paris`). The list quoted here before that date,
+> `[87054,62868,71961,27051,19151]`, was the un-mirrored forward's own output —
+> the token salad of VybForge#11, which is why it has no business being a gold.
 > Checkpoint C DONE, hardware-verified (2026-09-11): `decode_driver.vyb` gained
 > an optional `VYB_PROMPT_IDS` prompt-seed path (default [0,1] keeps decode-real
 > green) that runs the proven recompute-full-prefix greedy GEN loop over a real
 > prompt and decodes the continuation to a String via the stdlib/vllm CPU head.
 > `make chat-gen` (default prompt + GEN=3) gates the GPU generated stream against
-> the numpy autoregressive gold `chatgen_ref.py` (full seq
-> [785,6722,315,9625,374,19151,87054,83376]) token-for-token, and asserts a
-> non-empty fluent response.
+> the numpy autoregressive gold `chatgen_ref.py`, regenerated on every run, and
+> asserts a non-empty fluent response. (The sequence quoted here previously,
+> `[785,6722,315,9625,374,19151,87054,83376]`, was the pre-orientation-fix salad.)
 > `model_driver.vyb` now composes `llm::` (stdlib/vllm CPU decode) on the real
 > Qwen3-4B: full 36-layer forward -> tied lm_head argmax `[31784,31784]` ->
 > stdlib/vllm CPU decode -> response `<CogCog>` (the model's deterministic
