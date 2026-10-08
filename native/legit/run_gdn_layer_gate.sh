@@ -8,13 +8,14 @@
 # against that authority STAGE BY STAGE, so a wiring mistake names the stage that is wrong.
 #
 # Geometry is small (n_embd=512, S=32, H_k=4, H_v=8, d_conv=4) so the gate is quick, and deliberately
-# NOT degenerate: every stride exceeds 1, which is where wiring/axis bugs live. One token, one
-# sequence, state zero — a fresh decode. The fixture is generated once and fed to both sides in their
+# NOT degenerate: every stride exceeds 1, which is where wiring/axis bugs live. It runs TWO chained
+# decode steps and compares both: step 2's conv window and delta-net state come out of step 1, so the
+# carry-over a running sequence needs is exercised, not just one token from a zero state. The fixture is generated once and fed to both sides in their
 # own precision (authority f32, kernels f64), so the expected agreement is the authority's f32 floor
 # (~2e-7 measured) while a wiring error is O(1).
 #
-# The check reports its own negatives: the same run also prints the residual taken on the normed
-# input (7.9e-2) and with no residual at all (9.5e-1), both against a 1e-4 bar.
+# The check reports its own negatives: the same run also prints, for step 2, the residual taken on the
+# normed input (7.6e-2) and with no residual at all (9.1e-1), both against a 1e-4 bar.
 #
 # SKIPs (never PASSes) without a Vyb toolchain, without libggml for the authority, or without CUDA.
 set -u
@@ -55,18 +56,18 @@ rc=$?
 grep -E '^GDNL_VERIFY' "$log" | sed 's/^/      /'
 
 if grep -q "^GDNL_VERIFY_SKIP" "$log"; then
-  step "GPU layer wiring (12 stages)" "SKIP ($(grep -m1 '^GDNL_VERIFY_SKIP' "$log" | sed 's/^GDNL_VERIFY_SKIP //'))"
+  step "GPU layer wiring (2 steps, 26 stages)" "SKIP ($(grep -m1 '^GDNL_VERIFY_SKIP' "$log" | sed 's/^GDNL_VERIFY_SKIP //'))"
   echo; echo "GDN LAYER GATE: SKIP (no CUDA device — nothing ran)"; exit 0
 fi
 
 if grep -q "^GDNL_VERIFY_DONE" "$log" && [ "$rc" = "0" ]; then
-  nst="$(grep -cE '^GDNL_VERIFY [a-z_]+ +n=' "$log")"
-  worst="$(grep -E '^GDNL_VERIFY [a-z_]+ +n=' "$log" | grep -oE 'maxrel=[0-9.e+-]+' | sed 's/maxrel=//' | sort -g | tail -1)"
-  step "GPU layer wiring ($nst stages)" "PASS (worst ${worst}, rejected 7.9e-2/9.5e-1)"
+  nst="$(grep -cE '^GDNL_VERIFY [a-z0-9_]+ +n=' "$log")"
+  worst="$(grep -E '^GDNL_VERIFY [a-z0-9_]+ +n=' "$log" | grep -oE 'maxrel=[0-9.e+-]+' | sed 's/maxrel=//' | sort -g | tail -1)"
+  step "GPU layer wiring ($nst stages)" "PASS (worst ${worst}, steps=2, rejected 7.6e-2/9.1e-1)"
   echo; echo "GDN LAYER GATE: PASS"
   exit 0
 fi
 
-step "GPU layer wiring (12 stages)" "FAIL (see $log)"
+step "GPU layer wiring (2 steps, 26 stages)" "FAIL (see $log)"
 echo; echo "GDN LAYER GATE: FAIL"
 exit 1

@@ -22,9 +22,10 @@
 //   y    = mul_mat(ssm_out, reshape(RMSNorm(out, ssm_norm) * SiLU(z), [value_dim, T, B]))
 //   x_out = x + y                                    (the block's attn residual)
 //
-// The window (conv state) is zero and the delta-net state is zero: this models the FIRST token of a
-// sequence, which is what a fresh decode carries and the only geometry the op's sequential kernel
-// covers (T > 1 has a chunked kernel that is not yet characterised).
+// The window (conv state) and the delta-net state come from the input file, so this authority can run
+// any STEP of a sequence: zero for the first token, or the state carried out of the previous step.
+// T is still 1 — the op's multi-token kernel is not characterised — but a sequence is a chain of
+// single-token steps, which is exactly what decode does.
 //
 // Usage: layer_authority in.bin outdir n_embd head_k_dim n_k_heads n_v_heads d_conv T B eps n_threads
 //   in.bin, in this order, each in ggml ORDER (the memory of a tensor whose ne is given, which is a
@@ -138,7 +139,10 @@ int main(int argc, char ** argv) {
     const size_t n_cv  = (size_t) qkv_dim * d_conv;
     const size_t n_hd  = (size_t) head_dim;
     const size_t n_wo  = (size_t) n_embd * value_dim;
-    const size_t total = n_x + n_xn + n_wq + n_wg + 2 * n_wa + 2 * n_hv + n_cv + n_hd + n_wo;
+    const size_t n_win = (size_t) qkv_dim * (d_conv - 1);
+    const size_t n_st  = (size_t) head_dim * head_dim * H_v * B;
+    const size_t total = n_x + n_xn + n_wq + n_wg + 2 * n_wa + 2 * n_hv + n_cv + n_hd + n_wo
+                       + n_win + n_st;
 
     struct ggml_init_params ip = { .mem_size = (size_t) 1024 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
     struct ggml_context * ctx = ggml_init(ip);
@@ -201,7 +205,7 @@ int main(int argc, char ** argv) {
     // to (T, qkv_dim, B) first and the concat gives (ncs, qkv_dim, B) — which is what ggml_ssm_conv
     // takes. Built as ops, so it is computed inside the graph rather than read before qkv exists.
     struct ggml_tensor * conv_win = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, qkv_dim, B);
-    memset(conv_win->data, 0, ggml_nbytes(conv_win));
+    memcpy(conv_win->data, buf + o, n_win * sizeof(float)); o += n_win;
     struct ggml_tensor * qkv_t = ggml_transpose(ctx, qkv);
     struct ggml_tensor * conv_in = ggml_concat(ctx, conv_win, qkv_t, 0);
     stage(ctx, gf, conv_in, "conv_in");
@@ -229,7 +233,7 @@ int main(int argc, char ** argv) {
 
     // the delta-net state, zero for the first token of a sequence.
     struct ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, head_dim, H_v, B);
-    memset(state->data, 0, ggml_nbytes(state));
+    memcpy(state->data, buf + o, n_st * sizeof(float)); o += n_st;
 
     struct ggml_tensor * gdn = ggml_gated_delta_net(ctx, q_n, k_n, v_conv, gate, beta, state, /*K=*/1);
     if (!gdn) { fprintf(stderr, "LA_ERR gated_delta_net refused\n"); return 5; }
@@ -238,6 +242,12 @@ int main(int argc, char ** argv) {
             (size_t) head_dim * sizeof(float), (size_t) head_dim * H_v * sizeof(float),
             (size_t) head_dim * H_v * T * sizeof(float), 0);
     stage(ctx, gf, gdn_out, "gdn_out");
+    // K=1: out [S_v,H_v,T,B] is immediately followed by the new state [S_v,S_v,H_v,B] in one buffer.
+    struct ggml_tensor * state_out = ggml_view_4d(ctx, gdn, head_dim, head_dim, H_v, B,
+            (size_t) head_dim * sizeof(float), (size_t) head_dim * head_dim * sizeof(float),
+            (size_t) head_dim * head_dim * H_v * sizeof(float),
+            (size_t) head_dim * H_v * T * B * sizeof(float));
+    stage(ctx, gf, state_out, "state_out");
 
     struct ggml_tensor * z2d = ggml_reshape_4d(ctx, z, head_dim, H_v, T, B);
     struct ggml_tensor * epi = ggml_mul(ctx, rms_norm_w(ctx, gdn_out, ssm_norm, eps), ggml_silu(ctx, z2d));

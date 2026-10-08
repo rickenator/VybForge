@@ -305,3 +305,21 @@ interleave_qkv(p<Int>) -> {
         st_f64(S + (ncs * ch + DC - 1 + t) * 8, ld_f64(Q + (ch + QKV * t) * 8))
     }
 }
+
+// Slide the conv buffer one step of history for the next token: every channel's frames shift down by
+// one, and the new token's frames are written into the tail by interleave_qkv afterwards. This is the
+// conv state carry-over of a running sequence (build_conv_state keeps the last d_conv-1 frames).
+//   S: ne (ncs, qkv_dim)  memory frame + ncs*ch
+// Params (device, 32 B): +0 S, +8 QKV, +16 ncs, +24 unused.
+conv_shift(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    QKV<Int> = ld_i64(p + 8)
+    ncs<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < QKV) {
+        j<Int> = 0
+        for (j in 0..ncs - 2) {
+            st_f64(S + (ncs * gid + j) * 8, ld_f64(S + (ncs * gid + j + 1) * 8))
+        }
+    }
+}

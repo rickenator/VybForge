@@ -133,6 +133,17 @@ Three lessons, all found by the per-stage split in one run each:
 * a NaN must FAIL a gate: `r > MAXREL` is False for NaN, so a NaN-filled stage printed DIFFERS and the
   gate still reported DONE. It is `not (r <= MAXREL)` now.
 
+## Unit 8 — state carry-over DONE (same session)
+
+The layer driver runs two chained decode steps and the gate compares both (26 stages, 2.4e-08..2.4e-07):
+step 2's conv window comes from step 1's qkv via a new `conv_shift` kernel, and step 2's delta-net
+state is step 1's new state (the state buffers swap each step). The authority runs the same sequence
+as two chained single-token steps. Gate: `run_gdn_layer_gate.sh` (P4.3, now 2 steps).
+
+Trap worth remembering: the fixture grew to two tokens but `DX` was still allocated for one, so an
+8192-byte upload into a 4096-byte buffer clobbered its neighbours and made step 1 read zeros — no
+device error, just wrong numbers. Device allocation sizes must move with the fixture.
+
 ## `eng_gdn()` is STILL 0, deliberately
 
 Do not flip it yet. The descriptor's `eng_gdn()` decides whether the caps gate reports
@@ -141,19 +152,20 @@ layer: no multi-token/prefill, no state carry-over across a sequence, no quantiz
 nothing wired into `model_driver`/the chat server. Flipping it would make the descriptor claim a
 capability the engine cannot deliver.
 
-## IMMEDIATE NEXT STEP (unit 8) — what the flip actually needs
+## IMMEDIATE NEXT STEP (unit 9) — what the flip still needs
 
-1. **State carry-over**: the kernels take the conv window and the delta-net state from buffers; a
-   running sequence needs them kept per layer between tokens (the conv state is `d_conv-1` frames per
-   channel, the delta state `S*S*H_v`) and the conv buffer re-interleaved each step.
-2. **The multi-token/prefill path** — the op's chunked kernel, still uncharacterised (see below).
-3. **Quantized weights**: the projections must go through the existing quant gemm path
-   (`layer_driver.vyb`/`model_driver.vyb` show how; `mm_nt` is the f64 reference form of it).
-4. **Engine integration**: a recurrent branch in `model_driver.vyb` (the per-layer loop that today
-   builds attention layers), then the `eng_gdn()` flip and a caps-gate re-run — the gate asserts the
-   refusal list SHRINKS as well as the new count (skill gate-and-probe §6) — plus re-running P4.1-P4.3.
+State carry-over is done (unit 8). Three things remain before `eng_gdn()` can honestly flip:
 
-## After that (do not start before unit 8 closes)
+1. **Quantized weights**: the projections (wqkv, wqkv_gate, ssm_beta, ssm_alpha, ssm_out) must go
+   through the existing quant gemm path — `layer_driver.vyb`/`model_driver.vyb` show how the current
+   attention layers do it; `mm_nt` is the f64 form of the same product.
+2. **The multi-token/prefill path** — the op's chunked kernel, still uncharacterised (see below); a
+   real prompt cannot run without it, and prefill is what makes 48 layers affordable.
+3. **Engine integration**: a recurrent branch in `model_driver.vyb`'s per-layer loop, then the flip and
+   a caps-gate re-run (the gate asserts the refusal list SHRINKS as well as the new count, skill
+   gate-and-probe §6), plus re-running P4.1-P4.3.
+
+## After that (do not start before unit 9 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven

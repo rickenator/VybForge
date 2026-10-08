@@ -68,7 +68,7 @@ def fixture():
     """One fixture, both precisions. Weights are ggml-order: a tensor of ne (K, N) is numpy (N, K)."""
     rng = np.random.default_rng(20261008)
     s = 1.0 / np.sqrt(NE)
-    x = rng.normal(0.0, 1.0, size=NE).astype(np.float32)
+    x = rng.normal(0.0, 1.0, size=(2, NE)).astype(np.float32)   # two decode steps
     attn_norm = rng.normal(1.0, 0.05, size=NE).astype(np.float32)
     wqkv = rng.normal(0.0, s, size=(QKV, NE)).astype(np.float32)
     wgate = rng.normal(0.0, s, size=(VALUE, NE)).astype(np.float32)
@@ -78,8 +78,8 @@ def fixture():
     conv1d = rng.normal(0.0, 0.2, size=(QKV, DC)).astype(np.float32)
     ssm_norm = rng.normal(1.0, 0.05, size=S).astype(np.float32)
     ssm_out = rng.normal(0.0, s, size=(NE, VALUE)).astype(np.float32)
-    zwindow = np.zeros(DC * QKV, dtype=np.float32)   # the conv buffer's window slots (ncs frames/channel)
-    state = np.zeros(S * S * H_V, dtype=np.float32)
+    zwindow = np.zeros(DC * QKV, dtype=np.float32)   # the conv buffer, window slots and all (ncs frames/channel)
+    state = np.zeros(S * S * H_V, dtype=np.float32)  # a fresh sequence starts at zero
     return dict(x=x, attn_norm=attn_norm, wqkv=wqkv, wqkv_gate=wgate, ssm_beta=wbeta,
                 ssm_alpha=walpha, ssm_dt=dt, ssm_a=a, ssm_conv1d=conv1d, ssm_norm=ssm_norm,
                 ssm_out=ssm_out, zwindow=zwindow, state=state), real
@@ -109,13 +109,17 @@ def build_ptx():
     return True
 
 
-def run_authority(fx):
+def run_authority_step(fx, x_step, window, state, outdir):
+    """One T=1 step of the authority with a given conv window and delta-net state."""
     with open(AUTH_IN, "wb") as fh:
-        for k in ("x", "attn_norm", "wqkv", "wqkv_gate", "ssm_beta", "ssm_alpha",
+        fh.write(np.ascontiguousarray(x_step, dtype="<f4").tobytes())          # x is FIRST in the file
+        for k in ("attn_norm", "wqkv", "wqkv_gate", "ssm_beta", "ssm_alpha",
                   "ssm_dt", "ssm_a", "ssm_conv1d", "ssm_norm", "ssm_out"):
             fh.write(np.ascontiguousarray(fx[k], dtype="<f4").tobytes())
-    os.makedirs(AUTH_DIR, exist_ok=True)
-    r = subprocess.run([AUTH_BIN, AUTH_IN, AUTH_DIR, str(NE), str(S), str(H_K), str(H_V),
+        fh.write(np.ascontiguousarray(window, dtype="<f4").tobytes())
+        fh.write(np.ascontiguousarray(state, dtype="<f4").tobytes())
+    os.makedirs(outdir, exist_ok=True)
+    r = subprocess.run([AUTH_BIN, AUTH_IN, outdir, str(NE), str(S), str(H_K), str(H_V),
                         str(DC), str(T), str(B), repr(EPS), "1"], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(("authority", r.stdout + r.stderr)[:400])
@@ -168,14 +172,25 @@ def rel(a, b):
 
 def main():
     print(f"GDNL_VERIFY geometry n_embd={NE} S={S} H_k={H_K} H_v={H_V} d_conv={DC} "
-          f"key={KEY} value={VALUE} qkv={QKV}")
+          f"key={KEY} value={VALUE} qkv={QKV}, steps=2")
     if not build_authority() or not build_ptx():
         return 1
     fx, real = fixture()
     print(f"GDNL_VERIFY fixture {'real ssm_a/ssm_dt from blk.0' if real else 'synthetic ssm_a/ssm_dt'}, "
-          f"state=0 (first token of a sequence)")
+          f"state and conv window start at zero")
 
-    run_authority(fx)
+    # The authority runs the sequence as two single-token steps: step 2 gets step 1's conv window
+    # (the last d_conv-1 frames of its conv_input) and step 1's delta-net state — the carry-over a
+    # decode loop has to reproduce.
+    d1, d2 = os.path.join(AUTH_DIR, "s1"), os.path.join(AUTH_DIR, "s2")
+    win0 = np.zeros(QKV * (DC - 1), dtype=np.float32)
+    st0 = np.zeros(S * S * H_V, dtype=np.float32)
+    run_authority_step(fx, fx["x"][0], win0, st0, d1)
+    conv1 = np.fromfile(os.path.join(d1, "conv_in.bin"), dtype="<f4").reshape(QKV, DC)  # ne (ncs, qkv_dim)
+    win1 = np.ascontiguousarray(conv1[:, 1:DC]).reshape(-1)
+    st1 = np.fromfile(os.path.join(d1, "state_out.bin"), dtype="<f4").reshape(-1)
+    run_authority_step(fx, fx["x"][1], win1, st1, d2)
+
     out = run_driver(fx)
     if "SKIP" in out and "GDNL_DONE" not in out:
         print("GDNL_VERIFY_SKIP " + [l for l in out.splitlines() if "SKIP" in l][0].strip())
@@ -185,56 +200,53 @@ def main():
         return 1
     got = parse_dumps(out)
 
+    stages = ("xn", "qkv", "z", "beta", "gate", "conv_silu", "q_norm", "k_norm",
+              "gdn_out", "epi", "y", "layer_out", "state_out")
     bad = 0
-    for name in ("xn", "qkv", "z", "beta", "gate", "conv_silu", "q_norm", "k_norm",
-                 "gdn_out", "epi", "y", "layer_out"):
-        ap = os.path.join(AUTH_DIR, f"{name}.bin")
-        if not os.path.exists(ap) or name not in got:
-            print(f"GDNL_VERIFY {name:11s} MISSING (authority={'y' if os.path.exists(ap) else 'n'} "
-                  f"driver={'y' if name in got else 'n'})")
-            bad = 1
-            continue
-        ref = np.fromfile(ap, dtype="<f4").reshape(SHAPES[name]).astype(np.float64).reshape(-1)
-        gpu = got[name].reshape(-1)
-        if gpu.size != ref.size:
-            print(f"GDNL_VERIFY {name:11s} LENGTH MISMATCH gpu={gpu.size} authority={ref.size}")
-            bad = 1
-            continue
-        r = rel(gpu, ref)
-        # NOTE: `not (r <= MAXREL)`, not `r > MAXREL` — a NaN comparison is False, so the inverted
-        # form would let a NaN output pass silently.
-        if not (r <= MAXREL):
-            flag = "DIFFERS"
-            bad = 1
-            print(f"GDNL_VERIFY {name:11s} n={gpu.size:6d} maxrel={r:.3e} "
-                  f"scale={float(np.max(np.abs(ref))):.3e} {flag}")
-            with np.errstate(invalid="ignore"):
-                d = np.abs(gpu - ref)
-            w = int(np.nanargmax(d)) if not np.all(np.isnan(d)) else 0
-            print(f"           worst idx {w}: gpu={gpu[w]:.9e} authority={ref[w]:.9e}")
-        else:
-            print(f"GDNL_VERIFY {name:11s} n={gpu.size:6d} maxrel={r:.3e} "
-                  f"scale={float(np.max(np.abs(ref))):.3e} ok")
+    for step, d in ((1, d1), (2, d2)):
+        for name in stages:
+            key = f"s{step}_{name}"
+            ap = os.path.join(d, f"{name}.bin")
+            if not os.path.exists(ap) or key not in got:
+                print(f"GDNL_VERIFY {key:16s} MISSING (authority={'y' if os.path.exists(ap) else 'n'} "
+                      f"driver={'y' if key in got else 'n'})")
+                bad = 1
+                continue
+            shape = (B, H_V, S, S) if name == "state_out" else SHAPES[name]
+            ref = np.fromfile(ap, dtype="<f4").reshape(shape).astype(np.float64).reshape(-1)
+            gpu = got[key].reshape(-1)
+            if gpu.size != ref.size:
+                print(f"GDNL_VERIFY {key:16s} LENGTH MISMATCH gpu={gpu.size} authority={ref.size}")
+                bad = 1
+                continue
+            r = rel(gpu, ref)
+            # NaN fails: `not (r <= bar)`, never `r > bar`.
+            if not (r <= MAXREL):
+                bad = 1
+                print(f"GDNL_VERIFY {key:16s} n={gpu.size:6d} maxrel={r:.3e} DIFFERS")
+                w = int(np.nanargmax(np.abs(gpu - ref)))
+                print(f"                 worst idx {w}: gpu={gpu[w]:.9e} authority={ref[w]:.9e}")
+            else:
+                print(f"GDNL_VERIFY {key:16s} n={gpu.size:6d} maxrel={r:.3e} ok")
 
     if bad:
         print(f"GDNL_VERIFY_FAIL worse than maxrel {MAXREL:g} (driver log: {os.path.relpath(DRV_LOG, REPO)})")
         return 1
 
-    # The check's teeth: two mis-wirings of THIS layer, computed from the authority's own stages.
-    x = np.fromfile(os.path.join(AUTH_DIR, "xn.bin"), dtype="<f4").reshape(-1).astype(np.float64)
-    lo = np.fromfile(os.path.join(AUTH_DIR, "layer_out.bin"), dtype="<f4").reshape(-1).astype(np.float64)
-    yv = np.fromfile(os.path.join(AUTH_DIR, "y.bin"), dtype="<f4").reshape(-1).astype(np.float64)
-    xraw = np.fromfile(os.path.join(AUTH_DIR, "xn.bin"), dtype="<f4").reshape(-1)
-    xin = fx["x"].astype(np.float64)
-    alt_norm_res = rel(x + yv, lo)          # residual on the normed input instead of the block input
-    alt_no_res = rel(yv, lo)                # residual dropped altogether
-    print(f"GDNL_VERIFY alt residual-on-attn_norm maxrel={alt_norm_res:.3e} (must be large)")
-    print(f"GDNL_VERIFY alt no-residual           maxrel={alt_no_res:.3e} (must be large)")
-    if min(alt_norm_res, alt_no_res) <= MAXREL:
+    # The check's teeth: mis-wirings of the carry-over, computed from the authority's own stages.
+    lo2 = np.fromfile(os.path.join(d2, "layer_out.bin"), dtype="<f4").reshape(-1).astype(np.float64)
+    y2 = np.fromfile(os.path.join(d2, "y.bin"), dtype="<f4").reshape(-1).astype(np.float64)
+    xn2 = np.fromfile(os.path.join(d2, "xn.bin"), dtype="<f4").reshape(-1).astype(np.float64)
+    alt_no_res = rel(y2, lo2)
+    alt_norm_res = rel(xn2 + y2, lo2)
+    print(f"GDNL_VERIFY alt step-2 no-residual          maxrel={alt_no_res:.3e} (must be large)")
+    print(f"GDNL_VERIFY alt step-2 residual-on-attn_norm maxrel={alt_norm_res:.3e} (must be large)")
+    if min(alt_no_res, alt_norm_res) <= MAXREL:
         print("GDNL_VERIFY_FAIL an alternative matches — the stage check proves nothing")
         return 1
-    print(f"GDNL_VERIFY_SUMMARY stages=12 rejected_alternatives={alt_norm_res:.2e}/{alt_no_res:.2e}")
-    print(f"GDNL_VERIFY_DONE the GPU wiring reproduces ggml's own graph within maxrel {MAXREL:g}")
+    print(f"GDNL_VERIFY_SUMMARY steps=2 stages=26 rejected_alternatives={alt_no_res:.2e}/{alt_norm_res:.2e}")
+    print(f"GDNL_VERIFY_DONE the GPU layer reproduces ggml's own graph for two chained steps "
+          f"within maxrel {MAXREL:g}")
     return 0
 
 

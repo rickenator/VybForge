@@ -489,6 +489,22 @@ Three bugs the per-stage split named in one run each, all worth keeping in mind 
 Gate: `native/legit/run_gdn_layer_gate.sh`, step **P4.3**; `make -f native/Makefile gdn-layer` runs the
 verifier. SKIPs without a toolchain, libggml or CUDA.
 
+### Eighth unit: two chained steps — the state carry-over a sequence needs
+
+The seventh unit's driver now runs **two** decode steps and the gate compares both: step 2's conv
+window is the last `d_conv-1` frames of step 1's qkv (the `conv_shift` kernel slides the buffer, the
+interleave writes the new token) and step 2's delta-net state is step 1's new state (the two state
+buffers swap roles each step, as a decode loop would). The authority runs the same sequence as two
+chained single-token steps, so this is the carry-over checked against ggml's own ops, not against our
+own loop. All 26 stages across both steps: `s1_*` and `s2_*` at 2.4e-08..2.4e-07, including
+`state_out` (8192 values per step).
+
+The trap here is not numerical: an 8192-byte upload into a 4096-byte device allocation
+(`cuMemAlloc(loc(DX), NE*8)` left behind when the fixture grew to two tokens) silently clobbered the
+neighbouring buffers and made the FIRST step read zeros — every stage then differed while the driver
+reported no error at all. Device allocation sizes must move with the fixture's sizes; the symptom of
+getting it wrong is wrong numbers, not a fault.
+
 ### `eng_gdn()` stays 0 — and why
 
 The descriptor's `eng_gdn()` (native/config/model_caps.vyb:140) is what makes the caps gate report
