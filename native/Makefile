@@ -477,4 +477,10 @@ q8_0: $(ROOT)/native/build/q8_0.ptx
 iq2_s: $(ROOT)/native/build/iq2s.ptx
 	./native/legit/run_iq2_s_gate.sh
 
+# ── Q5_K dequant (VybForge#10 phase 3, full-attention weight type) ──────────────
+# 51 tensors / 0.80 GiB: the full-attention layers' q/k/v. Same authority pattern as iq2_s —
+# llama.cpp's own dequantize_row_q5_K + get_scale_min_k4, extracted verbatim and compiled.
+q5k: $(ROOT)/native/build/q5k.ptx
+	./native/legit/run_q5k_gate.sh
+
 

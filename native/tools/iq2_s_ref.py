@@ -8,8 +8,8 @@ the independent authority here is **llama.cpp's own C**:
 
   * iq2_s_ours()   -- our numpy port of dequantize_row_iq2_s
   * the compiled authority -- the upstream function body, struct and tables copied VERBATIM out
-    of the local llama.cpp checkout by native/tools/iq2_s_c_authority.py and compiled as-is with
-    only macro shims. Neither the grid table (1024 entries) nor the sign mask is retyped.
+    of the local llama.cpp checkout by native/tools/ggml_dequant_authority.py and compiled as-is
+    with only macro shims. Neither the grid table (1024 entries) nor the sign mask is retyped.
 
 The two must agree on real tensor data. Writes native/out/iq2_s_ref.txt for the GPU gate:
     IQ2_S <tensor>@<element> -> v0 v1 v2 v3 v4 v5
@@ -94,17 +94,21 @@ def parse_inventory():
 
 
 def c_authority(raw):
-    """Dequantize the same bytes with the compiled upstream function; None if unavailable."""
-    spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iq2_s_c_authority.py")
+    """Dequantize the same bytes with the compiled upstream function; None if unavailable.
+
+    The extractor is shared with the other quant types (native/tools/ggml_dequant_authority.py),
+    so IQ2_S and Q5_K are checked against the same build of llama.cpp's own code.
+    """
+    spec = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ggml_dequant_authority.py")
     try:
         import importlib.util
-        s = importlib.util.spec_from_file_location("iq2s_auth", spec)
+        s = importlib.util.spec_from_file_location("ggml_auth", spec)
         mod = importlib.util.module_from_spec(s)
         s.loader.exec_module(mod)
     except Exception as exc:
         print(f"IQ2_S_AUTH_ERR {type(exc).__name__}: {exc}")
         return None
-    return mod.dequantize(raw)
+    return mod.dequantize(raw, "iq2_s")
 
 
 def write_grid_image(path):

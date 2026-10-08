@@ -10,11 +10,12 @@
 #          cross-checked against an INDEPENDENT parser (native/gguf/ridge_inventory.py, Python,
 #          written separately from the Vyb reader) — two implementations must agree.
 #   Qwen3.8-27B Ridge (the #10 target)
-#       -> UNSUPPORTED, naming EXACTLY two missing quant types, the Gated-DeltaNet layer kind and
-#          the MTP head — nothing more, nothing less — plus the hybrid facts the phase-2
-#          descriptor exists to express (64 text blocks = 16 attention + 48 recurrent, interval
-#          4, ssm state_size 128, one nextn layer). Q8_0 and IQ2_S are NOT in that list any more:
-#          they left it when their kernels landed, and the check asserts their absence.
+#       -> UNSUPPORTED, naming EXACTLY one missing quant type (IQ3_S), plus the Gated-DeltaNet
+#          layer kind and the MTP head — nothing more, nothing less — and the hybrid facts the
+#          phase-2 descriptor exists to express (64 text blocks = 16 attention + 48 recurrent,
+#          interval 4, ssm state_size 128, one nextn layer). Q8_0, Q5_K and IQ2_S are NOT in that
+#          list any more: they left it when their kernels landed, and the check asserts their
+#          absence.
 #   mmproj-BF16.gguf (the vision tower)
 #       -> UNSUPPORTED: BF16 and vision, filed as a vision-encoder layout, NOT as a broken text
 #          model.
@@ -163,14 +164,13 @@ else
     [ "$(cv ATTN_INTERVAL "$out")" = "4" ] || bad="$bad interval=$(cv ATTN_INTERVAL "$out")"
     [ "$(cv SSM_STATE_SIZE "$out")" = "128" ] || bad="$bad ssm_state=$(cv SSM_STATE_SIZE "$out")"
     [ "$(cv NEXTN_TENSORS "$out")" = "4" ] || bad="$bad nextn_tensors=$(cv NEXTN_TENSORS "$out")"
-    # the refusal list must be EXACTLY these four, each named, and no others. Q8_0 and IQ2_S left
-    # this list when their kernels landed (make q8_0 / make iq2_s), so the check asserts their
-    # ABSENCE too — a capability that silently stopped being reported would otherwise read as a
-    # passing gate.
+    # the refusal list must be EXACTLY these three, each named, and no others. Q8_0, IQ2_S and
+    # Q5_K left this list when their kernels landed (make q8_0 / iq2_s / q5k), so the check
+    # asserts their ABSENCE too — a capability that silently stopped being reported would
+    # otherwise read as a passing gate.
     nreasons="$(tr ',' '\n' <<<"$uns" | sed '/^$/d' | wc -l | tr -d ' ')"
-    [ "$nreasons" = "4" ] || bad="$bad reasons=$nreasons"
+    [ "$nreasons" = "3" ] || bad="$bad reasons=$nreasons"
     for want in \
-      "UNSUPPORTED_QUANT_TYPE Q5_K" \
       "UNSUPPORTED_QUANT_TYPE IQ3_S" \
       "UNSUPPORTED_LAYER_KIND gated-deltanet layers=48" \
       "UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1"; do
@@ -178,12 +178,13 @@ else
     done
     grep -qF "Q8_0" <<<"$uns" && bad="$bad Q8_0-still-refused"
     grep -qF "IQ2_S" <<<"$uns" && bad="$bad IQ2_S-still-refused"
+    grep -qF "Q5_K" <<<"$uns" && bad="$bad Q5_K-still-refused"
     if [ -n "$bad" ]; then
       step "Ridge text model (#10 target)" "FAIL:$bad"
       echo "      unsupported=[$uns]" | sed 's/^/      /'
       fail=1
     else
-      step "Ridge text model (#10 target)" "UNSUPPORTED with 4 named reasons (16 attn + 48 GDN = 64, MTP, IQ3_S/Q5_K; Q8_0 + IQ2_S implemented)"
+      step "Ridge text model (#10 target)" "UNSUPPORTED with 3 named reasons (16 attn + 48 GDN = 64, MTP, IQ3_S; Q8_0 + Q5_K + IQ2_S implemented)"
       proven=$((proven + 1))
     fi
     type_crosscheck "Ridge text model" "$out" "$ridge"

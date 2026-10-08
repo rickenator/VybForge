@@ -130,6 +130,7 @@ eng_type(id<Int>)<Int> -> {
     if (id == 2) { return 1 }      // Q4_0
     if (id == 8) { return 1 }      // Q8_0   (native/kernels/q8_0.vyb, make q8_0)
     if (id == 12) { return 1 }     // Q4_K
+    if (id == 13) { return 1 }     // Q5_K   (native/kernels/q5k.vyb, make q5k)
     if (id == 14) { return 1 }     // Q6_K
     if (id == 22) { return 1 }     // IQ2_S  (native/kernels/iq2s.vyb, make iq2_s)
     return 0

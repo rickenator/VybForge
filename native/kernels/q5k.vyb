@@ -1,0 +1,58 @@
+// GGUF block_q5_K dequant kernel — the full-attention layers of Qwen3.8-27B Ridge (q/k/v, 51
+// tensors, 0.80 GiB).
+// Ported faithfully from llama.cpp ggml-quants.c dequantize_row_q5_K / get_scale_min_k4.
+// Derived from llama.cpp (MIT License, https://github.com/ggml-org/llama.cpp):
+// ggml-quants.c, dequantize_row_q5_K / get_scale_min_k4. See THIRD-PARTY.md.
+//
+// block layout (176 B): d f16 @0, dmin f16 @2, scales[12] @4, qh[32] @16, qs[128] @48.
+//   256 values/block as 4 rounds of 64: each round uses one 6-bit scale/min pair for its low
+//   nibbles and the next pair for its high nibbles, and the 5th bit comes from qh[l] under a
+//   per-round mask (1 << 2t for the low half, 1 << (2t+1) for the high half):
+//     val = d*sc*((qs nibble) + (qh bit ? 16 : 0)) - dmin*m
+// No codebook, so this is a plain four-argument kernel — unlike iq2sdeq, which has to carry an
+// 8192-byte grid prefix in its buffer (Vyb#476).
+// Thread = one output element (Float, 8 bytes). Launch via cuda_launch4i.
+q5kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        block<Int> = gid / 256
+        e<Int> = gid % 256
+        bb<Int> = q + block * 176
+        t<Int> = e / 64                 # round 0..3
+        r<Int> = e % 64
+        half<Int> = r / 32              # 0 = low nibble, 1 = high nibble
+        l<Int> = r % 32
+        d<Float> = ld_f16(bb + 0)
+        dmin<Float> = ld_f16(bb + 2)
+        j<Int> = 2 * t + half           # scale/min pair index 0..7
+        # get_scale_min_k4(j, scales, &sc, &m): 6-bit packed, high nibbles shared with the
+        # second four pairs. Bytes are masked to unsigned before shifting — a signed shift here
+        # would arithmetic-shift and silently produce negative scales.
+        sc<Int> = 0
+        m<Int> = 0
+        if (j < 4) {
+            sc = (ld_i8(bb + 4 + j) as Int) & 63
+            m = (ld_i8(bb + 4 + j + 4) as Int) & 63
+        } else {
+            sc = ((ld_i8(bb + 4 + j + 4) as Int) & 15) | ((((ld_i8(bb + 4 + j - 4) as Int) & 255) >> 6) << 4)
+            m = (((ld_i8(bb + 4 + j + 4) as Int) & 255) >> 4) | ((((ld_i8(bb + 4 + j) as Int) & 255) >> 6) << 4)
+        }
+        qb<Int> = (ld_i8(bb + 48 + 32 * t + l) as Int) & 255
+        nib<Int> = 0
+        if (half == 0) { nib = qb & 15 } else { nib = qb >> 4 }
+        hmask<Int> = 1 << (2 * t + half)
+        hb<Int> = 0
+        if (((ld_i8(bb + 16 + l) as Int) & 255) & hmask) { hb = 16 }
+        qval<Int> = nib + hb
+        val<Float> = d * (sc as Float) * (qval as Float) - dmin * (m as Float)
+        # GGUF dequant emits out-major; gemm needs [in,out] (VybForge#11). When z (= in-dim) > 0,
+        # write transposed (see q4kdeq's comment for why).
+        if (z > 0) {
+            rr<Int> = gid / z
+            cc<Int> = gid % z
+            st_f64(o + cc * n / z * 8 + rr * 8, val)
+        } else {
+            st_f64(o + gid * 8, val)
+        }
+    }
+}

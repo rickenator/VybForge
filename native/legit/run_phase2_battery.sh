@@ -198,6 +198,18 @@ else
   step "S0.6 IQ2_S dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
 fi
 
+# ── S0.7 — Q5_K dequant on real Ridge tensors (VybForge#10 phase 3) ────────────────
+# Gate: native/legit/run_q5k_gate.sh — the full-attention layers' q/k/v (51 tensors, 0.80 GiB).
+# The 6-bit scale/min unpacking in scales[12] is where a bit-level mistake would hide, so the
+# numpy port is checked against llama.cpp's own compiled dequant on whole slices before it is
+# used to judge the GPU kernel. SKIPs without the model; FAILS if it proved nothing.
+out="$(./native/legit/run_q5k_gate.sh 2>&1)"
+if echo "$out" | grep -q "Q5_K GATE: PASS"; then
+  step "S0.7 Q5_K dequant (Ridge)" "$(echo "$out" | grep -o 'Q5_K GATE: PASS.*' | head -1)"
+else
+  step "S0.7 Q5_K dequant (Ridge)" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.2b — tensor core (shape/strides/dtype/broadcast) ─────────────────────────────
 # Gate: native/legit/run_tensor_gate.sh (doc/SPIKINGBRAIN.md S0.2b). numpy IS the definition of
 # this behaviour, so the table's expectations come from numpy (array strides, ravel_multi_index,

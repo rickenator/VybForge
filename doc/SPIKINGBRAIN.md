@@ -406,6 +406,25 @@ Mapped steps (each one gated, in order):
   IQ2_S implemented, the descriptor's Ridge refusal is down to **four** reasons (IQ3_S, Q5_K, the
   GDN layer kind, MTP), and the caps gate asserts both new types are absent from it.
 
+- **S0.7 — Q5_K dequant on real Ridge tensors. LANDED 2026-10-08 (VybForge#10 phase 3).**
+  `native/kernels/q5k.vyb` (`q5kdeq`), 51 tensors / 0.80 GiB: the full-attention layers' q/k/v.
+  Layout (176 B): `d` f16, `dmin` f16, `scales[12]` (6-bit scale/min pairs), `qh[32]`, `qs[128]`;
+  each 64-value round takes two scale/min pairs and a `1 << (2t+half)` mask for the 5th bit from
+  `qh`. No codebook, so this is a plain four-argument kernel — unlike `iq2sdeq`, which carries an
+  extra 8192-byte grid prefix (Vyb#476).
+
+  The shared authority gained a second spec here (`native/tools/ggml_dequant_authority.py`,
+  spec `q5_K`) rather than a second extractor, and `iq2_s_ref.py` was migrated onto it and
+  re-gated in the same pass — the refactor is proven by that gate still passing. The q5_K struct
+  needed three layout shims (`GGML_EXTENSION`, `GGML_COMMON_AGGR_S/U`, and a 4-byte `ggml_half2`),
+  which is recorded in the tool: a shim must preserve LAYOUT, not merely compile.
+
+  Measured: our numpy port vs llama.cpp's own compiled `dequantize_row_q5_K` **3/3 bit-identical**
+  on whole 4096-element slices; GPU kernel vs reference **maxrel 3.8e-6** (tolerance 1e-5, the f32
+  floor). Gate `native/legit/run_q5k_gate.sh` / `make q5k`, S0.7 in the Phase-2 battery. The
+  descriptor's Ridge refusal is now down to **three** (IQ3_S, the GDN layer kind, MTP), with all
+  three implemented types asserted absent from it.
+
 - **S0.4 — an INDEPENDENT decode oracle: llama.cpp, per token. LANDED 2026-10-07 (VybForge#22).**
   Every other inference gate here compares the GPU against the numpy reference, and both implement
   the same conventions, so agreement proves self-consistency and not correctness — which is how #11
