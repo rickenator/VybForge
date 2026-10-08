@@ -441,4 +441,17 @@ resident-bench: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(RO
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) VYB_RUNS=$(RESIDENT_RUNS) $(VYB) native/host/resident_driver.vyb --module-path native/llm 2>&1 | tee native/out/resident_bench.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_resident_bench.py
 
+# ── Ridge GGUF tensor inventory (VybForge#10, phase 3 groundwork) ────────────────
+# The inventory is a FUNCTION OF THE FILE, so regenerate it here rather than editing
+# the TSV by hand; the coverage section names the quant types this engine does not
+# implement yet, which is the phase-3 work list. Needs the reference GGUF:
+#   hf download empero-ai/Qwen3.8-27B-Ridge-GGUF Qwen3.8-27B-Ridge-3.7bpw.gguf \
+#     --local-dir $(HOME)/Models/qwen38-27b-ridge
+# Override RIDGE_GGUF for a different file (e.g. the vision tower, which has its own
+# mmproj-*.gguf and inventories cleanly through the same tool).
+RIDGE_GGUF ?= $(HOME)/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf
+ridge-inventory:
+	cd $(ROOT) && .venv/bin/python native/gguf/ridge_inventory.py "$(RIDGE_GGUF)" \
+	  --tsv native/gguf/ridge-3.7bpw-inventory.tsv --meta native/out/ridge_meta.txt
+
 
