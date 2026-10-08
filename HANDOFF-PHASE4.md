@@ -76,26 +76,43 @@ Three conventions pinned, each with its rejected alternative measured:
 * `ssm_a` is stored pre-exponentiated (`SSM_A_NOSCAN`; qwen35.cpp comments it `-A_log.exp()`), so do
   not re-apply the exp. The verifier reads it from the GGUF and asserts all-negative.
 
-`run_gdn_ops_gate.sh` now runs all four units (still step **P4.1** of the phase-2 battery).
+`run_gdn_ops_gate.sh` now runs all five units (still step **P4.1** of the phase-2 battery).
 
-## IMMEDIATE NEXT STEP (unit 5)
+## Unit 5 — DONE (fifth unit, same session)
 
-**The layer wiring.** Assemble the pieces in `build_layer_attn_linear`'s order —
+The whole recurrent block is verified wired stage by stage: `native/tools/layer_authority.c` builds it
+from the real ops in one graph (attn_norm → wqkv/wqkv_gate → beta/alpha gates → conv + SiLU → q|k|v
+views → l2 norms → gated_delta_net → gated epilogue → ssm_out → attn residual) and dumps 14 named
+stages; `native/tools/layer_verify.py` assembles the four earlier ports in the same order and compares
+each stage. Measured at the 27B geometry with T=1, zero state and the model's real ssm_dt/ssm_a: every
+stage at the f32 floor (worst 5.58e-07 on `y`, layer_out 1.21e-07), and the check has teeth — dropping
+the epilogue's SiLU(z) costs 2.95e-01, taking the residual on the normed input 8.79e-02.
 
-    input -> attn_norm -> [wqkv | wqkv_gate + ssm_beta/sigmoid | ssm_alpha/softplus*ssm_a]
-          -> conv_state + ssm_conv + silu -> split q|k|v -> l2_norm(q), l2_norm(k)
-          -> delta-net recurrence (state) -> RMSNorm*SiLU epilogue -> ssm_out
-          -> residual, then the block's ffn with attn_post_norm
+`run_gdn_ops_gate.sh` now runs all five units (still step **P4.1** of the phase-2 battery).
 
-— as one reference and check it end to end against a captured layer (the existing
-`llama_decode_capture.py` / `verify_layer*.py` tools capture per-tensor dumps from this llama.cpp, so
-the wiring can be validated against the real graph rather than against its own parts). The pieces are
-already individually verified, so a wiring mismatch is the thing being looked for; expect the residual
-order and where `z` enters the epilogue to be the likely places for a mistake.
+Not covered by unit 5: the FFN half of the block (dense path, already gated in phase 2), a NON-empty
+delta-net/conv state (one step from a fresh sequence only), and real weights (synthetic on purpose —
+op semantics are what is under test).
 
-Then: the Vyb kernel + driver + gate, and last the `eng_gdn()` flip.
+## IMMEDIATE NEXT STEP (unit 6)
 
-## After that (do not start before unit 5 closes)
+**The Vyb kernel for the recurrence + driver + gate.** The reference work for item 1 is complete:
+five units, all passing against the real ops. The next piece of the descriptor's blocker
+(`eng_gdn()` in `native/config/model_caps.vyb:140`) is Vyb code, not reference code:
+
+1. the kernel (`native/kernels/`): the l2 norm, the delta-rule step and the gated epilogue are the
+   natural first targets — they are elementwise/reduction work with no matmul, so they exercise the
+   Vyb CUDA path without needing a GEMM; the projections and the conv can reuse the existing gemm and
+   FIR kernels (check what `native/kernels/` already has before writing anything).
+2. the driver (`native/host/`) + a `native/legit/run_*_gate.sh` in the shape of the quant gates
+   (SKIP without model/GPU, FAIL if it proved nothing), wired into the phase-2 battery as P4.2.
+3. then the layer wiring in the driver, then flip `eng_gdn()`.
+
+Gate discipline to reuse from the five units: compile/run against the LOCAL authority, dump results
+and compare per stage, and print the rejected alternative's error so a check that cannot fail is
+visible.
+
+## After that (do not start before unit 6 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven

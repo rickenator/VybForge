@@ -275,14 +275,14 @@ else
 fi
 
 # ── P4.1 — Gated DeltaNet layer-op references (VybForge#10 phase 4, item 1) ─────────
-# Gate: native/legit/run_gdn_ops_gate.sh (doc/QWEN35-PHASE4.md). The recurrent layer's four verified
+# Gate: native/legit/run_gdn_ops_gate.sh (doc/QWEN35-PHASE4.md). The recurrent layer's five verified
 # units — the delta-rule recurrence + state read-out, the causal short convolution, the l2 norm /
-# RMS norm / gated epilogue, and the five projections with the beta/alpha gates — each checked
-# against the SAME libggml the local llama.cpp is built with (a C harness links it and calls the real
-# op), not against our own maths. Every verifier also reports the REJECTED alternative's error
-# (opposite eps convention 7e-2, transposed mul_mat operand ~1.2, threshold-less softplus inf) so the
-# agreements are measurements, not tolerances nothing could breach. SKIPs without the llama.cpp
-# checkout.
+# RMS norm / gated epilogue, the five projections with the beta/alpha gates, and the whole block wired
+# stage by stage (14 dumps) — each checked against the SAME libggml the local llama.cpp is built with
+# (a C harness links it and runs the real ops), not against our own maths. Every verifier also reports
+# the REJECTED alternative's error (opposite eps convention 7e-2, transposed mul_mat operand ~1.2,
+# threshold-less softplus inf, a mis-wired residual/epilogue 8.8e-2/3.0e-1) so the agreements are
+# measurements, not tolerances nothing could breach. SKIPs without the llama.cpp checkout.
 out="$(./native/legit/run_gdn_ops_gate.sh 2>&1)"
 last="$(echo "$out" | tail -1)"
 if echo "$last" | grep -q "GDN OPS GATE: PASS"; then

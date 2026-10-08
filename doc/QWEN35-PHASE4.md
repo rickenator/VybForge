@@ -360,10 +360,42 @@ So the layer's whole non-recurrent input path is now referenced: projections, bo
 units 2-3) the convolution, the two norms and the epilogue. What is left before a Vyb kernel can be
 written is the layer wiring itself and the multi-token/prefill kernel noted below.
 
-Next, outward: **the layer wiring** — assembling conv → l2 norm → recurrence → epilogue → projections
-in the order `build_layer_attn_linear` uses, with the residual and the two norms
-(`attn_norm` / `attn_post_norm`) around it, checked end to end against a captured layer. Then the Vyb
-kernel + driver + gate, and last the `eng_gdn()` flip.
+### Fifth unit: one whole recurrent block, wired and checked stage by stage
+
+`native/tools/layer_authority.c` builds the block the way `build_layer_attn_linear` + the block loop
+do — `attn_norm` → `wqkv`/`wqkv_gate` → `ssm_beta`/`ssm_alpha` gates → conv window + `ssm_conv` + SiLU →
+the q|k|v views → l2 norms → `ggml_gated_delta_net` → gated epilogue → `ssm_out` → the attn residual —
+out of the real ops, in one graph, and dumps 14 named stages. `native/tools/layer_verify.py` is the
+reference: the four earlier units' ports, assembled in that order, compared **per stage**.
+
+At the 27B Ridge geometry, T=1 (the sequential-kernel geometry), zero conv window and zero delta-net
+state (a fresh sequence, i.e. first-token decode), with the model's real `ssm_dt`/`ssm_a`:
+
+    xn         maxrel=0.000e+00        conv_silu  maxrel=2.915e-07
+    qkv        maxrel=2.332e-07        q_norm     maxrel=2.582e-07
+    z          maxrel=2.463e-07        k_norm     maxrel=3.696e-07
+    beta       maxrel=1.951e-07        gdn_out    maxrel=3.985e-07
+    gate       maxrel=2.208e-08        epi        maxrel=2.867e-07
+    conv_in    maxrel=2.332e-07        y          maxrel=5.581e-07
+                                       layer_out  maxrel=1.212e-07
+
+Every stage is at the f32 floor, and the check has teeth: the same reference with the epilogue's
+`SiLU(z)` factor dropped is off by 2.95e-01, and with the residual taken on the normed input instead of
+the block input by 8.79e-02. Two classes of wiring mistake — a missing factor and a misplaced
+residual — are therefore visibly rejected rather than silently tolerated.
+
+What this does NOT cover, and what is left before a Vyb kernel: the FFN half of the block (unchanged
+from the dense path already gated in phase 2), the recurrent path with a NON-empty state (this unit is
+one step from a fresh sequence; carrying state across tokens needs the multi-token kernel below), and
+the real-weight variant (the weights here are synthetic, deliberately — the op semantics are what is
+under test).
+
+## What next: the Vyb kernel
+
+The reference work for item 1 is complete: all five units pass against the real ops
+(`run_gdn_ops_gate.sh`, step P4.1). The remaining path is a Vyb kernel for the recurrence + its
+driver and gate, then the layer wiring in the driver, then the `eng_gdn()` flip. The two open risks to
+carry into that work are the ones recorded below: the multi-token/prefill kernel, and the MTP head.
 
 
 
