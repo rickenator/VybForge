@@ -101,25 +101,40 @@ directly, so it runs the identical op implementation llama.cpp uses, not a copy.
 
 ### NOT established — the open problem, with its evidence
 
-At model geometry the comparison fails, and not by rounding. The isolating probe: feed `H_v = 2`
-with **identical** memory for both heads (state, v, gate, beta all repeated along the head axis).
-Two consequences, both reproducible:
+At model geometry the comparison fails, and not by rounding. Three experiments narrowed it down.
 
-1. the op's two head outputs are NOT equal to each other, and
-2. the op's head 0 does NOT match the port's head-0 result, whereas the same head-0 computation at
-   `H_v = 1` matches exactly.
+**1. The delta rule itself is right, and so is the v-head mapping.** A setup where the update is the
+only effect (`state = 0`, `beta = 1`, `k = e_0`, `q = e_0`, `v[:,h] = V_h`) returns `out = V_h / sqrt(S)`
+per head — exactly what the port predicts, including the outer-product orientation and the scale.
 
-Identical input slices cannot produce different results under the layout that
-`build_delta_net_fused` asserts (`s->ne[0]==S_v && s->ne[1]==S_v && s->ne[2]==H_v && s->ne[3]==n_seqs`,
-`delta-net-base.cpp:399`) and that the kernel's addressing implies (`(iv3*H + iv1)*S_v*S_v`). So the
-op's per-head addressing differs from the documented layout in some way not yet identified — the
-candidates are the state's head axis, the v-head/k-head broadcast, or a head count the op derives
-from somewhere other than `V->ne[1]`. This must be settled before the reference can be trusted at
-model geometry; guessing would be worse than the blank.
+**2. Two heads fed identical memory give DIFFERENT results.** With `H_v = 2` and the state, v, gate
+and beta repeated along the head axis, the op returns two different head outputs, and a head-0 result
+that differs from the same head-0 computation at `H_v = 1`. Identical input slices cannot do that
+under the layout the model asserts.
 
-Next probe when this resumes: hold everything fixed and vary ONE head-dependent input (state vs v
-vs gate) with a per-head multiplier, and read which op output scales with it — that identifies the
-op's actual head slice. Only then does the port's geometry mapping get a defensible answer.
+**3. A delta-function scan maps the addressing outright.** Put a single `1.0` at flat state slot `k`
+(decay 1, `beta = 0`, `q = 1`) and read which `(out index, head)` picks it up. Result: **24 of 32
+slots land where the documented layout says they should not** — the op behaves as if the state's axes
+were `(i, head, j)` while its own asserts (`delta-net-base.cpp:399`) require
+`ne[0]=ne[1]=S_v, ne[2]=H_v`.
+
+### The likeliest explanation, and the next step
+
+`qwen35.cpp:401-402` does not hand the op a fresh tensor:
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+
+It RESHAPES a view of the flat per-layer cache. A reshape reinterprets flat memory, so the tensor's
+logical `ne` and its memory order need not agree — and the op's addressing follows the memory. My
+harness builds the state in the natural (S_v, S_v, H_v) order instead, which is why the asserts pass
+and the addressing still disagrees. The next step is therefore **to mirror the cache's actual order**
+(read how `ssm_states_all` is allocated and what order `build_rs` exposes) and only then re-run the
+scan; the port's geometry mapping can be settled against whatever the scan then shows.
+
+Until that is done the reference keeps failing at model geometry on purpose: a harness that reported
+agreement here would be lying.
+
 
 ## The sequencing decision
 
