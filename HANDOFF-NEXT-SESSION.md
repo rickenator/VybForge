@@ -1,4 +1,13 @@
-# HANDOFF — RESUME HERE (untracked; do not commit)
+# HANDOFF — RESUME HERE (tracked on main; a running log, not a spec — keep it out of unrelated commits)
+
+> **Historical log (superseded for anything Python-related).** This file is the
+> running handoff from the inference-substrate phase. For the current state of the
+> Python cleanup — what was ported to Vyb, what was deleted, and the oracle policy
+> that says the remaining `verify_*.py` / `*_ref.py` files are deliberately KEPT —
+> read `doc/PYTHON-CLEANUP.md` first. Two claims below are now stale: the
+> `tests/test_schema.py` original was deleted (its Vyb port `tests/test_schema.vyb`
+> carries `make schemacheck`), and the `test_backends.py` port is not a follow-up —
+> its guards moved into `native/legit/run_configurator_gate.sh` and the file is gone.
 
 **Project:** VybForge — repo `rickenator/VybForge`, local checkout
 `<VybForge checkout>`, branch `main`. Address the user neutrally.
