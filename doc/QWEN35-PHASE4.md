@@ -280,6 +280,26 @@ Both novel ops of a recurrent layer are now checked against the real implementat
 l2 normalisation and the gated RMS epilogue (ordinary ops, and closer to the existing prefill path),
 then the layer wiring, then the Vyb kernel and its gate.
 
+### Third unit (started): the l2 normalisation's exact form
+
+Read first-hand rather than taken from a summary, because the two variants differ by an ulp and a
+summary is not evidence. `ggml/src/ggml-cpu/ops.cpp:4198-4206`:
+
+    ggml_float sum = 0.0;
+    for (i00 < ne00) sum += (ggml_float)(xi * xi);
+    const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+
+So eps is a FLOOR applied AFTER the square root — not a term inside it — and the accumulation is in
+double while the reciprocal is `sqrtf` (f32) with an f32 `fmaxf`. A port that puts eps inside the
+sqrt, or accumulates in f32, will disagree with the model on the values where the norm is small. The
+norm is taken per head over the 128 state dimensions (`qwen35.cpp:440-443`); the epilogue is
+`RMSNorm(output, ssm_norm) * SiLU(z)` (`qwen35.cpp:257-266`).
+
+Still to do in this unit: an authority harness for `ggml_l2_norm` and `ggml_rms_norm` (both take
+`(x, eps)`, so one harness with two modes serves both) and the port, done the same way as the two
+above. Not started; recorded here so it is picked up with the semantics already pinned down.
+
+
 
 
 
