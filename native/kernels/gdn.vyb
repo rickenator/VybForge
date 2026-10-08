@@ -146,3 +146,162 @@ norm_gated(p<Int>) -> {
         st_f64(Y + (rw * D + d) * 8, xv * r * wv * (zv / sg))
     }
 }
+
+// ---- the rest of the block: projections, gates, conv, residual -------------------------------
+// One params-buffer kernel per piece, in the same style as the three above.
+
+// log, built from +,-,*,/ because the libm builtin does not lower in kernel mode. Range-reduce to
+// m in [1,2) with x = m * 2^k, then the atanh series ln m = 2 z (1 + z^2/3 + z^4/5 + ...), z =
+// (m-1)/(m+1) <= 1/3. Twelve terms put the truncation below 1e-13 relative.
+vlog(x<Float>)<Float> -> {
+    m<Float> = x
+    k<Int> = 0
+    i<Int> = 0
+    for (i in 0..63) {
+        if (m >= 2.0) { m = m * 0.5 ; k = k + 1 }
+    }
+    for (i in 0..63) {
+        if (m < 1.0) { m = m * 2.0 ; k = k - 1 }
+    }
+    z<Float> = (m - 1.0) / (m + 1.0)
+    z2<Float> = z * z
+    s<Float> = 1.0
+    p<Float> = z2
+    j<Int> = 0
+    for (j in 1..12) {
+        s = s + p / (2.0 * (j as Float) + 1.0)
+        p = p * z2
+    }
+    return (k as Float) * 0.6931471805599453 + 2.0 * z * s
+}
+
+// softplus, ggml's form (unary-ops.cpp op_softplus): (x > 20) ? x : log(1 + exp(x))
+vsoftplus(x<Float>)<Float> -> {
+    if (x > 20.0) { return x }
+    return vlog(1.0 + vexp(x))
+}
+
+// out[m,n] = sum_k x[m,k] * w[n,k] — both operands row-major, which is what a ggml weight of ne
+// (K, N) is (its memory is a numpy (N, K) array). Avoids transposing either operand on the host.
+// Params (device, 48 B): +0 X, +8 W, +16 Y, +24 M, +32 N, +40 K.
+mm_nt(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        m<Int> = gid / N
+        n<Int> = gid % N
+        acc<Float> = 0.0
+        k<Int> = 0
+        for (k in 0..K - 1) {
+            acc = acc + ld_f64(X + (m * K + k) * 8) * ld_f64(W + (n * K + k) * 8)
+        }
+        st_f64(Y + (m * N + n) * 8, acc)
+    }
+}
+
+// beta = sigmoid(alpha_projection). Params (device, 24 B): +0 X, +8 Y, +16 n.
+sigmoid_k(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f64(X + gid * 8)
+        st_f64(Y + gid * 8, 1.0 / (1.0 + vexp(0.0 - v)))
+    }
+}
+
+// the alpha gate: softplus(alpha + ssm_dt) * ssm_a, per head.
+// Params (device, 40 B): +0 A, +8 DT, +16 SA, +24 OUT, +32 n.
+alpha_gate(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    DT<Int> = ld_i64(p + 8)
+    SA<Int> = ld_i64(p + 16)
+    OUT<Int> = ld_i64(p + 24)
+    n<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f64(A + gid * 8) + ld_f64(DT + gid * 8)
+        st_f64(OUT + gid * 8, vsoftplus(v) * ld_f64(SA + gid * 8))
+    }
+}
+
+// y = x * sigmoid(x), elementwise. Params (device, 24 B): +0 X, +8 Y, +16 n.
+silu_k(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f64(X + gid * 8)
+        st_f64(Y + gid * 8, v / (1.0 + vexp(0.0 - v)))
+    }
+}
+
+// y = a + b, elementwise. Params (device, 32 B): +0 A, +8 B, +16 Y, +24 n.
+add_k(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(Y + gid * 8, ld_f64(A + gid * 8) + ld_f64(B + gid * 8))
+    }
+}
+
+// the causal depthwise short convolution over all qkv_dim channels, on exactly the buffer
+// ggml_ssm_conv takes: ne (ncs, qkv_dim) with the FRAME fastest (memory ncs*ch + frame), the window
+// occupying frames 0..d_conv-2 and the tokens the rest. numpy shape is (qkv_dim, ncs).
+//   S: ne (ncs, qkv_dim)    memory index frame + ncs*ch        ncs = d_conv-1+T
+//   W: ne (d_conv, qkv_dim) memory index j + d_conv*ch         (numpy (qkv_dim, d_conv))
+//   Y: ne (qkv_dim, T)      memory index ch + QKV*t
+// Params (device, 48 B): +0 S, +8 W, +16 Y, +24 QKV, +32 D_CONV, +40 T.
+conv1d_k(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    QKV<Int> = ld_i64(p + 24)
+    DC<Int> = ld_i64(p + 32)
+    T<Int> = ld_i64(p + 40)
+    ncs<Int> = DC - 1 + T
+    total<Int> = QKV * T
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        ch<Int> = gid % QKV
+        t<Int> = gid / QKV
+        acc<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..DC - 1) {
+            acc = acc + ld_f64(S + (ncs * ch + t + j) * 8) * ld_f64(W + (ch * DC + j) * 8)
+        }
+        st_f64(Y + (ch + QKV * t) * 8, acc)
+    }
+}
+
+// the token frames into the conv buffer: what build_conv_state's ggml_concat produces, since the
+// concat's ne0 axis is the frame and the window slots sit at ncs*ch + 0..d_conv-2.
+//   Q: ne (qkv_dim, T)      memory ch + QKV*t      (a projection's output)
+//   S: ne (ncs, qkv_dim)    memory frame + ncs*ch
+// Params (device, 40 B): +0 Q, +8 S, +16 QKV, +24 D_CONV, +32 T.
+interleave_qkv(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    S<Int> = ld_i64(p + 8)
+    QKV<Int> = ld_i64(p + 16)
+    DC<Int> = ld_i64(p + 24)
+    T<Int> = ld_i64(p + 32)
+    ncs<Int> = DC - 1 + T
+    total<Int> = QKV * T
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        ch<Int> = gid % QKV
+        t<Int> = gid / QKV
+        st_f64(S + (ncs * ch + DC - 1 + t) * 8, ld_f64(Q + (ch + QKV * t) * 8))
+    }
+}

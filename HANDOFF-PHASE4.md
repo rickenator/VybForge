@@ -113,23 +113,47 @@ Not covered by unit 6: no carry-over of state across calls (one token from a sta
 synthetic fp64 weights, no projections/conv (existing kernels), and no performance work (one thread
 per head).
 
-## IMMEDIATE NEXT STEP (unit 7)
+## Unit 7 — DONE (seventh unit, same session): the whole block wired on the GPU
 
-**The layer wiring in Vyb, then the `eng_gdn()` flip.** Now that all three non-gemm pieces run on the
-GPU, the recurrent block can be assembled in a driver the way unit 5's authority assembles it:
+`native/host/gdn_layer_driver.vyb` composes the block out of the Vyb kernels (rmsnorm, mm_nt,
+sigmoid_k, alpha_gate, interleave_qkv, conv1d_k, silu_k, l2norm, delta_step, norm_gated, add_k) in
+build_layer_attn_linear's order and dumps 12 stages; `native/tools/gdn_layer_kernel_verify.py` feeds
+one fixture to it and to unit 5's authority (real ggml ops) and compares stage by stage. Gate:
+`native/legit/run_gdn_layer_gate.sh`, step **P4.3**; `make -f native/Makefile gdn-layer`.
 
-1. a driver (`native/host/`) that wires, for one layer and one token: `attn_norm` (existing rmsnorm
-   kernel) → `wqkv`/`wqkv_gate`/`ssm_beta`/`ssm_alpha` (existing gemm + quant kernels; check what
-   `layer_driver.vyb`/`model_driver.vyb` already do for projections) → the gates (sigmoid/softplus —
-   reimplement from `vmath::vexp`, they are not in the kernel set yet) → conv (existing FIR path) →
-   `l2norm` → `delta_step` → `norm_gated` → `ssm_out` → residual;
-2. compare it stage by stage against unit 5's `layer_authority` dumps (the same per-stage discipline,
-   with the reference already written);
-3. then flip `eng_gdn()` in `native/config/model_caps.vyb:140` and re-run the caps gate, which asserts
-   the refusal list SHRINKS as well as the new count (see the skill's gate-and-probe §6) — and re-run
-   P4.1/P4.2 so the flip is not the only thing that changed.
+Small non-degenerate geometry (n_embd 512, S 32, H_k 4, H_v 8, d_conv 4), one token, state zero, real
+ssm_a/ssm_dt: every stage 8.8e-08..3.0e-07 against the authority's f32 floor, with the negatives
+printed (residual on the normed input 7.85e-02, no residual 9.45e-01).
 
-## After that (do not start before unit 7 closes)
+Three lessons, all found by the per-stage split in one run each:
+* the conv's memory order is FRAME-fastest: ne (ncs, qkv_dim) is `frame + ncs*ch`, the weight's ne
+  (d_conv, qkv_dim) is `j + d_conv*ch` (numpy (qkv_dim, ncs) / (qkv_dim, d_conv));
+* a projection cannot write the conv buffer directly — `build_conv_state`'s concat interleaves the
+  token frames per channel, hence `interleave_qkv` and a conv buffer that starts as zeros;
+* a NaN must FAIL a gate: `r > MAXREL` is False for NaN, so a NaN-filled stage printed DIFFERS and the
+  gate still reported DONE. It is `not (r <= MAXREL)` now.
+
+## `eng_gdn()` is STILL 0, deliberately
+
+Do not flip it yet. The descriptor's `eng_gdn()` decides whether the caps gate reports
+`UNSUPPORTED_LAYER_KIND gated-deltanet` for the Ridge model, and the engine path still has no recurrent
+layer: no multi-token/prefill, no state carry-over across a sequence, no quantized weight loading, and
+nothing wired into `model_driver`/the chat server. Flipping it would make the descriptor claim a
+capability the engine cannot deliver.
+
+## IMMEDIATE NEXT STEP (unit 8) — what the flip actually needs
+
+1. **State carry-over**: the kernels take the conv window and the delta-net state from buffers; a
+   running sequence needs them kept per layer between tokens (the conv state is `d_conv-1` frames per
+   channel, the delta state `S*S*H_v`) and the conv buffer re-interleaved each step.
+2. **The multi-token/prefill path** — the op's chunked kernel, still uncharacterised (see below).
+3. **Quantized weights**: the projections must go through the existing quant gemm path
+   (`layer_driver.vyb`/`model_driver.vyb` show how; `mm_nt` is the f64 reference form of it).
+4. **Engine integration**: a recurrent branch in `model_driver.vyb` (the per-layer loop that today
+   builds attention layers), then the `eng_gdn()` flip and a caps-gate re-run — the gate asserts the
+   refusal list SHRINKS as well as the new count (skill gate-and-probe §6) — plus re-running P4.1-P4.3.
+
+## After that (do not start before unit 8 closes)
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven

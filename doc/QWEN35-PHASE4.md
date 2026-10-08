@@ -390,13 +390,6 @@ one step from a fresh sequence; carrying state across tokens needs the multi-tok
 the real-weight variant (the weights here are synthetic, deliberately — the op semantics are what is
 under test).
 
-## What next: the Vyb kernel
-
-The reference work for item 1 is complete: all five units pass against the real ops
-(`run_gdn_ops_gate.sh`, step P4.1). The remaining path is a Vyb kernel for the recurrence + its
-driver and gate, then the layer wiring in the driver, then the `eng_gdn()` flip. The two open risks to
-carry into that work are the ones recorded below: the multi-token/prefill kernel, and the MTP head.
-
 ### Sixth unit: the layer's kernels, on the GPU
 
 `native/kernels/gdn.vyb` is the first Vyb code for the recurrent layer — the three pieces of a qwen35
@@ -458,9 +451,53 @@ Also noted, not touched: `src/models/qwen35.cpp` in that checkout carries 27 unc
 are not mine (the sibling `build-fastmtp` tree suggests MTP experimentation). They do not affect the
 harness, which links only libggml, but anyone reproducing this should know they are there.
 
+### Seventh unit: the whole block wired on the GPU, stage by stage against ggml
 
+`native/host/gdn_layer_driver.vyb` builds one qwen35 linear-attention block out of the Vyb kernels —
+`rmsnorm` (from the existing module), `mm_nt`, `sigmoid_k`, `alpha_gate`, `interleave_qkv`, `conv1d_k`,
+`silu_k`, `l2norm`, `delta_step`, `norm_gated`, `add_k` — in the order `build_layer_attn_linear` uses,
+and dumps 12 stages. `native/tools/gdn_layer_kernel_verify.py` feeds the same fixture to it and to
+unit 5's authority (the same block built from ggml's own ops) and compares the two **stage by stage**.
 
+Small geometry on purpose (n_embd=512, S=32, H_k=4, H_v=8, d_conv=4 — quick, and every stride > 1,
+which is where the axis traps live), one token, state zero, the model's real `ssm_a`/`ssm_dt`:
 
+    xn        1.109e-07      conv_silu 1.897e-07      gdn_out 2.095e-07
+    qkv       1.818e-07      q_norm    2.978e-07      epi     2.966e-07
+    z         1.245e-07      k_norm    1.076e-07      y       2.906e-07
+    beta      8.905e-08      conv_silu/window         layer_out 8.149e-08
+    gate      8.844e-08
+
+2e-7 is the authority's own f32 floor (the kernels are f64), so this is agreement, and the run prints
+its negatives too: the residual taken on the normed input is off by 7.85e-02 and with no residual at
+all 9.45e-01, against a 1e-4 bar.
+
+Three bugs the per-stage split named in one run each, all worth keeping in mind for the next layer:
+
+* **the conv's axis order is the frame, not the channel.** `ggml_ssm_conv` takes ne `(ncs, qkv_dim)`
+  with `ncs = d_conv-1+T`, so its memory is `frame + ncs*ch`, and the weight's ne `(d_conv, qkv_dim)`
+  is `j + d_conv*ch` (numpy `(qkv_dim, ncs)` and `(qkv_dim, d_conv)`). Written channel-fastest, the
+  conv was the first stage to diverge.
+* **the projection cannot write the conv buffer directly.** `build_conv_state` gets its token frames
+  by `ggml_concat` along ne0, which INTERLEAVES them per channel, so a plain qkv block is the wrong
+  layout — hence `interleave_qkv`, and a conv buffer that starts as zeros.
+* **a NaN must fail the gate.** The comparison used `r > MAXREL`, and every comparison with a NaN is
+  False, so a NaN-filled stage printed DIFFERS and still let the gate report DONE. It is `not (r <=
+  MAXREL)` now. (The NaN itself was a file-layout mismatch: the fixture's window section was
+  `d_conv-1` frames where the driver read `ncs` frames, so the state upload landed past EOF.)
+
+Gate: `native/legit/run_gdn_layer_gate.sh`, step **P4.3**; `make -f native/Makefile gdn-layer` runs the
+verifier. SKIPs without a toolchain, libggml or CUDA.
+
+### `eng_gdn()` stays 0 — and why
+
+The descriptor's `eng_gdn()` (native/config/model_caps.vyb:140) is what makes the caps gate report
+`UNSUPPORTED_LAYER_KIND gated-deltanet` for a model with 48 recurrent layers. It is tempting to flip it
+now that the layer runs on the GPU, and it would be wrong: the engine path (`model_driver`, the chat
+server, the state cache) still has no recurrent layer, no multi-token/prefill path, and no weight
+loading for a quantized model. Flipping it would make the descriptor claim a capability the engine
+cannot deliver — the green-that-means-nothing this project's gates exist to prevent. What is left is
+listed below; the flip is the last step of that list, not the first.
 
 ## The sequencing decision
 

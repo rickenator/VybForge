@@ -1,0 +1,309 @@
+// GDN recurrent-LAYER wiring driver (phase 4 item 1, unit 7).
+//
+// Assembles one qwen35 linear-attention block out of GPU kernels, in the order
+// src/models/qwen35.cpp builds it — attn_norm (the existing rmsnorm kernel, from a second module) →
+// wqkv / wqkv_gate (mm_nt) → beta (mm_nt + sigmoid) → alpha gate (mm_nt + softplus*ssm_a) → the
+// causal short conv (conv1d_k + silu_k) → the q|k|v split as channel offsets → l2norm on q and k →
+// delta_step → the gated RMS epilogue (norm_gated) → ssm_out (mm_nt) → the attn residual (add_k) —
+// and dumps every stage so the result can be compared per stage against unit 5's authority, which
+// builds the same block out of ggml's own ops.
+//
+// Geometry is a fixture (small enough to be quick, and NOT degenerate: S=32, H_k=4, H_v=8, d_conv=4
+// all have strides > 1, which is where the axis traps live). One token, one sequence.
+//
+// Input native/build/gdn_layer_in.bin, fp64, ALL ggml order (ne0 fastest), in this order:
+//   x NE | attn_norm NE | wqkv QKV*NE | wqkv_gate VALUE*NE | ssm_beta HV*NE | ssm_alpha HV*NE |
+//   ssm_dt HV | ssm_a HV | ssm_conv1d QKV*DC | ssm_norm S | ssm_out NE*VALUE | conv_zero (DC-1+1)*QKV |
+//   state S*S*HV
+// Prints SKIP and returns 0 without CUDA.
+import io::{open_read, read_at, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+upload(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(dst, from<loc<CVoid>>(addr(data)), nbytes) != 0) { return 15 }
+        return 0
+    }
+    return 0
+}
+
+read_slice(f<File>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+    return r
+}
+
+dump_section(base<Int>, count<Int>, nm<String>) -> {
+    println("DUMP " + nm + " " + count.to_string())
+    acc<String> = ""
+    i<Int> = 0
+    for (i in 0..count - 1) {
+        iv<Int> = 0
+        freedom {
+            cuMemcpyDtoH_v2(loc(iv), base + i * 8, 8)
+        }
+        acc = acc + iv.to_string() + " "
+        if (i % 64 == 63) { println(acc); acc = "" }
+    }
+    if (count % 64 != 0) { println(acc) }
+}
+
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom {
+        cuMemcpyHtoD_v2(PD + off, loc(v), 8)
+    }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom {
+        cuMemcpyHtoD_v2(PD + off, loc(v), 8)
+    }
+}
+
+main()<Int> -> {
+    NE<Int> = 512
+    S<Int> = 32
+    HK<Int> = 4
+    HV<Int> = 8
+    DC<Int> = 4
+    KEY<Int> = HK * S
+    VALUE<Int> = HV * S
+    QKV<Int> = 2 * KEY + VALUE
+    eps<Float> = 0.000001
+    sc<Float> = 0.17677669529663687        # 1/sqrt(32)
+    blkNN<Int> = 256
+
+    xs<String> = "" ; ans<String> = "" ; wqs<String> = "" ; wgs<String> = ""
+    wbs<String> = "" ; was<String> = "" ; dts<String> = "" ; asa<String> = ""
+    cws<String> = "" ; sns<String> = "" ; sos<String> = "" ; zws<String> = "" ; sts<String> = ""
+    match (open_read("native/build/gdn_layer_in.bin")) {
+        fh -> {
+            o<Int> = 0
+            xs = read_slice(fh, o, NE * 8)             ; o = o + NE * 8
+            ans = read_slice(fh, o, NE * 8)            ; o = o + NE * 8
+            wqs = read_slice(fh, o, QKV * NE * 8)      ; o = o + QKV * NE * 8
+            wgs = read_slice(fh, o, VALUE * NE * 8)    ; o = o + VALUE * NE * 8
+            wbs = read_slice(fh, o, HV * NE * 8)       ; o = o + HV * NE * 8
+            was = read_slice(fh, o, HV * NE * 8)       ; o = o + HV * NE * 8
+            dts = read_slice(fh, o, HV * 8)            ; o = o + HV * 8
+            asa = read_slice(fh, o, HV * 8)            ; o = o + HV * 8
+            cws = read_slice(fh, o, QKV * DC * 8)      ; o = o + QKV * DC * 8
+            sns = read_slice(fh, o, S * 8)             ; o = o + S * 8
+            sos = read_slice(fh, o, NE * VALUE * 8)    ; o = o + NE * VALUE * 8
+            zws = read_slice(fh, o, DC * QKV * 8)          ; o = o + DC * QKV * 8
+            sts = read_slice(fh, o, S * S * HV * 8)
+            close(fh)
+        }
+        ? -> { println("GDNL_ERR no input file") ; return 13 }
+    }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptxG<String> = ""
+    match (open_read("native/build/gdn.ptx")) {
+        g -> { ptxG = read_slice(g, 0, 262144) ; close(g) }
+        ? -> { return 13 }
+    }
+    ptxR<String> = ""
+    match (open_read("native/build/rmsnorm.ptx")) {
+        g -> { ptxR = read_slice(g, 0, 65536) ; close(g) }
+        ? -> { return 13 }
+    }
+
+    freedom {
+        hmodG<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hmodG), ptxG) != 0) { return 9 }
+        hmodR<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(hmodR), ptxR) != 0) { return 9 }
+
+        hRN<loc<CVoid>> = from<loc<CVoid>>(0)
+        hMM<loc<CVoid>> = from<loc<CVoid>>(0)
+        hSG<loc<CVoid>> = from<loc<CVoid>>(0)
+        hAG<loc<CVoid>> = from<loc<CVoid>>(0)
+        hSV<loc<CVoid>> = from<loc<CVoid>>(0)
+        hCV<loc<CVoid>> = from<loc<CVoid>>(0)
+        hIL<loc<CVoid>> = from<loc<CVoid>>(0)
+        hL2<loc<CVoid>> = from<loc<CVoid>>(0)
+        hDS<loc<CVoid>> = from<loc<CVoid>>(0)
+        hNG<loc<CVoid>> = from<loc<CVoid>>(0)
+        hAD<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hRN), hmodR, "rmsnorm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hMM), hmodG, "mm_nt") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hSG), hmodG, "sigmoid_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hAG), hmodG, "alpha_gate") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hSV), hmodG, "silu_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hCV), hmodG, "conv1d_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hIL), hmodG, "interleave_qkv") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hL2), hmodG, "l2norm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hDS), hmodG, "delta_step") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hNG), hmodG, "norm_gated") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hAD), hmodG, "add_k") != 0) { return 10 }
+
+        DX<Int> = 0 ; DAN<Int> = 0 ; DWQKV<Int> = 0 ; DWG<Int> = 0 ; DWB<Int> = 0 ; DWA<Int> = 0
+        DDT<Int> = 0 ; DA<Int> = 0 ; DCW<Int> = 0 ; DSN<Int> = 0 ; DSO<Int> = 0
+        DXN<Int> = 0 ; DQKV<Int> = 0 ; DCONV<Int> = 0 ; DCONVS<Int> = 0 ; DZ<Int> = 0 ; DBRAW<Int> = 0 ; DBETA<Int> = 0
+        DARAW<Int> = 0 ; DGATE<Int> = 0 ; DCRAW<Int> = 0 ; DQN<Int> = 0 ; DKN<Int> = 0
+        DSTATE<Int> = 0 ; DSTOUT<Int> = 0 ; DEL<Int> = 0 ; DOUT<Int> = 0 ; DEPI<Int> = 0
+        DY<Int> = 0 ; DLO<Int> = 0
+        P1<Int> = 0 ; P2<Int> = 0 ; P3<Int> = 0 ; P4<Int> = 0
+        cuMemAlloc_v2(loc(DX), NE * 8)
+        cuMemAlloc_v2(loc(DAN), NE * 8)
+        cuMemAlloc_v2(loc(DWQKV), QKV * NE * 8)
+        cuMemAlloc_v2(loc(DWG), VALUE * NE * 8)
+        cuMemAlloc_v2(loc(DWB), HV * NE * 8)
+        cuMemAlloc_v2(loc(DWA), HV * NE * 8)
+        cuMemAlloc_v2(loc(DDT), HV * 8)
+        cuMemAlloc_v2(loc(DA), HV * 8)
+        cuMemAlloc_v2(loc(DCW), QKV * DC * 8)
+        cuMemAlloc_v2(loc(DSN), S * 8)
+        cuMemAlloc_v2(loc(DSO), NE * VALUE * 8)
+        cuMemAlloc_v2(loc(DXN), NE * 8)
+        cuMemAlloc_v2(loc(DQKV), QKV * 8)
+        cuMemAlloc_v2(loc(DCONV), DC * QKV * 8)          # window + token, ssm_conv's input
+        cuMemAlloc_v2(loc(DCONVS), QKV * 8)
+        cuMemAlloc_v2(loc(DZ), VALUE * 8)
+        cuMemAlloc_v2(loc(DBRAW), HV * 8)
+        cuMemAlloc_v2(loc(DBETA), HV * 8)
+        cuMemAlloc_v2(loc(DARAW), HV * 8)
+        cuMemAlloc_v2(loc(DGATE), HV * 8)
+        cuMemAlloc_v2(loc(DCRAW), QKV * 8)
+        cuMemAlloc_v2(loc(DQN), KEY * 8)
+        cuMemAlloc_v2(loc(DKN), KEY * 8)
+        cuMemAlloc_v2(loc(DSTATE), S * S * HV * 8)
+        cuMemAlloc_v2(loc(DSTOUT), S * S * HV * 8)
+        cuMemAlloc_v2(loc(DEL), S * HV * 8)
+        cuMemAlloc_v2(loc(DOUT), S * HV * 8)
+        cuMemAlloc_v2(loc(DEPI), S * HV * 8)
+        cuMemAlloc_v2(loc(DY), NE * 8)
+        cuMemAlloc_v2(loc(DLO), NE * 8)
+        cuMemAlloc_v2(loc(P1), 128) ; cuMemAlloc_v2(loc(P2), 128)
+        cuMemAlloc_v2(loc(P3), 128) ; cuMemAlloc_v2(loc(P4), 128)
+
+        upload(xs, DX, NE * 8) ; upload(ans, DAN, NE * 8)
+        upload(wqs, DWQKV, QKV * NE * 8) ; upload(wgs, DWG, VALUE * NE * 8)
+        upload(wbs, DWB, HV * NE * 8) ; upload(was, DWA, HV * NE * 8)
+        upload(dts, DDT, HV * 8) ; upload(asa, DA, HV * 8)
+        upload(cws, DCW, QKV * DC * 8) ; upload(sns, DSN, S * 8)
+        upload(sos, DSO, NE * VALUE * 8) ; upload(zws, DCONV, DC * QKV * 8)
+        upload(sts, DSTATE, S * S * HV * 8)
+
+        # ---- 1. attn_norm: the existing rmsnorm kernel, params (X, W, Y, rows, D, eps) ----
+        put_i(P1, 0, DX) ; put_i(P1, 8, DAN) ; put_i(P1, 16, DXN)
+        put_i(P1, 24, 1) ; put_i(P1, 32, NE) ; put_f(P1, 40, eps)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hRN)), 2, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR rmsnorm") ; println_int(rc) ; return 12 }
+
+        # ---- 2. projections ----
+        put_i(P2, 0, DXN) ; put_i(P2, 8, DWQKV) ; put_i(P2, 16, DQKV)
+        put_i(P2, 24, 1) ; put_i(P2, 32, QKV) ; put_i(P2, 40, NE)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 2, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR mm wqkv") ; return 12 }
+        put_i(P2, 8, DWG) ; put_i(P2, 16, DZ) ; put_i(P2, 32, VALUE)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 1, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR mm wgate") ; return 12 }
+        put_i(P2, 8, DWB) ; put_i(P2, 16, DBRAW) ; put_i(P2, 32, HV)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 1, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR mm wbeta") ; return 12 }
+        put_i(P2, 8, DWA) ; put_i(P2, 16, DARAW) ; put_i(P2, 32, HV)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 1, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR mm walpha") ; return 12 }
+
+        # ---- 3. the two gates ----
+        put_i(P3, 0, DBRAW) ; put_i(P3, 8, DBETA) ; put_i(P3, 16, HV)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hSG)), 1, 1, 1, 64, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR sigmoid") ; return 12 }
+        put_i(P3, 0, DARAW) ; put_i(P3, 8, DDT) ; put_i(P3, 16, DA) ; put_i(P3, 24, DGATE) ; put_i(P3, 32, HV)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hAG)), 1, 1, 1, 64, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR alpha_gate") ; return 12 }
+
+        # ---- 4. the conv input's token frames, the causal short conv, then SiLU ----
+        put_i(P4, 0, DQKV) ; put_i(P4, 8, DCONV) ; put_i(P4, 16, QKV) ; put_i(P4, 24, DC) ; put_i(P4, 32, 1)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hIL)), 2, 1, 1, 256, 1, 1, P4, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR interleave") ; return 12 }
+        put_i(P3, 0, DCONV) ; put_i(P3, 8, DCW) ; put_i(P3, 16, DCRAW)
+        put_i(P3, 24, QKV) ; put_i(P3, 32, DC) ; put_i(P3, 40, 1)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hCV)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR conv") ; return 12 }
+        put_i(P3, 0, DCRAW) ; put_i(P3, 8, DCONVS) ; put_i(P3, 16, QKV)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hSV)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR silu") ; return 12 }
+
+        # ---- 5. l2 norm on q and k (the q|k|v split is just channel offsets) ----
+        put_i(P1, 0, DCONVS) ; put_i(P1, 8, DQN) ; put_i(P1, 16, HK) ; put_i(P1, 24, S) ; put_f(P1, 32, eps)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), 1, 1, 1, 128, 1, 1, P1, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR l2 q") ; return 12 }
+        put_i(P1, 0, DCONVS + KEY * 8) ; put_i(P1, 8, DKN)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), 1, 1, 1, 128, 1, 1, P1, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR l2 k") ; return 12 }
+
+        # ---- 6. the recurrence ----
+        put_i(P2, 0, DQN) ; put_i(P2, 8, DKN) ; put_i(P2, 16, DCONVS + 2 * KEY * 8)
+        put_i(P2, 24, DGATE) ; put_i(P2, 32, DBETA) ; put_i(P2, 40, DSTATE)
+        put_i(P2, 48, DSTOUT) ; put_i(P2, 56, DOUT) ; put_i(P2, 64, DEL)
+        put_i(P2, 72, S) ; put_i(P2, 80, HK) ; put_i(P2, 88, HV) ; put_f(P2, 96, sc)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hDS)), 1, 1, 1, 8, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR delta_step") ; return 12 }
+
+        # ---- 7. the gated RMS epilogue, then ssm_out and the residual ----
+        put_i(P3, 0, DOUT) ; put_i(P3, 8, DZ) ; put_i(P3, 16, DSN) ; put_i(P3, 24, DEPI)
+        put_i(P3, 32, HV) ; put_i(P3, 40, S) ; put_f(P3, 48, eps)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hNG)), 1, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR norm_gated") ; return 12 }
+        put_i(P2, 0, DEPI) ; put_i(P2, 8, DSO) ; put_i(P2, 16, DY)
+        put_i(P2, 24, 1) ; put_i(P2, 32, NE) ; put_i(P2, 40, VALUE)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 2, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR mm ssm_out") ; return 12 }
+        put_i(P3, 0, DY) ; put_i(P3, 8, DX) ; put_i(P3, 16, DLO) ; put_i(P3, 24, NE)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hAD)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        if (rc != 0) { println("GDNL_ERR residual") ; return 12 }
+        cuCtxSynchronize()
+
+        dump_section(DXN, NE, "xn")
+        dump_section(DQKV, QKV, "qkv")
+        dump_section(DZ, VALUE, "z")
+        dump_section(DBETA, HV, "beta")
+        dump_section(DGATE, HV, "gate")
+        dump_section(DCONVS, QKV, "conv_silu")
+        dump_section(DQN, KEY, "q_norm")
+        dump_section(DKN, KEY, "k_norm")
+        dump_section(DOUT, S * HV, "gdn_out")
+        dump_section(DEPI, S * HV, "epi")
+        dump_section(DY, NE, "y")
+        dump_section(DLO, NE, "layer_out")
+
+        cuMemFree_v2(DX) ; cuMemFree_v2(DAN) ; cuMemFree_v2(DWQKV) ; cuMemFree_v2(DWG)
+        cuMemFree_v2(DWB) ; cuMemFree_v2(DWA) ; cuMemFree_v2(DDT) ; cuMemFree_v2(DA)
+        cuMemFree_v2(DCW) ; cuMemFree_v2(DSN) ; cuMemFree_v2(DSO)
+        cuMemFree_v2(DXN) ; cuMemFree_v2(DQKV) ; cuMemFree_v2(DCONV) ; cuMemFree_v2(DCONVS) ; cuMemFree_v2(DZ)
+        cuMemFree_v2(DBRAW) ; cuMemFree_v2(DBETA) ; cuMemFree_v2(DARAW) ; cuMemFree_v2(DGATE)
+        cuMemFree_v2(DCRAW) ; cuMemFree_v2(DQN) ; cuMemFree_v2(DKN) ; cuMemFree_v2(DSTATE)
+        cuMemFree_v2(DSTOUT) ; cuMemFree_v2(DEL) ; cuMemFree_v2(DOUT) ; cuMemFree_v2(DEPI)
+        cuMemFree_v2(DY) ; cuMemFree_v2(DLO)
+        cuMemFree_v2(P1) ; cuMemFree_v2(P2) ; cuMemFree_v2(P3) ; cuMemFree_v2(P4)
+    }
+    println("GDNL_DONE NE=512 S=32 Hk=4 Hv=8 d_conv=4")
+    return 0
+}

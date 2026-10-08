@@ -59,6 +59,12 @@ mathprobe: $(ROOT)/native/build/math_probe.ptx
 gdn: $(ROOT)/native/build/gdn.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_kernel_verify.py
 
+# The whole recurrent block wired on the GPU vs ggml's own graph, stage by stage. Needs the rmsnorm
+# kernel too (the driver imports attn_norm from it) and libggml for the authority:
+#   ./native/legit/run_gdn_layer_gate.sh
+gdn-layer: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/rmsnorm.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_layer_kernel_verify.py
+
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py

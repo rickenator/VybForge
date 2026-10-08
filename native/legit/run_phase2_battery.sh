@@ -310,6 +310,24 @@ else
   step "P4.2 GDN GPU kernels" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.3 — the recurrent LAYER wired on the GPU vs ggml's own graph (phase 4, item 1) ──
+# Gate: native/legit/run_gdn_layer_gate.sh (doc/QWEN35-PHASE4.md). P4.2 ran the layer's kernels; this
+# one wires the whole block in Vyb (native/host/gdn_layer_driver.vyb: rmsnorm, mm_nt, sigmoid_k,
+# alpha_gate, conv1d_k, interleave_qkv, silu_k, l2norm, delta_step, norm_gated, add_k) and compares it
+# against unit 5's authority — the same block built from the real ggml ops — STAGE BY STAGE, so a
+# wiring mistake names the stage. Small non-degenerate geometry (n_embd=512, S=32, H_k=4, H_v=8,
+# d_conv=4), one token, state zero. Reports its own negatives (residual on the normed input 7.9e-2,
+# no residual 9.5e-1) against a 1e-4 bar. SKIPs without toolchain/libggml/CUDA.
+out="$(./native/legit/run_gdn_layer_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "GDN LAYER GATE: PASS"; then
+  step "P4.3 GDN layer wiring (GPU)" "$(echo "$out" | grep -oE 'GPU layer wiring \([0-9]+ stages\) +PASS.*' | head -1 | sed 's/GPU layer wiring //')"
+elif echo "$last" | grep -q "GDN LAYER GATE: SKIP"; then
+  step "P4.3 GDN layer wiring (GPU)" "SKIP ($(echo "$last" | sed 's/GDN LAYER GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.3 GDN layer wiring (GPU)" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail
