@@ -240,11 +240,28 @@ strides equal to 1, so a transposed read coincides with a correct one — which 
 matched to 6e-8 while nothing at model geometry did. It also explains why the harness's dump agreed
 with every expectation: the tensors really were right; only the reference's *reading* of them was not.
 
-The fix is a convention, not a formula: build and index the inputs as ggml does — numpy shape
-`(B, T, H, S)` with the LAST axis being `ne0`, the state as `(B, H, S, S)` with the last two axes being
-`(i, j)` — and read the op's result buffer the same way (scores `(B, T, H_v, S)`, state
-`(B, H_v, S, S)`). `native/tools/gdn_ref.py`'s `inputs()` and `numpy_rule()` need that one change; no
-kernel-side conclusion in this document is affected, and llama.cpp needs no further instrumentation.
+### Fixed and verified: the reference now matches the op at model geometry
+
+`native/tools/gdn_verify.py` (self-contained, corrected convention) reports
+
+    GDN_VERIFY geometry S=128 H_k=16 H_v=48 T=1 B=1
+    GDN_VERIFY broadcast=mod  maxrel out=1.555e-07 state=8.651e-08  MATCH
+    GDN_VERIFY_DONE the port reproduces ggml's op within maxrel 1e-05
+
+1.6e-7 relative is the authority's own f32 floor, so the recurrence, its state orientation, the
+read-out after the rank-1 update, the `1/sqrt(S)` scale and the head geometry all now agree with
+ggml's implementation at the real geometry. **The q/k→v broadcast is `mod`** (`h % H_k`) — what the
+kernel source said, now established by data instead of assumed.
+
+Phase-4 item 1's first unit is therefore done: a numpy reference for one Gated DeltaNet step, checked
+against ggml's own op rather than against itself. The harness (`gdn_authority.c`, linking the same
+libggml llama.cpp runs) plus `gdn_verify.py` is the reusable piece; `gdn_ref.py` still carries the
+old transposed indexing and should be deleted or rewritten onto `gdn_verify.py`'s convention.
+
+What this does NOT cover, and what follows: the multi-token/prefill path (the op's other kernel), and
+the rest of the layer around the recurrence — the short convolution, the l2 normalisation, the gated
+RMS epilogue and the projections — before a Vyb kernel and its gate can be written.
+
 
 
 
