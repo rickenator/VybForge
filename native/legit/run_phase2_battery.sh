@@ -328,6 +328,27 @@ else
   step "P4.3 GDN layer wiring (GPU)" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.4 — the layer-kind DISPATCH rule (VybForge#10 phase 4, unit 9c step 1) ─────────
+# Gate: native/legit/run_layerkind_gate.sh. Unit 9c is the engine integration, and its first
+# requirement is a per-layer dispatch decided from the model's TENSOR TABLE rather than from the
+# architecture name or a hardcoded block-index list. The rule now lives in one place
+# (model_caps::mc_layer_kind, which the capability descriptor counts with) and this gate pins it
+# three ways: a selftest table of the name traps (attn_qkv / attn_gate / attn_q_norm are NOT the
+# attention marker), the real interleave on both models (Ridge: 16 attention blocks at N%4==3 + 48
+# recurrent out of 64 text blocks; Qwen3-4B: 36 attention + 0), and an INDEPENDENT per-layer check
+# against the Python inventory's tensor NAMES. It also pins the draft-head exclusion — block 64 is
+# in the plan but out of the text count, which a kind-only count gets wrong as "17 attention". SKIPs
+# without a Vyb toolchain or the (12 GiB) Ridge download; a gate that proves nothing is a FAIL.
+out="$(./native/legit/run_layerkind_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "LAYER-KIND GATE: PASS"; then
+  step "P4.4 layer-kind dispatch rule" "$(echo "$last" | sed 's/P4.4 LAYER-KIND GATE: PASS //; s/[()]//g')"
+elif echo "$last" | grep -q "LAYER-KIND GATE: SKIP"; then
+  step "P4.4 layer-kind dispatch rule" "SKIP ($(echo "$last" | sed 's/P4.4 LAYER-KIND GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.4 layer-kind dispatch rule" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.10 — Q4_K dequant reference (the type with no reference until now) ───────────
 # Gate: native/legit/run_q4k_gate.sh. blk.N.attn_qkv, blk.N.attn_gate and blk.N.ssm_out are all Q4_K
 # (the model's biggest projections) and Q4_K was the one quant type with no numpy reference and no

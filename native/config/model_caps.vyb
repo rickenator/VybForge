@@ -121,6 +121,85 @@ cp_add(list<String>, item<String>)<String> -> {
     return list + "," + item
 }
 
+// ───────────────────────── layer KIND: the engine's dispatch rule ─────────────────────────
+// One rule, two consumers. The capability descriptor COUNTS layer kinds with it, and the engine's
+// per-layer loop must ASK it which kind a block is rather than re-deriving the answer from the
+// architecture name or from a hardcoded block-index list — a model whose interleave differs from
+// the one we tested would otherwise run the wrong branch on the wrong block, silently.
+//
+// The test is the block's OWN weight names, so it cannot be fooled by a block that merely looks
+// recurrent. Two name traps make it a suffix test and not a prefix one:
+//   * `attn_qkv.weight` and `attn_gate.weight` belong to the RECURRENT block in qwen35 despite
+//     the `attn_` prefix;
+//   * `attn_q_norm.weight` is an attention tensor whose name contains `attn_q`, while
+//     `ssm_norm.weight` is recurrent-only.
+// So the two identifiable tensors are the exact names `blk.N.attn_q.weight` (attention) and
+// `blk.N.ssm_alpha.weight` (recurrent), matched by suffix.
+//
+// Kinds: 0 = other/unknown, 1 = attention (needs conventional KV state), 2 = gated-deltanet
+// (needs the recurrent conv + delta-net state).
+share(all) mc_layer_kind(name<String>)<Int> -> {
+    if (name.ends_with(".ssm_alpha.weight")) { return 2 }
+    if (name.ends_with(".attn_q.weight")) { return 1 }
+    return 0
+}
+
+// Per-block kinds for a model, in block order, as "N:K,..." (e.g. "0:1,1:2,2:2,3:2,...").
+// Blocks with no identifiable kind are omitted; an unreadable tensor name STOPS the walk, so a
+// truncated table yields a short list rather than a crash.
+//
+// The return contract is three-valued, deliberately, because two DIFFERENT facts must not share a
+// value: "" means the table could not be read at all (a truncated file), "-" means the walk
+// SUCCEEDED and the file has no identifiable layer block (a vision tower: a real GGUF with a real
+// table and no `blk.N` text layers), and anything else is the plan. A caller that reads "" as
+// "no layers" would file a tower as a broken model, and one that reads "-" as a plan would parse
+// a token that is not there.
+share(all) mc_layer_kinds(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            head<String> = cp_rd(f, 0, 24)
+            if (head.len() < 24) { close(f); return "" }
+            nten<Int> = cp_u64(head, 8)
+            nkv<Int> = cp_u64(head, 16)
+            off<Int> = 24
+            i<Int> = 0
+            for (i in 0..nkv - 1) {
+                raw<String> = cp_rd(f, off, 8)
+                if (raw.len() < 8) { close(f); return "" }
+                kl<Int> = cp_u64(raw, 0)
+                off = off + 8 + kl
+                ty<Int> = cp_u32(cp_rd(f, off, 4), 0)
+                off = off + 4
+                off = cp_skip(f, off, ty)
+            }
+            out<String> = ""
+            j<Int> = 0
+            for (j in 0..nten - 1) {
+                nlraw<String> = cp_rd(f, off, 8)
+                if (nlraw.len() < 8) { close(f); return out }
+                nl<Int> = cp_u64(nlraw, 0)
+                name<String> = cp_rd(f, off + 8, nl)
+                if (name.len() < nl) { close(f); return out }
+                off = off + 8 + nl
+                nd<Int> = cp_u32(cp_rd(f, off, 4), 0)
+                off = off + 4
+                k<Int> = 0
+                for (k in 0..nd - 1) { off = off + 8 }
+                off = off + 12          // ggml type (4) + offset into the data region (8)
+                lk<Int> = mc_layer_kind(name)
+                if (lk > 0) {
+                    bi<Int> = cp_blk_index(name)
+                    if (bi >= 0) { out = cp_add(out, bi.to_string() + ":" + lk.to_string()) }
+                }
+            }
+            close(f)
+            if (out == "") { return "-" }
+            return out
+        }
+        ? -> { return "" }
+    }
+}
+
 // ─────────────────────────── what THIS BUILD implements ───────────────────────────
 // One table. A missing type is reported from `eng_type`, and the same function decides the
 // verdict, so the printed report and the refusal cannot disagree.
@@ -343,8 +422,11 @@ caps_tensors(f<File>, caps<ModelCaps>)<ModelCaps> -> {
         if (cp_has(name, ".nextn.")) { nextn = nextn + 1 }
         bi<Int> = cp_blk_index(name)
         if (bi >= 0 && bi < text_layers) {
-            if (name == "blk." + bi.to_string() + ".ssm_alpha.weight") { gdn = gdn + 1 }
-            if (name == "blk." + bi.to_string() + ".attn_q.weight") { attn = attn + 1 }
+            // The SAME rule the engine's dispatch and mc_layer_kinds use — one table, so the
+            // descriptor's counts cannot disagree with what the layer loop will do.
+            lk<Int> = mc_layer_kind(name)
+            if (lk == 2) { gdn = gdn + 1 }
+            if (lk == 1) { attn = attn + 1 }
         }
     }
     out.gdn_layers = gdn

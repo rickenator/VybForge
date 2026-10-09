@@ -1,0 +1,175 @@
+// layerkind_probe — the layer-kind DISPATCH rule and a model's real per-block plan
+// (VybForge#10 phase 4, unit 9c step 1).
+//
+//   VYBFORGE_MODEL=<path to a .gguf> ./build/vyb native/config/layerkind_probe.vyb \
+//       --module-path native/config --module-path native/json
+//
+// Why this exists. The engine's per-layer loop needs to know, per block, whether it runs the
+// conventional attention branch or the recurrent (Gated DeltaNet) branch — and the answer must
+// come from the tensor table, not from the architecture name or a hardcoded index list. That
+// decision lives in ONE place, `model_caps::mc_layer_kind`, which the capability descriptor counts
+// with. This probe makes the rule inspectable as data in two ways:
+//
+//   1. LK_SELFTEST — a TABLE of names with their expected kind, run before anything else. It pins
+//      the traps a prefix test (or a `.contains("attn_q")` test) gets wrong: `attn_qkv.weight` and
+//      `attn_gate.weight` belong to the RECURRENT block despite the `attn_` prefix, and
+//      `attn_q_norm.weight` contains `attn_q` without being the attention marker. A rule that
+//      classifies any of them would run the wrong branch on 48 of the Ridge model's 64 blocks.
+//   2. the model's real plan — `mc_layer_kinds` walks the file's tensor table and this probe prints
+//      it per block, so the gate can assert the real interleave against an INDEPENDENT parser's
+//      tensor list rather than against our own summary.
+//
+// Prints:
+//   LK_SELFTEST=PASS | LK_SELFTEST=FAIL(name=<name>, want=<k>, got=<k>)
+//   LK_LAYER <n> <kind>     one per classified block, in block order
+//   LK_BLOCKS=<count>  LK_ATTN_LAYERS=<n>  LK_GDN_LAYERS=<n>
+//   LK_TEXT_LAYERS=<n>  LK_TEXT_ATTN=<n>  LK_TEXT_GDN=<n>  LK_DRAFT_BLOCKS=<list>
+//   LK_KINDS=<the raw plan, "n:k,...">
+//   LK_ERROR=<reason>       (no plan — see the three-valued contract below)
+//   LK_DONE
+//
+// The text/draft split is NOT cosmetic: the draft (MTP) head's block carries `attn_q.weight` too,
+// so a kind-only count calls the 65-block Ridge model "17 attention + 48 recurrent" when the text
+// model is 16 + 48 and block 64 is the draft head. The engine's dispatch must run the text blocks
+// and must NOT feed the draft head into the text attention branch, so this probe states which
+// blocks are text — the count the capability descriptor also uses (n_layers - mtp_layers).
+//
+// The plan is THREE-VALUED (see mc_layer_kinds): "" is an unreadable table, "-" is a readable table
+// with no identifiable text block (a vision tower), anything else is the plan. Those two error
+// cases print DIFFERENT LK_ERROR lines on purpose: a gate that let them share a message could not
+// tell a truncated download from a clip model.
+//
+// The JIT PRINTS main()'s return value and always exits 0 (doc/PYTHON-CLEANUP.md), so a caller
+// reads the LK_ lines — never `$?`. Driven by native/legit/run_layerkind_gate.sh.
+import env::{env_get}
+import model_caps::{mc_layer_kind, mc_layer_kinds, caps_load, ModelCaps}
+
+// index of ':' in a "N:K" token, or -1.
+lk_colon(tok<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..tok.len() - 1) {
+        if ((tok.char_at(i) as Int) == 58) { return i }
+    }
+    return -1
+}
+
+// decimal value of tok[frm..endp-1]; -1 when a non-digit is present (so a malformed token cannot
+// read as 0 and pass unnoticed).
+lk_num(tok<String>, frm<Int>, endp<Int>)<Int> -> {
+    if (endp <= frm) { return -1 }
+    v<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (tok.char_at(i) as Int)
+        if (c < 48) { return -1 }
+        if (c > 57) { return -1 }
+        v = v * 10 + (c - 48)
+    }
+    return v
+}
+
+// The rule's own table: each name the models really carry, and the kind the DISPATCH must report.
+// The `0` rows are the traps — three of them carry `attn_` or `attn_q` and are NOT the attention
+// marker, one is recurrent without being the marker — and the first two rows are the markers.
+lk_expect(i<Int>)<String> -> {
+    if (i == 0) { return "blk.0.ssm_alpha.weight" }      // recurrent marker
+    if (i == 1) { return "blk.0.attn_q.weight" }         // attention marker
+    if (i == 2) { return "blk.0.attn_qkv.weight" }       // recurrent weight, attn_ prefix
+    if (i == 3) { return "blk.0.attn_gate.weight" }      // recurrent weight, attn_ prefix
+    if (i == 4) { return "blk.0.attn_q_norm.weight" }    // attention tensor, contains attn_q
+    if (i == 5) { return "blk.0.ssm_norm.weight" }       // recurrent tensor, not a marker
+    if (i == 6) { return "blk.0.attn_output.weight" }    // attention weight, not a marker
+    if (i == 7) { return "blk.0.ffn_gate.weight" }       // neither
+    return ""
+}
+
+lk_expect_kind(i<Int>)<Int> -> {
+    if (i == 0) { return 2 }
+    if (i == 1) { return 1 }
+    return 0
+}
+
+lk_selftest()<Int> -> {
+    bad<Int> = 0
+    i<Int> = 0
+    for (i in 0..7) {
+        nm<String> = lk_expect(i)
+        want<Int> = lk_expect_kind(i)
+        got<Int> = mc_layer_kind(nm)
+        if (got != want) {
+            println("LK_SELFTEST=FAIL(name=" + nm + ", want=" + want.to_string() + ", got=" + got.to_string() + ")")
+            bad = bad + 1
+        }
+    }
+    if (bad == 0) { println("LK_SELFTEST=PASS") }
+    return bad
+}
+
+main()<Int> -> {
+    if (lk_selftest() != 0) { return 6 }
+    path<String> = env_get("VYBFORGE_MODEL") else ""
+    if (path == "") {
+        println("LK_ERROR=VYBFORGE_MODEL not set (selftest only)")
+        return 2
+    }
+    kinds<String> = mc_layer_kinds(path)
+    if (kinds == "") {
+        println("LK_ERROR=no readable tensor table")
+        return 3
+    }
+    if (kinds == "-") {
+        println("LK_ERROR=no identifiable layer block (readable table, no blk.N text layers)")
+        return 5
+    }
+    nblk<Int> = 0
+    gdn<Int> = 0
+    attn<Int> = 0
+    # The text/draft boundary, from the same descriptor the caps gate reads.
+    caps<ModelCaps> = caps_load(path)
+    textlayers<Int> = caps.n_layers - caps.mtp_layers
+    tattn<Int> = 0
+    tgdn<Int> = 0
+    draft<String> = ""
+    src<String> = kinds + ","
+    start<Int> = 0
+    i<Int> = 0
+    for (i in 0..src.len() - 1) {
+        if ((src.char_at(i) as Int) == 44) {
+            tok<String> = src.substring(start, i)
+            cp<Int> = lk_colon(tok)
+            if (cp < 0) {
+                println("LK_ERROR=malformed token [" + tok + "]")
+                return 4
+            }
+            n<Int> = lk_num(tok, 0, cp)
+            k<Int> = lk_num(tok, cp + 1, tok.len())
+            if (n < 0 || k < 0) {
+                println("LK_ERROR=malformed token [" + tok + "]")
+                return 4
+            }
+            println("LK_LAYER " + n.to_string() + " " + k.to_string())
+            nblk = nblk + 1
+            if (k == 2) { gdn = gdn + 1 }
+            if (k == 1) { attn = attn + 1 }
+            if (textlayers > 0) {
+                if (n < textlayers) {
+                    if (k == 2) { tgdn = tgdn + 1 }
+                    if (k == 1) { tattn = tattn + 1 }
+                } else {
+                    if (draft == "") { draft = n.to_string() } else { draft = draft + "," + n.to_string() }
+                }
+            }
+            start = i + 1
+        }
+    }
+    println("LK_BLOCKS=" + nblk.to_string())
+    println("LK_ATTN_LAYERS=" + attn.to_string())
+    println("LK_GDN_LAYERS=" + gdn.to_string())
+    println("LK_TEXT_LAYERS=" + textlayers.to_string())
+    println("LK_TEXT_ATTN=" + tattn.to_string())
+    println("LK_TEXT_GDN=" + tgdn.to_string())
+    println("LK_DRAFT_BLOCKS=" + draft)
+    println("LK_KINDS=" + kinds)
+    println("LK_DONE")
+    return 0
+}
