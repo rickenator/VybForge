@@ -756,3 +756,70 @@ the feature, and the reason to run it on every change to a shared dispatch. Note
 of the previous regression: with the driver exiting early, `verify_prefill.py` compared the PREVIOUS
 run's outputs and reported OK — so a regression gate must assert the driver's own completion marker
 (`MODEL_PREFILL_DONE`), not just the final comparison.
+
+## Unit 10 reconnaissance — Ridge's ATTENTION layer, read from the reference
+
+The recurrent side is verified standalone; the attention side of a hybrid block is what stands between
+here and a whole-Ridge run, and the phase-4 note has been calling it "IMROPE" since phase 3. It is more
+than that, and less. This is the graph, read out of `~/Projects/llama.cpp` at `4df29be`
+(`src/models/qwen35.cpp`, `build_layer_attn`, and the rope op it calls), plus the semantics of the rope
+from `ggml/src/ggml-cpu/ops.cpp`.
+
+### The graph (order matters)
+
+    Qcur_full = wq @ cur                 // ONE joint projection: (2 * head_dim) * n_head wide
+    Qcur      = view of the FIRST head_dim of each head   (stride 2*head_dim per head)
+    Qcur      = RMS norm over head_dim, per head          (attn_q_norm: 256 values)
+    Kcur, Vcur = wk @ cur, wv @ cur
+    Kcur      = reshape (head_dim, n_head_kv, tokens) then RMS norm per head
+    gate      = view of the SECOND head_dim of each head, made contiguous  (head_dim * n_head)
+    Qcur, Kcur = rope_multi(Qcur), rope_multi(Kcur)       // MRoPE, see below
+    cur       = attention(Qcur, Kcur, Vcur)               // kq_scale = 1/sqrt(head_dim)
+    cur       = cur * sigmoid(gate)                       // the OUTPUT GATE
+    cur       = wo @ cur
+
+So `attn_q.weight` is `5120x12288` because it is Q **and** the gate in one matrix, **interleaved per
+head** — head h contributes dims [2h*256, 2h*256+256) to Q and [2h*256+256, 2h*256+512) to the gate — not
+"all Q then all gate". Ridge's numbers: n_head 24, n_head_kv 4, head_dim 256, so n_rot dims are rotated
+only in the first 64 of each head.
+
+### The rope: "IMROPE" collapses for text, and the rotation may already exist in this repo
+
+`rope.dimension_sections = [11, 11, 10, 0]` is MRoPE (the Qwen2-VL/Qwen3-VL scheme) and `is_imrope`
+selects the interleaved assignment: for pair index `sector = (i0/2) % 32`, `sector % 3 == 0` uses the
+temporal position, `1` the height, `2` the width, otherwise the extra position. **For a text-only model
+all four position ids are the same token position**, so every branch yields the same theta and the
+sectioning degenerates: the cache becomes the ordinary geometric progression over the head dims. The
+section code matters only for the vision tower.
+
+What does NOT degenerate, and is the real work:
+
+* only the first `n_dims = 64` dims are rotated; dims 64..255 are copied through unchanged
+  (`ggml/src/ggml-cpu/ops.cpp`, the `!is_vision` pass-through loop);
+* the rotation is the NEOX pairing (`rotate_pairs(n_dims, n_dims/2, ...)`) — pairs (i, i + 32) — which is
+  the convention the engine's `qwen3rope` already implements, over a parameterised dim count;
+* freq_base 1e7, and `kq_scale = 1/sqrt(256)` unless the GGUF sets `f_attention_scale`.
+
+So the likely finding, to be MEASURED rather than assumed: Ridge's attention rope is the engine's
+existing rope kernel with `n_rot = 64` and `head_dim = 256`, not a new kernel. `rotate_pairs`'s exact
+index arithmetic is not something to reconstruct by reading (its `ic = i0/scale` comment and the
+`n_offset` argument interact in a way that invites an off-by-one); the authority harness settles it, as
+it settled every other op in this phase.
+
+### The plan that follows (unit 10, in the repo's usual order)
+
+1. **Rope first, smallest unit.** A harness that links the built libggml and calls `ggml_rope_multi` with
+   Ridge's own parameters (n_dims 64, sections [11,11,10,0], mode IMROPE, freq_base 1e7) on known input,
+   plus a numpy port compared against it — the `mm_authority`/`norm_authority` pattern. If the engine's
+   rope kernel already reproduces it at `n_rot = 64`, this unit ends with a gate, not a kernel.
+2. **The attention block authority.** A C harness building the graph above out of ggml's own ops
+   (mul_mat, rms_norm, rope_multi, attention, mul/sigmoid, mul_mat) and dumping stages — `layer_authority`
+   for a hybrid attention layer, including the q/gate interleave and the output gate.
+3. **The engine-side branch.** `run_layer_attn` gains the joint-QG split, the per-head interleave, the
+   parameterised rope and the output gate, verified against (2) stage by stage.
+4. **Then the whole-model logits against llama.cpp.** `eng_mtp()`/the 65th block still has to be dealt
+   with (or the descriptor needs a documented profile without the draft head), and the state-cache
+   session question from unit 9c remains open.
+
+`eng_gdn()` stays 0 until step 4 lands: the recurrent block is verified standalone, but the engine has
+never produced a token from this model.
