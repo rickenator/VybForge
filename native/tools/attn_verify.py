@@ -89,12 +89,12 @@ def build_authority():
 THREADS = int(os.environ.get("VYBFORGE_ATTN_THREADS", "1"))
 
 
-def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid, mode=None):
+def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid, mode=None, kq_scale=None):
     with open(IN, "wb") as fh:
         for a in (Wqg, Wk, Wv, Wo, nmq, nmk, hid):
             fh.write(np.ascontiguousarray(a, dtype="<f4").tobytes())
     r = subprocess.run([BIN, IN, OUT, str(NH), str(HD), str(NKV), str(S), str(D), str(ND), "%.9g" % EPS,
-                        "%.9g" % KQS, (mode or MODE), *[str(x) for x in SECTIONS], str(THREADS)],
+                        "%.9g" % (KQS if kq_scale is None else kq_scale), (mode or MODE), *[str(x) for x in SECTIONS], str(THREADS)],
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(("attn authority", r.stdout + r.stderr)[:300])

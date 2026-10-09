@@ -1217,3 +1217,27 @@ So the next check is the SAME probe aimed at K instead of V — make k[t] a cons
 k[t, :] constant in t) with q distinguishable, and read which key each query scores against. That names
 the op's key indexing directly. The harness is restored to its working state; the default fixture is
 unaffected and still verifies all ten stages.
+
+### The K-side probe, its limitation, and where this leaves the flash path
+
+A second fixture was built to favour key 0 (scores `-(t+1)(k+1)*scale`) so a correct key axis would
+return V(key 0) = 1.0 at every query. It does not do that — but for a reason in the PROBE, not the op:
+the block normalises q and k per head (`ggml_rms_norm` over head_dim), and with only dim 0 non-zero each
+vector's norm pulls the magnitude to a constant, which flattens my intended score slope. So both probe
+fixtures are effectively flat-scored, and the useful statement is the one they DO support, which is now
+made in three independent ways:
+
+    flash returns V(key == query) — the DIAGONAL — in every fixture, with the mask causal, NULL, or
+    inverted. The explicit path, same inputs, same harness, does not.
+
+So: the flash path pairs query q with key q, and the supplied mask does not change that at all. Every
+mask-side experiment (three) was downstream of that. The remaining explanations all live in what the op
+expects of K/V that this harness does not provide; and since llama.cpp demonstrably works with this op,
+the reliable next move is to DIFF my call against llama.cpp's call site field by field (tensor types,
+the mask tensor's shape and padding, the KV padding of the cache, and `ggml_flash_attn_ext_set_prec`)
+rather than to run a fourth fixture. A probe that first neutralises the block's own normalisations
+(e.g. norm weights set to keep the score slope, or scores built across many dims) is the alternative if
+the diff comes back clean.
+
+The harness is restored to its working state and the default fixture is unaffected: all ten stages
+verify at worst 4.597e-07.

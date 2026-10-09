@@ -36,6 +36,26 @@ S = av.S
 NH, HD, NKV, D = av.NH, av.HD, av.NKV, av.D
 
 
+def fixture_favor0():
+    """Score every key by -(query+1)*(key+1)*scale, so the weights concentrate on KEY 0 — which the causal
+    mask allows for every query. A correct key axis therefore returns V(key 0) = 1.0 for EVERY query,
+    which is the discriminating reading: the flat-score probe cannot tell "one key (the diagonal)"
+    apart from "the key axis is read from the wrong place"."""
+    Wqg = np.zeros((NH * 2 * HD, D), dtype=np.float32)
+    Wk = np.zeros((NKV * HD, D), dtype=np.float32)
+    Wv = np.zeros((NKV * HD, D), dtype=np.float32)
+    Wv[:, 0] = 1.0
+    Wo = np.zeros((D, NH * HD), dtype=np.float32)
+    nmq, nmk = np.ones((HD,), dtype=np.float32), np.ones((HD,), dtype=np.float32)
+    hid = np.zeros((S, D), dtype=np.float32)
+    hid[:, 0] = np.arange(1, S + 1)
+    for h in range(NH):
+        Wqg[2 * h * HD + 0, 0] = -1.0      # q[t,h,0] = -(t+1)
+    for j in range(NKV):
+        Wk[j * HD + 0, 0] = 1.0            # k[k,j,0] =  (k+1)
+    return Wqg, Wk, Wv, Wo, nmq, nmk, hid
+
+
 def fixture():
     """The legible fixture: flat scores, V carrying the token index."""
     Wqg = np.zeros((NH * 2 * HD, D), dtype=np.float32)
@@ -62,9 +82,13 @@ def attn_stage(dump):
 
 def main():
     print(f"ROW PROBE geometry n_head={NH} n_kv={NKV} S={S} — V carries t+1, scores flat")
-    Wqg, Wk, Wv, Wo, nmq, nmk, hid = fixture()
+    which = os.environ.get("VYBFORGE_PROBE", "flat")
+    Wqg, Wk, Wv, Wo, nmq, nmk, hid = (fixture_favor0() if which == "favor0" else fixture())
+    scale = 4.0 if which == "favor0" else av.KQS
+    if which == "favor0":
+        print("ROW PROBE scores favour key 0 -> a correct key axis gives V(key 0) = 1.0 for EVERY query")
     for mode in ("explicit", "flash"):
-        av.run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid, mode=mode)
+        av.run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid, mode=mode, kq_scale=scale)
         a = attn_stage(np.fromfile(av.OUT, dtype="<f4"))
         print(f"ROW PROBE mode={mode}: the value the op produced per query (head 0, dim 0) "
               f"and the key set that value names")
