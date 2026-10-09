@@ -368,6 +368,21 @@ else
   step "P4.5 GDN engine weight path" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
+# Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
+# rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come
+# from a check that ignores the parameter. Measured: q 8.90e-08 / k 6.97e-08 at n_rot=64, 1.70e+00 at
+# n_rot=256. SKIPs without CUDA or the llama.cpp checkout.
+out="$(./native/legit/run_rope_kernel_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "ROPE KERNEL GATE: PASS"; then
+  step "P4.7 rope kernel (n_rot-gated)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "ROPE KERNEL GATE: SKIP"; then
+  step "P4.7 rope kernel (n_rot-gated)" "SKIP ($(echo "$last" | sed 's/ROPE KERNEL GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.7 rope kernel (n_rot-gated)" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.6 — Ridge's attention RoPE, against ggml's own op (phase 4, unit 10) ──────────
 # Gate: native/legit/run_rope_gate.sh. Phase 4 blamed "IMROPE" for the hybrid attention path; this
 # gate asks the real op which (mode, layout) reproduces it and requires exactly one at the f32 floor.

@@ -894,3 +894,36 @@ What IS established:
 The kernel stays SEPARATE from `qwen3rope` until it is green: that one is on the verified dense path,
 and merging them while this one is wrong would put the dense regression in the position of testing the
 change instead of the behaviour.
+
+### Correction to the paragraph above: the kernel is RIGHT, my PARSER was the bug
+
+The red run recorded above diagnosed the kernel's rotation as still wrong. That was wrong, and the way
+it was wrong is worth keeping.
+
+`rope_kernel_verify.py`'s dump parser built its section arrays with `np.array(buf, dtype="<f8")`. That
+CONVERTS the integers to floats — so a dumped `4602070306595536896` became the float
+4.602070306595537e+18, and the `frombuffer(..., dtype="<f8")` meant to reinterpret the raw i64 bit
+patterns then read back those already-converted bytes. The reinterpreting step never reinterpreted
+anything. Every "garbage" reading was arithmetic on integer values dressed as doubles, which is why the
+error was ~1e18 and identical at both `n_rot` values: the comparison was measuring my parser, not the
+kernel. The decisive fiducial was the cheap one — run the driver at `n_rot = 0` (a pure pass-through)
+THROUGH the verifier's own parse path; it returned 4.602070306595537e+18 where the fixture holds
+0.46622076630592346. The plumbing had been cleared earlier with a manual decode of the printed values,
+which is exactly why the bug hid: the printed values were right and the parsed ones were not.
+
+With the parser keeping the raw int64 patterns (`dtype="<i8"`, then one deliberate reinterpretation):
+
+    ROPE_KERNEL_VERIFY n_rot= 64 q maxrel=8.903e-08 k maxrel=6.969e-08 MATCH
+    ROPE_KERNEL_VERIFY n_rot=256 q maxrel=1.703e+00 k maxrel=1.237e+00 differs
+
+So the transposed-rotation fix WAS necessary (a transposed pair is an O(1) error, and it was hidden
+under a 1e18 parser artifact), and the kernel now reproduces ggml's rope at the f32 floor. Gate P4.7
+(`native/legit/run_rope_kernel_gate.sh`, wired into the phase-2 battery): PASS.
+
+The lesson, which is the same one twice over: when a measurement is absurd, suspect the instrument
+before the subject — and use the cheapest fiducial that separates them (here, a pass-through launch
+through the same parse path).
+
+Lessons for the skill: a dump parser must keep the dumped int64 BIT PATTERNS intact until the single
+reinterpretation (an intermediate dtype="<f8" silently converts); and a pass-through/no-op case is the
+right fiducial for any load→compute→store→dump chain.

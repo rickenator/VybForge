@@ -82,7 +82,7 @@ def parse_dumps(text):
     for line in text.splitlines():
         if line.startswith("DUMP "):
             if name is not None:
-                secs[name] = np.array(buf[:want], dtype="<f8")
+                secs[name] = np.array(buf[:want], dtype="<i8")
             _, name, count = line.split()
             want, buf = int(count), []
         elif name is not None and len(buf) < want:
@@ -91,7 +91,7 @@ def parse_dumps(text):
             except ValueError:
                 pass
     if name is not None:
-        secs[name] = np.array(buf[:want], dtype="<f8")
+        secs[name] = np.array(buf[:want], dtype="<i8")
     return {k: np.frombuffer(v.tobytes(), dtype="<f8") for k, v in secs.items()}
 
 
