@@ -368,6 +368,23 @@ else
   step "P4.5 GDN engine weight path" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.6 — Ridge's attention RoPE, against ggml's own op (phase 4, unit 10) ──────────
+# Gate: native/legit/run_rope_gate.sh. Phase 4 blamed "IMROPE" for the hybrid attention path; this
+# gate asks the real op which (mode, layout) reproduces it and requires exactly one at the f32 floor.
+# Measured: mode=neox, NEOX pairing inside the first n_dims (64 of 256), the rest passed through —
+# 8.99e-08, runner-up 1.01e+00. The sections are INERT for this architecture, and the engine's rope
+# (every head dim, pairs (i, i+HD/2)) is the rejected candidate at 1.478 — so a rope VARIANT is real
+# work, not a parameter change. SKIPs without the llama.cpp checkout.
+out="$(./native/legit/run_rope_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "ROPE GATE: PASS"; then
+  step "P4.6 attention rope (vs ggml)" "$(echo "$out" | grep -oE 'PASS \(winner.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "ROPE GATE: SKIP"; then
+  step "P4.6 attention rope (vs ggml)" "SKIP ($(echo "$last" | sed 's/ROPE GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.6 attention rope (vs ggml)" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.10 — Q4_K dequant reference (the type with no reference until now) ───────────
 # Gate: native/legit/run_q4k_gate.sh. blk.N.attn_qkv, blk.N.attn_gate and blk.N.ssm_out are all Q4_K
 # (the model's biggest projections) and Q4_K was the one quant type with no numpy reference and no

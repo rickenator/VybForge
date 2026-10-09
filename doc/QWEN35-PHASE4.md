@@ -823,3 +823,43 @@ it settled every other op in this phase.
 
 `eng_gdn()` stays 0 until step 4 lands: the recurrent block is verified standalone, but the engine has
 never produced a token from this model.
+
+## Unit 10 step 1 — the rope spec, MEASURED (gate P4.6), and a correction to the reconnaissance
+
+The reconnaissance above reasoned that the MRoPE sectioning "collapses for a text model". The
+measurement says otherwise, in a way that matters, so it is recorded as a correction rather than a
+refinement.
+
+`native/tools/rope_authority.c` links the libggml llama.cpp runs and calls `ggml_rope_multi` with
+Ridge's own parameters; `native/tools/rope_verify.py` then asks which (mode, rotation layout) pair
+reproduces it. Measured on the text case (all four MRoPE positions the same):
+
+    mode=neox    neox_first_nd      8.993e-08  MATCH
+    mode=neox    swizzle_2k_in_nd   1.332e+00  differs
+    mode=neox    adjacent_in_nd     1.287e+00  differs
+    mode=neox    neox_all_dims      1.478e+00  differs
+    mode=mrope   (all four layouts) 1.01e+00 .. 1.689e+00  differ
+    mode=imrope  (all four layouts) 1.01e+00 .. 1.478e+00  differ
+
+Three things follow, and two of them correct what this document said earlier:
+
+1. **The modes are not interchangeable even for text.** `ggml.h` states it plainly: the sections do
+   not change the theta per dim ("idx used for theta: [0..n_dims/2], not reset for each section") —
+   they change WHICH DIMS ARE PAIRED (`MROPE: [ttttyyxxttttyyxx00]` vs `IMROPE: [ttyxttyxttyxttyx00]`).
+   Equal positions therefore do not make IMROPE and MROPE agree, and "the sections collapse" was
+   wrong.
+2. **For this architecture the sections are inert anyway.** `llama_model_rope_type` gives qwen35 the
+   NEOX mode (it sits with qwen3next), ggml's `mrope_used = mode & MROPE` is then false, and the
+   `[11,11,10,0]` metadata never reaches the kernel. So Ridge's attention rope is ordinary rope.
+3. **It is still a real piece of work, not a parameterisation.** The spec: rotate ONLY the first
+   `n_dims = 64` dims of each 256-dim head with NEOX pairing inside them — pairs (k, k + 32) — and
+   pass dims 64..255 through. The engine's `qwen3rope` rotates every head dim with pairs
+   (i, i + HD/2); that is the `neox_all_dims` candidate, measured at 1.478, i.e. wrong for Ridge. The
+   kernel needs a variant (a `n_rot` bound and a pair offset of `n_rot/2`), and the gate has teeth:
+   eleven alternatives are rejected in every run.
+
+What the earlier reconnaissance got right and is worth keeping: the joint Q+gate projection
+(`attn_q.weight` is `5120x12288`, interleaved per head) and the output gate `attn * sigmoid(gate)`
+before `wo` — that remains the substantial attention-path work, and it is where the next unit starts.
+The lesson about method is the one this document keeps relearning: a harness that runs the real op
+settles in one run what reading the source gets wrong, and the wrong reading here was mine.
