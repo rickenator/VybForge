@@ -181,8 +181,23 @@ int main(int argc, char ** argv) {
         // K and V need the TOKEN axis in ne1 too: the op asserts ggml_can_mul_mat(k, q), i.e.
         // k->ne[2] == q->ne[2]. With S == n_head the two extents coincide and it passes by accident —
         // which is why this never fired until the fixture ran with S != n_head.
-        struct ggml_tensor * kf = ggml_cont(ctx, ggml_permute(ctx, kr, 0, 2, 1, 3));
-        struct ggml_tensor * vf = ggml_cont(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3));
+        struct ggml_tensor * kf0 = ggml_cont(ctx, ggml_permute(ctx, kr, 0, 2, 1, 3));   // (hd, tokens, n_kv)
+        struct ggml_tensor * vf0 = ggml_cont(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3));
+        // GQA: repeat the kv heads up to n_head, which is what makes k->ne[2] == q->ne[2] hold. The
+        // repeat is along a new trailing axis, so head h reads kv head h % n_kv (round-robin).
+        struct ggml_tensor * kf = kf0;
+        struct ggml_tensor * vf = vf0;
+        if (nkv != nh) {
+            // The repeat's AXIS ORDER decides the pairing: putting the group axis inside the kv axis
+            // (…, g, nkv) makes the flat head index h = j + kv*g, so head h reads kv head h // g — the
+            // CONTIGUOUS grouping the spec expects. (…, nkv, g) would give h % nkv instead, which is what
+            // the first attempt built and why it missed by 1.0.)
+            const int64_t g = nh / nkv;
+            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, 1, nkv);
+            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, 1, nkv);
+            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, g, nkv), hd, S, nh);
+            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, g, nkv), hd, S, nh);
+        }
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kf, vf, mask2, kqs, 0.0f, 0.0f);
         // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
         // n_tokens) that the split half of this harness and the gate multiply use
@@ -204,8 +219,23 @@ int main(int argc, char ** argv) {
         // K and V need the TOKEN axis in ne1 too: the op asserts ggml_can_mul_mat(k, q), i.e.
         // k->ne[2] == q->ne[2]. With S == n_head the two extents coincide and it passes by accident —
         // which is why this never fired until the fixture ran with S != n_head.
-        struct ggml_tensor * kf = ggml_cont(ctx, ggml_permute(ctx, kr, 0, 2, 1, 3));
-        struct ggml_tensor * vf = ggml_cont(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3));
+        struct ggml_tensor * kf0 = ggml_cont(ctx, ggml_permute(ctx, kr, 0, 2, 1, 3));   // (hd, tokens, n_kv)
+        struct ggml_tensor * vf0 = ggml_cont(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3));
+        // GQA: repeat the kv heads up to n_head, which is what makes k->ne[2] == q->ne[2] hold. The
+        // repeat is along a new trailing axis, so head h reads kv head h % n_kv (round-robin).
+        struct ggml_tensor * kf = kf0;
+        struct ggml_tensor * vf = vf0;
+        if (nkv != nh) {
+            // The repeat's AXIS ORDER decides the pairing: putting the group axis inside the kv axis
+            // (…, g, nkv) makes the flat head index h = j + kv*g, so head h reads kv head h // g — the
+            // CONTIGUOUS grouping the spec expects. (…, nkv, g) would give h % nkv instead, which is what
+            // the first attempt built and why it missed by 1.0.)
+            const int64_t g = nh / nkv;
+            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, 1, nkv);
+            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, 1, nkv);
+            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, g, nkv), hd, S, nh);
+            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, g, nkv), hd, S, nh);
+        }
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kf, vf, mask2, kqs, 0.0f, 0.0f);
         at = ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3));
         kqs_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);

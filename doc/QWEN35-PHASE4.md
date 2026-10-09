@@ -1305,3 +1305,28 @@ all three, and test at S ≠ n_head where the asserts can actually see what is w
 
 Unchanged and still verified: the default fixture (n_kv == n_head, hand-rolled path), all ten stages at
 worst 4.597e-07, six misreadings rejected.
+
+## Unit 10 step 4l — SOLVED: the flash path is the three permutes, plus the GQA repeat's axis order
+
+The two things the op's asserts pointed at were both real, and both are now measured:
+
+    geom=heads (n_kv == n_head), S=6:  attn 2.493e-07   gated 2.201e-07   out 2.447e-07
+                                       -> DONE: all 10 stages, worst 3.887e-07
+
+So the flash path reproduces the reference **exactly as well as the hand-rolled one**, at f32 precision
+(the CPU backend does not drop to F16 here, so no tolerance exception is needed — the 1e-4 bar stands).
+The fix is the one llama.cpp's call site performs and that I had applied to the wrong tensor:
+
+* q, k AND v are all permuted to `(hd, tokens, heads)`. `ggml_flash_attn_ext` asserts
+  `ggml_can_mul_mat(k, q)`, i.e. `k->ne[2] == q->ne[2]`; the unpermuted harness satisfied that only
+  because q's and k's ne2 were both S — the accident that produced a **diagonal-only** attention with no
+  assert firing, for as long as the fixture had `S == n_head == 3`. That single degenerate choice of
+  fixture geometry is what hid the bug and manufactured five refuted hypotheses.
+
+For the GQA fixture the third piece is the repeat from n_kv to n_head, and its **axis order** decides the
+pairing, which is the last open item:
+
+* `(…, nkv, g)` (the first attempt) gives head h -> kv head `h % n_kv` — round-robin: attn 1.000e+00.
+* `(…, g, nkv)` gives h -> `h // g` — the contiguous grouping the spec uses: measuring now.
+
+If the second form matches, the GQA attention stages come into the gate and unit 10 step 4 is done.
