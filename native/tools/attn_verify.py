@@ -67,7 +67,10 @@ DUMPED = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope",
 SCORE_STAGES = ("scores", "probs")
 # The two DIAGNOSTIC tensors, not block outputs: their comparison order is not settled, but `attn` is
 # computed FROM probs on both sides and matches ggml at 2.7e-7, so the two sides agree in content.
-LATER = ("scores", "probs", "attn", "gated", "out")
+# Reported-but-ungated. At n_kv == n_head that is only the two diagnostic tensors (their comparison order
+# is unsettled; attn is derived from probs and is gated, so the content is corroborated). In GQA mode
+# nothing beyond the front half is authorised at all, so the three attention stages are listed here too.
+LATER = ("scores", "probs", "attn", "gated", "out") if GQA else ("scores", "probs")
 STAGES = FRONT + LATER
 
 
@@ -296,9 +299,10 @@ def main():
                   f"check cannot tell them apart, so a pass here proves nothing")
             return 1
 
-    print(f"ATTN_VERIFY_DONE {len(FRONT)} front-half stages reproduce ggml's ops within {MAXREL:g} "
+    print(f"ATTN_VERIFY_DONE {'all ' if not GQA else ''}{len(FRONT)} "
+          f"{'stages of the attention block' if not GQA else 'front-half stages'} reproduce ggml's ops within {MAXREL:g} "
           f"(worst {worst:.3e}), and all {len(alts)} alternative readings of them are rejected; "
-          f"{len(LATER)} attention stages are reported, NOT authorised (GQA mode: see the note in the doc)")
+          f"{len(LATER)} {'attention stages are reported and NOT authorised (GQA)' if GQA else 'diagnostic tensors are reported with their order unsettled'}")
     return 0
 
 
