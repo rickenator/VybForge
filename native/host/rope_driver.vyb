@@ -1,0 +1,184 @@
+// rope_driver.vyb — the rope VARIANT kernel on the GPU, dumped for comparison with ggml (unit 10.2).
+//
+// Loads native/kernels/rope.vyb's `rope_nrot` and runs it on a fixture the verifier writes, then
+// prints the rotated q and k as machine-readable DUMP lines. The comparison is against
+// `rope_authority` (ggml's own ggml_rope_multi, mode NEOX) — the authority this unit exists to match.
+//
+// Input file (VYB_ROPE_IN), all in ggml order:
+//   q  f32  S * H   * HD      (ne = (HD, H, S))
+//   k  f32  S * KVH * HD      (ne = (HD, KVH, S))
+//   fr f64  NROT / 2          the inverse frequencies for the first n_rot/2 pair indices
+// Positions are implicit: POS base 0 and one position per token (s), which is the text case.
+//
+// Env: VYB_ROPE_IN, VYB_ROPE_S, VYB_ROPE_H, VYB_ROPE_KVH, VYB_ROPE_HD, VYB_ROPE_NROT.
+// Prints SKIP and returns 0 without CUDA.
+import env::{env_get}
+import io::{open_read, read_at, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+slice(data<String>, off<Int>, n<Int>)<String> -> {
+    if (data.len() < off + n) { return "" }
+    return data.substring(off, off + n)
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8)
+        ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8
+            ch<Int> = 0
+            bj<Int> = 0
+            for (bj in 0..7) {
+                bv<Int> = (data.char_at(o8 + bj) as Int) & 255
+                ch = ch | (bv << (bj * 8))
+            }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) {
+            by<Int> = (data.char_at(tj) as Int) & 255
+            if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }
+            tj = tj + 1
+        }
+        return 0
+    }
+    return 0
+}
+dump_section(base<Int>, count<Int>, nm<String>) -> {
+    println("DUMP " + nm + " " + count.to_string())
+    acc<String> = ""
+    i<Int> = 0
+    for (i in 0..count - 1) {
+        iv<Int> = 0
+        freedom { cuMemcpyDtoH_v2(loc(iv), base + i * 8, 8) }
+        acc = acc + iv.to_string() + " "
+        if (i % 64 == 63) { println(acc); acc = "" }
+    }
+    if (count % 64 != 0) { println(acc) }
+}
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+env_i(name<String>, dflt<Int>)<Int> -> {
+    v<String> = env_get(name) else ""
+    if (v.len() == 0) { return dflt }
+    return parse_u(v, 0, v.len())
+}
+
+main()<Int> -> {
+    input<String> = env_get("VYB_ROPE_IN") else ""
+    if (input == "") { println("ROPE_DRIVER_ERR VYB_ROPE_IN not set"); return 2 }
+    S<Int> = env_i("VYB_ROPE_S", 5)
+    H<Int> = env_i("VYB_ROPE_H", 24)
+    KVH<Int> = env_i("VYB_ROPE_KVH", 4)
+    HD<Int> = env_i("VYB_ROPE_HD", 256)
+    NROT<Int> = env_i("VYB_ROPE_NROT", 64)
+    NQ<Int> = S * H * HD
+    NK<Int> = S * KVH * HD
+    NQF<Int> = NQ * 4
+    NKF<Int> = NK * 4
+    FRN<Int> = (NROT / 2) * 8
+    raw<String> = read_bin(input)
+    if (raw.len() < NQF + NKF + FRN) {
+        println("ROPE_DRIVER_ERR input too short: " + raw.len().to_string() + " < " + (NQF + NKF + FRN).to_string())
+        return 2
+    }
+    qf<String> = slice(raw, 0, NQF)
+    kf<String> = slice(raw, NQF, NKF)
+    fr<String> = slice(raw, NQF + NKF, FRN)
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    freedom {
+        mR<loc<CVoid>> = from<loc<CVoid>>(0)
+        mW<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(mR), read_bin("native/build/rope.ptx")) != 0) { println("MODLOAD_FAIL rope"); return 9 }
+        if (cuModuleLoadData(loc(mW), read_bin("native/build/qwen3.ptx")) != 0) { println("MODLOAD_FAIL qwen3"); return 9 }
+        kfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        exfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(kfn), mR, "rope_nrot") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(exfn), mW, "f32expand") != 0) { return 10 }
+
+        DQF<Int> = 0; DQ<Int> = 0; DQO<Int> = 0; DKF<Int> = 0; DK<Int> = 0; DKO<Int> = 0
+        DFR<Int> = 0; P<Int> = 0; PF<Int> = 0
+        cuMemAlloc_v2(loc(DQF), NQF)
+        cuMemAlloc_v2(loc(DQ), NQ * 8)
+        cuMemAlloc_v2(loc(DQO), NQ * 8)
+        cuMemAlloc_v2(loc(DKF), NKF)
+        cuMemAlloc_v2(loc(DK), NK * 8)
+        cuMemAlloc_v2(loc(DKO), NK * 8)
+        cuMemAlloc_v2(loc(DFR), FRN)
+        cuMemAlloc_v2(loc(P), 88)
+        cuMemAlloc_v2(loc(PF), 40)
+        if (download(qf, DQF, NQF) != 0) { return 15 }
+        if (download(kf, DKF, NKF) != 0) { return 15 }
+        if (download(fr, DFR, FRN) != 0) { return 15 }
+        # the fixture arrives f32 (the authority's own precision); the kernel works in f64
+        put_i(PF, 0, DQF) ; put_i(PF, 8, DQ) ; put_i(PF, 16, NQ)
+        if (cuda_launch4i(from<loc<CVoid>>(addr(exfn)), (NQ + 255) / 256, 1, 1, 256, 1, 1, PF, 0, 0, 0) != 0) { return 12 }
+        put_i(PF, 0, DKF) ; put_i(PF, 8, DK) ; put_i(PF, 16, NK)
+        if (cuda_launch4i(from<loc<CVoid>>(addr(exfn)), (NK + 255) / 256, 1, 1, 256, 1, 1, PF, 0, 0, 0) != 0) { return 12 }
+
+        # rope_nrot takes separate input and output buffers: the pairs (i, i + n_rot/2) are written
+        # in place across threads otherwise (thread i writes while thread i+half reads its v0).
+        put_i(P, 0, DQ) ; put_i(P, 8, DK) ; put_i(P, 16, DQO) ; put_i(P, 24, DKO)
+        put_i(P, 32, DFR) ; put_i(P, 40, S) ; put_i(P, 48, HD) ; put_i(P, 56, H)
+        put_i(P, 64, KVH) ; put_i(P, 72, 0) ; put_i(P, 80, NROT)
+        total<Int> = NQ + NK
+        if (cuda_launch4i(from<loc<CVoid>>(addr(kfn)), (total + 255) / 256, 1, 1, 256, 1, 1, P, 0, 0, 0) != 0) { return 12 }
+        cuCtxSynchronize()
+        dump_section(DQO, NQ, "q")
+        dump_section(DKO, NK, "k")
+        println("ROPE_DRIVER_DONE S=" + S.to_string() + " H=" + H.to_string() + " KVH=" + KVH.to_string()
+                + " HD=" + HD.to_string() + " n_rot=" + NROT.to_string())
+        return 0
+    }
+    return 0
+}

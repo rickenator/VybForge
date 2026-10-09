@@ -863,3 +863,34 @@ What the earlier reconnaissance got right and is worth keeping: the joint Q+gate
 before `wo` — that remains the substantial attention-path work, and it is where the next unit starts.
 The lesson about method is the one this document keeps relearning: a harness that runs the real op
 settles in one run what reading the source gets wrong, and the wrong reading here was mine.
+
+## Unit 10 step 2 — the rope variant kernel: plumbing proven, rotation still WRONG (gate P4.7 RED, not wired)
+
+`native/kernels/rope.vyb`'s `rope_nrot` (NEOX inside the first `n_rot` dims, the rest passed through)
+runs on the GPU through `native/host/rope_driver.vyb`, and `native/tools/rope_kernel_verify.py` compares
+it against the P4.6 authority. **It does not match yet** — this is recorded as a red gate rather than
+wired into the battery, so nobody reads a green battery as covering it.
+
+What IS established:
+
+* The kernel compiles and runs, and the comparison machinery is real: the verifier runs the kernel at
+  `n_rot = 64` (must match) AND at `n_rot = HD` (must not), so a pass cannot come from a check that
+  ignores the parameter.
+* **The fixture plumbing is sound, and that is measured, not assumed.** Running the driver at
+  `n_rot = 0` — a pure pass-through — dumps values whose i64 bit patterns decode exactly to the
+  fixture's own inputs (4602070306595536896 = 0.4662207755…, the fixture's q[0]). Upload → f32→f64
+  expand → kernel → download → dump is therefore correct, and the defect is inside the rotation.
+* One real defect found by reading the kernel against ggml's `rotate_pairs` and fixed: a thread sitting
+  on the SECOND element of a pair must compute `x[i-half]*sin + x[i]*cos`; the first draft had the two
+  multiplied the other way round (a transposed rotation).
+* That fix did not clear it: the output is still ~1e18, and identical for `n_rot = 64` and
+  `n_rot = 256`, which looks like the q buffer never being written rather than a wrong angle. Two
+  leads for whoever picks this up: (1) the `n_rot = 256` run reads `FR + (i % 128)*8` = up to 5 KB out
+  of a 1 KB `DFR` allocation — that run is definitively out of bounds and probably corrupts the
+  context, and its garbage may be a false lead for the `n_rot = 64` case; (2) rule the crash out by
+  launching the rotation on a single head and reading back, i.e. narrow with a fiducial the way the
+  `n_rot = 0` run narrowed the plumbing.
+
+The kernel stays SEPARATE from `qwen3rope` until it is green: that one is on the verified dense path,
+and merging them while this one is wrong would put the dense regression in the position of testing the
+change instead of the behaviour.

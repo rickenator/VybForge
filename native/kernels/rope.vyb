@@ -1,0 +1,85 @@
+// rope_nrot — NEOX rope over the FIRST n_rot dims of each head, the rest passed through.
+//
+// VybForge#10 phase 4, unit 10 step 2. Ridge's attention layers rotate n_dims = 64 of each 256-dim
+// head with NEOX pairing inside those 64 dims (pairs (k, k+32)) and leave dims 64..255 untouched —
+// measured against ggml's own op, gate P4.6 (`rope_authority.c` + `rope_verify.py`):
+// mode=neox/neox_first_nd at 8.993e-08, with `neox_all_dims` (what the engine's `qwen3rope` does:
+// every head dim, pairs (i, i + HD/2)) rejected at 1.478.
+//
+// This is a SEPARATE kernel rather than an edit to `qwen3rope` on purpose: that one is on the verified
+// dense path (make prefill), and touching it would make the dense regression the thing being tested
+// instead of this. When this kernel is wired into the driver the two can be merged with the
+// regression as the proof; until then one kernel is unverified-new and the other unverified-changed.
+//
+// Params (device, 88 B): +0 Q, +8 K, +16 Qd, +24 Kd, +32 FR (n_rot/2 f64 inverse frequencies),
+//   +40 S (tokens), +48 HD, +56 H, +64 KVH, +72 POS, +80 NROT.
+// Thread = one output element. Launch via cuda_launch4i.
+import vmath::{vcos, vsin}
+
+rope_nrot(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    K<Int> = ld_i64(p + 8)
+    Qd<Int> = ld_i64(p + 16)
+    Kd<Int> = ld_i64(p + 24)
+    FR<Int> = ld_i64(p + 32)
+    S<Int> = ld_i64(p + 40)
+    HD<Int> = ld_i64(p + 48)
+    H<Int> = ld_i64(p + 56)
+    KVH<Int> = ld_i64(p + 64)
+    POS<Int> = ld_i64(p + 72)
+    NROT<Int> = ld_i64(p + 80)
+    half<Int> = NROT / 2
+    shd<Int> = S * H * HD
+    skd<Int> = S * KVH * HD
+    total<Int> = shd + skd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        if (gid < shd) {
+            s<Int> = gid / (H * HD)
+            rem<Int> = gid % (H * HD)
+            hh<Int> = rem / HD
+            i<Int> = rem % HD
+            src<Int> = Q + (s * H * HD + hh * HD) * 8
+            if (i < NROT) {
+                ang<Float> = ((POS + s) as Float) * ld_f64(FR + (i % half) * 8)
+                c<Float> = vcos(ang)
+                sn<Float> = vsin(ang)
+                v0<Float> = ld_f64(src + i * 8)
+                if (i < half) {
+                    v1<Float> = ld_f64(src + (i + half) * 8)
+                    st_f64(Qd + gid * 8, v0 * c - v1 * sn)
+                } else {
+                    v1<Float> = ld_f64(src + (i - half) * 8)
+                    st_f64(Qd + gid * 8, v1 * sn + v0 * c)
+                }
+            } else {
+                # outside the rotated block: copied through unchanged, as ggml does for i0 >= n_dims
+                st_f64(Qd + gid * 8, ld_f64(src + i * 8))
+            }
+        } else {
+            # a variable declared inside the branch above is scoped to it, so the K half declares
+            # its own (the first draft reused `i`/`src` and the kernel would not compile)
+            gk<Int> = gid - shd
+            sk<Int> = gk / (KVH * HD)
+            remk<Int> = gk % (KVH * HD)
+            hhk<Int> = remk / HD
+            ik<Int> = remk % HD
+            srck<Int> = K + (sk * KVH * HD + hhk * HD) * 8
+            if (ik < NROT) {
+                angk<Float> = ((POS + sk) as Float) * ld_f64(FR + (ik % half) * 8)
+                ck<Float> = vcos(angk)
+                snk<Float> = vsin(angk)
+                v0k<Float> = ld_f64(srck + ik * 8)
+                if (ik < half) {
+                    v1k<Float> = ld_f64(srck + (ik + half) * 8)
+                    st_f64(Kd + gk * 8, v0k * ck - v1k * snk)
+                } else {
+                    v1k<Float> = ld_f64(srck + (ik - half) * 8)
+                    st_f64(Kd + gk * 8, v1k * snk + v0k * ck)
+                }
+            } else {
+                st_f64(Kd + gk * 8, ld_f64(srck + ik * 8))
+            }
+        }
+    }
+}
