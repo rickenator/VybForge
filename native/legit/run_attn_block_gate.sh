@@ -55,6 +55,21 @@ if grep -q "^ATTN_VERIFY_DONE" "$log" && [ "$rc" = "0" ]; then
   exit 0
 fi
 
+# The FLASH op at n_kv == n_head, with S != n_head. The geometry matters: at S == n_head the op's
+# ggml_can_mul_mat(k, q) assert passes by accident and a diagonal-only attention slips through silently
+# (that is what hid the missing q/k/v permutes for a whole unit). S = 6 makes the axes distinguishable.
+flog="$work/verify_flash.log"
+VYBFORGE_ATTN_MODE=flash VYBFORGE_ATTN_S=6 env -u PYTHONPATH "$py" native/tools/attn_verify.py >"$flog" 2>&1
+frc=$?
+if grep -q "^ATTN_VERIFY_DONE all 10 stages" "$flog" && [ "$frc" = "0" ]; then
+  step "attention stages vs ggml (flash, S=6)" "PASS ($(grep -m1 '^ATTN_VERIFY_DONE' "$flog" | sed 's/^ATTN_VERIFY_DONE //' | cut -c1-96)...)"
+else
+  step "attention stages vs ggml (flash, S=6)" "FAIL (see $flog)"
+  grep -E '^ATTN_VERIFY' "$flog" | tail -8 | sed 's/^/      /'
+  echo; echo "ATTENTION BLOCK GATE: FAIL"
+  exit 1
+fi
+
 # The GQA fixture as well: n_kv < n_head (6:2, Ridge's 24:4 scaled down), where the hand-rolled path
 # cannot run and the flash op carries the grouping. Its front half must hold too, and its attention
 # stages are NOT claimed yet (the verdict says so itself).

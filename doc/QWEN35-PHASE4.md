@@ -1330,3 +1330,19 @@ pairing, which is the last open item:
 * `(…, g, nkv)` gives h -> `h // g` — the contiguous grouping the spec uses: measuring now.
 
 If the second form matches, the GQA attention stages come into the gate and unit 10 step 4 is done.
+
+### The GQA grouping is refuted too — both repeat orders give exactly 1.000e+00
+
+    repeat (…, nkv, g)  -> head h reads kv h % n_kv   attn 1.000e+00
+    repeat (…, g, nkv)  -> head h reads kv h // g     attn 1.000e+00
+
+Identical to three digits, so the repeat's axis order is not the difference either — the same signature
+that refuted the mask fill and the K/V axis order. Since the flash path is now VERIFIED at n_kv == n_head
+(all ten stages, 3.887e-07) and its front half is verified at n_kv < n_head, what remains is specific to
+the repeated-K tensor itself: the op's reading of a tensor whose head axis was built by a repeat, rather
+than the pairing convention. The instrumentation is already in place for that (`ATTN_CALL` prints ne/nb
+at the call) — extending it to the repeated k/v and to the op's expected n_head_kv is the next step, and
+it is a measurement rather than a hypothesis.
+
+The `q == k` accident is now locked down in the gate: the flash case runs at S = 6, not S = 3, so
+`ggml_can_mul_mat(k, q)` sees axes of different lengths and cannot pass by accident again.
