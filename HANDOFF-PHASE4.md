@@ -1,96 +1,73 @@
 # Phase 4 handoff — Gated DeltaNet reference (VybForge #10, item 1)
 
-Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --oneline -15` shows the
-unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative (units 1-9) and
-`doc/SPIKINGBRAIN.md` for the phase-1..3 background.
+Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --oneline -20` shows the
+unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative — units 1-9, then unit 10 steps
+1-4q with every measurement and every refuted hypothesis — and `doc/SPIKINGBRAIN.md` for the phase-1..3
+background.
 
-## RESTART HERE — option #1 is unit 9c, which has STARTED
+## RESTART HERE — 2026-10-09: unit 10's AUTHORITY side is complete; the next unit is step 5, the engine probe
 
-Seven units are done and green: five reference units against ggml's own ops (P4.1), the kernels on the
-GPU at model geometry (P4.2), the block wired on the GPU with two-step state carry-over (P4.3), and the
-layer check now running at the model's own geometry on the model's own weights — F32
-`attn_norm`/`ssm_conv1d`, Q8_0 `ssm_alpha`/`ssm_beta`, Q4_K `attn_qkv`/`attn_gate`/`ssm_out` — 26
-stages over two chained steps, worst maxrel 1.686e-06. Q4_K also gained the reference it never had
-(`native/tools/q4k_ref.py`, bit-identical to the `gguf` package, gate S0.10).
+Everything below is pushed; main is clean. Read `doc/QWEN35-PHASE4.md` for the narrative — units 1-9 there,
+then unit 10 (steps 1-4q), which records every measurement AND every refuted hypothesis. This section is
+the restart point.
 
-**Unit 9c step 1 is DONE (commit 3f34465, pushed, gate P4.4): the per-layer dispatch.** The rule that
-decides which branch a block takes now exists in ONE place and is verified against both real models —
-`model_caps::mc_layer_kind`, which the capability descriptor counts with. Ridge is 64 text blocks =
-16 attention (at `N % 4 == 3`) + 48 recurrent, Qwen3-4B is 36 attention + 0, and the two models'
-per-block kinds agree with the INDEPENDENT Python inventory's tensor names. What that bought:
+### Where phase 4 stands
 
-* the dispatch is data, not a hardcoded index list — `mc_layer_kind(name)` returns 2 recurrent /
-  1 attention / 0 other by SUFFIX match, because `attn_qkv`/`attn_gate` are recurrent weights
-  despite the `attn_` prefix and `attn_q_norm` contains `attn_q`. The selftest table in
-  `native/config/layerkind_probe.vyb` pins all four traps (measured: a `.contains()` rule fails 2
-  rows, a marker swap fails 1, a double-counting rule that passes the table is caught by the plan
-  counts);
-* `mc_layer_kinds(path)` gives the plan and is THREE-VALUED — `""` unreadable table, `"-"` readable
-  table with no text block (the mmproj tower), else `"N:K,..."`. Do not collapse those: the first
-  draft did, and the tower read as a broken model;
-* **block 64 is the MTP draft head and carries `attn_q.weight` too.** A kind-only count reports 17
-  attention layers for a 16-attention model, and the descriptor's 16 is the TEXT count
-  (`n_layers - mtp_layers`). The engine's loop must run blocks `< text_layers` and keep the draft
-  head out of the text attention branch.
+Phase 4 = make the engine run a hybrid Qwen3.5/Ridge model (Gated DeltaNet recurrent blocks + attention
+blocks). DONE: the recurrent block (unit 9/9c — layer check at model geometry on real weights, the loop,
+per-layer dispatch) and **the attention block's AUTHORITY** (unit 10 — the ten stages of Ridge's attention
+block verified against ggml's own ops, three ways).
 
-**Unit 9c step 2 is DONE (commit cd78628, pushed, gate P4.5): the block runs on the ENGINE's own
-weight path.** `native/host/gdn_engine_driver.vyb` stages all ten of blk.0's tensors from the live
-GGUF the way the engine does — by name, through `q4kdeq`/`q8_0deq`/`f32expand` — and multiplies with
-the engine's `gemm` (B = [in,out]), not the fixture path's `mm_nt`. 26/26 stages over two chained
-decode steps pass against unit 5's authority on real weights, worst **3.903e-06**, including the
-786432-element state at 4.1e-07. `native/tools/gdn_engine_verify.py` reuses P4.3's fixture and
-authority runner verbatim, so only the driver under test changed.
+Verified and green right now:
 
-* the engine's tensor index for Ridge is GENERATED (`native/tools/inventory_to_tsv.py`, from
-  `ridge_inventory.py`'s TSV, every tensor's byte count asserted against its type) — do not
-  hand-write offsets;
-* **the bug this caught, and the reason stage comparison alone is not enough**: `delta_step` and the
-  `ssm_out` gemm SHARE the `P2` param block, and `delta_step` writes a POINTER into `P2+48` — exactly
-  where `gemm` reads `alpha`. The projection came back as denormals (~1e-308) while every stage
-  feeding it agreed to 1e-6, so it read as "one wrong element" (maxrel 1.000e+00 is the signature of
-  "output is all zeros, argmax of |diff| is anywhere"). Re-state alpha/beta before that gemm. The
-  verifier now also compares the STAGED operand slot by slot at the addresses gemm reads;
-* the projection is now verified in three layers: the block (26 stages) vs ggml, the block's OPERAND
-  vs the model's own tensor, and the two mis-wirings as prints.
+* `./native/legit/run_attn_block_gate.sh` (P4.8) — three cases, all ten stages each: hand-rolled
+  4.597e-07, flash at S=6 3.887e-07, GQA 6-over-2 replicated 3.493e-07; six misreadings rejected per case,
+  plus the group-assignment tooth in the GQA case.
+* `./native/legit/run_rope_gate.sh` (P4.6 — the rope SPEC: mode=neox, NEOX inside n_dims=64, 8.993e-08,
+  11 alternatives rejected) and `./native/legit/run_rope_kernel_gate.sh` (P4.7 — `rope_nrot` on the GPU).
+* `run_gdn_engine_gate.sh` (P4.5), `run_layerkind_gate.sh` (P4.4), `run_caps_gate.sh` (S0.2e).
+* `make -f native/Makefile prefill` — the dense Qwen3-4B regression, last run BIT-IDENTICAL to its
+  baseline (maxrel 3.393e-04, top1 [55286, 576]) after both the `n_rot` wiring and the `VYB_INVFREQ`
+  driver change, so neither is behaviour-changing.
+* `native/out/ridge_invfreq.bin` — Ridge's rope table (base 1e7, n_dims 64 -> 32 entries), generated from
+  Ridge's own GGUF metadata by `native/tools/gen_invfreq.py`, which reproduces the engine's existing
+  Qwen3-4B table byte-for-byte.
 
-**Unit 9c step 3 is DONE FOR THE LOOP (commit 9e6619f, gate P4.5): the layer loop dispatches and the
-recurrent branch is inside it.** `native/host/model_driver.vyb` asks `mc_layer_kind` per block and runs
-the Gated DeltaNet mixer for kind 2 — staging the ten mixer weights plus the block's FFN from the GGUF
-by name, running the mixer one token at a time (the sequential rule, per-layer conv window and
-delta-net state in a cache allocated once for every text block), writing the block's residual into the
-same `X1` the attention branch writes and feeding one shared FFN (`run_layer` is now
-`run_layer_attn` + `run_ffn`). `VYB_GDN_PROBE=<layer>` restricts the loop to one block with the input
-from the fixture, so P4.5 verifies THE LOOP's own dispatch, staging, cache and chain: 26/26 stages,
-worst 3.903e-06, two chained tokens, unchanged. Three bugs fell out and are fixed: buffer sizing from
-blk.0 (recurrent in a hybrid model — no attn_q/k/v), the qwen35 FFN pre-norm name
-(`post_attention_norm`), and an activation buffer shadowing the geometry variable of the same name
-(which zeroed every size and failed the first allocation).
+### What is NOT done: the ENGINE side of attention (step 5)
 
-**What is left for a first 27B token, and what is blocking what:**
+The authority is verified; the engine does not yet run an attention block against it for a real model.
+`run_layer_attn` runs the dense path with the new rope kernel (`n_rot` taken from the model's own table),
+but:
 
-1. **The whole-model logits comparison against llama.cpp** — the finish line for unit 9c's item 5. It
-   needs the pieces below; per-layer agreement cannot see a wiring error BETWEEN layers, so this is
-   not optional.
-2. **IMROPE for the Ridge attention layers** (`rope.dimension_sections [11,11,10,0]`; the engine's
-   `qwen3rope` is pairs-only) — and note qwen35's attention also FOLDS AN OUTPUT GATE INTO `attn_q`
-   (`blk.3.attn_q.weight` is `5120x12288` = q + gate), which the engine's attention path does not
-   build. Both are attention-path work, not recurrent work, and neither is started.
-3. **The multi-token/prefill path for recurrent layers** — the loop runs the SEQUENTIAL kernel one
-   token at a time (correct for decode); llama.cpp's chunked prefill kernel is uncharacterised, so a
-   long prompt is either slow (sequential) or unverified (chunked). `--tokens 1` in the reference still
-   stands.
-4. **Session state** — the state cache is correct within ONE forward pass. Persisting a sequence across
-   passes needs the per-block slot parity (and the conv window) carried in a session object, which the
-   engine does not have yet; a chat server would need it before a second token can follow a first.
-5. **Smaller:** the P4.5 probe verifies blk.0 only (the verifier's fixture/authority side is built from
-   blk.0's weights, so a second block needs that parameterised); `eng_mtp()`/the 65th block; and the
-   two standing follow-ups (S0.10's q4kdeq-vs-reference promotion, retiring `gdn_ref.py`).
+* it does **not** implement GQA. Ridge is 24 query heads over 4 kv heads; the authority expresses GQA by
+  REPLICATING the kv groups into their own K/V rows (verified, 3.493e-07) and the engine must do the same
+  inside `run_layer_attn`.
+* there is no per-stage probe/verification of the engine's attention the way P4.5 does for the recurrent
+  block.
 
-`eng_gdn()` and `eng_mtp()` are both still 0 and both still have to flip (or the descriptor needs a
-documented "without the draft head" profile) before the caps gate can call the Ridge model SUPPORTED.
+The plan and reconnaissance are in the last section of this file ("Next unit: unit 10 step 5"): the
+attention weights are ALREADY staged per layer (the `stage_one` calls around `model_driver.vyb:1005`), the
+probe should mirror `VYB_GDN_PROBE` (fixture hidden state from `$VYB_ATTN_X`, `dump_section` stages named
+after the authority's, a `gdn_engine_verify.py`-style verifier), and the comparison bar must account for
+DEQUANTIZATION rather than reuse the exact-path 1e-4. Order: probe branch -> verifier + teeth -> GQA
+replication -> gate/battery -> whole-model Ridge run.
 
-Two smaller follow-ups are also open and recorded below: promoting the `q4kdeq`-vs-reference
-comparison into S0.10 proper, and retiring `native/tools/gdn_ref.py`.
+### Lessons that will save the most time in step 5
+
+Read "THE LESSON THAT COST THE MOST" below, plus these from unit 10 (full text in `doc/QWEN35-PHASE4.md`
+and in the skill's `gate-and-probe-discipline.md`):
+
+* A fixture whose axes have EQUAL LENGTHS cannot test their order. `S == n_head == 3` made
+  `ggml_flash_attn_ext`'s `ggml_can_mul_mat(k, q)` assert pass by accident and hid a diagonal-only
+  attention for a whole unit, manufacturing five refuted hypotheses.
+* Repeated "identical to the digit" results (1.073e+00 twice, 1.000e+00 four times) are INSTRUMENT
+  failures, not small effects. Print the tensors' `ne`/`nb` at the call before forming another hypothesis.
+* Build a probe that NAMES the answer (which key, which kv head) before the second hypothesis, not after
+  the sixth. Three probes each settled in one run what reasoning had not.
+* If an op will not express a transformation in your harness, put it in the DATA — that is how GQA closed,
+  and it is what the engine has to do anyway.
+* Read the caller: `~/Projects/llama.cpp`'s own call sites (and the op's asserts) have been right every
+  time my reconstruction of them was wrong.
 
 ## The goal, and where phase 4 sits
 
