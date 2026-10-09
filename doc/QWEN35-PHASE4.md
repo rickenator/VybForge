@@ -1278,3 +1278,30 @@ Two things fall out of it:
 So the re-test that matters is flash at S ≠ n_head WITH the q permute — running now. This is the kind of
 thing the fixture's geometry should be chosen for from the start: whenever a test is about the ORDER of
 two axes, that fixture must make those axes different lengths, or the test is blind.
+
+## Unit 10 step 4k — what the flash op actually requires (from its own asserts), and where this stops
+
+Six experiments on the flash call, with the last two driven by the op's asserts rather than by hypothesis.
+The asserts have now stated the contract:
+
+* `ggml_can_mul_mat(k, q)` requires **`k->ne[2] == q->ne[2]`**. The unpermuted harness passes this for
+  every S only by accident — q's ne2 and k's ne2 are both S — and that accident is what let a
+  diagonal-only attention through for hundreds of turns without a single assert firing.
+* Combined with what the row probe showed (flash returns V(key == query) when q is in its native
+  `(hd, n_head, n_tokens)` form), the op wants the **token axis in ne1** for q, k and v alike — the same
+  convention llama.cpp produces by permuting all three with `(0,2,1,3)` at its call site.
+* Permuting all three and running at S ≠ n_kv == n_head still does not reproduce the reference
+  (S = 3 with all three permuted: 1.368e+00, vs 1.073 unpermuted), so the contract above is necessary
+  and not yet sufficient.
+* **GQA needs more than permutes**: with n_kv = 2, n_head = 6 the permuted k has ne2 = 2 against q's 6,
+  so the assert fires. K and V must first be REPEATED from n_kv to n_head (which is the "GQA repeat"
+  this document has been carrying since step 4a) — a reshape/repeat step that the harness does not do.
+
+Where this stops, plainly: the flash path is NOT authorised and the GQA attention stages remain outside
+the gate. What the next session inherits is a precise contract (token axis in ne1 for q/k/v; k->ne2 ==
+q->ne2; the K/V repeat for GQA) plus six refuted hypotheses so it does not re-walk them. The cheapest next
+experiment is now well-defined and small: build K/V by `ggml_repeat`-ing the kv heads to n_head, permute
+all three, and test at S ≠ n_head where the asserts can actually see what is wrong.
+
+Unchanged and still verified: the default fixture (n_kv == n_head, hand-rolled path), all ten stages at
+worst 4.597e-07, six misreadings rejected.
