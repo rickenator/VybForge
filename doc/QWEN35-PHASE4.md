@@ -1151,3 +1151,28 @@ the op: at index (0, 0) two different axis conventions read the same value, and 
 llama.cpp's KV cache is `(head_dim, n_ctx, n_head_kv)` — the kv-LENGTH axis second — while this harness
 hands the op `(head_dim, n_kv_heads, n_tokens)`. That transposition is being measured now; if it is the
 cause, the fix is one permute per tensor, not a fixture redesign.
+
+### The flash mismatch: five hypotheses tested, five refuted — and the probe that would settle it
+
+Each of these was measured, not argued, and each is refuted:
+
+| hypothesis | test | result |
+|---|---|---|
+| GQA grouping convention | contiguous `h // group` vs round-robin `h % n_kv` | same error for both (0.884) |
+| mask fill inverted | fill `(qi > ki)` instead of `(ki > qi)` | worse (1.043 vs 1.073) |
+| the F16 cast llama.cpp performs | `ggml_cast` q/k/v to F16 + `set_prec(F32)` | output becomes nans — worse |
+| ggml's KV tiling | S = 64 instead of 3 (far beyond any tile) | same error (1.039 vs 1.073) |
+| K/V axis order | kv-length axis in `ne1` (llama.cpp's cache layout) | worse (1.428 vs 1.073) |
+
+What is established: the disagreement is inside the flash path, at both token counts, with magnitudes
+that match (0.6077 both sides in GQA mode); the ONLY row that agrees is (query 0, head 0) at 3.3e-04,
+and with a causal mask that row is a pure copy of V's first row — so it says nothing about the score or
+weight computation, only that the first element is read the same under every candidate convention.
+
+The probe that would settle it, instead of a sixth guess: make the fixture's TOKENS trivially
+distinguishable and READ WHICH ROW THE OP USED. Concretely — set V's projection so that token t's V is a
+constant vector equal to `t` (or a one-hot on `t`) and set the scores flat (k = 0), then the flash output
+for (query q, head h, dim d) is the mean of the V values of the keys q attends to, i.e. a number that
+NAMES the keys it used. Twenty lines in the verifier's fixture, no harness change, and it converts "some
+row is read wrong" into "it used rows 2 and 3 where I expected 0 and 1" — which is a fact about the
+layout rather than a hypothesis about it.
