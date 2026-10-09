@@ -1176,3 +1176,25 @@ for (query q, head h, dim d) is the mean of the V values of the keys q attends t
 NAMES the keys it used. Twenty lines in the verifier's fixture, no harness change, and it converts "some
 row is read wrong" into "it used rows 2 and 3 where I expected 0 and 1" — which is a fact about the
 layout rather than a hypothesis about it.
+
+## Unit 10 step 4f — the row probe: the flash op attends ONLY to the diagonal, and the explicit path is right
+
+`native/tools/attn_flash_row_probe.py` builds a fixture whose answer is legible — q = k = 0 so every
+score is 0 and the softmax is UNIFORM over whichever keys the op allows, and V set so token t carries the
+constant t+1 — then attention(query q) = mean of (t+1) over the keys it used, i.e. a number that NAMES
+the key set. Under a causal mask that is (q+2)/2.
+
+    mode=explicit  q=0..5 -> 1.0, 1.5, 2.0, 2.5, 3.0, 3.5   all MATCH (mean over keys 0..q)
+    mode=flash     q=0..5 -> 1.0, 2.0, 3.0, 4.0, 5.0, 6.0   DIFFERENT KEY SET
+
+The flash values are q+1 exactly — V of key q, taking the whole weight — so the flash path attends ONLY
+TO THE KEY AT THE SAME POSITION, whatever mask is in play. The explicit path, given the same inputs in
+the same harness, produces the correct cumulative means. Two consequences worth stating plainly:
+
+* The flash op is not being handed what it expects from this harness, and the effect is a DIAGONAL-ONLY
+  attention — a mask read as "only the diagonal is allowed", not a wrong head, wrong grouping or wrong
+  scale (all separately refuted). Two variants are being measured now (mask = NULL, and the fill
+  inverted) to establish whether my mask is read at all and in which sense.
+* This probe is the tool that should have been written before the five hypotheses: it converted a 1.0
+  disagreement into a one-line statement of what the op did. Its 20 lines are worth more than the
+  guessing they replace.
