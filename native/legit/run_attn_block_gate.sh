@@ -70,16 +70,18 @@ else
   exit 1
 fi
 
-# The GQA fixture as well: n_kv < n_head (6:2, Ridge's 24:4 scaled down), where the hand-rolled path
-# cannot run and the flash op carries the grouping. Its front half must hold too, and its attention
-# stages are NOT claimed yet (the verdict says so itself).
+# The GQA fixture: 6 query heads over 2 kv groups of 3, REPLICATED into their own K/V rows so the
+# verified n_kv == n_head path computes the GQA attention. (Six measurements refuted every attempt to
+# make ggml's flash op express the grouping here — all of them produced the same wrong pairing — so the
+# grouping is expressed in the fixture instead, exactly as the engine must express it.) All ten stages
+# are required for it, because it runs through the paths that are already verified.
 glog="$work/verify_gqa.log"
 VYBFORGE_ATTN_GEOM=gqa env -u PYTHONPATH "$py" native/tools/attn_verify.py >"$glog" 2>&1
 grc=$?
-if grep -q "^ATTN_VERIFY_DONE GQA" "$glog" && [ "$grc" = "0" ]; then
-  step "attention stages vs ggml (GQA 3:1)" "PASS ($(grep -m1 '^ATTN_VERIFY_DONE GQA' "$glog" | sed 's/^ATTN_VERIFY_DONE GQA [^:]*: //'))"
+if grep -q "^ATTN_VERIFY_DONE all 10 stages" "$glog" && [ "$grc" = "0" ]; then
+  step "attention stages vs ggml (GQA 2x3)" "PASS ($(grep -m1 '^ATTN_VERIFY_DONE' "$glog" | sed 's/^ATTN_VERIFY_DONE //' | cut -c1-84)...)"
 else
-  step "attention stages vs ggml (GQA 3:1)" "FAIL (see $glog)"
+  step "attention stages vs ggml (GQA 2x3)" "FAIL (see $glog)"
   grep -E '^ATTN_VERIFY' "$glog" | tail -8 | sed 's/^/      /'
   echo; echo "ATTENTION BLOCK GATE: FAIL"
   exit 1

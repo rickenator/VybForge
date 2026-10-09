@@ -1414,3 +1414,24 @@ verified, rather than the engine inheriting a dependency on the flash op's GQA b
 STATUS of the flash/GQA line, plainly: the flash path is VERIFIED and gated at `n_kv == n_head`. The GQA
 fixture's front half is verified; its attention stages are NOT authorised, and six refutations say the way
 to authorise them is the fixture-side replication above, not another permutation of this call.
+
+## Unit 10 step 4q — GQA AUTHORISED: replicate the groups, then use the verified path
+
+    VYBFORGE_ATTN_GEOM=gqa (6 query heads, 2 groups of 3, replicated into their own K/V rows)
+    ATTN_VERIFY_DONE all 10 stages of the attention block reproduce ggml's ops within 0.0001
+                     (worst 3.493e-07), and all 6 alternative readings of them are rejected
+
+That is the GQA gap closed, and the way it closed is the lesson: **six** attempts to make
+`ggml_flash_attn_ext` express the grouping here measured the same wrong pairing (all heads -> kv head 0),
+and the answer was to stop asking it to. GQA is a REPLICATION of the kv heads, so the fixture replicates
+them — each query head gets its group's K/V rows, host-side, with the ordering under my control — and then
+the path that was ALREADY verified (`n_kv == n_head`) computes the GQA attention and its own six
+alternatives are rejected. The group assignment has its own tooth too (shifting every head's group by one
+must miss), so a pass here certifies the grouping rather than a convention.
+
+This is also the design the engine needs: Ridge is 24 query heads over 4 kv heads, so `run_layer_attn`
+must replicate K/V to the query-head count itself. Engine and authority now share one verified mechanism.
+
+The gate runs this case and requires all ten stages, because it goes through paths that are already
+verified — no tolerance exception, no partial coverage. The flash path (verified at n_kv == n_head, S=6)
+is gated separately; what the flash op does at n_kv < n_head is no longer load-bearing for anything.

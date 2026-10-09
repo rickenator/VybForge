@@ -46,16 +46,22 @@ BASE = 1e7                                  # ridge_theta
 #   gqa            : n_kv < n_head (6:2 = 3:1, Ridge's 24:4 scaled down) — flash op, GQA grouping; only
 #                    the front half is verified so far and the attention stages are reported
 GEOM = os.environ.get("VYBFORGE_ATTN_GEOM", "heads")
+# "gqa" expresses the GQA grouping the way the ENGINE will have to: the kv heads are REPLICATED into
+# their own K/V rows (each query head gets its group's copy) and the already-verified n_kv == n_head path
+# runs over that. Six refutations say this is the way to authorise GQA here — every attempt to make
+# ggml's flash op express the grouping measured the same wrong pairing (all heads -> kv head 0).
+GROUPED = GEOM == "gqa"
+GROUPS = 3            # query heads per kv group in the replicated fixture (6 heads / 2 groups)
 _S = int(os.environ.get("VYBFORGE_ATTN_S", "3"))
-NH, HD, NKV, S, D = ((6, 256, 2, _S, 64) if GEOM == "gqa" else (3, 256, 3, _S, 64))
-MODE = os.environ.get("VYBFORGE_ATTN_MODE", "flash" if GEOM == "gqa" else "explicit")
-GQA = NKV != NH
-GROUP = NH // NKV if GQA else 1
+NH, HD, NKV, S, D = ((6, 256, 6, _S, 64) if GROUPED else (3, 256, 3, _S, 64))
+MODE = os.environ.get("VYBFORGE_ATTN_MODE", "explicit")
+GQA = NKV != NH          # what the op does; false here by construction
+GROUP = (NH // (NKV // 1)) if GQA else (GROUPS if GROUPED else 1)
 KQS = 1.0 / (HD ** 0.5)                       # 1/sqrt(head_dim), unless GGUF overrides the scale
 # What the gate requires vs what the harness also computes. The front half is measured and required;
 # attention/gate/wo are computed and REPORTED only, because they do not agree yet (see the note the
 # verifier prints) — a mismatch that is printed but not gated is a known-open item, not a pass.
-FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope") if GQA else \
+FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope") if False else \
         ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope", "attn", "gated", "out")
 # The harness's dump ORDER, which is what the sequential parse below walks. It must list EVERY dumped
 # tensor: leaving `scores`/`probs` out of this list shifted every later slot by two, so `attn` was read
@@ -169,6 +175,10 @@ def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, 
     # requires to differ.
     if GQA:
         idx = np.array([(h % NKV) if round_robin else (h // GROUP) for h in range(NH)])
+    elif GROUPED:
+        # the grouping is IN the fixture: each head has its own K/V rows, replicated per group. The
+        # `round_robin` variant shifts each head's group by one, which the fixture must reject.
+        idx = np.array([((h + GROUPS) % NH) if round_robin else h for h in range(NH)])
     else:
         idx = np.arange(NH)
     k_g = k_rope[:, idx, :]
@@ -208,6 +218,12 @@ def main():
     Wqg = rng.normal(0, 0.02, size=(NH * 2 * HD, D)).astype(np.float32)
     Wk = rng.normal(0, 0.02, size=(NKV * HD, D)).astype(np.float32)
     Wv = rng.normal(0, 0.02, size=(NKV * HD, D)).astype(np.float32)
+    if GROUPED:
+        # replicate each kv group's rows into every query head of that group (host-side, ordering under
+        # my control): heads 0..2 share group 0's K/V, heads 3..5 share group 1's.
+        ngrp = NH // GROUPS
+        Wk = np.concatenate([np.repeat(Wk[j * HD:(j + 1) * HD], GROUPS, axis=0) for j in range(ngrp)])
+        Wv = np.concatenate([np.repeat(Wv[j * HD:(j + 1) * HD], GROUPS, axis=0) for j in range(ngrp)])
     # ggml's ne0 is the INPUT width, so a numpy array (r, c) is the ggml tensor ne=(c, r): W_o's
     # ggml ne is (n_head*head_dim, D) and therefore reads here as (D, n_head*head_dim)
     Wo = rng.normal(0, 0.02, size=(D, NH * HD)).astype(np.float32)
@@ -286,10 +302,10 @@ def main():
             ("non-causal attention", dict(non_causal=True), "attn"),
             ("raw gate (no sigmoid)", dict(raw_gate=True), "gated"),
             ("no kq_scale", dict(no_scale=True), "attn"))
-    if GQA:
-        # Only meaningful when there IS a grouping to get wrong: at n_kv == n_head the mapping is the
-        # identity either way and a "not distinguished" here would be correct, useless noise.
-        alts = alts + (("round-robin GQA grouping", dict(round_robin=True), "attn"),)
+    if GQA or GROUPED:
+        # Only meaningful when there IS a grouping to get wrong. In the replicated fixture the tooth
+        # shifts every head's group by one (h + GROUPS), which the fixture's data must reject.
+        alts = alts + (("wrong GQA group assignment", dict(round_robin=True), "attn"),)
     for nm, kw, key in alts:
         a = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, **kw)
         r = rv.rel(a[key], ref[key])
