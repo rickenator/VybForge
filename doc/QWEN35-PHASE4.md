@@ -1346,3 +1346,26 @@ it is a measurement rather than a hypothesis.
 
 The `q == k` accident is now locked down in the gate: the flash case runs at S = 6, not S = 3, so
 `ggml_can_mul_mat(k, q)` sees axes of different lengths and cannot pass by accident again.
+
+## Unit 10 step 4n — Ridge's inverse-frequency table, and the one the engine already runs
+
+`native/tools/gen_invfreq.py` generates a model's rope table (`inv[k] = base^(-2k/n_dims)`, one f64 per
+pair) and validates itself in the strongest available way: run on Qwen3-4B's numbers it reproduces
+`native/out/layer0_invfreq.bin` **byte-for-byte** (512 bytes, 64 entries). Nothing in the repo generated
+that file, so its content had to be identified by measurement first — it is `1/5e6^(2k/128)`, i.e. rope
+base 5,000,000 over 128 dims, maxrel 0.0 — and only then could a generator be written that is proven
+against the artifact the engine actually runs rather than against my reading of a formula.
+
+Ridge's table, from Ridge's own GGUF rather than from prose:
+
+    qwen35.rope.freq_base         = 1e7
+    qwen35.rope.dimension_count   = 64          -> 32 pairs
+    qwen35.attention.key_length   = 256
+    qwen35.context_length         = 262144
+
+    native/out/ridge_invfreq.bin  32 entries, first 1.0, last 1.6548e-07, base round-trips to 1e7
+
+The driver now reads its table from `VYB_INVFREQ` (default unchanged: `native/out/layer0_invfreq.bin`),
+so the same code path serves either model. A table that disagrees with the model's metadata is a SILENT
+rope corruption — the model still runs, with a subtly wrong rotation — which is why the generator takes
+the base with no default and refuses a table that does not round-trip to it.

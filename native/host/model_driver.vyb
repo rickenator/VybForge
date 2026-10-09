@@ -794,7 +794,11 @@ main()<Int> -> {
         println("EMBED_PROBE_DONE")
         }
 
-        fb<String> = read_bin("native/out/layer0_invfreq.bin")
+        # WHICH model's rope table: measured per model from its own GGUF (rope.freq_base and
+        # rope.dimension_count), and named by env so the same driver path can serve either. Ridge's is
+        # 1e7 over 64 dims (32 pairs); Qwen3-4B's is 5e6 over 128 (64 pairs) — see native/tools/gen_invfreq.py.
+        fip<String> = env_get("VYB_INVFREQ") else "native/out/layer0_invfreq.bin"
+        fb<String> = read_bin(fip)
         if (fb.len() < 8) { println("INVFREQ_MISSING"); return 35 }
         # the table holds one inverse frequency per PAIR, so n_dims = 2 * entries: 64 entries is
         # Qwen3-4B's whole 128-dim head (rotate everything, as qwen3rope did), 32 is Ridge's
