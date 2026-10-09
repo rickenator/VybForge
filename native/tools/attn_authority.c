@@ -41,8 +41,8 @@ static void * xmalloc(size_t n) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 15) {
-        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2\n", argv[0]);
+    if (argc < 15 || argc > 16) {
+        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2 [threads]\n", argv[0]);
         return 2;
     }
     const int64_t nh   = atoll(argv[3]);
@@ -159,6 +159,16 @@ int main(int argc, char ** argv) {
     struct ggml_tensor * qc  = ggml_cont(ctx, q);
     struct ggml_tensor * gtc = ggml_cont(ctx, gt);
 
+    // Mark every read-back tensor as a graph OUTPUT *before* the graph is allocated. Called after the
+    // compute (or after ggml_new_graph) it is too late: the allocator has already handed a stage's buffer
+    // to someone else, and the dump then reports that other tensor's values — which is exactly how
+    // `attn` came to hold the scores (and why a change elsewhere in the graph moved it: the aliasing did).
+    ggml_set_input(mask);
+    ggml_set_output(qg);  ggml_set_output(qc);  ggml_set_output(gtc);
+    ggml_set_output(qn);  ggml_set_output(qr);  ggml_set_output(kn);  ggml_set_output(kr);
+    ggml_set_output(kqs_t); ggml_set_output(pr);
+    ggml_set_output(at);  ggml_set_output(gtd); ggml_set_output(wo_out);
+
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, qg);
     ggml_build_forward_expand(gf, q);
@@ -175,8 +185,17 @@ int main(int argc, char ** argv) {
     ggml_build_forward_expand(gf, qr);
     ggml_build_forward_expand(gf, kn);
     ggml_build_forward_expand(gf, kr);
-    ggml_graph_compute_with_ctx(ctx, gf, 4);
+    // An authority must be deterministic. Default to ONE thread (a threaded graph compute is the prime
+    // suspect for a verdict that flipped between runs), and let the caller ask for more to test that.
+    const int n_threads = (argc == 16) ? atoi(argv[15]) : 1;
+    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
+    // Every tensor this harness READS BACK is marked as an output before the graph is built (and the
+    // mask as an input), so the allocator keeps those buffers alive to the end. NOTE: this was added
+    // while chasing what looked like buffer aliasing, and it was NOT the cause of that mismatch — the
+    // cause was a parse-order bug in attn_verify.py (see the DUMPED comment there). Kept because it is
+    // the correct way to read a stage back, and because a harness that dumps what it reads should say so.
+    ggml_set_input(mask);
     const struct { const char * nm; struct ggml_tensor * t; } stages[] = {
         { "qg", qg }, { "q_pre", qc }, { "gate_pre", gtc }, { "q_norm", qn },
         { "q_rope", qr }, { "k_norm", kn }, { "k_rope", kr },
@@ -195,8 +214,8 @@ int main(int argc, char ** argv) {
         }
     }
     fclose(out);
-    printf("ATTN_OK n_head=%lld head_dim=%lld n_kv=%lld S=%lld D=%lld n_dims=%d eps=%g\n",
-           (long long) nh, (long long) hd, (long long) nkv, (long long) S, (long long) D, nd, (double) eps);
+    printf("ATTN_OK n_head=%lld head_dim=%lld n_kv=%lld S=%lld D=%lld n_dims=%d eps=%g threads=%d\n",
+           (long long) nh, (long long) hd, (long long) nkv, (long long) S, (long long) D, nd, (double) eps, n_threads);
     ggml_free(ctx);
     free(fbuf);
     return 0;

@@ -1020,3 +1020,31 @@ times, so the harness is deterministic for those.
 
 The gate therefore stays on the seven front-half stages (worst 4.597e-07, three misreadings rejected), and
 `attn`/`gated`/`out` are printed every run as NOT authorised with that note.
+
+## Unit 10 step 3e — the attention block is authorised end to end, and the "flakiness" was MY parse bug
+
+`attn` 2.675e-07, `gated` 2.859e-07, `out` 2.634e-07, on top of the five earlier stages — all ten stages
+of Ridge's attention block now reproduce ggml's own ops, and the gate requires all ten. The alternative
+readings are rejected: gate-first split 1.294, one norm over the whole projection 1.500, rope over the
+whole head 1.066, non-causal attention 9.521e-01, raw gate (no sigmoid) 1.166e+00.
+
+The correction that matters: the "verdict that flipped between runs" was not nondeterminism and not
+buffer aliasing. `attn_authority.c` writes its stage dumps in a fixed order — including the two
+diagnostic tensors `scores` and `probs` — and `attn_verify.py` parsed them with a list that did not
+mention those two. Every later slot was therefore read two positions early: `attn` was compared against
+the scores, `gated` against the probs (its max value 0.239 is a probability, which is the tell), `out`
+against `attn`. That is why it appeared exactly when the two diagnostic dumps were added, and why it
+looked like it came and went with unrelated edits.
+
+Two lessons, both already in the skill reference:
+
+* A dump container is positional, so the reader's list must name EVERY dumped tensor in order. Leaving
+  two out silently shifts everything after them — a wrong-tensor comparison that looks exactly like a
+  numerical disagreement (and is worse: it made me screen the engine when the fault was the reader).
+* The harness was deterministic the whole time: two runs byte-identical, at one thread and at four. That
+  was worth measuring — it moved the suspicion off the harness in one run. Add the determinism check
+  before doubting a verdict.
+
+Fixed in the verifier: the einsum token axes, the masked-vs-unmasked scores, the view-dump of `attn`, and
+the parse order. Fixed in the harness: every read-back tensor is now marked `ggml_set_output` before the
+graph is built (correct practice; it was NOT the cause of anything that went wrong here).

@@ -44,14 +44,19 @@ KQS = 1.0 / (HD ** 0.5)                       # 1/sqrt(head_dim), unless GGUF ov
 # What the gate requires vs what the harness also computes. The front half is measured and required;
 # attention/gate/wo are computed and REPORTED only, because they do not agree yet (see the note the
 # verifier prints) — a mismatch that is printed but not gated is a known-open item, not a pass.
-FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope")
+FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope", "attn", "gated", "out")
+# The harness's dump ORDER, which is what the sequential parse below walks. It must list EVERY dumped
+# tensor: leaving `scores`/`probs` out of this list shifted every later slot by two, so `attn` was read
+# from the scores slot, `gated` from probs and `out` from attn — which read exactly like a numerical
+# disagreement (and appeared the moment those two dumps were added, i.e. like flakiness).
+DUMPED = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope",
+          "scores", "probs", "attn", "gated", "out")
 # The harness's score/prob tensors are ne = (S_kv, S_q, n_head), i.e. ne0-fastest order (kv, q, head);
 # the spec computes (q, head, kv), so these two stages are stored transposed to match the dump.
 SCORE_STAGES = ("scores", "probs")
 # The two DIAGNOSTIC tensors, not block outputs: their comparison order is not settled, but `attn` is
-# computed FROM probs and matches ggml at 2.7e-7, so the two sides agree in content and only the flat
-# ordering of these two dumps is in question.
-LATER = ("scores", "probs", "attn", "gated", "out")
+# computed FROM probs on both sides and matches ggml at 2.7e-7, so the two sides agree in content.
+LATER = ("scores", "probs")
 STAGES = FRONT + LATER
 
 
@@ -66,12 +71,15 @@ def build_authority():
     return True
 
 
+THREADS = int(os.environ.get("VYBFORGE_ATTN_THREADS", "1"))
+
+
 def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid):
     with open(IN, "wb") as fh:
         for a in (Wqg, Wk, Wv, Wo, nmq, nmk, hid):
             fh.write(np.ascontiguousarray(a, dtype="<f4").tobytes())
     r = subprocess.run([BIN, IN, OUT, str(NH), str(HD), str(NKV), str(S), str(D), str(ND), "%.9g" % EPS,
-                        "%.9g" % KQS, *[str(x) for x in SECTIONS]], capture_output=True, text=True)
+                        "%.9g" % KQS, *[str(x) for x in SECTIONS], str(THREADS)], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(("attn authority", r.stdout + r.stderr)[:300])
     shapes = {}
@@ -81,7 +89,7 @@ def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid):
             shapes[line.split()[1]] = int(p["n"])
     data = np.fromfile(OUT, dtype="<f4")
     out, off = {}, 0
-    for nm in STAGES:
+    for nm in DUMPED:
         n = shapes[nm]
         out[nm] = data[off:off + n].astype(np.float64)
         off += n
@@ -168,7 +176,8 @@ def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, 
 
 
 def main():
-    print(f"ATTN_VERIFY geometry n_head={NH} head_dim={HD} n_kv={NKV} S={S} D={D} n_dims={ND} eps={EPS:g}")
+    print(f"ATTN_VERIFY geometry n_head={NH} head_dim={HD} n_kv={NKV} S={S} D={D} n_dims={ND} eps={EPS:g} "
+          f"threads={THREADS}")
     if not os.path.exists(os.path.join(LLAMA, "ggml/include/ggml.h")):
         print(f"ATTN_VERIFY_SKIP no llama.cpp checkout at {LLAMA}")
         return 0
@@ -187,6 +196,15 @@ def main():
     hid = rng.normal(0, 1.0, size=(S, D)).astype(np.float32)
 
     ref = run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid)
+    first = open(OUT, "rb").read()
+    run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid)
+    again = open(OUT, "rb").read()
+    if first != again:
+        nd = sum(1 for a, b in zip(first, again) if a != b)
+        print(f"ATTN_VERIFY_FAIL the harness is NON-DETERMINISTIC at threads={THREADS}: two runs of the "
+              f"same graph differ in {nd} of {len(first)} bytes — no verdict from it can gate anything")
+        return 1
+    print(f"ATTN_VERIFY determinism: two runs byte-identical at threads={THREADS} ({len(first)} bytes)")
     print("ATTN_VERIFY stage comparison against ggml's own ops (ggml is f32, the engine f64):")
     mine = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid)
     worst, bad = 0.0, []
@@ -195,6 +213,11 @@ def main():
         worst = max(worst, r)
         print(f"ATTN_VERIFY stage {nm:9s} maxrel={r:.3e} {'ok' if r <= MAXREL else 'MISMATCH'}")
         if r > MAXREL:
+            a = np.asarray(mine[nm], dtype=np.float64)
+            b = np.asarray(ref[nm], dtype=np.float64)
+            i = int(np.argmax(np.abs(a - b)))
+            print(f"ATTN_VERIFY   worst #{i}/{a.size}: harness={b[i]:.6g} spec={a[i]:.6g} "
+                  f"|a|max={np.max(np.abs(a)):.4g} |b|max={np.max(np.abs(b)):.4g}")
             bad.append(nm)
     if bad:
         print(f"ATTN_VERIFY_FAIL the spec does not reproduce ggml for: {', '.join(bad)} "
@@ -205,12 +228,11 @@ def main():
     # explicit mask tensor + soft_max_ext, both at 1.409e+00 to three decimals), so the mask is not the
     # cause and the attention stage's difference lies elsewhere. Until it is found, this stays visible
     # and unauthorised rather than inside the gate.
-    # FLAKINESS, measured: the SAME mine/ref comparison of attn/gated/out produced 2.675e-07/2.859e-07/
-    # 2.634e-07 in one run and 9.107e-01/1.533e+00/1.521e+00 in the next, with no change to the verifier's
-    # data. A verdict that flips between runs cannot gate anything, so these stay outside it until the
-    # cause is found — prime suspect the harness's 4-thread ggml_graph_compute, or a race in the
-    # view/permute paths. Until then the block's arithmetic is NOT established end to end.
-    print("ATTN_VERIFY_NOT_GATED attention/gate/wo (computed, NOT authorised — flaky between runs):")
+    # Diagnostic tensors, not block outputs. Their flat comparison order is not settled (soft_max_ext's
+    # output arrangement, or my transpose of it), but `attn` is computed FROM probs on both sides and is
+    # gated at 2.7e-7, so the two sides agree in content — only the comparison's ordering is in question.
+    # NOT the cause of the earlier "flakiness": that was the parse-offset bug fixed in DUMPED above.
+    print("ATTN_VERIFY_NOT_GATED diagnostic tensors (order unsettled, content corroborated by attn):")
     for nm in LATER:
         a, b = np.asarray(mine[nm], dtype=np.float64), np.asarray(ref[nm], dtype=np.float64)
         r = rv.rel(a, b)
@@ -243,7 +265,7 @@ def main():
 
     print(f"ATTN_VERIFY_DONE {len(FRONT)} front-half stages reproduce ggml's ops within {MAXREL:g} "
           f"(worst {worst:.3e}), and all {len(alts)} alternative readings of them are rejected; "
-          f"{len(LATER)} attention stages are reported, NOT authorised (see the flakiness note)")
+          f"the {len(LATER)} diagnostic tensors ({', '.join(LATER)}) are reported with their order unsettled")
     return 0
 
 
