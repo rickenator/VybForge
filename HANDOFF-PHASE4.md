@@ -2,72 +2,74 @@
 
 Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --oneline -20` shows the
 unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative — units 1-9, then unit 10 steps
-1-4q with every measurement and every refuted hypothesis — and `doc/SPIKINGBRAIN.md` for the phase-1..3
-background.
+1-5 with every measurement and every refuted hypothesis — and `doc/SPIKINGBRAIN.md` for the phase-1..3
+background. (The working tree now carries unit 10 step 5 UNCOMMITTED: see RESTART HERE below.)
 
-## RESTART HERE — 2026-10-09: unit 10's AUTHORITY side is complete; the next unit is step 5, the engine probe
+## RESTART HERE — 2026-10-09 (later): unit 10 step 5 is DONE; the next blocker is the FFN's IQ3_S
 
-Everything below is pushed; main is clean. Read `doc/QWEN35-PHASE4.md` for the narrative — units 1-9 there,
-then unit 10 (steps 1-4q), which records every measurement AND every refuted hypothesis. This section is
-the restart point.
+The attention block now runs in the ENGINE, not just in the authority. Everything below is
+uncommitted on top of `5f991e0`; read `doc/QWEN35-PHASE4.md`, section "Unit 10 step 5", for the full
+narrative (measurements, the two lessons, and what is deliberately not covered).
 
-### Where phase 4 stands
+### What landed (uncommitted, working tree)
 
-Phase 4 = make the engine run a hybrid Qwen3.5/Ridge model (Gated DeltaNet recurrent blocks + attention
-blocks). DONE: the recurrent block (unit 9/9c — layer check at model geometry on real weights, the loop,
-per-layer dispatch) and **the attention block's AUTHORITY** (unit 10 — the ten stages of Ridge's attention
-block verified against ggml's own ops, three ways).
+* `native/kernels/attn35.vyb` (NEW, added to the Makefile `KERNELS`): `qg_split` (the joint q+gate
+  de-interleave) and `gate_mul` (`attn * sigmoid(gate)`).
+* `native/host/model_driver.vyb`: Q5_K (13) in `packed_bytes` + `stage_one`; the `JQG` dispatch flag
+  (from the TENSOR TABLE: `attn_q` numel == `2*NQ*D`); the `VYB_ATTN_PROBE=<layer>` selector (S comes
+  from the fixture's own length); the Ridge attention branch (attn_norm -> joint qg -> split ->
+  per-head norms -> `rope_nrot` -> causal GQA attention -> gate -> `wo` -> residual) with the ten
+  stage dumps and the operand probes.
+* `native/tools/attn_engine_verify.py` (NEW) + `native/legit/run_attn_engine_gate.sh` (NEW, step
+  **P4.9** of `run_phase2_battery.sh`).
+* `native/tools/attn_authority.c`: ggml pool 512 MB -> 3 GB (a full-size real-weight fixture for the
+  same harness; P4.8's numbers are unchanged).
 
-Verified and green right now:
+### Verified this session
 
-* `./native/legit/run_attn_block_gate.sh` (P4.8) — three cases, all ten stages each: hand-rolled
-  4.597e-07, flash at S=6 3.887e-07, GQA 6-over-2 replicated 3.493e-07; six misreadings rejected per case,
-  plus the group-assignment tooth in the GQA case.
-* `./native/legit/run_rope_gate.sh` (P4.6 — the rope SPEC: mode=neox, NEOX inside n_dims=64, 8.993e-08,
-  11 alternatives rejected) and `./native/legit/run_rope_kernel_gate.sh` (P4.7 — `rope_nrot` on the GPU).
-* `run_gdn_engine_gate.sh` (P4.5), `run_layerkind_gate.sh` (P4.4), `run_caps_gate.sh` (S0.2e).
-* `make -f native/Makefile prefill` — the dense Qwen3-4B regression, last run BIT-IDENTICAL to its
-  baseline (maxrel 3.393e-04, top1 [55286, 576]) after both the `n_rot` wiring and the `VYB_INVFREQ`
-  driver change, so neither is behaviour-changing.
-* `native/out/ridge_invfreq.bin` — Ridge's rope table (base 1e7, n_dims 64 -> 32 entries), generated from
-  Ridge's own GGUF metadata by `native/tools/gen_invfreq.py`, which reproduces the engine's existing
-  Qwen3-4B table byte-for-byte.
+* P4.9 (`./native/legit/run_attn_engine_gate.sh`, or `make -f native/Makefile attn-engine`):
+  blk.3 and blk.7, ten stages each, worst 1.668e-06 / 1.061e-06 on the model's own weights
+  (attn_q/k/v Q5_K, attn_output Q6_K), with teeth — the staged operands at gemm's addresses, the
+  contiguous grouping vs round-robin (2.7e-08 vs 1.6e+00), and the gate vs raw/no gate (6.3e+00 /
+  1.1e+00). Proven able to FAIL: dropping the gate in `gate_mul` turns exactly `gated`/`out` red.
+* `make -f native/Makefile prefill`: BIT-IDENTICAL to the recorded baseline (maxrel 3.393e-04,
+  top1 [55286, 576]) — the engine change is inert on the dense path.
+* P4.8 (`run_attn_block_gate.sh`): PASS, unchanged (worst 4.597e-07).
+* The full phase-2 battery was NOT re-run this session (only P4.8, P4.9 and prefill by hand).
 
-### What is NOT done: the ENGINE side of attention (step 5)
+### THE NEXT BLOCKER: Ridge's FFN is IQ3_S, and the engine cannot stage it
 
-The authority is verified; the engine does not yet run an attention block against it for a real model.
-`run_layer_attn` runs the dense path with the new rope kernel (`n_rot` taken from the model's own table),
-but:
+`stage_one` handles Q4_K (12), Q5_K (13), Q6_K (14) and falls through to the 1-D norm loader for
+everything else — which silently mis-stages a quantized weight. Ridge's FFN is IQ3_S (type 21,
+`blk.N.ffn_gate/up/down.weight`, ~38 MB each), so:
+* the attention probe STOPS before `run_ffn` (documented in the driver and the gate), and
+* a whole Ridge attention LAYER cannot run through the loop yet.
 
-* it does **not** implement GQA. Ridge is 24 query heads over 4 kv heads; the authority expresses GQA by
-  REPLICATING the kv groups into their own K/V rows (verified, 3.493e-07) and the engine must do the same
-  inside `run_layer_attn`.
-* there is no per-stage probe/verification of the engine's attention the way P4.5 does for the recurrent
-  block.
+Order for that unit: the IQ3_S dequant kernel already exists and is gated (`native/kernels/iq3s.vyb`,
+`run_iq3_s_gate.sh`, byte-exact) — so this is the *staging* side: `packed_bytes` for type 21,
+`stage_one` (or a `q3fn` in its signature), load `iq3s.ptx` in the driver, add a `--module-path`-safe
+kernel-list entry, and then the FFN can run and the probe can be extended past `out` to the block
+output. Check its IQ3_S block size against `native/gguf/ridge_inventory.py` and its grid-prefix
+requirement (`iq2s`/`iq3s` carry an 8192-byte table prefix in the buffer — Vyb#476's workaround).
 
-The plan and reconnaissance are in the last section of this file ("Next unit: unit 10 step 5"): the
-attention weights are ALREADY staged per layer (the `stage_one` calls around `model_driver.vyb:1005`), the
-probe should mirror `VYB_GDN_PROBE` (fixture hidden state from `$VYB_ATTN_X`, `dump_section` stages named
-after the authority's, a `gdn_engine_verify.py`-style verifier), and the comparison bar must account for
-DEQUANTIZATION rather than reuse the exact-path 1e-4. Order: probe branch -> verifier + teeth -> GQA
-replication -> gate/battery -> whole-model Ridge run.
+### After that
 
-### Lessons that will save the most time in step 5
+* `eng_mtp()` (the 65th block + the `d2t` tensor) — item 2, and without it the descriptor cannot flip.
+* The multi-token / prefill path for the recurrent block (the op's chunked kernel, still
+  uncharacterised).
+* Then the whole-model Ridge run (logits against llama.cpp on the same GGUF) and the `eng_gdn()` flip
+  — still 0 on purpose; see `doc/QWEN35-PHASE4.md` and the caps gate.
 
-Read "THE LESSON THAT COST THE MOST" below, plus these from unit 10 (full text in `doc/QWEN35-PHASE4.md`
-and in the skill's `gate-and-probe-discipline.md`):
+### Lessons worth reading first (full text in doc/QWEN35-PHASE4.md and the skills)
 
-* A fixture whose axes have EQUAL LENGTHS cannot test their order. `S == n_head == 3` made
-  `ggml_flash_attn_ext`'s `ggml_can_mul_mat(k, q)` assert pass by accident and hid a diagonal-only
-  attention for a whole unit, manufacturing five refuted hypotheses.
-* Repeated "identical to the digit" results (1.073e+00 twice, 1.000e+00 four times) are INSTRUMENT
-  failures, not small effects. Print the tensors' `ne`/`nb` at the call before forming another hypothesis.
-* Build a probe that NAMES the answer (which key, which kv head) before the second hypothesis, not after
-  the sixth. Three probes each settled in one run what reasoning had not.
-* If an op will not express a transformation in your harness, put it in the DATA — that is how GQA closed,
-  and it is what the engine has to do anyway.
-* Read the caller: `~/Projects/llama.cpp`'s own call sites (and the op's asserts) have been right every
-  time my reconstruction of them was wrong.
+* GQA needed NO replication kernel in the engine: `attn` already groups `h/(H/KVH)`. When comparing
+  against a replicated-row authority, replicate the ENGINE's K stages with a SLICE repeat
+  (`np.repeat(..., axis=1)` on 3-D) but replicate WEIGHTS with `np.tile` — `np.repeat(W, grp, axis=0)`
+  repeats rows and scrambles the block (measured 1.365 error for a verifier-side bug).
+* A quant type can be gated bit-exact AND unstaged: check `packed_bytes` *and* `stage_one`, not just
+  the kernel.
+* One GPU job at a time on this box: two drivers serialise and each busy-waits at 100% CPU, which
+  looks exactly like a slow driver (33 min with no output, then 15 s when the other was killed).
 
 ## The goal, and where phase 4 sits
 
