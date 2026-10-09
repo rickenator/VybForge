@@ -136,7 +136,7 @@ int main(int argc, char ** argv) {
     struct ggml_tensor * mask2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, S, S);
     for (int64_t qi = 0; qi < S; qi++) {
         for (int64_t ki = 0; ki < S; ki++) {
-            ((ggml_fp16_t *) mask2->data)[ki + qi * S] = ggml_fp32_to_fp16((qi > ki) ? -INFINITY : 0.0f);
+            ((ggml_fp16_t *) mask2->data)[ki + qi * S] = ggml_fp32_to_fp16((ki > qi) ? -INFINITY : 0.0f);
         }
     }
 

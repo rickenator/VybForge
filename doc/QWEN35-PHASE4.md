@@ -1198,3 +1198,22 @@ the same harness, produces the correct cumulative means. Two consequences worth 
 * This probe is the tool that should have been written before the five hypotheses: it converted a 1.0
   disagreement into a one-line statement of what the op did. Its 20 lines are worth more than the
   guessing they replace.
+
+### The diagonal is MASK-INDEPENDENT — so the mask is not the lever
+
+Three variants, same fixture, same probe:
+
+    mask = mine (causal: -inf for kv > q)   q -> 1.0, 2.0, 3.0, 4.0, 5.0, 6.0   diagonal only
+    mask = NULL                             q -> 1.0, 2.0, 3.0, 4.0, 5.0, 6.0   diagonal only
+    mask = mine, fill inverted              q -> 1.0, 2.0, 3.0, 4.0, 5.0, 6.0   diagonal only
+
+Identical to the digit. With flat scores (q = k = 0) and NO mask, attention must be the uniform mean
+over all keys — 3.5 for every query at S = 6 — so the op is not attending over the key axis as this
+harness lays it out. The mask, its fill, and its very presence change nothing; the diagonal comes from
+how the K/V are read (query q is paired with exactly one key, the same index), which is why every
+mask-side experiment I ran was doomed: they were all downstream of a wrong premise.
+
+So the next check is the SAME probe aimed at K instead of V — make k[t] a constant that NAMES t (e.g.
+k[t, :] constant in t) with q distinguishable, and read which key each query scores against. That names
+the op's key indexing directly. The harness is restored to its working state; the default fixture is
+unaffected and still verifies all ten stages.
