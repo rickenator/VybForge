@@ -172,6 +172,12 @@ int main(int argc, char ** argv) {
         // and q's native layout is (hd, n_head, n_tokens) while this harness passes that form
         // straight through. k/v are already (hd, n_head, n_tokens) — the layout the op wants.
         struct ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, qr, 0, 2, 1, 3));
+        fprintf(stderr, "ATTN_CALL qf ne=(%lld,%lld,%lld) nb=(%lld,%lld,%lld)  kr ne=(%lld,%lld,%lld)  vp ne=(%lld,%lld,%lld)  mask ne=(%lld,%lld) type=%d\n",
+                (long long) qf->ne[0], (long long) qf->ne[1], (long long) qf->ne[2],
+                (long long) qf->nb[0], (long long) qf->nb[1], (long long) qf->nb[2],
+                (long long) kr->ne[0], (long long) kr->ne[1], (long long) kr->ne[2],
+                (long long) vp->ne[0], (long long) vp->ne[1], (long long) vp->ne[2],
+                (long long) mask2->ne[0], (long long) mask2->ne[1], (int) mask2->type);
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kr, vp, mask2, kqs, 0.0f, 0.0f);
         // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
         // n_tokens) that the split half of this harness and the gate multiply use
@@ -184,6 +190,12 @@ int main(int argc, char ** argv) {
         // and q's native layout is (hd, n_head, n_tokens) while this harness passes that form
         // straight through. k/v are already (hd, n_head, n_tokens) — the layout the op wants.
         struct ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, qr, 0, 2, 1, 3));
+        fprintf(stderr, "ATTN_CALL qf ne=(%lld,%lld,%lld) nb=(%lld,%lld,%lld)  kr ne=(%lld,%lld,%lld)  vp ne=(%lld,%lld,%lld)  mask ne=(%lld,%lld) type=%d\n",
+                (long long) qf->ne[0], (long long) qf->ne[1], (long long) qf->ne[2],
+                (long long) qf->nb[0], (long long) qf->nb[1], (long long) qf->nb[2],
+                (long long) kr->ne[0], (long long) kr->ne[1], (long long) kr->ne[2],
+                (long long) vp->ne[0], (long long) vp->ne[1], (long long) vp->ne[2],
+                (long long) mask2->ne[0], (long long) mask2->ne[1], (int) mask2->type);
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kr, vp, mask2, kqs, 0.0f, 0.0f);
         at = ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3));
         kqs_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);

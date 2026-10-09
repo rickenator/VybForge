@@ -1259,3 +1259,22 @@ of them, and THAT is where a source read should focus (the `_one_chunk` loop's q
 
 The q permute is kept: it matches the reference call site, and the explicit path — the one that is
 verified — does not go through this code.
+
+### Instrumentation at the flash call, and an insight about the fixture's geometry
+
+Printing the tensors at the call (stderr, so the gate is unaffected):
+
+    ATTN_CALL qf ne=(256,3,3) nb=(4,1024,3072)  kr ne=(256,3,3)  vp ne=(256,3,3)  mask ne=(3,3) type=1
+
+Two things fall out of it:
+
+1. `qf` IS a different tensor from a native `qr` — contiguous with `nb=(hd*4, hd*4*?, ...)`, so the
+   permutation is real in the data. That makes "identical output before and after the permute"
+   stranger, not smaller: the op produced the same answer from two different arrays.
+2. **In the default fixture `S == n_head == 3`, so ne is `(256,3,3)` either way** — the two layouts are
+   indistinguishable by shape. Which means the post-fix test I ran (at S = 3) was the ONE geometry where
+   the permutation cannot possibly show up. My earlier S = 64 runs, where it CAN show up, predate the fix.
+
+So the re-test that matters is flash at S ≠ n_head WITH the q permute — running now. This is the kind of
+thing the fixture's geometry should be chosen for from the start: whenever a test is about the ORDER of
+two axes, that fixture must make those axes different lengths, or the test is blind.
