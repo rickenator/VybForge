@@ -353,3 +353,36 @@ State carry-over is done (unit 8). Three things remain before `eng_gdn()` can ho
   convention when convenient. Its stale numbers in `doc/QWEN35-PHASE4.md` are labelled as such.
 * Neither verifier is wired into the Makefile or the Phase-2 battery yet — they are one-off scripts.
   Wiring them so they stay green is a small, worthwhile task.
+
+## Next unit: unit 10 step 5 — the engine attention probe (`VYB_ATTN_PROBE=<layer>`)
+
+The authority side is DONE and gated: the attention block's ten stages (joint Q+gate split, per-head q/k
+RMS norms, rope over 64 of 256 dims, causal attention, the output gate, `wo`), verified three ways —
+hand-rolled (4.597e-07), flash at S=6 (3.887e-07), and GQA 6-over-2 replicated (3.493e-07), each with its
+misreadings rejected. Rope's `n_rot` is wired in the engine and the dense prefill is bit-identical.
+
+What is left is the ENGINE side, and the reconnaissance is done — the pieces exist, so this is assembly,
+not discovery:
+
+* The attention weights are ALREADY staged per layer in `model_driver.vyb` (attn_q/k/v/output at the
+  `stage_one` calls around line 1005, plus attn_q_norm/attn_k_norm and attn_norm) — a probe does not need
+  new staging, only a dump path.
+* Mirror the recurrent probe's shape: `VYB_GDN_PROBE=<layer>` reads its fixture input from
+  `$VYB_GDN_X` (default `native/build/gdn_engine_x.bin`), runs the block, and dumps stages with
+  `dump_section(...)` under a `gdn_engine_verify.py`-style verifier. The attention probe should do the
+  same: `VYB_ATTN_PROBE=<layer>`, a fixture hidden state from `$VYB_ATTN_X`, and stage dumps named after
+  the authority's (`qg`, `q_pre`, `gate_pre`, `q_norm`, `q_rope`, `k_norm`, `k_rope`, `attn`, `gated`,
+  `out`).
+* The engine needs the GQA REPLICATION itself: Ridge is 24 query heads over 4 kv heads, so `run_layer_attn`
+  must replicate K/V to the query-head count (the same design the authority now uses and that is verified —
+  see doc/QWEN35-PHASE4.md unit 10 step 4q). The authority's replicated fixture is the reference for it.
+* Weights are quantized in the GGUF while the authority's fixture is f32, so the comparison bar must
+  account for dequantization the way `gdn_engine_verify.py` does (it reads the model's real tensors and
+  uses a tolerance reflecting the quantization, not the 1e-4 used for exact paths).
+* Then extend `native/legit/run_attn_block_gate.sh` (three cases today) with the engine case, so the
+  battery covers the block end to end rather than only its authority.
+
+Order I would take it: (1) probe branch that runs layer L's attention on a fixture and dumps the ten
+stages; (2) `native/tools/attn_engine_verify.py` comparing the dumps against the authority's, with the
+same teeth; (3) the K/V replication for GQA in `run_layer_attn`; (4) wire the gate + battery; (5) only
+then run a whole Ridge model.
