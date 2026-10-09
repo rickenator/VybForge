@@ -1048,3 +1048,32 @@ Two lessons, both already in the skill reference:
 Fixed in the verifier: the einsum token axes, the masked-vs-unmasked scores, the view-dump of `attn`, and
 the parse order. Fixed in the harness: every read-back tensor is now marked `ggml_set_output` before the
 graph is built (correct practice; it was NOT the cause of anything that went wrong here).
+
+## Unit 10 step 4 reconnaissance — the real geometry, and the GQA gap the next unit must close
+
+Ridge's own tensor table (`native/out/ridge_tensors.tsv`) settles the attention geometry, and one number
+in it changes the plan:
+
+    blk.3.attn_q.weight        5120x12288     -> 24 heads x (256 q + 256 gate): the joint QG projection
+    blk.3.attn_k.weight        5120x1024      -> 4 kv heads x 256
+    blk.3.attn_v.weight        5120x1024      -> 4 kv heads x 256
+    blk.3.attn_output.weight   6144x5120      -> 24 heads x 256 -> hidden (5120)
+    blk.3.attn_q_norm.weight   256            -> per head, as P4.8 verified
+    blk.3.attn_k_norm.weight   256            -> per head
+
+Three facts worth having:
+
+1. **`attn_output` is `6144x5120`** = 24 x 256 -> 5120, which confirms the layout P4.8 measured: the
+   attention output carries one 256-dim vector per QUERY head (not the gate), and `wo` maps that back to
+   the model width.
+2. **The joint projection is 12288 = 2 x 6144**, i.e. exactly `n_head * (head_dim q + head_dim gate)`,
+   so "5120x12288" is 24 heads of (q, gate) and not some other pairing.
+3. **Ridge is GQA 6:1** — 24 query heads against 4 kv heads. This is the gap P4.8 explicitly left open:
+   its fixture used `n_kv == n_head` because ggml's batched `mul_mat` requires matching batch dims, so
+   the authority does NOT yet cover the repeat that GQA needs (llama.cpp repeats K/V from n_head_kv to
+   n_head before the score and value products).
+
+So the next unit is not "wire the engine probe" but "extend the authority to GQA and prove the repeat",
+because the engine probe would otherwise be validated against a reading of GQA that has never been
+measured — the exact failure mode this whole unit has been correcting. The engine side has the same
+requirement: `run_layer_attn` currently stages ONE `attn_k`/`attn_v` at the query-head count.
