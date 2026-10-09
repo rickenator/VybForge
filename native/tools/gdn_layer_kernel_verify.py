@@ -107,12 +107,39 @@ def real_q8_weight(name):
         return None, None
 
 
+
+def real_f32_weight(name, want_shape):
+    """A tensor the model stores as F32, read raw and used directly (no dequant needed), or (None,None)."""
+    try:
+        off = size = None
+        for line in open(INVENTORY):
+            if line.startswith(name + "\t"):
+                f = line.split("\t")
+                off, size = int(f[5]), int(f[6])
+                break
+        if off is None:
+            raise KeyError(name)
+        with open(os.environ.get("VYBFORGE_RIDGE_GGUF",
+                                 os.path.expanduser("~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf")), "rb") as fh:
+            fh.seek(off)
+            raw = fh.read(size)
+        vals = np.frombuffer(raw, dtype="<f4").reshape(want_shape)
+        return vals.copy()
+    except Exception as e:      # noqa: BLE001
+        print(f"GDNL_VERIFY note: real {name} unavailable ({e.__class__.__name__}); synthetic")
+        return None
+
+
 def fixture():
     """One fixture, both precisions. Weights are ggml-order: a tensor of ne (K, N) is numpy (N, K)."""
     rng = np.random.default_rng(20261008)
     s = 1.0 / np.sqrt(NE)
     x = rng.normal(0.0, 1.0, size=(2, NE)).astype(np.float32)   # two decode steps
     attn_norm = rng.normal(1.0, 0.05, size=NE).astype(np.float32)
+    real_norm = real_f32_weight("blk.0.attn_norm.weight", (NE,))          # F32 in the file: no dequant
+    real_conv = real_f32_weight("blk.0.ssm_conv1d.weight", (QKV, DC))
+    if real_norm is not None:
+        attn_norm = real_norm
     wqkv = rng.normal(0.0, s, size=(QKV, NE)).astype(np.float32)
     wgate = rng.normal(0.0, s, size=(VALUE, NE)).astype(np.float32)
     wbeta = rng.normal(0.0, s, size=(H_V, NE)).astype(np.float32)
@@ -120,11 +147,14 @@ def fixture():
     alpha_raw, alpha_deq = real_q8_weight("blk.0.ssm_alpha.weight")
     beta_raw, beta_deq = real_q8_weight("blk.0.ssm_beta.weight")
     quantised = alpha_raw is not None and beta_raw is not None
+    f32_real = real_norm is not None and real_conv is not None
     if quantised:
         walpha = alpha_deq.astype(np.float32)     # the authority sees the same values the GPU will
         wbeta = beta_deq.astype(np.float32)
     dt, a, real = real_gate_params(H_V)
     conv1d = rng.normal(0.0, 0.2, size=(QKV, DC)).astype(np.float32)
+    if real_conv is not None:
+        conv1d = real_conv
     ssm_norm = rng.normal(1.0, 0.05, size=S).astype(np.float32)
     ssm_out = rng.normal(0.0, s, size=(NE, VALUE)).astype(np.float32)
     zwindow = np.zeros(DC * QKV, dtype=np.float32)   # the conv buffer, window slots and all (ncs frames/channel)
@@ -132,7 +162,7 @@ def fixture():
     return dict(x=x, attn_norm=attn_norm, wqkv=wqkv, wqkv_gate=wgate, ssm_beta=wbeta,
                 alpha_q8=(alpha_raw if quantised else b""), beta_q8=(beta_raw if quantised else b""),
                 ssm_alpha=walpha, ssm_dt=dt, ssm_a=a, ssm_conv1d=conv1d, ssm_norm=ssm_norm,
-                ssm_out=ssm_out, zwindow=zwindow, state=state), real, quantised
+                ssm_out=ssm_out, zwindow=zwindow, state=state), real, quantised, f32_real
 
 
 def build_authority():
@@ -227,9 +257,10 @@ def main():
           f"key={KEY} value={VALUE} qkv={QKV}, steps=2")
     if not build_authority() or not build_ptx():
         return 1
-    fx, real, quantised = fixture()
-    print(f"GDNL_VERIFY fixture {'real ssm_a/ssm_dt from blk.0' if real else 'synthetic ssm_a/ssm_dt'}, "
-          f"ssm_alpha/ssm_beta {'REAL Q8_0 tensors of blk.0 (dequantised on the GPU)' if quantised else 'synthetic'}, "
+    fx, real, quantised, f32_real = fixture()
+    print(f"GDNL_VERIFY fixture ssm_a/ssm_dt {'real' if real else 'synthetic'}, "
+          f"ssm_alpha/ssm_beta {'REAL Q8_0 tensors (dequantised on the GPU)' if quantised else 'synthetic'}, "
+          f"attn_norm/ssm_conv1d {'REAL F32 tensors (read raw)' if f32_real else 'synthetic'}, "
           f"state and conv window start at zero")
 
     # The authority runs the sequence as two single-token steps: step 2 gets step 1's conv window

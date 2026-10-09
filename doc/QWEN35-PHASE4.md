@@ -526,9 +526,18 @@ I/O-bound and cheap. The ~270 GFLOP figure describes a PREFILL, where M is the p
 the case that needs a tiled/gemm projection (and, if it grows, the shared DGX Sparks cluster rather
 than this box's single 3090).
 
-Still synthetic: the other projections (`ssm_out` is Q4_K in this file; `wqkv`/`wqkv_gate` likewise
-quantized). Extending the same mechanism to them is mechanical — raw bytes at the inventory's offset,
-the matching dequant kernel (`q4kdeq`, already gated), the same wiring.
+The model's F32 tensors came along for free: `attn_norm` and `ssm_conv1d` are read RAW and used
+directly (no dequant). So four of the layer's weight sets are the model's own — `attn_norm`,
+`ssm_conv1d`, `ssm_alpha`, `ssm_beta` — and the check still lands at 2.5e-07..4.8e-08 on those stages.
+
+Still synthetic, and BLOCKED for a reason worth recording: the three remaining projections
+(`blk.0.attn_qkv`, `blk.0.attn_gate`, `blk.0.ssm_out`) are all **Q4_K**, and Q4_K is the one quant type
+this repo has no numpy reference for (`native/tools/` has `q5k_ref.py`, `q8_0_ref.py`, `iq2_s_ref.py`,
+`iq3_s_ref.py`, `bf16_ref.py` — no `q4k_ref.py`) and no S0.x gate in the phase-2 battery. Using it here
+without that would be the self-consistency the project forbids: the authority has to be fed the same
+weights the GPU dequantised, and "our numpy agrees with our kernel" proves nothing. The `gguf` package
+does implement Q4_K, so the S0.5 pattern applies directly — write `q4k_ref.py`, cross-check it against
+the package, add the gate, and then the layer check can take the three remaining weights as data.
 
 ### `eng_gdn()` stays 0 — and why
 

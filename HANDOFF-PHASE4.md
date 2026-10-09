@@ -158,8 +158,15 @@ and is I/O-bound; the ~270 GFLOP estimate that had kept this dormant describes a
 cluster is needed for this check — the 3090 here is fine — and the Sparks are the right place for the
 prefill case (unit 9b) if it needs scheduling.
 
-Still synthetic: `ssm_out` (Q4_K in this file) and `wqkv`/`wqkv_gate`. Same mechanism, `q4kdeq`
-already exists and is gated.
+Also real now: `attn_norm` and `ssm_conv1d` (the model stores both as F32, read raw and used
+directly). Four of the layer's weight sets are the model's own.
+
+BLOCKED, with the reason: the three remaining projections are `blk.0.attn_qkv`, `blk.0.attn_gate` and
+`blk.0.ssm_out`, all **Q4_K** — the one quant type with no numpy reference in `native/tools/` and no
+S0.x gate in the battery. The layer check cannot use them until that reference exists (write
+`q4k_ref.py`, cross-check against the `gguf` package's Q4_K dequantizer, add the gate); feeding the
+authority GPU-produced weights instead would make the comparison self-consistent, which is the thing
+the project forbids. That reference is the next step for this thread.
 
 ## `eng_gdn()` is STILL 0, deliberately
 
