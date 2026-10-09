@@ -1388,3 +1388,29 @@ group axis appended, vs the group inside), because the probe answers in one run 
 This is the third time in this unit that a probe converted an argument into a number, and the pattern is
 consistent: inference about ggml's tensor semantics has been wrong every single time; measurement has
 been right every time.
+
+## Unit 10 step 4p — both repeat forms give the same wrong pairing; change the approach
+
+    form A: (…, g, nkv)   h0..h5 -> 0 0 0 0 0 0
+    form B: (…, nkv, g)   h0..h5 -> 0 0 0 0 0 0
+
+Identical, so this is not the axis order either: whatever `ggml_repeat_4d` is doing, every query head ends
+up reading kv head 0. Two forms, one result — the same "identical to the digit" signature that has now
+refuted grouping, mask fill, K/V axis order, tiling, and both repeat forms. The common factor in all six
+is that I was trying to make the FLASH op express GQA.
+
+The change of approach, and the decision: **stop asking ggml's flash op to do GQA in this harness.** The
+op is verified for `n_kv == n_head` (all ten stages, 3.887e-07), the hand-rolled path is verified for the
+same shape, and GQA is a REPLICATION of the kv heads — so the authority can express the grouping in the
+FIXTURE instead: build K/V with each query head's group replicated into its own row (host-side, where I
+control the ordering exactly) and run the already-verified `n_kv == n_head` path over it. That is an
+authority for the same mathematics, built out of the two paths that both measure correctly, instead of
+depending on a third mechanism that has failed every measurement so far.
+
+This also matches what the ENGINE will have to do — Ridge is 24:4, so `run_layer_attn` must replicate K/V
+to the query-head count itself. The engine and the authority can therefore share one design that is
+verified, rather than the engine inheriting a dependency on the flash op's GQA behaviour.
+
+STATUS of the flash/GQA line, plainly: the flash path is VERIFIED and gated at `n_kv == n_head`. The GQA
+fixture's front half is verified; its attention stages are NOT authorised, and six refutations say the way
+to authorise them is the fixture-side replication above, not another permutation of this call.

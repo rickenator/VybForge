@@ -193,12 +193,10 @@ int main(int argc, char ** argv) {
             // CONTIGUOUS grouping the spec expects. (…, nkv, g) would give h % nkv instead, which is what
             // the first attempt built and why it missed by 1.0.)
             const int64_t g = nh / nkv;
-            // FORM B: the kv axis stays second and the group axis is appended. The kvhead probe measures
-            // which kv head each query head reads, so this is checked rather than argued.
-            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, nkv, 1);
-            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, nkv, 1);
-            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, nkv, g), hd, S, nh);
-            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, nkv, g), hd, S, nh);
+            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, 1, nkv);
+            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, 1, nkv);
+            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, g, nkv), hd, S, nh);
+            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, g, nkv), hd, S, nh);
         }
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kf, vf, mask2, kqs, 0.0f, 0.0f);
         // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
@@ -233,12 +231,10 @@ int main(int argc, char ** argv) {
             // CONTIGUOUS grouping the spec expects. (…, nkv, g) would give h % nkv instead, which is what
             // the first attempt built and why it missed by 1.0.)
             const int64_t g = nh / nkv;
-            // FORM B: the kv axis stays second and the group axis is appended. The kvhead probe measures
-            // which kv head each query head reads, so this is checked rather than argued.
-            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, nkv, 1);
-            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, nkv, 1);
-            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, nkv, g), hd, S, nh);
-            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, nkv, g), hd, S, nh);
+            struct ggml_tensor * k4 = ggml_reshape_4d(ctx, kf0, hd, S, 1, nkv);
+            struct ggml_tensor * v4 = ggml_reshape_4d(ctx, vf0, hd, S, 1, nkv);
+            kf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, k4, hd, S, g, nkv), hd, S, nh);
+            vf = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, v4, hd, S, g, nkv), hd, S, nh);
         }
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kf, vf, mask2, kqs, 0.0f, 0.0f);
         at = ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3));
