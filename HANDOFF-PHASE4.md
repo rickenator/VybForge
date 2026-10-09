@@ -33,11 +33,34 @@ per-block kinds agree with the INDEPENDENT Python inventory's tensor names. What
   (`n_layers - mtp_layers`). The engine's loop must run blocks `< text_layers` and keep the draft
   head out of the text attention branch.
 
-**The next step is unit 9c step 2: the recurrent branch in `native/host/model_driver.vyb`.** Everything
-it needs is now named: the dispatch rule above, the kernel chain `gdn_layer_driver.vyb` already
-composes, and the state cache the handoff section "Unit 9c" sizes. `eng_gdn()` and `eng_mtp()` are both
-still 0 and both still have to flip (or the descriptor needs a documented "without the draft head"
-profile) before the caps gate can call the Ridge model SUPPORTED.
+**Unit 9c step 2 is DONE (commit cd78628, pushed, gate P4.5): the block runs on the ENGINE's own
+weight path.** `native/host/gdn_engine_driver.vyb` stages all ten of blk.0's tensors from the live
+GGUF the way the engine does — by name, through `q4kdeq`/`q8_0deq`/`f32expand` — and multiplies with
+the engine's `gemm` (B = [in,out]), not the fixture path's `mm_nt`. 26/26 stages over two chained
+decode steps pass against unit 5's authority on real weights, worst **3.903e-06**, including the
+786432-element state at 4.1e-07. `native/tools/gdn_engine_verify.py` reuses P4.3's fixture and
+authority runner verbatim, so only the driver under test changed.
+
+* the engine's tensor index for Ridge is GENERATED (`native/tools/inventory_to_tsv.py`, from
+  `ridge_inventory.py`'s TSV, every tensor's byte count asserted against its type) — do not
+  hand-write offsets;
+* **the bug this caught, and the reason stage comparison alone is not enough**: `delta_step` and the
+  `ssm_out` gemm SHARE the `P2` param block, and `delta_step` writes a POINTER into `P2+48` — exactly
+  where `gemm` reads `alpha`. The projection came back as denormals (~1e-308) while every stage
+  feeding it agreed to 1e-6, so it read as "one wrong element" (maxrel 1.000e+00 is the signature of
+  "output is all zeros, argmax of |diff| is anywhere"). Re-state alpha/beta before that gemm. The
+  verifier now also compares the STAGED operand slot by slot at the addresses gemm reads;
+* the projection is now verified in three layers: the block (26 stages) vs ggml, the block's OPERAND
+  vs the model's own tensor, and the two mis-wirings as prints.
+
+**The next step is unit 9c step 3: wire the branch into `native/host/model_driver.vyb`.** The pieces
+exist separately and are each verified — the dispatch rule (`model_caps::mc_layer_kind`, P4.4), the
+staged block (`gdn_engine_driver.vyb`, P4.5), and the state cache the section "Unit 9c" sizes. What
+is missing is the loop: per-layer dispatch, the nine weight buffers per recurrent layer, the per-layer
+state cache, and then the whole-model logits against llama.cpp (per-layer agreement cannot see a
+wiring error BETWEEN layers). `eng_gdn()` and `eng_mtp()` are both still 0 and both still have to flip
+(or the descriptor needs a documented "without the draft head" profile) before the caps gate can call
+the Ridge model SUPPORTED.
 
 Two smaller follow-ups are also open and recorded below: promoting the `q4kdeq`-vs-reference
 comparison into S0.10 proper, and retiring `native/tools/gdn_ref.py`.
@@ -213,13 +236,12 @@ more. Measured: 26 stages over two chained steps pass — the Q4_K-driven stages
 8.6e-08/1.7e-06 (ssm_out) — and this also exercises `q4kdeq` on whole real tensors against a reference
 that is independently checked (the S0.10 GPU side, as a side effect).
 
-## Unit 9c — step 1 (the dispatch) DONE; step 2 (the engine branch) not started
+## Unit 9c — steps 1 and 2 DONE; step 3 (the loop) not started
 
-I stopped short of the engine work rather than starting it half-way. `native/host/model_driver.vyb`
-is a 660-line full-model driver for the Qwen3-4B path (36 layers, per-tensor quant staging, one
-`stage_one(...)` call per weight at fixed lines ~544-560, kernels from `layer.vyb`/`qwen3.vyb`), and a
-recurrent branch is a real piece of engine surgery plus a full 27B run to verify it — not something to
-begin at the end of a session's context budget with no way to check the result.
+`native/host/model_driver.vyb` is a 660-line full-model driver for the Qwen3-4B path (36 layers,
+per-tensor quant staging, one `stage_one(...)` call per weight at fixed lines ~544-560, kernels from
+`layer.vyb`/`qwen3.vyb`). The recurrent branch is now built and verified on its own; what is left is
+the loop surgery plus a full 27B run.
 
 What it needs:
 
@@ -232,10 +254,13 @@ What it needs:
    `blk.N.ssm_conv1d.weight`, `blk.N.ssm_norm.weight`, `blk.N.ssm_a`, `blk.N.ssm_dt.bias` where an
    attention layer has `attn_q/k/v/output` — and note the two traps the gate pins: `attn_qkv` and
    `attn_gate` carry the `attn_` prefix but are RECURRENT weights.
-2. **The six projections through the existing quant path**: `stage_one(...)` per tensor, then the
-   quant gemm the attention layers already use (attn_qkv 5120->10240 Q4_K, attn_gate 5120->6144 Q4_K,
-   ssm_beta/ssm_alpha 5120->48 Q8_0, ssm_out 6144->5120 Q4_K) — `mm_nt` is the f64 reference form of
-   the same product, so the layer check's numbers are the target.
+2. **The six projections through the existing quant path** — **DONE, commit cd78628.** Gate P4.5
+   (`native/legit/run_gdn_engine_gate.sh`, `native/host/gdn_engine_driver.vyb`) stages every blk.0
+   tensor from the live GGUF through the engine's own path and runs the chain with layer.ptx's
+   `gemm`, 26/26 stages over two chained steps, worst 3.903e-06 against unit 5's authority. Two traps
+   it recorded: `delta_step` and the `ssm_out` gemm share the `P2` param block (alpha lives at
+   `P2+48`, which `delta_step` overwrites with a pointer), and the dequant kernels' `z` argument is
+   the tensor's IN dim, which is what makes the staged B `[in,out]` for `gemm`.
 3. **The state cache, per layer per sequence**: the conv state is `(d_conv-1) * conv_channels` values
    (3 x 10240) and the delta-net state `S * S * H_v` (128 x 128 x 48 = 786432) — llama.cpp calls these
    `n_embd_r()`/`n_embd_s()`; the layer driver in this repo already exercises both, including the

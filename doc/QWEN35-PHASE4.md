@@ -608,3 +608,52 @@ Gate: `native/legit/run_layerkind_gate.sh`, step **P4.4** of the phase-2 battery
 on godzilla (the Ridge and Qwen3 GGUFs are present there; a checkout without them SKIPs those cases,
 and a gate that proved nothing is a FAIL). The S0.2e capability gate is unchanged by the refactor and
 still PASSes.
+
+## Unit 9c step 2 — the block on the ENGINE's own weight path (DONE, commit cd78628)
+
+P4.3 ran the block out of Vyb kernels, but on a fixture, and it multiplied with `mm_nt`, whose B
+operand is [out,in]. The engine finds each tensor by NAME in the GGUF, dequantises the packed types
+with the kernels it uses for every layer, and multiplies with `gemm` (layer.ptx), whose B operand is
+[in,out] — the layout the dequant kernels' transposing write produces when their `z` argument is the
+tensor's IN dim (VybForge#11). Those are different staging paths and a different matmul, so P4.3's
+green says nothing about the engine's. This unit runs the engine's path for one recurrent block and
+compares it against the same authority on the same real weights.
+
+`native/host/gdn_engine_driver.vyb` stages all ten of blk.0's tensors from the live GGUF —
+`attn_qkv`/`attn_gate`/`ssm_out` Q4_K and `ssm_alpha`/`ssm_beta` Q8_0 through `q4kdeq`/`q8_0deq`,
+`attn_norm`/`ssm_conv1d`/`ssm_norm`/`ssm_a`/`ssm_dt` F32 through `f32expand` — runs the chain with
+the engine's `gemm` for the six projections and the engine's `rmsnorm`/`resid`, carries the conv
+window and the delta-net state across two decode steps, and dumps the same 13 stages. Its geometry
+and strides are DERIVED from blk.0's own tensor numels and cross-checked against each other, so
+nothing is spelled out that the file can answer.
+
+`native/tools/gdn_engine_verify.py` reuses P4.3's fixture and authority runner verbatim: the
+reference is unchanged, the driver under test is what changed. Measured on the real weights, two
+chained steps from a zero state: **26/26 stages within maxrel 1e-4, worst 3.903e-06**, including the
+786432-element delta-net state at 4.1e-07.
+
+The engine's tensor index for Ridge is generated rather than hand-written:
+`native/tools/inventory_to_tsv.py` projects `ridge_inventory.py`'s TSV into the engine's
+`name / dims / type / off=<absolute> / size=0` form and asserts every tensor's byte count against its
+type before writing, so a change in the alignment rule cannot quietly shift the weights.
+
+### The bug this check caught — and why stage comparison alone could not
+
+`delta_step` and the `ssm_out` projection gemm SHARE the `P2` param block. `delta_step` needs nine
+words there and writes a POINTER into `P2+48` (the `stout` state buffer) — exactly where `gemm` reads
+`alpha`. The projection therefore ran with alpha = the bits of a device pointer reinterpreted as f64,
+and the whole `y` vector came back as denormals (~1e-308).
+
+What made it instructive is how it READ: not as a wrong projection but as an almost-perfect one.
+`epi`, which feeds it, agreed to 1.5e-06; the state, the norms and the conv agreed to 1e-7; and the
+reported failure was "one index differs, maxrel 1.000e+00". A maxrel of exactly 1.0 is the signature
+of "the output is all zeros": the difference vector is the reference itself, so the argmax of |diff|,
+and the index it names, are arbitrary. The tell was counting, not reading — 5120 of 5120 slots were
+denormal, not 1.
+
+The lesson, in the form the next session needs it: **a param block is not an argument list.** The
+kernel reads whatever words are at the offsets it reads; nothing tells you when a second kernel has
+reused them. Two defences are now in place here: the alpha/beta words are re-stated immediately
+before that gemm (with the comment saying why), and the verifier compares the STAGED operand slot by
+slot at the addresses `gemm` reads — because a block that is right about everything except what it
+was fed is invisible to a stage-by-stage comparison.
