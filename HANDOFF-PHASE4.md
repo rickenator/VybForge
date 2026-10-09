@@ -1,8 +1,26 @@
 # Phase 4 handoff — Gated DeltaNet reference (VybForge #10, item 1)
 
-Written at the end of a long session whose context window is spent. Everything below is pushed;
-`~/Projects/VybForge` main is at `a7273e4`, tree clean. Read `doc/QWEN35-PHASE4.md` for the full
-narrative and `doc/SPIKINGBRAIN.md` for the phase-1..3 background.
+Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --oneline -15` shows the
+unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative (units 1-9) and
+`doc/SPIKINGBRAIN.md` for the phase-1..3 background.
+
+## RESTART HERE — option #1 is unit 9c
+
+Seven units are done and green: five reference units against ggml's own ops (P4.1), the kernels on the
+GPU at model geometry (P4.2), the block wired on the GPU with two-step state carry-over (P4.3), and the
+layer check now running at the model's own geometry on the model's own weights — F32
+`attn_norm`/`ssm_conv1d`, Q8_0 `ssm_alpha`/`ssm_beta`, Q4_K `attn_qkv`/`attn_gate`/`ssm_out` — 26
+stages over two chained steps, worst maxrel 1.686e-06. Q4_K also gained the reference it never had
+(`native/tools/q4k_ref.py`, bit-identical to the `gguf` package, gate S0.10).
+
+What is NOT done is the engine: `eng_gdn()` and `eng_mtp()` are both still 0, and the Ridge file has
+65 blocks with the MTP head as the 65th — so both have to flip (or the descriptor needs a documented
+"without the draft head" profile) before the caps gate can call that model SUPPORTED. That is unit 9c,
+and the plan with the specific hooks is in the section "Unit 9c — NOT STARTED, and deliberately"
+below. Start there; nothing else in this file is a prerequisite for it.
+
+Two smaller follow-ups are also open and recorded below: promoting the `q4kdeq`-vs-reference
+comparison into S0.10 proper, and retiring `native/tools/gdn_ref.py`.
 
 ## The goal, and where phase 4 sits
 
