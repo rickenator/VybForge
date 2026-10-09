@@ -735,3 +735,24 @@ gate verifies one block (blk.0), because the authority side of the fixture is bu
 weights; a second block needs that parameterised. `eng_gdn()` stays 0 until the whole-model logits are
 compared against llama.cpp — which also needs IMROPE for Ridge's attention layers and its `attn_q`
 output gate, both attention-path work.
+
+### The fourth bug, and the one worth remembering: a classifier is not an existence test
+
+The dispatch started as `mc_layer_kind("blk." + L + ".ssm_alpha.weight") == 2` — which is the shared
+rule, applied to a constructed name. That is not a dispatch: `mc_layer_kind` answers "what kind is this
+NAME", and every constructed name ends with the marker, so it answered `recurrent` for every block of a
+DENSE model. The engine stopped on Qwen3-4B with `GDN_CFG_FAIL the first recurrent block blk.0. is
+missing a tensor`, before it had done any work.
+
+The rule that came out of it, now written at the three sites: **presence comes from the tensor table,
+the kind comes from the rule.** `find_nm(nmv, name) >= 0` says IF; `mc_layer_kind(name)` says WHAT. The
+loop also refuses loudly when a block carries neither marker, rather than quietly treating it as
+attention.
+
+What makes it worth a section is how it survived two green gates. P4.5 passed twice while the dense
+path was broken, because the probe only exercises the recurrent branch — a check of the NEW path says
+nothing about the OLD one. The check that caught it was the regression on the model that does NOT have
+the feature, and the reason to run it on every change to a shared dispatch. Note also the failure mode
+of the previous regression: with the driver exiting early, `verify_prefill.py` compared the PREVIOUS
+run's outputs and reported OK — so a regression gate must assert the driver's own completion marker
+(`MODEL_PREFILL_DONE`), not just the final comparison.
