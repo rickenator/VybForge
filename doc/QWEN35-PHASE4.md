@@ -981,3 +981,15 @@ Three shape lessons from this step, all paid for with a run:
 * A fixture's numpy shape for a ggml tensor is `(ne1, ne0)` — `(r, c)` in numpy is `ne = (c, r)`. W_o is
   `ggml ne = (n_head*head_dim, D)`, so it reads as numpy `(D, n_head*head_dim)`; getting that backwards
   produced a 768-vs-64 matmul error rather than a wrong number, which is the good failure mode.
+
+### The causal mask was not the cause of the attention mismatch
+
+Replacing `ggml_diag_mask_inf` with an explicit `(S_kv, S_q)` causal mask tensor passed to
+`ggml_soft_max_ext(kq, mask, kqs, 0.0f)` — the shape dance llama.cpp actually uses, with `soft_max`
+reducing `ne0`, the key axis — left `attn` at **1.409e+00, identical to three decimals**. The mask is
+therefore not the cause (and the unchanged number says the stage's output did not move at all, i.e. the
+difference is elsewhere: the V pairing, the head pairing, or the reference's own attention step). The
+next step is to stop guessing and compare the two sides entry by entry for one (query, head, dim) — the
+error is O(1), so one printed entry from each side will identify the axis that is transposed.
+
+The gate stays scoped to the seven front-half stages, with attention/gate/wo reported and unauthorised.

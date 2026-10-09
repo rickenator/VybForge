@@ -184,18 +184,21 @@ def main():
               f"(worst {worst:.3e}) — do not build engine code on this reading")
         return 1
 
-    # Reported, NOT gated: the three stages below do not agree yet. Their error is printed so the size
-    # of the gap is visible, and the reason is known (ggml_diag_mask_inf masks ne0 against ne2, and ne2
-    # here is the head axis, not the query axis — so the causal mask is applied along the wrong axis
-    # until the attention is laid out as llama.cpp lays it out).
+    # Reported, NOT gated. The error did NOT move when the causal mask was replaced (diag_mask_inf ->
+    # explicit mask tensor + soft_max_ext, both at 1.409e+00 to three decimals), so the mask is not the
+    # cause and the attention stage's difference lies elsewhere. Until it is found, this stays visible
+    # and unauthorised rather than inside the gate.
     print("ATTN_VERIFY_NOT_GATED attention/gate/wo (computed, not yet authorised):")
     for nm in LATER:
         print(f"ATTN_VERIFY_NOT_GATED   {nm:9s} maxrel={rv.rel(mine[nm], ref[nm]):.3e}")
 
+
+
     # The teeth: each alternative reading must MISS, or the check is not measuring the reading.
     alts = (("gate-first split", dict(gate_first=True), "q_norm"),
             ("norm over the whole projection", dict(norm_whole=True), "q_norm"),
-            ("rope over the whole head", dict(rope_whole=True), "q_rope"))
+            ("rope over the whole head", dict(rope_whole=True), "q_rope"),
+            )
     for nm, kw, key in alts:
         a = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, **kw)
         r = rv.rel(a[key], ref[key])
@@ -206,7 +209,7 @@ def main():
                   f"check cannot tell them apart, so a pass here proves nothing")
             return 1
 
-    print(f"ATTN_VERIFY_DONE {len(FRONT)} FRONT-HALF stages reproduce ggml's ops within {MAXREL:g} "
+    print(f"ATTN_VERIFY_DONE {len(FRONT)} front-half stages reproduce ggml's ops within {MAXREL:g} "
           f"(worst {worst:.3e}), and all {len(alts)} alternative readings of them are rejected; "
           f"{len(LATER)} later stages ({', '.join(LATER)}) are reported, NOT authorised")
     return 0

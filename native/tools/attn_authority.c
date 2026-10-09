@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static void * xmalloc(size_t n) {
     void * p = malloc(n);
@@ -132,9 +133,16 @@ int main(int argc, char ** argv) {
     // V must present the KEY axis as ne0 for the contraction below: (hd, n_kv, S) -> (S, hd, n_kv)
     struct ggml_tensor * vpp = ggml_cont(ctx, ggml_transpose(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3)));
     struct ggml_tensor * kq  = ggml_mul_mat(ctx, kpp, qp);                // (S_kv, S_q, n_head)
-    struct ggml_tensor * kqm = ggml_diag_mask_inf(ctx, kq, 0);           // causal across these S tokens
-    struct ggml_tensor * kqs_t = ggml_scale(ctx, kqm, kqs);              // 1/sqrt(head_dim) unless GGUF overrides
-    struct ggml_tensor * pr  = ggml_soft_max(ctx, kqs_t);
+    // The causal mask must be an EXPLICIT (S_kv, S_q) tensor passed to soft_max_ext, which reduces ne0 —
+    // the key axis. `ggml_diag_mask_inf` would be wrong here: it cuts ne0 against ne2, and ne2 is the
+    // HEAD axis in this arrangement, so it would place the causal cut across heads.
+    struct ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, 1);
+    for (int64_t qi = 0; qi < S; qi++) {
+        for (int64_t ki = 0; ki < S; ki++) {
+            ((float *) mask->data)[ki + qi * S] = (ki > qi) ? -INFINITY : 0.0f;
+        }
+    }
+    struct ggml_tensor * pr = ggml_soft_max_ext(ctx, kq, mask, kqs, 0.0f);  // kqs = 1/sqrt(head_dim)
     struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);               // (hd, S_q, n_head)
     struct ggml_tensor * at  = ggml_permute(ctx, atp, 0, 2, 1, 3);       // back to (hd, n_head, S)
     struct ggml_tensor * gs  = ggml_sigmoid(ctx, gt);                   // the gate half of the joint projection
