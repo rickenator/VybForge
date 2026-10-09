@@ -993,3 +993,30 @@ next step is to stop guessing and compare the two sides entry by entry for one (
 error is O(1), so one printed entry from each side will identify the axis that is transposed.
 
 The gate stays scoped to the seven front-half stages, with attention/gate/wo reported and unauthorised.
+
+## Unit 10 step 3d — three verifier bugs fixed, the block's arithmetic shown correct ONCE, then flaky
+
+Fixing the attention stage's real bugs moved it from 1.409e+00 to **2.675e-07**, with `gated` 2.859e-07 and
+`out` 2.634e-07 — and those last two depend on the whole chain (split → norms → rope → attention → output
+gate → `wo`), so that run showed the attention block's arithmetic correct end to end. All three bugs were
+in the VERIFIER, not the harness:
+
+1. `np.einsum("shd,skd->shk", q_rope, k_rope)` reused the letter `s` for the query-token AND key-token
+   axes. numpy matched them by name, so the contraction forced key token == query token and the output's
+   third axis became the kv HEAD, not the key. Signature: only the diagonal (q == kv) agreed, and NO axis
+   permutation could match (3/27 elements at best for all six permutations). Correct: `"qhd,khd->qhk"`.
+2. The `scores` stage was compared masked-against-unmasked: the harness's mask is applied INSIDE
+   `ggml_soft_max_ext`, so the tensor it dumps is unmasked. Tell: the harness had 0 of 27 `-inf` where the
+   spec had 9.
+3. `attn` was dumped from a `ggml_permute` VIEW, so its linear dump reported the parent's layout (the same
+   trap as `q_pre`/`gate_pre`, cured the same way — `ggml_cont` first).
+
+Then the flakiness: the SAME comparison of `attn`/`gated`/`out` produced 2.7e-07-class agreement in one run
+and 9.107e-01 / 1.533e+00 / 1.521e+00 in the next, with no change to the verifier's data and no rebuild
+failure. **A verdict that flips between runs cannot gate anything**, so those three are outside the gate
+until the cause is found. Prime suspects: the harness's 4-thread `ggml_graph_compute`, or a race in the
+view/permute paths. The seven front-half stages were re-run twice and are identical to three decimals both
+times, so the harness is deterministic for those.
+
+The gate therefore stays on the seven front-half stages (worst 4.597e-07, three misreadings rejected), and
+`attn`/`gated`/`out` are printed every run as NOT authorised with that note.

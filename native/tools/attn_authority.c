@@ -24,6 +24,7 @@
 //   out.bin: stages concatenated as f32, in this order (counts derivable from the args):
 //     qg (S, n_head*2*hd), q_pre (S, n_head, hd), gate_pre (S, n_head, hd),
 //     q_norm (S, n_head, hd), q_rope (S, n_head, hd), k_norm (S, n_kv, hd), k_rope (S, n_kv, hd),
+//     scores (S_q, S, n_head) [ne = (S_kv, S_q, n_head)], probs (same shape),
 //     attn (S, n_head, hd), gated (S, n_head, hd), out (S, D)
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -142,9 +143,11 @@ int main(int argc, char ** argv) {
             ((float *) mask->data)[ki + qi * S] = (ki > qi) ? -INFINITY : 0.0f;
         }
     }
-    struct ggml_tensor * pr = ggml_soft_max_ext(ctx, kq, mask, kqs, 0.0f);  // kqs = 1/sqrt(head_dim)
+    struct ggml_tensor * kqs_t = ggml_scale(ctx, kq, kqs);   // scores: 1/sqrt(head_dim) scaling
+    struct ggml_tensor * pr = ggml_soft_max_ext(ctx, kqs_t, mask, 1.0f, 0.0f);
     struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);               // (hd, S_q, n_head)
-    struct ggml_tensor * at  = ggml_permute(ctx, atp, 0, 2, 1, 3);       // back to (hd, n_head, S)
+    // permute yields a VIEW: dumping it linearly would report atp's layout, so copy it contiguous
+    struct ggml_tensor * at  = ggml_cont(ctx, ggml_permute(ctx, atp, 0, 2, 1, 3));  // (hd, n_head, S)
     struct ggml_tensor * gs  = ggml_sigmoid(ctx, gt);                   // the gate half of the joint projection
     struct ggml_tensor * gtd = ggml_mul(ctx, at, gs);
     struct ggml_tensor * gc2 = ggml_cont_2d(ctx, gtd, nh * hd, S);
@@ -177,6 +180,7 @@ int main(int argc, char ** argv) {
     const struct { const char * nm; struct ggml_tensor * t; } stages[] = {
         { "qg", qg }, { "q_pre", qc }, { "gate_pre", gtc }, { "q_norm", qn },
         { "q_rope", qr }, { "k_norm", kn }, { "k_rope", kr },
+        { "scores", kqs_t }, { "probs", pr },
         { "attn", at }, { "gated", gtd }, { "out", wo_out },
     };
     FILE * out = fopen(argv[2], "wb");
