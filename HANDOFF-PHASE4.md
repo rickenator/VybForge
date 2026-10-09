@@ -175,6 +175,42 @@ more. Measured: 26 stages over two chained steps pass — the Q4_K-driven stages
 8.6e-08/1.7e-06 (ssm_out) — and this also exercises `q4kdeq` on whole real tensors against a reference
 that is independently checked (the S0.10 GPU side, as a side effect).
 
+## Unit 9c — NOT STARTED, and deliberately: what it needs, where the hooks are
+
+I stopped short of the engine work rather than starting it half-way. `native/host/model_driver.vyb`
+is a 660-line full-model driver for the Qwen3-4B path (36 layers, per-tensor quant staging, one
+`stage_one(...)` call per weight at fixed lines ~544-560, kernels from `layer.vyb`/`qwen3.vyb`), and a
+recurrent branch is a real piece of engine surgery plus a full 27B run to verify it — not something to
+begin at the end of a session's context budget with no way to check the result.
+
+What it needs:
+
+1. **A per-layer dispatch, decided from the tensor table, not the model name**: a recurrent layer has
+   `blk.N.attn_qkv.weight`, `blk.N.attn_gate.weight`, `blk.N.ssm_alpha.weight`, `blk.N.ssm_beta.weight`,
+   `blk.N.ssm_out.weight`, `blk.N.ssm_conv1d.weight`, `blk.N.ssm_norm.weight`, `blk.N.ssm_a`,
+   `blk.N.ssm_dt.bias` where an attention layer has `attn_q/k/v/output`. `model_caps.vyb` already counts
+   exactly this way, so the same test belongs in the driver.
+2. **The six projections through the existing quant path**: `stage_one(...)` per tensor, then the
+   quant gemm the attention layers already use (attn_qkv 5120->10240 Q4_K, attn_gate 5120->6144 Q4_K,
+   ssm_beta/ssm_alpha 5120->48 Q8_0, ssm_out 6144->5120 Q4_K) — `mm_nt` is the f64 reference form of
+   the same product, so the layer check's numbers are the target.
+3. **The state cache, per layer per sequence**: the conv state is `(d_conv-1) * conv_channels` values
+   (3 x 10240) and the delta-net state `S * S * H_v` (128 x 128 x 48 = 786432) — llama.cpp calls these
+   `n_embd_r()`/`n_embd_s()`; the layer driver in this repo already exercises both, including the
+   per-step `conv_shift` + `interleave_qkv` and the state-buffer swap.
+4. **The kernel sequence per layer**: rmsnorm(attn_norm) -> the projections -> sigmoid/alpha_gate ->
+   conv -> q|k|v split -> l2norm -> delta_step -> norm_gated -> ssm_out -> residual, i.e. exactly
+   `gdn_layer_driver.vyb`'s chain, now reading real weights.
+5. **Verification, two levels**: per layer against `layer_authority` (already written, and the GPU
+   layer check is already at model geometry on the model's own weights), then the whole model's logits
+   against llama.cpp on the same GGUF — the same "independent oracle" standard as the S0.4 decode
+   oracle, because per-layer agreement cannot see a wiring error between layers.
+
+**And a sequencing fact that changes the finish line**: the Ridge file has 65 blocks and the 65th is
+the MTP head, so `eng_gdn()` alone does not make it runnable — `eng_mtp()` (item 2) must flip too, or
+the descriptor needs a documented "run without the draft head" profile. The caps gate asserts the
+refusal list SHRINKS as well as the new count, so it will say which of the two is still refusing.
+
 ## `eng_gdn()` is STILL 0, deliberately
 
 Do not flip it yet. The descriptor's `eng_gdn()` decides whether the caps gate reports
