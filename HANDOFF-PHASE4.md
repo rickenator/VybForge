@@ -167,11 +167,13 @@ compared element-wise against the independent `gguf` package's Q4_K dequantizer 
 (`run_q4k_gate.sh`). The bug worth remembering: the LOW nibble of each `qs` byte belongs to the EVEN
 sub-block (2g) and the high nibble to 2g+1; swapped, every value was wrong.
 
-Next for this thread: wire the three Q4_K projections (`blk.0.attn_qkv`, `blk.0.attn_gate`,
-`blk.0.ssm_out`) into the layer check with the same mechanism the Q8_0 pair uses (`q4kdeq` on the GPU,
-the reference in numpy for the authority), and — for the GPU side of S0.10 — compare the `q4kdeq`
-kernel's dump against `native/out/q4k_ref.txt` (which already carries the first 4096 values of each
-tensor as raw f64 bit patterns).
+WIRED, and the layer now runs on the model's OWN weights throughout: the three Q4_K projections
+(`blk.0.attn_qkv`, `blk.0.attn_gate`, `blk.0.ssm_out`) are uploaded as raw GGUF bytes and dequantised
+on the GPU by the existing `q4kdeq` kernel, with the authority fed the same values from `q4k_ref.py`.
+Four weight sets are real F32/Q8_0 and three are real Q4_K; nothing in the layer is synthetic any
+more. Measured: 26 stages over two chained steps pass — the Q4_K-driven stages at 4.2e-07 (attn_qkv),
+8.6e-08/1.7e-06 (ssm_out) — and this also exercises `q4kdeq` on whole real tensors against a reference
+that is independently checked (the S0.10 GPU side, as a side effect).
 
 ## `eng_gdn()` is STILL 0, deliberately
 

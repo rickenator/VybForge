@@ -27,6 +27,8 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import q4k_ref                      # our Q4_K port, itself gated against the gguf package (S0.10)
 REPO = os.path.dirname(os.path.dirname(HERE))
 VYBHOME = os.environ.get("VYBHOME", os.path.expanduser("~/Projects/Vyb"))
 VYB = os.environ.get("VYB", os.path.join(VYBHOME, "build", "vyb"))
@@ -130,6 +132,37 @@ def real_f32_weight(name, want_shape):
         return None
 
 
+def real_q4k_weight(name, want_shape):
+    """Raw GGUF bytes and the numpy dequant of a Q4_K tensor, or (None, None, b"").
+
+    The port is q4k_ref.dequant_q4k, which is checked element-wise against the independent gguf
+    package's Q4_K dequantizer in the S0.10 gate — so the authority and the GPU both get values from
+    an independently verified reference, and the GPU's own dequant (q4kdeq) is a third implementation.
+    """
+    try:
+        off = size = None
+        for line in open(INVENTORY):
+            if line.startswith(name + "\t"):
+                f = line.split("\t")
+                off, size = int(f[5]), int(f[6])
+                break
+        if off is None:
+            raise KeyError(name)
+        with open(os.environ.get("VYBFORGE_RIDGE_GGUF",
+                                 os.path.expanduser("~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf")), "rb") as fh:
+            fh.seek(off)
+            raw = fh.read(size)
+        vals = q4k_ref.dequant_q4k(raw)
+        if vals.size != int(np.prod(want_shape)):
+            print(f"GDNL_VERIFY note: real {name} is {vals.size} values, this fixture wants "
+                  f"{int(np.prod(want_shape))} — synthetic here")
+            return None, None, b""
+        return raw, vals.reshape(want_shape), raw
+    except Exception as e:      # noqa: BLE001
+        print(f"GDNL_VERIFY note: real {name} unavailable ({e.__class__.__name__}); synthetic")
+        return None, None, b""
+
+
 def fixture():
     """One fixture, both precisions. Weights are ggml-order: a tensor of ne (K, N) is numpy (N, K)."""
     rng = np.random.default_rng(20261008)
@@ -142,6 +175,10 @@ def fixture():
         attn_norm = real_norm
     wqkv = rng.normal(0.0, s, size=(QKV, NE)).astype(np.float32)
     wgate = rng.normal(0.0, s, size=(VALUE, NE)).astype(np.float32)
+    qkv_raw, qkv_deq, qkv_bytes = real_q4k_weight("blk.0.attn_qkv.weight", (QKV, NE))
+    gate_raw, gate_deq, gate_bytes = real_q4k_weight("blk.0.attn_gate.weight", (VALUE, NE))
+    so_raw, so_deq, so_bytes = real_q4k_weight("blk.0.ssm_out.weight", (NE, VALUE))
+    q4_real = qkv_raw is not None and gate_raw is not None and so_raw is not None
     wbeta = rng.normal(0.0, s, size=(H_V, NE)).astype(np.float32)
     walpha = rng.normal(0.0, s, size=(H_V, NE)).astype(np.float32)
     alpha_raw, alpha_deq = real_q8_weight("blk.0.ssm_alpha.weight")
@@ -157,12 +194,16 @@ def fixture():
         conv1d = real_conv
     ssm_norm = rng.normal(1.0, 0.05, size=S).astype(np.float32)
     ssm_out = rng.normal(0.0, s, size=(NE, VALUE)).astype(np.float32)
+    if q4_real:
+        wqkv, wgate, ssm_out = qkv_deq, gate_deq, so_deq      # the model's own Q4_K projections
     zwindow = np.zeros(DC * QKV, dtype=np.float32)   # the conv buffer, window slots and all (ncs frames/channel)
     state = np.zeros(S * S * H_V, dtype=np.float32)  # a fresh sequence starts at zero
     return dict(x=x, attn_norm=attn_norm, wqkv=wqkv, wqkv_gate=wgate, ssm_beta=wbeta,
                 alpha_q8=(alpha_raw if quantised else b""), beta_q8=(beta_raw if quantised else b""),
+                qkv_q4=(qkv_bytes if q4_real else b""), gate_q4=(gate_bytes if q4_real else b""),
+                out_q4=(so_bytes if q4_real else b""),
                 ssm_alpha=walpha, ssm_dt=dt, ssm_a=a, ssm_conv1d=conv1d, ssm_norm=ssm_norm,
-                ssm_out=ssm_out, zwindow=zwindow, state=state), real, quantised, f32_real
+                ssm_out=ssm_out, zwindow=zwindow, state=state), real, quantised, f32_real, q4_real
 
 
 def build_authority():
@@ -210,7 +251,7 @@ def run_driver(fx):
         for k in ("x", "attn_norm", "wqkv", "wqkv_gate", "ssm_beta", "ssm_alpha", "ssm_dt", "ssm_a",
                   "ssm_conv1d", "ssm_norm", "ssm_out", "zwindow", "state"):
             fh.write(np.ascontiguousarray(fx[k], dtype="<f8").tobytes())
-        for k in ("alpha_q8", "beta_q8"):
+        for k in ("alpha_q8", "beta_q8", "qkv_q4", "gate_q4", "out_q4"):
             fh.write(bytes(fx[k]))                    # raw GGUF bytes, or nothing
     env = dict(os.environ, VYB_STDLIB=STDLIB)
     r = subprocess.run([VYB, "native/host/gdn_layer_driver.vyb"], cwd=REPO,
@@ -257,10 +298,11 @@ def main():
           f"key={KEY} value={VALUE} qkv={QKV}, steps=2")
     if not build_authority() or not build_ptx():
         return 1
-    fx, real, quantised, f32_real = fixture()
+    fx, real, quantised, f32_real, q4_real = fixture()
     print(f"GDNL_VERIFY fixture ssm_a/ssm_dt {'real' if real else 'synthetic'}, "
           f"ssm_alpha/ssm_beta {'REAL Q8_0 tensors (dequantised on the GPU)' if quantised else 'synthetic'}, "
-          f"attn_norm/ssm_conv1d {'REAL F32 tensors (read raw)' if f32_real else 'synthetic'}, "
+          f"attn_norm/ssm_conv1d {'REAL F32' if f32_real else 'synthetic'}, "
+          f"attn_qkv/attn_gate/ssm_out {'REAL Q4_K (dequantised on the GPU)' if q4_real else 'synthetic'}, "
           f"state and conv window start at zero")
 
     # The authority runs the sequence as two single-token steps: step 2 gets step 1's conv window
