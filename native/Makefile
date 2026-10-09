@@ -65,6 +65,12 @@ gdn: $(ROOT)/native/build/gdn.ptx
 gdn-layer: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/rmsnorm.ptx $(ROOT)/native/build/q8_0.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_layer_kernel_verify.py
 
+# unit 9c step 2: the same block, but with every weight staged from the GGUF by the ENGINE's own
+# path (stage-by-name + dequant kernels) and multiplied with layer.ptx's gemm.
+#   ./native/legit/run_gdn_engine_gate.sh
+gdn-engine: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q8_0.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_engine_verify.py
+
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py

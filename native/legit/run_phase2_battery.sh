@@ -349,6 +349,25 @@ else
   step "P4.4 layer-kind dispatch rule" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.5 — the recurrent block on the ENGINE's own weight path (phase 4, unit 9c step 2) ──
+# Gate: native/legit/run_gdn_engine_gate.sh. P4.3 proved the block can be wired out of Vyb kernels,
+# but on a FIXTURE and with `mm_nt` (B = [out,in]). The engine loads each tensor by NAME from the
+# GGUF, dequantises it with the same kernels it uses for every layer, and multiplies with `gemm`
+# (B = [in,out], the dequant kernels' transposing write). This gate runs
+# native/host/gdn_engine_driver.vyb — all ten blk.0 tensors staged from the live GGUF through that
+# path — against the same authority, 26 stages over two chained steps, plus a slot-by-slot check of
+# the staged ssm_out operand at the addresses gemm reads. SKIPs without toolchain/libggml/CUDA/the
+# Ridge download.
+out="$(./native/legit/run_gdn_engine_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "GDN ENGINE GATE: PASS"; then
+  step "P4.5 GDN engine weight path" "$(echo "$out" | grep -oE 'engine path block \([0-9]+ stages\) +PASS.*' | head -1 | sed 's/engine path block //')"
+elif echo "$last" | grep -q "GDN ENGINE GATE: SKIP"; then
+  step "P4.5 GDN engine weight path" "SKIP ($(echo "$last" | sed 's/GDN ENGINE GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.5 GDN engine weight path" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 # ── S0.10 — Q4_K dequant reference (the type with no reference until now) ───────────
 # Gate: native/legit/run_q4k_gate.sh. blk.N.attn_qkv, blk.N.attn_gate and blk.N.ssm_out are all Q4_K
 # (the model's biggest projections) and Q4_K was the one quant type with no numpy reference and no

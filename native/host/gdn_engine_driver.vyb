@@ -1,0 +1,523 @@
+// The recurrent block on the ENGINE's own weight path (VybForge#10 phase 4, unit 9c step 2).
+//
+// What this is, and why it exists. Unit 7/9 proved the block can be wired out of Vyb kernels, but
+// they proved it on a FIXTURE: `gdn_layer_driver.vyb` reads its weights from a .bin file the
+// verifier writes, and multiplies with `mm_nt`. The engine does not work that way — it loads each
+// tensor from the live GGUF by NAME, dequantises the packed types on the GPU with the same kernels
+// it uses for every other layer, and multiplies with `gemm` (layer.ptx), whose B operand is
+// [in,out] (the dequant kernels' transposing write, VybForge#11). This driver is that path, for one
+// recurrent block, and nothing else: if the block's numbers move when the weights come in through
+// the engine's staging, the difference is in the staging, which is exactly what a fixture cannot
+// show.
+//
+// Geometry, dims and strides are DERIVED from the tensor table (the numels of blk.0's own tensors,
+// cross-checked against each other), not spelled out here — so the same driver is correct for any
+// qwen35 model with a recurrent block at layer 0.
+//
+// Inputs (env): VYB_GDN_MODEL (the GGUF), VYB_GDN_TSV (engine tensor index for it),
+//               VYB_GDN_X (f64, 2 x NE values: the two decode steps' inputs).
+// Output: the same DUMP <prefix><stage> <count> format gdn_layer_driver prints, compared stage by
+// stage against layer_authority (unit 5) by native/tools/gdn_engine_verify.py.
+//
+// Prints SKIP and returns 0 without CUDA.
+import env::{env_get}
+import io::{open_read, read_at, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+u8(s<String>, o<Int>)<Int> -> { return (s.char_at(o) as Int) & 255 }
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) {
+        if ((s.char_at(i) as Int) == nd) { return i }
+    }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1
+    seg<Int> = frm
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        if ((s.char_at(i) as Int) == 120) {
+            n = n * parse_u(s, seg, i)
+            seg = i + 1
+        }
+    }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+// packed bytes for a type: Q4_K 144/256, Q6_K 210/256, Q8_0 34/32, else f32. Q8_0 is here because
+// the recurrent block is the first place the engine stages one (ssm_alpha / ssm_beta).
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 8) { return numel * 34 / 32 }
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (nmv.get(i) == nm) { return i }
+    }
+    return -1
+}
+
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        npb<Int> = nbytes - (nbytes % 8)
+        ci<Int> = 0
+        for (ci in 0..(npb / 8) - 1) {
+            o8<Int> = ci * 8
+            ch<Int> = 0
+            bj<Int> = 0
+            for (bj in 0..7) {
+                bv<Int> = u8(data, o8 + bj)
+                ch = ch | (bv << (bj * 8))
+            }
+            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
+        }
+        tj<Int> = npb
+        while (tj < nbytes) {
+            by<Int> = u8(data, tj)
+            if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }
+            tj = tj + 1
+        }
+        return 0
+    }
+    return 0
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+// staged f64 weight from a packed type: inz = the tensor's IN dim, so the kernel writes [in,out]
+// (gemm's B). Same call shape model_driver uses for every attention projection.
+load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
+    data<String> = read_model(path, off, nb)
+    if (data.len() < nb) { return 32 }
+    freedom {
+        e<Int> = download(data, dpack, nb)
+        if (e != 0) { return e }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, dpack, dout, numel, inz)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+load_f32(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
+    data<String> = read_model(path, off, numel * 4)
+    if (data.len() < numel * 4) { return 32 }
+    freedom {
+        e<Int> = download(data, dpack, numel * 4)
+        if (e != 0) { return e }
+        cuMemcpyHtoD_v2(pf + 0, loc(dpack), 8)
+        cuMemcpyHtoD_v2(pf + 8, loc(dout), 8)
+        cuMemcpyHtoD_v2(pf + 16, loc(numel), 8)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)), (numel + 255) / 256, 1, 1, 256, 1, 1, pf, 0, 0, 0)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+
+dump_section(base<Int>, count<Int>, pfx<String>, nm<String>) -> {
+    println("DUMP " + pfx + nm + " " + count.to_string())
+    acc<String> = ""
+    i<Int> = 0
+    for (i in 0..count - 1) {
+        iv<Int> = 0
+        freedom {
+            cuMemcpyDtoH_v2(loc(iv), base + i * 8, 8)
+        }
+        acc = acc + iv.to_string() + " "
+        if (i % 64 == 63) { println(acc); acc = "" }
+    }
+    if (count % 64 != 0) { println(acc) }
+}
+
+dump_slot(base<Int>, idx<Int>, tag<String>) -> {
+    iv<Int> = 0
+    freedom { cuMemcpyDtoH_v2(loc(iv), base + idx * 8, 8) }
+    println("PROBE " + tag + " " + idx.to_string() + " " + iv.to_string())
+}
+
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "."
+    MODEL<String> = env_get("VYB_GDN_MODEL") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
+    TSV<String> = env_get("VYB_GDN_TSV") else "native/out/ridge_tensors.tsv"
+    XF<String> = env_get("VYB_GDN_X") else "native/build/gdn_engine_x.bin"
+    LN<Int> = 0
+
+    # ---- tensor index -------------------------------------------------------------
+    nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+    bff<String> = read_bin(TSV)
+    if (bff.len() < 64) { println("GDN_ENGINE_ERR no tensor index at " + TSV); return 2 }
+    ln = bff.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                t2<Int> = strchr(bff, 9, t1 + 1)
+                if (t2 < 0) { t2 = i }
+                t3<Int> = strchr(bff, 9, t2 + 1)
+                if (t3 < 0) { t3 = i }
+                t4<Int> = strchr(bff, 9, t3 + 1)
+                if (t4 < 0) { t4 = i }
+                nmv.push(bff.substring(st, t1))
+                tyv.push(parse_u(bff, t2 + 1, t3))
+                nlv.push(parse_numel(bff, t1 + 1, t2))
+                ofv.push(parse_u(bff, t3 + 1, t4))
+            }
+            st = i + 1
+        }
+    }
+    println("GDN_ENGINE_TSV_TENSORS=" + nmv.len().to_string())
+    if (nmv.len() < 64) { println("GDN_ENGINE_ERR tensor index too short"); return 2 }
+
+    # ---- geometry, from blk.0's own tensor numels (cross-checked, never assumed) ----
+    i_an<Int> = find_nm(nmv, "blk.0.attn_norm.weight")
+    i_qkv<Int> = find_nm(nmv, "blk.0.attn_qkv.weight")
+    i_gat<Int> = find_nm(nmv, "blk.0.attn_gate.weight")
+    i_bet<Int> = find_nm(nmv, "blk.0.ssm_beta.weight")
+    i_alp<Int> = find_nm(nmv, "blk.0.ssm_alpha.weight")
+    i_out<Int> = find_nm(nmv, "blk.0.ssm_out.weight")
+    i_cw<Int> = find_nm(nmv, "blk.0.ssm_conv1d.weight")
+    i_sn<Int> = find_nm(nmv, "blk.0.ssm_norm.weight")
+    i_dt<Int> = find_nm(nmv, "blk.0.ssm_dt.bias")
+    i_a<Int> = find_nm(nmv, "blk.0.ssm_a")
+    if (i_an < 0 || i_qkv < 0 || i_gat < 0 || i_bet < 0 || i_alp < 0 || i_out < 0
+        || i_cw < 0 || i_sn < 0 || i_dt < 0 || i_a < 0) {
+        println("GDN_ENGINE_ERR blk.0 is not a recurrent block (missing tensors)")
+        return 3
+    }
+    NE<Int> = nlv.get(i_an)
+    HV<Int> = nlv.get(i_a)
+    VALUE<Int> = nlv.get(i_gat) / NE
+    QKV<Int> = nlv.get(i_qkv) / NE
+    DC<Int> = nlv.get(i_cw) / QKV
+    SS<Int> = nlv.get(i_sn)                  # the delta-net state dim (llama.cpp's n_embd_s)
+    HK<Int> = (QKV - VALUE) / (2 * SS)
+    KEY<Int> = HK * SS
+    if (VALUE != HV * SS) { println("GDN_ENGINE_ERR VALUE=" + VALUE.to_string() + " != HV*S=" + (HV * SS).to_string()); return 3 }
+    if (QKV != 2 * KEY + VALUE) { println("GDN_ENGINE_ERR QKV mismatch"); return 3 }
+    if (nlv.get(i_out) != NE * VALUE) { println("GDN_ENGINE_ERR ssm_out shape mismatch"); return 3 }
+    if (nlv.get(i_cw) != QKV * DC) { println("GDN_ENGINE_ERR ssm_conv1d shape mismatch"); return 3 }
+    if (nlv.get(i_alp) != NE * HV) { println("GDN_ENGINE_ERR ssm_alpha shape mismatch"); return 3 }
+    println("GDN_ENGINE_GEOM NE=" + NE.to_string() + " S=" + SS.to_string() + " Hk=" + HK.to_string()
+            + " Hv=" + HV.to_string() + " d_conv=" + DC.to_string() + " key=" + KEY.to_string()
+            + " value=" + VALUE.to_string() + " qkv=" + QKV.to_string())
+    sc<Float> = 1.0 / sqrt(SS as Float)
+    eps<Float> = 0.000001
+    blkNN<Int> = 256
+    gRms<Int> = ((1 * NE) + 255) / 256
+    gQkv<Int> = (QKV + 255) / 256
+    gVal<Int> = (VALUE + 255) / 256
+    gKey<Int> = (KEY + 255) / 256
+    gHead<Int> = (HV * SS + 255) / 256
+    gOut<Int> = (NE + 255) / 256
+    gNE<Int> = (NE + 255) / 256
+    gHV<Int> = (HV + 255) / 256
+
+    # ---- x for the two steps ------------------------------------------------------
+    xb<String> = read_bin(XF)
+    if (xb.len() < 2 * NE * 8) { println("GDN_ENGINE_ERR no step input at " + XF); return 2 }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    # ---- modules: the engine's own kernels (layer.ptx) plus the recurrent op's (gdn.ptx) --
+    # Everything device-side from here down lives in ONE freedom block, the way model_driver
+    # structures it: `loc()`, `from<T>()` and every CUDA call are only allowed inside one.
+    freedom {
+    mL<loc<CVoid>> = from<loc<CVoid>>(0)
+    mG<loc<CVoid>> = from<loc<CVoid>>(0)
+    mQ4<loc<CVoid>> = from<loc<CVoid>>(0)
+    mQ8<loc<CVoid>> = from<loc<CVoid>>(0)
+    mW<loc<CVoid>> = from<loc<CVoid>>(0)
+    rl<CInt> = cuModuleLoadData(loc(mL), read_bin("native/build/layer.ptx"))
+    if (rl != 0) { println("MODLOAD_FAIL layer"); return 9 }
+    rg<CInt> = cuModuleLoadData(loc(mG), read_bin("native/build/gdn.ptx"))
+    if (rg != 0) { println("MODLOAD_FAIL gdn"); return 9 }
+    r4<CInt> = cuModuleLoadData(loc(mQ4), read_bin("native/build/q4k.ptx"))
+    if (r4 != 0) { println("MODLOAD_FAIL q4k"); return 9 }
+    r8<CInt> = cuModuleLoadData(loc(mQ8), read_bin("native/build/q8_0.ptx"))
+    if (r8 != 0) { println("MODLOAD_FAIL q8_0"); return 9 }
+    # f32expand lives in qwen3.ptx (the engine loads it from there too, as efn)
+    rw<CInt> = cuModuleLoadData(loc(mW), read_bin("native/build/qwen3.ptx"))
+    if (rw != 0) { println("MODLOAD_FAIL qwen3"); return 9 }
+    gfn<loc<CVoid>> = from<loc<CVoid>>(0)
+    rfn<loc<CVoid>> = from<loc<CVoid>>(0)
+    refn<loc<CVoid>> = from<loc<CVoid>>(0)
+    hSG<loc<CVoid>> = from<loc<CVoid>>(0)
+    hAG<loc<CVoid>> = from<loc<CVoid>>(0)
+    hSV<loc<CVoid>> = from<loc<CVoid>>(0)
+    hCV<loc<CVoid>> = from<loc<CVoid>>(0)
+    hIL<loc<CVoid>> = from<loc<CVoid>>(0)
+    hSH<loc<CVoid>> = from<loc<CVoid>>(0)
+    hL2<loc<CVoid>> = from<loc<CVoid>>(0)
+    hDS<loc<CVoid>> = from<loc<CVoid>>(0)
+    hNG<loc<CVoid>> = from<loc<CVoid>>(0)
+    hQ4<loc<CVoid>> = from<loc<CVoid>>(0)
+    hQ8<loc<CVoid>> = from<loc<CVoid>>(0)
+    exfn<loc<CVoid>> = from<loc<CVoid>>(0)
+    if (cuModuleGetFunction(loc(gfn), mL, "gemm") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(rfn), mL, "rmsnorm") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(refn), mL, "resid") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(exfn), mW, "f32expand") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hSG), mG, "sigmoid_k") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hAG), mG, "alpha_gate") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hSV), mG, "silu_k") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hCV), mG, "conv1d_k") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hIL), mG, "interleave_qkv") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hSH), mG, "conv_shift") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hL2), mG, "l2norm") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hDS), mG, "delta_step") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hNG), mG, "norm_gated") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hQ4), mQ4, "q4kdeq") != 0) { return 10 }
+    if (cuModuleGetFunction(loc(hQ8), mQ8, "q8_0deq") != 0) { return 10 }
+
+    # ---- buffers ------------------------------------------------------------------
+    DAN<Int> = 0; DWQKV<Int> = 0; DWG<Int> = 0; DWB<Int> = 0; DWA<Int> = 0; DSO<Int> = 0
+    DCW<Int> = 0; DSN<Int> = 0; DDT<Int> = 0; DA<Int> = 0
+    DXN<Int> = 0; DQKV<Int> = 0; DZ<Int> = 0; DBRAW<Int> = 0; DBETA<Int> = 0; DARAW<Int> = 0
+    DGATE<Int> = 0; DCONV<Int> = 0; DCONVS<Int> = 0; DCRAW<Int> = 0; DQN<Int> = 0; DKN<Int> = 0
+    DSTATE<Int> = 0; DSTOUT<Int> = 0; DEL<Int> = 0; DOUT<Int> = 0; DEPI<Int> = 0
+    DY<Int> = 0; DLO<Int> = 0; DX<Int> = 0; DPK<Int> = 0
+    P1<Int> = 0; P2<Int> = 0; P3<Int> = 0; P4<Int> = 0
+    cuMemAlloc_v2(loc(DAN), NE * 8)
+    cuMemAlloc_v2(loc(DWQKV), QKV * NE * 8)
+    cuMemAlloc_v2(loc(DWG), VALUE * NE * 8)
+    cuMemAlloc_v2(loc(DWB), HV * NE * 8)
+    cuMemAlloc_v2(loc(DWA), HV * NE * 8)
+    cuMemAlloc_v2(loc(DSO), NE * VALUE * 8)
+    cuMemAlloc_v2(loc(DCW), QKV * DC * 8)
+    cuMemAlloc_v2(loc(DSN), SS * 8)
+    cuMemAlloc_v2(loc(DDT), HV * 8)
+    cuMemAlloc_v2(loc(DA), HV * 8)
+    cuMemAlloc_v2(loc(DXN), NE * 8)
+    cuMemAlloc_v2(loc(DQKV), QKV * 8)
+    cuMemAlloc_v2(loc(DZ), VALUE * 8)
+    cuMemAlloc_v2(loc(DBRAW), HV * 8)
+    cuMemAlloc_v2(loc(DBETA), HV * 8)
+    cuMemAlloc_v2(loc(DARAW), HV * 8)
+    cuMemAlloc_v2(loc(DGATE), HV * 8)
+    cuMemAlloc_v2(loc(DCONV), DC * QKV * 8)
+    cuMemAlloc_v2(loc(DCONVS), QKV * 8)
+    cuMemAlloc_v2(loc(DCRAW), QKV * 8)
+    cuMemAlloc_v2(loc(DQN), KEY * 8)
+    cuMemAlloc_v2(loc(DKN), KEY * 8)
+    cuMemAlloc_v2(loc(DSTATE), SS * SS * HV * 8)
+    cuMemAlloc_v2(loc(DSTOUT), SS * SS * HV * 8)
+    cuMemAlloc_v2(loc(DEL), SS * HV * 8)
+    cuMemAlloc_v2(loc(DOUT), SS * HV * 8)
+    cuMemAlloc_v2(loc(DEPI), SS * HV * 8)
+    cuMemAlloc_v2(loc(DY), NE * 8)
+    cuMemAlloc_v2(loc(DLO), NE * 8)
+    cuMemAlloc_v2(loc(DX), 2 * NE * 8)
+    pk<Int> = packed_bytes(nlv.get(i_qkv), tyv.get(i_qkv))
+    cuMemAlloc_v2(loc(DPK), pk)
+    cuMemAlloc_v2(loc(P1), 128) ; cuMemAlloc_v2(loc(P2), 128)
+    cuMemAlloc_v2(loc(P3), 128) ; cuMemAlloc_v2(loc(P4), 128)
+
+    # ---- stage the block's weights through the ENGINE's path -----------------------
+    e<Int> = 0
+    e = load_f32(MODEL, P1, DPK, DAN, ofv.get(i_an), NE, exfn) ; if (e != 0) { println("STAGE_ERR attn_norm " + e.to_string()); return 40 }
+    e = load_quant(MODEL, DPK, DWQKV, ofv.get(i_qkv), packed_bytes(nlv.get(i_qkv), tyv.get(i_qkv)), nlv.get(i_qkv), hQ4, NE) ; if (e != 0) { println("STAGE_ERR attn_qkv " + e.to_string()); return 41 }
+    e = load_quant(MODEL, DPK, DWG, ofv.get(i_gat), packed_bytes(nlv.get(i_gat), tyv.get(i_gat)), nlv.get(i_gat), hQ4, NE) ; if (e != 0) { println("STAGE_ERR attn_gate " + e.to_string()); return 42 }
+    e = load_quant(MODEL, DPK, DWB, ofv.get(i_bet), packed_bytes(nlv.get(i_bet), tyv.get(i_bet)), nlv.get(i_bet), hQ8, NE) ; if (e != 0) { println("STAGE_ERR ssm_beta " + e.to_string()); return 43 }
+    e = load_quant(MODEL, DPK, DWA, ofv.get(i_alp), packed_bytes(nlv.get(i_alp), tyv.get(i_alp)), nlv.get(i_alp), hQ8, NE) ; if (e != 0) { println("STAGE_ERR ssm_alpha " + e.to_string()); return 44 }
+    e = load_quant(MODEL, DPK, DSO, ofv.get(i_out), packed_bytes(nlv.get(i_out), tyv.get(i_out)), nlv.get(i_out), hQ4, VALUE) ; if (e != 0) { println("STAGE_ERR ssm_out " + e.to_string()); return 45 }
+    e = load_f32(MODEL, P1, DPK, DCW, ofv.get(i_cw), QKV * DC, exfn) ; if (e != 0) { println("STAGE_ERR ssm_conv1d " + e.to_string()); return 46 }
+    e = load_f32(MODEL, P1, DPK, DSN, ofv.get(i_sn), SS, exfn) ; if (e != 0) { println("STAGE_ERR ssm_norm " + e.to_string()); return 47 }
+    e = load_f32(MODEL, P1, DPK, DDT, ofv.get(i_dt), HV, exfn) ; if (e != 0) { println("STAGE_ERR ssm_dt " + e.to_string()); return 48 }
+    e = load_f32(MODEL, P1, DPK, DA, ofv.get(i_a), HV, exfn) ; if (e != 0) { println("STAGE_ERR ssm_a " + e.to_string()); return 49 }
+    up<Int> = download(xb, DX, 2 * NE * 8)
+    if (up != 0) { return 15 }
+    # The conv window and both delta-net state buffers start at ZERO (a fresh sequence), and
+    # state_out is written before step 1 reads it. Zeroing them element-by-element would be 1.6 M
+    # host-to-device calls; one zero file read and three downloads is the same bytes in three calls.
+    ZF<String> = env_get("VYB_GDN_Z") else "native/build/gdn_engine_zero.bin"
+    zs<String> = read_bin(ZF)
+    if (zs.len() < SS * SS * HV * 8) { println("GDN_ENGINE_ERR no zero buffer at " + ZF); return 2 }
+    zc<Int> = download(zs, DCONV, DC * QKV * 8) ; if (zc != 0) { return 15 }
+    zc = download(zs, DSTATE, SS * SS * HV * 8) ; if (zc != 0) { return 15 }
+    zc = download(zs, DSTOUT, SS * SS * HV * 8) ; if (zc != 0) { return 15 }
+    println("GDN_ENGINE_STAGED attn_norm F32, attn_qkv Q4_K, attn_gate Q4_K, ssm_beta Q8_0, ssm_alpha Q8_0, ssm_out Q4_K, ssm_conv1d F32, ssm_norm F32, ssm_dt F32, ssm_a F32")
+    # The staged ssm_out operand, at a few (k,n) slots of the [in,out] layout: the engine's gemm
+    # reads B[k*N+n], and the verifier compares these against the model's own dequantised tensor.
+    dump_slot(DSO, 0 * NE + 0, "so")
+    dump_slot(DSO, 0 * NE + 3994, "so")
+    dump_slot(DSO, 1 * NE + 3994, "so")
+    dump_slot(DSO, 2 * NE + 3994, "so")
+    dump_slot(DSO, 3994 * NE + 3994, "so")
+    dump_slot(DSO, 6143 * NE + 3994, "so")
+    dump_slot(DSO, 5000 * NE + 3994, "so")
+    dump_slot(DSO, 0 * NE + 100, "so")
+
+    freedom {
+        stin<Int> = DSTATE
+        stout<Int> = DSTOUT
+        st<Int> = 0
+        for (st in 0..1) {
+            xp<Int> = DX + st * NE * 8
+            pf<String> = "s1_"
+            if (st == 1) { pf = "s2_" }
+            # rc lives at the STEP scope, not inside the `if`: a declaration inside a block is not
+            # visible after it, and every launch below assigns to this one.
+            rc<CInt> = 0
+            if (st > 0) {
+                put_i(P4, 0, DCONV) ; put_i(P4, 8, QKV) ; put_i(P4, 16, DC) ; put_i(P4, 24, 0)
+                rc = cuda_launch4i(from<loc<CVoid>>(addr(hSH)), gQkv, 1, 1, 256, 1, 1, P4, 0, 0, 0)
+                if (rc != 0) { println("GDN_ENGINE_ERR conv_shift") ; return 12 }
+            }
+            # 1. attn_norm — the engine's own rmsnorm kernel
+            put_i(P1, 0, xp) ; put_i(P1, 8, DAN) ; put_i(P1, 16, DXN)
+            put_i(P1, 24, 1) ; put_i(P1, 32, NE) ; put_f(P1, 40, eps)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), gRms, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR rmsnorm") ; return 12 }
+            # 2. the six projections through the ENGINE's gemm (B is [in,out] from the dequant)
+            put_f(P2, 48, 1.0) ; put_f(P2, 56, 0.0)
+            put_i(P2, 0, DXN) ; put_i(P2, 8, DWQKV) ; put_i(P2, 16, DQKV)
+            put_i(P2, 24, 1) ; put_i(P2, 32, QKV) ; put_i(P2, 40, NE)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), gQkv, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR gemm qkv") ; return 12 }
+            put_i(P2, 8, DWG) ; put_i(P2, 16, DZ) ; put_i(P2, 32, VALUE)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), gVal, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR gemm gate") ; return 12 }
+            put_i(P2, 8, DWB) ; put_i(P2, 16, DBRAW) ; put_i(P2, 32, HV)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), gHV, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR gemm beta") ; return 12 }
+            put_i(P2, 8, DWA) ; put_i(P2, 16, DARAW) ; put_i(P2, 32, HV)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), gHV, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR gemm alpha") ; return 12 }
+            # 3. the two gates
+            put_i(P3, 0, DBRAW) ; put_i(P3, 8, DBETA) ; put_i(P3, 16, HV)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hSG)), 1, 1, 1, 64, 1, 1, P3, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR sigmoid") ; return 12 }
+            put_i(P3, 0, DARAW) ; put_i(P3, 8, DDT) ; put_i(P3, 16, DA) ; put_i(P3, 24, DGATE) ; put_i(P3, 32, HV)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hAG)), 1, 1, 1, 64, 1, 1, P3, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR alpha_gate") ; return 12 }
+            # 4. the conv input's token frames, the causal short conv, then SiLU
+            put_i(P4, 0, DQKV) ; put_i(P4, 8, DCONV) ; put_i(P4, 16, QKV) ; put_i(P4, 24, DC) ; put_i(P4, 32, 1)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hIL)), gQkv, 1, 1, 256, 1, 1, P4, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR interleave") ; return 12 }
+            put_i(P3, 0, DCONV) ; put_i(P3, 8, DCW) ; put_i(P3, 16, DCRAW)
+            put_i(P3, 24, QKV) ; put_i(P3, 32, DC) ; put_i(P3, 40, 1)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hCV)), gQkv, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR conv") ; return 12 }
+            put_i(P3, 0, DCRAW) ; put_i(P3, 8, DCONVS) ; put_i(P3, 16, QKV)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hSV)), gQkv, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR silu") ; return 12 }
+            # 5. l2 norm on q and k (the split is a channel offset)
+            put_i(P1, 0, DCONVS) ; put_i(P1, 8, DQN) ; put_i(P1, 16, HK) ; put_i(P1, 24, SS) ; put_f(P1, 32, eps)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), gKey, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR l2 q") ; return 12 }
+            put_i(P1, 0, DCONVS + KEY * 8) ; put_i(P1, 8, DKN)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), gKey, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR l2 k") ; return 12 }
+            # 6. the recurrence
+            put_i(P2, 0, DQN) ; put_i(P2, 8, DKN) ; put_i(P2, 16, DCONVS + 2 * KEY * 8)
+            put_i(P2, 24, DGATE) ; put_i(P2, 32, DBETA) ; put_i(P2, 40, stin)
+            put_i(P2, 48, stout) ; put_i(P2, 56, DOUT) ; put_i(P2, 64, DEL)
+            put_i(P2, 72, SS) ; put_i(P2, 80, HK) ; put_i(P2, 88, HV) ; put_f(P2, 96, sc)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hDS)), 1, 1, 1, HV, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR delta_step") ; return 12 }
+            # 7. the gated RMS epilogue, ssm_out (engine gemm), the residual (engine resid)
+            put_i(P3, 0, DOUT) ; put_i(P3, 8, DZ) ; put_i(P3, 16, DSN) ; put_i(P3, 24, DEPI)
+            put_i(P3, 32, HV) ; put_i(P3, 40, SS) ; put_f(P3, 48, eps)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hNG)), gHead, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR norm_gated") ; return 12 }
+            put_i(P2, 0, DEPI) ; put_i(P2, 8, DSO) ; put_i(P2, 16, DY)
+            put_i(P2, 24, 1) ; put_i(P2, 32, NE) ; put_i(P2, 40, VALUE)
+            # P2 is SHARED with delta_step, which writes +48/+56 (stout/DOUT as pointers). gemm
+            # reads alpha/beta from exactly those offsets, so they must be re-stated here: without
+            # this, alpha is a pointer's bits reinterpreted as f64 (~1e-308) and the whole
+            # projection comes back as denormals. Caught by comparing against the authority.
+            put_f(P2, 48, 1.0) ; put_f(P2, 56, 0.0)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), gOut, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+            if (rc != 0) { println("GDN_ENGINE_ERR gemm ssm_out") ; return 12 }
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(refn)), gNE, 1, 1, 256, 1, 1, DY, xp, DLO, NE)
+            if (rc != 0) { println("GDN_ENGINE_ERR residual") ; return 12 }
+            cuCtxSynchronize()
+
+            sw<Int> = stin ; stin = stout ; stout = sw
+            dump_section(DXN, NE, pf, "xn")
+            dump_section(DQKV, QKV, pf, "qkv")
+            dump_section(DZ, VALUE, pf, "z")
+            dump_section(DBETA, HV, pf, "beta")
+            dump_section(DGATE, HV, pf, "gate")
+            dump_section(DCONVS, QKV, pf, "conv_silu")
+            dump_section(DQN, KEY, pf, "q_norm")
+            dump_section(DKN, KEY, pf, "k_norm")
+            dump_section(DOUT, SS * HV, pf, "gdn_out")
+            dump_section(DEPI, SS * HV, pf, "epi")
+            dump_section(DY, NE, pf, "y")
+            dump_section(DLO, NE, pf, "layer_out")
+            dump_section(stin, SS * SS * HV, pf, "state_out")
+        }
+    }
+    println("GDN_ENGINE_DONE steps=2 NE=" + NE.to_string() + " S=" + SS.to_string()
+            + " Hk=" + HK.to_string() + " Hv=" + HV.to_string() + " d_conv=" + DC.to_string())
+    return 0
+    }
+    return 0
+}
