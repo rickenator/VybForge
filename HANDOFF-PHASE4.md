@@ -53,35 +53,38 @@ authority runner verbatim, so only the driver under test changed.
 * the projection is now verified in three layers: the block (26 stages) vs ggml, the block's OPERAND
   vs the model's own tensor, and the two mis-wirings as prints.
 
-**Unit 9c step 3 is STARTED (gate P4.5 now drives the engine's own file): the recurrent branch lives
-in `native/host/model_driver.vyb`.** The block is no longer a side harness: `VYB_GDN_PROBE=<layer>`
-makes the ENGINE's driver stage blk.0's ten tensors from the live GGUF through its own staging
-(found by name in the tensor index, `q4kdeq`/`q8_0deq`/`f32expand`), run the chain with its own
-`gemm`/`rmsnorm`/`resid` plus the gdn.ptx ops, carry the conv window and the delta-net state across
-two decode steps, and dump the 13 stages. `native/tools/gdn_engine_verify.py` drives that instead of
-the standalone driver, which is now DELETED — one implementation, verified where it will run.
-Measured: 26/26 stages, worst 3.903e-06, unchanged.
+**Unit 9c step 3 is DONE FOR THE LOOP (commit 9e6619f, gate P4.5): the layer loop dispatches and the
+recurrent branch is inside it.** `native/host/model_driver.vyb` asks `mc_layer_kind` per block and runs
+the Gated DeltaNet mixer for kind 2 — staging the ten mixer weights plus the block's FFN from the GGUF
+by name, running the mixer one token at a time (the sequential rule, per-layer conv window and
+delta-net state in a cache allocated once for every text block), writing the block's residual into the
+same `X1` the attention branch writes and feeding one shared FFN (`run_layer` is now
+`run_layer_attn` + `run_ffn`). `VYB_GDN_PROBE=<layer>` restricts the loop to one block with the input
+from the fixture, so P4.5 verifies THE LOOP's own dispatch, staging, cache and chain: 26/26 stages,
+worst 3.903e-06, two chained tokens, unchanged. Three bugs fell out and are fixed: buffer sizing from
+blk.0 (recurrent in a hybrid model — no attn_q/k/v), the qwen35 FFN pre-norm name
+(`post_attention_norm`), and an activation buffer shadowing the geometry variable of the same name
+(which zeroed every size and failed the first allocation).
 
-Also landed in the engine file: `gdn.ptx` + `q8_0.ptx` loaded with their ten function handles, the
-`put_i`/`put_f`/`dump_section`/`dump_slot` helpers, and `VYB_MODEL`/`VYB_TSV` overrides so the same
-driver can be pointed at another model without editing it.
+**What is left for a first 27B token, and what is blocking what:**
 
-**What step 3 still needs (the loop itself, not the block):**
-
-1. **the per-layer dispatch in `main`'s layer loop** — the loop today stages `attn_q/k/v/output` and
-   runs `run_layer` for every block. It must `mc_layer_kind(...)` each block, run the recurrent
-   branch for kind 2 (the stage+chain code is already there, in the probe) and the attention branch
-   otherwise, and keep the draft head (kind 1, block `>= text_layers`) out of the text path;
-2. **the per-layer state cache** — conv window `(d_conv-1)*conv_channels` + delta-net `S*S*H_v` per
-   recurrent layer (48 x (40960 + 786432) x 8 B ~= 320 MB), zeroed once at sequence start and
-   swapped per step, exactly as the probe does for one layer;
-3. **the FFN half** of a recurrent block — `run_layer` does attention AND ffn; for a recurrent layer
-   the mixer's residual output (what the probe dumps as `layer_out`) feeds the same FFN it already
-   contains, so `run_layer` wants splitting into `run_layer_attn` + `run_ffn`;
-4. **then** the whole-model logits against llama.cpp. That needs two things that are NOT this unit:
-   IMROPE for the Ridge ATTENTION layers (`rope.dimension_sections [11,11,10,0]` — the engine's
-   `qwen3rope` is pairs-only) and the multi-token/prefill path for recurrent layers (today only the
-   sequential T=1 kernel is characterised). Neither is started.
+1. **The whole-model logits comparison against llama.cpp** — the finish line for unit 9c's item 5. It
+   needs the pieces below; per-layer agreement cannot see a wiring error BETWEEN layers, so this is
+   not optional.
+2. **IMROPE for the Ridge attention layers** (`rope.dimension_sections [11,11,10,0]`; the engine's
+   `qwen3rope` is pairs-only) — and note qwen35's attention also FOLDS AN OUTPUT GATE INTO `attn_q`
+   (`blk.3.attn_q.weight` is `5120x12288` = q + gate), which the engine's attention path does not
+   build. Both are attention-path work, not recurrent work, and neither is started.
+3. **The multi-token/prefill path for recurrent layers** — the loop runs the SEQUENTIAL kernel one
+   token at a time (correct for decode); llama.cpp's chunked prefill kernel is uncharacterised, so a
+   long prompt is either slow (sequential) or unverified (chunked). `--tokens 1` in the reference still
+   stands.
+4. **Session state** — the state cache is correct within ONE forward pass. Persisting a sequence across
+   passes needs the per-block slot parity (and the conv window) carried in a session object, which the
+   engine does not have yet; a chat server would need it before a second token can follow a first.
+5. **Smaller:** the P4.5 probe verifies blk.0 only (the verifier's fixture/authority side is built from
+   blk.0's weights, so a second block needs that parameterised); `eng_mtp()`/the 65th block; and the
+   two standing follow-ups (S0.10's q4kdeq-vs-reference promotion, retiring `gdn_ref.py`).
 
 `eng_gdn()` and `eng_mtp()` are both still 0 and both still have to flip (or the descriptor needs a
 documented "without the draft head" profile) before the caps gate can call the Ridge model SUPPORTED.

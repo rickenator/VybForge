@@ -688,3 +688,50 @@ answers, P4.4), the per-layer state cache (48 x (40960 conv + 786432 delta-net) 
 logits against llama.cpp — which waits on two things outside this unit: IMROPE for Ridge's attention
 layers (`rope.dimension_sections [11,11,10,0]`; the engine's rope is pairs-only) and the multi-token
 prefill path for recurrent layers (only the sequential T=1 kernel is characterised so far).
+
+## Unit 9c step 3 — the layer loop dispatches, and the block is inside it (DONE for the loop)
+
+The engine's layer loop no longer assumes every block is attention. It asks `mc_layer_kind` per block —
+the same rule the capability descriptor counts with (P4.4) — and for a recurrent block runs the Gated
+DeltaNet mixer: the ten mixer weights staged from the GGUF by name through the engine's own path plus
+the block's FFN weights, the mixer run ONE TOKEN AT A TIME (the sequential rule, which is what a decode
+step is), the conv window carried in place by `conv_shift` and the delta-net state carried in a
+per-layer cache slot, and the block's residual written into the SAME `X1` the attention branch writes.
+Both branches then feed one shared FFN: `run_layer` became `run_layer_attn` + `run_ffn`.
+
+The state cache is allocated once for every text block — conv windows, and two delta-net slots per
+block used alternately so the in/out swap is a pointer rather than a 6 MB copy — and cleared with one
+`cuMemsetD8_v2` per buffer. `VYB_GDN_PROBE=<layer>` restricts the loop to a single block with its input
+read from the fixture, so the gate now verifies THE LOOP's own dispatch, staging, cache and chain
+rather than a copy of them: 26/26 stages, worst 3.903e-06 over two chained tokens, unchanged.
+
+### Three bugs a hybrid model found that a dense one could not
+
+* **Buffer sizing from block 0.** The attention buffers were sized from `blk.0.attn_q/k/v/output` — but
+  in a hybrid model block 0 is RECURRENT and carries none of them, so every attention buffer took a
+  missing tensor's size and the first allocation failed (main returned 11 before any work). Sizing now
+  uses the first ATTENTION block as the template, with sane defaults for tensors an architecture names
+  differently.
+* **`post_attention_norm`.** qwen35 names the FFN's pre-norm `post_attention_norm`; qwen3 calls it
+  `ffn_norm`. A name-based staging call fails outright on the one that is absent, so the recurrent
+  branch resolves either name and stages by index.
+* **A shadowed variable that zeroed every size.** An activation buffer named `GQKV` shadowed the
+  geometry variable of the same name; every size computed from it became 0 and the allocation of a
+  419 MB weight buffer was the first casualty. Separately, the 410 MB state cache was being zeroed by
+  the host-side `download` helper, which moves 8 bytes per device call — 51 M calls, minutes of wall
+  clock — instead of one `cuMemsetD8_v2`.
+
+The lesson worth keeping: **a hybrid model exercises the parts of a loader that a dense one leaves
+dormant**, and those parts are exactly where the assumptions live (`blk.0` is an attention layer; the
+FFN's norm is called `ffn_norm`). Both assumptions had been true for 36 dense layers.
+
+### What this does NOT yet do
+
+The sequential kernel is the decode rule, so a recurrent block is correct at T=1 per token and slow for
+a long prompt; llama.cpp's chunked prefill kernel is still uncharacterised. The state cache is correct
+within one forward pass and does not yet persist its slot parity across passes (there is no session
+state in the engine — a chat server would need one before a second token can follow a first). And the
+gate verifies one block (blk.0), because the authority side of the fixture is built from blk.0's
+weights; a second block needs that parameterised. `eng_gdn()` stays 0 until the whole-model logits are
+compared against llama.cpp — which also needs IMROPE for Ridge's attention layers and its `attn_q`
+output gate, both attention-path work.
