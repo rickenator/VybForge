@@ -168,7 +168,11 @@ int main(int argc, char ** argv) {
         // NOT cast to F16: llama.cpp does that at its call site, but doing the same here (with
         // ggml_flash_attn_ext_set_prec F32) turned the output into nans, so the F16 cast is not the
         // explanation for the mismatch below and is left out.
-        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qr, kr, vp, mask2, kqs, 0.0f, 0.0f);
+        // q must be (hd, n_tokens, n_head) here: llama.cpp permutes q/k/v all three before the call,
+        // and q's native layout is (hd, n_head, n_tokens) while this harness passes that form
+        // straight through. k/v are already (hd, n_head, n_tokens) — the layout the op wants.
+        struct ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, qr, 0, 2, 1, 3));
+        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kr, vp, mask2, kqs, 0.0f, 0.0f);
         // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
         // n_tokens) that the split half of this harness and the gate multiply use
         at = flash ? ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3)) : at_ex;
@@ -176,7 +180,11 @@ int main(int argc, char ** argv) {
         // GQA (n_kv < n_head): the hand-rolled products cannot be expressed, so the flash op — the one
         // llama.cpp uses for this architecture — is the authority, and the two diagnostic slots are
         // zeros. Keep the slot COUNT and ORDER identical in both modes: the reader walks positionally.
-        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qr, kr, vp, mask2, kqs, 0.0f, 0.0f);
+        // q must be (hd, n_tokens, n_head) here: llama.cpp permutes q/k/v all three before the call,
+        // and q's native layout is (hd, n_head, n_tokens) while this harness passes that form
+        // straight through. k/v are already (hd, n_head, n_tokens) — the layout the op wants.
+        struct ggml_tensor * qf = ggml_cont(ctx, ggml_permute(ctx, qr, 0, 2, 1, 3));
+        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qf, kr, vp, mask2, kqs, 0.0f, 0.0f);
         at = ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3));
         kqs_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);
         pr    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);

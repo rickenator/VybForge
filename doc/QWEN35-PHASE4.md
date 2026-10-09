@@ -1241,3 +1241,21 @@ the diff comes back clean.
 
 The harness is restored to its working state and the default fixture is unaffected: all ten stages
 verify at worst 4.597e-07.
+
+### The q permute (copied from llama.cpp's call site) changed NOTHING — and that is now the lead
+
+The reference's flash call site permutes q, k and v all three with `(0,2,1,3)` before
+`ggml_flash_attn_ext`, and this harness was passing q in its native `(hd, n_head, n_tokens)` form. That
+looked like the answer. Applied at both call sites, the result is **1.073e+00 — identical to four
+digits** to the run before it.
+
+A layout change that leaves the output bit-for-bit the same is not a small effect; it says the harness
+is not actually feeding the op a different q, or that the op does not read q where I think. So the next
+check is not another hypothesis but a DIRECT INSTRUMENTATION of the call: print `qf->ne[]`, `qf->nb[]`,
+`kr->ne[]`, `vp->ne[]`, `mask2->ne[]` at the point of the call (the shape probe used earlier in this unit
+worked the same way, and `at->ne` from it is what established the output is `(hd, n_tokens, n_head)`).
+If qf's and qr's `nb` differ and the output is still identical, the difference is inside the op's reading
+of them, and THAT is where a source read should focus (the `_one_chunk` loop's q/k/v indexing).
+
+The q permute is kept: it matches the reference call site, and the explicit path — the one that is
+verified — does not go through this code.
