@@ -231,7 +231,7 @@ emb_dequant(path<String>, off<Int>, total<Int>, dpk<Int>, q6fn<loc<CVoid>>, de<I
 // their per-head norms, rope, attention, the output projection and the residual. The FFN that
 // follows it in every block is `run_ffn` — split out so a RECURRENT block (whose mixer writes the
 // same X1) can use it too. The remaining parameters are the FFN's, kept for call-site compatibility.
-run_layer_attn(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
+run_layer_attn(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, NROT<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           EPS<Float>, XI<Int>, XO<Int>,
           gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
           GM<Int>, RN<Int>, ATT<Int>, ROP<Int>,
@@ -272,11 +272,15 @@ run_layer_attn(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<
         cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
 
-        cuMemcpyHtoD_v2(ROP + 80, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN), 8)
-        cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr), 8)
-        cuMemcpyHtoD_v2(ROP + 176, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 184, loc(S), 8)
-        cuMemcpyHtoD_v2(ROP + 200, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 208, loc(H), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVH), 8)
-        cuMemcpyHtoD_v2(ROP + 224, loc(zro), 8)   # POS offset = 0 (qwen3rope +224)
+        # rope_nrot's layout (native/kernels/rope.vyb): +0 Q, +8 K, +16 Qd, +24 Kd, +32 FR, +40 S,
+        # +48 HD, +56 H, +64 KVH, +72 POS, +80 NROT. ROP is 232 B and nothing else reads its low
+        # half, so the variant reuses the block.
+        cuMemcpyHtoD_v2(ROP + 0, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 8, loc(DKN), 8)
+        cuMemcpyHtoD_v2(ROP + 16, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 24, loc(DKr), 8)
+        cuMemcpyHtoD_v2(ROP + 32, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 40, loc(S), 8)
+        cuMemcpyHtoD_v2(ROP + 48, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 56, loc(H), 8); cuMemcpyHtoD_v2(ROP + 64, loc(KVH), 8)
+        cuMemcpyHtoD_v2(ROP + 72, loc(zro), 8)      # POS base = 0
+        cuMemcpyHtoD_v2(ROP + 80, loc(NROT), 8)     # how many of each head's dims rotate
         rope_total<Int> = S * H * HD + S * KVH * HD
         cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
 
@@ -521,6 +525,11 @@ main()<Int> -> {
         rcw<CInt> = -1
         tw<Int> = 0
         for (tw in 0..5) { if (rcw != 0) { mw = from<loc<CVoid>>(0); rcw = cuModuleLoadData(loc(mw), read_bin("native/build/qwen3.ptx")) } }
+        mrope<loc<CVoid>> = from<loc<CVoid>>(0)
+        rcw2<CInt> = -1
+        rcw2 = cuModuleLoadData(loc(mrope), read_bin("native/build/rope.ptx"))
+        for (tw2 in 0..5) { if (rcw2 != 0) { mrope = from<loc<CVoid>>(0); rcw2 = cuModuleLoadData(loc(mrope), read_bin("native/build/rope.ptx")) } }
+        if (rcw2 != 0) { println("MODLOAD_FAIL rope"); return 9 }
         if (rcw != 0) { println("MODLOAD_FAIL qwen3"); return 9 }
         q4fn<loc<CVoid>> = from<loc<CVoid>>(0)
         q6fn<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -541,7 +550,7 @@ main()<Int> -> {
         lsfn<loc<CVoid>> = from<loc<CVoid>>(0)
         arfn<loc<CVoid>> = from<loc<CVoid>>(0)
         emfn<loc<CVoid>> = from<loc<CVoid>>(0)
-        if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(rpfn), mrope, "rope_nrot") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
@@ -786,8 +795,14 @@ main()<Int> -> {
         }
 
         fb<String> = read_bin("native/out/layer0_invfreq.bin")
-        if (fb.len() < 64 * 8) { println("INVFREQ_MISSING"); return 35 }
-        download(fb, DF, 64 * 8)
+        if (fb.len() < 8) { println("INVFREQ_MISSING"); return 35 }
+        # the table holds one inverse frequency per PAIR, so n_dims = 2 * entries: 64 entries is
+        # Qwen3-4B's whole 128-dim head (rotate everything, as qwen3rope did), 32 is Ridge's
+        # 64-of-256. Reading it here rather than hardcoding it is what lets one kernel serve both.
+        NROTP<Int> = fb.len() / 8
+        if (NROTP > 64) { NROTP = 64 }        # DF is 64 entries
+        download(fb, DF, NROTP * 8)
+        NROT<Int> = NROTP * 2
 
         XI<Int> = XA; XO<Int> = XB
         e<Int> = 0
@@ -995,7 +1010,7 @@ main()<Int> -> {
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn, 0); if (e != 0) { return 79 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn, 0); if (e != 0) { return 80 }
 
-            e = run_layer_attn(S, D, H, KVH, HD, FF, NQ, NKV, EPS, XI, XO,
+            e = run_layer_attn(S, D, H, KVH, HD, NROT, FF, NQ, NKV, EPS, XI, XO,
                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                           N1, DWq, DWk, DWv, Nq, Nk, DF, DWo, N2, DWg, DWu, DWd,
                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
