@@ -956,3 +956,28 @@ keep); and K must be reshaped to `(head_dim, n_kv, n_tokens)` before the per-hea
 over the whole `n_kv*head_dim` width and rope sees a 2-D tensor (ggml asserts on that).
 
 Not covered yet: attention itself, the output gate `attn * sigmoid(gate)`, and `wo`.
+
+## Unit 10 step 3b — the harness covers the whole block; the last three stages are NOT yet authorised
+
+The harness now computes attention (causal), the output gate `attn * sigmoid(gate)` and `wo` as well,
+and the verifier reports all ten stages. The gate covers SEVEN: the numbers for the last three are
+printed every run and marked `ATTN_VERIFY_NOT_GATED`, with the reason, because they do not agree yet —
+
+    attn   1.409e+00     gated  1.352e+00     out  9.278e-01
+
+The diagnosis, so the next session starts where the evidence is: `ggml_diag_mask_inf` masks `ne0` against
+`ne2`, and in this layout `ne2` is the HEAD axis, not the query axis — so the causal mask is being
+applied along the wrong axis. The attention needs the layout llama.cpp's non-flash path actually uses
+(`KQ` as `(n_kv, n_head, n_tokens)` with the mask and `soft_max` reducing `ne0`), not the
+permute-to-token-axis arrangement the harness reached for. Everything upstream of it is green at ~3e-7,
+so the mismatch is localised to the attention layout.
+
+Three shape lessons from this step, all paid for with a run:
+
+* ggml's 3-D `mul_mat` collapses `ne0` and treats `ne2` as the batch — so "attention over tokens" needs
+  the token axis in `ne1` (or the layout llama.cpp uses), not just a reshape.
+* `ggml_mul_mat(a, b)` requires `a->ne0 == b->ne0`; for the V product that means V must present the KEY
+  axis as `ne0` (`permute` + `transpose` + `cont`), or ggml aborts with `ggml_can_mul_mat(a, b)`.
+* A fixture's numpy shape for a ggml tensor is `(ne1, ne0)` — `(r, c)` in numpy is `ne = (c, r)`. W_o is
+  `ggml ne = (n_head*head_dim, D)`, so it reads as numpy `(D, n_head*head_dim)`; getting that backwards
+  produced a 768-vs-64 matmul error rather than a wrong number, which is the good failure mode.

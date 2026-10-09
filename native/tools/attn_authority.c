@@ -7,21 +7,24 @@
 // `ggml_rms_norm`, `ggml_rope_multi` — and dumps the stages, so the engine has an authority to match
 // instead of a reading of the source to believe.
 //
-// Scope: the Q/gate split, the two per-head RMS norms, and rope. Attention, the output gate and `wo`
-// are NOT here yet (they are the next increment); this harness exists because the split and the norms
-// are where a wrong reading is silent — a swapped q/gate half or a norm taken over the whole 6144-wide
-// projection would still produce plausible numbers.
+// Scope: the whole block front-to-back — the Q/gate split, the two per-head RMS norms, rope, causal
+// attention, the output gate `attn * sigmoid(gate)` and `wo`. Every stage is where a wrong reading is
+// silent: a swapped q/gate half, a norm over the whole projection, rope across the whole head, a
+// non-causal attention, or a raw gate multiply would all still produce plausible numbers.
 //
-// Usage: attn_authority in.bin out.bin n_head head_dim n_kv S D n_rot eps sections... 
+// Usage: attn_authority in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2
 //   in.bin (f32, ggml order — ne0 fastest, so numpy reads each as its last axis):
 //     W_qg   (n_head*2*head_dim, D)   the joint Q+gate projection
 //     W_k    (n_kv*head_dim,    D)
+//     W_v    (n_kv*head_dim,    D)
+//     W_o    (n_head*head_dim,  D)
 //     norm_q (head_dim)
 //     norm_k (head_dim)
 //     hidden (S, D)
 //   out.bin: stages concatenated as f32, in this order (counts derivable from the args):
 //     qg (S, n_head*2*hd), q_pre (S, n_head, hd), gate_pre (S, n_head, hd),
-//     q_norm (S, n_head, hd), q_rope (S, n_head, hd), k_norm (S, n_kv, hd), k_rope (S, n_kv, hd)
+//     q_norm (S, n_head, hd), q_rope (S, n_head, hd), k_norm (S, n_kv, hd), k_rope (S, n_kv, hd),
+//     attn (S, n_head, hd), gated (S, n_head, hd), out (S, D)
 #include "ggml.h"
 #include "ggml-cpu.h"
 
@@ -36,8 +39,8 @@ static void * xmalloc(size_t n) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 14) {
-        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps s0 s1 s2\n", argv[0]);
+    if (argc != 15) {
+        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2\n", argv[0]);
         return 2;
     }
     const int64_t nh   = atoll(argv[3]);
@@ -47,14 +50,15 @@ int main(int argc, char ** argv) {
     const int64_t D    = atoll(argv[7]);
     const int     nd   = atoi(argv[8]);
     const float   eps  = (float) atof(argv[9]);
-    int sections[4] = { atoi(argv[10]), atoi(argv[11]), atoi(argv[12]), 0 };
+    const float   kqs  = (float) atof(argv[10]);
+    int sections[4] = { atoi(argv[11]), atoi(argv[12]), atoi(argv[13]), 0 };
     (void) sections;
 
     const int64_t nqg = nh * 2 * hd;
     const int64_t nk  = nkv * hd;
 
     // every f32 the fixture holds, in the order they are laid out in in.bin
-    size_t n_float = (size_t) (nqg * D + nk * D + hd + hd + S * D);
+    size_t n_float = (size_t) (nqg * D + nk * D + nk * D + nh * hd * D + hd + hd + S * D);
     float * fbuf = (float *) xmalloc(n_float * sizeof(float));
     {
         FILE * f = fopen(argv[1], "rb");
@@ -65,7 +69,9 @@ int main(int argc, char ** argv) {
     }
     float * Wqg = fbuf;
     float * Wk  = Wqg + nqg * D;
-    float * nmq = Wk + nk * D;
+    float * Wv  = Wk + nk * D;
+    float * Wo  = Wv + nk * D;
+    float * nmq = Wo + nh * hd * D;
     float * nmk = nmq + hd;
     float * hid = nmk + hd;
 
@@ -105,6 +111,37 @@ int main(int argc, char ** argv) {
     struct ggml_tensor * kr = ggml_rope_multi(ctx, kn, pos, NULL, nd, (int[4]) { 11, 11, 10, 0 },
                                              GGML_ROPE_TYPE_NEOX, 40960, 1e7f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
 
+    struct ggml_tensor * t_wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, nk);
+    struct ggml_tensor * t_wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nh * hd, D);
+    memcpy(t_wv->data, Wv, (size_t) nk * D * sizeof(float));
+    memcpy(t_wo->data, Wo, (size_t) nh * hd * D * sizeof(float));
+
+    // ── attention (causal), the OUTPUT GATE, and wo ──
+    // scores need K transposed for the V product afterwards, exactly as llama.cpp's non-flash path
+    // does: KQ = mul_mat(k, q) -> (n_kv, n_head, S); V is transposed to (n_kv, head_dim, S) so that
+    // mul_mat(V_t, probs) yields (head_dim, n_head, S).
+    // The shape dance llama.cpp's non-flash path performs. ggml's 3-D mul_mat collapses ne0 and treats
+    // ne2 as the batch, so attention over TOKENS needs the token axis in ne1: permute k/q/v from
+    // (hd, heads, S) to (hd, S, heads). Then KQ = mul_mat(k, q) is (S_kv, S_q, n_head) — the key axis is
+    // ne0, which is what soft_max reduces and what the causal mask indexes. (This fixture therefore uses
+    // n_kv == n_head; GQA with fewer kv heads needs the repeat llama.cpp applies to K/V, which is a
+    // separate step and is not claimed here.)
+    struct ggml_tensor * vp  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, t_wv, t_h), hd, nkv, S);
+    struct ggml_tensor * qp  = ggml_permute(ctx, qr, 0, 2, 1, 3);        // (hd, S, n_head)
+    struct ggml_tensor * kpp = ggml_permute(ctx, kr, 0, 2, 1, 3);       // (hd, S, n_kv)
+    // V must present the KEY axis as ne0 for the contraction below: (hd, n_kv, S) -> (S, hd, n_kv)
+    struct ggml_tensor * vpp = ggml_cont(ctx, ggml_transpose(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3)));
+    struct ggml_tensor * kq  = ggml_mul_mat(ctx, kpp, qp);                // (S_kv, S_q, n_head)
+    struct ggml_tensor * kqm = ggml_diag_mask_inf(ctx, kq, 0);           // causal across these S tokens
+    struct ggml_tensor * kqs_t = ggml_scale(ctx, kqm, kqs);              // 1/sqrt(head_dim) unless GGUF overrides
+    struct ggml_tensor * pr  = ggml_soft_max(ctx, kqs_t);
+    struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);               // (hd, S_q, n_head)
+    struct ggml_tensor * at  = ggml_permute(ctx, atp, 0, 2, 1, 3);       // back to (hd, n_head, S)
+    struct ggml_tensor * gs  = ggml_sigmoid(ctx, gt);                   // the gate half of the joint projection
+    struct ggml_tensor * gtd = ggml_mul(ctx, at, gs);
+    struct ggml_tensor * gc2 = ggml_cont_2d(ctx, gtd, nh * hd, S);
+    struct ggml_tensor * wo_out = ggml_mul_mat(ctx, t_wo, gc2);            // (D, S)
+
     // The splits are VIEWS: their ->data points into the parent with the parent's strides, so a linear
     // dump of a view reports the parent's layout. Copy them contiguous — that is what makes the two
     // split stages mean anything on their own.
@@ -117,6 +154,12 @@ int main(int argc, char ** argv) {
     ggml_build_forward_expand(gf, gt);
     ggml_build_forward_expand(gf, qc);
     ggml_build_forward_expand(gf, gtc);
+    ggml_build_forward_expand(gf, qp);
+    ggml_build_forward_expand(gf, kpp);
+    ggml_build_forward_expand(gf, atp);
+    ggml_build_forward_expand(gf, at);
+    ggml_build_forward_expand(gf, gtd);
+    ggml_build_forward_expand(gf, wo_out);
     ggml_build_forward_expand(gf, qn);
     ggml_build_forward_expand(gf, qr);
     ggml_build_forward_expand(gf, kn);
@@ -126,6 +169,7 @@ int main(int argc, char ** argv) {
     const struct { const char * nm; struct ggml_tensor * t; } stages[] = {
         { "qg", qg }, { "q_pre", qc }, { "gate_pre", gtc }, { "q_norm", qn },
         { "q_rope", qr }, { "k_norm", kn }, { "k_rope", kr },
+        { "attn", at }, { "gated", gtd }, { "out", wo_out },
     };
     FILE * out = fopen(argv[2], "wb");
     if (!out) { fprintf(stderr, "ATTN_ERR create %s\n", argv[2]); return 2; }

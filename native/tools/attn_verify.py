@@ -37,7 +37,16 @@ SECTIONS = (11, 11, 10, 0)
 BASE = 1e7                                  # ridge_theta
 # A geometry that keeps the shapes honest while staying small: the interleave is per head, so two
 # heads are enough to pin it, and head_dim stays at Ridge's real 256 (the norm and rope are per head).
-NH, HD, NKV, S, D = 3, 256, 2, 3, 64
+# n_kv == n_head on purpose: ggml's batched mul_mat needs matching batch dims, so the fixture stays
+# inside the shape dance the harness performs. GQA (fewer kv heads) needs the K/V repeat, untested.
+NH, HD, NKV, S, D = 3, 256, 3, 3, 64
+KQS = 1.0 / (HD ** 0.5)                       # 1/sqrt(head_dim), unless GGUF overrides the scale
+# What the gate requires vs what the harness also computes. The front half is measured and required;
+# attention/gate/wo are computed and REPORTED only, because they do not agree yet (see the note the
+# verifier prints) — a mismatch that is printed but not gated is a known-open item, not a pass.
+FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope")
+LATER = ("attn", "gated", "out")
+STAGES = FRONT + LATER
 
 
 def build_authority():
@@ -51,12 +60,12 @@ def build_authority():
     return True
 
 
-def run_authority(Wqg, Wk, nmq, nmk, hid):
+def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid):
     with open(IN, "wb") as fh:
-        for a in (Wqg, Wk, nmq, nmk, hid):
+        for a in (Wqg, Wk, Wv, Wo, nmq, nmk, hid):
             fh.write(np.ascontiguousarray(a, dtype="<f4").tobytes())
-    r = subprocess.run([BIN, IN, OUT, str(NH), str(HD), str(NKV), str(S), str(D), str(ND), str(EPS),
-                        *[str(x) for x in SECTIONS]], capture_output=True, text=True)
+    r = subprocess.run([BIN, IN, OUT, str(NH), str(HD), str(NKV), str(S), str(D), str(ND), "%.9g" % EPS,
+                        "%.9g" % KQS, *[str(x) for x in SECTIONS]], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(("attn authority", r.stdout + r.stderr)[:300])
     shapes = {}
@@ -66,7 +75,7 @@ def run_authority(Wqg, Wk, nmq, nmk, hid):
             shapes[line.split()[1]] = int(p["n"])
     data = np.fromfile(OUT, dtype="<f4")
     out, off = {}, 0
-    for nm in ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope"):
+    for nm in STAGES:
         n = shapes[nm]
         out[nm] = data[off:off + n].astype(np.float64)
         off += n
@@ -97,7 +106,12 @@ def neox(x, pos, n_rot):
     return out
 
 
-def spec(Wqg, Wk, nmq, nmk, hid, *, gate_first=False, norm_whole=False, rope_whole=False):
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, rope_whole=False,
+         non_causal=False, raw_gate=False, no_scale=False):
     """The engine's intended reading of the block, stage by stage. `pos` is (S,)."""
     pos = np.arange(S, dtype=np.float64)
     qg = hid @ Wqg.T                                     # (S, nh*2*hd) -- ggml ne = (nqg, S)
@@ -118,9 +132,22 @@ def spec(Wqg, Wk, nmq, nmk, hid, *, gate_first=False, norm_whole=False, rope_who
     k_pre = kflat.reshape(S, NKV, HD)
     k_norm = rms(k_pre, nmk)
     k_rope = neox(k_norm, pos, HD if rope_whole else ND)
+    # causal attention over these S tokens, then the output gate, then wo
+    kqs = 1.0 if no_scale else KQS
+    v_pre = (hid @ Wv.T).reshape(S, NKV, HD)
+    sc = np.einsum("shd,skd->shk", q_rope, k_rope) * kqs
+    if not non_causal:
+        above = np.arange(S)[None, :] > np.arange(S)[:, None]      # key index > query index
+        sc = np.where(above[:, None, :], -np.inf, sc)
+    m = sc.max(axis=2, keepdims=True)
+    e = np.exp(sc - m)
+    pr = e / e.sum(axis=2, keepdims=True)
+    at = np.einsum("shk,skd->shd", pr, v_pre)
+    gated = at * (gate_eff if raw_gate else sigmoid(gate_eff))
+    out = gated.reshape(S, NH * HD) @ Wo.T
     return {"qg": qg.reshape(S, -1).ravel(), "q_pre": q_pre.ravel(), "gate_pre": gate_eff.ravel(),
             "q_norm": q_norm.ravel(), "q_rope": q_rope.ravel(), "k_norm": k_norm.ravel(),
-            "k_rope": k_rope.ravel()}
+            "k_rope": k_rope.ravel(), "attn": at.ravel(), "gated": gated.ravel(), "out": out.ravel()}
 
 
 def main():
@@ -134,15 +161,19 @@ def main():
     rng = np.random.default_rng(777)
     Wqg = rng.normal(0, 0.02, size=(NH * 2 * HD, D)).astype(np.float32)
     Wk = rng.normal(0, 0.02, size=(NKV * HD, D)).astype(np.float32)
+    Wv = rng.normal(0, 0.02, size=(NKV * HD, D)).astype(np.float32)
+    # ggml's ne0 is the INPUT width, so a numpy array (r, c) is the ggml tensor ne=(c, r): W_o's
+    # ggml ne is (n_head*head_dim, D) and therefore reads here as (D, n_head*head_dim)
+    Wo = rng.normal(0, 0.02, size=(D, NH * HD)).astype(np.float32)
     nmq = rng.normal(1.0, 0.05, size=(HD,)).astype(np.float32)
     nmk = rng.normal(1.0, 0.05, size=(HD,)).astype(np.float32)
     hid = rng.normal(0, 1.0, size=(S, D)).astype(np.float32)
 
-    ref = run_authority(Wqg, Wk, nmq, nmk, hid)
+    ref = run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid)
     print("ATTN_VERIFY stage comparison against ggml's own ops (ggml is f32, the engine f64):")
-    mine = spec(Wqg, Wk, nmq, nmk, hid)
+    mine = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid)
     worst, bad = 0.0, []
-    for nm in ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope"):
+    for nm in FRONT:
         r = rv.rel(mine[nm], ref[nm])
         worst = max(worst, r)
         print(f"ATTN_VERIFY stage {nm:9s} maxrel={r:.3e} {'ok' if r <= MAXREL else 'MISMATCH'}")
@@ -153,21 +184,31 @@ def main():
               f"(worst {worst:.3e}) — do not build engine code on this reading")
         return 1
 
+    # Reported, NOT gated: the three stages below do not agree yet. Their error is printed so the size
+    # of the gap is visible, and the reason is known (ggml_diag_mask_inf masks ne0 against ne2, and ne2
+    # here is the head axis, not the query axis — so the causal mask is applied along the wrong axis
+    # until the attention is laid out as llama.cpp lays it out).
+    print("ATTN_VERIFY_NOT_GATED attention/gate/wo (computed, not yet authorised):")
+    for nm in LATER:
+        print(f"ATTN_VERIFY_NOT_GATED   {nm:9s} maxrel={rv.rel(mine[nm], ref[nm]):.3e}")
+
     # The teeth: each alternative reading must MISS, or the check is not measuring the reading.
-    alts = (("gate-first split", dict(gate_first=True)), ("norm over the whole projection", dict(norm_whole=True)),
-            ("rope over the whole head", dict(rope_whole=True)))
-    for nm, kw in alts:
-        a = spec(Wqg, Wk, nmq, nmk, hid, **kw)
-        r = max(rv.rel(a[k], ref[k]) for k in ("q_norm", "q_rope"))
+    alts = (("gate-first split", dict(gate_first=True), "q_norm"),
+            ("norm over the whole projection", dict(norm_whole=True), "q_norm"),
+            ("rope over the whole head", dict(rope_whole=True), "q_rope"))
+    for nm, kw, key in alts:
+        a = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, **kw)
+        r = rv.rel(a[key], ref[key])
         ok = r > MAXREL * 100
-        print(f"ATTN_VERIFY alt {nm:30s} maxrel={r:.3e} {'rejected' if ok else 'NOT DISTINGUISHED'}")
+        print(f"ATTN_VERIFY alt {nm:30s} ({key}) maxrel={r:.3e} {'rejected' if ok else 'NOT DISTINGUISHED'}")
         if not ok:
             print(f"ATTN_VERIFY_FAIL the alternative '{nm}' is not distinguished from the spec — this "
                   f"check cannot tell them apart, so a pass here proves nothing")
             return 1
 
-    print(f"ATTN_VERIFY_DONE {len(ref)} stages reproduce ggml's ops within {MAXREL:g} (worst {worst:.3e}), "
-          f"and all {len(alts)} alternative readings are rejected")
+    print(f"ATTN_VERIFY_DONE {len(FRONT)} FRONT-HALF stages reproduce ggml's ops within {MAXREL:g} "
+          f"(worst {worst:.3e}), and all {len(alts)} alternative readings of them are rejected; "
+          f"{len(LATER)} later stages ({', '.join(LATER)}) are reported, NOT authorised")
     return 0
 
 
