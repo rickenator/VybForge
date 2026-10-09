@@ -4,7 +4,7 @@ Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --
 unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative (units 1-9) and
 `doc/SPIKINGBRAIN.md` for the phase-1..3 background.
 
-## RESTART HERE — option #1 is unit 9c
+## RESTART HERE — option #1 is unit 9c, which has STARTED
 
 Seven units are done and green: five reference units against ggml's own ops (P4.1), the kernels on the
 GPU at model geometry (P4.2), the block wired on the GPU with two-step state carry-over (P4.3), and the
@@ -13,11 +13,31 @@ layer check now running at the model's own geometry on the model's own weights �
 stages over two chained steps, worst maxrel 1.686e-06. Q4_K also gained the reference it never had
 (`native/tools/q4k_ref.py`, bit-identical to the `gguf` package, gate S0.10).
 
-What is NOT done is the engine: `eng_gdn()` and `eng_mtp()` are both still 0, and the Ridge file has
-65 blocks with the MTP head as the 65th — so both have to flip (or the descriptor needs a documented
-"without the draft head" profile) before the caps gate can call that model SUPPORTED. That is unit 9c,
-and the plan with the specific hooks is in the section "Unit 9c — NOT STARTED, and deliberately"
-below. Start there; nothing else in this file is a prerequisite for it.
+**Unit 9c step 1 is DONE (commit 3f34465, pushed, gate P4.4): the per-layer dispatch.** The rule that
+decides which branch a block takes now exists in ONE place and is verified against both real models —
+`model_caps::mc_layer_kind`, which the capability descriptor counts with. Ridge is 64 text blocks =
+16 attention (at `N % 4 == 3`) + 48 recurrent, Qwen3-4B is 36 attention + 0, and the two models'
+per-block kinds agree with the INDEPENDENT Python inventory's tensor names. What that bought:
+
+* the dispatch is data, not a hardcoded index list — `mc_layer_kind(name)` returns 2 recurrent /
+  1 attention / 0 other by SUFFIX match, because `attn_qkv`/`attn_gate` are recurrent weights
+  despite the `attn_` prefix and `attn_q_norm` contains `attn_q`. The selftest table in
+  `native/config/layerkind_probe.vyb` pins all four traps (measured: a `.contains()` rule fails 2
+  rows, a marker swap fails 1, a double-counting rule that passes the table is caught by the plan
+  counts);
+* `mc_layer_kinds(path)` gives the plan and is THREE-VALUED — `""` unreadable table, `"-"` readable
+  table with no text block (the mmproj tower), else `"N:K,..."`. Do not collapse those: the first
+  draft did, and the tower read as a broken model;
+* **block 64 is the MTP draft head and carries `attn_q.weight` too.** A kind-only count reports 17
+  attention layers for a 16-attention model, and the descriptor's 16 is the TEXT count
+  (`n_layers - mtp_layers`). The engine's loop must run blocks `< text_layers` and keep the draft
+  head out of the text attention branch.
+
+**The next step is unit 9c step 2: the recurrent branch in `native/host/model_driver.vyb`.** Everything
+it needs is now named: the dispatch rule above, the kernel chain `gdn_layer_driver.vyb` already
+composes, and the state cache the handoff section "Unit 9c" sizes. `eng_gdn()` and `eng_mtp()` are both
+still 0 and both still have to flip (or the descriptor needs a documented "without the draft head"
+profile) before the caps gate can call the Ridge model SUPPORTED.
 
 Two smaller follow-ups are also open and recorded below: promoting the `q4kdeq`-vs-reference
 comparison into S0.10 proper, and retiring `native/tools/gdn_ref.py`.
@@ -193,7 +213,7 @@ more. Measured: 26 stages over two chained steps pass — the Q4_K-driven stages
 8.6e-08/1.7e-06 (ssm_out) — and this also exercises `q4kdeq` on whole real tensors against a reference
 that is independently checked (the S0.10 GPU side, as a side effect).
 
-## Unit 9c — NOT STARTED, and deliberately: what it needs, where the hooks are
+## Unit 9c — step 1 (the dispatch) DONE; step 2 (the engine branch) not started
 
 I stopped short of the engine work rather than starting it half-way. `native/host/model_driver.vyb`
 is a 660-line full-model driver for the Qwen3-4B path (36 layers, per-tensor quant staging, one
@@ -203,11 +223,15 @@ begin at the end of a session's context budget with no way to check the result.
 
 What it needs:
 
-1. **A per-layer dispatch, decided from the tensor table, not the model name**: a recurrent layer has
-   `blk.N.attn_qkv.weight`, `blk.N.attn_gate.weight`, `blk.N.ssm_alpha.weight`, `blk.N.ssm_beta.weight`,
-   `blk.N.ssm_out.weight`, `blk.N.ssm_conv1d.weight`, `blk.N.ssm_norm.weight`, `blk.N.ssm_a`,
-   `blk.N.ssm_dt.bias` where an attention layer has `attn_q/k/v/output`. `model_caps.vyb` already counts
-   exactly this way, so the same test belongs in the driver.
+1. **A per-layer dispatch, decided from the tensor table, not the model name** — **DONE, commit 3f34465.**
+   `model_caps::mc_layer_kind(name)` is that test and the descriptor counts with it; the engine's loop
+   asks the same function instead of re-deriving the answer. Gate P4.4
+   (`native/legit/run_layerkind_gate.sh`) proves it per block on both models against an independent
+   parser. A recurrent layer has `blk.N.attn_qkv.weight`, `blk.N.attn_gate.weight`,
+   `blk.N.ssm_alpha.weight`, `blk.N.ssm_beta.weight`, `blk.N.ssm_out.weight`,
+   `blk.N.ssm_conv1d.weight`, `blk.N.ssm_norm.weight`, `blk.N.ssm_a`, `blk.N.ssm_dt.bias` where an
+   attention layer has `attn_q/k/v/output` — and note the two traps the gate pins: `attn_qkv` and
+   `attn_gate` carry the `attn_` prefix but are RECURRENT weights.
 2. **The six projections through the existing quant path**: `stage_one(...)` per tensor, then the
    quant gemm the attention layers already use (attn_qkv 5120->10240 Q4_K, attn_gate 5120->6144 Q4_K,
    ssm_beta/ssm_alpha 5120->48 Q8_0, ssm_out 6144->5120 Q4_K) — `mm_nt` is the f64 reference form of

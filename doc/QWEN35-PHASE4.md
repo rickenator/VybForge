@@ -561,3 +561,50 @@ sizing (2), or means nothing without it (3). The risk to watch is that the refer
 builder over ggml ops, not a standalone function — so the honest first step is to extract the
 per-layer math from `llm_build_delta_net_base` into something a numpy reference can be checked
 against, exactly as `ggml_dequant_authority.py` did for the quants.
+
+## Unit 9c step 1 — the per-layer dispatch, from the tensor table (DONE, commit 3f34465)
+
+Unit 9c is the engine integration, and its first requirement is the least glamorous one: the
+per-layer loop has to know which branch a block takes. Getting that from the architecture name, or
+from a list of block indices copied off this model, is the kind of assumption that runs the wrong
+branch on the wrong block and still produces plausible numbers — 48 of the Ridge model's 64 text
+blocks are recurrent, so most of the output would be wrong and nothing would say so.
+
+The rule now lives in one place. `model_caps::mc_layer_kind(name)` returns **2** for a recurrent
+block, **1** for an attention block, **0** otherwise, from the block's own weight names, and the
+capability descriptor counts with it (`caps_tensors`), so the printed report and the engine's
+dispatch cannot drift apart. `mc_layer_kinds(path)` returns the per-block plan.
+
+The test is a SUFFIX match, and the two traps make that necessary rather than stylistic:
+
+* `blk.N.attn_qkv.weight` and `blk.N.attn_gate.weight` carry the `attn_` prefix but belong to the
+  RECURRENT block — a prefix test, or a `.contains("attn")`, classifies them as attention;
+* `blk.N.attn_q_norm.weight` contains `attn_q` without being the attention marker, and
+  `blk.N.ssm_norm.weight` is recurrent-only without being the recurrent marker.
+
+So the two markers are the exact names `blk.N.attn_q.weight` and `blk.N.ssm_alpha.weight`. The probe
+(`native/config/layerkind_probe.vyb`) carries a table of these names with the kind the dispatch must
+report for each, and runs it before it opens a file. Measured teeth: replacing the suffix test with
+`.contains(".attn_q")` fails two rows, and a rule that passes the table while double-counting real
+tensors (a second `.ssm_out.weight` marker) is caught by the plan counts instead — 113 blocks and 96
+recurrent where 65 and 48 are correct.
+
+The plan is the real interleave, and it agrees with an INDEPENDENT parser (the Python inventory's
+tensor names), per block, on both models: Ridge is 64 text blocks = **16 attention at `N % 4 == 3`
++ 48 recurrent**, Qwen3-4B is 36 attention + 0.
+
+One fact worth carrying into the engine work, because it is exactly the sort of thing a summary
+hides: **the tensor table classifies 65 blocks and only 64 are text.** Block 64 is the MTP draft head
+and it carries `attn_q.weight` too. A kind-only count therefore reports "17 attention layers" for a
+16-attention model. The descriptor's 16 is `n_layers - mtp_layers`; the engine's loop must run blocks
+below `text_layers` and must not feed the draft head into the text attention branch.
+
+`mc_layer_kinds` is deliberately THREE-VALUED, and collapsing the last two was the first draft's
+bug: `""` is an unreadable table (a truncated download), `"-"` is a readable table with no
+identifiable block (the mmproj tower), anything else is the plan. The tower read as a broken model
+until the two were separated, and the gate now asserts they stay distinguishable.
+
+Gate: `native/legit/run_layerkind_gate.sh`, step **P4.4** of the phase-2 battery. 9 cases, 0 skipped
+on godzilla (the Ridge and Qwen3 GGUFs are present there; a checkout without them SKIPs those cases,
+and a gate that proved nothing is a FAIL). The S0.2e capability gate is unchanged by the refactor and
+still PASSes.
