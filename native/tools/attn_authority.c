@@ -80,7 +80,7 @@ int main(int argc, char ** argv) {
     float * nmk = nmq + hd;
     float * hid = nmk + hd;
 
-    struct ggml_init_params ip = { .mem_size = (size_t) 512 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+    struct ggml_init_params ip = { .mem_size = (size_t) 3 * 1024 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
     struct ggml_context * ctx = ggml_init(ip);
     if (!ctx) { fprintf(stderr, "ATTN_ERR ggml_init\n"); return 4; }
 

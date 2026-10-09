@@ -383,6 +383,24 @@ else
   step "P4.8 attention block (front half)" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.9 — Ridge's attention block on the ENGINE's own weight path (unit 10 step 5) ────
+# Gate: native/legit/run_attn_engine_gate.sh. P4.8 pinned the READING of the attention block against
+# ggml on a synthetic fixture; this runs it in the file that will run it — native/host/model_driver.vyb
+# in probe mode (VYB_ATTN_PROBE) — staging the model's own Q5_K attn_q/attn_k/attn_v and Q6_K
+# attn_output from the GGUF, splitting the joint q+gate, and comparing all TEN stages against
+# native/tools/attn_authority.c fed the same weights. Teeth: the staged operands at gemm's own
+# addresses, the contiguous GQA grouping (must match) vs round-robin (must miss), and the output gate
+# vs raw/no gate. Measured: worst 1.67e-06.
+out="$(./native/legit/run_attn_engine_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "ATTN ENGINE GATE: PASS"; then
+  step "P4.9 attention block (engine weights)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "ATTN ENGINE GATE: SKIP"; then
+  step "P4.9 attention block (engine weights)" "SKIP ($(echo "$last" | sed 's/ATTN ENGINE GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.9 attention block (engine weights)" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come

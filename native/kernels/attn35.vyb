@@ -1,0 +1,53 @@
+// attn35.vyb — the two elementwise steps Ridge's attention block needs and no other block does.
+// VybForge#10 phase 4, unit 10 step 5 (the engine side of the attention block).
+//
+// `qg_split` exists because `attn_q.weight` in this architecture is a JOINT q+gate projection: the
+// gemm's output row is
+//     [ head0 q(HD) | head0 gate(HD) | head1 q(HD) | head1 gate(HD) | ... ]
+// and llama.cpp splits it with `ggml_view_3d` (see native/tools/attn_authority.c: q is the first
+// HD of each 2*HD block, the gate the second). `gate-first` is the measured-and-rejected
+// alternative (attn_verify.py's teeth). This kernel writes the two halves into their own
+// contiguous [S, H, HD] buffers, which is what lets the per-head RMS norm and rope_nrot run on
+// them (both expect HD-wide contiguous rows).
+//
+// `gate_mul` is the output gate `attn * sigmoid(gate)` — the authority applies ggml_sigmoid then
+// ggml_mul; `raw gate (no sigmoid)` is the measured-and-rejected alternative.
+//
+// Thread = one output element of q (and its gate). Launch via cuda_launch4i.
+import vmath::{vexp}
+
+// params (48 B): +0 QG, +8 Q, +16 GT, +24 S, +32 H, +40 HD
+qg_split(p<Int>) -> {
+    QG<Int> = ld_i64(p + 0)
+    Q<Int> = ld_i64(p + 8)
+    GT<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    H<Int> = ld_i64(p + 32)
+    HD<Int> = ld_i64(p + 40)
+    row<Int> = H * 2 * HD
+    total<Int> = S * H * HD
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Int> = gid / (H * HD)
+        rem<Int> = gid % (H * HD)
+        h<Int> = rem / HD
+        d<Int> = rem % HD
+        base<Int> = QG + (s * row + h * 2 * HD) * 8
+        st_f64(Q + gid * 8, ld_f64(base + d * 8))
+        st_f64(GT + gid * 8, ld_f64(base + (HD + d) * 8))
+    }
+}
+
+// params (32 B): +0 AT, +8 GT, +16 OUT, +24 N
+gate_mul(p<Int>) -> {
+    AT<Int> = ld_i64(p + 0)
+    GT<Int> = ld_i64(p + 8)
+    OUT<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        gv<Float> = ld_f64(GT + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        st_f64(OUT + gid * 8, ld_f64(AT + gid * 8) * sg)
+    }
+}

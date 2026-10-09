@@ -17,7 +17,7 @@ MODPATH := --module-path $(ROOT)/native/kernels
 # can import them (Vyb#442 keeps native/tensor/tensor.vyb itself off this list).
 S02MODS := --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope q5k attn35
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
@@ -71,6 +71,14 @@ gdn-layer: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/rmsnorm.ptx $(ROOT)
 #   ./native/legit/run_gdn_engine_gate.sh
 gdn-engine: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q8_0.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/gdn_engine_verify.py
+
+# unit 10 step 5: Ridge's ATTENTION block on the ENGINE's own weight path — the joint q+gate
+# projection and its split, the two per-head RMS norms, the partial rope, causal GQA attention, the
+# output gate and `wo`, all staged from the live GGUF and compared stage by stage against
+# native/tools/attn_authority.c (the real ggml ops).
+#   ./native/legit/run_attn_engine_gate.sh
+attn-engine: $(ROOT)/native/build/attn35.ptx $(ROOT)/native/build/q5k.ptx $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/rope.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/attn_engine_verify.py
 
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
@@ -395,7 +403,7 @@ wcheck: $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx
 # a result here -- with a 2-character punctuation input there is no language being
 # requested; read PREFILL_HIDDEN_MATCH / PREFILL_TOP1_MATCH. For an English
 # response see chat-real / chat-prompt below, which run a real prompt.
-prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+prefill: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx $(ROOT)/native/build/q5k.ptx $(ROOT)/native/build/attn35.ptx
 	cd $(ROOT) && .venv/bin/python native/gguf/prefill_ref.py
 	cd $(ROOT) && VYB_PROMPT_RAW=1 VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/model_driver.vyb $(S02MODS) --module-path native/llm
 	cd $(ROOT) && .venv/bin/python native/tools/verify_prefill.py

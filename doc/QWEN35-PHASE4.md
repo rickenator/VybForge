@@ -1435,3 +1435,98 @@ must replicate K/V to the query-head count itself. Engine and authority now shar
 The gate runs this case and requires all ten stages, because it goes through paths that are already
 verified — no tolerance exception, no partial coverage. The flash path (verified at n_kv == n_head, S=6)
 is gated separately; what the flash op does at n_kv < n_head is no longer load-bearing for anything.
+
+## Unit 10 step 5 — the ENGINE side of the attention block (VYB_ATTN_PROBE)
+
+    make -f native/Makefile attn-engine        # or ./native/legit/run_attn_engine_gate.sh  (P4.9)
+
+The authority (steps 1-4q, above) pinned the READING of Ridge's attention block against ggml on a
+synthetic fixture. This step runs the block in the file that will run it —
+`native/host/model_driver.vyb` in probe mode (`VYB_ATTN_PROBE=<layer>`) — staging every operand from
+the live GGUF by name through the engine's own dequant kernels and multiplying with layer.ptx's
+`gemm`, and compares all TEN stages against `attn_authority.c` fed the SAME weights (dequantised by
+the independent `gguf` package).
+
+    blk.3  D=5120 H=24 KVH=4 HD=256 NROT=64 S=4, real weights (attn_q/k/v Q5_K, attn_output Q6_K,
+                             attn_norm/q_norm/k_norm F32), one forward, fixture = the block input
+    qg 5.093e-07  q_pre 5.238e-07  gate_pre 5.093e-07  q_norm 5.712e-07  q_rope 5.712e-07
+    k_norm 5.360e-07  k_rope 5.533e-07  attn 1.668e-06  gated 1.060e-06  out 4.145e-07
+    worst 1.668e-06 (ggml is f32 and the engine f64, so this is the authority's floor, not slack)
+
+Teeth, all required to be distinguishable:
+
+    staged operands: 7 slots of attn_q/attn_output at the addresses gemm reads == the model's own
+                     dequantised tensors
+    grouping:        attn recomputed from the ENGINE's own q_rope/k_rope with kv = h//(H/KVH)
+                     2.659e-08 (must match); with round-robin kv = h % KVH 1.634e+00 (must miss)
+    output gate:     gated == attn * sigmoid(gate_pre) 5.781e-11; raw gate 6.305e+00; no gate 1.100e+00
+
+### What had to be built
+
+* `native/kernels/attn35.vyb` (new, in the Makefile's KERNELS list): `qg_split` — the joint q+gate
+  SPLIT (per head the projection carries q then gate; `ggml_view_3d`'s arithmetic in the authority) —
+  and `gate_mul` — the output gate `attn * sigmoid(gate)`. Nothing else in the engine needs either.
+* `model_driver.vyb`: Q5_K (type 13) in `packed_bytes` and in `stage_one` (Ridge's q/k/v are Q5_K —
+  a type the kernel and its own bit-exact gate already existed for, but the model path had never
+  staged); the `JQG` flag; the `VYB_ATTN_PROBE` selector, with **S taken from the fixture's own
+  length** so one file sets the token count; the Ridge attention branch (attn_norm -> joint qg ->
+  split -> the two per-head norms -> `rope_nrot` -> causal attention -> gate -> `wo` -> residual);
+  the ten stage dumps; the operand probes.
+* `native/tools/attn_engine_verify.py` (new) and `native/legit/run_attn_engine_gate.sh` (new, step
+  **P4.9** of the phase-2 battery).
+* `attn_authority.c`: the ggml context had to grow (512 MB -> 3 GB). At Ridge's real geometry the
+  operands alone are ~630 MB, so the shared harness could not run a full-size fixture; P4.8's
+  numbers are unchanged (worst 4.597e-07) after the change.
+
+### LESSON: GQA needed no replication in the engine — the KERNEL already groups
+
+The plan (written in step 4q) was that `run_layer_attn` "must replicate K/V to the query-head count
+itself". It does not need to: `layer.vyb`'s `attn` kernel already computes `kvh = h / (H/KVH)` — the
+CONTIGUOUS grouping, which is exactly the function the authority expresses by replicating each kv
+group into its own K/V rows. Two implementations of one function, one compared against the other.
+
+That is what the ENGINE dumps, and it is why the comparison has to replicate the engine's two k
+stages to line them up with the authority's H replicated rows. Two ways to get that wrong, and one
+of them measured 1.365 relative error before it was fixed:
+
+* replicating a **3-D** activation along the head axis (`np.repeat(g, grp, axis=1)` on `(S, KVH, HD)`)
+  is correct — it repeats the SLICE at each kv index;
+* replicating a **2-D** weight with `np.repeat(W, grp, axis=0)` is NOT — it repeats each ROW
+  (r0 r0 r0 r1 r1 r1 ...), scrambling which weights each head reads, so the two sides end up
+  computing different functions. `np.tile(block, (grp, 1))` is the block replication. (The same
+  pattern in `attn_verify.py`'s GROUPED fixture is a row-wise repeat; its verdict stands — it tests
+  WHICH rows a head reads, and both sides read the same array — but the fixture's rows are a
+  scramble, not a per-group replication. Flagged, not changed here.)
+
+### Second layer, and proof the gate can FAIL (§21)
+
+    blk.7 (same geometry, one forward): all 10 stages ok, worst 1.061e-06, teeth fire
+          grouping 2.086e-08 vs 1.423e+00, raw gate 3.661e+00, no gate 1.089e+00
+
+    MUTATION: gate_mul writes `attn` unchanged (the output gate dropped)
+      gated 1.100e+00 DIFFERS, out 1.018e+00 DIFFERS -> verifier rc=1, gate FAIL
+    REVERTED (same source bytes back, ptx rebuilt): the recorded numbers come back
+      gated 1.060e-06 ok, out 4.145e-07 ok -> gate PASS
+
+So the ten-stage comparison has teeth against a wrong IMPLEMENTATION, not only against a wrong
+fixture: the mutation left every earlier stage bit-identical (the gate is downstream of all of them)
+and was caught at exactly the two stages the gate feeds.
+
+### Also verified in the same session (the engine change is inert on the dense path)
+
+    make -f native/Makefile prefill   ->  PREFILL_HIDDEN_MATCH: OK  maxrel 3.393e-04
+                                          PREFILL_TOP1_MATCH:  OK  top1 vyb=[55286, 576] ref=[55286, 576]
+    run_attn_block_gate.sh (P4.8)     ->  PASS, unchanged numbers (worst 4.597e-07)
+
+Both are byte-for-byte the figures recorded before this unit, which is what shows the new dispatch
+flag, the Q5_K staging case, the extra module loads and the grown authority pool change nothing for a
+model whose `attn_q` does not carry a gate.
+
+### Still NOT covered
+
+* The FFN half of the block. Ridge's FFN weights are IQ3_S, which no engine kernel implements yet, so
+  the probe STOPPED at the authority's last stage (`out`, the `wo` output, pre-residual) rather than
+  running `run_ffn`. A whole Ridge attention LAYER therefore cannot run through the loop yet.
+* A whole-model Ridge run (logits against llama.cpp) — that needs the FFN and the MTP head.
+* Multi-token / state: the fixture is a single forward (S=4), which is the prefill form. There is no
+  KV cache and no decode path in this branch.

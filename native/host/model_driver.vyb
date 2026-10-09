@@ -73,6 +73,7 @@ parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
 }
 packed_bytes(numel<Int>, ty<Int>)<Int> -> {
     if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 13) { return numel * 176 / 256 }
     if (ty == 14) { return numel * 210 / 256 }
     return numel * 4
 }
@@ -193,11 +194,13 @@ dump_slot(base<Int>, idx<Int>, tag<String>) -> {
 
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
           nm<String>, dpk<Int>, pf<Int>, dout<Int>,
-          q4fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>)<Int> -> {
+          q4fn<loc<CVoid>>, q5fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>)<Int> -> {
     idx<Int> = find_nm(nmv, nm)
     if (idx < 0) { return 60 }
     off<Int> = ofv.get(idx); numel<Int> = nlv.get(idx); ty<Int> = tyv.get(idx)
     if (ty == 12) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q4fn, inz) }
+    # Q5_K (13): Ridge's attention q/k/v. Its own dequant kernel, gated bit-exact in native/legit/run_q5k_gate.sh.
+    if (ty == 13) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q5fn, inz) }
     if (ty == 14) { return load_quant(path, dpk, dout, off, packed_bytes(numel, ty), numel, q6fn, inz) }
     return load_norm(path, pf, dpk, dout, off, numel, efn)
 }
@@ -385,9 +388,27 @@ main()<Int> -> {
             + " KVH=" + KVH.to_string() + " HD=" + HD.to_string() + " FF=" + FF.to_string()
             + " NQ=" + NQ.to_string() + " NKV=" + NKV.to_string() + " VOCAB=" + VOCAB.to_string()
             + " MAXL=" + MAXL.to_string() + " EPS=" + EPS.to_string())
+    # ---- unit 10 step 5: the ATTENTION-block probe selector (VYB_ATTN_PROBE=<layer index>) ----
+    # Empty (the normal case) runs the model. A layer index runs ONLY that attention block, with the
+    # block's input taken from a fixture instead of the embedding, and dumps the ten stages the
+    # authority (native/tools/attn_authority.c) produces — the same shape as the recurrent probe
+    # below. S comes from the FIXTURE's own length (S = len / (D*8)), so one file sets the token
+    # count; the fixture is the block INPUT (attn_norm runs inside the driver, as it does in the
+    # loop), and its bits are compared as f64, like every other dump here.
+    aps<String> = env_get("VYB_ATTN_PROBE") else ""
+    APR<Int> = -1
+    if (aps.len() > 0) { APR = parse_u(aps, 0, aps.len()) }
+    afx<String> = ""
+    if (APR >= 0) {
+        afx = read_bin(env_get("VYB_ATTN_X") else "native/build/attn_engine_x.bin")
+        if (afx.len() < D * 8) { println("ATTN_ERR no fixture to probe the attention block with"); return 2 }
+        S = afx.len() / (D * 8)
+        println("ATTN_PROBE_INPUT fixture_tokens=" + S.to_string())
+    }
     # Shapes (in elements) as the tensor core wants them; every buffer below is one call.
     SD<Vec<Int>> = Vec(); SD.push(S); SD.push(D)
     SQ<Vec<Int>> = Vec(); SQ.push(S); SQ.push(NQ)
+    SQ2<Vec<Int>> = Vec(); SQ2.push(S); SQ2.push(2 * NQ)
     SK<Vec<Int>> = Vec(); SK.push(S); SK.push(NKV)
     SF<Vec<Int>> = Vec(); SF.push(S); SF.push(FF)
     SV<Vec<Int>> = Vec(); SV.push(S); SV.push(VOCAB)
@@ -495,6 +516,27 @@ main()<Int> -> {
         }
     }
 
+    # ---- unit 10 step 5: does this model's attention carry a FOLDED output gate? ----
+    # Decided from the TENSOR TABLE (attn_q's own element count), never from the arch name: a dense
+    # model's attn_q is (heads*head_dim, D) = NQ*D elements, while qwen35's carries per head a q
+    # block AND a gate block, so it is 2*NQ*D (Ridge: 12288 x 5120). The loop then dispatches on
+    # this flag, exactly as it dispatches on the layer KIND for the recurrent blocks.
+    JQG<Int> = 0
+    fj<Int> = 0
+    for (fj in 0..MAXL - 1) {
+        if (JQG == 0) {
+            if (fj > 0) {
+                ji<Int> = find_nm(nmv, "blk." + fj.to_string() + ".attn_q.weight")
+                if (ji >= 0) {
+                    if (mc_layer_kind("blk." + fj.to_string() + ".attn_q.weight") == 1) {
+                        if (nlv.get(ji) == 2 * NQ * D) { JQG = 1 }
+                    }
+                }
+            }
+        }
+    }
+    if (GRL >= 0) { println("ATTN_CFG joint_q_gate=" + JQG.to_string() + " (1 = attn_q carries the output gate, 2*NQ*D elements)") }
+
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> ndev = 0
@@ -533,6 +575,7 @@ main()<Int> -> {
         if (rcw != 0) { println("MODLOAD_FAIL qwen3"); return 9 }
         q4fn<loc<CVoid>> = from<loc<CVoid>>(0)
         q6fn<loc<CVoid>> = from<loc<CVoid>>(0)
+        q5fn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q4fn), m4, "q4kdeq") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q6fn), m6, "q6kdeq") != 0) { return 10 }
         gfn<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -584,6 +627,21 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(hds), mgd, "delta_step") != 0) { return 10 }
         if (cuModuleGetFunction(loc(hng), mgd, "norm_gated") != 0) { return 10 }
 
+        # ---- unit 10 step 5: the ATTENTION block's own kernels ----
+        # q5k.ptx: the dequant for Ridge's q/k/v (Q5_K) — stage_one's ty==13 branch.
+        # attn35.ptx: the joint q+gate SPLIT and the output gate (attn * sigmoid(gate)); nothing else
+        # in the engine needs them. Both are loaded unconditionally (like gdn.ptx/q8_0.ptx above) and
+        # built by the Makefile's KERNELS list, so a clean build has them.
+        mq5<loc<CVoid>> = from<loc<CVoid>>(0)
+        ma35<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(mq5), read_bin("native/build/q5k.ptx")) != 0) { println("MODLOAD_FAIL q5k"); return 9 }
+        if (cuModuleLoadData(loc(ma35), read_bin("native/build/attn35.ptx")) != 0) { println("MODLOAD_FAIL attn35"); return 9 }
+        if (cuModuleGetFunction(loc(q5fn), mq5, "q5kdeq") != 0) { return 10 }
+        hsplit<loc<CVoid>> = from<loc<CVoid>>(0)
+        hgmul<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hsplit), ma35, "qg_split") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hgmul), ma35, "gate_mul") != 0) { return 10 }
+
 
         # Buffers are sized from a TEMPLATE layer's tensors, never from blk.0 by assumption: in a
         # hybrid model block 0 is RECURRENT and has no attn_q/k/v at all, so sizing from blk.0 makes
@@ -627,6 +685,8 @@ main()<Int> -> {
         DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DH<Int> = 0; DE<Int> = 0; DEt<Int> = 0; DL<Int> = 0; AO<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0; IDS<Int> = 0; EP<Int> = 0
+        # unit 10 step 5: the Ridge attention branch's buffers (allocated only when JQG == 1)
+        DQG<Int> = 0; DGT<Int> = 0; DGD<Int> = 0; AP1<Int> = 0
         if (cuMemAlloc_v2(loc(DWq), dt_bytes_for(wq_nl, dt_f64())) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DWk), dt_bytes_for(wk_nl, dt_f64())) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DWv), dt_bytes_for(wv_nl, dt_f64())) != 0) { return 11 }
@@ -665,6 +725,18 @@ main()<Int> -> {
         i0 = find_nm(nmv, "blk.0.ffn_down.weight")
         pk_max<Int> = packed_bytes(nlv.get(i0), tyv.get(i0))
         if (cuMemAlloc_v2(loc(DPK), pk_max) != 0) { return 11 }
+
+        # ---- unit 10 step 5: the Ridge attention branch's own buffers ----
+        # DQG holds the JOINT q+gate projection (S x 2*NQ), which nothing else allocates; DGT the
+        # gate half after the split, DGD the gated context, AP1 the split/gate kernels' param block.
+        # Only allocated when the model's attn_q actually carries the gate (JQG), so a dense model's
+        # memory footprint is unchanged.
+        if (JQG == 1) {
+            if (cuMemAlloc_v2(loc(DQG), tt_nbytes(SQ2, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(DGT), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(DGD), tt_nbytes(SQ, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(AP1), 64) != 0) { return 11 }
+        }
 
         # ---- unit 9c: the recurrent branch's buffers ----
         # ONE set of weight and activation buffers, staged per recurrent block as the loop reaches
@@ -759,6 +831,12 @@ main()<Int> -> {
             if (download(xf, XA, 2 * D * 8) != 0) { return 15 }
             println("GDN_PROBE_INPUT fixture_tokens=2")
         } else {
+        if (APR >= 0) {
+            # unit 10 step 5: the attention probe's input is the BLOCK INPUT (pre-attn_norm), S tokens
+            # of D, read from the fixture whose LENGTH set S above.
+            if (download(afx, XA, S * D * 8) != 0) { return 15 }
+            println("ATTN_PROBE_X_READY tokens=" + S.to_string() + " D=" + D.to_string())
+        } else {
 
         # ---- token_embd -> DE (f64 gather table), loaded up front so BOTH the
         # prompt embed (this block) and the tied lm_head reuse it. ----
@@ -792,6 +870,7 @@ main()<Int> -> {
             ? -> { return 17 }
         }
         println("EMBED_PROBE_DONE")
+        }
         }
 
         # WHICH model's rope table: measured per model from its own GGUF (rope.freq_base and
@@ -830,7 +909,7 @@ main()<Int> -> {
                 println("DISPATCH_FAIL blk." + L.to_string() + " carries neither a recurrent nor an attention marker")
                 return 7
             }
-            if (PR < 0 || L == PR) {
+            if ((PR < 0 && APR < 0) || L == PR || L == APR) {
             if (lkc == 2) {
                 # ---- the recurrent block: mixer (per token, state carried) then the shared FFN ----
                 l_an<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight")
@@ -878,9 +957,9 @@ main()<Int> -> {
                 if (l_fn < 0) { println("GDN_ERR blk." + L.to_string() + " has no FFN pre-norm tensor"); return 7 }
                 e = load_norm(MODEL, PF, DPK, N2, ofv.get(l_fn), nlv.get(l_fn), efn)
                 if (e != 0) { println("GDN_ERR stage ffn pre-norm"); return 80 }
-                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn, D); if (e != 0) { return 74 }
-                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn, D); if (e != 0) { return 75 }
-                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn, FF); if (e != 0) { return 76 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 74 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 75 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF); if (e != 0) { return 76 }
                 if (PR >= 0) {
                     println("GDN_GEOM blk." + L.to_string() + ".NE=" + GNE.to_string() + " S=" + GSS.to_string()
                             + " Hk=" + GHK.to_string() + " Hv=" + GHV.to_string() + " d_conv=" + GDC.to_string()
@@ -1002,23 +1081,131 @@ main()<Int> -> {
                     }
                 }
             } else {
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q6fn, efn, D); if (e != 0) { return 70 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q6fn, efn, D); if (e != 0) { return 71 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q6fn, efn, D); if (e != 0) { return 72 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q6fn, efn, NQ); if (e != 0) { return 73 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q6fn, efn, D); if (e != 0) { return 74 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q6fn, efn, D); if (e != 0) { return 75 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q6fn, efn, FF); if (e != 0) { return 76 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q6fn, efn, 0); if (e != 0) { return 77 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q6fn, efn, 0); if (e != 0) { return 78 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q6fn, efn, 0); if (e != 0) { return 79 }
-            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q6fn, efn, 0); if (e != 0) { return 80 }
+            if (JQG == 1) {
+                # ---- Ridge's ATTENTION block, on the engine's own weight path (unit 10 step 5) ----
+                # `attn_q` is a JOINT q+gate projection, so the block is: attn_norm -> qg -> SPLIT
+                # (qg_split) -> the two per-head RMS norms -> rope_nrot over the first NROT dims ->
+                # causal attention (the engine's `attn` kernel already groups kv heads h/(H/KVH),
+                # which is the same function the authority expresses by replicating K/V) -> the
+                # output gate (gate_mul) -> wo -> residual. Every operand is re-stated immediately
+                # before the launch that reads it: a param block is not an argument list.
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q5fn, q6fn, efn, D); if (e != 0) { println("ATTN_ERR stage attn_q"); return 70 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q5fn, q6fn, efn, D); if (e != 0) { println("ATTN_ERR stage attn_k"); return 71 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q5fn, q6fn, efn, D); if (e != 0) { println("ATTN_ERR stage attn_v"); return 72 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q5fn, q6fn, efn, NQ); if (e != 0) { println("ATTN_ERR stage attn_output"); return 73 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { println("ATTN_ERR stage attn_norm"); return 77 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { println("ATTN_ERR stage attn_q_norm"); return 78 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { println("ATTN_ERR stage attn_k_norm"); return 79 }
+                if (APR >= 0) {
+                    println("ATTN_GEOM blk." + L.to_string() + " D=" + D.to_string() + " H=" + H.to_string()
+                            + " KVH=" + KVH.to_string() + " HD=" + HD.to_string() + " NQ=" + NQ.to_string()
+                            + " NKV=" + NKV.to_string() + " NROT=" + NROT.to_string() + " S=" + S.to_string())
+                    println("ATTN_STAGED blk." + L.to_string() + " attn_q/attn_k/attn_v/attn_output by their own type, attn_norm/attn_q_norm/attn_k_norm F32")
+                    # the staged operands at the addresses gemm reads (B[k*N+n]) — a good block fed a
+                    # wrong operand is invisible to a stage-by-stage comparison, so check the operand
+                    # itself against the model's own dequantised tensor (as the GDN gate does).
+                    dump_slot(DWq, 0 * 2 * NQ + 0, "aq")
+                    dump_slot(DWq, 5119 * 2 * NQ + 0, "aq")
+                    dump_slot(DWq, 100 * 2 * NQ + 7, "aq")
+                    dump_slot(DWq, 3000 * 2 * NQ + 9000, "aq")
+                    dump_slot(DWo, 0 * D + 0, "ao")
+                    dump_slot(DWo, 6143 * D + 5119, "ao")
+                    dump_slot(DWo, 5000 * D + 3000, "ao")
+                }
+                ac1<Float> = 1.0; bc1<Float> = 0.0; zro2<Int> = 0
+                # 1. attn_norm (the engine's own rmsnorm kernel) -> XN
+                rA = XI; rB = N1; rC = XN
+                cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+                cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+                # 2. the three projections through the engine's gemm (B is [in,out] from the dequant)
+                gA = XN; gB = DWq; gC = DQG; gM = S; gN = 2 * NQ; gK = D
+                cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+                cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+                cuMemcpyHtoD_v2(GM + 48, loc(ac1), 8); cuMemcpyHtoD_v2(GM + 56, loc(bc1), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                gB = DWk; gC = DK; gN = NKV
+                cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                gB = DWv; gC = DV
+                cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                # 3. the joint q+gate SPLIT: per head the projection carries q then gate
+                put_i(AP1, 0, DQG) ; put_i(AP1, 8, DQ) ; put_i(AP1, 16, DGT)
+                put_i(AP1, 24, S) ; put_i(AP1, 32, H) ; put_i(AP1, 40, HD)
+                cuda_launch4i(from<loc<CVoid>>(addr(hsplit)), (S * NQ + 255) / 256, 1, 1, 256, 1, 1, AP1, 0, 0, 0)
+                # 4. the two per-head RMS norms (rows of HD), as llama.cpp's attention does
+                rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
+                cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+                cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+                rA = DK; rB = Nk; rC = DKN; gM = S * KVH; gN = HD
+                cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+                cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+                # 5. rope over the first NROT dims of each head (rope_nrot's own layout)
+                cuMemcpyHtoD_v2(ROP + 0, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 8, loc(DKN), 8)
+                cuMemcpyHtoD_v2(ROP + 16, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 24, loc(DKr), 8)
+                cuMemcpyHtoD_v2(ROP + 32, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 40, loc(S), 8)
+                cuMemcpyHtoD_v2(ROP + 48, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 56, loc(H), 8); cuMemcpyHtoD_v2(ROP + 64, loc(KVH), 8)
+                cuMemcpyHtoD_v2(ROP + 72, loc(zro2), 8)
+                cuMemcpyHtoD_v2(ROP + 80, loc(NROT), 8)
+                rt2<Int> = S * H * HD + S * KVH * HD
+                cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rt2 + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+                # 6. causal attention; the kv head for query head h is h/(H/KVH)
+                cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(DKr), 8)
+                cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
+                cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
+                cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                # 7. the OUTPUT GATE: gated = attn * sigmoid(gate)
+                put_i(AP1, 0, DCtx) ; put_i(AP1, 8, DGT) ; put_i(AP1, 16, DGD) ; put_i(AP1, 24, S * NQ)
+                cuda_launch4i(from<loc<CVoid>>(addr(hgmul)), (S * NQ + 255) / 256, 1, 1, 256, 1, 1, AP1, 0, 0, 0)
+                # 8. wo and the residual into X1 (what the shared FFN consumes)
+                gA = DGD; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
+                cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
+                cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
+                cuMemcpyHtoD_v2(GM + 48, loc(ac1), 8); cuMemcpyHtoD_v2(GM + 56, loc(bc1), 8)
+                cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
+                cuCtxSynchronize()
+                if (APR >= 0) {
+                    dump_section(DQG, S * 2 * NQ, "a1_", "qg")
+                    dump_section(DQ, S * NQ, "a1_", "q_pre")
+                    dump_section(DGT, S * NQ, "a1_", "gate_pre")
+                    dump_section(DQN, S * NQ, "a1_", "q_norm")
+                    dump_section(DQr, S * NQ, "a1_", "q_rope")
+                    dump_section(DKN, S * NKV, "a1_", "k_norm")
+                    dump_section(DKr, S * NKV, "a1_", "k_rope")
+                    dump_section(DCtx, S * NQ, "a1_", "attn")
+                    dump_section(DGD, S * NQ, "a1_", "gated")
+                    dump_section(DO, S * D, "a1_", "out")
+                    println("ATTN_PROBE_DONE blk." + L.to_string() + " tokens=" + S.to_string()
+                            + " H=" + H.to_string() + " KVH=" + KVH.to_string() + " HD=" + HD.to_string())
+                    # The FFN half of the block is deliberately NOT run: this check is about the
+                    # attention authority, whose last stage is `out` (the wo output, pre-residual),
+                    # and Ridge's FFN weights are IQ3_S, which no engine kernel implements yet.
+                    return 0
+                }
+            } else {
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q.weight", DPK, PF, DWq, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 70 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 71 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 72 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q5fn, q6fn, efn, NQ); if (e != 0) { return 73 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 74 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D); if (e != 0) { return 75 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF); if (e != 0) { return 76 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { return 77 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { return 78 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { return 79 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_norm.weight", DPK, PF, N2, q4fn, q5fn, q6fn, efn, 0); if (e != 0) { return 80 }
 
             e = run_layer_attn(S, D, H, KVH, HD, NROT, FF, NQ, NKV, EPS, XI, XO,
                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                           N1, DWq, DWk, DWv, Nq, Nk, DF, DWo, N2, DWg, DWu, DWd,
                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
             if (e != 0) { return 81 }
+            }
             }
             e = run_ffn(S, D, FF, gfn, rfn, sfn, refn, GM, RN, EPS,
                         X1, N2, DWg, DWu, DWd, X1N, Gr, Up, Hu, M, XO)
