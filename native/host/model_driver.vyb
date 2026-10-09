@@ -440,7 +440,14 @@ main()<Int> -> {
     GL<Int> = 0
     for (GL in 0..MAXL - 1) {
         if (GRL < 0) {
-            if (mc_layer_kind("blk." + GL.to_string() + ".ssm_alpha.weight") == 2) { GRL = GL }
+            # mc_layer_kind classifies a NAME — "what kind is this tensor" — it does NOT answer "does
+            # this tensor exist", and every constructed name ends with the marker, so a bare kind test
+            # calls a DENSE model recurrent. Measured: it did, and the dense regression failed with
+            # GDN_CFG_FAIL. Presence comes from the tensor table; the kind says what a present tensor
+            # means. Always pair the two.
+            if (find_nm(nmv, "blk." + GL.to_string() + ".ssm_alpha.weight") >= 0) {
+                if (mc_layer_kind("blk." + GL.to_string() + ".ssm_alpha.weight") == 2) { GRL = GL }
+            }
         }
     }
     GNE<Int> = 0; GSS<Int> = 0; GHK<Int> = 0; GHV<Int> = 0
@@ -579,7 +586,11 @@ main()<Int> -> {
         atl2<Int> = 0
         for (atl2 in 0..MAXL - 1) {
             if (ATL == 0) {
-                if (mc_layer_kind("blk." + atl2.to_string() + ".attn_q.weight") == 1) { ATL = atl2 }
+                if (atl2 > 0) {
+                    if (find_nm(nmv, "blk." + atl2.to_string() + ".attn_q.weight") >= 0) {
+                        if (mc_layer_kind("blk." + atl2.to_string() + ".attn_q.weight") == 1) { ATL = atl2 }
+                    }
+                }
             }
         }
         ats<String> = "blk." + ATL.to_string() + "."
@@ -783,12 +794,23 @@ main()<Int> -> {
         L<Int> = 0
         for (L in 0..MAXL - 1) {
             # ---- the per-layer DISPATCH (unit 9c) ----
-            # kind 2 = Gated DeltaNet (recurrent), 1 = attention, and the rule is mc_layer_kind —
-            # the SAME one the capability descriptor counts with (gate P4.4), so the loop cannot
-            # decide differently from the report. A dense model (kind never 2) runs exactly as
-            # before. In probe mode only the selected block runs, and the block's own path does the
-            # work: nothing here is a copy of a side harness.
-            lkc<Int> = mc_layer_kind("blk." + L.to_string() + ".ssm_alpha.weight")
+            # Presence comes from the tensor table; the KIND comes from the shared classifier. This
+            # pairing is not optional: mc_layer_kind classifies a name, so asking it alone about a
+            # constructed name makes every layer look recurrent (measured — a dense model reported
+            # "the first recurrent block blk.0. is missing a tensor").
+            lkc<Int> = 0
+            if (find_nm(nmv, "blk." + L.to_string() + ".ssm_alpha.weight") >= 0) {
+                lkc = mc_layer_kind("blk." + L.to_string() + ".ssm_alpha.weight")
+            }
+            if (lkc == 0) {
+                if (find_nm(nmv, "blk." + L.to_string() + ".attn_q.weight") >= 0) {
+                    lkc = mc_layer_kind("blk." + L.to_string() + ".attn_q.weight")
+                }
+            }
+            if (lkc == 0) {
+                println("DISPATCH_FAIL blk." + L.to_string() + " carries neither a recurrent nor an attention marker")
+                return 7
+            }
             if (PR < 0 || L == PR) {
             if (lkc == 2) {
                 # ---- the recurrent block: mixer (per token, state carried) then the shared FFN ----
