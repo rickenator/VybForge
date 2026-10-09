@@ -39,12 +39,23 @@ BASE = 1e7                                  # ridge_theta
 # heads are enough to pin it, and head_dim stays at Ridge's real 256 (the norm and rope are per head).
 # n_kv == n_head on purpose: ggml's batched mul_mat needs matching batch dims, so the fixture stays
 # inside the shape dance the harness performs. GQA (fewer kv heads) needs the K/V repeat, untested.
-NH, HD, NKV, S, D = 3, 256, 3, 3, 64
+# Ridge's ratio, scaled down: 24 query heads to 4 kv heads is 6:1; here 6 query heads to 2 kv heads is
+# 3:1, which exercises a real GROUPING (heads 0..2 -> kv 0, heads 3..5 -> kv 1) without a large fixture.
+# Two fixtures, selected by VYBFORGE_ATTN_GEOM (the gate runs both):
+#   heads (default): n_kv == n_head, the hand-rolled path — all TEN stages verified, the stronger case
+#   gqa            : n_kv < n_head (6:2 = 3:1, Ridge's 24:4 scaled down) — flash op, GQA grouping; only
+#                    the front half is verified so far and the attention stages are reported
+GEOM = os.environ.get("VYBFORGE_ATTN_GEOM", "heads")
+NH, HD, NKV, S, D = (6, 256, 2, 3, 64) if GEOM == "gqa" else (3, 256, 3, 3, 64)
+MODE = os.environ.get("VYBFORGE_ATTN_MODE", "flash" if GEOM == "gqa" else "explicit")
+GQA = NKV != NH
+GROUP = NH // NKV if GQA else 1
 KQS = 1.0 / (HD ** 0.5)                       # 1/sqrt(head_dim), unless GGUF overrides the scale
 # What the gate requires vs what the harness also computes. The front half is measured and required;
 # attention/gate/wo are computed and REPORTED only, because they do not agree yet (see the note the
 # verifier prints) — a mismatch that is printed but not gated is a known-open item, not a pass.
-FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope", "attn", "gated", "out")
+FRONT = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope") if GQA else \
+        ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope", "attn", "gated", "out")
 # The harness's dump ORDER, which is what the sequential parse below walks. It must list EVERY dumped
 # tensor: leaving `scores`/`probs` out of this list shifted every later slot by two, so `attn` was read
 # from the scores slot, `gated` from probs and `out` from attn — which read exactly like a numerical
@@ -56,7 +67,7 @@ DUMPED = ("qg", "q_pre", "gate_pre", "q_norm", "q_rope", "k_norm", "k_rope",
 SCORE_STAGES = ("scores", "probs")
 # The two DIAGNOSTIC tensors, not block outputs: their comparison order is not settled, but `attn` is
 # computed FROM probs on both sides and matches ggml at 2.7e-7, so the two sides agree in content.
-LATER = ("scores", "probs")
+LATER = ("scores", "probs", "attn", "gated", "out")
 STAGES = FRONT + LATER
 
 
@@ -74,12 +85,13 @@ def build_authority():
 THREADS = int(os.environ.get("VYBFORGE_ATTN_THREADS", "1"))
 
 
-def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid):
+def run_authority(Wqg, Wk, Wv, Wo, nmq, nmk, hid, mode=None):
     with open(IN, "wb") as fh:
         for a in (Wqg, Wk, Wv, Wo, nmq, nmk, hid):
             fh.write(np.ascontiguousarray(a, dtype="<f4").tobytes())
     r = subprocess.run([BIN, IN, OUT, str(NH), str(HD), str(NKV), str(S), str(D), str(ND), "%.9g" % EPS,
-                        "%.9g" % KQS, *[str(x) for x in SECTIONS], str(THREADS)], capture_output=True, text=True)
+                        "%.9g" % KQS, (mode or MODE), *[str(x) for x in SECTIONS], str(THREADS)],
+                       capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(("attn authority", r.stdout + r.stderr)[:300])
     shapes = {}
@@ -125,7 +137,7 @@ def sigmoid(x):
 
 
 def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, rope_whole=False,
-         non_causal=False, raw_gate=False, no_scale=False):
+         non_causal=False, raw_gate=False, no_scale=False, round_robin=False):
     """The engine's intended reading of the block, stage by stage. `pos` is (S,)."""
     pos = np.arange(S, dtype=np.float64)
     qg = hid @ Wqg.T                                     # (S, nh*2*hd) -- ggml ne = (nqg, S)
@@ -148,12 +160,16 @@ def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, 
     k_rope = neox(k_norm, pos, HD if rope_whole else ND)
     # causal attention over these S tokens, then the output gate, then wo
     kqs = 1.0 if no_scale else KQS
+    # GQA: each query head reads ONE kv head, grouped contiguously (kv = h // group) — which is what
+    # repeating K/V from n_kv to n_head produces. `round_robin` (h % n_kv) is the misreading the gate
+    # requires to differ.
+    if GQA:
+        idx = np.array([(h % NKV) if round_robin else (h // GROUP) for h in range(NH)])
+    else:
+        idx = np.arange(NH)
+    k_g = k_rope[:, idx, :]
     v_pre = (hid @ Wv.T).reshape(S, NKV, HD)
-    # NOTE the letters: the query-token and key-token axes must be DISTINCT. Writing "shd,skd->shk"
-    # reuses `s` for both, which silently forces key token == query token (it contracts the two
-    # token axes together) and turns the output's third axis into the kv HEAD instead of the key.
-    # The symptom is subtle: only the diagonal (q == kv) agrees, and no axis permutation can match.
-    sc_scaled = np.einsum("qhd,khd->qhk", q_rope, k_rope) * kqs   # (q, head, kv), UNMASKED
+    sc_scaled = np.einsum("qhd,khd->qhk", q_rope, k_g) * kqs       # (q, head, kv), UNMASKED
     sc = sc_scaled
     if not non_causal:
         above = np.arange(S)[None, :] > np.arange(S)[:, None]      # key index > query index
@@ -161,10 +177,10 @@ def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, 
     m = sc.max(axis=2, keepdims=True)
     e = np.exp(sc - m)
     pr = e / e.sum(axis=2, keepdims=True)
-    at = np.einsum("qhk,kd...".replace("...", ""), pr, v_pre) if False else np.einsum("qhk,khd->qhd", pr, v_pre)
+    at = np.einsum("qhk,khd->qhd", pr, v_pre[:, idx, :])
     gated = at * (gate_eff if raw_gate else sigmoid(gate_eff))
     out = gated.reshape(S, NH * HD) @ Wo.T
-    # matched to the harness's ne0-fastest dump order for the two score tensors: its tensor is
+    # matched to the harness's ne0-fastest dump order for the two score tensors:
     # ne = (S_kv, S_q, n_head), so the flat order is (kv, q, head) — axes (2, 0, 1) of (q, head, kv),
     # NOT (2, 1, 0), which silently reorders the head axis into the query axis
     sc_t = np.transpose(sc_scaled, (2, 0, 1)).ravel()
@@ -176,8 +192,8 @@ def spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, *, gate_first=False, norm_whole=False, 
 
 
 def main():
-    print(f"ATTN_VERIFY geometry n_head={NH} head_dim={HD} n_kv={NKV} S={S} D={D} n_dims={ND} eps={EPS:g} "
-          f"threads={THREADS}")
+    print(f"ATTN_VERIFY geometry={GEOM} n_head={NH} head_dim={HD} n_kv={NKV} S={S} D={D} n_dims={ND} "
+          f"eps={EPS:g} threads={THREADS} mode={MODE}" + (f" GQA group={GROUP}:1" if GQA else ""))
     if not os.path.exists(os.path.join(LLAMA, "ggml/include/ggml.h")):
         print(f"ATTN_VERIFY_SKIP no llama.cpp checkout at {LLAMA}")
         return 0
@@ -232,6 +248,19 @@ def main():
     # output arrangement, or my transpose of it), but `attn` is computed FROM probs on both sides and is
     # gated at 2.7e-7, so the two sides agree in content — only the comparison's ordering is in question.
     # NOT the cause of the earlier "flakiness": that was the parse-offset bug fixed in DUMPED above.
+    if GQA:
+        # The GQA fixture: the hand-rolled cross-check cannot run at n_kv < n_head (its scores/probs slots
+        # are zeros), and attn/gated/out do not yet agree with the flash op — so nothing beyond the front
+        # half is authorised here. The mismatch is localised: magnitudes match exactly (0.6077 both sides)
+        # and head 0 token 0 agrees, so it is a mapping/position question inside the attention, not a
+        # reading of the split or the norms (those are the seven stages below, at 2.2..2.9e-07).
+        print("ATTN_VERIFY_NOT_GATED GQA mode: scores/probs are ZERO placeholders (no hand-rolled "
+              "cross-check at n_kv < n_head); attn/gated/out are NOT authorised")
+        for nm in ("attn", "gated", "out"):
+            print(f"ATTN_VERIFY_NOT_GATED   {nm:9s} maxrel={rv.rel(mine[nm], ref[nm]):.3e}")
+        print(f"ATTN_VERIFY_DONE GQA ({GEOM}): the {len(FRONT)} front-half stages reproduce ggml's ops "
+              f"within {MAXREL:g} (the flash op's GQA repeat is NOT yet authorised)")
+        return 0
     print("ATTN_VERIFY_NOT_GATED diagnostic tensors (order unsettled, content corroborated by attn):")
     for nm in LATER:
         a, b = np.asarray(mine[nm], dtype=np.float64), np.asarray(ref[nm], dtype=np.float64)
@@ -253,6 +282,10 @@ def main():
             ("non-causal attention", dict(non_causal=True), "attn"),
             ("raw gate (no sigmoid)", dict(raw_gate=True), "gated"),
             ("no kq_scale", dict(no_scale=True), "attn"))
+    if GQA:
+        # Only meaningful when there IS a grouping to get wrong: at n_kv == n_head the mapping is the
+        # identity either way and a "not distinguished" here would be correct, useless noise.
+        alts = alts + (("round-robin GQA grouping", dict(round_robin=True), "attn"),)
     for nm, kw, key in alts:
         a = spec(Wqg, Wk, Wv, Wo, nmq, nmk, hid, **kw)
         r = rv.rel(a[key], ref[key])
@@ -265,7 +298,7 @@ def main():
 
     print(f"ATTN_VERIFY_DONE {len(FRONT)} front-half stages reproduce ggml's ops within {MAXREL:g} "
           f"(worst {worst:.3e}), and all {len(alts)} alternative readings of them are rejected; "
-          f"the {len(LATER)} diagnostic tensors ({', '.join(LATER)}) are reported with their order unsettled")
+          f"{len(LATER)} attention stages are reported, NOT authorised (GQA mode: see the note in the doc)")
     return 0
 
 

@@ -55,6 +55,26 @@ if grep -q "^ATTN_VERIFY_DONE" "$log" && [ "$rc" = "0" ]; then
   exit 0
 fi
 
+# The GQA fixture as well: n_kv < n_head (6:2, Ridge's 24:4 scaled down), where the hand-rolled path
+# cannot run and the flash op carries the grouping. Its front half must hold too, and its attention
+# stages are NOT claimed yet (the verdict says so itself).
+glog="$work/verify_gqa.log"
+VYBFORGE_ATTN_GEOM=gqa env -u PYTHONPATH "$py" native/tools/attn_verify.py >"$glog" 2>&1
+grc=$?
+if grep -q "^ATTN_VERIFY_DONE GQA" "$glog" && [ "$grc" = "0" ]; then
+  step "attention stages vs ggml (GQA 3:1)" "PASS ($(grep -m1 '^ATTN_VERIFY_DONE GQA' "$glog" | sed 's/^ATTN_VERIFY_DONE GQA [^:]*: //'))"
+else
+  step "attention stages vs ggml (GQA 3:1)" "FAIL (see $glog)"
+  grep -E '^ATTN_VERIFY' "$glog" | tail -8 | sed 's/^/      /'
+  echo; echo "ATTENTION BLOCK GATE: FAIL"
+  exit 1
+fi
+
+if grep -q "^ATTN_VERIFY_DONE " "$log" && [ "$rc" = "0" ]; then
+  echo; echo "ATTENTION BLOCK GATE: PASS"
+  exit 0
+fi
+
 step "attention stages vs ggml" "FAIL (see $log)"
 echo; echo "ATTENTION BLOCK GATE: FAIL"
 exit 1

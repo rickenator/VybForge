@@ -12,7 +12,8 @@
 // silent: a swapped q/gate half, a norm over the whole projection, rope across the whole head, a
 // non-causal attention, or a raw gate multiply would all still produce plausible numbers.
 //
-// Usage: attn_authority in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2
+// Usage: attn_authority in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale attn_mode s0 s1 s2 [threads]
+//   attn_mode = explicit (hand-rolled, n_kv must equal n_head) | flash (ggml_flash_attn_ext; GQA-capable)
 //   in.bin (f32, ggml order — ne0 fastest, so numpy reads each as its last axis):
 //     W_qg   (n_head*2*head_dim, D)   the joint Q+gate projection
 //     W_k    (n_kv*head_dim,    D)
@@ -41,8 +42,8 @@ static void * xmalloc(size_t n) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 15 || argc > 16) {
-        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale s0 s1 s2 [threads]\n", argv[0]);
+    if (argc < 16 || argc > 17) {
+        fprintf(stderr, "usage: %s in.bin out.bin n_head head_dim n_kv S D n_rot eps kq_scale attn_mode s0 s1 s2 [threads]\n", argv[0]);
         return 2;
     }
     const int64_t nh   = atoll(argv[3]);
@@ -53,7 +54,9 @@ int main(int argc, char ** argv) {
     const int     nd   = atoi(argv[8]);
     const float   eps  = (float) atof(argv[9]);
     const float   kqs  = (float) atof(argv[10]);
-    int sections[4] = { atoi(argv[11]), atoi(argv[12]), atoi(argv[13]), 0 };
+    const char *  amode = argv[11];
+    const int     flash = (strcmp(amode, "flash") == 0);
+    int sections[4] = { atoi(argv[12]), atoi(argv[13]), atoi(argv[14]), 0 };
     (void) sections;
 
     const int64_t nqg = nh * 2 * hd;
@@ -129,25 +132,52 @@ int main(int argc, char ** argv) {
     // n_kv == n_head; GQA with fewer kv heads needs the repeat llama.cpp applies to K/V, which is a
     // separate step and is not claimed here.)
     struct ggml_tensor * vp  = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, t_wv, t_h), hd, nkv, S);
-    struct ggml_tensor * qp  = ggml_permute(ctx, qr, 0, 2, 1, 3);        // (hd, S, n_head)
-    struct ggml_tensor * kpp = ggml_permute(ctx, kr, 0, 2, 1, 3);       // (hd, S, n_kv)
-    // V must present the KEY axis as ne0 for the contraction below: (hd, n_kv, S) -> (S, hd, n_kv)
-    struct ggml_tensor * vpp = ggml_cont(ctx, ggml_transpose(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3)));
-    struct ggml_tensor * kq  = ggml_mul_mat(ctx, kpp, qp);                // (S_kv, S_q, n_head)
-    // The causal mask must be an EXPLICIT (S_kv, S_q) tensor passed to soft_max_ext, which reduces ne0 —
-    // the key axis. `ggml_diag_mask_inf` would be wrong here: it cuts ne0 against ne2, and ne2 is the
-    // HEAD axis in this arrangement, so it would place the causal cut across heads.
-    struct ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, 1);
+    // ggml_flash_attn_ext asserts its mask is F16, so this one is built as F16
+    struct ggml_tensor * mask2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, S, S);
     for (int64_t qi = 0; qi < S; qi++) {
         for (int64_t ki = 0; ki < S; ki++) {
-            ((float *) mask->data)[ki + qi * S] = (ki > qi) ? -INFINITY : 0.0f;
+            ((ggml_fp16_t *) mask2->data)[ki + qi * S] = ggml_fp32_to_fp16((ki > qi) ? -INFINITY : 0.0f);
         }
     }
-    struct ggml_tensor * kqs_t = ggml_scale(ctx, kq, kqs);   // scores: 1/sqrt(head_dim) scaling
-    struct ggml_tensor * pr = ggml_soft_max_ext(ctx, kqs_t, mask, 1.0f, 0.0f);
-    struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);               // (hd, S_q, n_head)
-    // permute yields a VIEW: dumping it linearly would report atp's layout, so copy it contiguous
-    struct ggml_tensor * at  = ggml_cont(ctx, ggml_permute(ctx, atp, 0, 2, 1, 3));  // (hd, n_head, S)
+
+    struct ggml_tensor * kqs_t;
+    struct ggml_tensor * pr;
+    struct ggml_tensor * at;
+    if (nkv == nh) {
+        // The hand-rolled path, which ggml's batched mul_mat can only express when the batch (head) dims
+        // match. It is the cross-check on the flash op below, and it is why this fixture ran with
+        // n_kv == n_head until now. Uses the view for at_ex, but the same 2-D mask as flash.
+        struct ggml_tensor * qp  = ggml_permute(ctx, qr, 0, 2, 1, 3);        // (hd, S, n_head)
+        struct ggml_tensor * kpp = ggml_permute(ctx, kr, 0, 2, 1, 3);       // (hd, S, n_kv)
+        struct ggml_tensor * vpp = ggml_cont(ctx, ggml_transpose(ctx, ggml_permute(ctx, vp, 0, 2, 1, 3)));
+        struct ggml_tensor * kq  = ggml_mul_mat(ctx, kpp, qp);              // (S_kv, S_q, n_head)
+        struct ggml_tensor * kqm = ggml_diag_mask_inf(ctx, kq, 0);
+        (void) kqm;
+        kqs_t = ggml_scale(ctx, kq, kqs);
+        // the mask is applied INSIDE the op, so `scores` is deliberately the unmasked scaled scores
+        struct ggml_tensor * kq3 = ggml_reshape_3d(ctx, ggml_scale(ctx, kq, 1.0f), S, S, nh);
+        struct ggml_tensor * mask3 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, 1);
+        for (int64_t qi = 0; qi < S; qi++) {
+            for (int64_t ki = 0; ki < S; ki++) {
+                ((float *) mask3->data)[ki + qi * S] = (ki > qi) ? -INFINITY : 0.0f;
+            }
+        }
+        pr = ggml_soft_max_ext(ctx, kq3, mask3, kqs, 0.0f);
+        struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);
+        struct ggml_tensor * at_ex = ggml_cont(ctx, ggml_permute(ctx, atp, 0, 2, 1, 3));
+        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qr, kr, vp, mask2, kqs, 0.0f, 0.0f);
+        // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
+        // n_tokens) that the split half of this harness and the gate multiply use
+        at = flash ? ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3)) : at_ex;
+    } else {
+        // GQA (n_kv < n_head): the hand-rolled products cannot be expressed, so the flash op — the one
+        // llama.cpp uses for this architecture — is the authority, and the two diagnostic slots are
+        // zeros. Keep the slot COUNT and ORDER identical in both modes: the reader walks positionally.
+        struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qr, kr, vp, mask2, kqs, 0.0f, 0.0f);
+        at = ggml_cont(ctx, ggml_permute(ctx, atf, 0, 2, 1, 3));
+        kqs_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);
+        pr    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, S, nh);
+    }
     struct ggml_tensor * gs  = ggml_sigmoid(ctx, gt);                   // the gate half of the joint projection
     struct ggml_tensor * gtd = ggml_mul(ctx, at, gs);
     struct ggml_tensor * gc2 = ggml_cont_2d(ctx, gtd, nh * hd, S);
@@ -163,7 +193,7 @@ int main(int argc, char ** argv) {
     // compute (or after ggml_new_graph) it is too late: the allocator has already handed a stage's buffer
     // to someone else, and the dump then reports that other tensor's values — which is exactly how
     // `attn` came to hold the scores (and why a change elsewhere in the graph moved it: the aliasing did).
-    ggml_set_input(mask);
+    ggml_set_input(mask2);
     ggml_set_output(qg);  ggml_set_output(qc);  ggml_set_output(gtc);
     ggml_set_output(qn);  ggml_set_output(qr);  ggml_set_output(kn);  ggml_set_output(kr);
     ggml_set_output(kqs_t); ggml_set_output(pr);
@@ -175,9 +205,6 @@ int main(int argc, char ** argv) {
     ggml_build_forward_expand(gf, gt);
     ggml_build_forward_expand(gf, qc);
     ggml_build_forward_expand(gf, gtc);
-    ggml_build_forward_expand(gf, qp);
-    ggml_build_forward_expand(gf, kpp);
-    ggml_build_forward_expand(gf, atp);
     ggml_build_forward_expand(gf, at);
     ggml_build_forward_expand(gf, gtd);
     ggml_build_forward_expand(gf, wo_out);
@@ -187,7 +214,7 @@ int main(int argc, char ** argv) {
     ggml_build_forward_expand(gf, kr);
     // An authority must be deterministic. Default to ONE thread (a threaded graph compute is the prime
     // suspect for a verdict that flipped between runs), and let the caller ask for more to test that.
-    const int n_threads = (argc == 16) ? atoi(argv[15]) : 1;
+    const int n_threads = (argc == 17) ? atoi(argv[16]) : 1;
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 
     // Every tensor this harness READS BACK is marked as an output before the graph is built (and the
@@ -195,7 +222,7 @@ int main(int argc, char ** argv) {
     // while chasing what looked like buffer aliasing, and it was NOT the cause of that mismatch — the
     // cause was a parse-order bug in attn_verify.py (see the DUMPED comment there). Kept because it is
     // the correct way to read a stage back, and because a harness that dumps what it reads should say so.
-    ggml_set_input(mask);
+    ggml_set_input(mask2);
     const struct { const char * nm; struct ggml_tensor * t; } stages[] = {
         { "qg", qg }, { "q_pre", qc }, { "gate_pre", gtc }, { "q_norm", qn },
         { "q_rope", qr }, { "k_norm", kn }, { "k_rope", kr },
@@ -214,8 +241,9 @@ int main(int argc, char ** argv) {
         }
     }
     fclose(out);
-    printf("ATTN_OK n_head=%lld head_dim=%lld n_kv=%lld S=%lld D=%lld n_dims=%d eps=%g threads=%d\n",
-           (long long) nh, (long long) hd, (long long) nkv, (long long) S, (long long) D, nd, (double) eps, n_threads);
+    printf("ATTN_OK n_head=%lld head_dim=%lld n_kv=%lld S=%lld D=%lld n_dims=%d eps=%g threads=%d mode=%s\n",
+           (long long) nh, (long long) hd, (long long) nkv, (long long) S, (long long) D, nd, (double) eps,
+           n_threads, amode);
     ggml_free(ctx);
     free(fbuf);
     return 0;

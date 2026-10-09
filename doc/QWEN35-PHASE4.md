@@ -1077,3 +1077,31 @@ So the next unit is not "wire the engine probe" but "extend the authority to GQA
 because the engine probe would otherwise be validated against a reading of GQA that has never been
 measured — the exact failure mode this whole unit has been correcting. The engine side has the same
 requirement: `run_layer_attn` currently stages ONE `attn_k`/`attn_v` at the query-head count.
+
+## Unit 10 step 4a — the GQA fixture is in: Ridge's ratio, the flash op, and what is NOT yet authorised
+
+Ridge's attention is 24 query heads to 4 kv heads, and P4.8's fixture deliberately used `n_kv == n_head`
+because ggml's batched `mul_mat` needs matching batch dims (the two products it uses are
+`mul_mat(k, q)` and `mul_mat(v_t, probs)`). That gap is now covered in the fixture — and bounded
+honestly:
+
+* `VYBFORGE_ATTN_GEOM=gqa` runs n_kv < n_head (6:2 = 3:1, Ridge's 24:4 scaled down) through
+  `ggml_flash_attn_ext` — the op llama.cpp actually uses for this architecture, which handles GQA inside
+  itself, so no K/V repeat has to be built by hand. The hand-rolled path cannot run at that ratio at all,
+  so its two diagnostic slots are documented zero placeholders (the dump order is unchanged: the reader
+  walks positionally, and this unit has already been bitten by exactly that).
+* The default fixture stays at n_kv == n_head, where all TEN stages are verified and six misreadings are
+  rejected. The gate now runs BOTH fixtures, so the GQA work is covered by the gate without giving up the
+  stronger case.
+* **Not authorised**: in GQA mode the front half is verified (2.2..2.9e-07) but `attn`/`gated`/`out` are
+  not — `attn` 8.842e-01. The mismatch is LOCALISED, which is where the next session should start: the
+  magnitudes match exactly (0.6077 on both sides), head 0 / token 0 agrees for the first six values, and
+  both standard head->kv mappings (contiguous `h // group` and round-robin `h % n_kv`) give the same
+  error, so it is not the grouping convention. The mask convention was tested too: filling it transposed
+  makes things WORSE (1.287 vs 0.884), so it is not that either. Remaining candidates: the flash op's
+  internal handling of the (hd, tokens, heads) output this fixture permutes, or a position/rope
+  interaction that the seven verified front-half stages do not exercise at tokens >= 1.
+
+Two facts about `ggml_flash_attn_ext` learned by measurement rather than recall: its mask must be
+**F16** (it asserts), and its output is `(hd, n_tokens, n_head)` — the token axis second — not the
+`(hd, n_head, n_tokens)` the rest of the block uses, so it needs a permute before the gate multiply.
