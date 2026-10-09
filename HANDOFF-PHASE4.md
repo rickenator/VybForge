@@ -144,25 +144,22 @@ Trap worth remembering: the fixture grew to two tokens but `DX` was still alloca
 8192-byte upload into a 4096-byte buffer clobbered its neighbours and made step 1 read zeros — no
 device error, just wrong numbers. Device allocation sizes must move with the fixture.
 
-## Unit 9 (started, DORMANT on purpose): real quantized weights
+## Unit 9 — DONE for the Q8_0 pair: the layer check runs at model geometry on real weights
 
-The layer fixture can carry the model's own Q8_0 `ssm_alpha`/`ssm_beta` (raw GGUF bytes at the
-inventory offsets) and the driver dequantises them on the GPU with the existing `q8_0deq` kernel; the
-authority is fed the same values dequantised in numpy. Verified dormant: the verifier refuses the
-model's `(48, 5120)` tensors at this fixture's `(8, 512)` geometry and SAYS so, rather than feeding a
-truncated slice, and the 26-stage check is unchanged (2.4e-07).
+`native/tools/gdn_layer_kernel_verify.py` now runs at the 27B's own geometry (n_embd 5120, S 128,
+H_k 16, H_v 48, d_conv 4) and `ssm_alpha`/`ssm_beta` are the model's own Q8_0 tensors, read raw from
+the GGUF and dequantised on the GPU by the existing `q8_0deq` kernel. 26 stages over two chained
+steps, worst maxrel 7.866e-07, gate wall clock 23 s. The driver's launch grids are computed from the
+dims now, so the geometry is a constant, not a set of literals.
 
-Blocker is only the fixture's geometry. **Measured** (`native/host/mmnt_bench.vyb`): one full-size
-`5120 -> 10240` f64 `mm_nt` — load + 419 MB upload + kernel — takes 0.53 s, because a single-token
-step is a matrix-vector product and is data-bound. So the model-geometry layer check is affordable on
-this box: raise the fixture geometry (NE 5120, S 128, H_k 16, H_v 48) and the real Q8_0 weights switch
-on by themselves. An earlier estimate of "~270 GFLOP, so minutes" was for a PREFILL (M = prompt
-length) — that is the case that needs a tiled/gemm projection and, if it grows, the DGX Sparks
-cluster; it is NOT the case this layer check runs.
+Measured before changing anything (`native/host/mmnt_bench.vyb`): one full-size 5120 -> 10240 f64
+projection — load + 419 MB upload + kernel — is 0.53 s. A single-token step is a matrix-vector product
+and is I/O-bound; the ~270 GFLOP estimate that had kept this dormant describes a PREFILL. So no
+cluster is needed for this check — the 3090 here is fine — and the Sparks are the right place for the
+prefill case (unit 9b) if it needs scheduling.
 
-Scheduling note (from Rick, 2026-10-08): the dual DGX Sparks are shared with other agents, so a
-cluster run must be scheduled by hand. The main GPU (this box's 3090, 23.7 GB free at the time of
-writing) is the right place for the decode-step check and for any prefill measurement that fits.
+Still synthetic: `ssm_out` (Q4_K in this file) and `wqkv`/`wqkv_gate`. Same mechanism, `q4kdeq`
+already exists and is gated.
 
 ## `eng_gdn()` is STILL 0, deliberately
 

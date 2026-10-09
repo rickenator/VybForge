@@ -7,21 +7,17 @@
 # conv1d_k, interleave_qkv, silu_k, l2norm, delta_step, norm_gated and add_k — and compares it
 # against that authority STAGE BY STAGE, so a wiring mistake names the stage that is wrong.
 #
-# Geometry is small (n_embd=512, S=32, H_k=4, H_v=8, d_conv=4) so the gate is quick, and deliberately
-# NOT degenerate: every stride exceeds 1, which is where wiring/axis bugs live. It runs TWO chained
-# decode steps and compares both: step 2's conv window and delta-net state come out of step 1, so the
-# carry-over a running sequence needs is exercised, not just one token from a zero state. The fixture is generated once and fed to both sides in their
+# Geometry is the 27B Ridge model's own (n_embd=5120, S=128, H_k=16, H_v=48, d_conv=4) and
+# ssm_alpha/ssm_beta are the model's real Q8_0 tensors, dequantised on the GPU by the existing q8_0deq
+# kernel. It runs TWO chained decode steps and compares both: step 2's conv window and delta-net state
+# come out of step 1, so the carry-over a running sequence needs is exercised. Wall clock ~23 s (a
+# single-token step is I/O-bound — see native/host/mmnt_bench.vyb). The fixture is generated once and fed to both sides in their
 # own precision (authority f32, kernels f64), so the expected agreement is the authority's f32 floor
 # (~2e-7 measured) while a wiring error is O(1).
 #
 # The check reports its own negatives: the same run also prints, for step 2, the residual taken on the
 # normed input (7.6e-2) and with no residual at all (9.1e-1), both against a 1e-4 bar.
 #
-# ssm_alpha and ssm_beta can be driven by the model's OWN Q8_0 tensors (raw GGUF bytes uploaded, then
-# dequantised on the GPU by the existing q8_0deq kernel) — the mechanism is in place and dormant,
-# because the model's tensors are (48, 5120) and this fixture's geometry is (8, 512); the verifier
-# says so instead of feeding a truncated slice. Activating it means running this gate at the model's
-# real geometry, which the naive mm_nt projections make expensive (see doc/QWEN35-PHASE4.md).
 #
 # SKIPs (never PASSes) without a Vyb toolchain, without libggml for the authority, or without CUDA.
 set -u

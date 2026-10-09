@@ -76,17 +76,23 @@ put_f(PD<Int>, off<Int>, v<Float>) -> {
 }
 
 main()<Int> -> {
-    NE<Int> = 512
-    S<Int> = 32
-    HK<Int> = 4
-    HV<Int> = 8
+    NE<Int> = 5120
+    S<Int> = 128
+    HK<Int> = 16
+    HV<Int> = 48
     DC<Int> = 4
     KEY<Int> = HK * S
     VALUE<Int> = HV * S
     QKV<Int> = 2 * KEY + VALUE
     eps<Float> = 0.000001
-    sc<Float> = 0.17677669529663687        # 1/sqrt(32)
+    sc<Float> = 0.08838834764831845        # 1/sqrt(128)
     blkNN<Int> = 256
+    gRms<Int> = (NE + 255) / 256
+    gQkv<Int> = (QKV + 255) / 256
+    gVal<Int> = (VALUE + 255) / 256
+    gKey<Int> = (HK * S + 255) / 256
+    gHead<Int> = (HV * S + 255) / 256
+    gOut<Int> = (NE + 255) / 256
 
     xs<String> = "" ; ans<String> = "" ; wqs<String> = "" ; wgs<String> = ""
     wbs<String> = "" ; was<String> = "" ; dts<String> = "" ; asa<String> = ""
@@ -250,23 +256,23 @@ main()<Int> -> {
         if (st == 1) { pf = "s2_" }
         if (st > 0) {
             put_i(P4, 0, DCONV) ; put_i(P4, 8, QKV) ; put_i(P4, 16, DC) ; put_i(P4, 24, 0)
-            rc = cuda_launch4i(from<loc<CVoid>>(addr(hSH)), 2, 1, 1, 256, 1, 1, P4, 0, 0, 0)
+            rc = cuda_launch4i(from<loc<CVoid>>(addr(hSH)), gQkv, 1, 1, 256, 1, 1, P4, 0, 0, 0)
             if (rc != 0) { println("GDNL_ERR conv_shift") ; return 12 }
         }
 
         # ---- 1. attn_norm: the existing rmsnorm kernel, params (X, W, Y, rows, D, eps) ----
         put_i(P1, 0, xp) ; put_i(P1, 8, DAN) ; put_i(P1, 16, DXN)
         put_i(P1, 24, 1) ; put_i(P1, 32, NE) ; put_f(P1, 40, eps)
-        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hRN)), 2, 1, 1, 256, 1, 1, P1, 0, 0, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hRN)), gRms, 1, 1, 256, 1, 1, P1, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR rmsnorm") ; println_int(rc) ; return 12 }
 
         # ---- 2. projections ----
         put_i(P2, 0, DXN) ; put_i(P2, 8, DWQKV) ; put_i(P2, 16, DQKV)
         put_i(P2, 24, 1) ; put_i(P2, 32, QKV) ; put_i(P2, 40, NE)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 2, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), gQkv, 1, 1, 256, 1, 1, P2, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR mm wqkv") ; return 12 }
         put_i(P2, 8, DWG) ; put_i(P2, 16, DZ) ; put_i(P2, 32, VALUE)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 1, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), gVal, 1, 1, 256, 1, 1, P2, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR mm wgate") ; return 12 }
         put_i(P2, 8, DWB) ; put_i(P2, 16, DBRAW) ; put_i(P2, 32, HV)
         rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 1, 1, 1, 256, 1, 1, P2, 0, 0, 0)
@@ -285,22 +291,22 @@ main()<Int> -> {
 
         # ---- 4. the conv input's token frames, the causal short conv, then SiLU ----
         put_i(P4, 0, DQKV) ; put_i(P4, 8, DCONV) ; put_i(P4, 16, QKV) ; put_i(P4, 24, DC) ; put_i(P4, 32, 1)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hIL)), 2, 1, 1, 256, 1, 1, P4, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hIL)), gQkv, 1, 1, 256, 1, 1, P4, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR interleave") ; return 12 }
         put_i(P3, 0, DCONV) ; put_i(P3, 8, DCW) ; put_i(P3, 16, DCRAW)
         put_i(P3, 24, QKV) ; put_i(P3, 32, DC) ; put_i(P3, 40, 1)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hCV)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hCV)), gQkv, 1, 1, 256, 1, 1, P3, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR conv") ; return 12 }
         put_i(P3, 0, DCRAW) ; put_i(P3, 8, DCONVS) ; put_i(P3, 16, QKV)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hSV)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hSV)), gQkv, 1, 1, 256, 1, 1, P3, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR silu") ; return 12 }
 
         # ---- 5. l2 norm on q and k (the q|k|v split is just channel offsets) ----
         put_i(P1, 0, DCONVS) ; put_i(P1, 8, DQN) ; put_i(P1, 16, HK) ; put_i(P1, 24, S) ; put_f(P1, 32, eps)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), 1, 1, 1, 128, 1, 1, P1, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), gKey, 1, 1, 256, 1, 1, P1, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR l2 q") ; return 12 }
         put_i(P1, 0, DCONVS + KEY * 8) ; put_i(P1, 8, DKN)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), 1, 1, 1, 128, 1, 1, P1, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hL2)), gKey, 1, 1, 256, 1, 1, P1, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR l2 k") ; return 12 }
 
         # ---- 6. the recurrence ----
@@ -308,20 +314,20 @@ main()<Int> -> {
         put_i(P2, 24, DGATE) ; put_i(P2, 32, DBETA) ; put_i(P2, 40, stin)
         put_i(P2, 48, stout) ; put_i(P2, 56, DOUT) ; put_i(P2, 64, DEL)
         put_i(P2, 72, S) ; put_i(P2, 80, HK) ; put_i(P2, 88, HV) ; put_f(P2, 96, sc)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hDS)), 1, 1, 1, 8, 1, 1, P2, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hDS)), 1, 1, 1, HV, 1, 1, P2, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR delta_step") ; return 12 }
 
         # ---- 7. the gated RMS epilogue, then ssm_out and the residual ----
         put_i(P3, 0, DOUT) ; put_i(P3, 8, DZ) ; put_i(P3, 16, DSN) ; put_i(P3, 24, DEPI)
         put_i(P3, 32, HV) ; put_i(P3, 40, S) ; put_f(P3, 48, eps)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hNG)), 1, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hNG)), gHead, 1, 1, 256, 1, 1, P3, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR norm_gated") ; return 12 }
         put_i(P2, 0, DEPI) ; put_i(P2, 8, DSO) ; put_i(P2, 16, DY)
         put_i(P2, 24, 1) ; put_i(P2, 32, NE) ; put_i(P2, 40, VALUE)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), 2, 1, 1, 256, 1, 1, P2, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hMM)), gOut, 1, 1, 256, 1, 1, P2, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR mm ssm_out") ; return 12 }
         put_i(P3, 0, DY) ; put_i(P3, 8, xp) ; put_i(P3, 16, DLO) ; put_i(P3, 24, NE)
-        rc = cuda_launch4i(from<loc<CVoid>>(addr(hAD)), 2, 1, 1, 256, 1, 1, P3, 0, 0, 0)
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hAD)), gOut, 1, 1, 256, 1, 1, P3, 0, 0, 0)
         if (rc != 0) { println("GDNL_ERR residual") ; return 12 }
         cuCtxSynchronize()
 
@@ -351,6 +357,6 @@ main()<Int> -> {
         cuMemFree_v2(DY) ; cuMemFree_v2(DLO)
         cuMemFree_v2(P1) ; cuMemFree_v2(P2) ; cuMemFree_v2(P3) ; cuMemFree_v2(P4)
     }
-    println("GDNL_DONE steps=2 NE=512 S=32 Hk=4 Hv=8 d_conv=4")
+    println("GDNL_DONE steps=2 NE=5120 S=128 Hk=16 Hv=48 d_conv=4")
     return 0
 }

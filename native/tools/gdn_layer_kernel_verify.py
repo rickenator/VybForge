@@ -13,9 +13,10 @@ code" — the same standard the earlier units were held to. The fixture is gener
 both, in their own precisions: the authority computes in f32, the kernels in f64, so the expected
 agreement is the f32 rounding of the authority (~1e-6), while a wiring mistake is O(1).
 
-Geometry is small enough to be quick and deliberately NOT degenerate — S=32, H_k=4, H_v=8, d_conv=4,
-n_embd=512 — because a wiring bug that only appears once strides exceed 1 is exactly what the earlier
-units were bitten by.
+Geometry is the 27B Ridge model's own (n_embd=5120, S=128, H_k=16, H_v=48, d_conv=4), so the fixture
+can carry the model's real Q8_0 ssm_alpha/ssm_beta tensors — dequantised on the GPU by the existing
+q8_0deq kernel. A single-token step is a matrix-vector product, so this is I/O-bound: measured 0.53 s
+for one full-size projection (native/host/mmnt_bench.vyb).
 
 Usage: gdn_layer_kernel_verify.py
 """
@@ -38,7 +39,7 @@ AUTH_IN = os.path.join(BUILD, "gdn_layer_authority_in.bin")
 DRV_IN = os.path.join(BUILD, "gdn_layer_in.bin")
 DRV_LOG = os.path.join(BUILD, "gdn_layer_driver.log")
 
-NE, S, H_K, H_V, DC, T, B = 512, 32, 4, 8, 4, 1, 1
+NE, S, H_K, H_V, DC, T, B = 5120, 128, 16, 48, 4, 1, 1
 KEY, VALUE = H_K * S, H_V * S
 QKV = 2 * KEY + VALUE
 EPS = 1e-6

@@ -505,29 +505,30 @@ neighbouring buffers and made the FIRST step read zeros — every stage then dif
 reported no error at all. Device allocation sizes must move with the fixture's sizes; the symptom of
 getting it wrong is wrong numbers, not a fault.
 
-### Ninth unit (started): real quantized weights, and what blocks them
+### Ninth unit: the layer check now runs at the model's own geometry, on real quantized weights
 
-The engine's projections consume QUANTIZED weights, so the layer check should too. The mechanism is in
-place: the fixture can carry the model's own `blk.0.ssm_alpha.weight` / `blk.0.ssm_beta.weight` (the
-Q8_0 tensors of the gdn_state path — read RAW from the GGUF at the inventory's offsets), the driver
-uploads those bytes and runs the existing `q8_0deq` kernel to dequantise them on the GPU into the
-projection weights, and the authority is fed the same values dequantised in numpy. The Q8_0 math
-itself is already gated separately (S0.5, bit-exact against the `gguf` package).
+The layer check runs at 27B Ridge geometry (`n_embd=5120`, `S=128`, `H_k=16`, `H_v=48`, `d_conv=4`) and
+`ssm_alpha` / `ssm_beta` are the model's OWN `blk.0.*.weight` Q8_0 tensors: read RAW from the GGUF at
+the inventory's offsets, uploaded, and dequantised on the GPU by the existing `q8_0deq` kernel, with
+the authority fed the same values dequantised in numpy. The Q8_0 math is separately gated (S0.5,
+bit-exact against the `gguf` package), so what this adds is the pipeline: real GGUF bytes → GPU dequant
+→ the layer's projections → the block's output.
 
-It is DORMANT because of geometry, not machinery: the model's tensors are `(48, 5120)` while this
-layer fixture is `(8, 512)` — the verifier refuses to feed a truncated slice and says so (there is no
-model tensor of the fixture's shape, so slicing is not an option). Activating it means raising the
-fixture to the model's geometry.
+    26 stages over two chained steps, worst maxrel 7.866e-07, gate wall clock 23 s
 
-**Measured, because the estimate was wrong**: `native/host/mmnt_bench.vyb` runs one `5120 -> 10240`
-f64 `mm_nt` on a real-sized 419 MB weight and the whole process — load, 419 MB upload, kernel — takes
-**0.53 s**. A single-token step is a matrix-VECTOR product (M=1: 52 M MACs, data-bound), so the three
-big projections cost about a second of I/O and the model-geometry layer check is affordable on this
-box. The FLOP estimate that made it look expensive (~270 GFLOP for that projection) describes a
-PREFILL, where M is the prompt length — that is the case that needs a tiled/gemm kernel and, for the
-largest runs, the DGX Sparks cluster rather than the single 3090. So: raise the fixture geometry and
-switch the real Q8_0 weights on for the decode-step check; keep the prefill case (unit 9b) as the one
-that needs the faster kernel and scheduled hardware.
+That is the authority's f32 floor over K = 6144 dot products, and the negatives still read
+9.5e-01 / 1.1e-01 against the 1e-4 bar.
+
+**The cost estimate that kept this dormant was wrong, and measuring it is what unblocked it.**
+`native/host/mmnt_bench.vyb` times one full-size `5120 -> 10240` projection at 0.53 s including the
+419 MB upload: a single-token step is a matrix-VECTOR product (M=1, ~52 M MACs), so the check is
+I/O-bound and cheap. The ~270 GFLOP figure describes a PREFILL, where M is the prompt length — that is
+the case that needs a tiled/gemm projection (and, if it grows, the shared DGX Sparks cluster rather
+than this box's single 3090).
+
+Still synthetic: the other projections (`ssm_out` is Q4_K in this file; `wqkv`/`wqkv_gate` likewise
+quantized). Extending the same mechanism to them is mechanical — raw bytes at the inventory's offset,
+the matching dequant kernel (`q4kdeq`, already gated), the same wiring.
 
 ### `eng_gdn()` stays 0 — and why
 
