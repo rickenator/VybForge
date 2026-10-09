@@ -328,6 +328,23 @@ else
   step "P4.3 GDN layer wiring (GPU)" "FAIL"; echo "$out" | tail -10 | sed 's/^/      /'; fail=1
 fi
 
+# ── S0.10 — Q4_K dequant reference (the type with no reference until now) ───────────
+# Gate: native/legit/run_q4k_gate.sh. blk.N.attn_qkv, blk.N.attn_gate and blk.N.ssm_out are all Q4_K
+# (the model's biggest projections) and Q4_K was the one quant type with no numpy reference and no
+# gate — which is what blocked the GDN layer check from taking those weights. native/tools/q4k_ref.py
+# is that reference, compared ELEMENT-WISE against the independent gguf package's own Q4_K
+# dequantizer on whole real tensors (2 x 31.5 M values, bit-identical). SKIPs without the model and
+# FAILS if it proved nothing.
+out="$(./native/legit/run_q4k_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "Q4_K GATE: PASS"; then
+  step "S0.10 Q4_K dequant reference" "$(echo "$out" | grep -oE 'PASS \(.*\)' | tail -1)"
+elif echo "$last" | grep -q "Q4_K GATE: SKIP"; then
+  step "S0.10 Q4_K dequant reference" "SKIP ($(echo "$last" | sed 's/Q4_K GATE: SKIP //; s/[()]//g'))"
+else
+  step "S0.10 Q4_K dequant reference" "FAIL"; echo "$out" | tail -8 | sed 's/^/      /'; fail=1
+fi
+
 echo
 if [ $fail -eq 0 ]; then echo "PHASE 2 BATTERY: PASS"; else echo "PHASE 2 BATTERY: FAIL"; fi
 exit $fail

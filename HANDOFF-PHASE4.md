@@ -161,12 +161,17 @@ prefill case (unit 9b) if it needs scheduling.
 Also real now: `attn_norm` and `ssm_conv1d` (the model stores both as F32, read raw and used
 directly). Four of the layer's weight sets are the model's own.
 
-BLOCKED, with the reason: the three remaining projections are `blk.0.attn_qkv`, `blk.0.attn_gate` and
-`blk.0.ssm_out`, all **Q4_K** — the one quant type with no numpy reference in `native/tools/` and no
-S0.x gate in the battery. The layer check cannot use them until that reference exists (write
-`q4k_ref.py`, cross-check against the `gguf` package's Q4_K dequantizer, add the gate); feeding the
-authority GPU-produced weights instead would make the comparison self-consistent, which is the thing
-the project forbids. That reference is the next step for this thread.
+Q4_K IS NO LONGER THE BLOCKER: `native/tools/q4k_ref.py` (a numpy port of dequantize_row_q4_K) is now
+compared element-wise against the independent `gguf` package's Q4_K dequantizer on whole real tensors
+— 2 x 31.5 M values, bit-identical — and gated as **S0.10** of the phase-2 battery
+(`run_q4k_gate.sh`). The bug worth remembering: the LOW nibble of each `qs` byte belongs to the EVEN
+sub-block (2g) and the high nibble to 2g+1; swapped, every value was wrong.
+
+Next for this thread: wire the three Q4_K projections (`blk.0.attn_qkv`, `blk.0.attn_gate`,
+`blk.0.ssm_out`) into the layer check with the same mechanism the Q8_0 pair uses (`q4kdeq` on the GPU,
+the reference in numpy for the authority), and — for the GPU side of S0.10 — compare the `q4kdeq`
+kernel's dump against `native/out/q4k_ref.txt` (which already carries the first 4096 values of each
+tensor as raw f64 bit patterns).
 
 ## `eng_gdn()` is STILL 0, deliberately
 
