@@ -1369,3 +1369,22 @@ The driver now reads its table from `VYB_INVFREQ` (default unchanged: `native/ou
 so the same code path serves either model. A table that disagrees with the model's metadata is a SILENT
 rope corruption — the model still runs, with a subtly wrong rotation — which is why the generator takes
 the base with no default and refuses a table that does not round-trip to it.
+
+### The kvhead probe: the repeat was broadcasting kv head 0 to every query head
+
+A third probe fixture names the kv head each query head reads (V constant per kv head, value `j+1`,
+independent of the token; scores flat). Measured for the GQA fixture (n_head 6, n_kv 2):
+
+    harness: h0->0 h1->0 h2->0 h3->0 h4->0 h5->0
+    spec:    h0->0 h1->0 h2->0 h3->1 h4->1 h5->1
+
+So every query head read kv head 0. That is not a convention question — the `ggml_repeat_4d` call was
+building the wrong thing, duplicating the first kv block instead of laying out the group axis, which
+also explains why "round-robin" and "contiguous" both failed identically: neither pairing was ever in the
+data. Two forms of the repeat are being measured with this probe as the oracle (kv axis second with the
+group axis appended, vs the group inside), because the probe answers in one run where reasoning about
+`ggml_repeat_4d`'s fill order did not.
+
+This is the third time in this unit that a probe converted an argument into a number, and the pattern is
+consistent: inference about ggml's tensor semantics has been wrong every single time; measurement has
+been right every time.

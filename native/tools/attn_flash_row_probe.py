@@ -36,6 +36,25 @@ S = av.S
 NH, HD, NKV, D = av.NH, av.HD, av.NKV, av.D
 
 
+def fixture_kvhead():
+    """Name the KV HEAD each query head reads. V is constant per kv head and independent of the token
+    (hid[:, 0] = 1, W_v[j*hd + d, 0] = j+1), and the scores are flat (q = k = 0), so with a causal mask
+    every query head returns the mean of one constant: attention(h) = kv_head(h) + 1. That converts
+    "the GQA pairing is wrong" into "head 3 reads kv head 2", which is a fact about the repeat rather
+    than a hypothesis about it."""
+    Wqg = np.zeros((NH * 2 * HD, D), dtype=np.float32)
+    Wk = np.zeros((NKV * HD, D), dtype=np.float32)
+    Wv = np.zeros((NKV * HD, D), dtype=np.float32)
+    Wo = np.zeros((D, NH * HD), dtype=np.float32)
+    nmq, nmk = np.ones((HD,), dtype=np.float32), np.ones((HD,), dtype=np.float32)
+    hid = np.zeros((S, D), dtype=np.float32)
+    hid[:, 0] = 1.0
+    for j in range(NKV):
+        for dd in range(HD):
+            Wv[j * HD + dd, 0] = j + 1
+    return Wqg, Wk, Wv, Wo, nmq, nmk, hid
+
+
 def fixture_favor0():
     """Score every key by -(query+1)*(key+1)*scale, so the weights concentrate on KEY 0 — which the causal
     mask allows for every query. A correct key axis therefore returns V(key 0) = 1.0 for EVERY query,
@@ -83,7 +102,10 @@ def attn_stage(dump):
 def main():
     print(f"ROW PROBE geometry n_head={NH} n_kv={NKV} S={S} — V carries t+1, scores flat")
     which = os.environ.get("VYBFORGE_PROBE", "flat")
-    Wqg, Wk, Wv, Wo, nmq, nmk, hid = (fixture_favor0() if which == "favor0" else fixture())
+    Wqg, Wk, Wv, Wo, nmq, nmk, hid = ({"favor0": fixture_favor0, "kvhead": fixture_kvhead}.get(which, fixture))()
+    if which == "kvhead":
+        print("ROW PROBE V is constant per kv head (value j+1) and flat-scored, so attention(head h) names")
+        print("ROW PROBE the kv head it reads: value-1. Reading the same value at every query = consistent.")
     scale = 4.0 if which == "favor0" else av.KQS
     if which == "favor0":
         print("ROW PROBE scores favour key 0 -> a correct key axis gives V(key 0) = 1.0 for EVERY query")
@@ -92,6 +114,16 @@ def main():
         a = attn_stage(np.fromfile(av.OUT, dtype="<f4"))
         print(f"ROW PROBE mode={mode}: the value the op produced per query (head 0, dim 0) "
               f"and the key set that value names")
+        if which == "kvhead":
+            print(f"ROW PROBE mode={mode} pairing (head -> kv head read, value-1):")
+            row = []
+            for h in range(NH):
+                v = float(a[0, h, 0])
+                row.append(f"h{h}->{v - 1:.0f}")
+            print("ROW PROBE   " + "  ".join(row)
+                  + f"   [spec expects h//{max(NKV and NH // NKV, 1)}: "
+                  + " ".join(f"h{h}->{h // (NH // NKV)}" for h in range(NH)) + "]")
+            continue
         for q in range(S):
             vals = a[q, 0, :]
             const = float(np.nanmax(vals) - np.nanmin(vals)) < 1e-6
