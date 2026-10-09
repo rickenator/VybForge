@@ -1131,3 +1131,23 @@ So the next step is a fixture change, not a math change: build K/V (and the mask
 tile size with zeros, then the flash path should agree at F16 precision — which also means it needs its
 own tolerance bar (`~1e-3` relative for values of order 0.1), not the 1e-4 the f64-engine comparisons
 use, and that bar must be justified in the gate rather than silently shared.
+
+### Correction: the "KV tiling" explanation above is REFUTED
+
+Running the same flash comparison with S = 64 (far beyond any tile size — `ggml_fa_tile_config` sets
+Q/KV tile sizes of a few dozen at most) gives the SAME disagreement: 1.039e+00 vs 1.073e+00 at S = 3.
+If the op were reading K/V rows that do not exist, a fixture with 64 real rows would not have them.
+So tiling is not the cause, and the padding step proposed above is not the next step.
+
+What survives from the measurements, and is the current best lead:
+
+* where flash writes it agrees with the spec at 3.3e-04 — but ONLY at (key 0, kv head 0), which is the
+  identity position, where every candidate layout reads the same element;
+* everything else diverges, at both S = 3 and S = 64, with matching magnitudes;
+* neither the mask fill (inverted: 1.043 vs 1.073) nor the F16 cast (nans) changes that.
+
+The identity-position-only agreement is the signature of an AXIS ORDER difference in the K/V passed to
+the op: at index (0, 0) two different axis conventions read the same value, and nowhere else do they.
+llama.cpp's KV cache is `(head_dim, n_ctx, n_head_kv)` — the kv-LENGTH axis second — while this harness
+hands the op `(head_dim, n_kv_heads, n_tokens)`. That transposition is being measured now; if it is the
+cause, the fix is one permute per tensor, not a fixture redesign.

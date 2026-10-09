@@ -46,7 +46,8 @@ BASE = 1e7                                  # ridge_theta
 #   gqa            : n_kv < n_head (6:2 = 3:1, Ridge's 24:4 scaled down) — flash op, GQA grouping; only
 #                    the front half is verified so far and the attention stages are reported
 GEOM = os.environ.get("VYBFORGE_ATTN_GEOM", "heads")
-NH, HD, NKV, S, D = (6, 256, 2, 3, 64) if GEOM == "gqa" else (3, 256, 3, 3, 64)
+_S = int(os.environ.get("VYBFORGE_ATTN_S", "3"))
+NH, HD, NKV, S, D = ((6, 256, 2, _S, 64) if GEOM == "gqa" else (3, 256, 3, _S, 64))
 MODE = os.environ.get("VYBFORGE_ATTN_MODE", "flash" if GEOM == "gqa" else "explicit")
 GQA = NKV != NH
 GROUP = NH // NKV if GQA else 1
