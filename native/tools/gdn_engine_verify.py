@@ -40,18 +40,31 @@ DRV_LOG = os.path.join(BUILD, "gdn_engine_driver.log")
 TSV = os.path.join(REPO, "native/out/ridge_tensors.tsv")
 MODEL = os.environ.get("VYBFORGE_RIDGE_GGUF",
                        os.path.expanduser("~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"))
+# which recurrent block the engine driver probes. blk.0 is the first one in the Ridge model (the
+# interleave is 3 recurrent, then 1 attention, so any 0/1/2 works; blk.3 is attention).
+PROBE_LAYER = int(os.environ.get("VYBFORGE_GDN_PROBE_LAYER", "0"))
 
 
 def run_driver(fx):
-    """The engine-path driver. It takes x and a zero buffer; the weights it stages itself."""
+    """The ENGINE's own driver, in probe mode.
+
+    `native/host/model_driver.vyb` is the file the loop lives in; VYB_GDN_PROBE=<layer> makes it run
+    ONE recurrent block through the same staging, kernels and state carry-over the loop will use.
+    Pointing the check at this driver (rather than at a side harness) is the point: a green probe is
+    the loop's block half, verified in the file that will run it.
+    """
     with open(DRV_X, "wb") as fh:
         fh.write(np.ascontiguousarray(fx["x"], dtype="<f8").tobytes())
     with open(DRV_Z, "wb") as fh:
         fh.write(b"\x00" * (S * S * H_V * 8))
-    env = dict(os.environ, VYB_STDLIB=STDLIB, VYB_GDN_MODEL=MODEL,
-               VYB_GDN_TSV=TSV, VYB_GDN_X=DRV_X, VYB_GDN_Z=DRV_Z)
-    r = subprocess.run([VYB, "native/host/gdn_engine_driver.vyb"], cwd=REPO,
-                       capture_output=True, text=True, env=env)
+    env = dict(os.environ, VYB_STDLIB=STDLIB, VYB_MODEL=MODEL, VYB_TSV=TSV,
+               VYB_GDN_X=DRV_X, VYB_GDN_Z=DRV_Z, VYB_GDN_PROBE=str(PROBE_LAYER),
+               VYB_PROMPT_RAW="1")
+    cmd = [VYB, "native/host/model_driver.vyb",
+           "--module-path", "native/config", "--module-path", "native/json",
+           "--module-path", "native/tensor", "--module-path", "native/dtype",
+           "--module-path", "native/llm"]
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, env=env)
     out = r.stdout + r.stderr
     with open(DRV_LOG, "w") as fh:
         fh.write(out)
@@ -100,14 +113,14 @@ def main():
     gdnl.run_authority_step(fx, fx["x"][1], win1, st1, d2)
 
     out = run_driver(fx)
-    if "SKIP" in out and "GDN_ENGINE_DONE" not in out:
+    if "SKIP" in out and "GDN_PROBE_DONE" not in out:
         print("GDNL_ENGINE_VERIFY_SKIP " + [l for l in out.splitlines() if "SKIP" in l][0].strip())
         return 0
-    if "GDN_ENGINE_DONE" not in out:
+    if "GDN_PROBE_DONE" not in out:
         print("GDNL_ENGINE_VERIFY_FAIL driver: " + out[-900:])
         return 1
     for line in out.splitlines():
-        if line.startswith("GDN_ENGINE_GEOM") or line.startswith("GDN_ENGINE_TSV_TENSORS"):
+        if line.startswith("GDN_GEOM") or line.startswith("GDN_STAGED"):
             print("GDNL_ENGINE_VERIFY " + line)
     got = gdnl.parse_dumps(out)
 

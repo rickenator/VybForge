@@ -657,3 +657,34 @@ reused them. Two defences are now in place here: the alpha/beta words are re-sta
 before that gemm (with the comment saying why), and the verifier compares the STAGED operand slot by
 slot at the addresses `gemm` reads — because a block that is right about everything except what it
 was fed is invisible to a stage-by-stage comparison.
+
+## Unit 9c step 3 (started) — the block moves INTO the engine's own driver (gate P4.5)
+
+The step-2 driver was a side harness: it re-parsed the tensor index, had its own copy of the staging
+helpers, and existed only to be verified. That is the wrong home for code the loop has to run, and a
+second copy of a chain is a second thing to keep true. So the block moved into
+`native/host/model_driver.vyb` — the file the layer loop lives in — behind a probe selector:
+
+    VYB_GDN_PROBE=<layer>   run ONE recurrent block and return (verification)
+    unset                   run the model (unchanged)
+
+In probe mode the ENGINE's driver stages blk.0's ten tensors from the live GGUF through the engine's
+own path (found by name in the tensor index; `q4kdeq`/`q8_0deq`/`f32expand`; transposing writes so
+`gemm` sees B as [in,out]), runs the chain with its own `gemm`/`rmsnorm`/`resid` plus the gdn.ptx
+ops, carries the conv window and the delta-net state across two chained decode steps, and dumps the
+same 13 stages. `native/tools/gdn_engine_verify.py` now drives THAT, and the standalone driver is
+deleted. Measured: **26/26 stages, worst 3.903e-06** — identical to step 2, which is the point: the
+same block, in the file that will run it.
+
+Landed with it: `gdn.ptx` and `q8_0.ptx` are loaded in the engine's CUDA setup with their ten
+function handles; `put_i`/`put_f`/`dump_section`/`dump_slot` are helpers in the engine file; and
+`VYB_MODEL`/`VYB_TSV` override the model and its tensor index, so the same driver can be pointed at
+another GGUF without editing it (the probe needs the Ridge index; the dense path keeps its default).
+
+What is NOT done, and is the rest of step 3: the loop still stages `attn_q/k/v/output` and calls
+`run_layer` for every block. The dispatch (`mc_layer_kind` per block, which `model_caps` already
+answers, P4.4), the per-layer state cache (48 x (40960 conv + 786432 delta-net) x 8 B), and the
+`run_layer` split into `run_layer_attn` + `run_ffn` are the remaining three. Then the whole-model
+logits against llama.cpp — which waits on two things outside this unit: IMROPE for Ridge's attention
+layers (`rope.dimension_sections [11,11,10,0]`; the engine's rope is pairs-only) and the multi-token
+prefill path for recurrent layers (only the sequential T=1 kernel is characterised so far).

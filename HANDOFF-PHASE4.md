@@ -53,14 +53,38 @@ authority runner verbatim, so only the driver under test changed.
 * the projection is now verified in three layers: the block (26 stages) vs ggml, the block's OPERAND
   vs the model's own tensor, and the two mis-wirings as prints.
 
-**The next step is unit 9c step 3: wire the branch into `native/host/model_driver.vyb`.** The pieces
-exist separately and are each verified — the dispatch rule (`model_caps::mc_layer_kind`, P4.4), the
-staged block (`gdn_engine_driver.vyb`, P4.5), and the state cache the section "Unit 9c" sizes. What
-is missing is the loop: per-layer dispatch, the nine weight buffers per recurrent layer, the per-layer
-state cache, and then the whole-model logits against llama.cpp (per-layer agreement cannot see a
-wiring error BETWEEN layers). `eng_gdn()` and `eng_mtp()` are both still 0 and both still have to flip
-(or the descriptor needs a documented "without the draft head" profile) before the caps gate can call
-the Ridge model SUPPORTED.
+**Unit 9c step 3 is STARTED (gate P4.5 now drives the engine's own file): the recurrent branch lives
+in `native/host/model_driver.vyb`.** The block is no longer a side harness: `VYB_GDN_PROBE=<layer>`
+makes the ENGINE's driver stage blk.0's ten tensors from the live GGUF through its own staging
+(found by name in the tensor index, `q4kdeq`/`q8_0deq`/`f32expand`), run the chain with its own
+`gemm`/`rmsnorm`/`resid` plus the gdn.ptx ops, carry the conv window and the delta-net state across
+two decode steps, and dump the 13 stages. `native/tools/gdn_engine_verify.py` drives that instead of
+the standalone driver, which is now DELETED — one implementation, verified where it will run.
+Measured: 26/26 stages, worst 3.903e-06, unchanged.
+
+Also landed in the engine file: `gdn.ptx` + `q8_0.ptx` loaded with their ten function handles, the
+`put_i`/`put_f`/`dump_section`/`dump_slot` helpers, and `VYB_MODEL`/`VYB_TSV` overrides so the same
+driver can be pointed at another model without editing it.
+
+**What step 3 still needs (the loop itself, not the block):**
+
+1. **the per-layer dispatch in `main`'s layer loop** — the loop today stages `attn_q/k/v/output` and
+   runs `run_layer` for every block. It must `mc_layer_kind(...)` each block, run the recurrent
+   branch for kind 2 (the stage+chain code is already there, in the probe) and the attention branch
+   otherwise, and keep the draft head (kind 1, block `>= text_layers`) out of the text path;
+2. **the per-layer state cache** — conv window `(d_conv-1)*conv_channels` + delta-net `S*S*H_v` per
+   recurrent layer (48 x (40960 + 786432) x 8 B ~= 320 MB), zeroed once at sequence start and
+   swapped per step, exactly as the probe does for one layer;
+3. **the FFN half** of a recurrent block — `run_layer` does attention AND ffn; for a recurrent layer
+   the mixer's residual output (what the probe dumps as `layer_out`) feeds the same FFN it already
+   contains, so `run_layer` wants splitting into `run_layer_attn` + `run_ffn`;
+4. **then** the whole-model logits against llama.cpp. That needs two things that are NOT this unit:
+   IMROPE for the Ridge ATTENTION layers (`rope.dimension_sections [11,11,10,0]` — the engine's
+   `qwen3rope` is pairs-only) and the multi-token/prefill path for recurrent layers (today only the
+   sequential T=1 kernel is characterised). Neither is started.
+
+`eng_gdn()` and `eng_mtp()` are both still 0 and both still have to flip (or the descriptor needs a
+documented "without the draft head" profile) before the caps gate can call the Ridge model SUPPORTED.
 
 Two smaller follow-ups are also open and recorded below: promoting the `q4kdeq`-vs-reference
 comparison into S0.10 proper, and retiring `native/tools/gdn_ref.py`.

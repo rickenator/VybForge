@@ -6,9 +6,13 @@
 # work that way: it finds each tensor by NAME in the GGUF, dequantises the packed types on the GPU
 # with the kernels it uses for every layer, and multiplies with `gemm` (layer.ptx), whose B operand
 # is [in,out] — the layout the dequant kernels' transposing write produces (VybForge#11). This gate
-# runs native/host/gdn_engine_driver.vyb, which stages all ten of blk.0's tensors from the live GGUF
-# through that path, and compares 13 stages over TWO chained decode steps against unit 5's authority
-# (the real ggml ops), on the model's own weights. Measured: worst maxrel 3.9e-06.
+# runs THE ENGINE'S OWN DRIVER — native/host/model_driver.vyb, the file the loop lives in, in probe
+# mode (VYB_GDN_PROBE=<layer>) — which stages all ten of blk.0's tensors from the live GGUF through
+# that path, and compares 13 stages over TWO chained decode steps against unit 5's authority (the
+# real ggml ops), on the model's own weights. Measured: worst maxrel 3.9e-06.
+#
+# It is not a side harness on purpose: the loop will call this same code once per recurrent layer per
+# token, so a green probe is the loop's block half, verified in the file that will run it.
 #
 # The check has teeth in three ways:
 #   * the STAGED OPERAND is compared slot by slot against the model's own dequantised ssm_out

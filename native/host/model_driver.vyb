@@ -15,6 +15,9 @@ import env::{env_get}
 // Both are PURE (no CUDA, no allocation) — a module that pulls in cuda_binding cannot be
 // imported by a file declaring its own extern "C" (Vyb#442).
 import model_config::{mc_load, mc_nq, mc_nkv, mc_is_ok, ModelConfig}
+// unit 9c: the per-layer DISPATCH. The loop asks this rule which branch a block takes instead of
+// inferring it from the architecture name or a layer-index list (P4.4, model_caps::mc_layer_kind).
+import model_caps::{mc_layer_kind}
 import tshape::{tt_nbytes}
 import dtype::{dt_f64, dt_bytes_for}
 
@@ -157,6 +160,34 @@ load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he
         return 0
     }
     return 0
+}
+
+// ───────── unit 9c: the recurrent block, on the engine's own weight path ─────────
+// put_*/dump_* are the small device-side helpers the Gated DeltaNet branch needs. `dump_section`
+// and `dump_slot` print machine-readable evidence for native/tools/gdn_engine_verify.py; the
+// engine's normal path writes files instead, which is not what a stage comparison wants.
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+dump_section(base<Int>, count<Int>, pfx<String>, nm<String>) -> {
+    println("DUMP " + pfx + nm + " " + count.to_string())
+    acc<String> = ""
+    i<Int> = 0
+    for (i in 0..count - 1) {
+        iv<Int> = 0
+        freedom { cuMemcpyDtoH_v2(loc(iv), base + i * 8, 8) }
+        acc = acc + iv.to_string() + " "
+        if (i % 64 == 63) { println(acc); acc = "" }
+    }
+    if (count % 64 != 0) { println(acc) }
+}
+dump_slot(base<Int>, idx<Int>, tag<String>) -> {
+    iv<Int> = 0
+    freedom { cuMemcpyDtoH_v2(loc(iv), base + idx * 8, 8) }
+    println("PROBE " + tag + " " + idx.to_string() + " " + iv.to_string())
 }
 
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
@@ -312,7 +343,10 @@ main()<Int> -> {
     }
     S<Int> = prids.len()
     hm<String> = env_get("HOME") else "."
-    MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
+    # VYB_MODEL / VYB_TSV override the model and its tensor index (the unit 9c probe points them at
+    # the Ridge GGUF and its generated index); VYBFORGE_QWEN3_GGUF stays the default so the existing
+    # make targets are unaffected.
+    MODEL<String> = env_get("VYB_MODEL") else (env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf")
     # ---- S0.2: every dimension is read from the model's OWN config, not spelled here ----
     cfg<ModelConfig> = mc_load(MODEL)
     if (!mc_is_ok(cfg)) {
@@ -338,7 +372,7 @@ main()<Int> -> {
     SV<Vec<Int>> = Vec(); SV.push(S); SV.push(VOCAB)
     D1<Vec<Int>> = Vec(); D1.push(D)
     S1<Vec<Int>> = Vec(); S1.push(S)
-    TSV<String> = "native/out/qwen3_4b_tensors.tsv"
+    TSV<String> = env_get("VYB_TSV") else "native/out/qwen3_4b_tensors.tsv"
     AF<Float> = 1.0; BF<Float> = 0.0
     rA<Int> = 0; rB<Int> = 0; rC<Int> = 0
     gA<Int> = 0; gB<Int> = 0; gC<Int> = 0; gM<Int> = 0; gN<Int> = 0; gK<Int> = 0
@@ -373,6 +407,12 @@ main()<Int> -> {
     }
     println("TSV_ALL_TENSORS=" + nmv.len().to_string() + " (expect 398)")
     if (nmv.len() < 396) { println("TSV_PARSE_FAIL"); return 2 }
+
+    # ---- unit 9c: the recurrent-block probe selector (VYB_GDN_PROBE=<layer index>) ----
+    # Empty (the normal case) runs the model; a layer index runs ONE recurrent block and returns.
+    prs<String> = env_get("VYB_GDN_PROBE") else ""
+    PR<Int> = -1
+    if (prs.len() > 0) { PR = parse_u(prs, 0, prs.len()) }
 
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
@@ -429,6 +469,281 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
         if (cuModuleGetFunction(loc(emfn), mw, "embed") != 0) { return 10 }
+
+        # ---- unit 9c: the recurrent branch's kernels, plus Q8_0 staging ----
+        # gdn.ptx carries the ops the Gated DeltaNet block needs and nothing else does; q8_0.ptx the
+        # dequant for its ssm_alpha/ssm_beta. Loaded here so the loop can call the branch directly.
+        mq8<loc<CVoid>> = from<loc<CVoid>>(0)
+        mgd<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(mq8), read_bin("native/build/q8_0.ptx")) != 0) { println("MODLOAD_FAIL q8_0"); return 9 }
+        if (cuModuleLoadData(loc(mgd), read_bin("native/build/gdn.ptx")) != 0) { println("MODLOAD_FAIL gdn"); return 9 }
+        q8fn<loc<CVoid>> = from<loc<CVoid>>(0)
+        hsg<loc<CVoid>> = from<loc<CVoid>>(0)
+        hag<loc<CVoid>> = from<loc<CVoid>>(0)
+        hsv<loc<CVoid>> = from<loc<CVoid>>(0)
+        hcv<loc<CVoid>> = from<loc<CVoid>>(0)
+        hil<loc<CVoid>> = from<loc<CVoid>>(0)
+        hsh<loc<CVoid>> = from<loc<CVoid>>(0)
+        hl2<loc<CVoid>> = from<loc<CVoid>>(0)
+        hds<loc<CVoid>> = from<loc<CVoid>>(0)
+        hng<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q8fn), mq8, "q8_0deq") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hsg), mgd, "sigmoid_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hag), mgd, "alpha_gate") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hsv), mgd, "silu_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hcv), mgd, "conv1d_k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hil), mgd, "interleave_qkv") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hsh), mgd, "conv_shift") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hl2), mgd, "l2norm") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hds), mgd, "delta_step") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(hng), mgd, "norm_gated") != 0) { return 10 }
+
+        # ───────── unit 9c probe: one recurrent block, two chained decode steps ─────────
+        # VYB_GDN_PROBE=<layer> runs ONE recurrent block the way the loop will — weights staged from
+        # the GGUF by name, the chain on the engine's kernels, the conv window and the delta-net
+        # state carried from step 1 to step 2 — and dumps the same stages native/tools/
+        # gdn_engine_verify.py compares against unit 5's authority (the real ggml ops). It is the
+        # engine's OWN code path, not a side harness: the loop will call it once per recurrent layer
+        # per token, so a green probe is the loop's block half.
+        if (PR >= 0) {
+            sp<String> = "blk." + PR.to_string() + "."
+            if (mc_layer_kind(sp + "ssm_alpha.weight") != 2) {
+                println("GDN_ERR " + sp + " is not a recurrent block (dispatch says kind != 2)")
+                return 7
+            }
+            i_an<Int> = find_nm(nmv, sp + "attn_norm.weight")
+            i_qk<Int> = find_nm(nmv, sp + "attn_qkv.weight")
+            i_ga<Int> = find_nm(nmv, sp + "attn_gate.weight")
+            i_be<Int> = find_nm(nmv, sp + "ssm_beta.weight")
+            i_al<Int> = find_nm(nmv, sp + "ssm_alpha.weight")
+            i_ou<Int> = find_nm(nmv, sp + "ssm_out.weight")
+            i_cw<Int> = find_nm(nmv, sp + "ssm_conv1d.weight")
+            i_sn<Int> = find_nm(nmv, sp + "ssm_norm.weight")
+            i_dt<Int> = find_nm(nmv, sp + "ssm_dt.bias")
+            i_aa<Int> = find_nm(nmv, sp + "ssm_a")
+            if (i_an < 0 || i_qk < 0 || i_ga < 0 || i_be < 0 || i_al < 0 || i_ou < 0
+                || i_cw < 0 || i_sn < 0 || i_dt < 0 || i_aa < 0) {
+                println("GDN_ERR " + sp + " is missing a recurrent tensor")
+                return 7
+            }
+            # geometry from the block's OWN numels, cross-checked (never spelled out)
+            GNE<Int> = nlv.get(i_an)
+            GHV<Int> = nlv.get(i_aa)
+            GVALUE<Int> = nlv.get(i_ga) / GNE
+            GQKV<Int> = nlv.get(i_qk) / GNE
+            GDC<Int> = nlv.get(i_cw) / GQKV
+            GSS<Int> = nlv.get(i_sn)
+            GHK<Int> = (GQKV - GVALUE) / (2 * GSS)
+            GKEY<Int> = GHK * GSS
+            if (GVALUE != GHV * GSS || GQKV != 2 * GKEY + GVALUE || nlv.get(i_ou) != GNE * GVALUE
+                || nlv.get(i_cw) != GQKV * GDC || nlv.get(i_al) != GNE * GHV) {
+                println("GDN_ERR " + sp + " tensor shapes are not a consistent recurrent block")
+                return 7
+            }
+            println("GDN_GEOM " + sp + "NE=" + GNE.to_string() + " S=" + GSS.to_string()
+                    + " Hk=" + GHK.to_string() + " Hv=" + GHV.to_string()
+                    + " d_conv=" + GDC.to_string() + " qkv=" + GQKV.to_string()
+                    + " value=" + GVALUE.to_string())
+            GSC<Float> = 1.0 / sqrt(GSS as Float)
+            # the authority runs f32 with eps 1e-6; keep the same constant so the comparison is
+            # about the wiring, not about two different eps conventions.
+            GEPS<Float> = 0.000001
+            GRMS<Int> = (GNE + 255) / 256
+            GQKVG<Int> = (GQKV + 255) / 256
+            GVALG<Int> = (GVALUE + 255) / 256
+            GKEYG<Int> = (GKEY + 255) / 256
+            GHEADG<Int> = (GHV * GSS + 255) / 256
+            GOUTG<Int> = (GNE + 255) / 256
+            GNEG<Int> = (GNE + 255) / 256
+            GHVG<Int> = (GHV + 255) / 256
+            GDAN<Int> = 0; GDWQKV<Int> = 0; GDWG<Int> = 0; GDWB<Int> = 0; GDWA<Int> = 0; GDSO<Int> = 0
+            GDCW<Int> = 0; GDSN<Int> = 0; GDDT<Int> = 0; GDA<Int> = 0
+            GDXN<Int> = 0; GDQKV<Int> = 0; GDZ<Int> = 0; GDBRAW<Int> = 0; GDBETA<Int> = 0
+            GDARAW<Int> = 0; GDGATE<Int> = 0; GDCONV<Int> = 0; GDCONVS<Int> = 0; GDCRAW<Int> = 0
+            GDQN<Int> = 0; GDKN<Int> = 0; GDSTATE<Int> = 0; GDSTOUT<Int> = 0; GDEL<Int> = 0
+            GDOUT<Int> = 0; GDEPI<Int> = 0; GDY<Int> = 0; GDLO<Int> = 0; GDDX<Int> = 0; GDDPK<Int> = 0
+            GP1<Int> = 0; GP2<Int> = 0; GP3<Int> = 0; GP4<Int> = 0
+            cuMemAlloc_v2(loc(GDAN), GNE * 8)
+            cuMemAlloc_v2(loc(GDWQKV), GQKV * GNE * 8)
+            cuMemAlloc_v2(loc(GDWG), GVALUE * GNE * 8)
+            cuMemAlloc_v2(loc(GDWB), GHV * GNE * 8)
+            cuMemAlloc_v2(loc(GDWA), GHV * GNE * 8)
+            cuMemAlloc_v2(loc(GDSO), GNE * GVALUE * 8)
+            cuMemAlloc_v2(loc(GDCW), GQKV * GDC * 8)
+            cuMemAlloc_v2(loc(GDSN), GSS * 8)
+            cuMemAlloc_v2(loc(GDDT), GHV * 8)
+            cuMemAlloc_v2(loc(GDA), GHV * 8)
+            cuMemAlloc_v2(loc(GDXN), GNE * 8)
+            cuMemAlloc_v2(loc(GDQKV), GQKV * 8)
+            cuMemAlloc_v2(loc(GDZ), GVALUE * 8)
+            cuMemAlloc_v2(loc(GDBRAW), GHV * 8)
+            cuMemAlloc_v2(loc(GDBETA), GHV * 8)
+            cuMemAlloc_v2(loc(GDARAW), GHV * 8)
+            cuMemAlloc_v2(loc(GDGATE), GHV * 8)
+            cuMemAlloc_v2(loc(GDCONV), GDC * GQKV * 8)
+            cuMemAlloc_v2(loc(GDCONVS), GQKV * 8)
+            cuMemAlloc_v2(loc(GDCRAW), GQKV * 8)
+            cuMemAlloc_v2(loc(GDQN), GKEY * 8)
+            cuMemAlloc_v2(loc(GDKN), GKEY * 8)
+            cuMemAlloc_v2(loc(GDSTATE), GSS * GSS * GHV * 8)
+            cuMemAlloc_v2(loc(GDSTOUT), GSS * GSS * GHV * 8)
+            cuMemAlloc_v2(loc(GDEL), GSS * GHV * 8)
+            cuMemAlloc_v2(loc(GDOUT), GSS * GHV * 8)
+            cuMemAlloc_v2(loc(GDEPI), GSS * GHV * 8)
+            cuMemAlloc_v2(loc(GDY), GNE * 8)
+            cuMemAlloc_v2(loc(GDLO), GNE * 8)
+            cuMemAlloc_v2(loc(GDDX), 2 * GNE * 8)
+            GPK<Int> = packed_bytes(nlv.get(i_qk), tyv.get(i_qk))
+            cuMemAlloc_v2(loc(GDDPK), GPK)
+            cuMemAlloc_v2(loc(GP1), 128) ; cuMemAlloc_v2(loc(GP2), 128)
+            cuMemAlloc_v2(loc(GP3), 128) ; cuMemAlloc_v2(loc(GP4), 128)
+
+            # the model's REAL weights, staged from the GGUF by the engine's own path: Q4_K and Q8_0
+            # through the dequant kernels (transposing write -> B is [in,out] for gemm), F32 through
+            # f32expand. inz is the tensor's IN dim: NE for everything but ssm_out, which maps
+            # VALUE -> NE.
+            gerr<Int> = 0
+            gerr = load_norm(MODEL, GP1, GDDPK, GDAN, ofv.get(i_an), GNE, efn)
+            if (gerr != 0) { println("GDN_ERR stage attn_norm " + gerr.to_string()); return 40 }
+            gerr = load_quant(MODEL, GDDPK, GDWQKV, ofv.get(i_qk), packed_bytes(nlv.get(i_qk), tyv.get(i_qk)), nlv.get(i_qk), q4fn, GNE)
+            if (gerr != 0) { println("GDN_ERR stage attn_qkv " + gerr.to_string()); return 41 }
+            gerr = load_quant(MODEL, GDDPK, GDWG, ofv.get(i_ga), packed_bytes(nlv.get(i_ga), tyv.get(i_ga)), nlv.get(i_ga), q4fn, GNE)
+            if (gerr != 0) { println("GDN_ERR stage attn_gate " + gerr.to_string()); return 42 }
+            gerr = load_quant(MODEL, GDDPK, GDWB, ofv.get(i_be), packed_bytes(nlv.get(i_be), tyv.get(i_be)), nlv.get(i_be), q8fn, GNE)
+            if (gerr != 0) { println("GDN_ERR stage ssm_beta " + gerr.to_string()); return 43 }
+            gerr = load_quant(MODEL, GDDPK, GDWA, ofv.get(i_al), packed_bytes(nlv.get(i_al), tyv.get(i_al)), nlv.get(i_al), q8fn, GNE)
+            if (gerr != 0) { println("GDN_ERR stage ssm_alpha " + gerr.to_string()); return 44 }
+            gerr = load_quant(MODEL, GDDPK, GDSO, ofv.get(i_ou), packed_bytes(nlv.get(i_ou), tyv.get(i_ou)), nlv.get(i_ou), q4fn, GVALUE)
+            if (gerr != 0) { println("GDN_ERR stage ssm_out " + gerr.to_string()); return 45 }
+            gerr = load_norm(MODEL, GP1, GDDPK, GDCW, ofv.get(i_cw), GQKV * GDC, efn)
+            if (gerr != 0) { println("GDN_ERR stage ssm_conv1d " + gerr.to_string()); return 46 }
+            gerr = load_norm(MODEL, GP1, GDDPK, GDSN, ofv.get(i_sn), GSS, efn)
+            if (gerr != 0) { println("GDN_ERR stage ssm_norm " + gerr.to_string()); return 47 }
+            gerr = load_norm(MODEL, GP1, GDDPK, GDDT, ofv.get(i_dt), GHV, efn)
+            if (gerr != 0) { println("GDN_ERR stage ssm_dt " + gerr.to_string()); return 48 }
+            gerr = load_norm(MODEL, GP1, GDDPK, GDA, ofv.get(i_aa), GHV, efn)
+            if (gerr != 0) { println("GDN_ERR stage ssm_a " + gerr.to_string()); return 49 }
+            gxs<String> = read_bin(env_get("VYB_GDN_X") else "native/build/gdn_engine_x.bin")
+            if (gxs.len() < 2 * GNE * 8) { println("GDN_ERR no step input"); return 2 }
+            gzu<Int> = download(gxs, GDDX, 2 * GNE * 8)
+            if (gzu != 0) { return 15 }
+            gzs<String> = read_bin(env_get("VYB_GDN_Z") else "native/build/gdn_engine_zero.bin")
+            if (gzs.len() < GSS * GSS * GHV * 8) { println("GDN_ERR no zero buffer"); return 2 }
+            gzu = download(gzs, GDCONV, GDC * GQKV * 8) ; if (gzu != 0) { return 15 }
+            gzu = download(gzs, GDSTATE, GSS * GSS * GHV * 8) ; if (gzu != 0) { return 15 }
+            gzu = download(gzs, GDSTOUT, GSS * GSS * GHV * 8) ; if (gzu != 0) { return 15 }
+            println("GDN_STAGED " + sp + "attn_norm F32, attn_qkv Q4_K, attn_gate Q4_K, ssm_beta Q8_0, ssm_alpha Q8_0, ssm_out Q4_K, ssm_conv1d F32, ssm_norm F32, ssm_dt F32, ssm_a F32")
+            # the staged operand at the addresses gemm reads (B[k*N+n]) — evidence that the engine's
+            # staging produced the model's own weights, not just a plausible block
+            dump_slot(GDSO, 0 * GNE + 0, "so")
+            dump_slot(GDSO, 0 * GNE + 3994, "so")
+            dump_slot(GDSO, 1 * GNE + 3994, "so")
+            dump_slot(GDSO, 2 * GNE + 3994, "so")
+            dump_slot(GDSO, 3994 * GNE + 3994, "so")
+            dump_slot(GDSO, 6143 * GNE + 3994, "so")
+            dump_slot(GDSO, 5000 * GNE + 3994, "so")
+            dump_slot(GDSO, 0 * GNE + 100, "so")
+
+            Gs<Int> = GDSTATE
+            Gs2<Int> = GDSTOUT
+            gst<Int> = 0
+            for (gst in 0..1) {
+                gxp<Int> = GDDX + gst * GNE * 8
+                gpf<String> = "s1_"
+                if (gst == 1) { gpf = "s2_" }
+                grc<CInt> = 0
+                if (gst > 0) {
+                    put_i(GP4, 0, GDCONV) ; put_i(GP4, 8, GQKV) ; put_i(GP4, 16, GDC) ; put_i(GP4, 24, 0)
+                    grc = cuda_launch4i(from<loc<CVoid>>(addr(hsh)), GQKVG, 1, 1, 256, 1, 1, GP4, 0, 0, 0)
+                    if (grc != 0) { println("GDN_ERR conv_shift") ; return 12 }
+                }
+                # 1. attn_norm — the engine's own rmsnorm kernel
+                put_i(GP1, 0, gxp) ; put_i(GP1, 8, GDAN) ; put_i(GP1, 16, GDXN)
+                put_i(GP1, 24, 1) ; put_i(GP1, 32, GNE) ; put_f(GP1, 40, GEPS)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), GRMS, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR rmsnorm") ; return 12 }
+                # 2. the six projections through the engine's gemm
+                put_f(GP2, 48, 1.0) ; put_f(GP2, 56, 0.0)
+                put_i(GP2, 0, GDXN) ; put_i(GP2, 8, GDWQKV) ; put_i(GP2, 16, GDQKV)
+                put_i(GP2, 24, 1) ; put_i(GP2, 32, GQKV) ; put_i(GP2, 40, GNE)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), GQKVG, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR gemm qkv") ; return 12 }
+                put_i(GP2, 8, GDWG) ; put_i(GP2, 16, GDZ) ; put_i(GP2, 32, GVALUE)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), GVALG, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR gemm gate") ; return 12 }
+                put_i(GP2, 8, GDWB) ; put_i(GP2, 16, GDBRAW) ; put_i(GP2, 32, GHV)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), GHVG, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR gemm beta") ; return 12 }
+                put_i(GP2, 8, GDWA) ; put_i(GP2, 16, GDARAW) ; put_i(GP2, 32, GHV)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), GHVG, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR gemm alpha") ; return 12 }
+                # 3. the two gates
+                put_i(GP3, 0, GDBRAW) ; put_i(GP3, 8, GDBETA) ; put_i(GP3, 16, GHV)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hsg)), 1, 1, 1, 64, 1, 1, GP3, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR sigmoid") ; return 12 }
+                put_i(GP3, 0, GDARAW) ; put_i(GP3, 8, GDDT) ; put_i(GP3, 16, GDA) ; put_i(GP3, 24, GDGATE) ; put_i(GP3, 32, GHV)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hag)), 1, 1, 1, 64, 1, 1, GP3, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR alpha_gate") ; return 12 }
+                # 4. the conv input's token frame, the causal short conv, then SiLU
+                put_i(GP4, 0, GDQKV) ; put_i(GP4, 8, GDCONV) ; put_i(GP4, 16, GQKV) ; put_i(GP4, 24, GDC) ; put_i(GP4, 32, 1)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hil)), GQKVG, 1, 1, 256, 1, 1, GP4, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR interleave") ; return 12 }
+                put_i(GP3, 0, GDCONV) ; put_i(GP3, 8, GDCW) ; put_i(GP3, 16, GDCRAW)
+                put_i(GP3, 24, GQKV) ; put_i(GP3, 32, GDC) ; put_i(GP3, 40, 1)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hcv)), GQKVG, 1, 1, 256, 1, 1, GP3, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR conv") ; return 12 }
+                put_i(GP3, 0, GDCRAW) ; put_i(GP3, 8, GDCONVS) ; put_i(GP3, 16, GQKV)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hsv)), GQKVG, 1, 1, 256, 1, 1, GP3, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR silu") ; return 12 }
+                # 5. l2 norm on q and k (the split is a channel offset)
+                put_i(GP1, 0, GDCONVS) ; put_i(GP1, 8, GDQN) ; put_i(GP1, 16, GHK) ; put_i(GP1, 24, GSS) ; put_f(GP1, 32, GEPS)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hl2)), GKEYG, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR l2 q") ; return 12 }
+                put_i(GP1, 0, GDCONVS + GKEY * 8) ; put_i(GP1, 8, GDKN)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hl2)), GKEYG, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR l2 k") ; return 12 }
+                # 6. the recurrence
+                put_i(GP2, 0, GDQN) ; put_i(GP2, 8, GDKN) ; put_i(GP2, 16, GDCONVS + 2 * GKEY * 8)
+                put_i(GP2, 24, GDGATE) ; put_i(GP2, 32, GDBETA) ; put_i(GP2, 40, Gs)
+                put_i(GP2, 48, Gs2) ; put_i(GP2, 56, GDOUT) ; put_i(GP2, 64, GDEL)
+                put_i(GP2, 72, GSS) ; put_i(GP2, 80, GHK) ; put_i(GP2, 88, GHV) ; put_f(GP2, 96, GSC)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hds)), 1, 1, 1, GHV, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR delta_step") ; return 12 }
+                # 7. the gated RMS epilogue, ssm_out, the residual
+                put_i(GP3, 0, GDOUT) ; put_i(GP3, 8, GDZ) ; put_i(GP3, 16, GDSN) ; put_i(GP3, 24, GDEPI)
+                put_i(GP3, 32, GHV) ; put_i(GP3, 40, GSS) ; put_f(GP3, 48, GEPS)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(hng)), GHEADG, 1, 1, 256, 1, 1, GP3, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR norm_gated") ; return 12 }
+                put_i(GP2, 0, GDEPI) ; put_i(GP2, 8, GDSO) ; put_i(GP2, 16, GDY)
+                put_i(GP2, 24, 1) ; put_i(GP2, 32, GNE) ; put_i(GP2, 40, GVALUE)
+                # GP2 is SHARED with delta_step, which wrote pointers into +48/+56 (the state
+                # buffers) — exactly where gemm reads alpha/beta. Re-state them, or the projection
+                # runs with alpha = a pointer's bits as f64 and yields denormals.
+                put_f(GP2, 48, 1.0) ; put_f(GP2, 56, 0.0)
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), GOUTG, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grc != 0) { println("GDN_ERR gemm ssm_out") ; return 12 }
+                grc = cuda_launch4i(from<loc<CVoid>>(addr(refn)), GNEG, 1, 1, 256, 1, 1, GDY, gxp, GDLO, GNE)
+                if (grc != 0) { println("GDN_ERR residual") ; return 12 }
+                cuCtxSynchronize()
+                gsw<Int> = Gs ; Gs = Gs2 ; Gs2 = gsw
+                dump_section(GDXN, GNE, gpf, "xn")
+                dump_section(GDQKV, GQKV, gpf, "qkv")
+                dump_section(GDZ, GVALUE, gpf, "z")
+                dump_section(GDBETA, GHV, gpf, "beta")
+                dump_section(GDGATE, GHV, gpf, "gate")
+                dump_section(GDCONVS, GQKV, gpf, "conv_silu")
+                dump_section(GDQN, GKEY, gpf, "q_norm")
+                dump_section(GDKN, GKEY, gpf, "k_norm")
+                dump_section(GDOUT, GSS * GHV, gpf, "gdn_out")
+                dump_section(GDEPI, GSS * GHV, gpf, "epi")
+                dump_section(GDY, GNE, gpf, "y")
+                dump_section(GDLO, GNE, gpf, "layer_out")
+                dump_section(Gs, GSS * GSS * GHV, gpf, "state_out")
+            }
+            println("GDN_PROBE_DONE " + sp + "steps=2 NE=" + GNE.to_string() + " S=" + GSS.to_string()
+                    + " Hk=" + GHK.to_string() + " Hv=" + GHV.to_string() + " d_conv=" + GDC.to_string())
+            return 0
+        }
 
         i0<Int> = find_nm(nmv, "blk.0.attn_q.weight"); wq_nl<Int> = nlv.get(i0)
         i0 = find_nm(nmv, "blk.0.attn_k.weight"); wk_nl<Int> = nlv.get(i0)
