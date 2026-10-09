@@ -165,6 +165,9 @@ int main(int argc, char ** argv) {
         pr = ggml_soft_max_ext(ctx, kq3, mask3, kqs, 0.0f);
         struct ggml_tensor * atp = ggml_mul_mat(ctx, vpp, pr);
         struct ggml_tensor * at_ex = ggml_cont(ctx, ggml_permute(ctx, atp, 0, 2, 1, 3));
+        // NOT cast to F16: llama.cpp does that at its call site, but doing the same here (with
+        // ggml_flash_attn_ext_set_prec F32) turned the output into nans, so the F16 cast is not the
+        // explanation for the mismatch below and is left out.
         struct ggml_tensor * atf = ggml_flash_attn_ext(ctx, qr, kr, vp, mask2, kqs, 0.0f, 0.0f);
         // flash returns (hd, n_tokens, n_head) — measured, not assumed — so permute to the (hd, n_head,
         // n_tokens) that the split half of this harness and the gate multiply use

@@ -1105,3 +1105,29 @@ honestly:
 Two facts about `ggml_flash_attn_ext` learned by measurement rather than recall: its mask must be
 **F16** (it asserts), and its output is `(hd, n_tokens, n_head)` — the token axis second — not the
 `(hd, n_head, n_tokens)` the rest of the block uses, so it needs a permute before the gate multiply.
+
+## Unit 10 step 4c — why the flash path disagrees: its KV tiling, not the mask and not GQA
+
+Ran the flash path at **n_kv == n_head**, where the hand-rolled path also runs and is the verified
+truth (2.675e-07). Flash disagrees there too — so the GQA grouping was never the problem, and the fault
+is in how this fixture feeds `ggml_flash_attn_ext`. Measured evidence:
+
+* Where flash writes, it agrees with the spec at **3.3e-04** for (query 0, head 0) — that is the op's
+  F16 precision, and it says the plumbing (mask type/layout, the output permute, the scale) is right.
+* Agreement then decays with the token index: 3.3e-04, 1.75e-03, 0.136, 0.156, 0.696, 0.719, 2.17, 2.53.
+* Exactly ONE row is entirely `nan`: (query 2, head 2) — 256 values, in a fixture with S = 3.
+* Inverting the mask fill changes the error but not its size (1.043 vs 1.073), so the mask is not it.
+* Casting q/k/v to F16 and setting F32 precision, as llama.cpp's call site does, turned the output into
+  nans here — so that is not it either (and it is NOT left in).
+
+The explanation that fits all of it: `ggml_flash_attn_ext` processes its key/value axis in TILES
+(`KV_TILE_SZ`), so with 3 keys it still reads whole tiles — including K/V rows that do not exist in this
+fixture — and pads the MASK with `-inf` for them but not the K/V values. `0 * exp(-inf)` is zero only if
+the padded K/V is finite; read garbage gives `nan` in one row and skews every partial tile, which is
+exactly the growing-with-token disagreement above. llama.cpp does not hit this because its KV cache is
+allocated rounded up and zeroed.
+
+So the next step is a fixture change, not a math change: build K/V (and the mask) PADDED to the op's
+tile size with zeros, then the flash path should agree at F16 precision — which also means it needs its
+own tolerance bar (`~1e-3` relative for values of order 0.1), not the 1e-4 the f64-engine comparisons
+use, and that bar must be justified in the gate rather than silently shared.
