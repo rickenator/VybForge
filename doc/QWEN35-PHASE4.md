@@ -927,3 +927,32 @@ through the same parse path).
 Lessons for the skill: a dump parser must keep the dumped int64 BIT PATTERNS intact until the single
 reinterpretation (an intermediate dtype="<f8" silently converts); and a pass-through/no-op case is the
 right fiducial for any load→compute→store→dump chain.
+
+## Unit 10 step 3a — the attention block's front half, measured (gate P4.8)
+
+The reconnaissance called the joint Q+gate projection the substantial attention-path risk, and it was
+right about the risk even though it was wrong about IMROPE. `attn_q.weight` is one matrix
+(`5120 x 12288`) carrying, per head, a 256-dim q block followed by a 256-dim gate block. A reading that
+swapped the halves, took the RMS norm over the whole 12288-wide projection instead of per head, or ran
+rope across the whole head would each still produce plausible-looking numbers.
+
+`native/tools/attn_authority.c` builds the block's front half with ggml's own ops — `ggml_view_3d` for
+the split (llama.cpp's own view arithmetic), `ggml_rms_norm` per head, `ggml_rope_multi` for rope — and
+dumps seven stages; `native/tools/attn_verify.py` reproduces the intended reading and compares each one:
+
+    qg       3.439e-07   q_pre    3.981e-07   gate_pre 3.009e-07
+    q_norm   3.924e-07   q_rope   3.924e-07   k_norm   3.187e-07   k_rope 3.187e-07
+    alt gate-first split             1.541e+00  rejected
+    alt norm over the whole projection 1.447e+00  rejected
+    alt rope over the whole head     1.197e+00  rejected
+
+So the split is q-first/gate-second per head, the norms are per head, and the rope covers the first 64
+of 256 dims — the same layout P4.6 and P4.7 pinned, now in the position it will actually occupy.
+
+Two harness lessons, both of which cost a run: a `ggml_view_3d` result has the PARENT's strides, so
+dumping a view linearly reports the parent's layout (copy with `ggml_cont` first — and that artifact
+looked exactly like a spec failure at 1.6, which is where the check's stage-by-stage printing earned its
+keep); and K must be reshaped to `(head_dim, n_kv, n_tokens)` before the per-head norm, or the norm runs
+over the whole `n_kv*head_dim` width and rope sees a 2-D tensor (ggml asserts on that).
+
+Not covered yet: attention itself, the output gate `attn * sigmoid(gate)`, and `wo`.

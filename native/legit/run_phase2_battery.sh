@@ -368,6 +368,21 @@ else
   step "P4.5 GDN engine weight path" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.8 — Ridge's attention-block front half, against ggml (unit 10.3a) ───────────────
+# Gate: native/legit/run_attn_block_gate.sh. The joint Q+gate split, both per-head RMS norms and rope,
+# each stage compared with ggml's own ops, with the alternative readings required to differ (gate-first
+# split, one norm over the whole projection, rope over the whole head). Measured: 7 stages at worst
+# 3.98e-07, 3 alternatives rejected at 1.20..1.54. Attention, the output gate and wo are NOT covered.
+out="$(./native/legit/run_attn_block_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "ATTENTION BLOCK GATE: PASS"; then
+  step "P4.8 attention block (front half)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "ATTENTION BLOCK GATE: SKIP"; then
+  step "P4.8 attention block (front half)" "SKIP ($(echo "$last" | sed 's/ATTENTION BLOCK GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.8 attention block (front half)" "FAIL"; echo "$out" | tail -12 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come
