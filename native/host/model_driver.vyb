@@ -1877,6 +1877,16 @@ main()<Int> -> {
                         }
                         vs2 = vs2 + rows2
                     }
+                    # argmax_acc does NOT seed its running best — the CALLER must (the head's walk seeds
+                    # -1e308 first). Unseeded, the fresh buffer's zeros become the running best and every
+                    # logit below 0 is ignored, which is why the first dump came back all zeros at index
+                    # 0. Seed BOTH passes: the winner, then the runner-up after masking the winner.
+                    zseed<Float> = -1.0e308
+                    s11<Int> = 0
+                    for (s11 in 0..S - 1) {
+                        put_f(DBV2, s11 * 8, zseed)
+                        put_i(DAO2, s11 * 8, 0)
+                    }
                     # the winner over the whole vocab, then mask exactly that entry and take the runner-up
                     put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV2) ; put_i(A4 + 16, DAO2)
                     put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
@@ -1889,6 +1899,11 @@ main()<Int> -> {
                         if (cuMemcpyDtoH_v2(loc(iv9), DAO2 + s9 * 8, 8) != 0) { return 16 }
                         negv<Float> = -1.0e308
                         if (cuMemcpyHtoD_v2(DLF + (s9 * VOCAB + iv9) * 8, loc(negv), 8) != 0) { return 15 }
+                    }
+                    s11 = 0
+                    for (s11 in 0..S - 1) {
+                        put_f(DBV3, s11 * 8, zseed)
+                        put_i(DAO3, s11 * 8, 0)
                     }
                     put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV3) ; put_i(A4 + 16, DAO3)
                     put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
