@@ -58,10 +58,44 @@ if grep -q '^RIDGE_FORWARD_VERIFY_DONE' "$log" && [ "$rc" = "0" ]; then
   n="$(grep -oE '^RIDGE_FORWARD_VERIFY_SUMMARY fixture=[^ ]+' "$log" | wc -l)"
   step "whole Ridge forward ($n prompt(s))" "PASS (hidden cos $c, per-position top1 == the oracle)"
   grep -oE '^RIDGE_FORWARD_VERIFY_SUMMARY.*' "$log" | sed 's/^/      /'
+  full_ok=1
+else
+  step "whole Ridge forward" "FAIL (see $log)"
+  full_ok=0
+fi
+
+# ── the CAUSAL PATH, on the same fixture, at shorter prefixes ───────────────────────────────────
+# A causal model's token-k hidden cannot depend on the tokens that FOLLOW it, so the fixture also
+# covers the first k positions: running the prompt at k = 1, 2, 3 is an oracle-backed check of the
+# causal path, and it is the check that catches a per-layer state buffer sized for one layer (the
+# S=1/S=2 `GDN_ERR conv` crash) or any cross-token contamination. The verifier proves each prefix's
+# IDS are the fixture's first k ids, so a prefix that tokenizes differently FAILS loudly instead of
+# silently comparing the wrong positions. Skipped when VYBFORGE_RF_SKIP_RUN is set (there is then
+# only one log to read, and it belongs to one prompt).
+pfx_ok=1
+if [ -z "${VYBFORGE_RF_SKIP_RUN:-}" ]; then
+  IFS='|' read -ra PFXS <<< "${VYBFORGE_RIDGE_PREFIXES:-The|The capital|The capital of}"
+  i=0
+  for px in "${PFXS[@]}"; do
+    i=$((i + 1))
+    logp="$work/verify_prefix$i.log"
+    env -u PYTHONPATH VYBFORGE_RF_PROMPT="$px" "$py" native/tools/ridge_forward_verify.py "$@" >"$logp" 2>&1
+    prc=$?
+    pc="$(grep -oE 'hidden_cos=[0-9.]+' "$logp" | tail -1 | sed 's/hidden_cos=//')"
+    pn="$(grep -oE 'per-position top1: [0-9]+/[0-9]+' "$logp" | tail -1 | sed 's/per-position top1: //')"
+    if [ "$prc" = 0 ] && grep -q '^RIDGE_FORWARD_VERIFY_DONE' "$logp"; then
+      step "prefix [${px}]" "PASS (top1 $pn, hidden cos $pc)"
+    else
+      step "prefix [${px}]" "FAIL (see $logp)"
+      grep -E '^RIDGE_FORWARD_VERIFY_FAIL' "$logp" | sed 's/^/      /'
+      pfx_ok=0
+    fi
+  done
+fi
+
+if [ "$full_ok" = 1 ] && [ "$pfx_ok" = 1 ]; then
   echo; echo "RIDGE FORWARD GATE: PASS"
   exit 0
 fi
-
-step "whole Ridge forward" "FAIL (see $log)"
 echo; echo "RIDGE FORWARD GATE: FAIL"
 exit 1

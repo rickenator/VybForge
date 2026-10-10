@@ -201,7 +201,12 @@ def verify_fixture(fx):
           % (text, S, D, len(pos), bar))
 
     # ── the encoding must be the oracle's (P4.11 checks this directly; here it is the run's input) ─
-    out = existing_run(text) if SKIP_RUN else run_driver(text)
+    # A gate may deliberately run a SHORTER prompt, and then the same fixture covers the first runS
+    # positions: a causal model's token-k hidden cannot depend on the tokens after it, which is
+    # exactly the property that catches a cross-token state bug. The ids check below is what makes
+    # that sound (the fixture is keyed by ids).
+    run_text = os.environ.get("VYBFORGE_RF_PROMPT") or text
+    out = existing_run(run_text) if SKIP_RUN else run_driver(run_text)
     if out is None:
         return 1
     if "MODEL_PREFILL_DONE" not in out:
@@ -215,11 +220,28 @@ def verify_fixture(fx):
         if line.startswith(("PROMPT_IDS=", "HEAD_CFG", "HEAD_TABLE", "EMBED_ROWS", "LMHEAD_MODE",
                             "LMHEAD_TOP1_DONE", "PREFILL_HIDDEN_DONE")):
             print("RIDGE_FORWARD_VERIFY driver: " + line)
-    got_ids_line = [l for l in out.splitlines() if l.startswith("PROMPT_N=")]
-    if got_ids_line and int(got_ids_line[0].split("=")[1]) != len(want_ids):
-        print("RIDGE_FORWARD_VERIFY_FAIL the driver embedded %s tokens, the fixture's prompt has %d "
-              "— the prompt stream is not the oracle's" % (got_ids_line[0], len(want_ids)))
-        return 1
+    got_n = [l for l in out.splitlines() if l.startswith("PROMPT_N=")]
+    got_i = [l for l in out.splitlines() if l.startswith("PROMPT_IDS=")]
+    if got_i:
+        run_ids = [int(x) for x in got_i[0].split("=", 1)[1].split()]
+        # The run may be the fixture's prompt or any PREFIX of it — decided on the IDS, not on the
+        # text and not on the token count. A text-prefix guess ("The cap") can tokenize to the same
+        # COUNT with different ids, which would silently compare the wrong positions.
+        if not run_ids or run_ids != want_ids[:len(run_ids)]:
+            print("RIDGE_FORWARD_VERIFY_FAIL the run embedded ids %s, which are not a prefix of the "
+                  "fixture's %s" % (run_ids[:8], want_ids[:8]))
+            return 1
+    else:
+        # logs from before PROMPT_IDS was printed: fall back to the exact-length rule
+        if not got_n or int(got_n[0].split("=")[1]) != len(want_ids):
+            print("RIDGE_FORWARD_VERIFY_FAIL the driver embedded %s tokens, the fixture's prompt has "
+                  "%d — the prompt stream is not the oracle's"
+                  % (got_n[0] if got_n else "?", len(want_ids)))
+            return 1
+        run_ids = want_ids
+    runS = len(run_ids)
+    print("RIDGE_FORWARD_VERIFY the run covers %d of the fixture's %d positions (prefix rule on ids)"
+          % (runS, len(want_ids)))
 
     # ── per-position top1, under the fixture's own equality/membership rule ───────────────────────
     ours = [int(v) for v in read_floats(TOPF).astype(np.int64)]
@@ -227,7 +249,7 @@ def verify_fixture(fx):
     details = []
     for row in pos:
         k, t1, lp1, t2, lp2, rule = int(row[0]), int(row[1]), float(row[2]), int(row[3]), float(row[4]), row[5]
-        if k > S or k > len(ours):
+        if k > runS or k > len(ours):
             break
         got = ours[k - 1]
         margin = lp1 - lp2
@@ -275,11 +297,12 @@ def verify_fixture(fx):
     except Exception:                                                     # noqa: BLE001
         print("RIDGE_FORWARD_VERIFY note: gguf unavailable, eps left at 1e-6")
     raw = read_floats(HIDF)
-    if raw.size != S * D:
-        print("RIDGE_FORWARD_VERIFY_FAIL our hidden is %d values, wanted %d" % (raw.size, S * D))
+    if raw.size != runS * D:
+        print("RIDGE_FORWARD_VERIFY_FAIL our hidden is %d values, wanted %d" % (raw.size, runS * D))
         return 1
-    pre = raw.reshape(S, D)
+    pre = raw.reshape(runS, D)
     post = rmsnorm(pre, w, eps)
+    H = H[:runS]                      # the oracle's rows for the positions this run actually covers
     c_post, c_pre = cos(post.ravel(), H.ravel()), cos(pre.ravel(), H.ravel())
     rel = float(np.max(np.abs(post - H)) / max(float(np.max(np.abs(H))), 1e-30))
     print("RIDGE_FORWARD_VERIFY hidden cos(post-output_norm)=%.6f maxrel=%.3e" % (c_post, rel))

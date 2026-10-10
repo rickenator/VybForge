@@ -440,6 +440,17 @@ main()<Int> -> {
         println("PROMPT_MODE=text PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
     }
     S<Int> = prids.len()
+    # Print the ACTUAL ids, not just the count: the oracle fixtures are keyed by token ids, so a
+    # verifier can prove the run it is reading embedded the fixture's own id sequence (or a PREFIX of
+    # it, when a gate deliberately runs a shorter prompt). Without this a log is only self-described —
+    # and a prompt whose text was edited would still report the right token COUNT.
+    ids_str<String> = ""
+    iid<Int> = 0
+    for (iid in 0..S - 1) {
+        ids_str = ids_str + prids.get(iid).to_string()
+        if (iid < S - 1) { ids_str = ids_str + " " }
+    }
+    println("PROMPT_IDS=" + ids_str)
     hm<String> = env_get("HOME") else "."
     # VYB_MODEL / VYB_TSV override the model and its tensor index (the unit 9c probe points them at
     # the Ridge GGUF and its generated index); VYBFORGE_QWEN3_GGUF stays the default so the existing
