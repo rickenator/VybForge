@@ -16,6 +16,19 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# A leaked PYTHONPATH is an environment artifact that reads as a regression: this battery picks
+# `$root/.venv/bin/python` as its oracle interpreter, and a PYTHONPATH pointing at ANOTHER
+# interpreter's site-packages makes that python resolve a FOREIGN numpy (measured: a python3.14
+# site-packages made `import numpy` die with "No module named 'numpy._core._multiarray_umath'"),
+# failing every python-backed step for no code reason. Clear it once, loudly, and re-exec.
+if [ -n "${PYTHONPATH:-}" ] && [ "${VYBFORGE_BATTERY_CLEANENV:-0}" != "1" ]; then
+  echo "note: clearing the inherited PYTHONPATH ($PYTHONPATH) — the repo's .venv is the interpreter"
+  echo "      authority, and a foreign site-packages on PYTHONPATH fails every python-backed step."
+  echo
+  VYBFORGE_BATTERY_CLEANENV=1 exec env -u PYTHONPATH "$root/native/legit/run_phase1_battery.sh" "$@"
+fi
+
 . "$root/vybenv.sh" || exit 1   # VYBHOME / VYB / VYB_STDLIB (VybForge#15, rickenator/Vyb#424)
 export VYB_STDLIB
 PY="${PY:-}"

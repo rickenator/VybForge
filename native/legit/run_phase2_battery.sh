@@ -14,6 +14,26 @@
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# A LEAKED PYTHONPATH IS AN ENVIRONMENT ARTIFACT THAT READS AS A REGRESSION. This battery spawns ~30
+# gates and many of them shell out to `$root/.venv/bin/python`; when the caller exports a PYTHONPATH
+# pointing at ANOTHER interpreter's site-packages (an agent session's own venv, a different python
+# minor), that path shadows the venv and every numpy-using reference gate dies with
+# "No module named 'numpy'" / "No module named 'numpy._core._multiarray_umath'" — which the battery then
+# reports as ~10 FAILed steps that have nothing to do with the code. Measured: run from an agent session
+# with PYTHONPATH=/home/rick/.hermes/installs/.../venv/lib/python3.14/site-packages, nine gates failed
+# this way while every GPU gate passed. The repo's .venv is the authority here, so clear it ONCE and
+# re-exec, loudly, rather than let the next reader chase a phantom.
+if [ -n "${PYTHONPATH:-}" ] && [ "${VYBFORGE_BATTERY_CLEANENV:-0}" != "1" ]; then
+  echo "note: clearing the inherited PYTHONPATH before running the gates:"
+  echo "        PYTHONPATH=$PYTHONPATH"
+  echo "      The repo's .venv is the interpreter authority; a foreign site-packages on PYTHONPATH makes"
+  echo "      every numpy-using reference gate fail with 'No module named numpy', which is not a code"
+  echo "      regression. Re-executing with it cleared (VYBFORGE_BATTERY_CLEANENV=1 keeps it as-is)."
+  echo
+  VYBFORGE_BATTERY_CLEANENV=1 exec env -u PYTHONPATH "$root/native/legit/run_phase2_battery.sh" "$@"
+fi
+
 . "$root/vybenv.sh" || exit 1
 
 fail=0
@@ -162,7 +182,9 @@ fi
 # Gate: native/legit/run_caps_gate.sh. model_caps.vyb decides whether this build can RUN a model
 # and refuses with a NAMED reason when it cannot; the gate checks that decision against the dense
 # model (SUPPORTED, type counts cross-checked against an independent Python parser), the Ridge
-# target (UNSUPPORTED with exactly five named reasons), the vision tower, and a truncated file.
+# target (SUPPORTED since W5 flipped eng_gdn()/eng_mtp() — its refusal list must be EMPTY, and both
+# structural names reappearing is a FAIL that says which flag went back), the vision tower, and a
+# truncated file.
 # The Ridge/mmproj cases SKIP when those files are not on disk, and the gate FAILS if it proved
 # nothing at all — a gate that skips everything has verified nothing.
 out="$(./native/legit/run_caps_gate.sh 2>&1)"
@@ -460,10 +482,14 @@ fi
 
 # ── P4.13 — the MTP DRAFT HEAD (blk.NTL) vs the same oracle, teacher-forced (phase 4, W4) ────
 # Gate: native/legit/run_ridge_mtp_gate.sh. Feeds the draft head the ORACLE's own normalised hidden row
-# and the ORACLE's own next token, and requires its per-step top1 to be the oracle's pick for t+2 — so
-# the new block is judged with the main pass taken out of the loop. No new oracle capture: the fixtures
-# already record a greedy pick at every position. Also runs the checker's off-by-one tooth, which MUST
-# miss (a checker that always agrees would make this gate decoration).
+# and the ORACLE's own next token, and requires its per-step top1 to agree with the oracle's pick for
+# t+2 under the fixture's margin rule — so the new block is judged with the main pass taken out of the
+# loop, and no new oracle capture is needed: the fixtures already record a greedy pick at every
+# position. The criterion is a per-fixture FLOOR on that rule-aware agreement, derived from measurement
+# (17/19 counting -> floor 15/19; 4/4 capital -> floor 3/4), and the gate runs the floor's own teeth
+# FIRST — a zeroed hidden (1/19) and a backward one-row shift (10/19), both of which must land below it
+# — plus the checker's off-by-one tooth, which MUST miss. (An exact-match criterion could only ever
+# FAIL on a correct head; see native/tools/ridge_mtp_verify.py and doc/QWEN35-MTP-HARVEST.md §10.)
 out="$(./native/legit/run_ridge_mtp_gate.sh 2>&1)"
 last="$(echo "$out" | tail -1)"
 if echo "$last" | grep -q "RIDGE MTP GATE: PASS"; then
