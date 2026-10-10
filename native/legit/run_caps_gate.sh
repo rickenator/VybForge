@@ -10,11 +10,16 @@
 #          cross-checked against an INDEPENDENT parser (native/gguf/ridge_inventory.py, Python,
 #          written separately from the Vyb reader) — two implementations must agree.
 #   Qwen3.8-27B Ridge (the #10 target)
-#       -> UNSUPPORTED for exactly TWO STRUCTURAL reasons — the Gated-DeltaNet layer kind and the
-#          MTP head — with every text quant type implemented (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_S,
-#          IQ3_S). The check asserts each of those types is ABSENT from the refusal list. It also
-#          pins the hybrid facts the phase-2 descriptor exists to express: 64 text blocks = 16
-#          attention + 48 recurrent, interval 4, ssm state_size 128, one nextn layer.
+#       -> SUPPORTED, now that W5 flipped `eng_gdn()`/`eng_mtp()`. The refusal list must be EMPTY and
+#          is asserted by ABSENCE (both structural names reappearing is a FAIL that names which flag
+#          went back), and every text quant type (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_S, IQ3_S) must still be
+#          absent from it. The check also pins the hybrid facts the phase-2 descriptor exists to
+#          express: 64 text blocks = 16 attention + 48 recurrent, interval 4, ssm state_size 128, one
+#          nextn layer. Cases 3 and 4 below still pin REFUSALS, so the gate keeps proving that the
+#          descriptor refuses when it should rather than only that it now says yes.
+#       (HISTORIC: this case asserted UNSUPPORTED with five named reasons, later two — GDN and MTP —
+#        while those capabilities were unbuilt. W5 is the flip; the evidence licensing each flag is in
+#        native/config/model_caps.vyb beside the flag itself.)
 #   mmproj-BF16.gguf (the vision tower)
 #       -> UNSUPPORTED for ONE reason: vision itself. Its weight type (BF16) is implemented, so the
 #          check asserts BF16 is ABSENT from the refusal and that the tower is still filed as a
@@ -152,7 +157,10 @@ else
   else
     uns="$(cv UNSUPPORTED "$out")"
     bad=""
-    [ "$(cv VERDICT "$out")" = "UNSUPPORTED" ] || bad="$bad verdict=$(cv VERDICT "$out")"
+    # W5: the flip. Ridge is now SUPPORTED by this build, so the refusal list must be EMPTY — asserted
+    # by ABSENCE, so a flag reverted to 0 fails with the name of the capability that went back — while
+    # every structural fact phase 2 exists to express stays pinned.
+    [ "$(cv VERDICT "$out")" = "SUPPORTED" ] || bad="$bad verdict=$(cv VERDICT "$out")"
     [ "$(cv ARCH "$out")" = "qwen35" ] || bad="$bad arch=$(cv ARCH "$out")"
     [ "$(cv LAYOUT "$out")" = "hybrid-recurrent" ] || bad="$bad layout=$(cv LAYOUT "$out")"
     # the hybrid facts phase 2 exists to express
@@ -164,27 +172,17 @@ else
     [ "$(cv ATTN_INTERVAL "$out")" = "4" ] || bad="$bad interval=$(cv ATTN_INTERVAL "$out")"
     [ "$(cv SSM_STATE_SIZE "$out")" = "128" ] || bad="$bad ssm_state=$(cv SSM_STATE_SIZE "$out")"
     [ "$(cv NEXTN_TENSORS "$out")" = "4" ] || bad="$bad nextn_tensors=$(cv NEXTN_TENSORS "$out")"
-    # the refusal list must be EXACTLY these two, each named, and no others: the text model's quant
-    # types are all implemented now, so what remains is structural. Every type that LEFT the list
-    # (Q8_0, Q5_K, IQ2_S, IQ3_S) is asserted ABSENT, so a capability that silently stopped being
-    # reported cannot read as a passing gate.
-    nreasons="$(tr ',' '\n' <<<"$uns" | sed '/^$/d' | wc -l | tr -d ' ')"
-    [ "$nreasons" = "2" ] || bad="$bad reasons=$nreasons"
-    for want in \
-      "UNSUPPORTED_LAYER_KIND gated-deltanet layers=48" \
-      "UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1"; do
-      grep -qF "$want" <<<"$uns" || bad="$bad missing[$want]"
-    done
-    grep -qF "Q8_0" <<<"$uns" && bad="$bad Q8_0-still-refused"
-    grep -qF "IQ2_S" <<<"$uns" && bad="$bad IQ2_S-still-refused"
-    grep -qF "Q5_K" <<<"$uns" && bad="$bad Q5_K-still-refused"
-    grep -qF "IQ3_S" <<<"$uns" && bad="$bad IQ3_S-still-refused"
+    [ -z "$uns" ] || bad="$bad unsupported=[$uns]"
+    # The flip's own regression case, by name: either structural refusal reappearing means W5 has been
+    # undone (or a capability silently stopped being consulted), and the step line says which.
+    grep -qF "UNSUPPORTED_LAYER_KIND gated-deltanet" <<<"$uns" && bad="$bad gdn-refused-again"
+    grep -qF "UNSUPPORTED_CAPABILITY mtp" <<<"$uns" && bad="$bad mtp-refused-again"
     if [ -n "$bad" ]; then
       step "Ridge text model (#10 target)" "FAIL:$bad"
       echo "      unsupported=[$uns]" | sed 's/^/      /'
       fail=1
     else
-      step "Ridge text model (#10 target)" "UNSUPPORTED with 2 named reasons (GDN 48 layers, MTP; all five text quant types implemented)"
+      step "Ridge text model (#10 target)" "SUPPORTED (hybrid-recurrent: 16 attention + 48 GDN, MTP head; refusal list EMPTY — the W5 flip)"
       proven=$((proven + 1))
     fi
     type_crosscheck "Ridge text model" "$out" "$ridge"

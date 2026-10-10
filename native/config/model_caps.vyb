@@ -216,8 +216,26 @@ eng_type(id<Int>)<Int> -> {
     if (id == 30) { return 1 }     // BF16   (native/kernels/bf16.vyb, make bf16)
     return 0
 }
-eng_gdn()<Int> -> { return 0 }     // Gated DeltaNet recurrent layers
-eng_mtp()<Int> -> { return 0 }     // native draft head
+// W5: both structural flags are FLIPPED. A descriptor flag claims a WHOLE capability at once — weight
+// loading, per-sequence state carry-over, the multi-path, the engine wiring and, for MTP, the draft head
+// itself — so each flip is licensed by an ORACLE comparison, never by the per-layer gates (the rule is
+// HANDOFF-PHASE4.md §3, "W5 — flip the descriptor, last"):
+//
+//   eng_gdn() = 1  licensed by P4.12 PASS: a whole 65-block Ridge forward against llama.cpp on the same
+//                  GGUF — per-position top1 == the oracle's and hidden cos 0.999609 — with the 48
+//                  recurrent layers carrying their conv window and delta-net state through the sequence.
+//                  Multi-token input runs as S SINGLE-TOKEN steps, which is the path P4.12 exercises and
+//                  the one the engine's loop uses; the op's CHUNKED kernel is still uncharacterised (W6)
+//                  and is not on that path.
+//   eng_mtp() = 1  licensed by P4.13 PASS: the draft head (blk.64) reproduces the same oracle's
+//                  next-next-token picks, 4/4 on the capital fixture and 17/19 on the counting one
+//                  against its derived floor, with the criterion's own wrong-input teeth landing below
+//                  that floor — plus the chained draft (VYB_MTP_CHAIN) measured against the same oracle.
+//
+// eng_vision() stays 0: the 27B text GGUF has no vision tower (`mmproj-*.gguf` is a separate file), and
+// the flip is about the text model this engine runs.
+eng_gdn()<Int> -> { return 1 }     // Gated DeltaNet recurrent layers
+eng_mtp()<Int> -> { return 1 }     // native draft head
 eng_vision()<Int> -> { return 0 }  // vision tower / mmproj
 
 caps_tyname(id<Int>)<String> -> {
