@@ -905,7 +905,15 @@ main()<Int> -> {
             # the state cache is allocated for every TEXT block, so the loop never has to decide
             # whether layer L owns a slot: recurrent blocks use theirs, the rest stay zeroed.
             if (cuMemAlloc_v2(loc(DSTC), MAXL * GDC * GQKV * 8) != 0) { return 11 }
-            if (cuMemAlloc_v2(loc(DSTS), MAXL * GSS * GSS * GHV * 8) != 0) { return 11 }
+            # TWO delta-net slots per layer, not one: the loop ping-pongs a layer's state between
+            # `L*2 + gst%2` and `L*2 + 1 - gst%2`, so the cache must hold 2*MAXL of them. Allocating
+            # MAXL (one per layer, which is what the name suggests) is out of bounds from L = MAXL/2
+            # — measured on Ridge: layers 0..31 run and the FIRST recurrent block past the halfway
+            # point faults, poisoning the context so the failure surfaces at the next checked launch
+            # (`GDN_ERR norm_gated` at blk.32) rather than at the delta_step that wrote past the end.
+            # The hidden state of a whole-model run had never reached layer 32 before this, which is
+            # why a probe at blk.0/blk.19 never saw it.
+            if (cuMemAlloc_v2(loc(DSTS), MAXL * 2 * GSS * GSS * GHV * 8) != 0) { return 11 }
             println("GDN_ALLOC_CACHE_OK")
             # the mixer weights' packed staging buffer. Sized at 4 bytes per element, which is the
             # widest any ggml type this loader accepts occupies, so no tensor can overrun it.
@@ -920,7 +928,7 @@ main()<Int> -> {
             # memory is NOT pre-zeroed, so both caches must be cleared here. The host-side
             # `download` helper moves 8 bytes per device call — for 410 MB that is 51 M calls and
             # minutes of wall clock; cuMemsetD8_v2 clears each cache in one call.
-            if (cuMemsetD8_v2(DSTS, 0, MAXL * GSS * GSS * GHV * 8) != 0) {
+            if (cuMemsetD8_v2(DSTS, 0, MAXL * 2 * GSS * GSS * GHV * 8) != 0) {
                 println("GDN_CFG_FAIL could not zero the state cache")
                 return 11
             }
@@ -928,7 +936,8 @@ main()<Int> -> {
                 println("GDN_CFG_FAIL could not zero the conv cache")
                 return 11
             }
-            println("GDN_CACHE layers=" + MAXL.to_string() + " delta-net=" + (MAXL * GSS * GSS * GHV).to_string()
+            println("GDN_CACHE layers=" + MAXL.to_string() + " delta-net=" + (MAXL * 2 * GSS * GSS * GHV).to_string()
+                    + " values (2 slots/layer, the ping-pong the loop indexes with L*2+slot)"
                     + " conv=" + (MAXL * GDC * GQKV).to_string() + " values, zeroed")
         }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
