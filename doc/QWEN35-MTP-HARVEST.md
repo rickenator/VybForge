@@ -1,7 +1,8 @@
 # MTP draft path — measured baseline and the chained-draft harvest
 
-Status: design + cost model. The chain is **not implemented yet**; P4.13 remains the single-step
-teacher-forced test. Written to be acted on: each step below is a concrete change with a measurement.
+Status: the chain is IMPLEMENTED and MEASURED (§9, W4b), and P4.13's acceptance criterion is now a
+rule-aware floor set from that measurement (§10) — the design and cost model below are the reasoning it
+was built from, kept because the predictions are worth checking against the result.
 
 ## 1. What is measured today
 
@@ -81,6 +82,11 @@ its top-2 margin and its `exact`/`membership` rule.
 
 ## 5. Instrumentation: CORRECTED — the reading half exists, the writing half does not
 
+**Superseded by §9 (W4b):** the chain was built IN THE ENGINE, so no h′-row writer was ever needed — the
+h chain never leaves the device (each step reads the previous step's output row by pointer), and the only
+file the chain writes is the drafted ids, as text, for the verifier. The analysis below stands for the
+offline route, which was not taken.
+
 An earlier version of this section claimed the offline chain needed no new code. That is **wrong** on the
 dump side and the error is worth keeping here:
 
@@ -95,12 +101,16 @@ dump side and the error is worth keeping here:
   acceptance curve, which is the worst outcome for a measurement whose only purpose is to decide whether
   to build something. Do not use it without checking that precision first.
 
-## 6. Order of work
+## 6. Order of work — all three DONE
 
-1. Offline chain (needs the writer from §5) — measure acceptance vs N against both fixtures.
-2. Serialised chain in the engine (`eng_mtp()`), staging weights once, with the chain's attention extent
-   as the one genuinely new correctness question.
-3. Set P4.13's bar from §4's numbers, replacing the exact-match criterion.
+1. ~~Offline chain (needs the writer from §5) — measure acceptance vs N against both fixtures.~~ DONE
+   differently and better: the chain is in the engine (§9), so the offline writer was never needed.
+2. ~~Serialised chain in the engine (`eng_mtp()`), staging weights once, with the chain's attention extent
+   as the one genuinely new correctness question.~~ DONE as `VYB_MTP_CHAIN` (§9). The attention extent is
+   no longer a question: the batch IS the accumulated rows, re-run at length k+1, and the mechanism's
+   tooth (§9) shows it reproduces the teacher-forced picks bit-for-bit.
+3. ~~Set P4.13's bar from §4's numbers, replacing the exact-match criterion.~~ DONE as a rule-aware floor
+   (§10).
 
 ## 7. Does the chain need its own KV cache? — no, corrected
 
@@ -168,4 +178,137 @@ Invariants to preserve, all load-bearing — each one a bug already paid for:
 **Verification of the refactor (this is what makes it safe):** the main path must produce unchanged
 results — after extracting, P4.13 must still read 4/4 capital and 17/19 counting, and P4.12's hidden cos
 0.999609 unchanged. If either moves, the extraction changed behaviour and is wrong.
+
+## 9. W4b — the chained draft: implemented and measured
+
+Status: IMPLEMENTED and MEASURED. Knob `VYB_MTP_CHAIN=<N>`, default off; the teacher-forced path is
+untouched and the chain path returns before the teacher-forced head walk, so a chain run never writes
+`prefill_top1_vyb.txt` / `prefill_hidden_vyb.txt` (it writes `native/out/ridge_mtp_chain.txt`).
+
+**Shape (driver `native/host/model_driver.vyb`).** The block's own `for (L in LST..LEP-1)` loop is
+wrapped in an outer per-step loop. Step k: build row k into `XA` from the previous step's OUTPUT ROW
+(passed as a device pointer — the driver has no device->device copy and needs none, because the row is
+read at build time, before the block overwrites that buffer) and from the previous step's own draft;
+set the batch length to k+1; re-seed `XI = XA; XO = XB` (the block swaps them); run the block; normalise
+row k with `nextn.shared_head_norm`; score it with `head_untied(DH, 0, 1, ...)` and take `DAO[0]`.
+Rows accumulate in `XA` and the batch re-runs, so earlier rows' K/V is rebuilt from unchanged inputs —
+§7's "no KV cache needed" holds, and it is measured, not argued: see the tooth below. RoPE needs no
+per-step knob: `rope_nrot`'s angle is `(POS + row index)`, so row k sits at exactly the position the
+teacher-forced batch gives that row.
+
+**The mechanism's instrument (`VYB_MTP_CHAIN_TF=1`).** The chain's per-step batching fed the
+teacher-forced inputs must reproduce `prefill_top1_vyb.txt` BIT-FOR-BIT. It does: 19 of 19 steps on the
+counting fixture, and 17/19 acceptance with the same two misses at steps 0 and 1. So the accumulation,
+the per-row rope position and the per-row head scoring are right, and a divergence in a real chain
+belongs to the draft head rather than to the loop. Without this, "the head cannot chain" and "the chain
+loop is wrong" would look identical.
+
+**Acceptance vs N** (one chain from step 0 — the literal measurement asked for):
+
+| fixture | N=1 | N=2 | N=3 | N=4 | N=19 |
+| --- | --- | --- | --- | --- | --- |
+| capital (4 steps) | 1/1 | 2/2 | 2/3 | 2/4 | — |
+| counting (19 steps) | 0/1 | 0/2 | 0/3 | 0/4 | 0/19 |
+
+That number is nearly uninformative, and the reason is structural rather than a defect: a chain consumes
+its own draft, so the FIRST disagreement poisons every later step. On the counting fixture step 0 is
+already a disagreement — our top1 there is not in the oracle's top-2 and the margin is 0.066, and the
+teacher-forced mode misses it too — so every longer N reads 0. Acceptance-vs-N answers "was the whole
+run right", never a per-step rate, and no head with a per-step accuracy below 1 can score above zero
+there.
+
+**Conditional survival** — the number §2's cost model actually needs — comes from
+`VYB_MTP_CHAIN_START=<k0>`: rows before k0 are truth-fed (that is what a verified prefix amounts to
+here), so depth 0 is the head's first draft from a fresh verify boundary and depth 1 onwards are the
+chained ones. One run per anchor position; depth j = P(hit at depth j | alive through depth j-1).
+
+counting, 19 anchors:
+
+```
+depth 0   17/19 (89.5%)   <- equals the teacher-forced rate exactly: the instrument reproduces P4.13
+depth 1   15/16 (93.8%)
+depth 2   13/14 (92.9%)
+depth 3    9/12 (75.0%)
+depth 4    5/8  (62.5%)
+depth 5    4/4      depth 6  3/4      depth 7  2/3      depth 8  0/1
+mean survival 3.58 drafts, expected 4.28 accepted drafts per verify
+```
+
+capital, 4 anchors: depth 0 4/4, depth 1 1/3, depth 2 0/1; mean survival 1.25, expected 1.33.
+
+So the head chains for several tokens on the counting prompt (up to 8 in a row at two anchors) and only
+about one on the capital prompt: there, one chained step survives 1 time in 3 (depth 1) against 15 of 16
+on the counting prompt, and every anchor still gets its own first draft right (depth 0 4/4). The sample
+is 4 anchors, so that gap is indicative rather than a rate — the counting prompt's periodicity is also
+why its chained drafts recover after a miss. Against §2: ~4.3 accepted drafts per verify on the counting
+prompt means ~4.3x fewer verification passes than no speculation, at ~2.3 GB of draft traffic per drafted
+token (~2-3% of computing it) — and this is the first measurement of the chain against this head. Note
+what it does NOT say: the per-step rate after depth 4 rests on 8 then 4, 3, 2, 1 anchors, so the tail of
+the curve is indicative only.
+
+Gate: `native/legit/run_ridge_mtp_chain_gate.sh`. Its PASS/FAIL criterion is the TF tooth (bit-for-bit
+agreement with the teacher-forced picks); the chain's acceptance numbers are REPORTED, not judged — a bar
+belongs on P4.13's criterion, and §10 sets it from the depth-0 rate measured here.
+
+### h sensitivity (measured while choosing §10's tooth)
+
+The floor's tooth has to be a wrong input the head actually feels, so the head's dependence on the hidden
+row was probed directly on the counting fixture (19 steps; the correct input scores 17/19):
+
+| hidden given to the head | agreement |
+| --- | --- |
+| the fixture's own rows (correct) | 17/19 |
+| the same rows shifted FORWARD by one | 19/19 |
+| the same rows shifted BACKWARDS by one | 10/19 |
+| zeroed | 1/19 |
+
+So h is load-bearing (zeroing destroys the head) but not an exact-position lookup (a one-row shift
+survives it). The forward shift's two flips are NOT a signature of an off-by-one pairing: it does not
+reproduce on the capital fixture (4/4 correct, 4/4 shifted forward), and 2 flips at near-tie positions out
+of 19 is inside what luck can do. It is recorded as a hypothesis with no support, not as a finding.
+§10's teeth are the ZEROED and the BACKWARD-shifted input, both of which land far below the floor.
+
+## 10. The acceptance bar — SET, from §9's depth-0 rate
+
+P4.13's criterion WAS exact-match against the oracle's greedy pick. That is **wrong for a draft head**: an
+approximate separate head reusing the main model's `output.weight` is not a copy of the main path, so its
+agreement with the oracle is below 100% by construction, and the criterion could only ever report FAIL on
+a correct engine (it did, for weeks — see the old §5 of `HANDOFF-MTP-CHAIN.md`).
+
+It is now a **rule-aware FLOOR**, pinned per fixture and DERIVED from measurement rather than chosen
+(`FLOORS` in `native/tools/ridge_mtp_verify.py`):
+
+| fixture | steps | measured | floor | slack |
+| --- | --- | --- | --- | --- |
+| `the_capital_of_france_is` | 4 | 4/4 (100%) | 3/4 | 1 miss |
+| `1_2_3_4_5_6_7` | 19 | 17/19 (89.5%) | 15/19 | 2 misses |
+
+The measurement behind it is §9's depth-0 survival rate — the same quantity by a different route, and it
+reproduces the teacher-forced number exactly, which is what makes it usable as a bar. The rule per step is
+unchanged (equality where the oracle's top-2 margin clears `margin_bar`, membership of {top1,top2} below
+it); only the verdict relaxed, and every disagreement is still printed with its position, its pick, the
+oracle's pick and its margin.
+
+What the slack is calibrated against, both measured:
+
+- **It must absorb a legitimately re-picked near-tie.** The counting fixture's pos-2 pick sits at a
+  0.066-nat margin, inside the ~0.02-0.05-nat spread the oracle shows against itself (CPU vs GPU capture
+  of the same GGUF — the same spread recorded in `HANDOFF-MTP-CHAIN.md`). The floor relaxes the verdict,
+  never the evidence.
+- **It must not absorb a real defect, and it does not.** Both teeth are run by
+  `native/legit/run_ridge_mtp_gate.sh` BEFORE it judges anything, and both must land below the floor: the
+  hidden ZEROED gives **1/19**, the hidden rows shifted BACKWARDS by one give **10/19**. That is the
+  difference between a gate and a printout.
+
+Consequences, recorded rather than assumed:
+
+- The oracle still cannot supply a bar (§6: its qwen35 MTP graph aborts on this GGUF), so this one is
+  ours, and the derivation above is its evidence.
+- The floor is tied to the fixture's step count: if a fixture changes shape the gate FAILS with
+  "re-derive the floor" instead of comparing against a stale bar.
+- Four steps cannot carry a rate bar — one miss of slack is all a 4-step fixture can express — so the
+  19-step counting fixture is the one that does, and the capital fixture is a correlated second sample.
+- The floors are calibrated on a DEFAULT-OFF engine state (no chain, `VYB_MTP_POS` inert): any change to
+  what the draft head consumes re-derives them, it does not inherit them.
+
 
