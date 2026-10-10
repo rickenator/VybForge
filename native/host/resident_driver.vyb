@@ -380,6 +380,16 @@ main()<Int> -> {
         ii0 = find_nm(nmv, "token_embd.weight"); te_nl<Int> = nlv.get(ii0); te_off0<Int> = ofv.get(ii0)
         ii0 = find_nm(nmv, "output_norm.weight"); on_off<Int> = ofv.get(ii0); on_nl<Int> = nlv.get(ii0)
 
+        # ---- the four per-layer norm kinds (VybForge#23) ----
+        # Static, per-layer, and (until now) re-read from the GGUF and re-uploaded for every layer of
+        # every token. Their sizes come from the file, not from hardcoded shapes, so a different model
+        # cannot silently index the resident block wrong.
+        ii0 = find_nm(nmv, "blk.0.attn_norm.weight"); n1n<Int> = nlv.get(ii0)
+        ii0 = find_nm(nmv, "blk.0.attn_q_norm.weight"); nqn<Int> = nlv.get(ii0)
+        ii0 = find_nm(nmv, "blk.0.attn_k_norm.weight"); nkn<Int> = nlv.get(ii0)
+        ii0 = find_nm(nmv, "blk.0.ffn_norm.weight"); n2n<Int> = nlv.get(ii0)
+        nstride<Int> = n1n + nqn + nkn + n2n
+
         # Qwen3-4B-Q4_K_M MIXES quantization per layer: attn_v and ffn_down are
         # Q6_K (ty 14, numel*210/256) on some layers, Q4_K (ty 12, numel*144/256)
         # on others (verified in the TSV), so their PACKED SIZE varies per layer.
@@ -415,6 +425,7 @@ main()<Int> -> {
         DCtx<Int> = 0; DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
+        NB<Int> = 0
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
@@ -422,10 +433,9 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Wg), wg_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wu), wu_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wd), wd_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(N1), 2560 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Nq), 128 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Nk), 128 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(N2), 2560 * 8) != 0) { return 11 }
+        # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
+        # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
+        if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(EMB), MAXS * D * 8) != 0) { return 11 }
@@ -506,6 +516,20 @@ main()<Int> -> {
         }
         println("ALL_PACKED_RESIDENT")
 
+        # ---- all 36 layers' norms: expand ONCE, resident (VybForge#23) ----
+        # Measured before this change: the four load_norm calls in the gen loop cost 7.5% of a token
+        # (norm_ms in RESIDENT_BREAKDOWN) — 144 file reads + H2D uploads + launches per token, on
+        # static data. They are now done once here (1.6 MB total) and indexed by layer in the loop.
+        for (L in 0..NLAYER - 1) {
+            LN<Int> = NB + L * nstride * 8
+            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e = load_norm(MODEL, PF, DPK, LN, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 85 }
+            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, LN + n1n * 8, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 86 }
+            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, LN + (n1n + nqn) * 8, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 87 }
+            ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, LN + (n1n + nqn + nkn) * 8, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 88 }
+            if (L % 6 == 0) { println("NORMS_RESIDENT layer " + L.to_string() + "/36") }
+        }
+        println("ALL_NORMS_RESIDENT")
+
         e = emb_dequant(MODEL, te_off0, te_nl, DPK, q6fn, DE); if (e != 0) { return 91 }
         println("EMB_DEQUANT_DONE")
 
@@ -564,11 +588,13 @@ main()<Int> -> {
                         for (L in 0..NLAYER - 1) {
                             if (QV == 0) { println("DECG L" + L.to_string() + " deqstart") }
                             phA<Int> = time_mono_millis()
-                            # per-layer RMSNorm weights (differ every layer — load layer L's)
-                            ii0<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e<Int> = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
-                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
-                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
-                            ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
+                            # per-layer norms are RESIDENT (expanded once at load) — index them here.
+                            # No file read, no H2D, no launch: this was 7.5% of a token (norm_ms).
+                            N1 = NB + L * nstride * 8
+                            Nq = N1 + n1n * 8
+                            Nk = Nq + nqn * 8
+                            N2 = Nk + nkn * 8
+                            e<Int> = 0
                             nmT = nmT + (time_mono_millis() - phA)
                             phB<Int> = time_mono_millis()
                             e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn, D); if (e != 0) { return 70 }
