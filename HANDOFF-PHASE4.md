@@ -155,10 +155,18 @@ verified by reverting `eng_gdn()` to 0, where the Ridge case fails with `gdn-ref
   oracle comparison: P4.12 for GDN, P4.13 for the draft head). `eng_vision()` stays 0. The gate's Ridge
   case now asserts the refusal list is EMPTY and fails by name if either flag goes back; see
   "The descriptor's own verdict right now" above.
-* **W6** (not required for the flip) multi-token / prefill for the recurrent op: the op's chunked
-  kernel is UNCHARACTERISED, and only single-token steps are verified. A prompt can still be run as S
-  single-token steps, which is what the loop does today. (The small-S crash found here is FIXED — see
-  W3's landing note — and P4.12 now runs S=1/2/3 as its causal-path coverage.)
+* **W6** DONE — the multi-token path needed no second implementation. ggml's op has ONE compute path:
+  `ggml_compute_forward_gated_delta_net_f32` calls `..._one_chunk` once per head/seq range, the token
+  loop lives inside that chunk, and the `K` op param is a SNAPSHOT-SLOT COUNT ("slot 0 = most recent
+  state"), not a kernel selector. So several tokens are the sequential rule repeated. Measured at T=3
+  against the libggml authority: the port matches at maxrel 1.28e-07, three T=1 calls CARRYING THE STATE
+  reproduce the one T=3 call bit-for-bit (scores and final state), and changing only the last token's
+  inputs leaves every earlier token's scores bit-identical. Both properties are now gate steps with
+  teeth (P4.1, `run_gdn_ops_gate.sh`, unit 1 at `--tokens 3`); the old "the op runs a second (chunked)
+  kernel for several tokens" note is WITHDRAWN, as its evidence was an artefact of the transposed read.
+  The engine still runs a prompt as S single-token steps — that is a performance choice, not a
+  limitation. (The small-S crash found here is FIXED — see W3's landing note — and P4.12 runs S=1/2/3 as
+  its causal-path coverage.)
 * **The caps probe still cannot distinguish** "a dequant KERNEL exists" from "the model PATH can stage
   the type" (W1 residue, see above) — W1 closed it for 21/22 in fact, but `run_caps_gate.sh` reads
   `eng_type` only and would not notice a regression. A caps-probe line pairing `eng_type` with a
@@ -502,15 +510,31 @@ capability at once** — weight loading, per-sequence state carry-over, the mult
 wiring, and (for MTP) the whole draft head. "Our kernels reproduce the layer to 1e-6" is evidence about
 KERNELS and says nothing about those. Flip on the oracle comparison, not on the per-layer gates.
 
-### W6 — the multi-token/prefill path for the recurrent op (not on the critical path)
+### W6 — the multi-token/prefill path for the recurrent op — DONE
 
-The op has TWO kernels: one token runs the sequential rule the port implements; several run a chunked
-one that fills the buffer differently. **This is NOT YET CHECKED** — two earlier claims about it (that
-token 0's output depends on later tokens; that identical slices gave different per-head results) were
-ARTEFACTS of a transposed read and are WITHDRAWN; do not repeat them. Characterise it with the
-`gdn_authority.c` harness at T=1,2,3 with distinguishable inputs, then extend the reference. Until
-then the port/reference must refuse multi-token comparison and the engine runs S single-token steps —
-which is correct, just slower.
+**There is no second kernel.** ggml's op has ONE compute path: `ggml_compute_forward_gated_delta_net_f32`
+calls `ggml_compute_forward_gated_delta_net_one_chunk` once per head/seq range, the `for (t = 0; t <
+n_tokens; ++t)` loop lives INSIDE that chunk, and the `K` op param is a SNAPSHOT-SLOT COUNT ("slot 0 =
+most recent state"; K=1 writes the final state straight into the output buffer), not a kernel selector.
+The "chunking" in the names is over heads and sequences. So several tokens are the sequential rule the
+port already implements, repeated — and the earlier claim that a second, differently-arranged kernel
+handles them was another artefact of the transposed read (its evidence — token 0's output changing when
+more tokens followed — is refuted below).
+
+Characterised the way the phase asked, by running `gdn_authority.c` at T=1,2,3 with distinguishable
+inputs (P4.1, unit 1 at `--tokens 3`), with both properties required BIT-FOR-BIT because they are
+structural rather than numeric:
+
+- **replay** — three T=1 calls carrying the state forward reproduce the one T=3 call: scores and final
+  state, maxabs 0.000e+00;
+- **causal** — changing only the LAST token's inputs leaves every earlier token's scores bit-identical
+  (maxabs 0.000e+00) while the last one changes (4.33e-03), so the check can fail;
+- and the port itself at T=3: `maxrel out=1.277e-07 state=1.520e-07`, the same order as T=1.
+
+No refusal remains: `gdn_verify.py` runs T>1 and gates those two properties; `gdn_ref.py` (the older
+sibling with the transposed indexing) now says plainly that it is superseded instead of repeating the
+withdrawn premise. The engine still runs a prompt as S single-token steps — a performance choice
+(the fused path is #23/#24 territory), not a limitation.
 
 ## 4. ENVIRONMENT — the exact setup
 

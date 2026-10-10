@@ -96,9 +96,11 @@ artifact that reads exactly like a regression.
 
 - The oracle's own MTP acceptance is still **unobtainable** (llama.cpp's qwen35 `graph_mtp` aborts on
   this GGUF), so the acceptance floor is ours and its derivation is the evidence for it.
-- The op's CHUNKED multi-token kernel for the recurrent layer is still uncharacterised (W6). It is NOT on
-  the path the engine uses — a prompt runs as S single-token steps, which is what P4.12 exercises
-  end to end — so it does not block anything, but it is also not verified.
+- W6 is CLOSED — there is no separate multi-token kernel to characterise: the op has ONE compute path
+  (the token loop is inside the head/seq chunk; `K` is a snapshot-slot count), a T=3 call is three
+  state-carrying T=1 calls BIT-FOR-BIT, and P4.1's unit 1 now runs at `--tokens 3` with causality and
+  replay as its teeth. The engine still runs a prompt as S single-token steps: a performance choice
+  (#23/#24 territory), not a limitation.
 - The caps descriptor still reads `eng_type` only, so it cannot distinguish "a dequant kernel exists"
   from "the model path can stage the type" (W1 residue) — a staging regression would not be caught there.
 - `1efd17f`'s commit message is still junk; amending it needs Rick's explicit OK.

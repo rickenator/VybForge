@@ -96,13 +96,16 @@ directly, so it runs the identical op implementation llama.cpp uses, not a copy.
   That validates the formula and the state orientation — including that the state is stored
   transposed (`s_out[j*S_v + i] = S[i][j]`, `ops.cpp:10849-10850`) and that the read-out happens
   AFTER the rank-1 update, scaled by `1/sqrt(S)` (`ops.cpp:10852-10882`).
-* **The op has TWO kernels, and the multi-token path is a different one.** With multiple tokens the
-  op's token-0 output CHANGES when more tokens follow — impossible for a causal recurrence
-  (demonstrated by feeding identical tokens at T=1,2,3). The kernel read at `ops.cpp:10740-10896`
-  writes scores but not the state when `K=1`; a second entry point,
-  `ggml_compute_forward_gated_delta_net_f32` (`ops.cpp:10899`), carries chunking logic. Multi-token
-  comparison therefore needs that path's arrangement established first, and the reference
-  deliberately refuses to claim it (`--tokens 1`).
+* **The op has ONE compute path, and its token loop is inside the chunk.** An earlier note here claimed
+  a second, CHUNKED kernel for several tokens, on the evidence that "the op's token-0 output CHANGES
+  when more tokens follow — impossible for a causal recurrence (demonstrated by feeding identical
+  tokens at T=1,2,3)". That observation was an artefact of a transposed read and is WITHDRAWN, like the
+  other two next to it. Measured at T=3 (W6, P4.1 unit 1 at `--tokens 3`): the op is strictly causal —
+  changing only the last token leaves every earlier token's scores bit-identical — and three T=1 calls
+  carrying the state reproduce the one T=3 call bit-for-bit, scores AND final state. The `K` op param is
+  a SNAPSHOT-SLOT COUNT ("slot 0 = most recent state"), not a kernel selector: the "chunking" in
+  `..._one_chunk` is over heads and sequences. There was never anything to characterise about a
+  second arrangement; there was only the transposed read to find.
 
 ### NOT established — the open problem, with its evidence
 
@@ -263,9 +266,11 @@ against ggml's own op rather than against itself. The harness (`gdn_authority.c`
 libggml llama.cpp runs) plus `gdn_verify.py` is the reusable piece; `gdn_ref.py` still carries the
 old transposed indexing and should be deleted or rewritten onto `gdn_verify.py`'s convention.
 
-What this does NOT cover, and what follows: the multi-token/prefill path (the op's other kernel), and
-the rest of the layer around the recurrence — the short convolution, the l2 normalisation, the gated
-RMS epilogue and the projections — before a Vyb kernel and its gate can be written.
+What this does NOT cover, and what follows: the rest of the layer around the recurrence — the short
+convolution, the l2 normalisation, the gated RMS epilogue and the projections — before a Vyb kernel and
+its gate can be written. (The "multi-token/prefill path" this sentence used to list as missing is
+settled: W6 measured that the op has ONE compute path, and a T=3 call is three state-carrying T=1 calls
+bit-for-bit — see the Established entry above.)
 
 ### Second unit: the short convolution, also verified against ggml's own op
 
@@ -733,7 +738,9 @@ FFN's norm is called `ffn_norm`). Both assumptions had been true for 36 dense la
 ### What this does NOT yet do
 
 The sequential kernel is the decode rule, so a recurrent block is correct at T=1 per token and slow for
-a long prompt; llama.cpp's chunked prefill kernel is still uncharacterised. The state cache is correct
+a long prompt; llama.cpp's "chunked prefill kernel" is uncharacterised because it does not exist — W6
+measured that the op has one compute path and that T=3 is three state-carrying T=1 calls, bit-for-bit.
+The state cache is correct
 within one forward pass and does not yet persist its slot parity across passes (there is no session
 state in the engine — a chat server would need one before a second token can follow a first). And the
 gate verifies one block (blk.0), because the authority side of the fixture is built from blk.0's
