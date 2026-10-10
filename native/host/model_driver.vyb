@@ -570,6 +570,38 @@ main()<Int> -> {
     mtp2s<String> = env_get("VYB_MTP_TOP2") else ""
     MTP2<Int> = 0
     if (mtp2s.len() > 0) { MTP2 = 1 }
+    # ---- W4b: the CHAINED draft (VYB_MTP_CHAIN=<N>), default off ----
+    # The teacher-forced mode above builds all S rows of the block input up front (each row = the
+    # ORACLE's hidden row + the prompt's own next token) and runs the block ONCE. A chain is the real
+    # thing: step k's input is the PREVIOUS STEP'S OWN OUTPUT, so the rows must be built and run one at
+    # a time and the draft head has to be driven once per step. That is what makes the acceptance
+    # number measured here comparable to a speculative decode's, rather than an upper bound that
+    # consumes the oracle's hidden (doc/QWEN35-MTP-HARVEST.md §4-§7).
+    mchs<String> = env_get("VYB_MTP_CHAIN") else ""
+    MCHN<Int> = 0
+    if (mchs.len() > 0) { MCHN = parse_u(mchs, 0, mchs.len()) }
+    if (MCHN > 0 && MTPM == 0) { println("MTP_CHAIN_ERR VYB_MTP_CHAIN needs VYB_MTP=1"); return 2 }
+    # VYB_MTP_CHAIN_TF=1 (default off): the chain's own TOOTH. It keeps the per-step batching, the
+    # per-step head walk and the growing batch length, but builds each row from the ORACLE's hidden and
+    # the prompt's own next token instead of our own previous output/draft — i.e. the teacher-forced
+    # inputs through the CHAIN mechanism. That run must reproduce the teacher-forced mode's per-step
+    # top1 EXACTLY (prefill_top1_vyb.txt); if it does, the mechanism (accumulate the rows, re-run at
+    # length k+1, score row k alone, per-row rope position) is right and any divergence in a real chain
+    # is the draft head's own, not the loop's. Without this the acceptance numbers below have no
+    # instrument behind them — a broken mechanism and a draft head that cannot chain look identical.
+    ctf<String> = env_get("VYB_MTP_CHAIN_TF") else ""
+    MCHTF<Int> = 0
+    if (ctf.len() > 0) { MCHTF = 1 }
+    # VYB_MTP_CHAIN_START=<k0> (default 0): build rows 0..k0-1 from the ORACLE's hidden and the prompt's
+    # own tokens, and hand over to our own output/draft at row k0. With k0 = 0 that is a chain from the
+    # prompt's first draft step (the literal "acceptance vs N"); with k0 > 0 it measures the chain's
+    # CONDITIONAL survival, i.e. the only case a speculative decode is ever in after a verify pass —
+    # "given a verified prefix, how many drafts in a row does this head get right". Without it a single
+    # early disagreement (which this head has, ~10% of steps) makes every longer N read as 0 and the
+    # decay curve is unmeasurable.
+    cs0<String> = env_get("VYB_MTP_CHAIN_START") else ""
+    MCHS0<Int> = 0
+    if (cs0.len() > 0) { MCHS0 = parse_u(cs0, 0, cs0.len()) }
     if (MTPM == 1) {
         if (prids.len() < 3) { println("MTP_ERR the draft head needs at least 3 prompt tokens"); return 2 }
         mtr<Vec<Int>> = Vec()
@@ -578,6 +610,8 @@ main()<Int> -> {
         prids = mtr
     }
     S<Int> = prids.len()
+    # The chain cannot run longer than the step sequence the fixture's ids define.
+    if (MCHN > S) { MCHN = S }
     # Print the ACTUAL ids, not just the count: the oracle fixtures are keyed by token ids, so a
     # verifier can prove the run it is reading embedded the fixture's own id sequence (or a PREFIX of
     # it, when a gate deliberately runs a shorter prompt). Without this a log is only self-described —
@@ -1364,7 +1398,12 @@ main()<Int> -> {
             }
             if (download(mhs, MHID, S * D * 8) != 0) { return 15 }
             msi<Int> = 0
-            for (msi in 0..S - 1) {
+            # Chain mode builds ONLY row 0 here (the fixture's hidden row + the prompt's own next token);
+            # its remaining rows are built one at a time inside the chain, from our own output. Anything
+            # else is the teacher-forced pre-build.
+            mrow<Int> = S
+            if (MCHN > 0) { mrow = 1 }
+            for (msi in 0..mrow - 1) {
                 # The per-step build lives in mtp_build_row() so the draft chain can call it once per step
                 # (with its own h and its own drafted token); this teacher-forced path builds S rows here.
                 e = mtp_build_row(XA + msi * D * 8, MHID + msi * D * 8, prids.get(msi), D,
@@ -1378,11 +1417,53 @@ main()<Int> -> {
             MPOS<Int> = parse_u(mpv, 0, mpv.len())
             cuMemcpyHtoD_v2(ROP + 72, loc(MPOS), 8)
             println("MTP_MODE steps=" + S.to_string() + " block=blk." + NTL.to_string()
-                    + " rope_pos_base=" + MPOS.to_string() + " hidden=" + mhp)
+                    + " rope_pos_base=" + MPOS.to_string() + " hidden=" + mhp
+                    + " chain=" + MCHN.to_string())
         }
 
         LST<Int> = 0 ; LEP<Int> = NTL
         if (MTPM == 1) { LST = NTL ; LEP = NTL + 1 }
+        # ---- W4b: the CHAINED draft's step loop (VYB_MTP_CHAIN=<N>, default off) ----
+        # This wrapper runs the block ONCE per draft step, over an accumulating batch, instead of once
+        # over a pre-built one. Step k:
+        #   - builds row k from OUR OWN previous output row (h) and OUR OWN previous drafted token —
+        #     a DEVICE pointer straight at the previous step's output, so no device->device copy is
+        #     needed (the driver's CUDA surface has none) and no host round-trip either. That row is
+        #     read here, before the block below overwrites its buffer;
+        #   - sets the batch length to k+1, so the block scores rows 0..k (row 0 is the fixture's own
+        #     hidden row and the prompt's own token, so the chain starts from the same place the
+        #     teacher-forced run starts, then diverges by using its own output);
+        #   - re-reads row k's output through the draft head and takes its single winner as the next
+        #     step's token.
+        # The rope position needs no per-step juggling: rope_nrot's angle is (POS + row index), so row k
+        # lands at exactly the position the teacher-forced batch gives that same row.
+        # `XI`/`XO` are re-seeded every step because the block SWAPS them (its output is the next
+        # layer's input), and the rows themselves stay in XA: the block READS its input buffer and
+        # writes the other one, so earlier rows survive for the next step's K/V (the harvest doc's
+        # "accumulate, do not rebuild" rule).
+        # Nothing here touches prefill_top1_vyb.txt / prefill_hidden_vyb.txt, so P4.13 and P4.12 are
+        # unaffected by a chain run (and by the knob being off, which is the default).
+        KCEND<Int> = 0
+        if (MCHN > 0) { KCEND = MCHN - 1 }
+        chk<Int> = 0
+        drf<Int> = 0
+        if (MCHN > 0) { drf = prids.get(0) }
+        cdrafts<Vec<Int>> = Vec()
+        for (chk in 0..KCEND) {
+        if (MCHN > 0) {
+            if (chk > 0) {
+                hsrc<Int> = XI + (chk - 1) * D * 8
+                tk<Int> = drf
+                if (MCHTF == 1 || chk < MCHS0) { hsrc = MHID + chk * D * 8 ; tk = prids.get(chk) }
+                e = mtp_build_row(XA + chk * D * 8, hsrc, tk, D,
+                                  MODEL, te_off, te_ty, MEH, MEN, MHN, MC2, MTMP,
+                                  DPK, q6fn, rfn, gfn, GP1, GP2, EPS)
+                if (e != 0) { println("MTP_CHAIN_ERR build row " + chk.to_string()); return e }
+            }
+            S = chk + 1
+            XI = XA
+            XO = XB
+        }
         for (L in LST..LEP - 1) {
             # ---- the per-layer DISPATCH (unit 9c) ----
             # Presence comes from the tensor table; the KIND comes from the shared classifier. This
@@ -1794,6 +1875,46 @@ main()<Int> -> {
             # between EMBED_PROBE_DONE and PREFILL_HIDDEN_DONE, so a slow-but-working run was
             # indistinguishable from a hang (it has been mistaken for one, and killed).
             if (L % 4 == 3) { pnl<Int> = L + 1; println("PREFILL_LAYER " + pnl.to_string() + "/" + NTL.to_string()) }
+        }
+        if (MCHN > 0) {
+            # ---- score step k's OWN row and take its winner as the next step's token ----
+            # `XI` is the block's output buffer after the swap above, so row k of the step's output is
+            # XI + k*D*8. Normalise that ONE row with the draft head's own `nextn.shared_head_norm` (the
+            # same weight the teacher-forced path uses) and score it with head_untied(nrows=1): its
+            # `DBV -> DAO` copy means DAO[0] is step k's draft.
+            one<Int> = 1
+            rA = XI + chk * D * 8 ; rB = MSN ; rC = DH
+            cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+            cuMemcpyHtoD_v2(RN + 24, loc(one), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+            cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+            e = head_untied(DH, 0, 1, DBV, DAO, out_off, VOCAB, D, CH, MODEL, PF, DPK, DCH, DCL,
+                            q6fn, lsfn, accfn, GM, A4)
+            if (e != 0) { println("MTP_CHAIN_ERR head at k=" + chk.to_string()); return e }
+            drf = 0
+            if (cuMemcpyDtoH_v2(loc(drf), DAO, 8) != 0) { return 16 }
+            cdrafts.push(drf)
+            println("MTP_CHAIN_DRAFT k=" + chk.to_string() + " tok=" + drf.to_string())
+        }
+        }
+        if (MCHN > 0) {
+            # One integer per line, in step order, for the chain verifier — the same shape the teacher
+            # path writes to prefill_top1_vyb.txt, but to a file of its own so neither gate can clobber
+            # the other's evidence.
+            match (open_write("native/out/ridge_mtp_chain.txt")) {
+                w -> {
+                    cw<Int> = 0
+                    for (cw in 0..cdrafts.len() - 1) {
+                        match (write_str(w, cdrafts.get(cw).to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    }
+                    close(w)
+                }
+                ? -> { return 17 }
+            }
+            println("MTP_CHAIN_DONE steps=" + MCHN.to_string() + " drafts=" + cdrafts.len().to_string()
+                    + " start=" + MCHS0.to_string()
+                    + " file=native/out/ridge_mtp_chain.txt")
+            println("MODEL_PREFILL_DONE")
+            return 0
         }
 
         # ---- probe mode ends here: one block ran through the loop's own dispatch, staging and
