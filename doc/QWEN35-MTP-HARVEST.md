@@ -19,36 +19,52 @@ plus `tools/server/server-context.cpp` both reference the MTP context — but `/
 draft model* (the entire `--spec-draft-*` family is draft-model config). So llama.cpp ships the head and
 does not use it: matching its acceptance is not a target, and the bar must come from our own measurement.
 
-## 2. Why chaining is the real lever (the cost model)
+## 2. Why chaining is the real lever (the cost model) — CORRECTED
 
-A token's worth of drafting costs, per pass:
+An earlier version of this section claimed the chain amortises the draft-head walk because the walk is a
+single gemm over all rows and does not scale with row count. **That is wrong, and it mattered:** the walk
+is incurred *per draft step*, because step k's input is the embedding of the token drafted at step k-1,
+which exists only after the head's argmax. The head is on the critical path once per step, and no amount
+of batching changes that. The "shared walk" only ever held for the teacher-forced pre-build, where all
+rows are known up front — which is exactly the freedom a real chain does not have.
 
-- **the draft-head walk**: the chunked lm_head walk over `output.weight` (10.2 GB at 3.7 bpw). This is
-  **bandwidth-bound** and it is a single gemm over ALL draft rows — it does **not** scale with the number
-  of rows. This is the dominant term, by far.
-- **one block-forward per drafted token** (attention + FFN of one block), i.e. ~1/64 of a verification
-  pass over the same positions.
-- **one verification pass** (64 layers) to check the drafted run.
+The arithmetic that actually holds (bytes of weight traffic, order-of-magnitude, not yet measured):
 
-Therefore N chained drafts per verify cost `1 walk + N blocks + 1 verify`, against a single-token MTP
-loop's `1 walk + 1 block + 1 verify` per token. The walk is shared, so the per-accepted-token cost of the
-dominant term falls ~N×. That is the "great vs mid" gap, and it is a property of the path, not of the
-weights.
+| term | traffic | note |
+| --- | --- | --- |
+| one draft step | ~1 block (~1.3 GB) + ~1 head walk (~1.0 GB) | ≈ 2.3 GB |
+| one verification pass | 64 blocks (~84 GB) + head (~1.0 GB) | the token's real cost |
 
-## 3. What the chain requires (the structural change)
+So a drafted token costs ~2-3% of the work of computing that token outright, and **accepting a draft saves
+~97% of that token's cost**. The chain's *additional* benefit is that one verification pass covers the
+whole accepted run, so the pass — dominated by the 64 block-forwards — is amortised over N accepted
+tokens rather than one. Both effects are real; they are just not the one originally stated.
 
-Today's MTP mode pre-builds **all** S rows of the block input `XA` in one loop (driver ~1280-1299) and
-then runs the block once over those rows. A chain cannot be pre-built: step k's input depends on step
-k-1's **output**.
+Consequence for the target: driving the built-in head *at all* is the bulk of the win (llama.cpp does not
+drive it), and chaining adds the verify-pass amortisation on top. That ordering is what the numbers
+support, and it is the opposite of the earlier claim's implication that batching was the lever.
 
-1. Run the draft rows **serially**, one row per step: `(h'_k-1, e(d_k-1)) -> d_k`, with `h'_0` = the
-   main pass's final normalised hidden and `d_0` = the first drafted token.
-2. Feed the block's own **output hidden** forward as the next step's `h`. The block is a transformer
-   block, so this is exactly what it is for; no new weights, no new kernel.
-3. Attention extent for the chain: row k must see rows `0..k` (its own prefix), not itself alone. This is
-   **the risky part** — the teacher-forced runs validate none of it, because each of their steps consumes
-   the oracle's own hidden row and is therefore self-consistent by construction.
-4. Stage the block's weights **once** for the whole chain (they do not change between steps).
+## 3. What the chain requires (the structural change) — as implemented-shape
+
+1. Build the draft rows **incrementally, one per step**, into consecutive rows of `XA`: row k uses
+   `h'_k-1` (our own hidden from step k-1, or the fixture's row 0 for k = 0) and the embedding of `d_k-1`,
+   our own drafted token. Consecutive rows, not a rebuilt row 0 — the batch must accumulate.
+2. Run the block over rows `0..k` (i.e. batch length `k+1`) to get row k's output. **This needs no
+   persistent KV cache**: causal attention makes rows `0..k-1` recompute identically from their unchanged
+   inputs, which are the ones already in `XA`. The cost is O(N²) block-forwards, which is negligible
+   against the head walk (~10 total block-forwards for N = 4, versus 64 for a single verify pass).
+   `S` is mutable, so the batch length can be varied per step without touching the block body — but the
+   buffers must be sized from the original length *before* the loop, and the ids/hidden/head lengths must
+   come from a captured full-length value, never from the varying `S`.
+3. Run the head **per step**, over row k only, to get `d_k` so row k+1 can be built. This is the part
+   that forces a restructure: the head is currently a large inline block wired to run once over S rows,
+   so it has to become callable (a function) before a chain can use it. That refactor is also what the
+   main path wants.
+4. Stage the block's weights once for the whole chain (they do not change between steps).
+
+Still true from the earlier version: the chain's attention extent is the one correctness question the
+teacher-forced runs cannot validate — though §7 below now identifies what it actually consists of.
+
 
 ## 4. The measurement that decides whether it pays
 
@@ -86,25 +102,30 @@ dump side and the error is worth keeping here:
    as the one genuinely new correctness question.
 3. Set P4.13's bar from §4's numbers, replacing the exact-match criterion.
 
-## 7. The chain needs its own KV cache (the real shape of the work)
+## 7. Does the chain need its own KV cache? — no, corrected
 
-Today's MTP block runs **once over all S pre-built rows in a single launch** (driver ~1280-1299 build `XA`,
-then one block forward). Each row's attention therefore sees rows `0..row` within that launch, with a
-fresh K/V: self-contained, and exactly right for teacher forcing, which is why the single-step results are
-meaningful.
+An earlier version of this section concluded the chain requires persistent per-layer K/V for blk.NTL plus
+the kernel path that reads it. That conclusion was **wrong**, and the correction is the useful part:
 
-A chain breaks that shape. Step k's input depends on step k-1's **output** (`h'_k-1`), so the rows cannot
-be pre-built, and step k must attend over rows `0..k` computed in *earlier launches*. That requires the
-MTP layer (blk.NTL) to keep its own K/V cache and append a row per step — i.e. persistent per-layer state
-plus the kernel path that reads it, not a loop restructuring.
+- The claim was that step k must attend over rows computed in *earlier launches*, which a cache would
+  supply.
+- In fact the rows can simply be **accumulated in `XA` and the batch re-run at each step** with length
+  `k+1`. Causal attention means rows `0..k-1` recompute identically from their own unchanged inputs, so
+  row k's output is correct, and no cross-launch state is needed at all. The engine already runs
+  full-sequence forwards and `S` is mutable, so this needs no new kernel and no new buffer.
+- The cost is O(N²) block-forwards: 10 for N = 4, against 64 for a single verification pass — negligible,
+  and dwarfed by the per-step head walk either way.
+
+What remains genuinely hard is §3.3: the head must become callable so it can run per step. That, not a KV
+cache, is the real work item.
 
 Consequences for the plan:
 
-- The "attention extent" risk flagged in §3 **is** this KV cache; it is not a parameter to tune, and it is
-  the entire correctness question for the chain. It is also the one thing the teacher-forced runs cannot
-  validate, since each of their steps consumes the oracle's hidden and never chains.
-- The dump detour is now clearly the wrong first move: the same effort must be spent on the KV path
-  regardless, and the KV path is on the production route while the dump is not.
+- The "attention extent" risk flagged in §3 reduces to "the batch must accumulate rows rather than rebuild
+  row 0", which is a property of the loop, not a new subsystem. It is still the one thing the
+  teacher-forced runs cannot validate, since each of their steps consumes the oracle's hidden and never
+  chains.
+- The dump detour stays the wrong first move: the head refactor is on the production route; the dump is not.
 - The single-step mode is the only validated evidence for blk.64 and must stay untouched: any chain work
   goes behind a new knob, default off.
 
