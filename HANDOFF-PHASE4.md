@@ -424,16 +424,28 @@ a gate demanding equality there flakes on a correct forward.
 here and `[785,6722,315,9625,374]` on Qwen3-4B. Feeding the dense ids to this model produced "u" from
 a 5-token prompt; every comparison must use the fixture's own ids.
 
-Two things NOT done for the oracle, both worth knowing before W3:
-* our ENCODER has never been checked against `/tokenize` for Ridge, because the model dir holds only
-  the GGUF (`~/Models/qwen38-27b-ridge/`) and the encoder path (`llm::llm_load`) wants a tokenizer
-  directory. `models--Qwen--Qwen3.8-27B` is in the HF cache as a bare ref; the official
-  `tokenizer.json` is an ~11 MB fetch and would let the encoder be checked against the oracle
-  independently of W2/W3. Worth doing before the W3 comparison — a wrong id stream makes every
-  downstream number meaningless.
-* there is deliberately NO gate yet: the fixture's job is to be CONSUMED by the W3 verifier, and a
-  gate with nothing to compare would be decoration. The provenance check (llama version + gguf_id)
-  belongs in that verifier, failing with "recapture required".
+Two things about the oracle, one now CLOSED:
+* **CLOSED — our encoder has been checked against `/tokenize` for Ridge, and it agrees.** The Ridge
+  tokenizer files are fetched into `artifacts/ridge-tokenizer` (gitignored; `vocab.json` + `merges.txt`
+  from `Qwen/Qwen3.8-27B` — note `hf download <repo> --include A B` warns and ignores `--include`, so
+  pass the filenames one form or the other and then `ls`), and `native/tools/ridge_encoder_check.py`
+  runs `llm_encode` over both fixture prompts and requires the oracle's exact ids. Measured PASS:
+  `The capital of France is` → `760,6511,314,9338,369`, and the 20-token counting prompt → its 20 ids.
+  Wired as **P4.11** (`native/legit/run_ridge_encoder_gate.sh`, `make -f native/Makefile encode-check`);
+  it SKIPs with the fetch command when the tokenizer files are absent, and its FAIL path was tested
+  with a lost-id map.
+* **The silent trap this closed, and the upstream defect it is.** `build_vocab_from` in
+  `stdlib/vllm/mod.vyb` walks `vocab.json` with a hand-rolled reader whose `read_int` stops at the
+  first non-digit — so a PRETTY-PRINTED `vocab.json` (a space after the `:`) maps **every** token to id
+  0, with no error, no short read, and the correct token COUNT. The official `Qwen/Qwen3.8-27B` repo
+  ships the file pretty-printed, so a fresh fetch hits it immediately: measured, 5 ids for
+  `The capital of France is`, all `0`. `ridge_encoder_check.py` therefore compacts the JSON before use
+  and asserts `,` → 11 (a map that lost its ids answers 0 there too), which turns the pathology into a
+  named FAIL. **This is a defect in the compiler's stdlib, not in VybForge** — the right fix is either
+  to skip whitespace in `read_int` or to refuse a file it cannot parse; the consumer-side compaction
+  here is a workaround, and the compiler repo (not ours) owns the fix.
+* Our driver still embeds no BOS and the fixtures pin `add_special:false` for exactly that reason; a
+  chat-templated prompt is a separate capture (one command) if a later gate needs one.
 
 ## APPENDIX — the accumulated record (chronological; headings marked HISTORIC are kept only
 ## so the record is not rewritten)
