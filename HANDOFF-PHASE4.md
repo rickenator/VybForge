@@ -441,9 +441,11 @@ Two things about the oracle, one now CLOSED:
   ships the file pretty-printed, so a fresh fetch hits it immediately: measured, 5 ids for
   `The capital of France is`, all `0`. `ridge_encoder_check.py` therefore compacts the JSON before use
   and asserts `,` → 11 (a map that lost its ids answers 0 there too), which turns the pathology into a
-  named FAIL. **This is a defect in the compiler's stdlib, not in VybForge** — the right fix is either
-  to skip whitespace in `read_int` or to refuse a file it cannot parse; the consumer-side compaction
-  here is a workaround, and the compiler repo (not ours) owns the fix.
+  named FAIL. **This is a defect in the compiler's stdlib, not in VybForge**, and it is FILED:
+  **https://github.com/rickenator/Vyb/issues/487** (body mirrors
+  `native/probes/vllm_vocab_whitespace/ISSUE.md`, with the minimal probe beside it). The consumer-side
+  compaction here is a labelled WORKAROUND; when 487 is fixed, delete it and re-run P4.11 — the guard
+  exists only to make the pathology loud. Re-check that issue before re-deriving any of this.
 * Our driver still embeds no BOS and the fixtures pin `add_special:false` for exactly that reason; a
   chat-templated prompt is a separate capture (one command) if a later gate needs one.
 
