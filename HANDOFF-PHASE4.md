@@ -380,6 +380,38 @@ The block is a FULL attention block plus an FFN plus the NextN-specific tensors,
   Verify the draft head does not change the MAIN logits (it must not: it is not in the main pass).
 * Wire it as a gate + battery step and prove it can FAIL, as always.
 
+**Reconnaissance done (from `src/models/qwen35.cpp` + `src/llama-context.cpp`), before writing code:**
+
+1. **The block's INPUT `h` is the NORMALISED hidden, not the last layer's raw output.**
+   `inp->h` is a caller-supplied embedding (`"mtp_h_input"`), and the MTP hook batches "carry both
+   token (next-token id) and embd (h_nextn row)" — `h_nextn` being the MTP graph's own output
+   `cb(cur, "h_nextn")` after `shared_head_norm`. So the pair for a step is
+   *(the post-output_norm hidden at position t, the embedding of token t+1)*, i.e. exactly what
+   `native/out/prefill_hidden_vyb.txt` + `output_norm` already gives us, and exactly what the fixtures
+   store. Do NOT feed the raw last-layer hidden: `nextn.hnorm` would then be a double normalisation.
+2. **The joint q+gate layout is the SAME as the main pass's — do not invent a new split.** The MTP
+   graph takes the q view with `nb1 = elem*head_dim*2` (per-head interleaved `[q_h, gate_h]`) and the
+   gate view from the same buffer at offset `elem*head_dim`, and the MAIN pass builds its `Qcur_full`
+   identically (`wq` → `[(head_dim*2)*n_head, n]`). The engine's existing split path is therefore the
+   right one; the earlier "q FIRST, gate SECOND" phrasing in this section describes OUR kernel's
+   OUTPUT arrangement, not the projection's layout.
+3. **The tail is confirmed**: FFN (parallel gate/up → down, `mtp_ffn_out`) → residual → then
+   `shared_head_norm` (falling back to `output_norm` if absent) → `cb(cur, "h_nextn")` → the shared
+   head `model.output` = `output.weight`. So the MTP head reuses the SAME head we already run; only
+   the block in front of it is new, and `h_nextn` doubles as the chaining input for a second draft.
+4. **Still to be settled EMPIRICALLY (the acceptance is the arbiter, two variants each):** the rope
+   position the draft step runs at (t+1 vs t+2) and its attention context (the prefix through t vs
+   through t+1). Both are caller-supplied in llama.cpp (`build_inp_pos()`/`build_attn_inp_kv()`), so
+   the source does not fix them for our standalone use; pick the variant that reproduces the oracle.
+5. **A cheap teacher-forced acceptance needs NO new capture.** The fixtures already record, for every
+   prompt position, the oracle's greedy token. So: for each t, feed (the fixture's hidden row t, the
+   embedding of the fixture's token t+1) and require the MTP head's top1 to be the fixture's
+   `pos_top1` at t+2, under the same margin rule (`exact` above `margin_bar`, membership below). That
+   gates the whole new block against llama.cpp's own numbers with zero new oracle plumbing — and it
+   is the same teacher-forced pattern §5 prescribes for near-ties. (Using the fixture's hidden rather
+   than ours isolates the MTP block from the main pass; a second pass can feed OUR hidden to test the
+   pair end to end.)
+
 ### W5 — flip the descriptor, last
 
 `native/config/model_caps.vyb`:
