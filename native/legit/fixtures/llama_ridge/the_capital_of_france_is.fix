@@ -1,0 +1,38 @@
+# Ridge decode oracle — captured by native/tools/ridge_oracle_capture.py.
+# The oracle is llama.cpp on the SAME GGUF, CPU-only (so it can serve beside a GPU
+# driver). A provenance mismatch below means the oracle moved: recapture, do not
+# compare against a stale fixture. `hidden_stage` says WHICH hidden this is.
+#
+# How to use it, and why the bar is not a fudge: greedy agreement is only meaningful
+# where the decision is decisive. Every recorded pick carries its top-2 margin (nats)
+# and the runner-up's id, so a gate checks EQUALITY where margin >= margin_bar and
+# MEMBERSHIP of {top1, top2} where it is below — a flat position is a coin flip that fp
+# noise can move, and a gate that demands equality there flakes on a correct forward.
+# Measured on this prompt: the 1-token prefix is inherently thin (after one token the
+# distribution is nearly flat), which is exactly the case the membership rule exists for.
+oracle llama-server
+llama_version version: 0.1.0-dev (build 628, commit 4df29be)
+llama_binary /home/rick/Projects/llama.cpp/build/bin/llama-server
+llama_flags -ngl 0 -c 512 --host 127.0.0.1 --port 18091 --pooling none --embd-normalize -1 --no-warmup --embeddings
+gguf Qwen3.8-27B-Ridge-3.7bpw.gguf
+gguf_id a60796cb68ca
+prompt_text The capital of France is
+prompt_ids 760 6511 314 9338 369
+margin_bar 0.5000
+mode membership
+mode_note 2 of 11 recorded picks are below the margin bar
+hidden_file the_capital_of_france_is.hidden.f64
+hidden_stage post_output_norm
+hidden_shape 5 5120
+pos_top1 1 2614 -3.563002 220 -3.801138 membership
+pos_top1 2 314 -0.661014 3177 -2.367730 exact
+pos_top1 3 279 -1.675785 9338 -3.835840 exact
+pos_top1 4 369 -0.797330 11 -1.589963 exact
+pos_top1 5 11751 -0.421761 303 -3.437775 exact
+gen_ids 11751 13 198 760 6511 314
+gen_step 11751 -0.421761 303 -3.437775
+gen_step 13 -0.410063 11 -1.502115
+gen_step 198 -1.435391 11751 -1.866637
+gen_step 760 -1.420285 57590 -2.263700
+gen_step 6511 -0.872104 6823 -3.611590
+gen_step 314 -0.022119 3177 -4.328142

@@ -1,0 +1,53 @@
+# Ridge decode oracle — captured by native/tools/ridge_oracle_capture.py.
+# The oracle is llama.cpp on the SAME GGUF, CPU-only (so it can serve beside a GPU
+# driver). A provenance mismatch below means the oracle moved: recapture, do not
+# compare against a stale fixture. `hidden_stage` says WHICH hidden this is.
+#
+# How to use it, and why the bar is not a fudge: greedy agreement is only meaningful
+# where the decision is decisive. Every recorded pick carries its top-2 margin (nats)
+# and the runner-up's id, so a gate checks EQUALITY where margin >= margin_bar and
+# MEMBERSHIP of {top1, top2} where it is below — a flat position is a coin flip that fp
+# noise can move, and a gate that demands equality there flakes on a correct forward.
+# Measured on this prompt: the 1-token prefix is inherently thin (after one token the
+# distribution is nearly flat), which is exactly the case the membership rule exists for.
+oracle llama-server
+llama_version version: 0.1.0-dev (build 628, commit 4df29be)
+llama_binary /home/rick/Projects/llama.cpp/build/bin/llama-server
+llama_flags -ngl 0 -c 512 --host 127.0.0.1 --port 18091 --pooling none --embd-normalize -1 --no-warmup --embeddings
+gguf Qwen3.8-27B-Ridge-3.7bpw.gguf
+gguf_id a60796cb68ca
+prompt_text 1, 2, 3, 4, 5, 6, 7,
+prompt_ids 16 11 220 17 11 220 18 11 220 19 11 220 20 11 220 21 11 220 22 11
+margin_bar 0.5000
+mode membership
+mode_note 2 of 26 recorded picks are below the margin bar
+hidden_file 1_2_3_4_5_6_7.hidden.f64
+hidden_stage post_output_norm
+hidden_shape 20 5120
+pos_top1 1 24 -1.625864 13 -2.208034 exact
+pos_top1 2 17 -2.253133 15 -2.318753 membership
+pos_top1 3 17 -0.703779 16 -2.045527 exact
+pos_top1 4 11 -1.235641 15 -1.607011 membership
+pos_top1 5 220 -0.160416 321 -3.122405 exact
+pos_top1 6 18 -0.088537 19 -3.504986 exact
+pos_top1 7 11 -0.968644 1076 -2.439194 exact
+pos_top1 8 220 -0.531752 5805 -3.598101 exact
+pos_top1 9 19 -0.057307 20 -4.470428 exact
+pos_top1 10 11 -0.710770 198 -3.590061 exact
+pos_top1 11 220 -0.261099 321 -3.887901 exact
+pos_top1 12 20 -0.036298 21 -4.870899 exact
+pos_top1 13 11 -0.579314 198 -3.521164 exact
+pos_top1 14 220 -0.178608 321 -4.146958 exact
+pos_top1 15 21 -0.047155 16 -4.421959 exact
+pos_top1 16 11 -0.331969 198 -3.476865 exact
+pos_top1 17 220 -0.093709 321 -4.735602 exact
+pos_top1 18 22 -0.025167 23 -4.418003 exact
+pos_top1 19 11 -0.176624 198 -4.029427 exact
+pos_top1 20 220 -0.066135 321 -5.186996 exact
+gen_ids 220 23 11 220 24 11
+gen_step 220 -0.066135 321 -5.186996
+gen_step 23 -0.022333 24 -4.790564
+gen_step 11 -0.167810 198 -3.915673
+gen_step 220 -0.046535 321 -5.122207
+gen_step 24 -0.019369 16 -4.661485
+gen_step 11 -0.209868 198 -3.517620
