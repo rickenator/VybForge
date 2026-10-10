@@ -422,6 +422,25 @@ else
   step "P4.10 FFN block (engine weights, IQ2_S/IQ3_S)" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.11 — OUR tokenizer vs the captured Ridge oracle (phase 4, W2/W3 prerequisite) ────
+# Gate: native/legit/run_ridge_encoder_gate.sh. The oracle fixtures (native/legit/fixtures/llama_ridge)
+# carry llama.cpp's OWN /tokenize output; this requires our encoder to reproduce those ids exactly,
+# because a different id stream makes every hidden and top1 downstream meaningless while looking like
+# a model bug. It also guards a silent upstream trap: stdlib/vllm's build_vocab_from parses a
+# pretty-printed vocab.json to id 0 for EVERY token (its read_int stops at the first non-digit) while
+# still returning the right token COUNT — measured, 5 ids for "The capital of France is", all 0. The
+# check compacts the file first and asserts a known token maps to a non-zero id. Measured: PASS on
+# both fixtures once compacted (5 and 20 ids, exactly the oracle's).
+out="$(./native/legit/run_ridge_encoder_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "RIDGE ENCODER GATE: PASS"; then
+  step "P4.11 encoder vs the Ridge oracle" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "RIDGE ENCODER GATE: SKIP"; then
+  step "P4.11 encoder vs the Ridge oracle" "SKIP ($(echo "$last" | sed 's/RIDGE ENCODER GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.11 encoder vs the Ridge oracle" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come

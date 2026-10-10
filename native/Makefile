@@ -94,6 +94,16 @@ attn-engine: $(ROOT)/native/build/attn35.ptx $(ROOT)/native/build/q5k.ptx $(ROOT
 ffn-engine: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/iq2s.ptx $(ROOT)/native/build/iq3s.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/q8_0.ptx $(ROOT)/native/build/qwen3.ptx $(ROOT)/native/build/rope.ptx $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/q5k.ptx $(ROOT)/native/build/attn35.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ffn_engine_verify.py
 
+# W2/W3 prerequisite: OUR tokenizer must reproduce llama.cpp's ids for the captured oracle prompts
+# (native/legit/fixtures/llama_ridge/*.fix carry them). It also compacts a pretty-printed vocab.json
+# first — stdlib/vllm's build_vocab_from otherwise parses that to id 0 for every token, in silence,
+# while still returning the right token COUNT (the official Qwen/Qwen3.8-27B repo ships it that way).
+# Needs vocab.json + merges.txt in artifacts/ridge-tokenizer (gitignored; the fetch command is
+# printed when they are missing): hf download Qwen/Qwen3.8-27B vocab.json merges.txt --local-dir ...
+#   ./native/legit/run_ridge_encoder_gate.sh
+encode-check:
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ridge_encoder_check.py
+
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py

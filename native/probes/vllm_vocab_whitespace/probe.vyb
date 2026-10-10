@@ -1,0 +1,36 @@
+// Minimal probe: stdlib/vllm's build_vocab_from maps EVERY token to id 0 when vocab.json is
+// PRETTY-PRINTED (a space after the `:`), because its read_int stops at the first non-digit.
+//
+// No model, no tokenizer, no merges.txt: this reads two hand-written vocab.json fixtures that differ
+// ONLY in whitespace, and prints what the map came out as. The diagnostic is the pair
+// KEYS / ZERO_VALUED — the walk inserts every key (so the count is right and nothing errors) while
+// every value is 0.
+//
+//   . ./vybenv.sh
+//   TOK_DIR=native/probes/vllm_vocab_whitespace/pretty  $VYB native/probes/vllm_vocab_whitespace/probe.vyb
+//   TOK_DIR=native/probes/vllm_vocab_whitespace/compact $VYB native/probes/vllm_vocab_whitespace/probe.vyb
+//
+// Expected (and what the upstream file does): pretty -> KEYS=2 ZERO_VALUED=2, both lookups 0;
+// compact -> KEYS=2 ZERO_VALUED=0, LOOKUP_BANG=1 LOOKUP_COMMA=11.
+//
+// The type import is explicit on purpose: `import mod` brings the functions but NOT the types, so
+// naming HashMap in a signature needs its own import (a Vyb convention, not part of the defect).
+import vllm::{build_vocab_from}
+import collections::{HashMap}
+import env::{env_get}
+
+main()<Int> -> {
+    dir<String> = env_get("TOK_DIR") else "native/probes/vllm_vocab_whitespace/pretty"
+    m<HashMap<String, Int>> = build_vocab_from(dir)
+    zeros<Int> = 0
+    i<Int> = 0
+    for (i in 0..m.keys.len() - 1) {
+        if (m.vals.get(i) == 0) { zeros = zeros + 1 }
+    }
+    println("TOK_DIR=" + dir)
+    println("KEYS=" + m.keys.len().to_string())
+    println("ZERO_VALUED=" + zeros.to_string())
+    println("LOOKUP_BANG=" + (m.get("!") else -1).to_string())
+    println("LOOKUP_COMMA=" + (m.get(",") else -1).to_string())
+    return 0
+}

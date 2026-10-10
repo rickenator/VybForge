@@ -1631,3 +1631,59 @@ module-load for anyone who had not run `make q8_0` by hand.
 * The caps probe still cannot distinguish "a dequant KERNEL exists" from "the model PATH can stage the
   type". W1 closed that gap in fact for 21/22 (they occur only in the FFN, and every FFN type now
   stages), but `run_caps_gate.sh` reads `eng_type` only and would not notice a regression.
+
+## W2/W3 prerequisite — the oracle is captured, and the ENCODER now agrees with it
+
+**The oracle.** `native/tools/ridge_oracle_capture.py` spawns the local llama-server on the Ridge GGUF
+(`-ngl 0`, so it can serve beside a GPU driver holding the 3090), captures, shuts it down, and freezes
+per prompt: the oracle's own `/tokenize` ids, the greedy pick after every prefix length with top-2 ids
+and logprobs, the greedy continuation, the per-position final hidden (`/embeddings` with
+`--pooling none`), and provenance (llama-server build 628 / commit 4df29be, flags, GGUF id
+`a60796cb68ca`). It re-issues every query and requires bit-identical answers before writing, so a flaky
+oracle fails the capture instead of becoming a gate. Fixtures: `native/legit/fixtures/llama_ridge/`.
+
+Three gotchas the capture had to learn, all measured:
+
+    --embeddings must be passed explicitly            otherwise /v1/embeddings answers 501
+    --pooling none is refused by /v1/embeddings       ("not OAI compatible") — the per-token route is
+                                                      the native /embeddings {"content":[ids]}
+    no route returns prompt-position logits           per-position top1 = one /completion per prefix
+                                                      length 1..S
+
+**The prompts, chosen on measured margins, not vibes.** `the_capital_of_france_is` gives the semantic
+check: after the full prompt the oracle picks 11751 " Paris" at −0.4218 vs −3.4378, a 3.02-nat margin.
+`1_2_3_4_5_6_7` gives the per-position check: 20 tokens, greedy continues " 8, 9,", 18 of 20 picks
+clear a 0.5-nat bar (0.58 .. 5.19). Each recorded pick carries its top-2 ids and logprobs and the
+fixture states `margin_bar`, so a gate checks equality above the bar and membership of {top1, top2}
+below it — the 1-token prefix is inherently flat on ANY prompt (0.24 for "The"), which is exactly the
+case the rule exists for.
+
+**Ridge's ids are not Qwen3-4B's.** Measured: "The capital of France is" is `[760,6511,314,9338,369]`
+on Ridge (vocab 248320) and `[785,6722,315,9625,374]` on Qwen3-4B (vocab 151936). Feeding the dense
+ids to this model returned `"u"` from a 5-token prompt. Every comparison must use the fixture's own ids.
+
+**The encoder, and a silent upstream trap.** Our tokenizer never had a Ridge check because the model
+dir holds only the GGUF and `llm::llm_load` wants a tokenizer directory. Fetching
+`vocab.json` + `merges.txt` from `Qwen/Qwen3.8-27B` into `artifacts/ridge-tokenizer` (gitignored — a
+model-derived artifact must not be committed) and running `llm_encode` gave this:
+
+    PROMPT_IDS=0,0,0,0,0        # "The capital of France is"
+    PROMPT_N=5
+
+Five ids — the right NUMBER — every one of them zero. Not a merge bug: the segmentation was correct.
+The cause is in the compiler's stdlib. `build_vocab_from` (`stdlib/vllm/mod.vyb`) walks vocab.json
+looking for `"`, reads the quoted key, advances to `:` and calls `read_int` — whose loop breaks on the
+FIRST non-digit. The official repo ships vocab.json PRETTY-PRINTED (`"!": 0,` with a space after the
+colon), so `read_int` reads zero digits, returns 0, and the map maps all 248044 tokens to 0. The walk
+still reaches the end of the file, so nothing errors: the token count stays right and every id is 0.
+Compacting the file (5,234,494 bytes from 6,722,759) made the same probe return the oracle's ids
+exactly, which is the confirmation. This is a defect to fix in the compiler repo — skip whitespace in
+`read_int`, or refuse a file the reader cannot parse — not in VybForge; what landed here is a
+consumer-side check that cannot be fooled by it.
+
+**What landed and is gated.** `native/tools/ridge_encoder_check.py` (also step **P4.11**,
+`native/legit/run_ridge_encoder_gate.sh`, `make -f native/Makefile encode-check`): it compacts a
+pretty-printed vocab.json, asserts a known token maps to a non-zero id (`,` → 11), runs the encode
+probe against every fixture prompt and requires the oracle's exact ids. Measured PASS on both fixtures.
+Proven able to FAIL: a vocab map whose values are all 0 → `the vocab map maps ',' to 0, want 11 …`, rc=1,
+gate FAIL; the SKIP path (no tokenizer files) prints the fetch command and does not go green.
