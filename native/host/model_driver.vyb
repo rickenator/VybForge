@@ -479,6 +479,11 @@ main()<Int> -> {
     mtps<String> = env_get("VYB_MTP") else ""
     MTPM<Int> = 0
     if (mtps.len() > 0) { MTPM = 1 }
+    # The W4 top-2 diagnostic (VYB_MTP_TOP2=1) is separate and default-off: it is a measurement tool,
+    # not part of the draft head, and while it is unverified it must not be able to break P4.13's run.
+    mtp2s<String> = env_get("VYB_MTP_TOP2") else ""
+    MTP2<Int> = 0
+    if (mtp2s.len() > 0) { MTP2 = 1 }
     if (MTPM == 1) {
         if (prids.len() < 3) { println("MTP_ERR the draft head needs at least 3 prompt tokens"); return 2 }
         mtr<Vec<Int>> = Vec()
@@ -1033,6 +1038,7 @@ main()<Int> -> {
         # head's normalisation), which fails as "Undefined identifier: MSN".
         MEH<Int> = 0; MEN<Int> = 0; MHN<Int> = 0; MSN<Int> = 0; MC2<Int> = 0; MTMP<Int> = 0; MHID<Int> = 0
         MPOS<Int> = 0
+        DLF<Int> = 0; DBV2<Int> = 0; DAO2<Int> = 0; DBV3<Int> = 0; DAO3<Int> = 0
         GP1<Int> = 0; GP2<Int> = 0; GP3<Int> = 0; GP4<Int> = 0
         if (GRL >= 0) {
             if (cuMemAlloc_v2(loc(GWAN), GNE * 8) != 0) { return 11 }
@@ -1824,6 +1830,83 @@ main()<Int> -> {
                     if (cuMemcpyHtoD_v2(AO + iu3 * 8, loc(iv3), 8) != 0) { return 15 }
                 }
                 println("LMHEAD_MODE=untied-chunked chunk_rows=" + CH.to_string() + " chunks=" + ((VOCAB + CH - 1) / CH).to_string())
+                # ---- W4 diagnostic: OUR top-2 per step, to compare against the oracle's own margins ----
+                # NOTE: unverified as of this commit — its first `logits_slice` launch returns a CUDA
+                # error (the driver exits 92 at "MTP_ERR top2 logits"), so the gap has NOT been
+                # measured. It is behind VYB_MTP_TOP2 (default off) precisely so that it cannot affect
+                # P4.13's run while that is unresolved. Suspects: this launch's param block (GM is 64 B
+                # and the kernel takes eight Ints) or a poisoned context from the block above.
+                if (MTP2 == 1) {
+                    # A logit is not comparable to the oracle's logprob (they differ by a per-position
+                # logsumexp), but the top-2 GAP is shift-invariant and IS. So: if our per-step gaps
+                # track the fixture's recorded margins, the argmax flips at the tight positions are the
+                # fp64-vs-fp32 gap that P4.12 already measures; if they do not, the block has a real
+                # defect and the dump says which steps and by how much. Done over a FULL-vocab logits
+                    # buffer because the chunked walk cannot see a runner-up living in another chunk.
+                    if (cuMemAlloc_v2(loc(DLF), VOCAB * S * 8) != 0) { return 11 }
+                    if (cuMemAlloc_v2(loc(DBV2), S * 8) != 0) { return 11 }
+                    if (cuMemAlloc_v2(loc(DAO2), S * 8) != 0) { return 11 }
+                    if (cuMemAlloc_v2(loc(DBV3), S * 8) != 0) { return 11 }
+                    if (cuMemAlloc_v2(loc(DAO3), S * 8) != 0) { return 11 }
+                    vs2<Int> = 0 ; rows2<Int> = 0 ; nb3<Int> = 0 ; nblk3<Int> = D / 256
+                    while (vs2 < VOCAB) {
+                        rows2 = CH
+                        if (vs2 + CH > VOCAB) { rows2 = VOCAB - vs2 }
+                        nb3 = rows2 * nblk3 * 210
+                        pkd3<String> = read_model(MODEL, out_off + vs2 * nblk3 * 210, nb3)
+                        if (pkd3.len() < nb3) { println("MTP_ERR top2 short read at " + vs2.to_string()); return 92 }
+                        if (download(pkd3, DPK, nb3) != 0) { return 15 }
+                        rcq2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D * rows2 + 255) / 256, 1, 1, 256, 1, 1, DPK, DCH, D * rows2, 0)
+                        if (rcq2 != 0) { println("MTP_ERR top2 dequant"); return 92 }
+                        s8<Int> = 0
+                        for (s8 in 0..S - 1) {
+                            cuMemcpyHtoD_v2(GM + 0, loc(DH), 8); cuMemcpyHtoD_v2(GM + 8, loc(DCH), 8)
+                            cuMemcpyHtoD_v2(GM + 16, loc(DLF), 8)
+                            cuMemcpyHtoD_v2(GM + 24, loc(s8), 8); cuMemcpyHtoD_v2(GM + 32, loc(D), 8)
+                            cuMemcpyHtoD_v2(GM + 40, loc(vs2), 8)
+                            vsE<Int> = vs2 + rows2
+                            cuMemcpyHtoD_v2(GM + 48, loc(vsE), 8); cuMemcpyHtoD_v2(GM + 56, loc(VOCAB), 8)
+                            rc_s2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (rows2 + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                            if (rc_s2 != 0) { println("MTP_ERR top2 logits"); return 92 }
+                        }
+                        vs2 = vs2 + rows2
+                    }
+                    # the winner over the whole vocab, then mask exactly that entry and take the runner-up
+                    put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV2) ; put_i(A4 + 16, DAO2)
+                    put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
+                    rc_a2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+                    if (rc_a2 != 0) { println("MTP_ERR top2 argmax1"); return 92 }
+                    cuCtxSynchronize()
+                    s9<Int> = 0
+                    for (s9 in 0..S - 1) {
+                        iv9<Int> = 0
+                        if (cuMemcpyDtoH_v2(loc(iv9), DAO2 + s9 * 8, 8) != 0) { return 16 }
+                        negv<Float> = -1.0e308
+                        if (cuMemcpyHtoD_v2(DLF + (s9 * VOCAB + iv9) * 8, loc(negv), 8) != 0) { return 15 }
+                    }
+                    put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV3) ; put_i(A4 + 16, DAO3)
+                    put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
+                    rc_a3<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+                    if (rc_a3 != 0) { println("MTP_ERR top2 argmax2"); return 92 }
+                    cuCtxSynchronize()
+                    match (open_write("native/out/ridge_mtp_top2.txt")) {
+                        w2 -> {
+                            s10<Int> = 0
+                            for (s10 in 0..S - 1) {
+                                b1<Float> = 0.0 ; b2<Float> = 0.0
+                                i1<Int> = 0 ; i2<Int> = 0
+                                if (cuMemcpyDtoH_v2(loc(b1), DBV2 + s10 * 8, 8) != 0) { return 16 }
+                                if (cuMemcpyDtoH_v2(loc(i1), DAO2 + s10 * 8, 8) != 0) { return 16 }
+                                if (cuMemcpyDtoH_v2(loc(b2), DBV3 + s10 * 8, 8) != 0) { return 16 }
+                                if (cuMemcpyDtoH_v2(loc(i2), DAO3 + s10 * 8, 8) != 0) { return 16 }
+                                match (write_str(w2, b1.to_string() + " " + i1.to_string() + " " + b2.to_string() + " " + i2.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                            }
+                            close(w2)
+                        }
+                        ? -> { return 17 }
+                    }
+                    println("MTP_TOP2_DONE steps=" + S.to_string())
+                }
                 match (open_write("native/out/prefill_top1_vyb.txt")) {
                     w -> {
                         iv<Int> = 0
