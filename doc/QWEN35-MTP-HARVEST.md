@@ -129,3 +129,43 @@ Consequences for the plan:
 - The single-step mode is the only validated evidence for blk.64 and must stay untouched: any chain work
   goes behind a new knob, default off.
 
+## 8. The head extraction — exact spec (from the code, ready to execute)
+
+Read from the driver's untied path (head block, ~1766-1824). The extraction is mechanical if done from this
+spec; it was **not** attempted yet, deliberately, rather than left half-written.
+
+**Why it is required:** the chain needs the head's argmax once per step (the drafted token builds the next
+step's input), and the head today is a large inline block wired to run once over `S` rows. There is no way
+to call it per step without extracting it.
+
+**Function to extract** (`head_untied`), mirroring the inline walk exactly:
+
+```
+head_untied(hid, rowStart, nrows, bv, bo, out_off, VOCAB, D, CH,
+            MODEL, PF, DPK, DCH, DCL, q6fn, lsfn, accfn, GM, A4) -> Int   # 0 ok, else an error code
+```
+
+Invariants to preserve, all load-bearing — each one a bug already paid for:
+
+- **Seed `bv`/`bo` per row with `-1.0e308` / 0 before any argmax.** `argmax_acc` does NOT seed its running
+  best; unseeded, the buffer's zeros win and every logit below zero is ignored.
+- **Row offset in bytes:** `out_off + vs0 * nblk2 * 210` with `nblk2 = D / 256` — the row-size factor is
+  not optional (omitting it read 5120x too few bytes and produced garbage logits while the hidden was
+  already cos 0.9996).
+- **Dequant orientation `inz = 0`** (row-major `[rows, D]`), matching `logits_slice`'s `Emb[vs*D + d]`.
+  `inz = D` transposes and multiplies wrong pairs.
+- **`logits_slice` param block (`GM`, 64 B):** `+0 hid, +8 chunk table, +16 logits out, +24 row index
+  (position within `hid`), +32 D, +40 Vstart=0, +48 Vend=rows, +56 V=rows` — chunk-local, so its write
+  lands in the chunk's own logits row.
+- **`argmax_acc` param block (`A4`, 48 B):** `+0 logits, +8 best values, +16 best indices, +24 rows to
+  score, +32 stride=rows, +40 base=vs0`; grid `(rows + 255) / 256`.
+- **`cuCtxSynchronize()` after the walk**, before anything reads the winners.
+
+**Per-step caller duty (the chain's step k):** normalise row k of the block's output (`XI + k*D*8`) into
+`hid` with the head's own `nextn.shared_head_norm` (the `rfn` launch, 1 row), then call
+`head_untied(hid=DH, rowStart=0, nrows=1, ...)` and take the single winner as `d_k`.
+
+**Verification of the refactor (this is what makes it safe):** the main path must produce unchanged
+results — after extracting, P4.13 must still read 4/4 capital and 17/19 counting, and P4.12's hidden cos
+0.999609 unchanged. If either moves, the extraction changed behaviour and is wrong.
+
