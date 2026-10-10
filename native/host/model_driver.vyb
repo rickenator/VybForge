@@ -344,6 +344,33 @@ head_untied(hid<Int>, rowStart<Int>, nrows<Int>, bv<Int>, bo<Int>, out_off<Int>,
     return 0
 }
 
+#> One draft step's block input: rms(e(token), enorm) concatenated with rms(h, hnorm), projected by eh_proj
+#> into `dst` (one row, D wide). Extracted so the draft chain can build ONE row per step (its h is the
+#> previous step's own output and its token is the previous step's own draft) while the teacher-forced path
+#> builds S rows with the oracle's hidden and the prompt's ids. The launch order and the concat order
+#> (embedding first) are llama.cpp's, and `+24`/`+32` are the rms row count and width, not the batch.
+mtp_build_row(dst<Int>, hrow<Int>, tok<Int>, D<Int>,
+              MODEL<String>, te_off<Int>, te_ty<Int>, MEH<Int>, MEN<Int>, MHN<Int>, MC2<Int>, MTMP<Int>,
+              DPK<Int>, q6fn<loc<CVoid>>, rfn<loc<CVoid>>, gfn<loc<CVoid>>, GP1<Int>, GP2<Int>, EPS<Float>)<Int> -> {
+    e<Int> = emb_row(MODEL, te_off, tok, D, te_ty, DPK, q6fn, MTMP)
+    if (e != 0) { return 91 }
+    gr<CInt> = 0
+    put_i(GP1, 0, MTMP) ; put_i(GP1, 8, MEN) ; put_i(GP1, 16, MC2)
+    put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
+    freedom { gr = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0) }
+    if (gr != 0) { return 12 }
+    put_i(GP1, 0, hrow) ; put_i(GP1, 8, MHN) ; put_i(GP1, 16, MC2 + D * 8)
+    put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
+    freedom { gr = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0) }
+    if (gr != 0) { return 12 }
+    put_f(GP2, 48, 1.0) ; put_f(GP2, 56, 0.0)
+    put_i(GP2, 0, MC2) ; put_i(GP2, 8, MEH) ; put_i(GP2, 16, dst)
+    put_i(GP2, 24, 1) ; put_i(GP2, 32, D) ; put_i(GP2, 40, 2 * D)
+    freedom { gr = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP2, 0, 0, 0) }
+    if (gr != 0) { return 12 }
+    return 0
+}
+
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
           nm<String>, dpk<Int>, pf<Int>, dout<Int>,
           q4fn<loc<CVoid>>, q5fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>,
@@ -1338,23 +1365,12 @@ main()<Int> -> {
             if (download(mhs, MHID, S * D * 8) != 0) { return 15 }
             msi<Int> = 0
             for (msi in 0..S - 1) {
-                dms<Int> = prids.get(msi)
-                e = emb_row(MODEL, te_off, dms, D, te_ty, DPK, q6fn, MTMP)
-                if (e != 0) { println("MTP_ERR embed row " + msi.to_string()); return 91 }
-                # embedding FIRST, then the hidden (ggml_concat(e_norm, h_norm)): into MC2's halves
-                put_i(GP1, 0, MTMP) ; put_i(GP1, 8, MEN) ; put_i(GP1, 16, MC2)
-                put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
-                grcc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
-                if (grcc != 0) { println("MTP_ERR enorm rms"); return 12 }
-                put_i(GP1, 0, MHID + msi * D * 8) ; put_i(GP1, 8, MHN) ; put_i(GP1, 16, MC2 + D * 8)
-                put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
-                grcc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
-                if (grcc != 0) { println("MTP_ERR hnorm rms"); return 12 }
-                put_f(GP2, 48, 1.0) ; put_f(GP2, 56, 0.0)
-                put_i(GP2, 0, MC2) ; put_i(GP2, 8, MEH) ; put_i(GP2, 16, XA + msi * D * 8)
-                put_i(GP2, 24, 1) ; put_i(GP2, 32, D) ; put_i(GP2, 40, 2 * D)
-                grcc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
-                if (grcc != 0) { println("MTP_ERR eh_proj gemm"); return 12 }
+                # The per-step build lives in mtp_build_row() so the draft chain can call it once per step
+                # (with its own h and its own drafted token); this teacher-forced path builds S rows here.
+                e = mtp_build_row(XA + msi * D * 8, MHID + msi * D * 8, prids.get(msi), D,
+                                  MODEL, te_off, te_ty, MEH, MEN, MHN, MC2, MTMP,
+                                  DPK, q6fn, rfn, gfn, GP1, GP2, EPS)
+                if (e != 0) { println("MTP_ERR build row " + msi.to_string()); return e }
             }
             # The draft step's rope position is the CALLER's choice in llama.cpp (inp_pos), so it is a
             # knob here: measured, not assumed. 1 = the next token's own position.
