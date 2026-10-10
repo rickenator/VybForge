@@ -332,10 +332,17 @@ like it used; that allocation is now removed and `GCONV` is `MAXL` windows, zero
 Verified after the fix: S=1, S=2, S=3 all complete, and because a causal model's token-k hidden cannot
 depend on later tokens, each prefix must reproduce the fixture's positions 1..k — measured
 cos 0.999713 (pos 1), 0.999474 (pos 2), 0.999673 (pos 3), with the oracle's top1 matched at every one.
-**P4.12 now runs those prefixes as part of the gate** (the run's own `PROMPT_IDS` must be the fixture's
-first k ids, so a prefix that tokenizes differently fails loudly instead of comparing wrong positions),
-and the S=5 verdict is unchanged (cos 0.999609, top1 5/5, tooth 1.0007/2.73) — i.e. the fix altered no
-behaviour, it only made legal memory it had been borrowing.
+**P4.12 now runs those prefixes for BOTH fixtures** — the 5-token capital prompt and the 20-token
+counting prompt — and takes each prefix from the fixture's OWN IDS through a new `VYB_PROMPT_IDS`
+driver path (an explicit id list, no tokenizer), so a prefix is exact by construction. (The first
+attempt passed a text prefix and proved it by the ids the run printed; a text prefix like `The cap`
+can tokenize to the same COUNT with different ids, so the id-list path is the sound form and replaced
+it.) The driver also prints the ids it actually embedded, so the verifier requires them to be the
+fixture's own or an id-prefix of them, rather than trusting `PROMPT_SRC` plus a count. Measured:
+`the_capital_of_france_is` S=5 → top1 5/5, hidden cos 0.999609; `1_2_3_4_5_6_7` S=20 → top1 **20/20**
+(18 exact, 2 membership), hidden cos 0.998861; plus ids[:1], ids[:2], ids[:3] for each. The S=5 verdict
+is unchanged (top1 5/5, tooth 1.0007/2.73) — the fix altered no behaviour, it only made legal memory it
+had been borrowing.
 
 ### W4 — the MTP head (blk.64): `eng_mtp()`'s evidence
 

@@ -1777,20 +1777,27 @@ Diagnosed with `CUDA_LAUNCH_BLOCKING=1`, which moved the reported failure from `
 real `GDN_ERR interleave`.
 
 **And that fix bought a stronger gate.** A causal model's token-k hidden cannot depend on the tokens
-after it, so the S-fixture also pins its first k < S positions: running the same prompt at k = 1, 2, 3
-is an oracle-backed check of cross-token state, and it is the only gate that would have caught a
-per-layer state buffer sized for one layer. **P4.12 now runs those prefixes** — and proves each one by
-IDS, not by text or token count: the driver prints `PROMPT_IDS=` and the verifier requires them to be
-the fixture's first k ids, because a text prefix like `The cap` can tokenize to the same COUNT with
-different ids and would silently compare the wrong positions. Measured, and now part of the gate:
+after it, so an S-token fixture also pins its first k < S positions: running the same prompt at
+k = 1, 2, 3 is an oracle-backed check of cross-token state, and it is the only gate that would have
+caught a per-layer state buffer sized for one layer. **P4.12 now does this for BOTH fixtures** (the
+5-token capital prompt and the 20-token counting prompt) — and the prefix is taken from the fixture's
+OWN IDS via a new `VYB_PROMPT_IDS` driver path (an explicit id list, no tokenizer), so it is exact by
+construction. That is strictly better than the text-prefix form tried first: a text prefix like
+`The cap` can tokenize to the same COUNT with different ids, and the comparison would then silently
+read the wrong positions. The driver also prints the ids it actually embedded (`PROMPT_IDS=`), so the
+verifier requires them to be the fixture's own (or an id-prefix of them) instead of trusting
+`PROMPT_SRC` plus a count. The loop lives in the verifier, keyed off each fixture, so a gate covers
+every fixture's prefixes without a per-prompt list to maintain. Measured:
 
 ```
-whole Ridge forward (1 prompt(s))   PASS (hidden cos 0.999609, per-position top1 == the oracle)
-prefix [The]                        PASS (top1 1/1, hidden cos 0.999713)
-prefix [The capital]                PASS (top1 2/2, hidden cos 0.999594)
-prefix [The capital of]             PASS (top1 3/3, hidden cos 0.999621)
+the_capital_of_france_is  S=5   PASS  top1 5/5 (4 exact, 1 membership)  hidden cos 0.999609
+1_2_3_4_5_6_7             S=20  PASS  top1 20/20 (18 exact, 2 membership) hidden cos 0.998861
++ ids[:1], ids[:2], ids[:3] for each fixture  PASS
 RIDGE FORWARD GATE: PASS
 ```
+
+(The counting prompt is the stronger oracle — 20 decisive positions against 5 — and it is also the
+longer causal path, which is why it was added.)
 
 The S=5 verdict is unchanged (cos 0.999609, top1 5/5, tooth 1.0007/2.73) — the fix altered no
 behaviour, it only made legal memory the run had been borrowing. Regression after the fix: P4.5 GDN
