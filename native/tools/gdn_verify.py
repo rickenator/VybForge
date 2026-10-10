@@ -78,6 +78,71 @@ def rule(q, k, v, g, be, st, bcast="mod"):
     return out, m_all
 
 
+def run_op(q, k, v, g, be, st, T, B, tag="v"):
+    """One call to ggml's op, returning (scores, new_state) in numpy order."""
+    inp, outp, stp = (os.path.join(BUILD, f"{tag}_{n}.bin") for n in ("in", "out", "st"))
+    with open(inp, "wb") as fh:
+        for a in (q, k, v, g, be, st):
+            fh.write(a.astype("<f4").tobytes())
+    r = subprocess.run([BIN, inp, outp, stp, str(S), str(H_K), str(H_V), str(T), str(B), "1"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("GDN_VERIFY_FAIL run: " + (r.stdout + r.stderr)[:300])
+        return None, None
+    return (np.fromfile(outp, dtype="<f4").reshape(B, T, H_V, S).astype(np.float64),
+            np.fromfile(stp, dtype="<f4").reshape(B, H_V, S, S).astype(np.float64))
+
+
+def maxabs(a, b):
+    return float(np.max(np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))))
+
+
+def multi_token_checks(q, k, v, g, be, st, ref, rsts, T, B):
+    """The multi-token characterisation (VybForge#10 phase 4, W6), checked rather than asserted.
+
+    ggml's op has ONE compute path (ggml-cpu/ops.cpp: ggml_compute_forward_gated_delta_net_f32 ->
+    ..._one_chunk, whose only loop over tokens is `for (t = 0; t < n_tokens; ++t)` inside the head/seq
+    chunk; the `K` op param is a SNAPSHOT-SLOT COUNT, not a kernel selector). Two consequences are
+    measurable, and both are required here EXACTLY (bit-for-bit), because they are structural rather
+    than numeric:
+
+      1. REPLAY: T single-token calls, carrying the state forward, reproduce the one T-token call —
+         same scores and same final state, exactly.
+      2. CAUSALITY: changing ONLY the last token's inputs leaves every earlier token's scores
+         bit-identical (and does change the last one, so the check can fail).
+
+    An earlier note in this repo claimed a second, differently-arranged kernel for several tokens, on
+    the evidence that token 0's output changed when more tokens followed. That observation was an
+    artefact of a transposed read, and it is withdrawn; these two checks are what replaced it."""
+    ok = True
+    stc = st
+    outs = []
+    for t in range(T):
+        ot, stc = run_op(q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1], g[:, t:t + 1], be[:, t:t + 1],
+                         stc, 1, B, tag="vseq")
+        if ot is None:
+            return False
+        outs.append(ot)
+    seq_out = np.concatenate(outs, axis=1)
+    d_o, d_s = maxabs(seq_out, ref), maxabs(stc, rsts)
+    print(f"GDN_VERIFY replay  {T} x T=1 calls == one T={T} call:  out maxabs={d_o:.3e} "
+          f"state maxabs={d_s:.3e}  {'IDENTICAL' if (d_o == 0.0 and d_s == 0.0) else 'DIFFERS'}")
+    ok = ok and d_o == 0.0 and d_s == 0.0
+
+    valt = v.copy()
+    valt[:, T - 1] *= -0.5                      # only the LAST token differs
+    alt, _ = run_op(q, k, valt, g, be, st, T, B, tag="valt")
+    if alt is None:
+        return False
+    d_prev = maxabs(alt[:, :T - 1], ref[:, :T - 1])
+    d_last = maxabs(alt[:, T - 1], ref[:, T - 1])
+    print(f"GDN_VERIFY causal  only the last token changed: earlier tokens maxabs={d_prev:.3e} "
+          f"({'IDENTICAL' if d_prev == 0.0 else 'DIFFERS'}, must be identical), "
+          f"last token maxabs={d_last:.3e} ({'differs' if d_last > 0 else 'IDENTICAL'}, must differ)")
+    ok = ok and d_prev == 0.0 and d_last > 0.0
+    return ok
+
+
 def main():
     T, B = 1, 1
     argv = sys.argv[1:]
@@ -86,28 +151,14 @@ def main():
             T = int(argv[i + 1])
         if a == "--seqs":
             B = int(argv[i + 1])
-    if T != 1:
-        print("GDN_VERIFY_FAIL multi-token uses the op's chunked path, not established; use --tokens 1")
-        return 1
     print(f"GDN_VERIFY geometry S={S} H_k={H_K} H_v={H_V} T={T} B={B}")
     if not build():
         return 1
 
     q, k, v, g, be, st = inputs(T, B)
-    inp, outp, stp = (os.path.join(BUILD, n) for n in ("v_in.bin", "v_out.bin", "v_st.bin"))
-    with open(inp, "wb") as fh:
-        for a in (q, k, v, g, be, st):
-            fh.write(a.astype("<f4").tobytes())
-    r = subprocess.run([BIN, inp, outp, stp, str(S), str(H_K), str(H_V), str(T), str(B), "1"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print("GDN_VERIFY_FAIL run: " + (r.stdout + r.stderr)[:300])
+    ref, rsts = run_op(q, k, v, g, be, st, T, B)
+    if ref is None or rsts is None:
         return 1
-    print("  " + r.stdout.strip())
-
-    # the op's buffer: scores (ne0-fastest) then state (ne0-fastest)
-    ref = np.fromfile(outp, dtype="<f4").reshape(B, T, H_V, S).astype(np.float64)
-    rsts = np.fromfile(stp, dtype="<f4").reshape(B, H_V, S, S).astype(np.float64)
 
     verdict = 0
     for mode in ("mod", "tile"):
@@ -122,11 +173,20 @@ def main():
             verdict = 0
             break
 
+    mt_ok = True
+    if T > 1:
+        mt_ok = multi_token_checks(q, k, v, g, be, st, ref, rsts, T, B)
+        if not mt_ok:
+            verdict = 1
+
     if verdict == 0:
-        print(f"GDN_VERIFY_SUMMARY broadcast={mode} maxrel_out={ro:.3e} maxrel_state={rs:.3e}")
-        print(f"GDN_VERIFY_DONE the port reproduces ggml's op within maxrel {MAXREL:g}")
+        print(f"GDN_VERIFY_SUMMARY broadcast={mode} T={T} maxrel_out={ro:.3e} maxrel_state={rs:.3e}"
+              + (f" multi_token_verified=1" if T > 1 else ""))
+        print(f"GDN_VERIFY_DONE the port reproduces ggml's op within maxrel {MAXREL:g}"
+              + (f" at T={T}, with the multi-token path characterised" if T > 1 else ""))
     else:
-        print("GDN_VERIFY_FAIL neither broadcast reproduces the op")
+        print("GDN_VERIFY_FAIL neither broadcast reproduces the op"
+              + ("" if mt_ok else " (or the multi-token characterisation failed)"))
     return verdict
 
 

@@ -20,8 +20,14 @@
 # a layer wired with the residual on the normed input or the epilogue missing SiLU(z) is off by 8.8e-2
 # and 3.0e-1 — so the 1e-6 agreements are real measurements, not tolerances nothing could breach.
 #
-# The recurrence verifier refuses multi-token: with T>1 the op runs a second (chunked) kernel whose
-# buffer layout is not yet characterised — see doc/QWEN35-PHASE4.md.
+# Unit 1 runs at T=1 AND at T=3. The multi-token case needed no new port: ggml's op has ONE compute
+# path, whose token loop lives INSIDE the head/seq chunk and whose `K` op param is a snapshot-slot
+# count (ggml-cpu/ops.cpp: the f32 entry point calls ..._one_chunk once per head/seq range), so several
+# tokens are the sequential rule repeated. The T=3 case MEASURES that rather than asserting it, exactly:
+#   replay — 3 x T=1 calls carrying the state forward reproduce the one T=3 call, bit-for-bit;
+#   causal — changing ONLY the last token leaves every earlier token's scores bit-identical.
+# An earlier note here said the op "runs a second (chunked) kernel" for several tokens; that was an
+# artefact of a transposed read and is WITHDRAWN (doc/QWEN35-PHASE4.md, HANDOFF-PHASE4.md W6).
 #
 # Needs the llama.cpp checkout (headers + built libggml) to compile the harnesses; SKIPs without it.
 #   VYBFORGE_LLAMA=/path/to/llama.cpp   override the checkout
@@ -79,12 +85,19 @@ run_unit() {
 }
 
 run_unit "unit1" native/tools/gdn_verify.py  GDN_VERIFY_DONE  "unit 1 recurrence + read-out" --tokens 1
+run_unit "unit1mt" native/tools/gdn_verify.py GDN_VERIFY_DONE "unit 1 recurrence, multi-token T=3" --tokens 3
 run_unit "unit2" native/tools/conv_verify.py CONV_VERIFY_DONE "unit 2 short convolution"
 run_unit "unit3" native/tools/norm_verify.py NORM_VERIFY_DONE "unit 3 l2 / rms / gated epilogue"
 run_unit "unit4" native/tools/mm_verify.py   MM_VERIFY_DONE   "unit 4 projections + beta/alpha gates"
 run_unit "unit5" native/tools/layer_verify.py LAYER_VERIFY_DONE "unit 5 one block, 14 stages"
 
 # The checks' teeth: report the rejected alternative in each, so a silently-broken verifier is visible.
+if [ -f "$work/unit1mt.log" ]; then
+  rep="$(grep -o 'replay.*' "$work/unit1mt.log" | head -1 | sed 's/  */ /g')"
+  cau="$(grep -o 'causal.*' "$work/unit1mt.log" | head -1 | sed 's/  */ /g')"
+  [ -n "$rep" ] && step "unit 1 multi-token replay tooth" "$rep"
+  [ -n "$cau" ] && step "unit 1 multi-token causality tooth" "$cau"
+fi
 if [ -f "$work/unit3.log" ]; then
   opp="$(grep -o 'opposite-convention maxrel=[0-9.e+-]*' "$work/unit3.log" | tr '\n' ' ' | sed 's/  */ /g')"
   [ -n "$opp" ] && step "unit 3 convention discrimination" "$opp (must be >> 1e-6)"

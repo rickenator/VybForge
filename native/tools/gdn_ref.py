@@ -120,14 +120,15 @@ def main():
 
     print(f"GDN_REF geometry S={S} H_k={H_K} H_v={H_V} T={T} B={B}")
     if T != 1:
-        # The op has TWO kernels. For a single token it runs the sequential rule this port
-        # implements — verified bit-for-bit at T=1. For several tokens it runs a CHUNKED kernel that
-        # fills the same buffer with a different arrangement (established by running the op itself:
-        # token 0's output changes when more tokens follow, which no causal recurrence can do).
-        # Comparing multi-token output therefore needs that arrangement established first, so it is
-        # deliberately not claimed here.
-        print("GDN_REF_FAIL multi-token comparison is not established yet (the op's chunked path "
-              "arranges its output differently); use --tokens 1")
+        # STALE, AND THE PREMISE IS WITHDRAWN — this file is not the gate's reference (gdn_verify.py is,
+        # and it runs the multi-token case: see its multi_token_checks). The claim this refusal rests on
+        # ("for several tokens the op runs a CHUNKED kernel that arranges its output differently",
+        # evidenced by token 0's output changing when more tokens followed) was an artefact of the
+        # transposed read this file still carries. Measured: at T=3 the op is strictly causal, and three
+        # T=1 calls carrying the state reproduce the one T=3 call BIT-FOR-BIT. The op has one compute
+        # path; only the `K` param (a snapshot-slot count) differs. Do not repeat the old claim.
+        print("GDN_REF_FAIL this file is superseded by gdn_verify.py (multi-token IS characterised now: "
+              "T>1 is causal and equals a state-carrying T=1 replay, bit-for-bit)")
         return 1
     if not build_authority():
         print("GDN_REF_FAIL authority did not build")
