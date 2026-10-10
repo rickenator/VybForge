@@ -43,8 +43,7 @@ def run_mtp(ids, hidden_file, pos):
     return out
 
 
-def main():
-    name = os.environ.get("VYBFORGE_MTP_FIXTURE", "the_capital_of_france_is")
+def verify_mtp(name):
     fx = os.path.join(rf.FIXDIR, name if name.endswith(".fix") else name + ".fix")
     for path, what in ((rf.MODEL, "the Ridge model"), (rf.INVENTORY, "the inventory"),
                        (rf.TSV, "the engine tensor index"), (rf.INVFREQ, "the rope table")):
@@ -119,9 +118,42 @@ def main():
         print("RIDGE_MTP_VERIFY_FAIL the draft head disagrees with the oracle at %d of %d steps"
               % (n_bad, n_checked))
         return 1
+    # The checker's own TOOTH, on the SAME completed run: compared one position later it must MISS at
+    # least one step. "At least one", not "all", because a prompt can legitimately repeat a pick at
+    # adjacent positions (the counting prompt does). A checker that agrees under a shift would make
+    # this gate decoration; an unchanged-input-only tooth proves nothing about the checker.
+    sh_ok = 0
+    for i, got in enumerate(ours):
+        r = by_k.get(i + 3)
+        if r is None:
+            continue
+        st1, st2, srule = int(r[1]), int(r[3]), r[5]
+        shit = (got == st1) if srule == "exact" else (got in (st1, st2))
+        sh_ok += 1 if shit else 0
+    print("RIDGE_MTP_VERIFY tooth off_by_one: %d of %d steps would still agree (must be fewer)"
+          % (sh_ok, n_checked))
+    if sh_ok >= n_checked:
+        print("RIDGE_MTP_VERIFY_FAIL the checker agrees even when the comparison is shifted by one")
+        return 1
     print("RIDGE_MTP_VERIFY_SUMMARY fixture=%s steps=%d agree=%d/%d rope_pos=%s"
           % (name, len(ours), n_ok, n_checked, POS))
-    print("RIDGE_MTP_VERIFY_DONE the MTP draft head reproduces the oracle's next-next-token picks")
+    return 0
+
+
+def main():
+    want = sys.argv[1:]
+    if not want:
+        one = os.environ.get("VYBFORGE_MTP_FIXTURE", "")
+        want = [one] if one else ["the_capital_of_france_is", "1_2_3_4_5_6_7"]
+    bad = []
+    for w in want:
+        if verify_mtp(w if w.endswith(".fix") else w + ".fix") != 0:
+            bad.append(w)
+    if bad:
+        print("RIDGE_MTP_VERIFY_FAIL %s did not match the oracle" % ", ".join(bad))
+        return 1
+    print("RIDGE_MTP_VERIFY_DONE the MTP draft head reproduces the oracle's next-next-token picks "
+          "for %d fixture(s)" % len(want))
     return 0
 
 
