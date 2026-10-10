@@ -1688,3 +1688,86 @@ pretty-printed vocab.json, asserts a known token maps to a non-zero id (`,` → 
 probe against every fixture prompt and requires the oracle's exact ids. Measured PASS on both fixtures.
 Proven able to FAIL: a vocab map whose values are all 0 → `the vocab map maps ',' to 0, want 11 …`, rc=1,
 gate FAIL; the SKIP path (no tokenizer files) prints the fetch command and does not go green.
+
+## W2 + W3 — the untied head, and the whole 64-block forward (LANDED)
+
+**The result.** `native/legit/run_ridge_forward_gate.sh` (**P4.12**, `make ridge-forward`) → **PASS**:
+
+```
+RIDGE_FORWARD_VERIFY per-position top1: 5/5 agree (4 exact, 1 membership)
+RIDGE_FORWARD_VERIFY hidden cos(post-output_norm)=0.999609 maxrel=1.321e-02
+RIDGE_FORWARD_VERIFY tooth stage norms: post ours/oracle max=1.0007 (must be ~1), pre ours/oracle min=2.73
+LLM_CHAT_RESPONSE=< following of the is Paris>
+```
+
+i.e. a 64-block hybrid (48 Gated-DeltaNet + 16 attention) 27B forward, staged entirely through the
+engine's own kernels, reproduces llama.cpp's per-position top1 and its final hidden on a real prompt.
+Same session, all green: P4.5 GDN, P4.9 attention, P4.10 FFN, and the dense `make prefill` on its
+RECORDED numbers (maxrel 3.393e-04, top1 [55286,576] MATCH).
+
+**Six bugs stood between the first whole-model attempt and this verdict.** Five of them were invisible
+to every gate that existed, which is the real finding: P4.12 is the first gate in this repo that can
+see a wiring error in the LOOP (as opposed to an op error inside a block).
+
+1. **`GDN_ERR norm_gated` at block 32 — the state cache was sized for one slot per layer and indexed
+   for two.** `DSTS` was `MAXL` = 65 slots while the loop indexes `L*2 + gst%2`, so layers ≥ 32 wrote
+   and read past the end; the fault surfaced at the next CHECKED launch (`norm_gated`), not at the
+   unchecked `delta_step` that caused it. Isolated with `VYB_GDN_PROBE`: blk.31 (attention, no state)
+   passed and blk.32/33 (recurrent) failed reproducibly. Fixed to `MAXL*2`.
+2. **The MTP draft head was being run as a text layer.** `MAXL = cfg.n_layers` is the file's
+   block_count, and for qwen35 that INCLUDES the draft head: Ridge has 65 blocks and llama's main pass
+   runs 64 (`blk.0..blk.63`; `blk.64` carries the `nextn.*` tensors and is applied separately). The
+   final hidden was therefore the draft head's output. The loop bound now comes from the TENSOR TABLE
+   (`NTL` = the first block carrying `nextn.eh_proj.weight`, or the full count when there is none), so
+   a dense model's loop is byte-for-byte unchanged. Signature that pointed here: cos 0.55 with the
+   RIGHT normalisation scale — a layout error would have been near-orthogonal.
+3. **The Ridge attention branch staged the attention tensors and then fell through to the shared
+   `run_ffn` without staging that call's own inputs** — the pre-norm `N2` and the three weights
+   `DWg`/`DWu`/`DWd`, all of which the RECURRENT branch stages per block. So all 16 attention blocks
+   computed a whole FFN from the PREVIOUS block's tensors. Measured in two steps: the pre-norm alone
+   moved cos 0.538 → 0.547 (adjacent `post_attention_norm` weights differ mainly in scale, mean ≈1.0,
+   so a stale one is nearly right), and adding the three weights moved 0.576 → **0.99961**. Every op
+   gate stayed green throughout: the attention probe deliberately stops at the authority's last stage
+   (before `run_ffn`) and the FFN probe stages its own operands.
+4. **The chunked head's byte offset and length dropped the row-size factor.** A Q6_K vocab row is
+   `(D/256)*210` = 4200 B, so the chunk must read `rows*(D/256)*210` bytes at `off + vs0*(D/256)*210`;
+   the code used `(vs0/256)*210`. Each chunk was therefore dequantised out of a 13 KB window of stale
+   buffer — plausible-looking but arbitrary vocab ids, stable across positions.
+5. **The chunk's dequant orientation was transposed against its consumer.** `logits_slice` reads
+   `Emb[vs*D + d]`, i.e. a row-major `[rows, D]` chunk — the natural `inz=0` order the packed bytes
+   already have, and exactly what the tied path's whole-table dequant produces. The chunk used `inz=D`
+   (`[D, rows]`), so every dot product multiplied the wrong pairs.
+6. **The running argmax got the nominal chunk size as its row stride/count,** correct for the 15 full
+   chunks and wrong for the short last one (2560 of 16384 rows). A vocab that divided evenly by the
+   chunk size would never have shown it.
+
+**Enabling change, and it should have come first: bulk H2D in `model_driver`.** The staging loop
+uploaded through the per-8-byte `download()` (one `cuMemcpyHtoD_v2` per 8 bytes) — call-count-bound,
+~2.2 MB/s, ~70 min for a 64-block forward. The one-line-per-tensor form
+(`cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0)` + `cuCtxSynchronize()`, source as `CString`) took the SAME
+run to **~3.5 min** with bit-identical output. That is what made this bisect affordable: six
+whole-model experiments in one sitting instead of one per hour.
+
+**Diagnostics added (default off, no gate sees them).** `VYB_RIDGE_TRACE=1` dumps the first 3
+components of every token's hidden after each block to `native/out/ridge_trace_L<L>.txt` — 3 because
+llama.cpp's own `llama-eval-callback` prints exactly that many per tensor dimension, so the two are
+comparable node-for-node (note: the dump is taken before the loop's `XI`/`XO` swap, so `trace_L` is the
+INPUT to block L = the output of L−1). The untied embed dumps its prompt rows to
+`native/out/ridge_embed_rows.txt`. Warning for the next session: in that checkout `llama-cli`,
+`llama-embedding` and `llama-eval-callback` all segfault even on `--help` (several libllama/ggml
+soversion sets sit side by side in `build/bin/`), while `llama-server` works — so the per-layer oracle
+is unavailable without a rebuild, and a rebuild is not free because the frozen fixtures pin the
+server's version+commit.
+
+**The verifier's stage tooth had to be fixed too, and it is a lesson about verification design.** It
+proved "same normalisation stage" by requiring the un-normalised comparison to score below a cosine
+bar. Cosine is SCALE-INVARIANT, so that tooth FAILS ON A CORRECT FORWARD: the same correct hidden
+scored cos 0.99961 with `output_norm` applied and 0.98039 without it. The stage-sensitive quantity is
+the per-row NORM (≈490 pre-norm vs ≈141 oracle; 141.02 vs 140.95 post-norm), so the tooth now requires
+the post-norm norm ratio ≈ 1 (≤1.05) AND the pre-norm norm ratio ≫ 1 (≥2.0).
+
+**Known and NOT fixed (found while bisecting, does not block W4/W5): short prompts crash.** S=1 and S=2
+die with `GDN_ERR conv` mid-stack (S=5 runs fine). This also invalidated a prefix-based causality check
+(an S=2 run's traces looked like a dramatic cross-token contamination until its exit status was read).
+Worth fixing before real serving.
+

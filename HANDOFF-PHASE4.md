@@ -123,16 +123,32 @@ over-claims relative to staging, and nothing currently catches that; see W1's la
   every FFN type now stages), but `run_caps_gate.sh` reads `eng_type` only and would not notice a
   regression. A caps-probe line that pairs `eng_type` with a staging capability is still a
   worthwhile follow-up.
-* **W2** the UNTIED lm_head and the 248320-row embedding table. `output.weight` exists; the driver
-  uses `token_embd` as if tied. A full f64 dequant of either table is 10.2 GB → both must be chunked.
-  (The 10.2 GB `DE` allocation is still made unconditionally in `main()`; it fits on the 3090 for a
-  probe run — the P4.5/P4.9/P4.10 probes all make it — but it must not exist for a whole-model run.)
-* **W3** no whole-model Ridge forward has ever run; the loop has only run single blocks in probe mode.
-* **W4** the MTP head (blk.64) is not implemented at all.
+* **W2** DONE — the UNTIED lm_head and the chunked embedding table. `HEAD_CFG tied=0 untied_path=1`;
+  the embed builds ONLY the prompt's own rows (`EMBED_ROWS tokens=5`, 4200 B/token — no table), the
+  head walks `output.weight` in 16384-row chunks with a running argmax; no `DE` for Ridge. Three bugs
+  found and fixed on the way (chunk offset/length missing the row-size factor; the chunk's dequant
+  orientation transposed against what `logits_slice` reads; the argmax stride given the nominal chunk
+  size so the SHORT last chunk was wrong). Verified by **P4.12** — see W3's landing note, because the
+  hidden and the top1 are checked in one run — plus the dense `make prefill` reproducing its RECORDED
+  numbers (maxrel 3.393e-04, top1 [55286,576] MATCH), which is what proves the branch is inert.
+* **W3** DONE — the whole-model Ridge forward. 64 text blocks in one process, **P4.12 PASS**:
+  `hidden cos=0.999609`, per-position top1 5/5, greedy decode `" following of the is Paris"`. Three
+  loop bugs had to be fixed first (the MTP block run as a text layer; the state cache sized for one
+  slot per layer while indexed for two; the Ridge attention branch not staging the shared FFN tail's
+  pre-norm AND weights). Bulk H2D landed with it: ~70 min → ~3.5 min per run.
+* **W4** the MTP head (blk.64) is not implemented at all — next up. Note for it: `MAXL` is still the
+  FILE's block count (65) and `NTL` (64) is the text-layer count; the draft head is `blk.NTL`.
 * **W5** `eng_gdn()`/`eng_mtp()` are still 0 (correctly — see the rule in §5).
 * **W6** (not required for the flip) multi-token / prefill for the recurrent op: the op's chunked
   kernel is UNCHARACTERISED, and only single-token steps are verified. A prompt can still be run as S
-  single-token steps, which is what the loop does today.
+  single-token steps, which is what the loop does today. RELATED, found while bisecting: **S=1 and S=2
+  crash** (`GDN_ERR conv` mid-stack) while S=5 is fine — the small-S case of the conv-state path, and
+  it is what makes a prefix-based causality check unusable. Worth fixing before real serving, since a
+  user's first prompt is often one or two tokens.
+* **The caps probe still cannot distinguish** "a dequant KERNEL exists" from "the model PATH can stage
+  the type" (W1 residue, see above) — W1 closed it for 21/22 in fact, but `run_caps_gate.sh` reads
+  `eng_type` only and would not notice a regression. A caps-probe line pairing `eng_type` with a
+  staging capability is still a worthwhile follow-up.
 
 ## 3. THE WORK, in order of dependency
 
@@ -226,6 +242,25 @@ stage it" (the probe reads `eng_type` only, so today it cannot see the differenc
   at `-ngl 0` temp 0 (see §6 for the oracle recipe). Pin the oracle's identity (llama.cpp revision +
   GGUF id) in the fixture and make a provenance mismatch a FAIL that says "recapture required".
 
+**LANDED (W2).** The design held: `HEAD_CFG tied=0 untied_path=1`, `EMBED_ROWS tokens=5 (the prompt's
+rows only; no table materialised)`, GPU footprint 6.2 GB instead of 10.2 GB + table, and the dense
+path reproduces its RECORDED `make prefill` numbers (maxrel 3.393e-04, top1 [55286,576] MATCH), which
+is what proves the branch is inert. Three bugs had to be found in the chunked head, none of which any
+hidden or op gate can see (all three produced a wrong top1 while the hidden was already correct at
+cos 0.9996) — the full write-up is in the skill and doc/QWEN35-PHASE4.md:
+
+1. **The chunk's byte offset and length dropped the row-size factor.** A Q6_K vocab row is
+   `(D/256)*210` = 4200 B, so the chunk must read `rows*(D/256)*210` bytes at `off + vs0*(D/256)*210`;
+   the code used `(vs0/256)*210` — ~5120x too few bytes from ~5120x too early, so every chunk was
+   dequantised out of a 13 KB window of stale buffer. (`emb_row`, one function away, has the right
+   arithmetic.)
+2. **The chunk's dequant orientation did not match its consumer.** `logits_slice` reads `Emb[vs*D+d]`
+   — row-major `[rows, D]`, the natural `inz=0` order the packed bytes already have and what the tied
+   path's whole-table dequant produces. The chunk was dequantised with `inz=D` (transposed), so every
+   dot product multiplied the wrong pairs.
+3. **The running-argmax kernel's stride param got the nominal chunk size, not the actual row count.**
+   Correct for all 15 full chunks and wrong for the last one (2560 of 16384 rows).
+
 ### W3 — the whole-model Ridge forward
 
 With W1 and W2 in place the loop has everything:
@@ -249,6 +284,48 @@ buffer whose name shadows a geometry value, a large cache zeroed through the 8-b
 
 Acceptance: `MODEL_PREFILL_DONE` + the oracle comparison of W2, on a real prompt, with the hidden
 comparison as the primary signal (the synthetic `[0,1]` prefix is a coin flip for top1 — see §5).
+
+**LANDED (W3) — the whole 64-block Ridge forward reproduces the oracle.**
+`make ridge-forward` / `native/legit/run_ridge_forward_gate.sh` → **PASS**: `hidden cos=0.999609`,
+per-position top1 **5/5** (4 exact + 1 membership at the documented near-tie), post-norm row norms
+141.02/140.16/143.58/139.22/142.40 against the oracle's 140.95/140.06/143.60/139.14/142.39, and the
+greedy decode reads `" following of the is Paris"`. Verified in the same session, all green:
+P4.5 GDN, P4.9 attention, P4.10 FFN, and `make prefill` on its recorded numbers. P4.12 is the FIRST
+gate in this repo that can see the class of bug that was actually holding W3 back, so treat it as the
+acceptance for anything that touches the loop:
+
+1. **The MTP block was being run as a text layer.** `MAXL = cfg.n_layers = 65` is the file's
+   block_count and for qwen35 that INCLUDES the draft head (blk.64, the block carrying the `nextn.*`
+   tensors); llama's main pass runs 64. The loop bound now comes from the TENSOR TABLE (`NTL`), so a
+   model with no `nextn` block keeps the identical old bound. Effect: the final hidden was the draft
+   head's output — cos 0.55 with the RIGHT norm scale (which is why it did not look like a layout bug).
+2. **The state cache was allocated one slot per layer but indexed two.** `DSTS` was `MAXL` slots
+   while the loop ping-pongs `L*2 + gst%2`, so the first out-of-bounds block is L = 32 — exactly where
+   the very first whole-model run died (`GDN_ERR norm_gated`, surfacing at the NEXT checked launch,
+   not at the unchecked write). Isolated with `VYB_GDN_PROBE` (blk.31 attention passes, blk.32/33
+   recurrent failed). `DSTS` is now `MAXL*2`.
+3. **The Ridge attention branch never staged the shared FFN tail's inputs.** It staged the attention
+   tensors and then fell through to `run_ffn`, which reads the pre-norm from `N2` and the three
+   weights from `DWg`/`DWu`/`DWd` — all of which the RECURRENT branch stages per block and this
+   branch never did. So all 16 attention blocks ran their FFN with the PREVIOUS recurrent block's
+   norm and weights. Measured in two steps: the pre-norm alone moved cos 0.538 → 0.547 (neighbouring
+   norms have mean ≈1.0, so a stale one is nearly right), and adding the three WEIGHTS moved it
+   0.576 → 0.99961. Invisible to every block probe by construction (the attention probe stops at the
+   authority's last stage; the FFN probe stages its own operands).
+
+Also landed with W3, and needed before W4/W5 are affordable: **bulk H2D in `model_driver`**, which
+took this same whole-model run from ~70 min to ~3.5 min (the same fix the training drivers got
+earlier). Six whole-model experiments fit in one sitting because of it. Two diagnostic modes were
+added and are default-off (no gate sees them): `VYB_RIDGE_TRACE=1` dumps the first 3 components of
+every token's hidden after each block (`native/out/ridge_trace_L<L>.txt`, matching llama's
+`eval-callback` print count), and the untied embed dumps its prompt rows. Note for the next session:
+`llama-cli`, `llama-embedding` and `llama-eval-callback` in that checkout all segfault (even on
+`--help`) while `llama-server` works — so the per-layer oracle route is closed without a rebuild,
+and a rebuild is not free because the fixtures pin the server's version+commit.
+
+KNOWN, NOT FIXED (found on the way, none blocks W4/W5): **short prompts crash.** S=1 and S=2 die with
+`GDN_ERR conv` mid-stack (S=5 is fine), which also makes a prefix-based causality check unusable —
+see the handoff's W6/notes; this is the `d_conv` state path's small-S case, not the loop.
 
 ### W4 — the MTP head (blk.64): `eng_mtp()`'s evidence
 
