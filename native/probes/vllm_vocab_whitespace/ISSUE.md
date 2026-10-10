@@ -1,5 +1,8 @@
 Title: bug: stdlib/vllm build_vocab_from maps EVERY token to id 0 when vocab.json is pretty-printed (silent wrong map)
 
+Filed as https://github.com/rickenator/Vyb/issues/487 — this file is the in-repo copy of that report's
+body, so the finding survives without the tracker and the next session can compare the two.
+
 ## Observed
 
 `build_vocab_from` in `stdlib/vllm/mod.vyb` returns a map whose every value is 0 when the

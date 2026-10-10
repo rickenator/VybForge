@@ -5,9 +5,10 @@ pointing VybForge's tokenizer path at a real model's `vocab.json` (Qwen3.8-27B "
 tree checked: `rickenator/Vyb` at `09fa22b8` (== origin/main at the time of writing), defect present.
 Tracker search for it (`vocab`, `tokenizer`, `read_int`, `vllm`) found no existing report.
 
-**Status: the report is drafted in `ISSUE.md` and NOT yet filed** on `rickenator/Vyb` — filing needs a
-go-ahead. When it is filed, put the issue URL here so the next session can re-check it against the
-current upstream instead of re-deriving the finding.
+**Status: FILED — https://github.com/rickenator/Vyb/issues/487** (open, label `bug`; body mirrors
+`ISSUE.md` below). Re-check that issue against the current upstream before re-deriving this finding:
+if it is closed, the consumer-side compaction in `native/tools/ridge_encoder_check.py` should be
+removed and gate P4.11 re-run without it — the guard existing only to make this pathology loud.
 
 ## What it shows
 

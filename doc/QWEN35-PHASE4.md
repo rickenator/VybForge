@@ -1677,9 +1677,10 @@ FIRST non-digit. The official repo ships vocab.json PRETTY-PRINTED (`"!": 0,` wi
 colon), so `read_int` reads zero digits, returns 0, and the map maps all 248044 tokens to 0. The walk
 still reaches the end of the file, so nothing errors: the token count stays right and every id is 0.
 Compacting the file (5,234,494 bytes from 6,722,759) made the same probe return the oracle's ids
-exactly, which is the confirmation. This is a defect to fix in the compiler repo — skip whitespace in
-`read_int`, or refuse a file the reader cannot parse — not in VybForge; what landed here is a
-consumer-side check that cannot be fooled by it.
+exactly, which is the confirmation. This is a defect in the compiler repo — skip whitespace in
+`read_int`, or refuse a file the reader cannot parse — not in VybForge, and it is FILED as
+**rickenator/Vyb#487** with a minimal probe (`native/probes/vllm_vocab_whitespace/`); what landed here
+is a consumer-side check that cannot be fooled by it, labelled a workaround.
 
 **What landed and is gated.** `native/tools/ridge_encoder_check.py` (also step **P4.11**,
 `native/legit/run_ridge_encoder_gate.sh`, `make -f native/Makefile encode-check`): it compacts a
