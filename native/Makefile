@@ -17,7 +17,12 @@ MODPATH := --module-path $(ROOT)/native/kernels
 # can import them (Vyb#442 keeps native/tensor/tensor.vyb itself off this list).
 S02MODS := --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype
 
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope q5k attn35
+# A kernel used by a driver MUST be in this list, or a clean build lacks its .ptx and the driver
+# fails at module-load with no compile error. model_driver.vyb loads q8_0.ptx (the Gated DeltaNet
+# state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
+# unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
+# an explicit `make q8_0` but a fresh `make verify` did not build it.
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
@@ -79,6 +84,15 @@ gdn-engine: $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/layer.ptx $(ROOT)/
 #   ./native/legit/run_attn_engine_gate.sh
 attn-engine: $(ROOT)/native/build/attn35.ptx $(ROOT)/native/build/q5k.ptx $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/rope.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/qwen3.ptx
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/attn_engine_verify.py
+
+# W1: the FFN half of a Ridge block on the ENGINE's own weight path — the block's pre-norm, the
+# parallel gate/up projections, SiLU, the down projection and the residual, with ffn_gate/ffn_up/
+# ffn_down staged by name from the live GGUF as IQ2_S and IQ3_S (the two grid-table codecs, which
+# launch through cuda_launch_n rather than cuda_launch4i) and compared stage by stage against a
+# reference assembled from OUR numpy ports of those dequantizers.
+#   ./native/legit/run_ffn_engine_gate.sh
+ffn-engine: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/iq2s.ptx $(ROOT)/native/build/iq3s.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/q8_0.ptx $(ROOT)/native/build/qwen3.ptx $(ROOT)/native/build/rope.ptx $(ROOT)/native/build/gdn.ptx $(ROOT)/native/build/q5k.ptx $(ROOT)/native/build/attn35.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ffn_engine_verify.py
 
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb

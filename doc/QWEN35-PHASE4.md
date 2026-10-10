@@ -1530,3 +1530,104 @@ model whose `attn_q` does not carry a gate.
 * A whole-model Ridge run (logits against llama.cpp) — that needs the FFN and the MTP head.
 * Multi-token / state: the fixture is a single forward (S=4), which is the prefill form. There is no
   KV cache and no decode path in this branch.
+
+## W1 — the FFN of every Ridge block STAGES: IQ2_S and IQ3_S through the grid launcher
+
+**Why this is the blocker it was.** Every Ridge block's FFN is IQ2_S (160 tensors, 4.25 GiB — the
+largest type in the file) or IQ3_S (32, the edge layers), and the FFN is the SAME shared code the
+dense model uses, so the arithmetic was never in doubt. What no engine path could do was STAGE those
+two types: their kernels had been gated bit-exact (S0.5/S0.8) but both take their codebook as an
+ordinary FIFTH kernel argument, and `stage_one` — the engine's per-tensor type dispatch — had no case
+for type 21 or 22. It therefore fell through to the last branch, `load_norm`, whose rule is
+"4 bytes per element, F32". That is not a crash: a packed IQ2_S tensor is SHORTER than `numel*4`, so
+the read comes up short and the driver returns 32 — but a tensor with a longer packed form (or a
+short read that still fills) would have staged a wrong block with plausible magnitudes. Nothing in
+the engine could have caught it; the reason P4.10 checks the staged OPERAND and not only the stages
+computed from it is exactly this class.
+
+**What landed** (`native/host/model_driver.vyb`):
+* `packed_bytes` gained `ty==22 → numel*82/256` (IQ2_S) and `ty==21 → numel*110/256` (IQ3_S);
+* `cuda_launch_n(f, gx, gy, gz, bx, by, bz, kernelParams, nargs)` added to the file's `extern "C"` —
+  Vyb#476's generic launcher, the one the standalone `iq2_s_load_driver.vyb` pinned;
+* `load_quant_grid(path, dpk, dout, off, nb, numel, fh, gridDev, inz)` builds the array of five
+  argument-cell ADDRESSES and launches with it. Same body otherwise as `load_quant`; `inz` keeps the
+  same meaning (the tensor's IN dim: D for gate/up, FF for down), which is what makes the staged B
+  `[in,out]` for `gemm`;
+* `stage_one` gained ONE trailing argument, a `GridK` struct (`f2/g2` = the `iq2sdeq` handle and its
+  device table, `f3/g3` the IQ3_S pair) rather than two more positional function handles plus two
+  tables: the 21 call sites then changed by that single value and the signature stays readable;
+* iq2s.ptx/iq3s.ptx load unconditionally next to q5k/attn35, and the two grid images
+  (`native/out/iq2s_grid.bin` 8192 B, `iq3s_grid.bin` 2048 B) are length-checked and uploaded ONCE
+  (they are the same for every tensor of their type);
+* the FFN probe: `VYB_FFN_PROBE=<layer>` + `VYB_FFN_X=<fixture>` runs the block's FFN half through
+  the loop's own `run_ffn` call, with the residual-stream input from a fixture, and dumps
+  `f1_norm/ffn_xn/ffn_gate/ffn_up/ffn_silu/ffn_down/block_out` plus six staged-operand slots.
+
+**Measured** (`native/legit/run_ffn_engine_gate.sh`, step **P4.10**; `native/tools/ffn_engine_verify.py`).
+Three layers, chosen because the FFN type is NOT a function of the block kind:
+
+    blk.3   all three IQ3_S                    worst 1.416e-11 over 7 stages
+    blk.7   ffn_down IQ3_S, gate/up IQ2_S      worst 2.326e-11      (the 4..11 boundary)
+    blk.19  all three IQ2_S                    worst 3.245e-11
+    bar 1e-4.  21 stage checks, 18 operand slots all correct.
+
+The agreement is far tighter than the bar because a Vyb `Float` is f64: the kernels' dequant is
+exact in this path, so the two sides are two routes to the same numbers. The teeth, computed from the
+reference's own stages, miss by 6.8e-02 .. 1.06e+00 (no residual; residual on the normed input; SiLU
+dropped) at a bar of 1e-2.
+
+**Proof the gate can FAIL (§21)** — two mutations, both reverted:
+* pairing the kernels with the WRONG grid table (`iq2sdeq` + the 2048-byte IQ3_S image) →
+  `staged operand FAIL (6/6 slots wrong)`, verifier rc=1, gate FAIL;
+* staging `ffn_down` with `inz=D` instead of `FF` → `staged operand FAIL (1/6 slots wrong)`. Only ONE
+  slot of six moved: this is the mistake a stage-only comparison would not reliably see, and it is why
+  the operand probe is in the gate.
+
+**Also verified in the same session** (the change must be inert elsewhere) — after the DPK fix below,
+and each number is byte-identical to the figure recorded before this unit:
+
+    run_gdn_engine_gate.sh  (P4.5)  ->  PASS  worst 3.903e-06, 26 stages / 2 chained steps
+    run_attn_engine_gate.sh (P4.9)  ->  PASS  worst 1.668e-06, 10 stages, 3 teeth
+    run_ffn_engine_gate.sh  (P4.10) ->  PASS  worst 3.245e-11, 3 layers / 21 stages   (new)
+    make -f native/Makefile prefill ->  PREFILL_HIDDEN_MATCH: OK  maxrel 3.393e-04
+                                        PREFILL_TOP1_MATCH:  OK  top1 vyb=[55286, 576]
+
+The dense gate reproducing `3.393e-04` and `[55286, 576]` exactly is the evidence that the new
+`stage_one` argument, the two extra module loads, the two uploaded grid tables, the FFN-probe branch
+and the computed `DPK` change nothing for a model whose tensors are all Q4_K/Q5_K/Q6_K.
+
+**The regression this landing caused, and the gate that caught it (record it, it is the lesson).**
+The first revision broke P4.9: `stage attn_q` failed with a CUDA error that reads like a kernel bug.
+The cause was the `packed_bytes` fix itself. `DPK`, the staging buffer every `stage_one`/`load_quant`
+uploads into, was sized as `packed_bytes(blk.0.ffn_down.weight)` — and blk.0 is RECURRENT, so for
+Ridge that is an IQ3_S FFN tensor which, before W1, fell through to the 4-bytes-per-element rule and
+made `DPK` 356 MB, larger than every packed form in the file. That accident was load-bearing: with the
+IQ2_S/IQ3_S cases real, `DPK` fell to 38 MB and Ridge's `attn_q` (12288x5120 Q5_K, 43.3 MB) overran it.
+The fix computes the size from the model's own tensor table — the maximum `packed_bytes` over the
+tensors the loop stages whole, excluding `token_embd` (which `emb_dequant` stages in 65536-ELEMENT
+chunks, 53,760 B for Q6_K) — and prints `PK_STAGE bytes=…` so the number is visible in every log.
+
+    # the row that failed, and the printout that replaced the guess
+    ATTN_ERR stage attn_q                             (revision 1: the too-small DPK)
+    PK_STAGE bytes=73113600 (the largest tensor staged whole)   (revision 2 — Ridge's blk.64.ffn_*
+                                                     Q6_K, 17408x5120; measured, in every driver log)
+
+Generalisation worth keeping: **a helper's FALL-THROUGH value can be load-bearing for an allocation
+size, and fixing the helper silently shrinks it.** When you add a case to a type-size helper, grep for
+every consumer of that helper's value, not just the call that motivated the change.
+
+`native/Makefile`'s `KERNELS` also gained `iq2s iq3s q8_0`. The last is a latent gap found on the
+way: `model_driver.vyb` loads `q8_0.ptx` unconditionally (the Gated DeltaNet state path) but it was
+not in `KERNELS`, so a clean `make verify` never built it and the driver would have failed at
+module-load for anyone who had not run `make q8_0` by hand.
+
+**Still NOT covered:**
+* A whole-model Ridge run (all 64 blocks in one process, logits against llama.cpp) — that is W3, and
+  it needs W2 (the untied head + the chunked embedding table). The 10.2 GB `DE` allocation is still
+  made unconditionally in `main()`; it fits on the 3090 for a probe (P4.5/P4.9/P4.10 all make it) but
+  it must not exist for a whole-model run.
+* The MTP head (blk.64) — W4.
+* `eng_gdn()`/`eng_mtp()` stay 0 — W5, and they flip only on the W3/W4 oracle comparisons.
+* The caps probe still cannot distinguish "a dequant KERNEL exists" from "the model PATH can stage the
+  type". W1 closed that gap in fact for 21/22 (they occur only in the FFN, and every FFN type now
+  stages), but `run_caps_gate.sh` reads `eng_type` only and would not notice a regression.

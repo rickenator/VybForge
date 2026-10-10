@@ -401,6 +401,27 @@ else
   step "P4.9 attention block (engine weights)" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.10 — Ridge's FFN block on the ENGINE's own weight path (phase 4, W1) ─────────
+# Gate: native/legit/run_ffn_engine_gate.sh. Every Ridge block's FFN is IQ2_S (160 tensors, the
+# mid-stack) or IQ3_S (32, the edge layers), and both carry their codebook as an ordinary FIFTH
+# kernel argument — so they launch through `cuda_launch_n`, not the four-slot `cuda_launch4i` every
+# other dequant uses. Before W1 `stage_one` had no case for types 21/22 and fell through to the F32
+# reader, silently mis-staging them. This stages the block's three FFN weights + its pre-norm by
+# name from the GGUF through the engine's own kernels and compares seven stages against OUR numpy
+# ports of the same two dequantizers, at three type boundaries (blk.3 all IQ3_S, blk.7 mixed:
+# IQ3_S down with IQ2_S gate/up, blk.19 all IQ2_S). Teeth: the staged operands at gemm's own
+# addresses (B[k*N+n]), the two residual mis-wirings, and SiLU dropped — all must MISS. Measured:
+# worst 2.3e-11 over 21 stages.
+out="$(./native/legit/run_ffn_engine_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "FFN ENGINE GATE: PASS"; then
+  step "P4.10 FFN block (engine weights, IQ2_S/IQ3_S)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "FFN ENGINE GATE: SKIP"; then
+  step "P4.10 FFN block (engine weights, IQ2_S/IQ3_S)" "SKIP ($(echo "$last" | sed 's/FFN ENGINE GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.10 FFN block (engine weights, IQ2_S/IQ3_S)" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come
