@@ -470,6 +470,22 @@ main()<Int> -> {
         println("PROMPT_MODE=text PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
         }
     }
+    # ---- W4: the MTP draft head (VYB_MTP=1) ----
+    # The draft head consumes the NORMALISED hidden at position t plus the embedding of token t+1 and
+    # predicts t+2 (llama.cpp's MTP hook batch carries both the next-token id and the `h_nextn` row),
+    # so there is one step per position 0..S-2 and the rest of the driver sees that STEP COUNT as S.
+    # The block itself is the ordinary attention block of the last file block (blk.NTL) — it runs on
+    # the loop's own dispatch and staging, so nothing inside the block changes; only its input does.
+    mtps<String> = env_get("VYB_MTP") else ""
+    MTPM<Int> = 0
+    if (mtps.len() > 0) { MTPM = 1 }
+    if (MTPM == 1) {
+        if (prids.len() < 3) { println("MTP_ERR the draft head needs at least 3 prompt tokens"); return 2 }
+        mtr<Vec<Int>> = Vec()
+        mti<Int> = 0
+        for (mti in 0..prids.len() - 2) { mtr.push(prids.get(mti + 1)) }
+        prids = mtr
+    }
     S<Int> = prids.len()
     # Print the ACTUAL ids, not just the count: the oracle fixtures are keyed by token ids, so a
     # verifier can prove the run it is reading embedded the fixture's own id sequence (or a PREFIX of
@@ -1012,6 +1028,10 @@ main()<Int> -> {
         GGATE<Int> = 0; GCONV<Int> = 0; GCONVS<Int> = 0; GCRAW<Int> = 0; GQN<Int> = 0; GKN<Int> = 0
         GOUT<Int> = 0; GEL<Int> = 0; GEPI<Int> = 0; GY<Int> = 0; GLOD<Int> = 0
         DSTS<Int> = 0; GDPK<Int> = 0
+        # W4's draft-head buffers: declared HERE, not inside the `if (MTPM == 1)` branch that fills
+        # them — a variable declared inside a branch is scoped to it, and MSN is read much later (the
+        # head's normalisation), which fails as "Undefined identifier: MSN".
+        MEH<Int> = 0; MEN<Int> = 0; MHN<Int> = 0; MSN<Int> = 0; MC2<Int> = 0; MTMP<Int> = 0; MHID<Int> = 0
         GP1<Int> = 0; GP2<Int> = 0; GP3<Int> = 0; GP4<Int> = 0
         if (GRL >= 0) {
             if (cuMemAlloc_v2(loc(GWAN), GNE * 8) != 0) { return 11 }
@@ -1213,7 +1233,75 @@ main()<Int> -> {
         XI<Int> = XA; XO<Int> = XB
         e<Int> = 0
         L<Int> = 0
-        for (L in 0..NTL - 1) {
+        # ---- W4: the MTP draft head's input sequence and staging ----
+        # `cur_i = eh_proj @ [ rms(e(token_{i+1}), enorm) ; rms(h_i, hnorm) ]`, one row per step, built
+        # into XA — the loop's own input buffer — so the block below consumes it exactly as a normal
+        # layer consumes the embed. The four nextn tensors are not per-layer, so they are staged once.
+        if (MTPM == 1) {
+            mtop<Int> = find_nm(nmv, "blk." + NTL.to_string() + ".nextn.eh_proj.weight")
+            mon<Int> = find_nm(nmv, "blk." + NTL.to_string() + ".nextn.enorm.weight")
+            mhn<Int> = find_nm(nmv, "blk." + NTL.to_string() + ".nextn.hnorm.weight")
+            msn<Int> = find_nm(nmv, "blk." + NTL.to_string() + ".nextn.shared_head_norm.weight")
+            if (mtop < 0 || mon < 0 || mhn < 0 || msn < 0) {
+                println("MTP_ERR blk." + NTL.to_string() + " is missing a nextn tensor"); return 2
+            }
+            if (cuMemAlloc_v2(loc(MEH), 2 * D * D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MEN), D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MHN), D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MSN), D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MC2), 2 * D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MTMP), D * 8) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(MHID), S * D * 8) != 0) { return 11 }
+            e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + NTL.to_string() + ".nextn.eh_proj.weight", DPK, PF, MEH, q4fn, q5fn, q6fn, efn, 2 * D, GK)
+            if (e != 0) { println("MTP_ERR stage eh_proj"); return 74 }
+            e = load_norm(MODEL, PF, DPK, MEN, ofv.get(mon), nlv.get(mon), efn)
+            if (e != 0) { println("MTP_ERR stage enorm"); return 80 }
+            e = load_norm(MODEL, PF, DPK, MHN, ofv.get(mhn), nlv.get(mhn), efn)
+            if (e != 0) { println("MTP_ERR stage hnorm"); return 80 }
+            e = load_norm(MODEL, PF, DPK, MSN, ofv.get(msn), nlv.get(msn), efn)
+            if (e != 0) { println("MTP_ERR stage shared_head_norm"); return 80 }
+            # The hidden rows come from the ORACLE's own capture (VYB_MTP_HIDDEN = a fixture's
+            # `.hidden.f64`), which isolates this new block from the main pass: with the oracle's
+            # hidden as input, any disagreement is this block's, not accumulation through 64 layers.
+            mhp<String> = env_get("VYB_MTP_HIDDEN") else ""
+            mhs<String> = read_bin(mhp)
+            if (mhs.len() < S * D * 8) {
+                println("MTP_ERR hidden file " + mhp + " has " + mhs.len().to_string() + " B, wanted "
+                        + (S * D * 8).to_string()); return 2
+            }
+            if (download(mhs, MHID, S * D * 8) != 0) { return 15 }
+            msi<Int> = 0
+            for (msi in 0..S - 1) {
+                dms<Int> = prids.get(msi)
+                e = emb_row(MODEL, te_off, dms, D, te_ty, DPK, q6fn, MTMP)
+                if (e != 0) { println("MTP_ERR embed row " + msi.to_string()); return 91 }
+                # embedding FIRST, then the hidden (ggml_concat(e_norm, h_norm)): into MC2's halves
+                put_i(GP1, 0, MTMP) ; put_i(GP1, 8, MEN) ; put_i(GP1, 16, MC2)
+                put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
+                grcc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
+                if (grcc != 0) { println("MTP_ERR enorm rms"); return 12 }
+                put_i(GP1, 0, MHID + msi * D * 8) ; put_i(GP1, 8, MHN) ; put_i(GP1, 16, MC2 + D * 8)
+                put_i(GP1, 24, 1) ; put_i(GP1, 32, D) ; put_f(GP1, 40, EPS)
+                grcc = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP1, 0, 0, 0)
+                if (grcc != 0) { println("MTP_ERR hnorm rms"); return 12 }
+                put_f(GP2, 48, 1.0) ; put_f(GP2, 56, 0.0)
+                put_i(GP2, 0, MC2) ; put_i(GP2, 8, MEH) ; put_i(GP2, 16, XA + msi * D * 8)
+                put_i(GP2, 24, 1) ; put_i(GP2, 32, D) ; put_i(GP2, 40, 2 * D)
+                grcc = cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (D + 255) / 256, 1, 1, 256, 1, 1, GP2, 0, 0, 0)
+                if (grcc != 0) { println("MTP_ERR eh_proj gemm"); return 12 }
+            }
+            # The draft step's rope position is the CALLER's choice in llama.cpp (inp_pos), so it is a
+            # knob here: measured, not assumed. 1 = the next token's own position.
+            mpv<String> = env_get("VYB_MTP_POS") else "1"
+            MPOS<Int> = parse_u(mpv, 0, mpv.len())
+            cuMemcpyHtoD_v2(ROP + 72, loc(MPOS), 8)
+            println("MTP_MODE steps=" + S.to_string() + " block=blk." + NTL.to_string()
+                    + " rope_pos_base=" + MPOS.to_string() + " hidden=" + mhp)
+        }
+
+        LST<Int> = 0 ; LEP<Int> = NTL
+        if (MTPM == 1) { LST = NTL ; LEP = NTL + 1 }
+        for (L in LST..LEP - 1) {
             # ---- the per-layer DISPATCH (unit 9c) ----
             # Presence comes from the tensor table; the KIND comes from the shared classifier. This
             # pairing is not optional: mc_layer_kind classifies a name, so asking it alone about a
@@ -1653,6 +1741,10 @@ main()<Int> -> {
             on_off<Int> = ofv.get(i0); on_nl<Int> = nlv.get(i0)
             e = load_norm(MODEL, PF, DPK, ON, on_off, on_nl, efn); if (e != 0) { return 90 }
             rA = XI; rB = ON; rC = DH
+            # W4: the draft head normalises with its OWN `nextn.shared_head_norm` (llama.cpp falls
+            # back to output_norm only when the tensor is absent), so the shared head sees the same
+            # kind of input either way but from a different weight.
+            if (MTPM == 1) { rB = MSN }
             cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
             cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
             cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
