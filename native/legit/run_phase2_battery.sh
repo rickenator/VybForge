@@ -441,6 +441,23 @@ else
   step "P4.11 encoder vs the Ridge oracle" "FAIL"; echo "$out" | tail -14 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.12 — a WHOLE 65-block Ridge forward vs the captured oracle (phase 4, W2/W3) ────
+# Gate: native/legit/run_ridge_forward_gate.sh. The probe gates (P4.5/P4.9/P4.10) each isolate ONE
+# block and compare it against a reference written here, so none of them can see an error BETWEEN
+# layers; this runs every block in one process (the untied head chunked, the embed built from the
+# prompt's own rows) and compares per-position top1 under the fixture's margin_bar rule plus the final
+# hidden, with provenance checked first so a moved oracle is a FAIL that says "recapture". EXPENSIVE:
+# the per-layer staging goes through the per-8-byte H2D helper, so it is tens of minutes per prompt.
+out="$(./native/legit/run_ridge_forward_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "RIDGE FORWARD GATE: PASS"; then
+  step "P4.12 whole Ridge forward (vs the oracle)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "RIDGE FORWARD GATE: SKIP"; then
+  step "P4.12 whole Ridge forward (vs the oracle)" "SKIP ($(echo "$last" | sed 's/RIDGE FORWARD GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.12 whole Ridge forward (vs the oracle)" "FAIL"; echo "$out" | tail -16 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come

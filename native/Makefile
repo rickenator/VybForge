@@ -104,6 +104,15 @@ ffn-engine: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/iq2s.ptx $(ROOT)
 encode-check:
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ridge_encoder_check.py
 
+# W2/W3 acceptance: the WHOLE 65-block Ridge model in one process, against the captured oracle
+# (llama.cpp on the same GGUF): per-position top1 under the fixture's margin_bar rule, and the final
+# hidden with our output_norm applied first. EXPENSIVE — one full run per prompt, tens of minutes,
+# because the per-layer weight staging goes through the per-8-byte H2D helper. Do not kill it on
+# elapsed time alone.
+#   ./native/legit/run_ridge_forward_gate.sh
+ridge-forward:
+	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ridge_forward_verify.py
+
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py

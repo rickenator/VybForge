@@ -123,6 +123,36 @@ logits_slice(p<Int>) -> {
         st_f64(Log + (s * V + vs) * 8, acc)
     }
 }
+// Running argmax over a vocab CHUNK, for an untied lm_head whose table cannot be dequantised whole
+// (Ridge: output.weight is Q6_K 5120x248320 -> 10.2 GB as f64, so the head runs chunk by chunk and
+// the winner is carried across chunks). Reads C[S,CH] (this chunk's logits for every position),
+// updates BV[S] (the running best value) and Out[S] (the running best index) with the GLOBAL index
+// base+i. One thread per row, grid = S. The caller seeds BV = -inf (or the first chunk's row max) and
+// Out = 0 before the first call. Strict `>` on purpose: a tie keeps the EARLIER index, which is what
+// argmax_row does, so a chunked head and a whole-table head agree on ties.
+// Params: +0 C +8 BV +16 Out +24 S +32 CH +40 base
+argmax_acc(p<Int>) -> {
+    C<Int> = ld_i64(p + 0)
+    BV<Int> = ld_i64(p + 8)
+    Out<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    CH<Int> = ld_i64(p + 32)
+    base<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S) {
+        rbase<Int> = C + gid * CH * 8
+        bv<Float> = ld_f64(BV + gid * 8)
+        best<Int> = ld_i64(Out + gid * 8)
+        i<Int> = 0
+        for (i in 0..CH - 1) {
+            v2<Float> = ld_f64(rbase + i * 8)
+            if (v2 > bv) { bv = v2; best = base + i }
+        }
+        st_f64(BV + gid * 8, bv)
+        st_i64(Out + gid * 8, best)
+    }
+}
+
 // Token-embedding gather (Qwen3 token_embd): OUT[s*D+d] = EMB[ids[s]*D+d].
 // EMB f64 [VOCAB,D], ids f64-width Int per row (as stored in an Int device buf).
 // Params: +0 EMB +8 IDS +16 OUT +24 S +32 D. Grid = S*D.

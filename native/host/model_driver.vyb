@@ -30,6 +30,7 @@ extern "C" {
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
     cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemFree_v2(dptr<Int>)<CInt>
     cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
@@ -103,24 +104,12 @@ find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
 
 download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     freedom {
-        npb<Int> = nbytes - (nbytes % 8)
-        ci<Int> = 0
-        for (ci in 0..(npb / 8) - 1) {
-            o8<Int> = ci * 8
-            ch<Int> = 0
-            bj<Int> = 0
-            for (bj in 0..7) {
-                bv<Int> = u8(data, o8 + bj)
-                ch = ch | (bv << (bj * 8))
-            }
-            if (cuMemcpyHtoD_v2(dst + o8, loc(ch), 8) != 0) { return 15 }
-        }
-        tj<Int> = npb
-        while (tj < nbytes) {
-            by<Int> = u8(data, tj)
-            if (cuMemcpyHtoD_v2(dst + tj, loc(by), 1) != 0) { return 15 }
-            tj = tj + 1
-        }
+        # Bulk HtoD from the String's raw {ptr,len} (srcHost declared CString); the
+        # per-8-byte loop was the DMA hotspot. Non-pinned Vyb buffer + null-stream
+        # async needs cuCtxSynchronize() to order DMA reads before `data` is reused
+        # (one driver call per tensor).
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
         return 0
     }
     return 0
@@ -174,6 +163,32 @@ load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he
         cuMemcpyHtoD_v2(pf + 8, loc(dout), 8)
         cuMemcpyHtoD_v2(pf + 16, loc(numel), 8)
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)), (numel + 255) / 256, 1, 1, 256, 1, 1, pf, 0, 0, 0)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
+
+// ───────── W2: the untied head, and the embed that cannot share its table ─────────
+// One embedding ROW, straight out of the model's own table: just that row's packed blocks
+// (D/256 of them), dequantised into `dst` as D f64 values, row-major. NO transpose — this is a
+// gather, not a weight, so the kernel's z stays 0.
+//
+// It exists because an untied model's token table cannot be materialised whole: Ridge's is
+// 248320 x 5120 Q6_K, i.e. 10.2 GB as f64, and an untied model needs a SECOND table of that size for
+// the head — neither fits the 3090 beside the weights. The dense path's `emb_dequant` (whole table
+// into DE, then a gather kernel) is kept unchanged for a tied model, so `make prefill` is byte-for-byte
+// unaffected. Q6_K only, asserted: that is what Qwen ships for both the token table and the head.
+emb_row(path<String>, off<Int>, tid<Int>, D<Int>, ty<Int>, dpk<Int>, q6fn<loc<CVoid>>, dst<Int>)<Int> -> {
+    if (ty != 14) { return 62 }
+    if (D % 256 != 0) { return 62 }
+    nblk<Int> = D / 256
+    data<String> = read_model(path, off + tid * nblk * 210, nblk * 210)
+    if (data.len() < nblk * 210) { return 32 }
+    freedom {
+        e<Int> = download(data, dpk, nblk * 210)
+        if (e != 0) { return e }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D + 255) / 256, 1, 1, 256, 1, 1, dpk, dst, D, 0)
         if (rc != 0) { return 33 }
         return 0
     }
@@ -509,6 +524,10 @@ main()<Int> -> {
                 if (nm.substring(0, 4) == "blk.") { keep = 1 }
                 if (nm == "output_norm.weight") { keep = 1 }
                 if (nm == "token_embd.weight") { keep = 1 }
+                # W2: the UNTIED head's own table. mc_load derives cfg.tied from this tensor's
+                # presence, and the chunked head path stages its bytes by offset, so it has to survive
+                # the index filter.
+                if (nm == "output.weight") { keep = 1 }
                 if (keep == 1) {
                     t3<Int> = strchr(bff, 9, t2 + 1)
                     if (t3 < 0) { t3 = i }
@@ -533,6 +552,16 @@ main()<Int> -> {
     prs<String> = env_get("VYB_GDN_PROBE") else ""
     PR<Int> = -1
     if (prs.len() > 0) { PR = parse_u(prs, 0, prs.len()) }
+
+    # ---- optional per-block TRACE (VYB_RIDGE_TRACE=1) ----
+    # Writes the FIRST THREE components of every token's hidden AFTER each block to
+    # native/out/ridge_trace_L<L>.txt. Three because that is exactly what llama.cpp's own
+    # `llama-eval-callback` example prints per tensor dimension (common_debug_print_tensor(..., 3, ...)),
+    # so the two traces compare directly and the FIRST block that diverges is visible in one run —
+    # a whole-model cosine says the forward is wrong, it cannot say WHERE. Default off: no gate sees it.
+    trs<String> = env_get("VYB_RIDGE_TRACE") else ""
+    LTR<Int> = 0
+    if (trs.len() > 0) { LTR = 1 }
 
     # ---- unit 9c: the recurrent geometry, and whether this model has recurrent blocks at all ----
     # Decided from the TENSOR TABLE (the same rule the loop dispatches on), never from the model
@@ -703,11 +732,14 @@ main()<Int> -> {
         lsfn<loc<CVoid>> = from<loc<CVoid>>(0)
         arfn<loc<CVoid>> = from<loc<CVoid>>(0)
         emfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        accfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rpfn), mrope, "rope_nrot") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
         if (cuModuleGetFunction(loc(emfn), mw, "embed") != 0) { return 10 }
+        # W2: the running argmax the chunked (untied) head folds each vocab chunk into.
+        if (cuModuleGetFunction(loc(accfn), mw, "argmax_acc") != 0) { return 10 }
 
         # ---- unit 9c: the recurrent branch's kernels, plus Q8_0 staging ----
         # gdn.ptx carries the ops the Gated DeltaNet block needs and nothing else does; q8_0.ptx the
@@ -815,6 +847,21 @@ main()<Int> -> {
         i0 = find_nm(nmv, ats + "ffn_norm.weight"); if (i0 >= 0) { n2_nl = nlv.get(i0) }
         i0 = find_nm(nmv, "token_embd.weight"); te_nl<Int> = nlv.get(i0)
         i0 = find_nm(nmv, "token_embd.weight"); te_off<Int> = ofv.get(i0)
+        i0 = find_nm(nmv, "token_embd.weight"); te_ty<Int> = tyv.get(i0)
+        # W2: the untied head's own table (absent on a tied model, where the head IS token_embd).
+        oi<Int> = find_nm(nmv, "output.weight")
+        out_nl<Int> = -1; out_off<Int> = 0; out_ty<Int> = -1
+        if (oi >= 0) { out_nl = nlv.get(oi); out_off = ofv.get(oi); out_ty = tyv.get(oi) }
+        if (UT == 1) {
+            if (oi < 0) { println("HEAD_FAIL the config says untied but the index has no output.weight"); return 2 }
+            if (out_nl != VOCAB * D || out_ty != 14) {
+                println("HEAD_FAIL output.weight is " + out_nl.to_string() + " values of type "
+                        + out_ty.to_string() + ", wanted " + (VOCAB * D).to_string() + " of type 14 (Q6_K)")
+                return 2
+            }
+            println("HEAD_TABLE output.weight " + out_nl.to_string() + " values, Q6_K, off=" + out_off.to_string()
+                    + "; token_embd off=" + te_off.to_string() + " type=" + te_ty.to_string())
+        }
 
         DWq<Int> = 0; DWk<Int> = 0; DWv<Int> = 0; DWo<Int> = 0; DWg<Int> = 0; DWu<Int> = 0; DWd<Int> = 0
         N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; ON<Int> = 0
@@ -822,6 +869,10 @@ main()<Int> -> {
         DK<Int> = 0; DKN<Int> = 0; DKr<Int> = 0; DV<Int> = 0; DCtx<Int> = 0
         DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DH<Int> = 0; DE<Int> = 0; DEt<Int> = 0; DL<Int> = 0; AO<Int> = 0
+        # W2: the untied head's chunk buffers, and the chunk size (rows of the output table held at
+        # once: 16384 x 5120 x 8 = 671 MB, which fits beside the layer weights on a 24 GB card).
+        DCH<Int> = 0; DCL<Int> = 0; DBV<Int> = 0; DAO<Int> = 0
+        CH<Int> = 16384
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0; IDS<Int> = 0; EP<Int> = 0
         # unit 10 step 5: the Ridge attention branch's buffers (allocated only when JQG == 1)
         DQG<Int> = 0; DGT<Int> = 0; DGD<Int> = 0; AP1<Int> = 0
@@ -857,7 +908,21 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Hu), tt_nbytes(SF, dt_f64())) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(M), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DH), tt_nbytes(SD, dt_f64())) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DE), dt_bytes_for(te_nl, dt_f64())) != 0) { return 11 }
+        # W2: the untied path's buffers. The head cannot hold its table whole (10.2 GB as f64), so it
+        # keeps a reusable [D, CH] chunk of it, that chunk's logits for every position, and a running
+        # (best value, best index) per position. A tied model allocates none of these and keeps the
+        # whole-table DE path it has always used.
+        if (UT == 0) {
+            if (cuMemAlloc_v2(loc(DE), dt_bytes_for(te_nl, dt_f64())) != 0) { return 11 }
+        } else {
+            if (cuMemAlloc_v2(loc(DCH), dt_bytes_for(D * CH, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(DCL), dt_bytes_for(S * CH, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(DBV), tt_nbytes(S1, dt_f64())) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(DAO), tt_nbytes(S1, dt_f64())) != 0) { return 11 }
+            println("HEAD_ALLOC chunk=" + CH.to_string() + " rows, [D,CH] f64 = "
+                    + (D * CH * 8 / 1048576).to_string() + " MB (the whole table would have been "
+                    + (te_nl * 8 / 1048576).to_string() + " MB, and an untied model needs a second one)")
+        }
         if (cuMemAlloc_v2(loc(DL), tt_nbytes(SV, dt_f64())) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(AO), tt_nbytes(S1, dt_f64())) != 0) { return 11 }
         # DPK is the staging buffer for every tensor the loop stages WHOLE, so it must cover the
@@ -980,7 +1045,9 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(T4), 32) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(A4), 32) != 0) { return 11 }
+        # 64 B, not 32: argmax_acc takes six params (+0 C +8 BV +16 Out +24 S +32 CH +40 base) and
+        # shares this block with argmax_row (which uses the first four).
+        if (cuMemAlloc_v2(loc(A4), 64) != 0) { return 11 }
         DF<Int> = 0
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(IDS), S * 8) != 0) { return 11 }
@@ -1007,6 +1074,38 @@ main()<Int> -> {
             # X1, which is what run_ffn takes as its residual operand.
             if (download(ffx, X1, S * D * 8) != 0) { return 15 }
             println("FFN_PROBE_X_READY tokens=" + S.to_string() + " D=" + D.to_string())
+        } else {
+
+        if (UT == 1) {
+            # ---- the untied path: build ONLY the prompt's own rows, straight from the table.
+            # One row is D/256 packed blocks (4200 B for Ridge), so the prompt embed costs kilobytes
+            # per token instead of a 10.2 GB table — which is the whole reason this path exists.
+            ir<Int> = 0
+            for (ir in 0..S - 1) {
+                dr<Int> = prids.get(ir)
+                e = emb_row(MODEL, te_off, dr, D, te_ty, DPK, q6fn, XA + ir * D * 8)
+                if (e != 0) { println("EMBED_ERR row " + ir.to_string() + " token " + dr.to_string() + " e=" + e.to_string()); return 91 }
+            }
+            println("EMBED_ROWS tokens=" + S.to_string() + " (the prompt's rows only; no table materialised)")
+            if (LTR == 1) {
+                # The untied embed is NEW code (W2) and nothing else checks it: dump the first three
+                # components of each prompt row so a python Q6_K dequant of the same table rows can
+                # be compared directly, and a wrong row offset or a missing transpose shows up as a
+                # number rather than as a whole-model cosine.
+                cuCtxSynchronize()
+                match (open_write("native/out/ridge_embed_rows.txt")) {
+                    ew -> {
+                        etj<Int> = 0
+                        for (etj in 0..S * 3 - 1) {
+                            etv<Float> = 0.0
+                            if (cuMemcpyDtoH_v2(loc(etv), XA + (etj / 3) * D * 8 + (etj % 3) * 8, 8) != 0) { return 16 }
+                            match (write_str(ew, etv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                        }
+                        close(ew)
+                    }
+                    ? -> { return 17 }
+                }
+            }
         } else {
 
         # ---- token_embd -> DE (f64 gather table), loaded up front so BOTH the
@@ -1041,6 +1140,7 @@ main()<Int> -> {
             ? -> { return 17 }
         }
         println("EMBED_PROBE_DONE")
+        }
         }
         }
         }
@@ -1508,6 +1608,88 @@ main()<Int> -> {
 
             # DE (token_embd gather table) is already populated by the up-front embed.
 
+            if (UT == 1) {
+                # ---- the UNTIED head, chunk by chunk. The table is output.weight (Q6_K,
+                # VOCAB x D = 248320 x 5120): 10.2 GB as f64, so it is never held whole. Each chunk is
+                # CH vocab rows, dequantised into DCH as [D, CH] by the same kernel the tied path uses
+                # for a whole table; that chunk's logits for every position come from logits_slice
+                # pointed AT THE CHUNK (its V = the chunk's row count, so the output is one chunk-local
+                # row), and argmax_acc folds them into the running (best value, best index) per
+                # position with the chunk's global base. A tie keeps the earlier index, which is
+                # argmax_row's own rule, so this and a whole-table head agree on ties.
+                vs0<Int> = 0
+                rows<Int> = 0
+                zz0<Int> = 0
+                nblk2<Int> = D / 256
+                seedv<Float> = -1.0e308
+                seedi<Int> = 0
+                iq2<Int> = 0
+                for (iq2 in 0..S - 1) {
+                    put_f(DBV, iq2 * 8, seedv)
+                    put_i(DAO, iq2 * 8, seedi)
+                }
+                while (vs0 < VOCAB) {
+                    rows = CH
+                    if (vs0 + CH > VOCAB) { rows = VOCAB - vs0 }
+                    # ONE ROW IS (D/256) PACKED BLOCKS = 4200 B for Ridge (Q6_K, 210 B per 256
+                    # values), so the byte offset of vocab row vs0 is vs0 * nblk2 * 210 and the
+                    # chunk's length is rows * nblk2 * 210. The missing nblk2 factor was the whole
+                    # bug: with (vs0/256)*210 the chunk read ~5120x too few bytes from ~5120x too
+                    # early, the dequant then expanded the whole chunk out of a 13 KB window, and
+                    # every logit came from garbage — while the HIDDEN was already correct at
+                    # cos 0.9996, so the top1 was wrong for a reason no hidden check could see.
+                    nb2<Int> = rows * nblk2 * 210
+                    pkd<String> = read_model(MODEL, out_off + vs0 * nblk2 * 210, nb2)
+                    if (pkd.len() < nb2) { println("LMHEAD_ERR short read at " + vs0.to_string()); return 92 }
+                    if (download(pkd, DPK, nb2) != 0) { return 15 }
+                    # NATURAL (non-transposed) dequant, inz=0: `logits_slice` reads its table as
+                    # Emb[vs*D + d], i.e. ROW-MAJOR [rows, D] — exactly the order the packed chunk
+                    # already has ([vocab, D] out-major in the file) — and exactly what the TIED
+                    # path's whole-table dequant (emb_dequant, also inz=0) produces. Asking for the
+                    # transposed write (inz=D) here put the chunk in [D, rows] and every dot product
+                    # then multiplied the wrong pairs: the argmax came out of an unscrambled table.
+                    rcq<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D * rows + 255) / 256, 1, 1, 256, 1, 1, DPK, DCH, D * rows, 0)
+                    if (rcq != 0) { println("LMHEAD_ERR dequant rc=" + (rcq as Int).to_string()); return 92 }
+                    s7 = 0
+                    for (s7 in 0..S - 1) {
+                        cuMemcpyHtoD_v2(GM + 0, loc(DH), 8); cuMemcpyHtoD_v2(GM + 8, loc(DCH), 8); cuMemcpyHtoD_v2(GM + 16, loc(DCL), 8)
+                        cuMemcpyHtoD_v2(GM + 24, loc(s7), 8); cuMemcpyHtoD_v2(GM + 32, loc(D), 8)
+                        cuMemcpyHtoD_v2(GM + 40, loc(zz0), 8); cuMemcpyHtoD_v2(GM + 48, loc(rows), 8); cuMemcpyHtoD_v2(GM + 56, loc(rows), 8)
+                        rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (rows + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+                        if (rc_sl != 0) { println("LMHEAD_ERR logits rc=" + (rc_sl as Int).to_string()); return 92 }
+                    }
+                    cuMemcpyHtoD_v2(A4 + 0, loc(DCL), 8); cuMemcpyHtoD_v2(A4 + 8, loc(DBV), 8); cuMemcpyHtoD_v2(A4 + 16, loc(DAO), 8)
+                    cuMemcpyHtoD_v2(A4 + 24, loc(S), 8); cuMemcpyHtoD_v2(A4 + 32, loc(rows), 8); cuMemcpyHtoD_v2(A4 + 40, loc(vs0), 8)
+                    rc_aa<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+                    if (rc_aa != 0) { println("LMHEAD_ERR argmax_acc rc=" + (rc_aa as Int).to_string()); return 92 }
+                    vs0 = vs0 + rows
+                }
+                cuCtxSynchronize()
+                # hand the S winners to AO — the buffer the shared tail below (the written top1 file
+                # and the chat decode) already reads — so nothing after this needs a branch.
+                iv3<Int> = 0
+                iu3<Int> = 0
+                for (iu3 in 0..S - 1) {
+                    iv3 = 0
+                    if (cuMemcpyDtoH_v2(loc(iv3), DAO + iu3 * 8, 8) != 0) { return 16 }
+                    if (cuMemcpyHtoD_v2(AO + iu3 * 8, loc(iv3), 8) != 0) { return 15 }
+                }
+                println("LMHEAD_MODE=untied-chunked chunk_rows=" + CH.to_string() + " chunks=" + ((VOCAB + CH - 1) / CH).to_string())
+                match (open_write("native/out/prefill_top1_vyb.txt")) {
+                    w -> {
+                        iv<Int> = 0
+                        i = 0
+                        for (i in 0..S - 1) {
+                            iv = 0
+                            if (cuMemcpyDtoH_v2(loc(iv), AO + i * 8, 8) != 0) { return 16 }
+                            match (write_str(w, iv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                        }
+                        close(w)
+                    }
+                    ? -> { return 17 }
+                }
+                println("LMHEAD_TOP1_DONE")
+            } else {
             # logits via logits_slice (chunked vocab slices; large-grid kernels truncate)
             LCH<Int> = 16384
             s7<Int> = 0
@@ -1548,6 +1730,7 @@ main()<Int> -> {
                 ? -> { return 17 }
             }
             println("LMHEAD_TOP1_DONE")
+            }
 
             # ---- llm.chat: decode the real-model argmax continuation to text
             # via the stdlib/vllm CPU head (llm:: facade). Closes the
