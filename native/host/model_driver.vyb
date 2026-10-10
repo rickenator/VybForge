@@ -1308,6 +1308,30 @@ main()<Int> -> {
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { println("ATTN_ERR stage attn_norm"); return 77 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { println("ATTN_ERR stage attn_q_norm"); return 78 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { println("ATTN_ERR stage attn_k_norm"); return 79 }
+                # ---- the FFN's own pre-norm, which NOTHING else stages for this branch ----
+                # Ridge names it `post_attention_norm` (qwen3 calls it `ffn_norm`); the fall-through
+                # `run_ffn` below takes it from N2, so without this the FFN of every attention layer
+                # ran with whatever N2 still held — the PREVIOUS block's weight. That is a silent,
+                # layer-dependent error: measured, it left the whole-model hidden at cos 0.54 against
+                # the oracle while every block probe stayed green, because the attention probe stops
+                # at `out` (the attention authority's last stage) and never reaches run_ffn. P4.12 is
+                # the gate that catches this class; the block probes cannot, by construction.
+                l_fn2<Int> = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight")
+                if (l_fn2 < 0) { l_fn2 = find_nm(nmv, "blk." + L.to_string() + ".post_attention_norm.weight") }
+                if (l_fn2 < 0) { println("ATTN_ERR blk." + L.to_string() + " has no FFN pre-norm tensor"); return 7 }
+                e = load_norm(MODEL, PF, DPK, N2, ofv.get(l_fn2), nlv.get(l_fn2), efn)
+                if (e != 0) { println("ATTN_ERR stage post_attention_norm"); return 80 }
+                # ...and the FFN's WEIGHTS, for the same reason and with the same failure mode: the
+                # shared `run_ffn` at the bottom of the loop reads DWg/DWu/DWd, which the RECURRENT
+                # branch stages per block and this branch never did — so every attention block ran its
+                # FFN with the previous recurrent block's gate/up/down. That is the dominant error of
+                # the two: 16 of 64 blocks computed a whole FFN from the wrong weights (Ridge's
+                # attention blocks have their own ffn_* tensors, at the same shapes as the recurrent
+                # ones, so nothing about the staging failed loudly). Stage them by their own type
+                # through the same GridK dispatcher the recurrent branch uses.
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { println("ATTN_ERR stage ffn_gate"); return 74 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { println("ATTN_ERR stage ffn_up"); return 75 }
+                e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { println("ATTN_ERR stage ffn_down"); return 76 }
                 if (APR >= 0) {
                     println("ATTN_GEOM blk." + L.to_string() + " D=" + D.to_string() + " H=" + H.to_string()
                             + " KVH=" + KVH.to_string() + " HD=" + HD.to_string() + " NQ=" + NQ.to_string()
