@@ -1766,8 +1766,33 @@ scored cos 0.99961 with `output_norm` applied and 0.98039 without it. The stage-
 the per-row NORM (≈490 pre-norm vs ≈141 oracle; 141.02 vs 140.95 post-norm), so the tooth now requires
 the post-norm norm ratio ≈ 1 (≤1.05) AND the pre-norm norm ratio ≫ 1 (≥2.0).
 
-**Known and NOT fixed (found while bisecting, does not block W4/W5): short prompts crash.** S=1 and S=2
-die with `GDN_ERR conv` mid-stack (S=5 runs fine). This also invalidated a prefix-based causality check
-(an S=2 run's traces looked like a dramatic cross-token contamination until its exit status was read).
-Worth fixing before real serving.
+**FIXED: short prompts crashed (found while bisecting, then fixed).** S=1 and S=2 died with `GDN_ERR conv`
+mid-stack while S=5 ran fine. Cause: the conv WINDOW was allocated for ONE window (`GDC*GQKV*8`) while
+the loop indexes it per layer (`GCONV + L*GDC*GQKV*8`), so every layer from L=1 wrote and read outside
+the allocation — into device memory nothing else happened to use, which is exactly why the S=5 run could
+still be correct. The dead twin beside it (`DSTC`, sized `MAXL*window` and zeroed) is what the code
+looked like it used; it was never read by any kernel and is now removed, with `GCONV` allocated `MAXL`
+windows and zeroed (a window is sequence state that token 0 reads, and device memory is not pre-zeroed).
+Diagnosed with `CUDA_LAUNCH_BLOCKING=1`, which moved the reported failure from `GDN_ERR conv` to the
+real `GDN_ERR interleave`.
+
+**And that fix bought a stronger gate.** A causal model's token-k hidden cannot depend on the tokens
+after it, so the S-fixture also pins its first k < S positions: running the same prompt at k = 1, 2, 3
+is an oracle-backed check of cross-token state, and it is the only gate that would have caught a
+per-layer state buffer sized for one layer. **P4.12 now runs those prefixes** — and proves each one by
+IDS, not by text or token count: the driver prints `PROMPT_IDS=` and the verifier requires them to be
+the fixture's first k ids, because a text prefix like `The cap` can tokenize to the same COUNT with
+different ids and would silently compare the wrong positions. Measured, and now part of the gate:
+
+```
+whole Ridge forward (1 prompt(s))   PASS (hidden cos 0.999609, per-position top1 == the oracle)
+prefix [The]                        PASS (top1 1/1, hidden cos 0.999713)
+prefix [The capital]                PASS (top1 2/2, hidden cos 0.999594)
+prefix [The capital of]             PASS (top1 3/3, hidden cos 0.999621)
+RIDGE FORWARD GATE: PASS
+```
+
+The S=5 verdict is unchanged (cos 0.999609, top1 5/5, tooth 1.0007/2.73) — the fix altered no
+behaviour, it only made legal memory the run had been borrowing. Regression after the fix: P4.5 GDN
+PASS, `make prefill` on its recorded numbers (3.393e-04, top1 [55286,576] MATCH).
 

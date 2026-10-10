@@ -141,10 +141,8 @@ over-claims relative to staging, and nothing currently catches that; see W1's la
 * **W5** `eng_gdn()`/`eng_mtp()` are still 0 (correctly — see the rule in §5).
 * **W6** (not required for the flip) multi-token / prefill for the recurrent op: the op's chunked
   kernel is UNCHARACTERISED, and only single-token steps are verified. A prompt can still be run as S
-  single-token steps, which is what the loop does today. RELATED, found while bisecting: **S=1 and S=2
-  crash** (`GDN_ERR conv` mid-stack) while S=5 is fine — the small-S case of the conv-state path, and
-  it is what makes a prefix-based causality check unusable. Worth fixing before real serving, since a
-  user's first prompt is often one or two tokens.
+  single-token steps, which is what the loop does today. (The small-S crash found here is FIXED — see
+  W3's landing note — and P4.12 now runs S=1/2/3 as its causal-path coverage.)
 * **The caps probe still cannot distinguish** "a dequant KERNEL exists" from "the model PATH can stage
   the type" (W1 residue, see above) — W1 closed it for 21/22 in fact, but `run_caps_gate.sh` reads
   `eng_type` only and would not notice a regression. A caps-probe line pairing `eng_type` with a
@@ -323,9 +321,21 @@ every token's hidden after each block (`native/out/ridge_trace_L<L>.txt`, matchi
 `--help`) while `llama-server` works — so the per-layer oracle route is closed without a rebuild,
 and a rebuild is not free because the fixtures pin the server's version+commit.
 
-KNOWN, NOT FIXED (found on the way, none blocks W4/W5): **short prompts crash.** S=1 and S=2 die with
-`GDN_ERR conv` mid-stack (S=5 is fine), which also makes a prefix-based causality check unusable —
-see the handoff's W6/notes; this is the `d_conv` state path's small-S case, not the loop.
+**FIXED (found while bisecting W3): short prompts crashed.** S=1 and S=2 died with `GDN_ERR conv`
+mid-stack while S=5 ran fine. Cause: the conv WINDOW was allocated for ONE window (`GDC*GQKV*8`) while
+the loop indexes it per layer (`GCONV + L*GDC*GQKV*8`), so every layer from L=1 wrote outside the
+allocation — into device memory nothing else used, which is why the S=5 run could still match the
+oracle at cos 0.9996. (Its dead twin `DSTC`, sized `MAXL*window` and zeroed, is what the code looked
+like it used; that allocation is now removed and `GCONV` is `MAXL` windows, zeroed.) Diagnosed with
+`CUDA_LAUNCH_BLOCKING=1`, which moved the report from `GDN_ERR conv` to the real `GDN_ERR interleave`.
+
+Verified after the fix: S=1, S=2, S=3 all complete, and because a causal model's token-k hidden cannot
+depend on later tokens, each prefix must reproduce the fixture's positions 1..k — measured
+cos 0.999713 (pos 1), 0.999474 (pos 2), 0.999673 (pos 3), with the oracle's top1 matched at every one.
+**P4.12 now runs those prefixes as part of the gate** (the run's own `PROMPT_IDS` must be the fixture's
+first k ids, so a prefix that tokenizes differently fails loudly instead of comparing wrong positions),
+and the S=5 verdict is unchanged (cos 0.999609, top1 5/5, tooth 1.0007/2.73) — i.e. the fix altered no
+behaviour, it only made legal memory it had been borrowing.
 
 ### W4 — the MTP head (blk.64): `eng_mtp()`'s evidence
 
