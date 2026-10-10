@@ -67,6 +67,29 @@ parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
     }
     return a
 }
+# A whitespace-separated id list -> a Vec, for VYB_PROMPT_IDS: the caller then supplies the EXACT
+# tokens to embed, with no tokenizer in the path. A gate uses it to run a captured fixture's own id
+# PREFIX, which is what makes causal-path coverage sound for any prompt — guessing a text prefix
+# ("The cap") can tokenize to a different id sequence while keeping the same token count.
+parse_ids(s<String>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec()
+    n<Int> = s.len()
+    cur<Int> = -1
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) {
+                if (cur < 0) { cur = 0 }
+                cur = cur * 10 + (c - 48)
+            }
+        } else {
+            if (cur >= 0) { v.push(cur) ; cur = -1 }
+        }
+    }
+    if (cur >= 0) { v.push(cur) }
+    return v
+}
 parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
     n<Int> = 1
     seg<Int> = frm
@@ -435,9 +458,17 @@ main()<Int> -> {
         prids.push(0); prids.push(1)
         println("PROMPT_MODE=synthetic PROMPT_N=2 PROMPT_NOTE=input is the characters !\" -- no tokenizer, no chat template; the decoded response is gibberish by construction, compare the hidden output instead")
     } else {
+        pids<String> = env_get("VYB_PROMPT_IDS") else ""
+        if (pids.len() > 0) {
+            # An explicit id sequence. No tokenizer, and nothing left to interpret: the ids printed
+            # below ARE the run's input, which is what a prefix-coverage gate needs.
+            prids = parse_ids(pids)
+            println("PROMPT_MODE=ids PROMPT_N=" + prids.len().to_string())
+        } else {
         m0<Model> = llm_load("qwen3", env_get("VYB_LLM_DIR") else "artifacts/vybos-configurator-lora")
         prids = llm_encode(m0, pstr)
         println("PROMPT_MODE=text PROMPT_SRC=<" + pstr + "> PROMPT_N=" + prids.len().to_string())
+        }
     }
     S<Int> = prids.len()
     # Print the ACTUAL ids, not just the count: the oracle fixtures are keyed by token ids, so a

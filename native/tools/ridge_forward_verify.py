@@ -120,9 +120,14 @@ def cos(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
-def run_driver(prompt_text):
+def run_driver(prompt_text, ids=None):
     env = dict(os.environ, VYB_STDLIB=STDLIB, VYB_MODEL=MODEL, VYB_TSV=TSV,
                VYB_INVFREQ=INVFREQ, VYB_LLM_DIR=TOKDIR, VYB_PROMPT=prompt_text)
+    if ids is not None:
+        # An explicit id sequence: no tokenizer in the path, so a PREFIX of the fixture's own ids is
+        # exact by construction. (Guessing a text prefix can tokenize differently.)
+        env["VYB_PROMPT_IDS"] = " ".join(str(i) for i in ids)
+        env.pop("VYB_PROMPT", None)
     cmd = [VYB, "native/host/model_driver.vyb",
            "--module-path", "native/config", "--module-path", "native/json",
            "--module-path", "native/tensor", "--module-path", "native/dtype",
@@ -172,9 +177,9 @@ def existing_run(prompt_text):
 SKIP_RUN = os.environ.get("VYBFORGE_RF_SKIP_RUN", "") != ""
 
 
-def verify_fixture(fx):
+def verify_fixture(fx, ids_k=None):
     name = os.path.basename(fx)
-    print("RIDGE_FORWARD_VERIFY fixture=%s" % name)
+    print("RIDGE_FORWARD_VERIFY fixture=%s%s" % (name, "" if not ids_k else " at ids[:%d]" % ids_k))
 
     # ── provenance FIRST: a mismatch means the oracle moved, not that we are wrong ────────────────
     want_ver, want_gid = field(fx, "llama_version"), field(fx, "gguf_id")
@@ -206,7 +211,8 @@ def verify_fixture(fx):
     # exactly the property that catches a cross-token state bug. The ids check below is what makes
     # that sound (the fixture is keyed by ids).
     run_text = os.environ.get("VYBFORGE_RF_PROMPT") or text
-    out = existing_run(run_text) if SKIP_RUN else run_driver(run_text)
+    ids = want_ids[:ids_k] if ids_k else None
+    out = existing_run(run_text) if SKIP_RUN else run_driver(run_text, ids)
     if out is None:
         return 1
     if "MODEL_PREFILL_DONE" not in out:
@@ -333,7 +339,7 @@ def verify_fixture(fx):
         print("RIDGE_FORWARD_VERIFY_FAIL the hidden's maxrel %.3e exceeds %.3e" % (rel, WORSTREL))
         return 1
     print("RIDGE_FORWARD_VERIFY_SUMMARY fixture=%s S=%d positions=%d hidden_cos=%.6f hidden_maxrel=%.3e "
-          "negatives=pre_norm_cos(%.4f)" % (name, S, checked, c_post, rel, c_pre))
+          "negatives=pre_norm_cos(%.4f)" % (name, runS, checked, c_post, rel, c_pre))
     return 0
 
 
@@ -368,14 +374,32 @@ def main():
         return 0
 
     bad = []
+    # The CAUSAL PATH: a causal model's token-k hidden cannot depend on the tokens that FOLLOW it, so
+    # the fixture also pins its first k positions — running the prompt at k = 1, 2, 3 is an
+    # oracle-backed check of cross-token state, and it is the check that catches a per-layer state
+    # buffer sized for one layer. The prefix is taken from the fixture's OWN ids (VYB_PROMPT_IDS), so
+    # it is exact for any prompt; a text prefix could tokenize differently and compare wrong positions.
+    ks = [] if SKIP_RUN else [int(x) for x in os.environ.get("VYBFORGE_RIDGE_PREFIXES", "1,2,3").split(",") if x.strip()]
+    n_runs = 0
     for fx in fxs:
+        base = os.path.basename(fx)
         if verify_fixture(fx) != 0:
-            bad.append(os.path.basename(fx))
+            bad.append(base)
+            continue
+        n_runs += 1
+        nS = len([int(x) for x in (field(fx, "prompt_ids") or "").split()])
+        for k in ks:
+            if k < 1 or k >= nS:
+                continue
+            if verify_fixture(fx, ids_k=k) != 0:
+                bad.append("%s ids[:%d]" % (base, k))
+            else:
+                n_runs += 1
     if bad:
         print("RIDGE_FORWARD_VERIFY_FAIL %s did not match the oracle" % ", ".join(bad))
         return 1
     print("RIDGE_FORWARD_VERIFY_DONE a whole 64-block Ridge forward reproduces the oracle's per-position "
-          "top1 and its final hidden for %d prompt(s)" % len(fxs))
+          "top1 and its final hidden over %d run(s) across %d fixture(s)" % (n_runs, len(fxs)))
     return 0
 
 

@@ -44,7 +44,8 @@ work="${VYBFORGE_RIDGE_FWD_OUTDIR:-$root/native/out/ridge_forward}"
 mkdir -p "$work"
 log="$work/verify.log"
 
-env -u PYTHONPATH "$py" native/tools/ridge_forward_verify.py "$@" >"$log" 2>&1
+env -u PYTHONPATH "$py" native/tools/ridge_forward_verify.py \
+  ${VYBFORGE_RIDGE_FIXTURES:-the_capital_of_france_is 1_2_3_4_5_6_7} "$@" >"$log" 2>&1
 rc=$?
 grep -E '^RIDGE_FORWARD_VERIFY' "$log" | sed 's/^/      /'
 
@@ -64,36 +65,12 @@ else
   full_ok=0
 fi
 
-# ── the CAUSAL PATH, on the same fixture, at shorter prefixes ───────────────────────────────────
-# A causal model's token-k hidden cannot depend on the tokens that FOLLOW it, so the fixture also
-# covers the first k positions: running the prompt at k = 1, 2, 3 is an oracle-backed check of the
-# causal path, and it is the check that catches a per-layer state buffer sized for one layer (the
-# S=1/S=2 `GDN_ERR conv` crash) or any cross-token contamination. The verifier proves each prefix's
-# IDS are the fixture's first k ids, so a prefix that tokenizes differently FAILS loudly instead of
-# silently comparing the wrong positions. Skipped when VYBFORGE_RF_SKIP_RUN is set (there is then
-# only one log to read, and it belongs to one prompt).
-pfx_ok=1
-if [ -z "${VYBFORGE_RF_SKIP_RUN:-}" ]; then
-  IFS='|' read -ra PFXS <<< "${VYBFORGE_RIDGE_PREFIXES:-The|The capital|The capital of}"
-  i=0
-  for px in "${PFXS[@]}"; do
-    i=$((i + 1))
-    logp="$work/verify_prefix$i.log"
-    env -u PYTHONPATH VYBFORGE_RF_PROMPT="$px" "$py" native/tools/ridge_forward_verify.py "$@" >"$logp" 2>&1
-    prc=$?
-    pc="$(grep -oE 'hidden_cos=[0-9.]+' "$logp" | tail -1 | sed 's/hidden_cos=//')"
-    pn="$(grep -oE 'per-position top1: [0-9]+/[0-9]+' "$logp" | tail -1 | sed 's/per-position top1: //')"
-    if [ "$prc" = 0 ] && grep -q '^RIDGE_FORWARD_VERIFY_DONE' "$logp"; then
-      step "prefix [${px}]" "PASS (top1 $pn, hidden cos $pc)"
-    else
-      step "prefix [${px}]" "FAIL (see $logp)"
-      grep -E '^RIDGE_FORWARD_VERIFY_FAIL' "$logp" | sed 's/^/      /'
-      pfx_ok=0
-    fi
-  done
-fi
+# The verifier itself runs each fixture's own id PREFIXES (VYBFORGE_RIDGE_PREFIXES, default 1,2,3):
+# a causal model's token-k hidden cannot depend on the tokens after it, so the fixture pins its first
+# k positions too — and the prefix comes from the fixture's OWN ids, so it is exact for any prompt.
+# Those runs are skipped in VYBFORGE_RF_SKIP_RUN mode, where one log belongs to one prompt.
 
-if [ "$full_ok" = 1 ] && [ "$pfx_ok" = 1 ]; then
+if [ "$full_ok" = 1 ]; then
   echo; echo "RIDGE FORWARD GATE: PASS"
   exit 0
 fi
