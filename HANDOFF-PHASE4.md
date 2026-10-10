@@ -1,75 +1,348 @@
-# Phase 4 handoff — Gated DeltaNet reference (VybForge #10, item 1)
+# Phase 4 — make the ENGINE run the Ridge 27B (hybrid Gated-DeltaNet + attention)
 
-Everything below is pushed; `~/Projects/VybForge` main is clean, and `git log --oneline -20` shows the
-unit-by-unit trail. Read `doc/QWEN35-PHASE4.md` for the full narrative — units 1-9, then unit 10 steps
-1-5 with every measurement and every refuted hypothesis — and `doc/SPIKINGBRAIN.md` for the phase-1..3
-background. (The working tree now carries unit 10 step 5 UNCOMMITTED: see RESTART HERE below.)
+This file is the mission brief: it should be enough to finish the job without re-deriving anything.
+Everything stated as measured below was measured; everything stated as not done is not done. Read it
+top to bottom once, then work the W-numbered items in order.
 
-## RESTART HERE — 2026-10-09 (later): unit 10 step 5 is DONE; the next blocker is the FFN's IQ3_S
+Read alongside it: `doc/QWEN35-PHASE4.md` — the phase narrative, unit by unit, including every
+measurement AND every refuted hypothesis (units 1-9, then unit 10 steps 1-5). Where this file and the
+narrative disagree, the narrative is the record and this file is the plan; fix this file.
 
-The attention block now runs in the ENGINE, not just in the authority. Everything below is
-uncommitted on top of `5f991e0`; read `doc/QWEN35-PHASE4.md`, section "Unit 10 step 5", for the full
-narrative (measurements, the two lessons, and what is deliberately not covered).
+---
 
-### What landed (uncommitted, working tree)
+## 1. MISSION — the finish line, precisely
 
-* `native/kernels/attn35.vyb` (NEW, added to the Makefile `KERNELS`): `qg_split` (the joint q+gate
-  de-interleave) and `gate_mul` (`attn * sigmoid(gate)`).
-* `native/host/model_driver.vyb`: Q5_K (13) in `packed_bytes` + `stage_one`; the `JQG` dispatch flag
-  (from the TENSOR TABLE: `attn_q` numel == `2*NQ*D`); the `VYB_ATTN_PROBE=<layer>` selector (S comes
-  from the fixture's own length); the Ridge attention branch (attn_norm -> joint qg -> split ->
-  per-head norms -> `rope_nrot` -> causal GQA attention -> gate -> `wo` -> residual) with the ten
-  stage dumps and the operand probes.
-* `native/tools/attn_engine_verify.py` (NEW) + `native/legit/run_attn_engine_gate.sh` (NEW, step
-  **P4.9** of `run_phase2_battery.sh`).
-* `native/tools/attn_authority.c`: ggml pool 512 MB -> 3 GB (a full-size real-weight fixture for the
-  same harness; P4.8's numbers are unchanged).
+Make the engine run `qwen35` (Qwen3.8-27B "Ridge"). Done means ALL of:
 
-### Verified this session
+1. **`eng_gdn()` = 1** in `native/config/model_caps.vyb` and the caps gate reports the Ridge model
+   without `UNSUPPORTED_LAYER_KIND gated-deltanet` — i.e. a full 64-block forward runs, with the 48
+   recurrent layers carrying their conv window and delta-net state across the sequence.
+2. **`eng_mtp()` = 1** and the draft head (blk.64) is verified — the refusal
+   `UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1` is gone. The descriptor refuses BOTH by design:
+   a 65-block file is not runnable while either is missing.
+3. **A whole-model Ridge run is verified against an INDEPENDENT oracle** — llama-server on the same
+   GGUF, temp 0 — using the S0.4 standard: final hidden + per-position top1 vs the oracle, and a real
+   prompt whose top-2 margin is decisive. Per-layer agreement cannot see an error BETWEEN layers, so
+   this is the acceptance test, not the per-layer gates.
+4. The phase-2 battery green, including the new steps for whatever lands.
+5. `eng_vision()` stays 0: the 27B text GGUF has no vision tower (`mmproj-*.gguf` is a separate file),
+   so text-only runs need nothing from it.
 
-* P4.9 (`./native/legit/run_attn_engine_gate.sh`, or `make -f native/Makefile attn-engine`):
-  blk.3 and blk.7, ten stages each, worst 1.668e-06 / 1.061e-06 on the model's own weights
-  (attn_q/k/v Q5_K, attn_output Q6_K), with teeth — the staged operands at gemm's addresses, the
-  contiguous grouping vs round-robin (2.7e-08 vs 1.6e+00), and the gate vs raw/no gate (6.3e+00 /
-  1.1e+00). Proven able to FAIL: dropping the gate in `gate_mul` turns exactly `gated`/`out` red.
-* `make -f native/Makefile prefill`: BIT-IDENTICAL to the recorded baseline (maxrel 3.393e-04,
-  top1 [55286, 576]) — the engine change is inert on the dense path.
-* P4.8 (`run_attn_block_gate.sh`): PASS, unchanged (worst 4.597e-07).
-* The full phase-2 battery was NOT re-run this session (only P4.8, P4.9 and prefill by hand).
+NOT in scope for this mission: macOS, performance work, prefill-scale distribution (a single-token
+step is I/O-bound; only prefill is throughput-bound and the 3090 handles it), and speculative decoding
+as a *feature* (item 2 only requires the MTP block to be implemented and verified, since the
+descriptor claims it).
 
-### THE NEXT BLOCKER: Ridge's FFN is IQ3_S, and the engine cannot stage it
+## 2. STATE — what is verified, and what is not
 
-`stage_one` handles Q4_K (12), Q5_K (13), Q6_K (14) and falls through to the 1-D norm loader for
-everything else — which silently mis-stages a quantized weight. Ridge's FFN is IQ3_S (type 21,
-`blk.N.ffn_gate/up/down.weight`, ~38 MB each), so:
-* the attention probe STOPS before `run_ffn` (documented in the driver and the gate), and
-* a whole Ridge attention LAYER cannot run through the loop yet.
+### The model
 
-Order for that unit: the IQ3_S dequant kernel already exists and is gated (`native/kernels/iq3s.vyb`,
-`run_iq3_s_gate.sh`, byte-exact) — so this is the *staging* side: `packed_bytes` for type 21,
-`stage_one` (or a `q3fn` in its signature), load `iq3s.ptx` in the driver, add a `--module-path`-safe
-kernel-list entry, and then the FFN can run and the probe can be extended past `out` to the block
-output. Check its IQ3_S block size against `native/gguf/ridge_inventory.py` and its grid-prefix
-requirement (`iq2s`/`iq3s` carry an 8192-byte table prefix in the buffer — Vyb#476's workaround).
+    ~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf   12.6 GB   (VYBFORGE_RIDGE_GGUF overrides)
+    arch=qwen35  65 blocks = 64 text + 1 MTP
+    D=5120  H=24  KVH=4  HD=256  FF=17408  VOCAB=248320  CTX=262144
+    rope: base 1e7, dimension_count 64 (rotate 64 of each 256-dim head), sections [11,11,10,0] (INERT)
+    eps=1e-6  attention 16 of 64 blocks, `blk.N` with N % 4 == 3 (`full_attention_interval=4`)
+    ssm: state_size 128, conv_kernel 4, inner_size 6144, time_step_rank 48, group_count 16
+    nextn_predict_layers=1     UNTIED head: `output.weight` (Q6_K, 5120x248320) is present
 
-### After that
+Tensor types (from `native/gguf/ridge-3.7bpw-inventory.tsv`, which is generated, never hand-edited):
 
-* `eng_mtp()` (the 65th block + the `d2t` tensor) — item 2, and without it the descriptor cannot flip.
-* The multi-token / prefill path for the recurrent block (the op's chunked kernel, still
-  uncharacterised).
-* Then the whole-model Ridge run (logits against llama.cpp on the same GGUF) and the `eng_gdn()` flip
-  — still 0 on purpose; see `doc/QWEN35-PHASE4.md` and the caps gate.
+    role/type            count   where                                   engine staging
+    gdn_state/F32         192    ssm_conv1d, ssm_norm, ssm_dt, ssm_a      load_norm            OK
+    gdn_state/Q8_0         96    ssm_beta, ssm_alpha                       load_quant(q8fn)     OK
+    gdn_state/Q4_K         48    ssm_out                                   load_quant(q4fn)     OK
+    gdn_mixer/Q4_K         96    attn_qkv, attn_gate                       load_quant(q4fn)     OK
+    attention/F32          96    attn_norm, attn_q_norm, attn_k_norm       load_norm            OK
+    attention/Q5_K         48    attn_q (JOINT q+gate), attn_k, attn_v     stage_one ty==13     OK (step 5)
+    attention/Q6_K         16    attn_output                               stage_one ty==14     OK
+    norm/F32               65    per-block norms                           load_norm            OK
+    ffn/IQ2_S             160    blk.4-11 gate/up, blk.12-59 all three     *** MISSING ***      -> W1
+    ffn/IQ3_S              32    blk.0-3 all three, blk.4-11 down,
+                                 blk.60-63 all three                       *** MISSING ***      -> W1
+    mtp/Q5_K                3    blk.64.attn_q (joint), attn_k, attn_v     stage_one ty==13     OK
+    mtp/Q6_K                5    blk.64.attn_output, ffn_gate/up/down,
+                                 nextn.eh_proj                             stage_one ty==14     OK
+    mtp/F32                 7    blk.64 norms incl. nextn.enorm/hnorm/
+                                 shared_head_norm                          load_norm            OK
+    embed_head/Q6_K         2    token_embd, output.weight                 see W2               W2
 
-### Lessons worth reading first (full text in doc/QWEN35-PHASE4.md and the skills)
+`IQ2_S` is 82 bytes per 256 values, `IQ3_S` 110, `Q5_K` 176, `Q6_K` 210, `Q4_K` 144. The FFN type
+boundary is NOT by block kind: blocks 0-3 and 60-63 are all IQ3_S, blocks 4-11 have IQ3_S `ffn_down`
+with IQ2_S gate/up, blocks 12-59 are all IQ2_S.
 
-* GQA needed NO replication kernel in the engine: `attn` already groups `h/(H/KVH)`. When comparing
-  against a replicated-row authority, replicate the ENGINE's K stages with a SLICE repeat
-  (`np.repeat(..., axis=1)` on 3-D) but replicate WEIGHTS with `np.tile` — `np.repeat(W, grp, axis=0)`
-  repeats rows and scrambles the block (measured 1.365 error for a verifier-side bug).
-* A quant type can be gated bit-exact AND unstaged: check `packed_bytes` *and* `stage_one`, not just
-  the kernel.
-* One GPU job at a time on this box: two drivers serialise and each busy-waits at 100% CPU, which
-  looks exactly like a slow driver (33 min with no output, then 15 s when the other was killed).
+### The descriptor's own verdict right now
+
+    ./native/legit/run_caps_gate.sh        # or: make -f native/Makefile caps
+    CAPS_LAYOUT=hybrid-recurrent  N_LAYERS=65 TEXT_LAYERS=64 ATTN_LAYERS=16 GDN_LAYERS=48 MTP_LAYERS=1
+    CAPS_NEXTN_TENSORS=4  ATTN_INTERVAL=4  VISION=0
+    CAPS_TYPES=F32:360,Q8_0:96,Q4_K:144,Q5_K:51,Q6_K:23,IQ3_S:32,IQ2_S:160
+    CAPS_UNSUPPORTED=UNSUPPORTED_LAYER_KIND gated-deltanet layers=48,
+                     UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1
+    CAPS_VERDICT=UNSUPPORTED
+
+Two things to know about that output. (a) There is NO quant-type refusal, because `eng_type()` in
+`native/config/model_caps.vyb` returns 1 for IQ2_S/IQ3_S — it means "a kernel exists", and the kernels
+do exist and are gated. But the model PATH cannot stage those types yet (W1). The descriptor therefore
+over-claims relative to staging, and nothing currently catches that; see W1's last bullet.
+(b) `eng_gdn()`/`eng_mtp()` are the only refusals, which is exactly the finish line in §1.
+
+### Verified — do not re-derive (each one has a gate; numbers are the recorded measurements)
+
+| gate | step | proves | measured |
+|---|---|---|---|
+| `run_gdn_ops_gate.sh` | P4.1 | the GDN op references (recurrence, conv, l2/rms norms, gates, projections) against ggml's own ops | maxrel 1.6e-07..5e-07 at model geometry |
+| `run_gdn_kernel_gate.sh` | P4.2 | the GDN GPU kernels | 8.0e+05 outputs, worst 6.3e-11 (fp64 both sides) |
+| `run_gdn_layer_gate.sh` | P4.3 | the recurrent block WIRED out of Vyb kernels, 2 chained steps | 26 stages, worst 2.4e-07 |
+| `run_layerkind_gate.sh` | P4.4 | the per-block KIND dispatch (`mc_layer_kind`) on both models vs an independent parser | per block, both models |
+| `run_gdn_engine_gate.sh` | P4.5 | the recurrent block on the ENGINE's weight path (GGUF by name + its own dequant + `gemm`) | 26 stages / 2 steps, worst 3.9e-06 |
+| `run_rope_gate.sh` | P4.6 | the rope SPEC: NEOX inside n_dims=64, 11 alternatives rejected | 8.993e-08 |
+| `run_rope_kernel_gate.sh` | P4.7 | `rope_nrot` on the GPU at n_rot=64 AND (must-miss) n_rot=HD | 8.9e-08 / 7.0e-08 vs 1.703 |
+| `run_attn_block_gate.sh` | P4.8 | Ridge's attention block's ten stages against ggml (synthetic fixture), incl. the GQA-replicated case | worst 3.9e-07..4.6e-07, 6-7 alternatives rejected |
+| `run_attn_engine_gate.sh` | P4.9 | the same block on the ENGINE's weight path (blk.3, blk.7), ten stages, real Q5_K/Q6_K weights | worst 1.668e-06 / 1.061e-06 |
+| `make prefill` | — | the dense Qwen3-4B regression (the path every engine change must not disturb) | bit-identical: maxrel 3.393e-04, top1 [55286, 576] |
+| S0.5/S0.6/S0.7/S0.8/S0.9/S0.10 | — | Q8_0, IQ2_S, Q5_K, IQ3_S, BF16, Q4_K dequant kernels vs the compiled upstream C | byte-exact (0 ulp) |
+| `run_caps_gate.sh` | S0.2e | the capability descriptor, 4 cases | see above |
+
+### NOT done — this is the work list
+
+* **W1** the FFN of every Ridge block cannot be STAGED (IQ2_S 160 + IQ3_S 32). Kernels gated; the
+  staging path lacks the types, and those two kernels take a GRID argument so the 4-arg loader cannot
+  launch them. Until W1, an attention probe must stop at `out` (it does, deliberately) and no whole
+  Ridge layer can run.
+* **W2** the UNTIED lm_head and the 248320-row embedding table. `output.weight` exists; the driver
+  uses `token_embd` as if tied. A full f64 dequant of either table is 10.2 GB → both must be chunked.
+* **W3** no whole-model Ridge forward has ever run; the loop has only run single blocks in probe mode.
+* **W4** the MTP head (blk.64) is not implemented at all.
+* **W5** `eng_gdn()`/`eng_mtp()` are still 0 (correctly — see the rule in §5).
+* **W6** (not required for the flip) multi-token / prefill for the recurrent op: the op's chunked
+  kernel is UNCHARACTERISED, and only single-token steps are verified. A prompt can still be run as S
+  single-token steps, which is what the loop does today.
+
+## 3. THE WORK, in order of dependency
+
+### W1 — stage IQ2_S (82 B/256) and IQ3_S (110 B/256): this unblocks the FFN
+
+Facts you need, all checked:
+
+* The kernels exist and are BYTE-EXACT gated: `native/kernels/iq2s.vyb` (`iq2sdeq`) and
+  `native/kernels/iq3s.vyb` (`iq3sdeq`), gates `run_iq2_s_gate.sh` / `run_iq3_s_gate.sh`.
+* Their signature is FIVE arguments — `iq2sdeq(grid, q, o, n, z)` — with the codebook grid as an
+  ordinary pointer argument, so they are launched with `cuda_launch_n` (Vyb#476), NOT
+  `cuda_launch4i`. **`model_driver.vyb` declares only `cuda_launch4i` today**: add
+  `cuda_launch_n(f<loc<CVoid>>, gx, gy, gz, bx, by, bz, kernelParams<loc<CVoid>>, nargs<CUInt>)<CInt>`
+  to its `extern "C"` and write a staging helper that builds the cell-address array (the pattern is in
+  `native/host/iq3_s_load_driver.vyb`, and gate-and-probe-discipline §8 has the shape).
+* The grid images are files: `native/out/iq2s_grid.bin` (8192 B) and `native/out/iq3s_grid.bin`
+  (2048 B), written by `native/tools/iq2_s_ref.py` / `iq3_s_ref.py` (mechanically extracted from
+  upstream by `gen_iq2s_tables.py`, commit recorded in the header). The driver must length-check them
+  and upload each ONCE (they are the same for every tensor).
+* `z` keeps the same meaning as the other dequant kernels: `z > 0` transposes the whole-matrix write,
+  and the value passed is the tensor's IN dim (`packed_bytes`-style numel is the N dimension). Same
+  convention as `q4kdeq`/`q5kdeq`/`q6kdeq` — read those comments before writing the call.
+* `packed_bytes` in `model_driver.vyb` needs `if (ty == 22) { return numel * 82 / 256 }` and
+  `if (ty == 21) { return numel * 110 / 256 }`.
+* `stage_one` needs two more cases, and because the launcher differs, give the grid kernels their own
+  helper rather than another positional argument to `stage_one` (its 13 call sites already carry
+  `q4fn, q5fn, q6fn, efn`; a 5th function pointer plus a grid pointer is where that signature stops
+  being readable). Suggested: `load_quant_grid(path, dpk, dout, off, nb, numel, qfn, gridDev, inz)`.
+* The reference for the FFN check is OUR ports (`iq2_s_ref.iq2_s_ours(raw)`,
+  `iq3_s_ref.iq3_s_ours(raw, kmask, grid)`), each verified element-wise against llama.cpp's own
+  compiled dequantizer in its gate. Do NOT use the python `gguf` package for these types — it has them
+  in its enum and no dequantizer, and "our numpy agrees with our numpy" is exactly the self-consistency
+  the authority rule forbids.
+
+Acceptance: extend the probe gate with the FFN. Cheapest honest version — a `VYB_FFN_PROBE=<layer>`
+(or an FFN section inside `VYB_ATTN_PROBE`) that stages the block's three FFN weights + its
+`post_attention_norm`, runs attn_post_norm → gate/up → silu → down → residual, and dumps the stages
+(`ffn_xn`, `ffn_gate`, `ffn_up`, `ffn_silu`, `ffn_down`, `block_out`). Compare against a numpy
+reference assembled from the model's OWN dequantised tensors (the GDN/attention verifiers are the
+template: `native/tools/gdn_engine_verify.py`, `native/tools/attn_engine_verify.py`), with
+(a) an OPERAND probe at the addresses `gemm` reads (`B[k*N+n]`), (b) the residual mis-wirings printed
+as negatives, (c) `not (r <= bar)` so NaN fails. Then wire it as P4.10 and prove it can FAIL (§21).
+Bar: ~1e-4 is right here, because the authority's operands come from our ports at f32 while the engine
+is f64 — say so in the gate header instead of implying an exact-path tolerance.
+
+Last bullet, and it is a real gap: when W1 lands, `eng_type(21)`/`eng_type(22)` are *finally* true of
+the model path as well as of the kernels. Until then the descriptor over-claims; record that in the
+gate header, and consider a caps-probe line that distinguishes "kernel exists" from "the model path can
+stage it" (the probe reads `eng_type` only, so today it cannot see the difference).
+
+### W2 — the UNTIED head and the chunked embedding table (needed for W3's oracle comparison)
+
+* `model_config` already derives this: `ModelConfig.tied` is 0 when the tensor table has
+  `output.weight` (`native/config/model_config.vyb`, the `tied(output.weight present)` branch). Ridge
+  is therefore tied=0 and `output.weight` is Q6_K 5120x248320. The driver currently ignores `cfg.tied`
+  and dequantizes `token_embd` into `DE`, using it for BOTH the embed gather and the lm_head.
+* Arithmetic that decides the design: a full f64 table is `248320 * 5120 * 8 = 10.17 GB` per table —
+  two of them plus the 3 GB of layer weights plus the 402 MB GDN state cache will not fit a 24 GB
+  card. So:
+  * **embed**: dequantize only the rows the prompt needs. One token row = 5120 values = 20 Q6_K blocks
+    of 210 B = 4200 bytes. A tiny kernel (or a `q6kdeq` launch over just those blocks with the right
+    offsets) builds the S rows into a `S*D` f64 buffer; the dense path's `embed` gather kernel can then
+    stay as it is, or be bypassed for a per-row build. Do NOT allocate `DE` for Ridge.
+  * **lm_head**: dequantize a VOCAB CHUNK into a reusable f64 buffer and run `gemm` over it, chunk by
+    chunk (16384 rows → 671 MB). The existing `logits_slice` kernel assumes a fully dequantized table,
+    so either extend it to take a chunk or drive `gemm` per chunk and keep the argmax running — state
+    which you did. This is also the shape the MTP head's shared head needs (W4).
+* Acceptance: the numeric gate on a real prompt — per-position top1 + final hidden vs `llama-server`
+  at `-ngl 0` temp 0 (see §6 for the oracle recipe). Pin the oracle's identity (llama.cpp revision +
+  GGUF id) in the fixture and make a provenance mismatch a FAIL that says "recapture required".
+
+### W3 — the whole-model Ridge forward
+
+With W1 and W2 in place the loop has everything:
+
+* the per-layer dispatch is already the shared rule (P4.4) and the loop asks it (`lkc` in
+  `model_driver.vyb`);
+* the recurrent branch is staged and verified per layer (P4.5) and carries conv + delta-net state
+  across S single-token steps (the loop's `for (gst in 0..S-1)`), with the 2-slot-per-layer state
+  cache allocated and zeroed per sequence;
+* the attention branch runs the whole block (P4.9) — extend it past `out` once W1 lands, so a whole
+  Ridge layer is covered end to end;
+* the FFN branch is the SAME code the dense model uses, and it is already exercised by `make prefill`.
+
+What has never happened: all 64 blocks in one process. Expect the class of failure in
+gate-and-probe-discipline §28 — "a hybrid model exercises the loader paths a dense one leaves dormant":
+buffers sized from the wrong template layer, a tensor name that differs by architecture, a device
+buffer whose name shadows a geometry value, a large cache zeroed through the 8-byte helper.
+
+Acceptance: `MODEL_PREFILL_DONE` + the oracle comparison of W2, on a real prompt, with the hidden
+comparison as the primary signal (the synthetic `[0,1]` prefix is a coin flip for top1 — see §5).
+
+### W4 — the MTP head (blk.64): `eng_mtp()`'s evidence
+
+The block is a FULL attention block plus an FFN plus the NextN-specific tensors, and llama.cpp's own
+`graph_mtp` is the recipe — copy it with file:line in your harness (`llama.cpp/src/models/qwen35.cpp`,
+`graph_mtp`, lines 498-671):
+
+    e        = rms(embed(next_token_ids), nextn.enorm)        # the SHARED token_embd (no nextn.embed_tokens here)
+    h        = rms(hidden, nextn.hnorm)
+    concat   = concat(e, h, ne0)                              # 2*D, EMBEDDING FIRST, then hidden  (line 559)
+    cur      = eh_proj @ concat                               # eh_proj ne (2*D, D) -> numpy (D, 2*D)
+    inpSA    = cur
+    cur      = attn_norm(cur)  -> wq (JOINT q+gate: q FIRST, gate SECOND) -> attn_q_norm per head
+                               -> wk -> attn_k_norm per head -> wv
+                               -> partial rope (n_dims 64, same sections, same base)
+                               -> GQA attention (kv = h/(H/KVH), same kernel)
+                               -> cur * sigmoid(gate) -> wo
+    cur      = cur + inpSA
+    cur      = cur + ffn(attn_post_norm(cur))                 # SILU, parallel gate/up   (lines 621-632)
+    logits   = shared_head_norm(cur) @ output.weight          # nextn.shared_head_norm here; head = model.output
+
+* **`d2t` does not exist in this file.** It is a DRAFT-VOCAB TRIM table (`n_vocab_out` rows) that
+  llama.cpp only uses when the GGUF is MTP-ONLY (`mtp_only`) and only if `output.weight` is present
+  (lines 40-61, 653-667). An earlier revision of this handoff called the draft head "the 65th block +
+  the d2t tensor" — that is wrong for this model, and a reader who went looking for `d2t` would waste
+  a session. The file has exactly four `nextn.*` tensors: `eh_proj`, `enorm`, `hnorm`,
+  `shared_head_norm` (which is what `CAPS_NEXTN_TENSORS=4` counts).
+* All of blk.64's types are already stageable after step 5 (Q5_K joint attn_q + Q6_K + F32) — W1 is
+  NOT a prerequisite for the MTP head, only W2's chunked head is.
+* Acceptance: an oracle comparison of the head's logits for a given (hidden, next token) pair against
+  llama.cpp. `llama-server`'s speculative/MTP path is the natural oracle if this revision exposes it
+  (`~/Projects/llama.cpp` at 4df29be4 has `--draft`/speculative machinery and `graph_mtp` as
+  `LLM_GRAPH_TYPE_DECODER_MTP`); if the server cannot emit it directly, build a small C harness that
+  links libggml and calls the same graph — the harness pattern is `native/tools/attn_authority.c`.
+  Verify the draft head does not change the MAIN logits (it must not: it is not in the main pass).
+* Wire it as a gate + battery step and prove it can FAIL, as always.
+
+### W5 — flip the descriptor, last
+
+`native/config/model_caps.vyb`:
+
+    eng_gdn()<Int> -> { return 1 }      // only after W3's oracle comparison is green
+    eng_mtp()<Int> -> { return 1 }      // only after W4 is green
+    eng_vision()<Int> -> { return 0 }   // stays: the text GGUF has no vision tower
+
+Then re-run `run_caps_gate.sh`. Its assertions are on the REFUSAL LIST, not just the count (S0.2e /
+unit-19): the two names above must disappear and nothing else may appear. Read the step that fails if
+one does — it names the flag still refusing, so never hunt for anything else first.
+
+The rule that keeps this honest: **a descriptor flag claims a whole capability at once** — weight
+loading, per-sequence state carry-over, the multi-token/prefill path, the engine wiring, and (for MTP)
+the whole draft head. "Our kernels reproduce the layer to 1e-6" is evidence about KERNELS and says
+nothing about those. Flip on the oracle comparison, not on the per-layer gates.
+
+### W6 — the multi-token/prefill path for the recurrent op (not on the critical path)
+
+The op has TWO kernels: one token runs the sequential rule the port implements; several run a chunked
+one that fills the buffer differently. **This is NOT YET CHECKED** — two earlier claims about it (that
+token 0's output depends on later tokens; that identical slices gave different per-head results) were
+ARTEFACTS of a transposed read and are WITHDRAWN; do not repeat them. Characterise it with the
+`gdn_authority.c` harness at T=1,2,3 with distinguishable inputs, then extend the reference. Until
+then the port/reference must refuse multi-token comparison and the engine runs S single-token steps —
+which is correct, just slower.
+
+## 4. ENVIRONMENT — the exact setup
+
+    repo      ~/Projects/VybForge        (this file's repo; ships to `main` directly)
+    compiler  ~/Projects/Vyb             (VYBHOME; `build/vyb`, `stdlib/`)
+    llama.cpp ~/Projects/llama.cpp       (4df29be4, supports qwen35; the ORACLE, not a dependency)
+
+* `. ./vybenv.sh` resolves `$VYB`, `$VYB_STDLIB`, `$VYBHOME` and the model paths; `VYBHOME=<other
+  checkout> ./native/legit/run_x_gate.sh` exercises an unmerged compiler fix in a worktree without
+  touching the main checkout.
+* **Run every python oracle with `env -u PYTHONPATH`** — the agent session's PYTHONPATH shadows the
+  repo `.venv`. A gate that says "transformers not available" or dies on
+  `numpy._core._multiarray_umath` is this, not a broken venv. Prefer
+  `env -u PYTHONPATH make -f native/Makefile <target>`.
+* `make -f native/Makefile verify` builds every kernel in `KERNELS` (kernels are artifacts of the
+  compiler that emitted them; a toolchain stamp guards reuse). A kernel used by a driver must be in
+  `KERNELS` or a clean build lacks its `.ptx`.
+* Derived inputs, all regenerable, never hand-edited:
+  * `native/gguf/ridge-3.7bpw-inventory.tsv` — `native/gguf/ridge_inventory.py` (name/dims/type/role/
+    offset/bytes + per-type summary). Offsets are ABSOLUTE file offsets.
+  * `native/out/ridge_tensors.tsv` — `native/tools/inventory_to_tsv.py` (what the driver parses).
+  * `native/out/ridge_invfreq.bin` — `native/tools/gen_invfreq.py 1e7 64 <out>` (32 f64 entries; the
+    entry COUNT is n_dims/2, so the table's length IS n_dims).
+  * `native/out/iq2s_grid.bin` (8192 B) / `native/out/iq3s_grid.bin` (2048 B) — written by
+    `iq2_s_ref.py` / `iq3_s_ref.py`.
+* Wrapper laws: `main()`'s return value is PRINTED, not the exit code (a driver that returns 60 still
+  exits 0) — parse the driver's `*_DONE` line or, better, gate on the verifier's exit status.
+* `llama-cli` dumps core on this box (even `--help`); `llama-server` is the working entry point.
+* `~/Projects/llama.cpp` has 27 uncommitted lines in `src/models/qwen35.cpp` that are NOT ours
+  (sibling `build-fastmtp` tree suggests MTP experimentation) — leave them alone, and remember the
+  tree is not pristine when you build an authority from it.
+* The conda plugin crash-report printed by every `python`/`vyb` start on this box is benign noise.
+* **ONE GPU JOB AT A TIME.** Two CUDA drivers serialise on the card and each busy-waits at 100% CPU:
+  a driver whose own phase normally writes its output in ~2 min wrote nothing for 33 minutes while a
+  second driver held the card, and wrote 15 s after it was killed. CPU time 1:1 with wall clock proves
+  a process is RUNNING, never that it is progressing.
+* Budget: the 3090 is 24 GB. A full-size attention weight is 503 MB f64 (12288x5120), the GDN paper
+  weight set ~1.2 GB, the GDN state cache 402 MB, the dense FFN weights 713 MB each. The dense path's
+  `DE` (10.2 GB for Ridge) is the one allocation that does not fit — see W2.
+* Timings worth keeping: `make prefill` varies from ~1 min to ~20 min run to run (page cache, GPU
+  state) — never kill it on elapsed time alone, and a wrong kill records a FAILED gate in the battery
+  (`Error 143`). The GDN engine gate is ~40 s; the attention engine gate is a few minutes.
+
+## 5. GATE AND EVIDENCE CONVENTIONS (short)
+
+* Three levels of evidence for a new capability, in this order: (1) an OP authority — link the built
+  libggml and call the real op, or an upstream function extracted verbatim and compiled; (2) the
+  engine's own path in probe mode with per-stage dumps and REQUIRED negatives; (3) a whole-model
+  comparison against llama-server. Never let level 2 be a side harness: put the probe in the file that
+  will run it (`§26`), and delete the harness in the same change.
+* Comparative teeth are mandatory: every stage check must print the error of the plausible mis-wiring
+  and FAIL if it is not distinguished. `not (r <= bar)` for float comparisons, always.
+* Prove the gate can FAIL (§21): mutate the implementation, re-run, revert, re-run. Never bake the
+  mutation in.
+* A gate that neither runs nor can disagree with the bug is not a gate: regenerate golds inside the
+  target, assert the producer's completion marker, and point comparators at data artifacts, not logs.
+* Landing a capability flag is the LAST step; if the budget runs out before a piece is verified, land
+  the PLAN plus a written reason, not a half-modified engine.
+* Workflow: do NOT commit or push without an explicit go-ahead; batch related checkpoints into one
+  verified commit; never `git add -A`; commit messages are `scope: what now happens` in the
+  imperative, and a commit that claims a gate verdict must be written AFTER that verdict returns.
+  Handoff files get their own `handoff:` commit.
+
+## APPENDIX — the accumulated record (chronological; headings marked HISTORIC are kept only
+## so the record is not rewritten)
+
+Below: the phase narrative as it accumulated (goal, per-unit measurements, the traps that cost the
+most, and the earlier step-5 plan, now superseded by §3 above and kept only so the record is not
+rewritten). The authoritative detailed narrative lives in `doc/QWEN35-PHASE4.md`; the skill lessons in
+the `vybos-development` skill (`references/gate-and-probe-discipline.md`, §1-42) and the
+`vybforge-gpu-model` skill (`references/hybrid-engine-wiring.md`, `model-config-contract.md`,
+`authority-op-verification.md`, `llama-oracle-verification.md`).
 
 ## The goal, and where phase 4 sits
 
@@ -284,7 +557,7 @@ the MTP head, so `eng_gdn()` alone does not make it runnable — `eng_mtp()` (it
 the descriptor needs a documented "run without the draft head" profile. The caps gate asserts the
 refusal list SHRINKS as well as the new count, so it will say which of the two is still refusing.
 
-## `eng_gdn()` is STILL 0, deliberately
+## (HISTORIC) `eng_gdn()` was 0 until the flip — the rule still applies, the state is stale
 
 Do not flip it yet. The descriptor's `eng_gdn()` decides whether the caps gate reports
 `UNSUPPORTED_LAYER_KIND gated-deltanet` for the Ridge model, and the engine path still has no recurrent
@@ -292,7 +565,7 @@ layer: no multi-token/prefill, no state carry-over across a sequence, no quantiz
 nothing wired into `model_driver`/the chat server. Flipping it would make the descriptor claim a
 capability the engine cannot deliver.
 
-## IMMEDIATE NEXT STEP (unit 9) — what the flip still needs
+## (HISTORIC) what the flip needed at unit 9 — superseded by the brief's §1/§3
 
 State carry-over is done (unit 8). Three things remain before `eng_gdn()` can honestly flip:
 
@@ -305,7 +578,7 @@ State carry-over is done (unit 8). Three things remain before `eng_gdn()` can ho
    a caps-gate re-run (the gate asserts the refusal list SHRINKS as well as the new count, skill
    gate-and-probe §6), plus re-running P4.1-P4.3.
 
-## After that (do not start before unit 9 closes)
+## (HISTORIC) 'after that' list from unit 9 — the live list is the brief's §3
 
 * **The prefill/multi-token path.** The op has TWO kernels: with one token it runs the sequential rule
   the port implements; with several it runs a chunked one that fills the buffer differently — proven
@@ -314,7 +587,7 @@ State carry-over is done (unit 8). Three things remain before `eng_gdn()` can ho
   (`--tokens 1`), and no real prompt can run.
 * Then `eng_mtp()` (the 65th block + the `d2t` tensor) — smaller, but buys no tokens alone.
 
-## Environment / gotchas
+## (HISTORIC) environment notes as first written — the brief's §4 supersedes this
 
 * Real runs need `env -u PYTHONPATH` (the session's PYTHONPATH shadows the repo `.venv`).
 * Harnesses must be compiled against the built libggml:
@@ -333,7 +606,9 @@ State carry-over is done (unit 8). Three things remain before `eng_gdn()` can ho
 * Neither verifier is wired into the Makefile or the Phase-2 battery yet — they are one-off scripts.
   Wiring them so they stay green is a small, worthwhile task.
 
-## Next unit: unit 10 step 5 — the engine attention probe (`VYB_ATTN_PROBE=<layer>`)
+## APPENDIX D — the step-5 plan as written before it was done (SUPERSEDED: step 5 landed; see the
+## brief's §1-§3 for the live plan; kept only so the record is not rewritten)
+
 
 The authority side is DONE and gated: the attention block's ten stages (joint Q+gate split, per-head q/k
 RMS norms, rope over 64 of 256 dims, causal attention, the output gate, `wo`), verified three ways —
