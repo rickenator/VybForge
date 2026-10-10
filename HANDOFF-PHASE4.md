@@ -56,9 +56,9 @@ Tensor types (from `native/gguf/ridge-3.7bpw-inventory.tsv`, which is generated,
     attention/Q5_K         48    attn_q (JOINT q+gate), attn_k, attn_v     stage_one ty==13     OK (step 5)
     attention/Q6_K         16    attn_output                               stage_one ty==14     OK
     norm/F32               65    per-block norms                           load_norm            OK
-    ffn/IQ2_S             160    blk.4-11 gate/up, blk.12-59 all three     *** MISSING ***      -> W1
+    ffn/IQ2_S             160    blk.4-11 gate/up, blk.12-59 all three     load_quant_grid      OK (W1)
     ffn/IQ3_S              32    blk.0-3 all three, blk.4-11 down,
-                                 blk.60-63 all three                       *** MISSING ***      -> W1
+                                 blk.60-63 all three                       load_quant_grid      OK (W1)
     mtp/Q5_K                3    blk.64.attn_q (joint), attn_k, attn_v     stage_one ty==13     OK
     mtp/Q6_K                5    blk.64.attn_output, ffn_gate/up/down,
                                  nextn.eh_proj                             stage_one ty==14     OK
@@ -99,18 +99,34 @@ over-claims relative to staging, and nothing currently catches that; see W1's la
 | `run_rope_kernel_gate.sh` | P4.7 | `rope_nrot` on the GPU at n_rot=64 AND (must-miss) n_rot=HD | 8.9e-08 / 7.0e-08 vs 1.703 |
 | `run_attn_block_gate.sh` | P4.8 | Ridge's attention block's ten stages against ggml (synthetic fixture), incl. the GQA-replicated case | worst 3.9e-07..4.6e-07, 6-7 alternatives rejected |
 | `run_attn_engine_gate.sh` | P4.9 | the same block on the ENGINE's weight path (blk.3, blk.7), ten stages, real Q5_K/Q6_K weights | worst 1.668e-06 / 1.061e-06 |
+| `run_ffn_engine_gate.sh` | P4.10 | Ridge's FFN block on the ENGINE's weight path (blk.3 IQ3_S, blk.7 mixed, blk.19 IQ2_S), seven stages ×3 layers, real IQ2_S/IQ3_S weights | worst 2.326e-11 |
 | `make prefill` | — | the dense Qwen3-4B regression (the path every engine change must not disturb) | bit-identical: maxrel 3.393e-04, top1 [55286, 576] |
 | S0.5/S0.6/S0.7/S0.8/S0.9/S0.10 | — | Q8_0, IQ2_S, Q5_K, IQ3_S, BF16, Q4_K dequant kernels vs the compiled upstream C | byte-exact (0 ulp) |
 | `run_caps_gate.sh` | S0.2e | the capability descriptor, 4 cases | see above |
 
 ### NOT done — this is the work list
 
-* **W1** the FFN of every Ridge block cannot be STAGED (IQ2_S 160 + IQ3_S 32). Kernels gated; the
-  staging path lacks the types, and those two kernels take a GRID argument so the 4-arg loader cannot
-  launch them. Until W1, an attention probe must stop at `out` (it does, deliberately) and no whole
-  Ridge layer can run.
+* **W1** DONE — the FFN of every Ridge block now STAGES. `stage_one` routes types 22/21 (IQ2_S
+  82 B/256, IQ3_S 110 B/256) to a new `load_quant_grid` that launches through `cuda_launch_n`
+  (Vyb#476) with the codebook as a real fifth argument; both grid images are uploaded once in
+  `main()`. Before W1 there was no case for 21/22 and the loader fell through to the F32 rule, so
+  an FFN weight would have been silently mis-staged. Verified by **P4.10**
+  (`native/legit/run_ffn_engine_gate.sh` → `native/tools/ffn_engine_verify.py`), which runs the
+  engine's own driver in FFN-probe mode (`VYB_FFN_PROBE=<layer>`) at three type boundaries —
+  blk.3 all IQ3_S, blk.7 IQ3_S `ffn_down` with IQ2_S gate/up, blk.19 all IQ2_S — comparing seven
+  stages over 21 checks against OUR `iq2_s_ref`/`iq3_s_ref` ports, with the staged operands at
+  gemm's own addresses and three mis-wirings required to MISS. **Measured: worst 2.326e-11 at
+  blk.7** (bar 1e-4). Proven able to FAIL: pairing the kernels with the wrong grid table is caught
+  at 6/6 operand slots, and staging `ffn_down` with `inz=D` instead of `FF` at 1/6.
+* **W1 residue** the caps probe still cannot distinguish "a dequant KERNEL exists" from "the model
+  PATH can stage the type" — W1 closed that gap for 21/22 in fact (they occur only in the FFN, and
+  every FFN type now stages), but `run_caps_gate.sh` reads `eng_type` only and would not notice a
+  regression. A caps-probe line that pairs `eng_type` with a staging capability is still a
+  worthwhile follow-up.
 * **W2** the UNTIED lm_head and the 248320-row embedding table. `output.weight` exists; the driver
   uses `token_embd` as if tied. A full f64 dequant of either table is 10.2 GB → both must be chunked.
+  (The 10.2 GB `DE` allocation is still made unconditionally in `main()`; it fits on the 3090 for a
+  probe run — the P4.5/P4.9/P4.10 probes all make it — but it must not exist for a whole-model run.)
 * **W3** no whole-model Ridge forward has ever run; the loop has only run single blocks in probe mode.
 * **W4** the MTP head (blk.64) is not implemented at all.
 * **W5** `eng_gdn()`/`eng_mtp()` are still 0 (correctly — see the rule in §5).
@@ -120,7 +136,29 @@ over-claims relative to staging, and nothing currently catches that; see W1's la
 
 ## 3. THE WORK, in order of dependency
 
-### W1 — stage IQ2_S (82 B/256) and IQ3_S (110 B/256): this unblocks the FFN
+### W1 — stage IQ2_S (82 B/256) and IQ3_S (110 B/256): this unblocks the FFN — **LANDED**
+
+**Landed** in `native/host/model_driver.vyb`: `cuda_launch_n` added to its `extern "C"`;
+`packed_bytes` gained `ty==22 → numel*82/256` and `ty==21 → numel*110/256`; a new
+`load_quant_grid(path, dpk, dout, off, nb, numel, fh, gridDev, inz)` builds the five-cell argument
+array and launches through `cuda_launch_n`; `stage_one` takes one extra argument — a `GridK` struct
+(`f2/g2` = the iq2sdeq handle + its device table, `f3/g3` the IQ3_S pair) — so its 21 call sites
+changed only by that trailing value and the two grid kernels are NOT two more positional function
+pointers; both `.ptx` load unconditionally next to q5k/attn35, and the two grid images
+(`native/out/iq2s_grid.bin` 8192 B, `iq3s_grid.bin` 2048 B) are length-checked and uploaded once.
+`native/Makefile`'s `KERNELS` gained `iq2s iq3s q8_0` (the last was a latent gap: `model_driver.vyb`
+loads `q8_0.ptx` unconditionally, but `make verify` did not build it). New target `ffn-engine`; new
+battery step **P4.10**. The recipe below is kept as the record of what the work was.
+
+**Trap this landing sprang, worth knowing before touching any size helper:** `DPK` (the staging buffer
+every `load_quant`/`stage_one` uploads into) used to be sized as `packed_bytes(blk.0.ffn_down.weight)`
+— and because blk.0 is RECURRENT, that is an IQ3_S FFN tensor which, before W1, fell through to the
+4-bytes-per-element rule and made `DPK` 356 MB, larger than every packed form in the file. The fix
+shrank it to 38 MB and Ridge's `attn_q` (12288x5120 Q5_K, 43.3 MB) overran it, surfacing as
+`ATTN_ERR stage attn_q` — a CUDA error that reads like a kernel bug. P4.9 caught it. `DPK` is now
+computed as `max packed_bytes` over the tensors the loop stages whole (excluding `token_embd`, which
+`emb_dequant` stages in 65536-ELEMENT chunks) and prints `PK_STAGE bytes=73113600`. When you add a
+case to `packed_bytes`, re-check every allocation sized from it.
 
 Facts you need, all checked:
 
@@ -197,8 +235,11 @@ With W1 and W2 in place the loop has everything:
 * the recurrent branch is staged and verified per layer (P4.5) and carries conv + delta-net state
   across S single-token steps (the loop's `for (gst in 0..S-1)`), with the 2-slot-per-layer state
   cache allocated and zeroed per sequence;
-* the attention branch runs the whole block (P4.9) — extend it past `out` once W1 lands, so a whole
-  Ridge layer is covered end to end;
+* the attention branch runs the whole block (P4.9) — the probe deliberately stops at `out`, because
+  that is the attention authority's last stage, but the LOOP already falls through to `run_ffn` at
+  the tail (the same shared FFN call the recurrent branch uses), so with W1 landed a whole Ridge
+  attention layer is covered end to end by P4.9 + P4.10; the attention probe must NOT be extended,
+  it would duplicate what P4.10 pins;
 * the FFN branch is the SAME code the dense model uses, and it is already exercised by `make prefill`.
 
 What has never happened: all 64 blocks in one process. Expect the class of failure in
