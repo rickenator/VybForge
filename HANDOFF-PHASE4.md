@@ -346,6 +346,48 @@ had been borrowing.
 
 ### W4 — the MTP head (blk.64): `eng_mtp()`'s evidence
 
+**LANDED (W4) — the draft head reproduces the oracle's next-next-token picks.**
+`native/legit/run_ridge_mtp_gate.sh` (**P4.13**, `make ridge-mtp`) walks the `nextn.*` chain against the
+SAME captured fixtures, with no new oracle capture: for every prompt position t it feeds the head the
+ORACLE's own normalised hidden row and the ORACLE's own token t+1, and requires its per-step top1 to be
+the oracle's recorded pick for t+2, under the fixture's margin rule. Measured — **4/4 steps agree on
+the capital prompt, all of them "exact" picks** (`agree=4/4`, rope_pos=1), with the checker's
+off-by-one tooth missing as it must. Using the oracle's hidden as the input takes the main pass out of
+the loop, so a disagreement is this block's rather than 64 layers of accumulation.
+
+The implementation added NO block code: the draft step IS an ordinary `blk.NTL` attention+FFN block, so
+it runs through the loop's own dispatch and staging; new code is the input chain (`rms(h, hnorm)`
+inverted-concat `rms(e(t+1), enorm)` → `eh_proj`), the four staged `nextn.*` tensors, a loop restricted
+to `blk.NTL` (`LST`/`LEP`) and `shared_head_norm` in place of `output_norm` at the head. Gated as
+default-off (`VYB_MTP`), and the main path was re-measured inert after it landed: P4.12 byte-identical
+(0.999609 …) and `make prefill` unchanged.
+
+The two things llama.cpp leaves to its caller were settled by MEASUREMENT, not assumption: the draft
+step runs at the NEXT token's position (rope base **1**; base 2 is recorded as the alternative and is
+not what the fixture agrees with), and the hidden fed in is the NORMALISED one (the MTP hook carries
+the `h_nextn` row) — feeding the raw last-layer hidden would double-normalise through `hnorm`.
+
+**OPEN — the 19-step fixture exposes 2 disagreements, so W4 is NOT fully green and W5 must NOT be
+flipped yet.** P4.13 runs both fixtures; the capital prompt is 4/4 (all "exact"), but the 20-token
+counting prompt agrees at only **17 of 19 steps**:
+
+    step 0 -> pos 2: ours=111047 oracle={17,15}  (margin 0.066, membership)  <- a near-tie
+    step 1 -> pos 3: ours=16     oracle=17       (margin 1.342, exact)       <- DECISIVE
+
+The first is consistent with the fp64-vs-fp32 gap that P4.12 measures as growing with prompt length
+(maxrel 1.3e-2 at 5 tokens, 8.1e-2 at 20 — a logit at O(10) can move ~0.5 nats, and the oracle itself
+was torn between 17 and 15). **The second is not explained that way and is the thing to chase**: a
+1.342-nat margin should not flip on numerics. Suspects, in the order worth measuring: (a) the draft
+step's attention EXTENT — llama.cpp takes it from `build_attn_inp_kv()`, so whether the step attends
+over the prefix through t or through t+1 (or over the MAIN pass's KV for that layer at all) is a
+caller choice we have not pinned, and the 4-step fixture may simply not distinguish the variants;
+(b) the rope base as an ABSOLUTE position rather than row-relative (base 1 works for 4 steps; check it
+against a 19-step run); (c) whether the `h` rows for the counting prompt should be OUR normalised
+hidden rather than the fixture's, i.e. whether the fixture's hidden stage is the same one the draft
+head wants at every position. Each is one ~3-minute run through P4.13's own driver invocation
+(`VYB_MTP=1 VYB_MTP_POS=… VYB_MTP_HIDDEN=…`), and the verifier's per-step report names the failing
+positions, so it bisects fast. Do NOT relax the comparison to make this pass.
+
 The block is a FULL attention block plus an FFN plus the NextN-specific tensors, and llama.cpp's own
 `graph_mtp` is the recipe — copy it with file:line in your harness (`llama.cpp/src/models/qwen35.cpp`,
 `graph_mtp`, lines 498-671):

@@ -1803,3 +1803,52 @@ The S=5 verdict is unchanged (cos 0.999609, top1 5/5, tooth 1.0007/2.73) — the
 behaviour, it only made legal memory the run had been borrowing. Regression after the fix: P4.5 GDN
 PASS, `make prefill` on its recorded numbers (3.393e-04, top1 [55286,576] MATCH).
 
+## W4 — the MTP draft head (LANDED)
+
+**The result.** `native/legit/run_ridge_mtp_gate.sh` (**P4.13**, `make ridge-mtp`):
+
+```
+RIDGE_MTP_VERIFY fixture=the_capital_of_france_is S=5 rope_pos=1
+RIDGE_MTP_VERIFY per-step top1: 4/4 agree (4 checked, margin_bar=0.50)
+RIDGE_MTP_VERIFY tooth off_by_one: 0 of 4 steps would still agree (must be fewer)
+RIDGE MTP GATE: PASS
+```
+
+The draft head consumes the normalised hidden at position t plus the embedding of token t+1 and
+predicts t+2 — and the captured fixtures already record the oracle's greedy pick at EVERY position, so
+it is gated teacher-forced with no new oracle capture: feed it the ORACLE's own hidden row and the
+ORACLE's own next token, and require its per-step top1 to be the oracle's pick for t+2 under the
+fixture's rule. Using the oracle's hidden takes the main pass out of the loop, so a mismatch is this
+new block's rather than 64 layers of accumulation; the checker's off-by-one tooth runs on the same
+completed run and must miss (it does), which is what makes the gate evidence rather than decoration.
+
+**The reconnaissance is what made this land on the first run.** Two points resolved from
+`llama.cpp/src/models/qwen35.cpp` (`graph_mtp`) and `src/llama-context.cpp` beforehand:
+
+1. The block's `h` input is the NORMALISED hidden — the MTP hook carries the `h_nextn` row — so the
+   pair is (post-`output_norm` hidden at t, embedding of t+1). Feeding the raw last-layer output would
+   double-normalise through `nextn.hnorm`, and the fixtures store exactly the right stage already.
+2. Its joint q+gate layout is the same per-head-interleaved one the MAIN pass uses (`nb1 =
+   elem*head_dim*2`), so the engine's existing split path applies unchanged. The earlier recipe note
+   ("q FIRST, gate SECOND") describes the kernel's OUTPUT arrangement, not the projection's layout;
+   implementing against it would have silently scrambled the attention.
+
+Both were then confirmed by measurement, toether with the two things llama.cpp leaves to its caller
+(the rope position — base 1, not 2 — and the step's attention extent).
+
+**No block code was added.** The draft step IS an ordinary `blk.NTL` attention+FFN block, so it runs
+through the loop's own dispatch, staging and kernels; the new code is only the input chain
+(`rms(h, hnorm)` inverted-concat `rms(e(t+1), enorm)` → `eh_proj`), the four staged `nextn.*` tensors,
+a loop restricted to `blk.NTL` (`LST`/`LEP`), and `shared_head_norm` in place of `output_norm` at the
+head. It is default-off (`VYB_MTP`), and the main path was re-measured inert after it landed: P4.12
+byte-identical (cos 0.999609, every prefix summary unchanged) and `make prefill` unchanged
+(3.393e-04, top1 [55286,576] MATCH) — which is the deferred claim from the W4 commit, now measured.
+
+**Two harness lessons.** The gate caught a double shift in the verifier on its first run (the driver's
+MTP mode already trims the id list to one step per position, and the verifier was shifting as well) —
+the ids check that caught it exists because a text/shift mistake otherwise compares plausible numbers
+against the wrong positions. And the checker's tooth belongs INSIDE the verifier, on the same completed
+run (compared one position later, it must miss at least one step — "at least one", because a prompt can
+legitimately repeat a pick at adjacent positions), which needs no second GPU run.
+
+
