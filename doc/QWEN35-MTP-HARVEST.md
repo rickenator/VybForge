@@ -63,19 +63,48 @@ its top-2 margin and its `exact`/`membership` rule.
   best case for k=1. A chained run's k=2..N rates are unknown until measured, and every step of the chain
   is fed our own hidden rather than the oracle's.
 
-## 5. The instrumentation already exists for the offline version
+## 5. Instrumentation: CORRECTED — the reading half exists, the writing half does not
 
-`VYB_MTP_HIDDEN` already takes the draft rows from a **file** and `VYB_PROMPT_IDS` takes the token ids, so
-the chain can be measured without new engine code: dump the block's output hidden rows from run k, feed
-them back as run k+1's `VYB_MTP_HIDDEN` with our own drafted tokens as the ids, and compare each run's
-drafts against the fixture. The production version is the serialised loop in §3; the offline version is
-how the acceptance-vs-N curve gets measured first.
+An earlier version of this section claimed the offline chain needed no new code. That is **wrong** on the
+dump side and the error is worth keeping here:
+
+- **What exists:** `VYB_MTP_HIDDEN` takes the draft rows from a file and `VYB_PROMPT_IDS` takes the ids,
+  so a *run* can be fed chained input with no engine change.
+- **What does not exist:** the driver's `io` import is text-only (`open_read`, `read_at`, `read_all`,
+  `open_write`, `write_str`, `close`) and a tree-wide search finds no binary or stage-dump helper
+  (`write_f64` / `dump_stage` / `save_stage`, or any `.f64` writer). The W1 "ten stages" were **printed**,
+  not dumped to binary. So producing the h′ rows requires building a writer first.
+- **The trap:** the obvious workaround — print the f64 rows and convert in Python — depends on
+  `to_string`'s float precision, which is unverified. A silently lossy dump yields a confidently wrong
+  acceptance curve, which is the worst outcome for a measurement whose only purpose is to decide whether
+  to build something. Do not use it without checking that precision first.
 
 ## 6. Order of work
 
-1. Dump the block's output hidden per draft step (one small addition to the MTP mode; the probe's stage
-   dumper is the existing pattern).
-2. Offline chain: iterate runs, measuring acceptance vs N against both fixtures.
-3. Serialised chain in the engine (`eng_mtp()`), staging weights once, with the chain's attention extent
+1. Offline chain (needs the writer from §5) — measure acceptance vs N against both fixtures.
+2. Serialised chain in the engine (`eng_mtp()`), staging weights once, with the chain's attention extent
    as the one genuinely new correctness question.
-4. Set P4.13's bar from §4's numbers, replacing the exact-match criterion.
+3. Set P4.13's bar from §4's numbers, replacing the exact-match criterion.
+
+## 7. The chain needs its own KV cache (the real shape of the work)
+
+Today's MTP block runs **once over all S pre-built rows in a single launch** (driver ~1280-1299 build `XA`,
+then one block forward). Each row's attention therefore sees rows `0..row` within that launch, with a
+fresh K/V: self-contained, and exactly right for teacher forcing, which is why the single-step results are
+meaningful.
+
+A chain breaks that shape. Step k's input depends on step k-1's **output** (`h'_k-1`), so the rows cannot
+be pre-built, and step k must attend over rows `0..k` computed in *earlier launches*. That requires the
+MTP layer (blk.NTL) to keep its own K/V cache and append a row per step — i.e. persistent per-layer state
+plus the kernel path that reads it, not a loop restructuring.
+
+Consequences for the plan:
+
+- The "attention extent" risk flagged in §3 **is** this KV cache; it is not a parameter to tune, and it is
+  the entire correctness question for the chain. It is also the one thing the teacher-forced runs cannot
+  validate, since each of their steps consumes the oracle's hidden and never chains.
+- The dump detour is now clearly the wrong first move: the same effort must be spent on the KV path
+  regardless, and the KV path is on the production route while the dump is not.
+- The single-step mode is the only validated evidence for blk.64 and must stay untouched: any chain work
+  goes behind a new knob, default off.
+
