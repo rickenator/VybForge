@@ -969,7 +969,7 @@ main()<Int> -> {
         GXN<Int> = 0; GQKVX<Int> = 0; GZ<Int> = 0; GBRAW<Int> = 0; GBETA<Int> = 0; GARAW<Int> = 0
         GGATE<Int> = 0; GCONV<Int> = 0; GCONVS<Int> = 0; GCRAW<Int> = 0; GQN<Int> = 0; GKN<Int> = 0
         GOUT<Int> = 0; GEL<Int> = 0; GEPI<Int> = 0; GY<Int> = 0; GLOD<Int> = 0
-        DSTC<Int> = 0; DSTS<Int> = 0; GDPK<Int> = 0
+        DSTS<Int> = 0; GDPK<Int> = 0
         GP1<Int> = 0; GP2<Int> = 0; GP3<Int> = 0; GP4<Int> = 0
         if (GRL >= 0) {
             if (cuMemAlloc_v2(loc(GWAN), GNE * 8) != 0) { return 11 }
@@ -990,7 +990,16 @@ main()<Int> -> {
             if (cuMemAlloc_v2(loc(GBETA), GHV * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GARAW), GHV * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GGATE), GHV * 8) != 0) { return 11 }
-            if (cuMemAlloc_v2(loc(GCONV), GDC * GQKV * 8) != 0) { return 11 }
+            # The conv WINDOW is per-layer sequence state and the loop indexes it that way
+            # (`gconv = GCONV + L * GDC*GQKV*8`), so it needs a slot per layer the index can reach —
+            # exactly what the delta-net cache below does. Sizing it for ONE window is an
+            # out-of-bounds write from L = 1 onward, and it is SILENT for as long as the write lands
+            # in device memory that nothing reads: measured, the S=5 whole-model forward matched the
+            # oracle at cos 0.9996 while an S=2 run died at block 16 with `GDN_ERR conv` (the OOB
+            # damage only reaches a fault when the neighbouring allocations are small). Zeroed
+            # explicitly below, like every other cache: a stale window is not guaranteed zero, and
+            # token 0 reads it directly.
+            if (cuMemAlloc_v2(loc(GCONV), MAXL * GDC * GQKV * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GCONVS), GQKV * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GCRAW), GQKV * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GQN), GKEY * 8) != 0) { return 11 }
@@ -1001,9 +1010,9 @@ main()<Int> -> {
             if (cuMemAlloc_v2(loc(GY), GNE * 8) != 0) { return 11 }
             if (cuMemAlloc_v2(loc(GLOD), GNE * 8) != 0) { return 11 }
             println("GDN_ALLOC_ACTS_OK")
-            # the state cache is allocated for every TEXT block, so the loop never has to decide
-            # whether layer L owns a slot: recurrent blocks use theirs, the rest stay zeroed.
-            if (cuMemAlloc_v2(loc(DSTC), MAXL * GDC * GQKV * 8) != 0) { return 11 }
+            # the delta-net state cache is allocated for every TEXT block, so the loop never has to
+            # decide whether layer L owns a slot: recurrent blocks use theirs, the rest stay zeroed.
+            # (The conv windows live in GCONV, allocated above with the same per-layer sizing.)
             # TWO delta-net slots per layer, not one: the loop ping-pongs a layer's state between
             # `L*2 + gst%2` and `L*2 + 1 - gst%2`, so the cache must hold 2*MAXL of them. Allocating
             # MAXL (one per layer, which is what the name suggests) is out of bounds from L = MAXL/2
@@ -1031,13 +1040,13 @@ main()<Int> -> {
                 println("GDN_CFG_FAIL could not zero the state cache")
                 return 11
             }
-            if (cuMemsetD8_v2(DSTC, 0, MAXL * GDC * GQKV * 8) != 0) {
-                println("GDN_CFG_FAIL could not zero the conv cache")
+            if (cuMemsetD8_v2(GCONV, 0, MAXL * GDC * GQKV * 8) != 0) {
+                println("GDN_CFG_FAIL could not zero the conv windows")
                 return 11
             }
             println("GDN_CACHE layers=" + MAXL.to_string() + " delta-net=" + (MAXL * 2 * GSS * GSS * GHV).to_string()
                     + " values (2 slots/layer, the ping-pong the loop indexes with L*2+slot)"
-                    + " conv=" + (MAXL * GDC * GQKV).to_string() + " values, zeroed")
+                    + " conv=" + (MAXL * GDC * GQKV).to_string() + " values in " + MAXL.to_string() + " per-layer windows, zeroed")
         }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
