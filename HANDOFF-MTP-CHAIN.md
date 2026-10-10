@@ -25,7 +25,8 @@ default-off and both are in:
   speculative decode is ever in. Without it a single early disagreement makes every longer N read 0 and
   there is no decay curve at all (§2).
 
-Out of scope and still out: W5 (now unblocked, and the only remaining item), macOS.
+Out of scope and still out: macOS. W5 — the descriptor flip that was blocked on W4's status — landed
+with this session (§3).
 
 ---
 
@@ -40,6 +41,9 @@ Out of scope and still out: W5 (now unblocked, and the only remaining item), mac
 | `native/tools/ridge_mtp_verify.py` | P4.13's criterion converted to a per-fixture rule-aware FLOOR (`FLOORS`, derived from the measurement above), plus the floor's wrong-input controls (`VYBFORGE_MTP_HIDDEN_ZERO`, `VYBFORGE_MTP_HIDDEN_SHIFT=<±k>`) |
 | `native/legit/run_ridge_mtp_gate.sh` | P4.13's gate: runs the floor's two teeth FIRST (zeroed and backward-shifted hidden must land below the floor) and only then judges the head |
 | `native/legit/run_ridge_mtp_chain_gate.sh` | the chain gate. Its PASS/FAIL criterion is the TF tooth; the acceptance numbers are REPORTED, not judged |
+| `native/config/model_caps.vyb` | W5: `eng_gdn()` and `eng_mtp()` are 1, `eng_vision()` stays 0, and the oracle comparison that licenses each flip is recorded beside the flag |
+| `native/legit/run_caps_gate.sh` | the Ridge case converted to assert **SUPPORTED with an EMPTY refusal list**, by absence, so either flag going back fails by name |
+| `native/legit/run_phase2_battery.sh`, `run_phase1_battery.sh` | both now clear an inherited `PYTHONPATH` and re-exec, with a printed reason (a foreign site-packages made nine numpy-backed gates fail as if the code had regressed) |
 | `doc/QWEN35-MTP-HARVEST.md` §9, §10 | the mechanism and the chain's numbers (§9); the acceptance bar's derivation and its teeth (§10) |
 
 The chain path returns **before** the teacher-forced head walk and never writes
@@ -80,12 +84,23 @@ reproduces P4.13, which is the internal consistency check that makes the rest of
 | P4.13 (`run_ridge_mtp_gate.sh`) | **PASS** — 4/4 capital (floor 3/4) and 17/19 counting (floor 15/19), same two misses at steps 0 and 1, same picks (`111047`, `16`); the floor's two teeth land below it (zeroed 1/19, backward shift 10/19) | the teacher-forced path is untouched, and the criterion now measures the head instead of demanding exact match. The floor and its derivation: harvest §10 |
 | P4.12 (`run_ridge_forward_gate.sh`) | **PASS**, 8 runs over 2 fixtures, capital S=5 `hidden_cos=0.999609` | the whole 64-block forward is untouched — the named invariant, reproduced to the digit |
 | `run_ridge_mtp_chain_gate.sh` | **PASS** (tooth bit-for-bit; measurement ran) | the chain mechanism is right, and the measurement is not silence |
+| `run_caps_gate.sh` (S0.2e) | **PASS**, 4 cases, 0 skipped — Ridge SUPPORTED with an EMPTY refusal list; reverting either flag makes it FAIL by name | the descriptor claims exactly what the engine delivers, and the claim is pinned by absence |
+| `run_phase2_battery.sh` | **PASS**, 33 steps, no FAIL and no SKIP | the phase-level finish line (`HANDOFF-PHASE4.md` §1), including S0.2e, P4.11, P4.12, P4.13 and the dense prefill regression (`maxrel 3.393e-04`, top1 MATCH) |
+
+Run the battery as `bash native/legit/run_phase2_battery.sh` and nothing else: it clears an inherited
+`PYTHONPATH` itself and says so. Skipping that clearing (or running an inner gate by hand from an agent
+session) makes the numpy-backed reference gates fail with `No module named 'numpy'` — an environment
+artifact that reads exactly like a regression.
 
 ### 2.4 Not done, deliberately
 
-- **W5** stays unflipped (it was blocked on the W4 status decision, which the bar above closes).
 - The oracle's own MTP acceptance is still **unobtainable** (llama.cpp's qwen35 `graph_mtp` aborts on
   this GGUF), so the acceptance floor is ours and its derivation is the evidence for it.
+- The op's CHUNKED multi-token kernel for the recurrent layer is still uncharacterised (W6). It is NOT on
+  the path the engine uses — a prompt runs as S single-token steps, which is what P4.12 exercises
+  end to end — so it does not block anything, but it is also not verified.
+- The caps descriptor still reads `eng_type` only, so it cannot distinguish "a dequant kernel exists"
+  from "the model path can stage the type" (W1 residue) — a staging regression would not be caught there.
 - `1efd17f`'s commit message is still junk; amending it needs Rick's explicit OK.
 - `native/out/oracle_gpu/1_2_3_4_5_6_7.fix` (a GPU capture of the same prompt) is still not promoted as a
   cross-implementation stability fixture.
@@ -100,9 +115,18 @@ reproduces P4.13, which is the internal consistency check that makes the rest of
 1. ~~**Set P4.13's bar.**~~ DONE — a per-fixture rule-aware floor derived from §9's depth-0 rate
    (`FLOORS` in `native/tools/ridge_mtp_verify.py`; harvest §10). P4.13 PASSes, and the criterion's two
    teeth (zeroed and backward-shifted hidden) are run by the gate before it judges anything.
-2. **W5** (flip `eng_gdn()`/`eng_mtp()` and re-run `run_caps_gate.sh`) — now unblocked, and the only item
-   left in this MTP line. Acceptance criteria are the ones already written for W5 in `HANDOFF-PHASE4.md`;
-   nothing about the chain changes them, because the chain is default-off.
+2. ~~**W5** (flip `eng_gdn()`/`eng_mtp()`, re-run `run_caps_gate.sh`)~~ **DONE** —
+   `eng_gdn()` and `eng_mtp()` are 1, `eng_vision()` stays 0, each flip licensed by an oracle
+   comparison (P4.12 for GDN, P4.13 for the draft head) per `HANDOFF-PHASE4.md` §3's W5 rule. The caps
+   gate's Ridge case now asserts **SUPPORTED with an EMPTY refusal list, by absence**, so either flag
+   going back fails by name (`gdn-refused-again` / `mtp-refused-again`) — verified by reverting each one;
+   all 4 cases run, 0 skipped. **The phase-2 battery is GREEN end to end: 33 steps, no FAIL and no SKIP**,
+   including S0.2e (the caps gate), P4.11 (encoder ids == llama.cpp), P4.12 (`hidden cos 0.997926` on the
+   prefix run, per-position top1 == the oracle) and P4.13 (floor + both teeth).
+   Note for anyone running that battery from an agent session: it now clears an inherited `PYTHONPATH`
+   itself. A foreign site-packages on PYTHONPATH made nine numpy-backed reference gates fail as if the
+   code had regressed — an environment artifact, and one that cost a full 17-minute battery run to
+   identify.
 3. Optional, cheap, and the honest way to firm the chain's curve up: a fixture whose prompt is long and
    decisive (the counting prompt's *periodicity* is why the chained drafts recover at all — several
    anchors hit after a miss). The capital fixture has only 4 anchors, so its survival numbers rest on a
@@ -131,6 +155,12 @@ VYBFORGE_MTP_CHAIN_SWEEP=1 bash native/legit/run_ridge_mtp_chain_gate.sh   # per
 # the gates this change must not move
 bash native/legit/run_ridge_mtp_gate.sh          # P4.13, ~5 min: floor teeth first, then PASS
 bash native/legit/run_ridge_forward_gate.sh      # P4.12, ~7 min, 8 runs, PASS
+
+# the phase-level finish line: ~33 gates, ~17 min, no FAIL and no SKIP. It clears an inherited
+# PYTHONPATH itself (and says so) — do not clear it for it, and do not run an inner gate by hand from an
+# agent session without `env -u PYTHONPATH`.
+bash native/legit/run_phase2_battery.sh
+bash native/legit/run_caps_gate.sh               # S0.2e on its own, seconds: Ridge must be SUPPORTED
 
 # P4.13's controls / probes by hand (env -u PYTHONPATH matters: the ambient PYTHONPATH shadows .venv):
 VYBFORGE_MTP_HIDDEN_ZERO=1   env -u PYTHONPATH .venv/bin/python native/tools/ridge_mtp_verify.py 1_2_3_4_5_6_7   # 1/19, below the floor

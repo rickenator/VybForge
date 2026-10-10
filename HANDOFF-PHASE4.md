@@ -70,21 +70,31 @@ Tensor types (from `native/gguf/ridge-3.7bpw-inventory.tsv`, which is generated,
 boundary is NOT by block kind: blocks 0-3 and 60-63 are all IQ3_S, blocks 4-11 have IQ3_S `ffn_down`
 with IQ2_S gate/up, blocks 12-59 are all IQ2_S.
 
-### The descriptor's own verdict right now
+### The descriptor's own verdict right now (after W5)
 
     ./native/legit/run_caps_gate.sh        # or: make -f native/Makefile caps
     CAPS_LAYOUT=hybrid-recurrent  N_LAYERS=65 TEXT_LAYERS=64 ATTN_LAYERS=16 GDN_LAYERS=48 MTP_LAYERS=1
     CAPS_NEXTN_TENSORS=4  ATTN_INTERVAL=4  VISION=0
     CAPS_TYPES=F32:360,Q8_0:96,Q4_K:144,Q5_K:51,Q6_K:23,IQ3_S:32,IQ2_S:160
-    CAPS_UNSUPPORTED=UNSUPPORTED_LAYER_KIND gated-deltanet layers=48,
-                     UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1
-    CAPS_VERDICT=UNSUPPORTED
+    CAPS_UNSUPPORTED=
+    CAPS_VERDICT=SUPPORTED
 
-Two things to know about that output. (a) There is NO quant-type refusal, because `eng_type()` in
-`native/config/model_caps.vyb` returns 1 for IQ2_S/IQ3_S — it means "a kernel exists", and the kernels
-do exist and are gated. But the model PATH cannot stage those types yet (W1). The descriptor therefore
-over-claims relative to staging, and nothing currently catches that; see W1's last bullet.
-(b) `eng_gdn()`/`eng_mtp()` are the only refusals, which is exactly the finish line in §1.
+**W5 landed the flip** — `eng_gdn()` and `eng_mtp()` are 1, `eng_vision()` stays 0 — so the two-reason
+refusal block this section used to print is gone. It is kept in the record rather than deleted, because
+the two notes beside it are what the flip had to answer:
+
+(a) There is NO quant-type refusal, because `eng_type()` in `native/config/model_caps.vyb` returns 1 for
+IQ2_S/IQ3_S — it means "a kernel exists". W1 closed the gap in fact (those types occur only in the FFN,
+and every FFN type now stages), but the descriptor still reads `eng_type` only, so a staging regression
+would not be caught here: W1's last bullet stands as a worthwhile follow-up.
+
+(b) `eng_gdn()`/`eng_mtp()` were the only refusals and are the finish line in §1. Each flip is licensed by
+an ORACLE comparison, not by the per-layer gates, and the licence is recorded beside the flag in
+`native/config/model_caps.vyb`: **P4.12 PASS** (a whole 65-block Ridge forward vs llama.cpp, per-position
+top1 == the oracle, hidden cos 0.999609, 48 recurrent layers carrying their state) for `eng_gdn()`, and
+**P4.13 PASS** (blk.64 reproduces the same oracle's next-next-token picks against its derived floor) for
+`eng_mtp()`. The gate now asserts the refusal list is EMPTY and fails BY NAME if either flag goes back —
+verified by reverting `eng_gdn()` to 0, where the Ridge case fails with `gdn-refused-again`.
 
 ### Verified — do not re-derive (each one has a gate; numbers are the recorded measurements)
 
@@ -136,9 +146,15 @@ over-claims relative to staging, and nothing currently catches that; see W1's la
   loop bugs had to be fixed first (the MTP block run as a text layer; the state cache sized for one
   slot per layer while indexed for two; the Ridge attention branch not staging the shared FFN tail's
   pre-norm AND weights). Bulk H2D landed with it: ~70 min → ~3.5 min per run.
-* **W4** the MTP head (blk.64) is not implemented at all — next up. Note for it: `MAXL` is still the
-  FILE's block count (65) and `NTL` (64) is the text-layer count; the draft head is `blk.NTL`.
-* **W5** `eng_gdn()`/`eng_mtp()` are still 0 (correctly — see the rule in §5).
+* **W4** DONE, and W4b with it — the MTP head (blk.64) is implemented and gated (P4.13, `run_ridge_mtp_gate.sh`),
+  and the CHAINED draft (`VYB_MTP_CHAIN`, default off) is measured against the same oracle; see
+  `HANDOFF-MTP-CHAIN.md` and `doc/QWEN35-MTP-HARVEST.md` §9/§10. The note below was the starting
+  geometry, kept because it is what the first draft got wrong: `MAXL` is the FILE's block count (65) and
+  `NTL` (64) is the text-layer count; the draft head is `blk.NTL`.
+* **W5** DONE — `eng_gdn()` and `eng_mtp()` are both 1 (the rule in §3's W5 note licensed each flip by an
+  oracle comparison: P4.12 for GDN, P4.13 for the draft head). `eng_vision()` stays 0. The gate's Ridge
+  case now asserts the refusal list is EMPTY and fails by name if either flag goes back; see
+  "The descriptor's own verdict right now" above.
 * **W6** (not required for the flip) multi-token / prefill for the recurrent op: the op's chunked
   kernel is UNCHARACTERISED, and only single-token steps are verified. A prompt can still be run as S
   single-token steps, which is what the loop does today. (The small-S crash found here is FIXED — see
@@ -465,22 +481,26 @@ The block is a FULL attention block plus an FFN plus the NextN-specific tensors,
    than ours isolates the MTP block from the main pass; a second pass can feed OUR hidden to test the
    pair end to end.)
 
-### W5 — flip the descriptor, last
+### W5 — flip the descriptor, last — DONE
 
-`native/config/model_caps.vyb`:
+Flipped in `native/config/model_caps.vyb` (the licence for each flag is recorded beside it):
 
-    eng_gdn()<Int> -> { return 1 }      // only after W3's oracle comparison is green
-    eng_mtp()<Int> -> { return 1 }      // only after W4 is green
+    eng_gdn()<Int> -> { return 1 }      // P4.12 PASS: the whole-model oracle comparison
+    eng_mtp()<Int> -> { return 1 }      // P4.13 PASS: the draft head vs the same oracle
     eng_vision()<Int> -> { return 0 }   // stays: the text GGUF has no vision tower
 
-Then re-run `run_caps_gate.sh`. Its assertions are on the REFUSAL LIST, not just the count (S0.2e /
-unit-19): the two names above must disappear and nothing else may appear. Read the step that fails if
-one does — it names the flag still refusing, so never hunt for anything else first.
+The gate's Ridge case was converted with it: it used to assert UNSUPPORTED with exactly two named
+reasons, and now asserts **SUPPORTED with an EMPTY refusal list**, by absence, so either flag going back
+to 0 fails with the name of the capability that went back (`gdn-refused-again` / `mtp-refused-again`).
+Measured end to end: the gate reports `SUPPORTED (hybrid-recurrent: 16 attention + 48 GDN, MTP head;
+refusal list EMPTY — the W5 flip)` with all 4 cases run and 0 skipped; with `eng_gdn()` reverted to 0 the
+same gate FAILs and names it. Cases 3 (vision tower) and 4 (truncated file) still pin REFUSALS, so the
+gate keeps proving the descriptor refuses when it should, not only that it now says yes.
 
-The rule that keeps this honest: **a descriptor flag claims a whole capability at once** — weight
-loading, per-sequence state carry-over, the multi-token/prefill path, the engine wiring, and (for MTP)
-the whole draft head. "Our kernels reproduce the layer to 1e-6" is evidence about KERNELS and says
-nothing about those. Flip on the oracle comparison, not on the per-layer gates.
+The rule that kept this honest, and still governs any future flip: **a descriptor flag claims a whole
+capability at once** — weight loading, per-sequence state carry-over, the multi-token path, the engine
+wiring, and (for MTP) the whole draft head. "Our kernels reproduce the layer to 1e-6" is evidence about
+KERNELS and says nothing about those. Flip on the oracle comparison, not on the per-layer gates.
 
 ### W6 — the multi-token/prefill path for the recurrent op (not on the critical path)
 
@@ -645,6 +665,11 @@ hardcoded in `native/config/model_caps.vyb`:
 
     :140  eng_gdn()<Int> -> { return 0 }   // Gated DeltaNet layers (48 of 64)
     :141  eng_mtp()<Int> -> { return 0 }   // native draft head
+
+(The two lines above are the state this appendix was written from, kept as written because they are the
+thing the phase set out to change. **W5 flipped both to 1** at the end of phase 4 — see §3's W5 note and
+"The descriptor's own verdict right now" — so the descriptor now reports the Ridge text model SUPPORTED
+with an EMPTY refusal list, and `run_caps_gate.sh` asserts that by absence.)
 
 Item 1 is the recurrent (Gated DeltaNet) layer's maths. It proceeds as: a numpy reference for each
 unit, checked against ggml's OWN implementation; only then a Vyb kernel + driver + gate; the

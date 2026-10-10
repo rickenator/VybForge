@@ -10,6 +10,11 @@ the descriptor names exactly two blockers, both of them hardcoded:
     :387  if (eng_gdn() == 0) { ... "UNSUPPORTED_LAYER_KIND gated-deltanet layers=48" }
     :390  if (eng_mtp() == 0) { ... "UNSUPPORTED_CAPABILITY mtp nextn_predict_layers=1" }
 
+(Those two flags and the refusals they control WERE the phase's finish line. **W5 flipped both** at the
+end of phase 4: `eng_gdn()` and `eng_mtp()` are 1, `eng_vision()` stays 0, the Ridge text model's refusal
+list is empty, and `run_caps_gate.sh` asserts that by absence. This note is the reconnaissance the phase
+was planned from and is kept as written; the live state is `HANDOFF-PHASE4.md`'s descriptor section.)
+
 ## What the model actually asks for (from the GGUF, not from the name)
 
     general.architecture          qwen35          (NOT qwen3next — worth knowing before searching)
