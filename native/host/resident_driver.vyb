@@ -281,6 +281,13 @@ main()<Int> -> {
     NRUNS<Int> = 1
     rn<String> = env_get("VYB_RUNS") else ""
     if (rn.len() > 0) { NRUNS = parse_u(rn, 0, rn.len()) }
+    # VYB_QUIET=1 suppresses the per-layer/per-step DECG trace. Those prints are ~150 lines per
+    # token and cost real wall-clock; the machine-readable lines (RESIDENT_RUN=,
+    # RESIDENT_BREAKDOWN=, RESIDENT_AVG_TOKENS_PER_SEC=) and the token-id files are untouched, so
+    # verify_resident_bench.py reads the same keys either way. Default 0 = trace on, as before.
+    QV<Int> = 0
+    qs<String> = env_get("VYB_QUIET") else ""
+    if (qs.len() > 0) { QV = 1 }
     MAXS<Int> = SEEDLEN + GEN
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
@@ -513,11 +520,19 @@ main()<Int> -> {
         # recompute-full-prefix greedy gen loop (GEN tokens). The model weights,
         # embedding and norms stay RESIDENT on-GPU from the load above, so this
         # measures steady-state generation, not re-loading.
+        # ---- per-phase wall-clock accounting (VybForge#23) ----
+        # Where a token's milliseconds actually go, summed over the run: the per-layer norm loads
+        # (4 file reads + H2D per layer per token), the per-layer f64 dequant, the layer forward
+        # (the f64 untiled gemm), and the head (final norm + logits slices + argmax). These are
+        # wall-clock deltas on the host, so they include launch and sync cost, which is the point:
+        # they say how much of the 850 ms/token is GPU arithmetic and how much is the driver loop.
+        nmT<Int> = 0; dqT<Int> = 0; lyT<Int> = 0; hdT<Int> = 0
         tot_ms<Int> = 0
         tot_tok<Int> = 0
         rn<Int> = 0
         for (rn in 0..NRUNS - 1) {
             t0<Int> = time_mono_millis()
+            nmT = 0; dqT = 0; lyT = 0; hdT = 0
 
             # seed EMB with the prompt rows (or [0,1])
             si<Int> = 0
@@ -544,15 +559,18 @@ main()<Int> -> {
                     for (g in 0..GEN - 1) {
                         Scur = SEEDLEN + g
                         cur<Int> = EMB
-                        println("DECG step " + g.to_string() + " Scur=" + Scur.to_string())
+                        if (QV == 0) { println("DECG step " + g.to_string() + " Scur=" + Scur.to_string()) }
                         L<Int> = 0
                         for (L in 0..NLAYER - 1) {
-                            println("DECG L" + L.to_string() + " deqstart")
+                            if (QV == 0) { println("DECG L" + L.to_string() + " deqstart") }
+                            phA<Int> = time_mono_millis()
                             # per-layer RMSNorm weights (differ every layer — load layer L's)
                             ii0<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight"); e<Int> = load_norm(MODEL, PF, DPK, N1, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 80 }
                             ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_q_norm.weight"); e = load_norm(MODEL, PF, DPK, Nq, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 81 }
                             ii0 = find_nm(nmv, "blk." + L.to_string() + ".attn_k_norm.weight"); e = load_norm(MODEL, PF, DPK, Nk, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 82 }
                             ii0 = find_nm(nmv, "blk." + L.to_string() + ".ffn_norm.weight"); e = load_norm(MODEL, PF, DPK, N2, ofv.get(ii0), nlv.get(ii0), efn); if (e != 0) { return 83 }
+                            nmT = nmT + (time_mono_millis() - phA)
+                            phB<Int> = time_mono_millis()
                             e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn, D); if (e != 0) { return 70 }
                             e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn, D); if (e != 0) { return 70 }
                             # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
@@ -568,7 +586,9 @@ main()<Int> -> {
                             fdq<loc<CVoid>> = q4fn
                             if (fdt == 14) { fdq = q6fn }
                             e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq, FF); if (e != 0) { return 70 }
-                            println("DECG deqdone L" + L.to_string())
+                            dqT = dqT + (time_mono_millis() - phB)
+                            if (QV == 0) { println("DECG deqdone L" + L.to_string()) }
+                            phC<Int> = time_mono_millis()
                             tgt<Int> = HA
                             if ((L % 2) == 1) { tgt = HB }
                             e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
@@ -576,10 +596,12 @@ main()<Int> -> {
                                           N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
                             if (e != 0) { return 71 }
+                            lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
-                            println("DECG layer " + L.to_string() + " done")
+                            if (QV == 0) { println("DECG layer " + L.to_string() + " done") }
                         }
-                        println("DECG forward done")
+                        if (QV == 0) { println("DECG forward done") }
+                        phD<Int> = time_mono_millis()
                         rA = cur; rB = ON; rC = DH
                         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
                         cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
@@ -607,7 +629,8 @@ main()<Int> -> {
                         cuMemcpyDtoH_v2(loc(nxt), AO, 8)
                         match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
                         copy_row(DE, nxt, D, EMB + Scur * D * 8)
-                        println("GEN step " + g.to_string() + " token=" + nxt.to_string())
+                        hdT = hdT + (time_mono_millis() - phD)
+                        if (QV == 0) { println("GEN step " + g.to_string() + " token=" + nxt.to_string()) }
                     }
                     close(w)
                 }
@@ -619,6 +642,12 @@ main()<Int> -> {
             tot_ms = tot_ms + drun
             tot_tok = tot_tok + GEN
             println("RESIDENT_RUN=" + rn.to_string() + " ms=" + drun.to_string() + " tokens=" + GEN.to_string())
+            # The measured split (VybForge#23): sums over this run's tokens of the per-layer norm
+            # loads, the per-layer f64 dequant, the layer forward and the head. Together with drun
+            # they say what is left over (parse/lookup/print overhead), so a fix can be aimed.
+            println("RESIDENT_BREAKDOWN norm_ms=" + nmT.to_string() + " dequant_ms=" + dqT.to_string()
+                    + " layer_ms=" + lyT.to_string() + " head_ms=" + hdT.to_string()
+                    + " total_ms=" + drun.to_string() + " tokens=" + GEN.to_string())
         }
         tps<Float> = (tot_tok as Float) / ((tot_ms as Float) / 1000.0)
         println("RESIDENT_RUNS=" + NRUNS.to_string() + " total_ms=" + tot_ms.to_string() + " total_tokens=" + tot_tok.to_string())
