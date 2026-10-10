@@ -285,6 +285,65 @@ dump_slot(base<Int>, idx<Int>, tag<String>) -> {
     println("PROBE " + tag + " " + idx.to_string() + " " + iv.to_string())
 }
 
+#> The untied lm_head, chunk by chunk: walks `output.weight` (VOCAB x D, Q6_K) into `chunk` and folds each
+#> chunk's logits into the running (best value, best index) for the scored rows [rowStart, rowStart+nrows)
+#> of `hid`. Extracted from the inline head so the draft chain can score ONE row per step (`nrows` = 1).
+#>
+#> Every invariant below is a bug already paid for (doc/QWEN35-MTP-HARVEST.md §8); do not simplify them:
+#>   - the caller-seeding of bv/bo (argmax_acc does NOT seed its running best: unseeded, the buffer's zeros
+#>     win and every logit below zero is ignored);
+#>   - the row byte offset including nblk = D/256 (dropping it reads D/256 times too few bytes and yields
+#>     garbage logits while the hidden is already correct);
+#>   - the dequant orientation inz=0 (row-major [rows, D], what logits_slice's Emb[vs*D + d] expects);
+#>   - logits_slice's Vstart=0/Vend=rows/V=rows chunk-local framing;
+#>   - the synchronise before anyone reads the winners.
+head_untied(hid<Int>, rowStart<Int>, nrows<Int>, bv<Int>, bo<Int>, out_off<Int>, VOCAB<Int>, D<Int>, CH<Int>,
+            MODEL<String>, PF<Int>, DPK<Int>, chunk<Int>, lg<Int>,
+            q6fn<loc<CVoid>>, lsfn<loc<CVoid>>, accfn<loc<CVoid>>, GM<Int>, A4<Int>)<Int> -> {
+    nblk<Int> = D / 256
+    seedv<Float> = -1.0e308
+    ir<Int> = 0
+    for (ir in 0..nrows - 1) {
+        put_f(bv, ir * 8, seedv)
+        put_i(bo, ir * 8, 0)
+    }
+    vs<Int> = 0
+    rows<Int> = 0
+    zz<Int> = 0
+    rcq<CInt> = 0
+    rcsl<CInt> = 0
+    rca<CInt> = 0
+    while (vs < VOCAB) {
+        rows = CH
+        if (vs + CH > VOCAB) { rows = VOCAB - vs }
+        nb<String> = read_model(MODEL, out_off + vs * nblk * 210, rows * nblk * 210)
+        if (nb.len() < rows * nblk * 210) { println("LMHEAD_ERR short read at " + vs.to_string()); return 92 }
+        if (download(nb, DPK, rows * nblk * 210) != 0) { return 15 }
+        freedom { rcq = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D * rows + 255) / 256, 1, 1, 256, 1, 1, DPK, chunk, D * rows, 0) }
+        if (rcq != 0) { println("LMHEAD_ERR dequant rc=" + (rcq as Int).to_string()); return 92 }
+        sr<Int> = 0
+        for (sr in 0..nrows - 1) {
+            rr<Int> = rowStart + sr
+            freedom {
+                cuMemcpyHtoD_v2(GM + 0, loc(hid), 8); cuMemcpyHtoD_v2(GM + 8, loc(chunk), 8); cuMemcpyHtoD_v2(GM + 16, loc(lg), 8)
+                cuMemcpyHtoD_v2(GM + 24, loc(rr), 8); cuMemcpyHtoD_v2(GM + 32, loc(D), 8)
+                cuMemcpyHtoD_v2(GM + 40, loc(zz), 8); cuMemcpyHtoD_v2(GM + 48, loc(rows), 8); cuMemcpyHtoD_v2(GM + 56, loc(rows), 8)
+                rcsl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (rows + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+            }
+            if (rcsl != 0) { println("LMHEAD_ERR logits rc=" + (rcsl as Int).to_string()); return 92 }
+        }
+        freedom {
+            cuMemcpyHtoD_v2(A4 + 0, loc(lg), 8); cuMemcpyHtoD_v2(A4 + 8, loc(bv), 8); cuMemcpyHtoD_v2(A4 + 16, loc(bo), 8)
+            cuMemcpyHtoD_v2(A4 + 24, loc(nrows), 8); cuMemcpyHtoD_v2(A4 + 32, loc(rows), 8); cuMemcpyHtoD_v2(A4 + 40, loc(vs), 8)
+            rca = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (nrows + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+        }
+        if (rca != 0) { println("LMHEAD_ERR argmax_acc rc=" + (rca as Int).to_string()); return 92 }
+        vs = vs + rows
+    }
+    freedom { cuCtxSynchronize() }
+    return 0
+}
+
 stage_one(path<String>, nmv<Vec<String>>, ofv<Vec<Int>>, nlv<Vec<Int>>, tyv<Vec<Int>>,
           nm<String>, dpk<Int>, pf<Int>, dout<Int>,
           q4fn<loc<CVoid>>, q5fn<loc<CVoid>>, q6fn<loc<CVoid>>, efn<loc<CVoid>>, inz<Int>,
