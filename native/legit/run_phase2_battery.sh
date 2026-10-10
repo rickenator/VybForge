@@ -458,6 +458,22 @@ else
   step "P4.12 whole Ridge forward (vs the oracle)" "FAIL"; echo "$out" | tail -16 | sed 's/^/      /'; fail=1
 fi
 
+# ── P4.13 — the MTP DRAFT HEAD (blk.NTL) vs the same oracle, teacher-forced (phase 4, W4) ────
+# Gate: native/legit/run_ridge_mtp_gate.sh. Feeds the draft head the ORACLE's own normalised hidden row
+# and the ORACLE's own next token, and requires its per-step top1 to be the oracle's pick for t+2 — so
+# the new block is judged with the main pass taken out of the loop. No new oracle capture: the fixtures
+# already record a greedy pick at every position. Also runs the checker's off-by-one tooth, which MUST
+# miss (a checker that always agrees would make this gate decoration).
+out="$(./native/legit/run_ridge_mtp_gate.sh 2>&1)"
+last="$(echo "$out" | tail -1)"
+if echo "$last" | grep -q "RIDGE MTP GATE: PASS"; then
+  step "P4.13 MTP draft head (teacher-forced)" "$(echo "$out" | grep -oE 'PASS \(.*\)' | head -1 | sed 's/PASS (//; s/)$//')"
+elif echo "$last" | grep -q "RIDGE MTP GATE: SKIP"; then
+  step "P4.13 MTP draft head (teacher-forced)" "SKIP ($(echo "$last" | sed 's/RIDGE MTP GATE: SKIP //; s/[()]//g'))"
+else
+  step "P4.13 MTP draft head (teacher-forced)" "FAIL"; echo "$out" | tail -16 | sed 's/^/      /'; fail=1
+fi
+
 # ── P4.7 — the rope VARIANT kernel on the GPU, against the same op (unit 10.2) ────────
 # Gate: native/legit/run_rope_kernel_gate.sh. P4.6 pins the spec; this proves the kernel that will
 # rotate Ridge's q/k reproduces it — at n_rot=64 AND (must-not) at n_rot=HD, so a pass cannot come

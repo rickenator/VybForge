@@ -113,6 +113,11 @@ encode-check:
 ridge-forward:
 	cd $(ROOT) && env -u PYTHONPATH $(ROOT)/.venv/bin/python native/tools/ridge_forward_verify.py
 
+# P4.13: the MTP DRAFT HEAD alone, teacher-forced against the same fixtures (W4). Runs the gate script
+# rather than the verifier alone, because the gate also exercises the checker's own tooth.
+ridge-mtp:
+	cd $(ROOT) && ./native/legit/run_ridge_mtp_gate.sh
+
 layer: $(ROOT)/native/build/layer.ptx
 	cd $(ROOT) && $(VYB) native/host/layer_driver.vyb
 	python3 native/tools/verify_layer.py
