@@ -613,6 +613,40 @@ main()<Int> -> {
     }
     if (GRL >= 0) { println("ATTN_CFG joint_q_gate=" + JQG.to_string() + " (1 = attn_q carries the output gate, 2*NQ*D elements)") }
 
+    # ---- W3: how many blocks are TEXT layers ----
+    # cfg.n_layers is the file's block_count, which for qwen35 INCLUDES the MTP draft head as a
+    # block: Ridge has 65 blocks (blk.0..blk.64) and llama.cpp's main pass runs only blk.0..blk.63 —
+    # the draft head is applied separately, to (hidden, next token), and is not part of the sequence.
+    # Running it as a text layer produced a hidden that agreed with the oracle at only cos 0.55 while
+    # EVERY block-level probe stayed green (the probes name a layer explicitly, so none of them ever
+    # ran the boundary). The bound therefore comes from the TENSOR TABLE: the first block carrying a
+    # `nextn.` tensor is the draft head, and everything before it is text. A model with no such block
+    # (the dense Qwen3-4B) keeps NTL == MAXL and the loop is byte-for-byte the same as before.
+    NTL<Int> = MAXL
+    mj<Int> = 0
+    for (mj in 0..MAXL - 1) {
+        if (find_nm(nmv, "blk." + mj.to_string() + ".nextn.eh_proj.weight") >= 0) {
+            if (mj < NTL) { NTL = mj }
+        }
+    }
+    if (NTL < MAXL) {
+        println("TEXT_LAYERS=" + NTL.to_string() + " of " + MAXL.to_string() + " blocks (blk."
+                + NTL.to_string() + " carries the nextn tensors = the MTP draft head, which is NOT "
+                + "part of the main pass; the loop stops before it)")
+    }
+
+    # ---- W2: is the head UNTIED (its own table) — and therefore is the embed table unshareable? ----
+    # Decided from the model's OWN config, never from the architecture name: mc_load derives tied from
+    # the tensor table (an `output.weight` present means untied; the dense Qwen3-4B has none). For an
+    # untied model one f64 table costs vocab*D*8 = 10.2 GB for 248320x5120 and TWO of them do not fit
+    # the 3090 beside the weights, so the embed builds only the prompt's own rows and the head runs
+    # chunk by chunk. A TIED model keeps the old path exactly (whole table into DE, shared by the
+    # gather and the head), so `make prefill` is untouched.
+    UT<Int> = 0
+    if (cfg.tied == 0) { UT = 1 }
+    println("HEAD_CFG tied=" + cfg.tied.to_string() + " untied_path=" + UT.to_string()
+            + " (1 = rows-only embed + chunked head, the untied-model path)")
+
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> ndev = 0
@@ -1028,7 +1062,7 @@ main()<Int> -> {
         XI<Int> = XA; XO<Int> = XB
         e<Int> = 0
         L<Int> = 0
-        for (L in 0..MAXL - 1) {
+        for (L in 0..NTL - 1) {
             # ---- the per-layer DISPATCH (unit 9c) ----
             # Presence comes from the tensor table; the KIND comes from the shared classifier. This
             # pairing is not optional: mc_layer_kind classifies a name, so asking it alone about a
@@ -1390,12 +1424,26 @@ main()<Int> -> {
             e = run_ffn(S, D, FF, gfn, rfn, sfn, refn, GM, RN, EPS,
                         X1, N2, DWg, DWu, DWd, X1N, Gr, Up, Hu, M, XO)
             if (e != 0) { return 82 }
+            if (LTR == 1) {
+                match (open_write("native/out/ridge_trace_L" + L.to_string() + ".txt")) {
+                    tw -> {
+                        tj2<Int> = 0
+                        for (tj2 in 0..S * 3 - 1) {
+                            tv<Float> = 0.0
+                            if (cuMemcpyDtoH_v2(loc(tv), XI + (tj2 / 3) * D * 8 + (tj2 % 3) * 8, 8) != 0) { return 16 }
+                            match (write_str(tw, tv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                        }
+                        close(tw)
+                    }
+                    ? -> { return 17 }
+                }
+            }
             tl2<Int> = XI; XI = XO; XO = tl2
             }
             # Progress heartbeat. This 36-layer staging loop runs for minutes and was silent
             # between EMBED_PROBE_DONE and PREFILL_HIDDEN_DONE, so a slow-but-working run was
             # indistinguishable from a hang (it has been mistaken for one, and killed).
-            if (L % 4 == 3) { pnl<Int> = L + 1; println("PREFILL_LAYER " + pnl.to_string() + "/" + MAXL.to_string()) }
+            if (L % 4 == 3) { pnl<Int> = L + 1; println("PREFILL_LAYER " + pnl.to_string() + "/" + NTL.to_string()) }
         }
 
         # ---- probe mode ends here: one block ran through the loop's own dispatch, staging and
