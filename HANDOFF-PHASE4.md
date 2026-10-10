@@ -362,10 +362,21 @@ to `blk.NTL` (`LST`/`LEP`) and `shared_head_norm` in place of `output_norm` at t
 default-off (`VYB_MTP`), and the main path was re-measured inert after it landed: P4.12 byte-identical
 (0.999609 …) and `make prefill` unchanged.
 
-The two things llama.cpp leaves to its caller were settled by MEASUREMENT, not assumption: the draft
-step runs at the NEXT token's position (rope base **1**; base 2 is recorded as the alternative and is
-not what the fixture agrees with), and the hidden fed in is the NORMALISED one (the MTP hook carries
-the `h_nextn` row) — feeding the raw last-layer hidden would double-normalise through `hnorm`.
+The two things llama.cpp leaves to its caller were settled by MEASUREMENT, not assumption: the hidden
+fed in is the NORMALISED one (the MTP hook carries the `h_nextn` row) — feeding the raw last-layer
+hidden would double-normalise through `hnorm`.
+
+**CORRECTION on the rope position (supersedes the "rope base 1" claim).** An earlier revision of this
+note said the draft step's rope position was "settled by measurement: base 1, not 2". That was wrong,
+in two ways, and the second is the interesting one:
+
+1. The knob was INERT: `VYB_MTP_POS` was written before the loop and the attention branch overwrites
+   `ROP + 72` on every layer, so all three values produced byte-identical output. The override now
+   lives where it takes effect (inside the branch, under `MTPM`, leaving the main pass's 0 untouched).
+2. Even with the knob live it CANNOT matter here: RoPE depends only on the RELATIVE position, so a
+   constant base shift cancels in every q·k product, and at step 0 the attention is self-only — one
+   key — where the rotation cancels exactly. Measured after the fix: POS 0/1/2 still byte-identical.
+   So the rope position is not a suspect for anything, and no future session should spend a run on it.
 
 **OPEN — the 19-step fixture exposes 2 disagreements, so W4 is NOT fully green and W5 must NOT be
 flipped yet.** P4.13 runs both fixtures; the capital prompt is 4/4 (all "exact"), but the 20-token

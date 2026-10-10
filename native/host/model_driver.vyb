@@ -1032,6 +1032,7 @@ main()<Int> -> {
         # them — a variable declared inside a branch is scoped to it, and MSN is read much later (the
         # head's normalisation), which fails as "Undefined identifier: MSN".
         MEH<Int> = 0; MEN<Int> = 0; MHN<Int> = 0; MSN<Int> = 0; MC2<Int> = 0; MTMP<Int> = 0; MHID<Int> = 0
+        MPOS<Int> = 0
         GP1<Int> = 0; GP2<Int> = 0; GP3<Int> = 0; GP4<Int> = 0
         if (GRL >= 0) {
             if (cuMemAlloc_v2(loc(GWAN), GNE * 8) != 0) { return 11 }
@@ -1623,7 +1624,12 @@ main()<Int> -> {
                 cuMemcpyHtoD_v2(ROP + 16, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 24, loc(DKr), 8)
                 cuMemcpyHtoD_v2(ROP + 32, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 40, loc(S), 8)
                 cuMemcpyHtoD_v2(ROP + 48, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 56, loc(H), 8); cuMemcpyHtoD_v2(ROP + 64, loc(KVH), 8)
-                cuMemcpyHtoD_v2(ROP + 72, loc(zro2), 8)
+                # The rope position base the MAIN pass wants is 0. The MTP draft head's is a caller
+                # choice, so when MTPM is set this is where it takes effect — setting it BEFORE the
+                # loop does not work, because this line overwrites it on every layer (measured: the
+                # knob was inert, POS 0/1/2 giving byte-identical results, which is how this was
+                # found; the earlier "rope base 1, settled by measurement" claim was therefore wrong).
+                if (MTPM == 1) { cuMemcpyHtoD_v2(ROP + 72, loc(MPOS), 8) } else { cuMemcpyHtoD_v2(ROP + 72, loc(zro2), 8) }
                 cuMemcpyHtoD_v2(ROP + 80, loc(NROT), 8)
                 rt2<Int> = S * H * HD + S * KVH * HD
                 cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rt2 + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)

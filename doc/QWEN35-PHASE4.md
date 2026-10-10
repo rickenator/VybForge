@@ -1833,8 +1833,11 @@ completed run and must miss (it does), which is what makes the gate evidence rat
    ("q FIRST, gate SECOND") describes the kernel's OUTPUT arrangement, not the projection's layout;
    implementing against it would have silently scrambled the attention.
 
-Both were then confirmed by measurement, toether with the two things llama.cpp leaves to its caller
-(the rope position — base 1, not 2 — and the step's attention extent).
+Both were then confirmed by measurement, together with the hidden stage; the rope position, by
+contrast, turned out NOT to be a real question at all — see the correction in the handoff (RoPE
+depends only on relative positions, so a base shift cancels, and at the first step the attention is
+self-only where it cancels exactly; the knob that was supposed to test it was also inert, writing the
+position before the layer loop only for the branch to overwrite it).
 
 **No block code was added.** The draft step IS an ordinary `blk.NTL` attention+FFN block, so it runs
 through the loop's own dispatch, staging and kernels; the new code is only the input chain
