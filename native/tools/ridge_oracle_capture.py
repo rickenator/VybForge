@@ -61,8 +61,14 @@ OUTDIR = os.environ.get("VYBFORGE_ORACLE_OUT", os.path.join(ROOT, "native/legit/
 CTX = int(os.environ.get("VYBFORGE_ORACLE_CTX", "512"))
 # The oracle must be reproducible, so its flags live here and nowhere else. CPU-only on purpose
 # (see the docstring); `--no-warmup` keeps the log short.
-FLAGS = ["-ngl", "0", "-c", str(CTX), "--host", "127.0.0.1", "--port", str(PORT),
+FLAGS = ["-ngl", os.environ.get("VYBFORGE_ORACLE_NGL", "0"), "-c", str(CTX), "--host", "127.0.0.1", "--port", str(PORT),
          "--pooling", "none", "--embd-normalize", "-1", "--no-warmup", "--embeddings"]
+# VYBFORGE_ORACLE_NGL / VYBFORGE_ORACLE_EXTRA exist to capture the SAME prompt under a DIFFERENT
+# numeric implementation (e.g. -ngl 99 offloads to CUDA, which uses different kernels and summation
+# order than the CPU path). That is how a fixture rule that is too strict at a tight position is told
+# apart from a real disagreement in the code being tested: if the oracle does not agree with ITSELF
+# across implementations, no exact-match rule can demand more than that at that position.
+FLAGS += os.environ.get("VYBFORGE_ORACLE_EXTRA", "").split()
 
 
 def post(path, payload, timeout=600):
