@@ -375,6 +375,66 @@ which is correct, just slower.
   imperative, and a commit that claims a gate verdict must be written AFTER that verdict returns.
   Handoff files get their own `handoff:` commit.
 
+## 6. THE ORACLE — captured, pinned, and reproducible
+
+`native/tools/ridge_oracle_capture.py` (new) stands up llama.cpp on the SAME GGUF, CPU-only, and
+freezes what the W2/W3 acceptance tests compare against:
+
+    python3 native/tools/ridge_oracle_capture.py --prompt "The capital of France is" --gen 6
+
+It spawns `~/Projects/llama.cpp/build/bin/llama-server` itself with pinned flags
+(`-ngl 0 -c 512 --pooling none --embd-normalize -1 --no-warmup --embeddings`, port from
+`VYBFORGE_ORACLE_PORT`, default 18091), waits for `/health`, captures, then shuts the server down.
+CPU-only is deliberate: the oracle can then serve WHILE a GPU driver holds the 3090 (the same rule as
+the dense decode oracle). Measured: a full capture (spawn + the per-position picks + the stream + the
+hidden + a determinism re-check) is ~15 s for a 5-token prompt.
+
+What it records, per prompt: the oracle's own TOKENIZER ids; the greedy pick after every prefix length
+1..S with the top-2 ids and logprobs; the greedy continuation with per-step logprobs; the per-position
+FINAL HIDDEN (`/embeddings` with `--pooling none` — the OAI `/v1/embeddings` refuses that pooling,
+and `--embeddings` must be passed or the route answers 501); and provenance (llama-server version,
+binary, flags, and a GGUF id = sha256 of the first MiB). It re-issues every query and requires
+bit-identical answers before writing, so a flaky oracle fails the capture rather than becoming a gate.
+
+Fixtures land in `native/legit/fixtures/llama_ridge/`: `<name>.fix` (text, `key value` lines — the
+dense `llama_decode` fixtures' shape) plus `<name>.hidden.f64` (S x D, f64, `hidden_stage
+post_output_norm` — apply our `output_norm` to our pre-norm hidden before comparing, or the cosine
+reads as a mismatch).
+
+Two prompts, for two different strengths — measured margins, not assumptions:
+
+    the_capital_of_france_is   ids [760,6511,314,9338,369]; after the full prompt the oracle picks
+                               11751 " Paris" at -0.4218 vs -3.4378 (margin 3.02 nats) — the
+                               SEMANTIC check; the 1-token prefix is thin (0.238) and one
+                               continuation step ties (0.017), so only the first token is an
+                               exact gate
+    1_2_3_4_5_6_7              ids are 20 tokens; the greedy continuation is " 8, 9," and 18 of the
+                               20 per-position picks clear the bar (0.58 .. 5.19 nats) — the
+                               PER-POSITION check. k=2 (0.066) and k=4 (0.371) are recorded as
+                               membership, which is the rule working: after "1," the oracle's top-2
+                               are 17 vs 15 at 0.066 nats apart, and no forward can be blamed for
+                               landing on either. All six continuation steps are decisive (>=3.5).
+
+`margin_bar 0.5` (nats) is in the fixture, with `pos_top1 <k> <top1> <lp1> <top2> <lp2> exact|membership`
+per position: a gate must check EQUALITY only where the margin clears the bar, and MEMBERSHIP of
+{top1, top2} below it. A flat position is a coin flip fp noise can move; the dense experience is that
+a gate demanding equality there flakes on a correct forward.
+
+**Ridge's ids are NOT Qwen3-4B's** — measured, "The capital of France is" is `[760,6511,314,9338,369]`
+here and `[785,6722,315,9625,374]` on Qwen3-4B. Feeding the dense ids to this model produced "u" from
+a 5-token prompt; every comparison must use the fixture's own ids.
+
+Two things NOT done for the oracle, both worth knowing before W3:
+* our ENCODER has never been checked against `/tokenize` for Ridge, because the model dir holds only
+  the GGUF (`~/Models/qwen38-27b-ridge/`) and the encoder path (`llm::llm_load`) wants a tokenizer
+  directory. `models--Qwen--Qwen3.8-27B` is in the HF cache as a bare ref; the official
+  `tokenizer.json` is an ~11 MB fetch and would let the encoder be checked against the oracle
+  independently of W2/W3. Worth doing before the W3 comparison — a wrong id stream makes every
+  downstream number meaningless.
+* there is deliberately NO gate yet: the fixture's job is to be CONSUMED by the W3 verifier, and a
+  gate with nothing to compare would be decoration. The provenance check (llama version + gguf_id)
+  belongs in that verifier, failing with "recapture required".
+
 ## APPENDIX — the accumulated record (chronological; headings marked HISTORIC are kept only
 ## so the record is not rewritten)
 
