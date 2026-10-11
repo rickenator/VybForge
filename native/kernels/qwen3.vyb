@@ -4322,3 +4322,2966 @@ gemv_q6k_m7(p<Int>) -> {
         mm0 = mm0 + 7
     }
 }
+
+// R=2 weight rows per warp for the exact-M twins (gemv_q*k_m{2..7}r2; Ursela, 3090 short-prompt TTFT):
+// each x load feeds two weight rows. Every accumulator gets the same additions in the same order and the
+// packed tree pairs are per accumulator -> bit-identical (harness bitdiff=0). 8-warp blocks x 16 rows.
+// 3090 cold-L2, M=5: 9728x2560 0.142 -> 0.105 ms, 2560x9728 0.178 -> 0.101 ms.
+
+gemv_q4k_m2r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc0B as Float)
+        st_shared_f64(wb + 96 + l, acc1B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 4 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 4) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 2) { ra = l - 2; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 2
+    }
+}
+
+gemv_q6k_m2r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc0B as Float)
+        st_shared_f64(wb + 96 + l, acc1B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 4 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 4) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 2) { ra = l - 2; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 2
+    }
+}
+
+gemv_q4k_m3r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                xv2_wl0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_wl0 * wl0
+                acc2B = acc2B + xv2_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                xv2_wh0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_wh0 * wh0
+                acc2B = acc2B + xv2_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                xv2_wl1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_wl1 * wl1
+                acc2B = acc2B + xv2_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                xv2_wh1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_wh1 * wh1
+                acc2B = acc2B + xv2_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                xv2_wl2<Float32> = ld_f32(xr2 + so + 8)
+                acc2 = acc2 + xv2_wl2 * wl2
+                acc2B = acc2B + xv2_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                xv2_wh2<Float32> = ld_f32(xr2 + so + 136)
+                acc2 = acc2 + xv2_wh2 * wh2
+                acc2B = acc2B + xv2_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                xv2_wl3<Float32> = ld_f32(xr2 + so + 12)
+                acc2 = acc2 + xv2_wl3 * wl3
+                acc2B = acc2B + xv2_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+                xv2_wh3<Float32> = ld_f32(xr2 + so + 140)
+                acc2 = acc2 + xv2_wh3 * wh3
+                acc2B = acc2B + xv2_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc0B as Float)
+        st_shared_f64(wb + 128 + l, acc1B as Float)
+        st_shared_f64(wb + 160 + l, acc2B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 6 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 6) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 3) { ra = l - 3; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 3
+    }
+}
+
+gemv_q6k_m3r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                xv2_w1e0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_w1e0 * w1e0
+                acc2B = acc2B + xv2_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                xv2_w2e0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_w2e0 * w2e0
+                acc2B = acc2B + xv2_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                xv2_w3e0<Float32> = ld_f32(xr2 + so + 256)
+                acc2 = acc2 + xv2_w3e0 * w3e0
+                acc2B = acc2B + xv2_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                xv2_w4e0<Float32> = ld_f32(xr2 + so + 384)
+                acc2 = acc2 + xv2_w4e0 * w4e0
+                acc2B = acc2B + xv2_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                xv2_w1e1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_w1e1 * w1e1
+                acc2B = acc2B + xv2_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                xv2_w2e1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_w2e1 * w2e1
+                acc2B = acc2B + xv2_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                xv2_w3e1<Float32> = ld_f32(xr2 + so + 260)
+                acc2 = acc2 + xv2_w3e1 * w3e1
+                acc2B = acc2B + xv2_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+                xv2_w4e1<Float32> = ld_f32(xr2 + so + 388)
+                acc2 = acc2 + xv2_w4e1 * w4e1
+                acc2B = acc2B + xv2_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc0B as Float)
+        st_shared_f64(wb + 128 + l, acc1B as Float)
+        st_shared_f64(wb + 160 + l, acc2B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 6 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 6) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 3) { ra = l - 3; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 3
+    }
+}
+
+gemv_q4k_m4r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                xv2_wl0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_wl0 * wl0
+                acc2B = acc2B + xv2_wl0 * wl0B
+                xv3_wl0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_wl0 * wl0
+                acc3B = acc3B + xv3_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                xv2_wh0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_wh0 * wh0
+                acc2B = acc2B + xv2_wh0 * wh0B
+                xv3_wh0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_wh0 * wh0
+                acc3B = acc3B + xv3_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                xv2_wl1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_wl1 * wl1
+                acc2B = acc2B + xv2_wl1 * wl1B
+                xv3_wl1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_wl1 * wl1
+                acc3B = acc3B + xv3_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                xv2_wh1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_wh1 * wh1
+                acc2B = acc2B + xv2_wh1 * wh1B
+                xv3_wh1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_wh1 * wh1
+                acc3B = acc3B + xv3_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                xv2_wl2<Float32> = ld_f32(xr2 + so + 8)
+                acc2 = acc2 + xv2_wl2 * wl2
+                acc2B = acc2B + xv2_wl2 * wl2B
+                xv3_wl2<Float32> = ld_f32(xr3 + so + 8)
+                acc3 = acc3 + xv3_wl2 * wl2
+                acc3B = acc3B + xv3_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                xv2_wh2<Float32> = ld_f32(xr2 + so + 136)
+                acc2 = acc2 + xv2_wh2 * wh2
+                acc2B = acc2B + xv2_wh2 * wh2B
+                xv3_wh2<Float32> = ld_f32(xr3 + so + 136)
+                acc3 = acc3 + xv3_wh2 * wh2
+                acc3B = acc3B + xv3_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                xv2_wl3<Float32> = ld_f32(xr2 + so + 12)
+                acc2 = acc2 + xv2_wl3 * wl3
+                acc2B = acc2B + xv2_wl3 * wl3B
+                xv3_wl3<Float32> = ld_f32(xr3 + so + 12)
+                acc3 = acc3 + xv3_wl3 * wl3
+                acc3B = acc3B + xv3_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+                xv2_wh3<Float32> = ld_f32(xr2 + so + 140)
+                acc2 = acc2 + xv2_wh3 * wh3
+                acc2B = acc2B + xv2_wh3 * wh3B
+                xv3_wh3<Float32> = ld_f32(xr3 + so + 140)
+                acc3 = acc3 + xv3_wh3 * wh3
+                acc3B = acc3B + xv3_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc0B as Float)
+        st_shared_f64(wb + 160 + l, acc1B as Float)
+        st_shared_f64(wb + 192 + l, acc2B as Float)
+        st_shared_f64(wb + 224 + l, acc3B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 8 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 8) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 4) { ra = l - 4; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 4
+    }
+}
+
+gemv_q6k_m4r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + g * 128 + jj) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                xv2_w1e0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_w1e0 * w1e0
+                acc2B = acc2B + xv2_w1e0 * w1e0B
+                xv3_w1e0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_w1e0 * w1e0
+                acc3B = acc3B + xv3_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                xv2_w2e0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_w2e0 * w2e0
+                acc2B = acc2B + xv2_w2e0 * w2e0B
+                xv3_w2e0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_w2e0 * w2e0
+                acc3B = acc3B + xv3_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                xv2_w3e0<Float32> = ld_f32(xr2 + so + 256)
+                acc2 = acc2 + xv2_w3e0 * w3e0
+                acc2B = acc2B + xv2_w3e0 * w3e0B
+                xv3_w3e0<Float32> = ld_f32(xr3 + so + 256)
+                acc3 = acc3 + xv3_w3e0 * w3e0
+                acc3B = acc3B + xv3_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                xv2_w4e0<Float32> = ld_f32(xr2 + so + 384)
+                acc2 = acc2 + xv2_w4e0 * w4e0
+                acc2B = acc2B + xv2_w4e0 * w4e0B
+                xv3_w4e0<Float32> = ld_f32(xr3 + so + 384)
+                acc3 = acc3 + xv3_w4e0 * w4e0
+                acc3B = acc3B + xv3_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                xv2_w1e1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_w1e1 * w1e1
+                acc2B = acc2B + xv2_w1e1 * w1e1B
+                xv3_w1e1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_w1e1 * w1e1
+                acc3B = acc3B + xv3_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                xv2_w2e1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_w2e1 * w2e1
+                acc2B = acc2B + xv2_w2e1 * w2e1B
+                xv3_w2e1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_w2e1 * w2e1
+                acc3B = acc3B + xv3_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                xv2_w3e1<Float32> = ld_f32(xr2 + so + 260)
+                acc2 = acc2 + xv2_w3e1 * w3e1
+                acc2B = acc2B + xv2_w3e1 * w3e1B
+                xv3_w3e1<Float32> = ld_f32(xr3 + so + 260)
+                acc3 = acc3 + xv3_w3e1 * w3e1
+                acc3B = acc3B + xv3_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+                xv2_w4e1<Float32> = ld_f32(xr2 + so + 388)
+                acc2 = acc2 + xv2_w4e1 * w4e1
+                acc2B = acc2B + xv2_w4e1 * w4e1B
+                xv3_w4e1<Float32> = ld_f32(xr3 + so + 388)
+                acc3 = acc3 + xv3_w4e1 * w4e1
+                acc3B = acc3B + xv3_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc0B as Float)
+        st_shared_f64(wb + 160 + l, acc1B as Float)
+        st_shared_f64(wb + 192 + l, acc2B as Float)
+        st_shared_f64(wb + 224 + l, acc3B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 8 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 8) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 4) { ra = l - 4; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 4
+    }
+}
+
+gemv_q4k_m5r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                xv2_wl0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_wl0 * wl0
+                acc2B = acc2B + xv2_wl0 * wl0B
+                xv3_wl0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_wl0 * wl0
+                acc3B = acc3B + xv3_wl0 * wl0B
+                xv4_wl0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_wl0 * wl0
+                acc4B = acc4B + xv4_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                xv2_wh0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_wh0 * wh0
+                acc2B = acc2B + xv2_wh0 * wh0B
+                xv3_wh0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_wh0 * wh0
+                acc3B = acc3B + xv3_wh0 * wh0B
+                xv4_wh0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_wh0 * wh0
+                acc4B = acc4B + xv4_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                xv2_wl1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_wl1 * wl1
+                acc2B = acc2B + xv2_wl1 * wl1B
+                xv3_wl1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_wl1 * wl1
+                acc3B = acc3B + xv3_wl1 * wl1B
+                xv4_wl1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_wl1 * wl1
+                acc4B = acc4B + xv4_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                xv2_wh1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_wh1 * wh1
+                acc2B = acc2B + xv2_wh1 * wh1B
+                xv3_wh1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_wh1 * wh1
+                acc3B = acc3B + xv3_wh1 * wh1B
+                xv4_wh1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_wh1 * wh1
+                acc4B = acc4B + xv4_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                xv2_wl2<Float32> = ld_f32(xr2 + so + 8)
+                acc2 = acc2 + xv2_wl2 * wl2
+                acc2B = acc2B + xv2_wl2 * wl2B
+                xv3_wl2<Float32> = ld_f32(xr3 + so + 8)
+                acc3 = acc3 + xv3_wl2 * wl2
+                acc3B = acc3B + xv3_wl2 * wl2B
+                xv4_wl2<Float32> = ld_f32(xr4 + so + 8)
+                acc4 = acc4 + xv4_wl2 * wl2
+                acc4B = acc4B + xv4_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                xv2_wh2<Float32> = ld_f32(xr2 + so + 136)
+                acc2 = acc2 + xv2_wh2 * wh2
+                acc2B = acc2B + xv2_wh2 * wh2B
+                xv3_wh2<Float32> = ld_f32(xr3 + so + 136)
+                acc3 = acc3 + xv3_wh2 * wh2
+                acc3B = acc3B + xv3_wh2 * wh2B
+                xv4_wh2<Float32> = ld_f32(xr4 + so + 136)
+                acc4 = acc4 + xv4_wh2 * wh2
+                acc4B = acc4B + xv4_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                xv2_wl3<Float32> = ld_f32(xr2 + so + 12)
+                acc2 = acc2 + xv2_wl3 * wl3
+                acc2B = acc2B + xv2_wl3 * wl3B
+                xv3_wl3<Float32> = ld_f32(xr3 + so + 12)
+                acc3 = acc3 + xv3_wl3 * wl3
+                acc3B = acc3B + xv3_wl3 * wl3B
+                xv4_wl3<Float32> = ld_f32(xr4 + so + 12)
+                acc4 = acc4 + xv4_wl3 * wl3
+                acc4B = acc4B + xv4_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+                xv2_wh3<Float32> = ld_f32(xr2 + so + 140)
+                acc2 = acc2 + xv2_wh3 * wh3
+                acc2B = acc2B + xv2_wh3 * wh3B
+                xv3_wh3<Float32> = ld_f32(xr3 + so + 140)
+                acc3 = acc3 + xv3_wh3 * wh3
+                acc3B = acc3B + xv3_wh3 * wh3B
+                xv4_wh3<Float32> = ld_f32(xr4 + so + 140)
+                acc4 = acc4 + xv4_wh3 * wh3
+                acc4B = acc4B + xv4_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc0B as Float)
+        st_shared_f64(wb + 192 + l, acc1B as Float)
+        st_shared_f64(wb + 224 + l, acc2B as Float)
+        st_shared_f64(wb + 256 + l, acc3B as Float)
+        st_shared_f64(wb + 288 + l, acc4B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 10 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 10) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 5) { ra = l - 5; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 5
+    }
+}
+
+gemv_q6k_m5r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + g * 128 + jj) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + g * 128 + jj) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                xv2_w1e0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_w1e0 * w1e0
+                acc2B = acc2B + xv2_w1e0 * w1e0B
+                xv3_w1e0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_w1e0 * w1e0
+                acc3B = acc3B + xv3_w1e0 * w1e0B
+                xv4_w1e0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_w1e0 * w1e0
+                acc4B = acc4B + xv4_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                xv2_w2e0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_w2e0 * w2e0
+                acc2B = acc2B + xv2_w2e0 * w2e0B
+                xv3_w2e0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_w2e0 * w2e0
+                acc3B = acc3B + xv3_w2e0 * w2e0B
+                xv4_w2e0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_w2e0 * w2e0
+                acc4B = acc4B + xv4_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                xv2_w3e0<Float32> = ld_f32(xr2 + so + 256)
+                acc2 = acc2 + xv2_w3e0 * w3e0
+                acc2B = acc2B + xv2_w3e0 * w3e0B
+                xv3_w3e0<Float32> = ld_f32(xr3 + so + 256)
+                acc3 = acc3 + xv3_w3e0 * w3e0
+                acc3B = acc3B + xv3_w3e0 * w3e0B
+                xv4_w3e0<Float32> = ld_f32(xr4 + so + 256)
+                acc4 = acc4 + xv4_w3e0 * w3e0
+                acc4B = acc4B + xv4_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                xv2_w4e0<Float32> = ld_f32(xr2 + so + 384)
+                acc2 = acc2 + xv2_w4e0 * w4e0
+                acc2B = acc2B + xv2_w4e0 * w4e0B
+                xv3_w4e0<Float32> = ld_f32(xr3 + so + 384)
+                acc3 = acc3 + xv3_w4e0 * w4e0
+                acc3B = acc3B + xv3_w4e0 * w4e0B
+                xv4_w4e0<Float32> = ld_f32(xr4 + so + 384)
+                acc4 = acc4 + xv4_w4e0 * w4e0
+                acc4B = acc4B + xv4_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                xv2_w1e1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_w1e1 * w1e1
+                acc2B = acc2B + xv2_w1e1 * w1e1B
+                xv3_w1e1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_w1e1 * w1e1
+                acc3B = acc3B + xv3_w1e1 * w1e1B
+                xv4_w1e1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_w1e1 * w1e1
+                acc4B = acc4B + xv4_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                xv2_w2e1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_w2e1 * w2e1
+                acc2B = acc2B + xv2_w2e1 * w2e1B
+                xv3_w2e1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_w2e1 * w2e1
+                acc3B = acc3B + xv3_w2e1 * w2e1B
+                xv4_w2e1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_w2e1 * w2e1
+                acc4B = acc4B + xv4_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                xv2_w3e1<Float32> = ld_f32(xr2 + so + 260)
+                acc2 = acc2 + xv2_w3e1 * w3e1
+                acc2B = acc2B + xv2_w3e1 * w3e1B
+                xv3_w3e1<Float32> = ld_f32(xr3 + so + 260)
+                acc3 = acc3 + xv3_w3e1 * w3e1
+                acc3B = acc3B + xv3_w3e1 * w3e1B
+                xv4_w3e1<Float32> = ld_f32(xr4 + so + 260)
+                acc4 = acc4 + xv4_w3e1 * w3e1
+                acc4B = acc4B + xv4_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+                xv2_w4e1<Float32> = ld_f32(xr2 + so + 388)
+                acc2 = acc2 + xv2_w4e1 * w4e1
+                acc2B = acc2B + xv2_w4e1 * w4e1B
+                xv3_w4e1<Float32> = ld_f32(xr3 + so + 388)
+                acc3 = acc3 + xv3_w4e1 * w4e1
+                acc3B = acc3B + xv3_w4e1 * w4e1B
+                xv4_w4e1<Float32> = ld_f32(xr4 + so + 388)
+                acc4 = acc4 + xv4_w4e1 * w4e1
+                acc4B = acc4B + xv4_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc0B as Float)
+        st_shared_f64(wb + 192 + l, acc1B as Float)
+        st_shared_f64(wb + 224 + l, acc2B as Float)
+        st_shared_f64(wb + 256 + l, acc3B as Float)
+        st_shared_f64(wb + 288 + l, acc4B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 10 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 10) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 5) { ra = l - 5; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 5
+    }
+}
+
+gemv_q4k_m6r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        acc5<Float32> = 0.0
+        acc5B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr5<Int> = mm0 + 5
+        if (rr5 > M - 1) { rr5 = M - 1 }
+        xr5<Int> = X + (rr5 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                xv2_wl0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_wl0 * wl0
+                acc2B = acc2B + xv2_wl0 * wl0B
+                xv3_wl0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_wl0 * wl0
+                acc3B = acc3B + xv3_wl0 * wl0B
+                xv4_wl0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_wl0 * wl0
+                acc4B = acc4B + xv4_wl0 * wl0B
+                xv5_wl0<Float32> = ld_f32(xr5 + so + 0)
+                acc5 = acc5 + xv5_wl0 * wl0
+                acc5B = acc5B + xv5_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                xv2_wh0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_wh0 * wh0
+                acc2B = acc2B + xv2_wh0 * wh0B
+                xv3_wh0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_wh0 * wh0
+                acc3B = acc3B + xv3_wh0 * wh0B
+                xv4_wh0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_wh0 * wh0
+                acc4B = acc4B + xv4_wh0 * wh0B
+                xv5_wh0<Float32> = ld_f32(xr5 + so + 128)
+                acc5 = acc5 + xv5_wh0 * wh0
+                acc5B = acc5B + xv5_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                xv2_wl1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_wl1 * wl1
+                acc2B = acc2B + xv2_wl1 * wl1B
+                xv3_wl1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_wl1 * wl1
+                acc3B = acc3B + xv3_wl1 * wl1B
+                xv4_wl1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_wl1 * wl1
+                acc4B = acc4B + xv4_wl1 * wl1B
+                xv5_wl1<Float32> = ld_f32(xr5 + so + 4)
+                acc5 = acc5 + xv5_wl1 * wl1
+                acc5B = acc5B + xv5_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                xv2_wh1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_wh1 * wh1
+                acc2B = acc2B + xv2_wh1 * wh1B
+                xv3_wh1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_wh1 * wh1
+                acc3B = acc3B + xv3_wh1 * wh1B
+                xv4_wh1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_wh1 * wh1
+                acc4B = acc4B + xv4_wh1 * wh1B
+                xv5_wh1<Float32> = ld_f32(xr5 + so + 132)
+                acc5 = acc5 + xv5_wh1 * wh1
+                acc5B = acc5B + xv5_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                xv2_wl2<Float32> = ld_f32(xr2 + so + 8)
+                acc2 = acc2 + xv2_wl2 * wl2
+                acc2B = acc2B + xv2_wl2 * wl2B
+                xv3_wl2<Float32> = ld_f32(xr3 + so + 8)
+                acc3 = acc3 + xv3_wl2 * wl2
+                acc3B = acc3B + xv3_wl2 * wl2B
+                xv4_wl2<Float32> = ld_f32(xr4 + so + 8)
+                acc4 = acc4 + xv4_wl2 * wl2
+                acc4B = acc4B + xv4_wl2 * wl2B
+                xv5_wl2<Float32> = ld_f32(xr5 + so + 8)
+                acc5 = acc5 + xv5_wl2 * wl2
+                acc5B = acc5B + xv5_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                xv2_wh2<Float32> = ld_f32(xr2 + so + 136)
+                acc2 = acc2 + xv2_wh2 * wh2
+                acc2B = acc2B + xv2_wh2 * wh2B
+                xv3_wh2<Float32> = ld_f32(xr3 + so + 136)
+                acc3 = acc3 + xv3_wh2 * wh2
+                acc3B = acc3B + xv3_wh2 * wh2B
+                xv4_wh2<Float32> = ld_f32(xr4 + so + 136)
+                acc4 = acc4 + xv4_wh2 * wh2
+                acc4B = acc4B + xv4_wh2 * wh2B
+                xv5_wh2<Float32> = ld_f32(xr5 + so + 136)
+                acc5 = acc5 + xv5_wh2 * wh2
+                acc5B = acc5B + xv5_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                xv2_wl3<Float32> = ld_f32(xr2 + so + 12)
+                acc2 = acc2 + xv2_wl3 * wl3
+                acc2B = acc2B + xv2_wl3 * wl3B
+                xv3_wl3<Float32> = ld_f32(xr3 + so + 12)
+                acc3 = acc3 + xv3_wl3 * wl3
+                acc3B = acc3B + xv3_wl3 * wl3B
+                xv4_wl3<Float32> = ld_f32(xr4 + so + 12)
+                acc4 = acc4 + xv4_wl3 * wl3
+                acc4B = acc4B + xv4_wl3 * wl3B
+                xv5_wl3<Float32> = ld_f32(xr5 + so + 12)
+                acc5 = acc5 + xv5_wl3 * wl3
+                acc5B = acc5B + xv5_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+                xv2_wh3<Float32> = ld_f32(xr2 + so + 140)
+                acc2 = acc2 + xv2_wh3 * wh3
+                acc2B = acc2B + xv2_wh3 * wh3B
+                xv3_wh3<Float32> = ld_f32(xr3 + so + 140)
+                acc3 = acc3 + xv3_wh3 * wh3
+                acc3B = acc3B + xv3_wh3 * wh3B
+                xv4_wh3<Float32> = ld_f32(xr4 + so + 140)
+                acc4 = acc4 + xv4_wh3 * wh3
+                acc4B = acc4B + xv4_wh3 * wh3B
+                xv5_wh3<Float32> = ld_f32(xr5 + so + 140)
+                acc5 = acc5 + xv5_wh3 * wh3
+                acc5B = acc5B + xv5_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc0B as Float)
+        st_shared_f64(wb + 224 + l, acc1B as Float)
+        st_shared_f64(wb + 256 + l, acc2B as Float)
+        st_shared_f64(wb + 288 + l, acc3B as Float)
+        st_shared_f64(wb + 320 + l, acc4B as Float)
+        st_shared_f64(wb + 352 + l, acc5B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 12 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 12) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 6) { ra = l - 6; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 6
+    }
+}
+
+gemv_q6k_m6r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        acc5<Float32> = 0.0
+        acc5B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + g * 128 + jj) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + g * 128 + jj) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + g * 128 + jj) * 4
+        rr5<Int> = mm0 + 5
+        if (rr5 > M - 1) { rr5 = M - 1 }
+        xr5<Int> = X + (rr5 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                xv2_w1e0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_w1e0 * w1e0
+                acc2B = acc2B + xv2_w1e0 * w1e0B
+                xv3_w1e0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_w1e0 * w1e0
+                acc3B = acc3B + xv3_w1e0 * w1e0B
+                xv4_w1e0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_w1e0 * w1e0
+                acc4B = acc4B + xv4_w1e0 * w1e0B
+                xv5_w1e0<Float32> = ld_f32(xr5 + so + 0)
+                acc5 = acc5 + xv5_w1e0 * w1e0
+                acc5B = acc5B + xv5_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                xv2_w2e0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_w2e0 * w2e0
+                acc2B = acc2B + xv2_w2e0 * w2e0B
+                xv3_w2e0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_w2e0 * w2e0
+                acc3B = acc3B + xv3_w2e0 * w2e0B
+                xv4_w2e0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_w2e0 * w2e0
+                acc4B = acc4B + xv4_w2e0 * w2e0B
+                xv5_w2e0<Float32> = ld_f32(xr5 + so + 128)
+                acc5 = acc5 + xv5_w2e0 * w2e0
+                acc5B = acc5B + xv5_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                xv2_w3e0<Float32> = ld_f32(xr2 + so + 256)
+                acc2 = acc2 + xv2_w3e0 * w3e0
+                acc2B = acc2B + xv2_w3e0 * w3e0B
+                xv3_w3e0<Float32> = ld_f32(xr3 + so + 256)
+                acc3 = acc3 + xv3_w3e0 * w3e0
+                acc3B = acc3B + xv3_w3e0 * w3e0B
+                xv4_w3e0<Float32> = ld_f32(xr4 + so + 256)
+                acc4 = acc4 + xv4_w3e0 * w3e0
+                acc4B = acc4B + xv4_w3e0 * w3e0B
+                xv5_w3e0<Float32> = ld_f32(xr5 + so + 256)
+                acc5 = acc5 + xv5_w3e0 * w3e0
+                acc5B = acc5B + xv5_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                xv2_w4e0<Float32> = ld_f32(xr2 + so + 384)
+                acc2 = acc2 + xv2_w4e0 * w4e0
+                acc2B = acc2B + xv2_w4e0 * w4e0B
+                xv3_w4e0<Float32> = ld_f32(xr3 + so + 384)
+                acc3 = acc3 + xv3_w4e0 * w4e0
+                acc3B = acc3B + xv3_w4e0 * w4e0B
+                xv4_w4e0<Float32> = ld_f32(xr4 + so + 384)
+                acc4 = acc4 + xv4_w4e0 * w4e0
+                acc4B = acc4B + xv4_w4e0 * w4e0B
+                xv5_w4e0<Float32> = ld_f32(xr5 + so + 384)
+                acc5 = acc5 + xv5_w4e0 * w4e0
+                acc5B = acc5B + xv5_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                xv2_w1e1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_w1e1 * w1e1
+                acc2B = acc2B + xv2_w1e1 * w1e1B
+                xv3_w1e1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_w1e1 * w1e1
+                acc3B = acc3B + xv3_w1e1 * w1e1B
+                xv4_w1e1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_w1e1 * w1e1
+                acc4B = acc4B + xv4_w1e1 * w1e1B
+                xv5_w1e1<Float32> = ld_f32(xr5 + so + 4)
+                acc5 = acc5 + xv5_w1e1 * w1e1
+                acc5B = acc5B + xv5_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                xv2_w2e1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_w2e1 * w2e1
+                acc2B = acc2B + xv2_w2e1 * w2e1B
+                xv3_w2e1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_w2e1 * w2e1
+                acc3B = acc3B + xv3_w2e1 * w2e1B
+                xv4_w2e1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_w2e1 * w2e1
+                acc4B = acc4B + xv4_w2e1 * w2e1B
+                xv5_w2e1<Float32> = ld_f32(xr5 + so + 132)
+                acc5 = acc5 + xv5_w2e1 * w2e1
+                acc5B = acc5B + xv5_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                xv2_w3e1<Float32> = ld_f32(xr2 + so + 260)
+                acc2 = acc2 + xv2_w3e1 * w3e1
+                acc2B = acc2B + xv2_w3e1 * w3e1B
+                xv3_w3e1<Float32> = ld_f32(xr3 + so + 260)
+                acc3 = acc3 + xv3_w3e1 * w3e1
+                acc3B = acc3B + xv3_w3e1 * w3e1B
+                xv4_w3e1<Float32> = ld_f32(xr4 + so + 260)
+                acc4 = acc4 + xv4_w3e1 * w3e1
+                acc4B = acc4B + xv4_w3e1 * w3e1B
+                xv5_w3e1<Float32> = ld_f32(xr5 + so + 260)
+                acc5 = acc5 + xv5_w3e1 * w3e1
+                acc5B = acc5B + xv5_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+                xv2_w4e1<Float32> = ld_f32(xr2 + so + 388)
+                acc2 = acc2 + xv2_w4e1 * w4e1
+                acc2B = acc2B + xv2_w4e1 * w4e1B
+                xv3_w4e1<Float32> = ld_f32(xr3 + so + 388)
+                acc3 = acc3 + xv3_w4e1 * w4e1
+                acc3B = acc3B + xv3_w4e1 * w4e1B
+                xv4_w4e1<Float32> = ld_f32(xr4 + so + 388)
+                acc4 = acc4 + xv4_w4e1 * w4e1
+                acc4B = acc4B + xv4_w4e1 * w4e1B
+                xv5_w4e1<Float32> = ld_f32(xr5 + so + 388)
+                acc5 = acc5 + xv5_w4e1 * w4e1
+                acc5B = acc5B + xv5_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc0B as Float)
+        st_shared_f64(wb + 224 + l, acc1B as Float)
+        st_shared_f64(wb + 256 + l, acc2B as Float)
+        st_shared_f64(wb + 288 + l, acc3B as Float)
+        st_shared_f64(wb + 320 + l, acc4B as Float)
+        st_shared_f64(wb + 352 + l, acc5B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 12 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 12) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 6) { ra = l - 6; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 6
+    }
+}
+
+gemv_q4k_m7r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        acc5<Float32> = 0.0
+        acc5B<Float32> = 0.0
+        acc6<Float32> = 0.0
+        acc6B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr5<Int> = mm0 + 5
+        if (rr5 > M - 1) { rr5 = M - 1 }
+        xr5<Int> = X + (rr5 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+        rr6<Int> = mm0 + 6
+        if (rr6 > M - 1) { rr6 = M - 1 }
+        xr6<Int> = X + (rr6 * K + (l / 8) * 64 + (l % 8) * 4) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            rbB<Int> = W + (n + 1) * nsb * 144
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 144
+                bbB<Int> = rbB + sb * 144
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb)
+                dfB<Float32> = ld_f16(bbB)
+                mnf<Float32> = ld_f16(bb + 2)
+                mnfB<Float32> = ld_f16(bbB + 2)
+                b0<UInt32> = (ld_i32(bb + 4) as UInt32) >> sh
+                b0B<UInt32> = (ld_i32(bbB + 4) as UInt32) >> sh
+                b1<UInt32> = (ld_i32(bb + 8) as UInt32) >> sh
+                b1B<UInt32> = (ld_i32(bbB + 8) as UInt32) >> sh
+                b2<UInt32> = (ld_i32(bb + 12) as UInt32) >> sh
+                b2B<UInt32> = (ld_i32(bbB + 12) as UInt32) >> sh
+                sc0<UInt32> = ((b0 & 63) & nmk) | (((b2 & 15) | (((b0 >> 6) & 3) << 4)) & mk)
+                sc0B<UInt32> = ((b0B & 63) & nmk) | (((b2B & 15) | (((b0B >> 6) & 3) << 4)) & mk)
+                m0<UInt32> = ((b1 & 63) & nmk) | ((((b2 >> 4) & 15) | (((b1 >> 6) & 3) << 4)) & mk)
+                m0B<UInt32> = ((b1B & 63) & nmk) | ((((b2B >> 4) & 15) | (((b1B >> 6) & 3) << 4)) & mk)
+                sc1<UInt32> = (((b0 >> 8) & 63) & nmk) | ((((b2 >> 8) & 15) | (((b0 >> 14) & 3) << 4)) & mk)
+                sc1B<UInt32> = (((b0B >> 8) & 63) & nmk) | ((((b2B >> 8) & 15) | (((b0B >> 14) & 3) << 4)) & mk)
+                m1<UInt32> = (((b1 >> 8) & 63) & nmk) | ((((b2 >> 12) & 15) | (((b1 >> 14) & 3) << 4)) & mk)
+                m1B<UInt32> = (((b1B >> 8) & 63) & nmk) | ((((b2B >> 12) & 15) | (((b1B >> 14) & 3) << 4)) & mk)
+                ds0<Float32> = df * (sc0 as Float32)
+                ds0B<Float32> = dfB * (sc0B as Float32)
+                dm0<Float32> = mnf * (m0 as Float32)
+                dm0B<Float32> = mnfB * (m0B as Float32)
+                ds1<Float32> = df * (sc1 as Float32)
+                ds1B<Float32> = dfB * (sc1B as Float32)
+                dm1<Float32> = mnf * (m1 as Float32)
+                dm1B<Float32> = mnfB * (m1B as Float32)
+                qw<UInt32> = ld_i32(bb + 16 + l4) as UInt32
+                qwB<UInt32> = ld_i32(bbB + 16 + l4) as UInt32
+                wl0<Float32> = ds0 * (((qw >> 0) & 15) as Float32) - dm0
+                wl0B<Float32> = ds0B * (((qwB >> 0) & 15) as Float32) - dm0B
+                xv0_wl0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_wl0 * wl0
+                acc0B = acc0B + xv0_wl0 * wl0B
+                xv1_wl0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_wl0 * wl0
+                acc1B = acc1B + xv1_wl0 * wl0B
+                xv2_wl0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_wl0 * wl0
+                acc2B = acc2B + xv2_wl0 * wl0B
+                xv3_wl0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_wl0 * wl0
+                acc3B = acc3B + xv3_wl0 * wl0B
+                xv4_wl0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_wl0 * wl0
+                acc4B = acc4B + xv4_wl0 * wl0B
+                xv5_wl0<Float32> = ld_f32(xr5 + so + 0)
+                acc5 = acc5 + xv5_wl0 * wl0
+                acc5B = acc5B + xv5_wl0 * wl0B
+                xv6_wl0<Float32> = ld_f32(xr6 + so + 0)
+                acc6 = acc6 + xv6_wl0 * wl0
+                acc6B = acc6B + xv6_wl0 * wl0B
+                wh0<Float32> = ds1 * (((qw >> 4) & 15) as Float32) - dm1
+                wh0B<Float32> = ds1B * (((qwB >> 4) & 15) as Float32) - dm1B
+                xv0_wh0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_wh0 * wh0
+                acc0B = acc0B + xv0_wh0 * wh0B
+                xv1_wh0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_wh0 * wh0
+                acc1B = acc1B + xv1_wh0 * wh0B
+                xv2_wh0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_wh0 * wh0
+                acc2B = acc2B + xv2_wh0 * wh0B
+                xv3_wh0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_wh0 * wh0
+                acc3B = acc3B + xv3_wh0 * wh0B
+                xv4_wh0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_wh0 * wh0
+                acc4B = acc4B + xv4_wh0 * wh0B
+                xv5_wh0<Float32> = ld_f32(xr5 + so + 128)
+                acc5 = acc5 + xv5_wh0 * wh0
+                acc5B = acc5B + xv5_wh0 * wh0B
+                xv6_wh0<Float32> = ld_f32(xr6 + so + 128)
+                acc6 = acc6 + xv6_wh0 * wh0
+                acc6B = acc6B + xv6_wh0 * wh0B
+                wl1<Float32> = ds0 * (((qw >> 8) & 15) as Float32) - dm0
+                wl1B<Float32> = ds0B * (((qwB >> 8) & 15) as Float32) - dm0B
+                xv0_wl1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_wl1 * wl1
+                acc0B = acc0B + xv0_wl1 * wl1B
+                xv1_wl1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_wl1 * wl1
+                acc1B = acc1B + xv1_wl1 * wl1B
+                xv2_wl1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_wl1 * wl1
+                acc2B = acc2B + xv2_wl1 * wl1B
+                xv3_wl1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_wl1 * wl1
+                acc3B = acc3B + xv3_wl1 * wl1B
+                xv4_wl1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_wl1 * wl1
+                acc4B = acc4B + xv4_wl1 * wl1B
+                xv5_wl1<Float32> = ld_f32(xr5 + so + 4)
+                acc5 = acc5 + xv5_wl1 * wl1
+                acc5B = acc5B + xv5_wl1 * wl1B
+                xv6_wl1<Float32> = ld_f32(xr6 + so + 4)
+                acc6 = acc6 + xv6_wl1 * wl1
+                acc6B = acc6B + xv6_wl1 * wl1B
+                wh1<Float32> = ds1 * (((qw >> 12) & 15) as Float32) - dm1
+                wh1B<Float32> = ds1B * (((qwB >> 12) & 15) as Float32) - dm1B
+                xv0_wh1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_wh1 * wh1
+                acc0B = acc0B + xv0_wh1 * wh1B
+                xv1_wh1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_wh1 * wh1
+                acc1B = acc1B + xv1_wh1 * wh1B
+                xv2_wh1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_wh1 * wh1
+                acc2B = acc2B + xv2_wh1 * wh1B
+                xv3_wh1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_wh1 * wh1
+                acc3B = acc3B + xv3_wh1 * wh1B
+                xv4_wh1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_wh1 * wh1
+                acc4B = acc4B + xv4_wh1 * wh1B
+                xv5_wh1<Float32> = ld_f32(xr5 + so + 132)
+                acc5 = acc5 + xv5_wh1 * wh1
+                acc5B = acc5B + xv5_wh1 * wh1B
+                xv6_wh1<Float32> = ld_f32(xr6 + so + 132)
+                acc6 = acc6 + xv6_wh1 * wh1
+                acc6B = acc6B + xv6_wh1 * wh1B
+                wl2<Float32> = ds0 * (((qw >> 16) & 15) as Float32) - dm0
+                wl2B<Float32> = ds0B * (((qwB >> 16) & 15) as Float32) - dm0B
+                xv0_wl2<Float32> = ld_f32(xr0 + so + 8)
+                acc0 = acc0 + xv0_wl2 * wl2
+                acc0B = acc0B + xv0_wl2 * wl2B
+                xv1_wl2<Float32> = ld_f32(xr1 + so + 8)
+                acc1 = acc1 + xv1_wl2 * wl2
+                acc1B = acc1B + xv1_wl2 * wl2B
+                xv2_wl2<Float32> = ld_f32(xr2 + so + 8)
+                acc2 = acc2 + xv2_wl2 * wl2
+                acc2B = acc2B + xv2_wl2 * wl2B
+                xv3_wl2<Float32> = ld_f32(xr3 + so + 8)
+                acc3 = acc3 + xv3_wl2 * wl2
+                acc3B = acc3B + xv3_wl2 * wl2B
+                xv4_wl2<Float32> = ld_f32(xr4 + so + 8)
+                acc4 = acc4 + xv4_wl2 * wl2
+                acc4B = acc4B + xv4_wl2 * wl2B
+                xv5_wl2<Float32> = ld_f32(xr5 + so + 8)
+                acc5 = acc5 + xv5_wl2 * wl2
+                acc5B = acc5B + xv5_wl2 * wl2B
+                xv6_wl2<Float32> = ld_f32(xr6 + so + 8)
+                acc6 = acc6 + xv6_wl2 * wl2
+                acc6B = acc6B + xv6_wl2 * wl2B
+                wh2<Float32> = ds1 * (((qw >> 20) & 15) as Float32) - dm1
+                wh2B<Float32> = ds1B * (((qwB >> 20) & 15) as Float32) - dm1B
+                xv0_wh2<Float32> = ld_f32(xr0 + so + 136)
+                acc0 = acc0 + xv0_wh2 * wh2
+                acc0B = acc0B + xv0_wh2 * wh2B
+                xv1_wh2<Float32> = ld_f32(xr1 + so + 136)
+                acc1 = acc1 + xv1_wh2 * wh2
+                acc1B = acc1B + xv1_wh2 * wh2B
+                xv2_wh2<Float32> = ld_f32(xr2 + so + 136)
+                acc2 = acc2 + xv2_wh2 * wh2
+                acc2B = acc2B + xv2_wh2 * wh2B
+                xv3_wh2<Float32> = ld_f32(xr3 + so + 136)
+                acc3 = acc3 + xv3_wh2 * wh2
+                acc3B = acc3B + xv3_wh2 * wh2B
+                xv4_wh2<Float32> = ld_f32(xr4 + so + 136)
+                acc4 = acc4 + xv4_wh2 * wh2
+                acc4B = acc4B + xv4_wh2 * wh2B
+                xv5_wh2<Float32> = ld_f32(xr5 + so + 136)
+                acc5 = acc5 + xv5_wh2 * wh2
+                acc5B = acc5B + xv5_wh2 * wh2B
+                xv6_wh2<Float32> = ld_f32(xr6 + so + 136)
+                acc6 = acc6 + xv6_wh2 * wh2
+                acc6B = acc6B + xv6_wh2 * wh2B
+                wl3<Float32> = ds0 * (((qw >> 24) & 15) as Float32) - dm0
+                wl3B<Float32> = ds0B * (((qwB >> 24) & 15) as Float32) - dm0B
+                xv0_wl3<Float32> = ld_f32(xr0 + so + 12)
+                acc0 = acc0 + xv0_wl3 * wl3
+                acc0B = acc0B + xv0_wl3 * wl3B
+                xv1_wl3<Float32> = ld_f32(xr1 + so + 12)
+                acc1 = acc1 + xv1_wl3 * wl3
+                acc1B = acc1B + xv1_wl3 * wl3B
+                xv2_wl3<Float32> = ld_f32(xr2 + so + 12)
+                acc2 = acc2 + xv2_wl3 * wl3
+                acc2B = acc2B + xv2_wl3 * wl3B
+                xv3_wl3<Float32> = ld_f32(xr3 + so + 12)
+                acc3 = acc3 + xv3_wl3 * wl3
+                acc3B = acc3B + xv3_wl3 * wl3B
+                xv4_wl3<Float32> = ld_f32(xr4 + so + 12)
+                acc4 = acc4 + xv4_wl3 * wl3
+                acc4B = acc4B + xv4_wl3 * wl3B
+                xv5_wl3<Float32> = ld_f32(xr5 + so + 12)
+                acc5 = acc5 + xv5_wl3 * wl3
+                acc5B = acc5B + xv5_wl3 * wl3B
+                xv6_wl3<Float32> = ld_f32(xr6 + so + 12)
+                acc6 = acc6 + xv6_wl3 * wl3
+                acc6B = acc6B + xv6_wl3 * wl3B
+                wh3<Float32> = ds1 * (((qw >> 28) & 15) as Float32) - dm1
+                wh3B<Float32> = ds1B * (((qwB >> 28) & 15) as Float32) - dm1B
+                xv0_wh3<Float32> = ld_f32(xr0 + so + 140)
+                acc0 = acc0 + xv0_wh3 * wh3
+                acc0B = acc0B + xv0_wh3 * wh3B
+                xv1_wh3<Float32> = ld_f32(xr1 + so + 140)
+                acc1 = acc1 + xv1_wh3 * wh3
+                acc1B = acc1B + xv1_wh3 * wh3B
+                xv2_wh3<Float32> = ld_f32(xr2 + so + 140)
+                acc2 = acc2 + xv2_wh3 * wh3
+                acc2B = acc2B + xv2_wh3 * wh3B
+                xv3_wh3<Float32> = ld_f32(xr3 + so + 140)
+                acc3 = acc3 + xv3_wh3 * wh3
+                acc3B = acc3B + xv3_wh3 * wh3B
+                xv4_wh3<Float32> = ld_f32(xr4 + so + 140)
+                acc4 = acc4 + xv4_wh3 * wh3
+                acc4B = acc4B + xv4_wh3 * wh3B
+                xv5_wh3<Float32> = ld_f32(xr5 + so + 140)
+                acc5 = acc5 + xv5_wh3 * wh3
+                acc5B = acc5B + xv5_wh3 * wh3B
+                xv6_wh3<Float32> = ld_f32(xr6 + so + 140)
+                acc6 = acc6 + xv6_wh3 * wh3
+                acc6B = acc6B + xv6_wh3 * wh3B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc6 as Float)
+        st_shared_f64(wb + 224 + l, acc0B as Float)
+        st_shared_f64(wb + 256 + l, acc1B as Float)
+        st_shared_f64(wb + 288 + l, acc2B as Float)
+        st_shared_f64(wb + 320 + l, acc3B as Float)
+        st_shared_f64(wb + 352 + l, acc4B as Float)
+        st_shared_f64(wb + 384 + l, acc5B as Float)
+        st_shared_f64(wb + 416 + l, acc6B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 14 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 14) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 7) { ra = l - 7; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 7
+    }
+}
+
+gemv_q6k_m7r2(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = (blk_x() * 8 + tid / 32) * 2
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm0<Int> = 0
+    while (mm0 < M) {
+        acc0<Float32> = 0.0
+        acc0B<Float32> = 0.0
+        acc1<Float32> = 0.0
+        acc1B<Float32> = 0.0
+        acc2<Float32> = 0.0
+        acc2B<Float32> = 0.0
+        acc3<Float32> = 0.0
+        acc3B<Float32> = 0.0
+        acc4<Float32> = 0.0
+        acc4B<Float32> = 0.0
+        acc5<Float32> = 0.0
+        acc5B<Float32> = 0.0
+        acc6<Float32> = 0.0
+        acc6B<Float32> = 0.0
+        rr0<Int> = mm0 + 0
+        if (rr0 > M - 1) { rr0 = M - 1 }
+        xr0<Int> = X + (rr0 * K + g * 128 + jj) * 4
+        rr1<Int> = mm0 + 1
+        if (rr1 > M - 1) { rr1 = M - 1 }
+        xr1<Int> = X + (rr1 * K + g * 128 + jj) * 4
+        rr2<Int> = mm0 + 2
+        if (rr2 > M - 1) { rr2 = M - 1 }
+        xr2<Int> = X + (rr2 * K + g * 128 + jj) * 4
+        rr3<Int> = mm0 + 3
+        if (rr3 > M - 1) { rr3 = M - 1 }
+        xr3<Int> = X + (rr3 * K + g * 128 + jj) * 4
+        rr4<Int> = mm0 + 4
+        if (rr4 > M - 1) { rr4 = M - 1 }
+        xr4<Int> = X + (rr4 * K + g * 128 + jj) * 4
+        rr5<Int> = mm0 + 5
+        if (rr5 > M - 1) { rr5 = M - 1 }
+        xr5<Int> = X + (rr5 * K + g * 128 + jj) * 4
+        rr6<Int> = mm0 + 6
+        if (rr6 > M - 1) { rr6 = M - 1 }
+        xr6<Int> = X + (rr6 * K + g * 128 + jj) * 4
+
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            rbB<Int> = W + (n + 1) * nsb * 210
+            sb<Int> = 0
+            for (sb in 0..nsb - 1) {
+                bb<Int> = rb + sb * 210
+                bbB<Int> = rbB + sb * 210
+                so<Int> = sb * 1024
+                df<Float32> = ld_f16(bb + 208)
+                dfB<Float32> = ld_f16(bbB + 208)
+                sbase<Int> = bb + 192 + g8is
+                sbaseB<Int> = bbB + 192 + g8is
+                da<Float32> = df * ((ld_i8(sbase) as Int32) as Float32)
+                daB<Float32> = dfB * ((ld_i8(sbaseB) as Int32) as Float32)
+                db<Float32> = df * ((ld_i8(sbase + 2) as Int32) as Float32)
+                dbB<Float32> = dfB * ((ld_i8(sbaseB + 2) as Int32) as Float32)
+                dc<Float32> = df * ((ld_i8(sbase + 4) as Int32) as Float32)
+                dcB<Float32> = dfB * ((ld_i8(sbaseB + 4) as Int32) as Float32)
+                dd<Float32> = df * ((ld_i8(sbase + 6) as Int32) as Float32)
+                ddB<Float32> = dfB * ((ld_i8(sbaseB + 6) as Int32) as Float32)
+                qla<UInt32> = (ld_u16(bb + g64jj) as UInt32) & 65535
+                qlaB<UInt32> = (ld_u16(bbB + g64jj) as UInt32) & 65535
+                qlb<UInt32> = (ld_u16(bb + g64jj + 32) as UInt32) & 65535
+                qlbB<UInt32> = (ld_u16(bbB + g64jj + 32) as UInt32) & 65535
+                qhw<UInt32> = (ld_u16(bb + 128 + g32jj) as UInt32) & 65535
+                qhwB<UInt32> = (ld_u16(bbB + 128 + g32jj) as UInt32) & 65535
+                q1e0<Int32> = ((((qla >> 0) & 15) | ((((qhw >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e0B<Int32> = ((((qlaB >> 0) & 15) | ((((qhwB >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e0<Float32> = da * (q1e0 as Float32)
+                w1e0B<Float32> = daB * (q1e0B as Float32)
+                xv0_w1e0<Float32> = ld_f32(xr0 + so + 0)
+                acc0 = acc0 + xv0_w1e0 * w1e0
+                acc0B = acc0B + xv0_w1e0 * w1e0B
+                xv1_w1e0<Float32> = ld_f32(xr1 + so + 0)
+                acc1 = acc1 + xv1_w1e0 * w1e0
+                acc1B = acc1B + xv1_w1e0 * w1e0B
+                xv2_w1e0<Float32> = ld_f32(xr2 + so + 0)
+                acc2 = acc2 + xv2_w1e0 * w1e0
+                acc2B = acc2B + xv2_w1e0 * w1e0B
+                xv3_w1e0<Float32> = ld_f32(xr3 + so + 0)
+                acc3 = acc3 + xv3_w1e0 * w1e0
+                acc3B = acc3B + xv3_w1e0 * w1e0B
+                xv4_w1e0<Float32> = ld_f32(xr4 + so + 0)
+                acc4 = acc4 + xv4_w1e0 * w1e0
+                acc4B = acc4B + xv4_w1e0 * w1e0B
+                xv5_w1e0<Float32> = ld_f32(xr5 + so + 0)
+                acc5 = acc5 + xv5_w1e0 * w1e0
+                acc5B = acc5B + xv5_w1e0 * w1e0B
+                xv6_w1e0<Float32> = ld_f32(xr6 + so + 0)
+                acc6 = acc6 + xv6_w1e0 * w1e0
+                acc6B = acc6B + xv6_w1e0 * w1e0B
+                q2e0<Int32> = ((((qlb >> 0) & 15) | ((((qhw >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e0B<Int32> = ((((qlbB >> 0) & 15) | ((((qhwB >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e0<Float32> = db * (q2e0 as Float32)
+                w2e0B<Float32> = dbB * (q2e0B as Float32)
+                xv0_w2e0<Float32> = ld_f32(xr0 + so + 128)
+                acc0 = acc0 + xv0_w2e0 * w2e0
+                acc0B = acc0B + xv0_w2e0 * w2e0B
+                xv1_w2e0<Float32> = ld_f32(xr1 + so + 128)
+                acc1 = acc1 + xv1_w2e0 * w2e0
+                acc1B = acc1B + xv1_w2e0 * w2e0B
+                xv2_w2e0<Float32> = ld_f32(xr2 + so + 128)
+                acc2 = acc2 + xv2_w2e0 * w2e0
+                acc2B = acc2B + xv2_w2e0 * w2e0B
+                xv3_w2e0<Float32> = ld_f32(xr3 + so + 128)
+                acc3 = acc3 + xv3_w2e0 * w2e0
+                acc3B = acc3B + xv3_w2e0 * w2e0B
+                xv4_w2e0<Float32> = ld_f32(xr4 + so + 128)
+                acc4 = acc4 + xv4_w2e0 * w2e0
+                acc4B = acc4B + xv4_w2e0 * w2e0B
+                xv5_w2e0<Float32> = ld_f32(xr5 + so + 128)
+                acc5 = acc5 + xv5_w2e0 * w2e0
+                acc5B = acc5B + xv5_w2e0 * w2e0B
+                xv6_w2e0<Float32> = ld_f32(xr6 + so + 128)
+                acc6 = acc6 + xv6_w2e0 * w2e0
+                acc6B = acc6B + xv6_w2e0 * w2e0B
+                q3e0<Int32> = ((((qla >> 4) & 15) | ((((qhw >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e0B<Int32> = ((((qlaB >> 4) & 15) | ((((qhwB >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e0<Float32> = dc * (q3e0 as Float32)
+                w3e0B<Float32> = dcB * (q3e0B as Float32)
+                xv0_w3e0<Float32> = ld_f32(xr0 + so + 256)
+                acc0 = acc0 + xv0_w3e0 * w3e0
+                acc0B = acc0B + xv0_w3e0 * w3e0B
+                xv1_w3e0<Float32> = ld_f32(xr1 + so + 256)
+                acc1 = acc1 + xv1_w3e0 * w3e0
+                acc1B = acc1B + xv1_w3e0 * w3e0B
+                xv2_w3e0<Float32> = ld_f32(xr2 + so + 256)
+                acc2 = acc2 + xv2_w3e0 * w3e0
+                acc2B = acc2B + xv2_w3e0 * w3e0B
+                xv3_w3e0<Float32> = ld_f32(xr3 + so + 256)
+                acc3 = acc3 + xv3_w3e0 * w3e0
+                acc3B = acc3B + xv3_w3e0 * w3e0B
+                xv4_w3e0<Float32> = ld_f32(xr4 + so + 256)
+                acc4 = acc4 + xv4_w3e0 * w3e0
+                acc4B = acc4B + xv4_w3e0 * w3e0B
+                xv5_w3e0<Float32> = ld_f32(xr5 + so + 256)
+                acc5 = acc5 + xv5_w3e0 * w3e0
+                acc5B = acc5B + xv5_w3e0 * w3e0B
+                xv6_w3e0<Float32> = ld_f32(xr6 + so + 256)
+                acc6 = acc6 + xv6_w3e0 * w3e0
+                acc6B = acc6B + xv6_w3e0 * w3e0B
+                q4e0<Int32> = ((((qlb >> 4) & 15) | ((((qhw >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e0B<Int32> = ((((qlbB >> 4) & 15) | ((((qhwB >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e0<Float32> = dd * (q4e0 as Float32)
+                w4e0B<Float32> = ddB * (q4e0B as Float32)
+                xv0_w4e0<Float32> = ld_f32(xr0 + so + 384)
+                acc0 = acc0 + xv0_w4e0 * w4e0
+                acc0B = acc0B + xv0_w4e0 * w4e0B
+                xv1_w4e0<Float32> = ld_f32(xr1 + so + 384)
+                acc1 = acc1 + xv1_w4e0 * w4e0
+                acc1B = acc1B + xv1_w4e0 * w4e0B
+                xv2_w4e0<Float32> = ld_f32(xr2 + so + 384)
+                acc2 = acc2 + xv2_w4e0 * w4e0
+                acc2B = acc2B + xv2_w4e0 * w4e0B
+                xv3_w4e0<Float32> = ld_f32(xr3 + so + 384)
+                acc3 = acc3 + xv3_w4e0 * w4e0
+                acc3B = acc3B + xv3_w4e0 * w4e0B
+                xv4_w4e0<Float32> = ld_f32(xr4 + so + 384)
+                acc4 = acc4 + xv4_w4e0 * w4e0
+                acc4B = acc4B + xv4_w4e0 * w4e0B
+                xv5_w4e0<Float32> = ld_f32(xr5 + so + 384)
+                acc5 = acc5 + xv5_w4e0 * w4e0
+                acc5B = acc5B + xv5_w4e0 * w4e0B
+                xv6_w4e0<Float32> = ld_f32(xr6 + so + 384)
+                acc6 = acc6 + xv6_w4e0 * w4e0
+                acc6B = acc6B + xv6_w4e0 * w4e0B
+                q1e1<Int32> = ((((qla >> 8) & 15) | ((((qhw >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                q1e1B<Int32> = ((((qlaB >> 8) & 15) | ((((qhwB >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                w1e1<Float32> = da * (q1e1 as Float32)
+                w1e1B<Float32> = daB * (q1e1B as Float32)
+                xv0_w1e1<Float32> = ld_f32(xr0 + so + 4)
+                acc0 = acc0 + xv0_w1e1 * w1e1
+                acc0B = acc0B + xv0_w1e1 * w1e1B
+                xv1_w1e1<Float32> = ld_f32(xr1 + so + 4)
+                acc1 = acc1 + xv1_w1e1 * w1e1
+                acc1B = acc1B + xv1_w1e1 * w1e1B
+                xv2_w1e1<Float32> = ld_f32(xr2 + so + 4)
+                acc2 = acc2 + xv2_w1e1 * w1e1
+                acc2B = acc2B + xv2_w1e1 * w1e1B
+                xv3_w1e1<Float32> = ld_f32(xr3 + so + 4)
+                acc3 = acc3 + xv3_w1e1 * w1e1
+                acc3B = acc3B + xv3_w1e1 * w1e1B
+                xv4_w1e1<Float32> = ld_f32(xr4 + so + 4)
+                acc4 = acc4 + xv4_w1e1 * w1e1
+                acc4B = acc4B + xv4_w1e1 * w1e1B
+                xv5_w1e1<Float32> = ld_f32(xr5 + so + 4)
+                acc5 = acc5 + xv5_w1e1 * w1e1
+                acc5B = acc5B + xv5_w1e1 * w1e1B
+                xv6_w1e1<Float32> = ld_f32(xr6 + so + 4)
+                acc6 = acc6 + xv6_w1e1 * w1e1
+                acc6B = acc6B + xv6_w1e1 * w1e1B
+                q2e1<Int32> = ((((qlb >> 8) & 15) | ((((qhw >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                q2e1B<Int32> = ((((qlbB >> 8) & 15) | ((((qhwB >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                w2e1<Float32> = db * (q2e1 as Float32)
+                w2e1B<Float32> = dbB * (q2e1B as Float32)
+                xv0_w2e1<Float32> = ld_f32(xr0 + so + 132)
+                acc0 = acc0 + xv0_w2e1 * w2e1
+                acc0B = acc0B + xv0_w2e1 * w2e1B
+                xv1_w2e1<Float32> = ld_f32(xr1 + so + 132)
+                acc1 = acc1 + xv1_w2e1 * w2e1
+                acc1B = acc1B + xv1_w2e1 * w2e1B
+                xv2_w2e1<Float32> = ld_f32(xr2 + so + 132)
+                acc2 = acc2 + xv2_w2e1 * w2e1
+                acc2B = acc2B + xv2_w2e1 * w2e1B
+                xv3_w2e1<Float32> = ld_f32(xr3 + so + 132)
+                acc3 = acc3 + xv3_w2e1 * w2e1
+                acc3B = acc3B + xv3_w2e1 * w2e1B
+                xv4_w2e1<Float32> = ld_f32(xr4 + so + 132)
+                acc4 = acc4 + xv4_w2e1 * w2e1
+                acc4B = acc4B + xv4_w2e1 * w2e1B
+                xv5_w2e1<Float32> = ld_f32(xr5 + so + 132)
+                acc5 = acc5 + xv5_w2e1 * w2e1
+                acc5B = acc5B + xv5_w2e1 * w2e1B
+                xv6_w2e1<Float32> = ld_f32(xr6 + so + 132)
+                acc6 = acc6 + xv6_w2e1 * w2e1
+                acc6B = acc6B + xv6_w2e1 * w2e1B
+                q3e1<Int32> = ((((qla >> 12) & 15) | ((((qhw >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                q3e1B<Int32> = ((((qlaB >> 12) & 15) | ((((qhwB >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                w3e1<Float32> = dc * (q3e1 as Float32)
+                w3e1B<Float32> = dcB * (q3e1B as Float32)
+                xv0_w3e1<Float32> = ld_f32(xr0 + so + 260)
+                acc0 = acc0 + xv0_w3e1 * w3e1
+                acc0B = acc0B + xv0_w3e1 * w3e1B
+                xv1_w3e1<Float32> = ld_f32(xr1 + so + 260)
+                acc1 = acc1 + xv1_w3e1 * w3e1
+                acc1B = acc1B + xv1_w3e1 * w3e1B
+                xv2_w3e1<Float32> = ld_f32(xr2 + so + 260)
+                acc2 = acc2 + xv2_w3e1 * w3e1
+                acc2B = acc2B + xv2_w3e1 * w3e1B
+                xv3_w3e1<Float32> = ld_f32(xr3 + so + 260)
+                acc3 = acc3 + xv3_w3e1 * w3e1
+                acc3B = acc3B + xv3_w3e1 * w3e1B
+                xv4_w3e1<Float32> = ld_f32(xr4 + so + 260)
+                acc4 = acc4 + xv4_w3e1 * w3e1
+                acc4B = acc4B + xv4_w3e1 * w3e1B
+                xv5_w3e1<Float32> = ld_f32(xr5 + so + 260)
+                acc5 = acc5 + xv5_w3e1 * w3e1
+                acc5B = acc5B + xv5_w3e1 * w3e1B
+                xv6_w3e1<Float32> = ld_f32(xr6 + so + 260)
+                acc6 = acc6 + xv6_w3e1 * w3e1
+                acc6B = acc6B + xv6_w3e1 * w3e1B
+                q4e1<Int32> = ((((qlb >> 12) & 15) | ((((qhw >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                q4e1B<Int32> = ((((qlbB >> 12) & 15) | ((((qhwB >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                w4e1<Float32> = dd * (q4e1 as Float32)
+                w4e1B<Float32> = ddB * (q4e1B as Float32)
+                xv0_w4e1<Float32> = ld_f32(xr0 + so + 388)
+                acc0 = acc0 + xv0_w4e1 * w4e1
+                acc0B = acc0B + xv0_w4e1 * w4e1B
+                xv1_w4e1<Float32> = ld_f32(xr1 + so + 388)
+                acc1 = acc1 + xv1_w4e1 * w4e1
+                acc1B = acc1B + xv1_w4e1 * w4e1B
+                xv2_w4e1<Float32> = ld_f32(xr2 + so + 388)
+                acc2 = acc2 + xv2_w4e1 * w4e1
+                acc2B = acc2B + xv2_w4e1 * w4e1B
+                xv3_w4e1<Float32> = ld_f32(xr3 + so + 388)
+                acc3 = acc3 + xv3_w4e1 * w4e1
+                acc3B = acc3B + xv3_w4e1 * w4e1B
+                xv4_w4e1<Float32> = ld_f32(xr4 + so + 388)
+                acc4 = acc4 + xv4_w4e1 * w4e1
+                acc4B = acc4B + xv4_w4e1 * w4e1B
+                xv5_w4e1<Float32> = ld_f32(xr5 + so + 388)
+                acc5 = acc5 + xv5_w4e1 * w4e1
+                acc5B = acc5B + xv5_w4e1 * w4e1B
+                xv6_w4e1<Float32> = ld_f32(xr6 + so + 388)
+                acc6 = acc6 + xv6_w4e1 * w4e1
+                acc6B = acc6B + xv6_w4e1 * w4e1B
+
+
+            }
+        }
+        wb<Int> = (tid / 32) * 512
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc6 as Float)
+        st_shared_f64(wb + 224 + l, acc0B as Float)
+        st_shared_f64(wb + 256 + l, acc1B as Float)
+        st_shared_f64(wb + 288 + l, acc2B as Float)
+        st_shared_f64(wb + 320 + l, acc3B as Float)
+        st_shared_f64(wb + 352 + l, acc4B as Float)
+        st_shared_f64(wb + 384 + l, acc5B as Float)
+        st_shared_f64(wb + 416 + l, acc6B as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 14 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 14) {
+            ra<Int> = l
+            nn<Int> = n
+            if (l >= 7) { ra = l - 7; nn = n + 1 }
+            if (nn < N) { if (mm0 + ra < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + ra) * N + nn) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + ra) * N + nn) * 8, vo) }
+            } }
+        }
+        kernel_barrier()
+        mm0 = mm0 + 7
+    }
+}
