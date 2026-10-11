@@ -2043,8 +2043,8 @@ main()<Int> -> {
                         put_i(DAO2, s11 * 8, 0)
                     }
                     # the winner over the whole vocab, then mask exactly that entry and take the runner-up
-                    put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV2) ; put_i(A4 + 16, DAO2)
-                    put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
+                    put_i(A4, 0, DLF) ; put_i(A4, 8, DBV2) ; put_i(A4, 16, DAO2)
+                    put_i(A4, 24, S) ; put_i(A4, 32, VOCAB) ; put_i(A4, 40, 0)
                     rc_a2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
                     if (rc_a2 != 0) { println("MTP_ERR top2 argmax1"); return 92 }
                     cuCtxSynchronize()
@@ -2060,8 +2060,8 @@ main()<Int> -> {
                         put_f(DBV3, s11 * 8, zseed)
                         put_i(DAO3, s11 * 8, 0)
                     }
-                    put_i(A4 + 0, DLF) ; put_i(A4 + 8, DBV3) ; put_i(A4 + 16, DAO3)
-                    put_i(A4 + 24, S) ; put_i(A4 + 32, VOCAB) ; put_i(A4 + 40, 0)
+                    put_i(A4, 0, DLF) ; put_i(A4, 8, DBV3) ; put_i(A4, 16, DAO3)
+                    put_i(A4, 24, S) ; put_i(A4, 32, VOCAB) ; put_i(A4, 40, 0)
                     rc_a3<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(accfn)), (S + 255) / 256, 1, 1, 256, 1, 1, A4, 0, 0, 0)
                     if (rc_a3 != 0) { println("MTP_ERR top2 argmax2"); return 92 }
                     cuCtxSynchronize()
