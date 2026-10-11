@@ -199,6 +199,34 @@ gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
     return 0
 }
 
+// Two-pass RMSNorm as one call (VybForge#23): pass 1 writes the per-chunk sums of squares, pass 2
+// sums those (NCH ~10, not D ~2560) and normalizes. Params buffers: RSPB for pass 1, RSB for pass 2.
+norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
+      X<Int>, W<Int>, Y<Int>, S<Int>, D<Int>, ep<Float>, CH<Int>)<Int> -> {
+    freedom {
+        NCH<Int> = (D + CH - 1) / CH
+        cuMemcpyHtoD_v2(RSPB + 0, loc(X), 8)
+        cuMemcpyHtoD_v2(RSPB + 8, loc(SNB), 8)
+        cuMemcpyHtoD_v2(RSPB + 16, loc(S), 8)
+        cuMemcpyHtoD_v2(RSPB + 24, loc(D), 8)
+        cuMemcpyHtoD_v2(RSPB + 32, loc(CH), 8)
+        rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rsnp)), (S * NCH + 255) / 256, 1, 1, 256, 1, 1, RSPB, 0, 0, 0)
+        if (rc1 != 0) { println("NORM2_SS_ERR rc=" + rc1.to_string()); return 75 }
+        cuMemcpyHtoD_v2(RSB + 0, loc(X), 8)
+        cuMemcpyHtoD_v2(RSB + 8, loc(W), 8)
+        cuMemcpyHtoD_v2(RSB + 16, loc(Y), 8)
+        cuMemcpyHtoD_v2(RSB + 24, loc(SNB), 8)
+        cuMemcpyHtoD_v2(RSB + 32, loc(S), 8)
+        cuMemcpyHtoD_v2(RSB + 40, loc(D), 8)
+        cuMemcpyHtoD_v2(RSB + 48, loc(ep), 8)
+        cuMemcpyHtoD_v2(RSB + 56, loc(NCH), 8)
+        rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(ranp)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RSB, 0, 0, 0)
+        if (rc2 != 0) { println("NORM2_AP_ERR rc=" + rc2.to_string()); return 76 }
+        return 0
+    }
+    return 0
+}
+
 run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           EPS<Float>, XI<Int>, XO<Int>,
           gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
@@ -207,14 +235,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           DWg<Int>, DWu<Int>, DWd<Int>,
           XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
           DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
-          gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>)<Int> -> {
+          gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
+          rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         zro<Int> = 0
         rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
-        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        if (norm2(rsn, ran, RSPB, RSB, SNB, XI, N1, XN, S, D, EPS, CHN) != 0) { return 75 }
 
         gA<Int> = XN; gB<Int> = DWq; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
         if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWq, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
@@ -254,9 +281,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
 
         rA = X1; rB = N2; rC = X1N
-        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        if (norm2(rsn, ran, RSPB, RSB, SNB, X1, N2, X1N, S, D, EPS, CHN) != 0) { return 75 }
 
         gA = X1N; gB = DWg; gC = Gr; gM = S; gN = FF; gK = D
         if (gemm2(gpn, grn, GPB, SKB, KSP, X1N, DWg, Gr, S, FF, D, AF, BF) != 0) { return 73 }
@@ -381,6 +406,9 @@ main()<Int> -> {
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(grn), ml, "gemm_r") != 0) { return 10 }
+        rsn<loc<CVoid>> = from<loc<CVoid>>(0); ran<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(rsn), ml, "rms_ss") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(ran), ml, "rms_apply") != 0) { return 10 }
         rpfn<loc<CVoid>> = from<loc<CVoid>>(0); efn<loc<CVoid>> = from<loc<CVoid>>(0); lsfn<loc<CVoid>> = from<loc<CVoid>>(0); arfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
@@ -443,6 +471,7 @@ main()<Int> -> {
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
         NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
+        RSPB<Int> = 0; RSB<Int> = 0; SNB<Int> = 0; CHN<Int> = 256
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
@@ -483,6 +512,10 @@ main()<Int> -> {
         # Split-K gemm scratch (VybForge#23): KSP slices of the largest gemm (M <= MAXS, N <= FF).
         if (cuMemAlloc_v2(loc(GPB), 128) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SKB), KSP * MAXS * FF * 8) != 0) { return 11 }
+        # Two-pass norm: params buffers + the per-chunk sum-of-squares scratch (NCH <= 64 covers D=2560).
+        if (cuMemAlloc_v2(loc(RSPB), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(SNB), MAXS * 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ATT), 224) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
@@ -641,7 +674,7 @@ main()<Int> -> {
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
-                                          gpn, grn, GPB, SKB, KSP)
+                                          gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
