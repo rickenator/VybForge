@@ -1142,6 +1142,13 @@ gemv_q6k_r1(p<Int>) -> {
 // instead of S times. Rows past M are clamped for the loads and not stored. Same decode, same
 // per-row reduction order as the M=1 kernels.
 
+// Item 18 (Ursela): prefill twins. (a) Packed f64 tree: the 8 per-row trees ran 40 warp-wide f64 adds
+// per warp (f64 is 1/64 rate on GA102), now the active pairs of all 8 rows share the 32 lanes: 4+2+1+1+1
+// steps, same pairs in the same order: both kernels bit-identical to before. (b) gemv_q4k_m8 runs 8-warp
+// blocks (grid N/8 x 256): at 80 registers a 16-warp block fits once per SM. 3090, 9728x2560, M=5:
+// q4 0.326 -> 0.198 ms, q6 0.248 -> 0.137 ms. (A coalesced lane map -- lane l owns quant byte l, so
+// x loads are whole 128-byte lines -- made q4 0.146 ms but changes the f32 partial sums, and on the
+// France prompt the QONLY stream lost the ',' at token 2 vs gold: not adopted; see the log.)
 gemv_q4k_m8(p<Int>) -> {
     W<Int> = ld_i64(p + 0)
     X<Int> = ld_i64(p + 8)
@@ -1152,7 +1159,7 @@ gemv_q4k_m8(p<Int>) -> {
     YE<Int> = ld_i64(p + 48)
     tid<Int> = tid_x()
     l<Int> = tid % 32
-    n<Int> = blk_x() * 16 + tid / 32
+    n<Int> = blk_x() * 8 + tid / 32
     nsb<Int> = K / 256
     t<Int> = l / 8
     l4<Int> = l * 4
@@ -1354,103 +1361,34 @@ gemv_q4k_m8(p<Int>) -> {
 
             }
         }
-        st_shared_f64(tid, acc0 as Float)
+        wb<Int> = (tid / 32) * 256
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc6 as Float)
+        st_shared_f64(wb + 224 + l, acc7 as Float)
         kernel_barrier()
         st2 = 16
         while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+            pc<Int> = l
+            while (pc < 8 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
             kernel_barrier()
             st2 = st2 / 2
         }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 0 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 0) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 0) * N + n) * 8, ld_shared_f64(tid)) } } }
+        if (l < 8) {
+            if (n < N) { if (mm0 + l < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + l) * N + n) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + l) * N + n) * 8, vo) }
+            } }
         }
         kernel_barrier()
-        st_shared_f64(tid, acc1 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 1 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 1) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 1) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc2 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 2 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 2) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 2) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc3 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 3 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 3) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 3) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc4 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 4 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 4) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 4) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc5 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 5 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 5) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 5) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc6 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 6 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 6) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 6) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc7 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 7 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 7) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 7) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-
         mm0 = mm0 + 8
     }
 }
@@ -1670,103 +1608,34 @@ gemv_q6k_m8(p<Int>) -> {
 
             }
         }
-        st_shared_f64(tid, acc0 as Float)
+        wb<Int> = (tid / 32) * 256
+        st_shared_f64(wb + 0 + l, acc0 as Float)
+        st_shared_f64(wb + 32 + l, acc1 as Float)
+        st_shared_f64(wb + 64 + l, acc2 as Float)
+        st_shared_f64(wb + 96 + l, acc3 as Float)
+        st_shared_f64(wb + 128 + l, acc4 as Float)
+        st_shared_f64(wb + 160 + l, acc5 as Float)
+        st_shared_f64(wb + 192 + l, acc6 as Float)
+        st_shared_f64(wb + 224 + l, acc7 as Float)
         kernel_barrier()
         st2 = 16
         while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+            pc<Int> = l
+            while (pc < 8 * st2) {
+                pix<Int> = wb + (pc / st2) * 32 + pc % st2
+                st_shared_f64(pix, ld_shared_f64(pix) + ld_shared_f64(pix + st2))
+                pc = pc + 32
+            }
             kernel_barrier()
             st2 = st2 / 2
         }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 0 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 0) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 0) * N + n) * 8, ld_shared_f64(tid)) } } }
+        if (l < 8) {
+            if (n < N) { if (mm0 + l < M) {
+                vo<Float> = ld_shared_f64(wb + l * 32)
+                if (YE == 4) { st_f32(Y + ((mm0 + l) * N + n) * 4, vo as Float32) } else { st_f64(Y + ((mm0 + l) * N + n) * 8, vo) }
+            } }
         }
         kernel_barrier()
-        st_shared_f64(tid, acc1 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 1 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 1) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 1) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc2 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 2 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 2) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 2) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc3 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 3 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 3) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 3) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc4 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 4 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 4) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 4) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc5 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 5 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 5) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 5) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc6 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 6 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 6) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 6) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-        st_shared_f64(tid, acc7 as Float)
-        kernel_barrier()
-        st2 = 16
-        while (st2 > 0) {
-            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
-            kernel_barrier()
-            st2 = st2 / 2
-        }
-        if (l == 0) {
-            if (n < N) { if (mm0 + 7 < M) { if (YE == 4) { st_f32(Y + ((mm0 + 7) * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + ((mm0 + 7) * N + n) * 8, ld_shared_f64(tid)) } } }
-        }
-        kernel_barrier()
-
         mm0 = mm0 + 8
     }
 }

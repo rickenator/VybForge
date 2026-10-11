@@ -267,15 +267,17 @@ gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<lo
     freedom {
         cuMemcpyAsync(PB, loc(qb), 56, 0)
         # M > 1 (prefill): the 8-row twins reuse each decoded weight for 8 activation rows.
+        gx<Int> = (N + 15) / 16
+        bx<Int> = 512
         qfn<loc<CVoid>> = q4f
         if (ty == 14) { qfn = q6f }
         if (M > 1) {
             qfn = q4m
             if (ty == 14) { qfn = q6m }
         }
+        # gemv_q4k_m8 runs 8-warp blocks (80 registers; item 18)
+        if (M > 1) { if (ty == 12) { gx = (N + 7) / 8; bx = 256 } }
         # M = 1: 2 rows per warp (item 19); 16-warp blocks, or 4-warp blocks for N <= 1024
-        gx<Int> = (N + 15) / 16
-        bx<Int> = 512
         if (M == 1) { if (GR == 2) {
             if (N % 2 != 0) { println("GEMVQ_ERR odd N"); return 78 }
             gx = (N + 31) / 32
