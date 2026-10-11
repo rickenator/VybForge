@@ -6,10 +6,14 @@
 # Phones are separated by 10 ms and words by 60 ms of silence: no transitions, no
 # prosody, no stress. That is the state of this synthesiser and the file says so
 # rather than pretending a coarticulation model exists.
-import synth::{Phone, SR, phone_table, render_phone, wav_of}
+import synth::{Phone, SR, phone_table, render_phone, render_seq, wav_of}
 import lex::{word_phones}
 import io::{open_write, write_bytes}
 import env::{env_get}
+
+# Transition length. 60 ms is in the range used for formant-track synthesis and is
+# short enough that a 90 ms stop still has an identifiable closure.
+TRANS_MS<Int> = 60
 
 env(n<String>, d<String>)<String> -> {
     return env_get(n) else d
@@ -52,15 +56,21 @@ main()<Int> -> {
         phones<String> = word_phones(word)
         println("WORD " + word + " -> " + phones)
         names<Vec<String>> = phones.split(" ")
+        # Build the word's phone sequence and render it as a TRACK, so the formants
+        # move between phones. Rendering each phone in isolation and concatenating
+        # was what made the round trip hear "(bell dings)": right spectrum, no
+        # transitions, not a word.
+        seq<Vec<Phone>> = Vec()
         p<Int> = 0
         for (p in 0..names.len() - 1) {
             nm<String> = names.get(p)
             if (nm == "") { continue }
-            ph<Phone> = find_phone(ts, nm)
-            samples_ph<Vec<Float>> = render_phone(ph, SR, 0.35, seed)
+            seq.push(find_phone(ts, nm))
+        }
+        if (seq.len() > 0) {
+            samples_w<Vec<Float>> = render_seq(seq, SR, 0.35, seed, TRANS_MS)
             seed = seed + 7919
-            append_all(borrow(samples), samples_ph)
-            append_silence(borrow(samples), 10)
+            append_all(borrow(samples), samples_w)
         }
         append_silence(borrow(samples), 50)
     }

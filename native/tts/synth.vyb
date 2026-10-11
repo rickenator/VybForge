@@ -121,7 +121,22 @@ render_vowel(v<Vowel>, sr<Int>, peak<Float>)<Vec<Float>> -> {
 }
 
 # ---------------------------------------------------------------------------
-# Consonants, and a phone SEQUENCE.
+# A phone SEQUENCE with time-varying formants -- the transitions.
+#
+# Rendering each phone as a stationary filter and concatenating the results gives
+# the right spectrum and the wrong word: the round trip transcribed a synthesised
+# "hello" as "(bell dings)". Consonant-vowel formant TRANSITIONS carry most of the
+# intelligibility in speech, and a stationary-filter sequence has none of them.
+#
+# So the targets move: over the first `trans_ms` of each phone, F1/F2/F3/BW
+# interpolate linearly from the PREVIOUS phone's targets to this one's, then hold.
+# The resonator coefficients are recomputed per sample from the moving targets.
+# That is the standard picture of a formant track, and it is what the LPC gate
+# measures a single phone of; here it moves.
+#
+# Not modelled, and worth saying: the transitions are linear rather than curved,
+# there is no locus theory or coarticulation beyond neighbours, and prosody (pitch
+# contour, stress, final fall) is still absent.
 #
 # A phone is a formant target plus a source: voiced phones drive the resonators
 # with the glottal impulse train, unvoiced ones with noise. That is the whole
@@ -201,6 +216,133 @@ noise_at(i<Int>, seed<Int>)<Float> -> {
     h = (h * 1274126177 + 1013904223) % 2147483648
     h = h ^ (h >> 15)
     return ((h % 65536) as Float / 32768.0) - 1.0
+}
+
+# Render a whole phone sequence with interpolated formant tracks.
+#   seq: the phones in order, each carrying its own duration
+#   trans_ms: how long the transition into each phone lasts
+share(all)
+render_seq(seq<Vec<Phone>>, sr<Int>, peak<Float>, seed<Int>, trans_ms<Int>)<Vec<Float>> -> {
+    n<Int> = 0
+    k<Int> = 0
+    for (k in 0..seq.len() - 1) { n = n + seq.get(k).ms * sr / 1000 }
+    if (n <= 0) { return Vec() }
+    trans_cap<Int> = trans_ms * sr / 1000
+
+    # ---- the formant track: nine coefficients per sample ---------------------
+    cf<Vec<Float>> = Vec()
+    voiced_at<Vec<Int>> = Vec()
+    f0_at<Vec<Float>> = Vec()
+    k = 0
+    for (k in 0..seq.len() - 1) {
+        cur<Phone> = seq.get(k)
+        prev<Phone> = cur
+        if (k > 0) { prev = seq.get(k - 1) }
+        dur<Int> = cur.ms * sr / 1000
+        tr<Int> = trans_cap
+        if (tr > dur / 2) { tr = dur / 2 }
+        b<Int> = 0
+        for (b in 0..dur - 1) {
+            f<Float> = 1.0
+            if (tr > 0) {
+                if (b < tr) { f = (b as Float) / (tr as Float) }
+            }
+            f1<Float> = prev.f1 + (cur.f1 - prev.f1) * f
+            f2<Float> = prev.f2 + (cur.f2 - prev.f2) * f
+            f3<Float> = prev.f3 + (cur.f3 - prev.f3) * f
+            w1<Float> = prev.bw1 + (cur.bw1 - prev.bw1) * f
+            w2<Float> = prev.bw2 + (cur.bw2 - prev.bw2) * f
+            w3<Float> = prev.bw3 + (cur.bw3 - prev.bw3) * f
+            c1<Vec<Float>> = reson(f1, w1, sr)
+            c2<Vec<Float>> = reson(f2, w2, sr)
+            c3<Vec<Float>> = reson(f3, w3, sr)
+            cf.push(c1.get(0))
+            cf.push(c1.get(1))
+            cf.push(c1.get(2))
+            cf.push(c2.get(0))
+            cf.push(c2.get(1))
+            cf.push(c2.get(2))
+            cf.push(c3.get(0))
+            cf.push(c3.get(1))
+            cf.push(c3.get(2))
+            voiced_at.push(cur.voiced)
+            f0_at.push(cur.f0)
+        }
+    }
+
+    # ---- synthesis -----------------------------------------------------------
+    # The noise corner follows the current phone too, since a fricative's high-pass
+    # and a vowel's voicing are properties of the same moving target.
+    s1a<Float> = 0.0
+    s1b<Float> = 0.0
+    s2a<Float> = 0.0
+    s2b<Float> = 0.0
+    s3a<Float> = 0.0
+    s3b<Float> = 0.0
+    prev_hp<Float> = 0.0
+    prev_hp2<Float> = 0.0
+    acc<Float> = 0.0
+    raw<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        o<Int> = i * 9
+        vflag<Int> = voiced_at.get(i)
+        src<Float> = 0.0
+        if (vflag == 1) {
+            # f0 comes from the phone that owns THIS sample, not from the first
+            # phone in the sequence. Taking it from seq.get(0) meant a word starting
+            # with an unvoiced phone ("hello" starts with /h/, f0 = 0) divided by
+            # zero, the period stayed infinite, and not one glottal pulse was ever
+            # emitted: the vowels were SILENT and the round trip heard
+            # "[BLANK_AUDIO]". An impulse accumulator replaces the modulo so the
+            # period can vary mid-sequence.
+            per<Float> = f0_at.get(i)
+            if (per <= 1.0) { per = 120.0 }
+            period<Float> = (sr as Float) / per
+            acc = acc + 1.0
+            if (acc >= period) {
+                src = 1.0
+                acc = acc - period
+            }
+        } else {
+            nz<Float> = noise_at(i, seed)
+            a<Float> = 0.843
+            hp1<Float> = nz - a * prev_hp
+            prev_hp = nz
+            src = hp1 - a * prev_hp2
+            prev_hp2 = hp1
+        }
+        v1<Float> = cf.get(o) * src + cf.get(o + 1) * s1a + cf.get(o + 2) * s1b
+        s1b = s1a
+        s1a = v1
+        v2<Float> = cf.get(o + 3) * v1 + cf.get(o + 4) * s2a + cf.get(o + 5) * s2b
+        s2b = s2a
+        s2a = v2
+        v3<Float> = cf.get(o + 6) * v2 + cf.get(o + 7) * s3a + cf.get(o + 8) * s3b
+        s3b = s3a
+        s3a = v3
+        raw.push(v3)
+    }
+
+    mx<Float> = 0.0000001
+    for (i in 0..n - 1) {
+        av<Float> = raw.get(i)
+        if (av < 0.0) { av = 0.0 - av }
+        if (av > mx) { mx = av }
+    }
+    gain<Float> = peak / mx
+    fade<Int> = FADE_MS * sr / 1000
+    if (fade > n / 4) { fade = n / 4 }
+    out<Vec<Float>> = Vec()
+    for (i in 0..n - 1) {
+        g<Float> = gain
+        if (fade > 0) {
+            if (i < fade) { g = gain * (i as Float) / (fade as Float) }
+            if (i >= n - fade) { g = gain * ((n - i) as Float) / (fade as Float) }
+        }
+        out.push(raw.get(i) * g)
+    }
+    return out
 }
 
 # Render one phone: source -> F1 -> F2 -> F3, faded, peak-normalised to `peak`.

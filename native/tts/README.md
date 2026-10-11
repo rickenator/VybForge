@@ -21,7 +21,18 @@ Vyb Whisper. It does not pass:
     sent:     hello
     heard:    (bell dings)
 
-Whisper classifies the output as a non-speech SOUND. That is an honest and useful
+and after formant transitions, and a bug fix:
+
+    sent:     hello
+    heard:    ♪♪
+
+The progression is the useful part. Stationary phones -> "(bell dings)"; adding
+transitions exposed a REAL BUG (the pitch period came from the first phone in the
+sequence, so a word starting with an unvoiced phone divided by zero and emitted no
+glottal pulses at all -- "hello" rendered its vowels as SILENCE and Whisper heard
+"[BLANK_AUDIO]"); with that fixed the vowels sound and Whisper calls it MUSIC.
+
+Whisper classifies the output as a non-speech SOUND, now with pitch in it. That is an honest and useful
 result, and the diagnosis is not mysterious: the synthesiser renders each phone as
 a STATIONARY filter and concatenates them. Consonant-vowel formant TRANSITIONS are
 the main carrier of intelligibility in speech -- the /e/ into /l/ into /o/ movement
@@ -29,9 +40,18 @@ is most of what makes "hello" that word -- and there are none here. The spectrum
 right (the vowel gate proves the filters do what they are told); the DYNAMICS are
 absent.
 
-So the next step is a time-varying formant track: interpolate F1/F2/F3 across phone
-boundaries (recomputing the resonator coefficients along the way) instead of
-rendering each phone in isolation, then prosody. This script exists as a measurement
+The formant track now moves: over the first 60 ms of each phone F1/F2/F3/BW
+interpolate from the previous phone's targets, and the resonator coefficients are
+recomputed per sample. What is still missing is everything AROUND the segment:
+
+  * an amplitude envelope -- every phone is peak-normalised to the same level and
+    butts against the next, so the output is a sequence of equal-loudness bursts.
+    A syllable has a rise and a fall, and ASR expects that modulation;
+  * a real glottal PULSE rather than an impulse train (an impulse train is
+    harmonically rich and buzzy, which is much of why this reads as music);
+  * prosody: pitch declination, stress, and a falling contour at the end;
+  * source amplitude per phone class -- stops and fricatives are much quieter than
+    vowels in speech, and here they are not. This script exists as a measurement
 rather than a gate until it passes, because a gate that is permanently red for work
 not yet done hides the failures that matter.
 
