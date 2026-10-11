@@ -70,6 +70,7 @@ q6kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         qlbase<Int> = g * 64
         qhbase<Int> = g * 32
         qloff<Int> = qlbase + (quad % 2) * 32 + l
+        # f32 decode arithmetic -- see q4kdeq32 for the measurement that motivates it.
         d<Float> = ld_f16(bb + 208)
         sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)
         qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
@@ -82,9 +83,12 @@ q6kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         if (quad == 2) { hib = (qhb >> 4) & 3 }
         if (quad == 3) { hib = (qhb >> 6) & 3 }
         qs<Int> = (nib | (hib << 4)) - 32
-        sf<Float> = sc0 as Float
-        qf<Float> = qs as Float
-        val<Float> = d * sf * qf
+        sf64<Float> = sc0 as Float
+        qf64<Float> = qs as Float
+        df<Float32> = d
+        sf<Float32> = sf64
+        qf<Float32> = qf64
+        val<Float32> = df * sf * qf
         if (z > 0) {
             st_f32(o + (cc * cw + rr) * 4, val)
         } else {
