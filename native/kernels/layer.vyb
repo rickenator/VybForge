@@ -39,7 +39,9 @@ gemm(p<Int>) -> {
 // SK[ks][m][n] (no alpha/beta). Grid = NBLK * KSP, NBLK = ceil(M*N/256).
 // Why: `gemm` at decode shapes launches 10-38 blocks for an 82-SM card — the same defect nsys showed
 // for `attn` (ONE block, 21x slow). Splitting K multiplies the block count by KSP for the price of a
-// scratch buffer and one extra launch. The summation ORDER changes (each slice sums its own range, then
+// scratch buffer and one extra launch. (A shared-memory tiled version — `fixtures/kernel/matmul_smem.vyb`
+// in the Vyb repo is the template, and Vyb has the intrinsics for it — could reduce inside the block
+// instead of through pass 2; this pair is the version that exists today.) The summation ORDER changes (each slice sums its own range, then
 // pass 2 adds the slices), so results differ from `gemm` at ~1e-16 relative — f64 rounding.
 // Params: +0 A, +8 B, +16 SK, +24 M, +32 N, +40 K, +48 NBLK, +56 KSP.
 gemm_p(p<Int>) -> {
@@ -100,8 +102,19 @@ gemm_r(p<Int>) -> {
 }
 
 // Two-pass RMSNorm (VybForge#23). `rmsnorm` gives every one of its S*D threads the WHOLE row sum, so a
-// row costs S*D*D loads/ops instead of D — the same redundant-work shape the old `attn` had. Vyb has no
-// shared memory or barriers, so the reduction is split across two kernels with a small scratch:
+// row costs S*D*D loads/ops instead of D — the same redundant-work shape the old `attn` had.
+//
+// CORRECTION — a claim that stood here was WRONG: "Vyb has no shared memory or barriers". Vyb has both.
+// Probed directly rather than inferred: a kernel using `st_shared_f64`/`ld_shared_f64` + `kernel_barrier`
+// emits `.shared .align 8 .b8 __vyb_kernel_shared[32768]`, `st.shared.u64`, `ld.shared.f64`, `bar.sync`;
+// a kernel doing `a<Float32> * b<Float32> + a<Float32>` on non-constant inputs emits `mul.rn.f32` /
+// `add.rn.f32`; and the language reference documents `atomic_add_f64/i32` and grid/lane reads. The
+// shipped `fixtures/kernel/matmul_smem.vyb` is a shared-memory TILED matmul with block barriers,
+// verified on an RTX 3090. The mistake came from grepping this project's kernels for usage instead of
+// reading Vyb's own reference — do not repeat it.
+//
+// So the two-pass split below is ONE way, not the only way: a shared-memory version can reduce inside a
+// block and drop the scratch entirely, and that is the natural next step for this kernel.
 //   rms_ss     one thread per (row, chunk of CH) -> SS[s*NCH + ch], the chunk's sum of squares.
 //   rms_apply  one thread per element: sums the NCH partials (NCH ~10, not D ~2560), then normalizes.
 // Params: rms_ss +0 X, +8 SS, +16 S, +24 D, +32 CH.  rms_apply +0 X, +8 W, +16 Y, +24 SS, +32 S,
