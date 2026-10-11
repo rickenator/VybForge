@@ -377,6 +377,20 @@ current lengths and, more importantly, FLAT instead of degrading as the context 
 > load in the gemm. Halving the weight bytes should roughly halve that fixed cost. NB the earlier
 > `ebb29ed` win came from deleting a per-token dequant PASS, which is not the same as keeping weights
 > small -- it left them f32 and therefore fat.
+>
+> **THAT WEIGHT-SHRINKING PLAN IS ALSO WRONG -- the harness says so directly.** Same gemm, same K, same
+> KSP, 300 reps: **M=5 (124.5M MACs, 2 row-blocks) = 74 ms** vs **M=1 (24.9M MACs, 1 row-block) = 69 ms**.
+> Five times less work for a 7% change in time. With RB=4 the per-THREAD k-loop is identical in both
+> cases (each thread covers 4 rows regardless), and at these grid sizes (80-160 blocks vs 82 SMs) the
+> kernel is LATENCY-bound: the k-loop walks B at stride N*4, i.e. a fresh cache line every iteration, so
+> it is a serial chain of dependent memory accesses whose length is set by K/KSP, not by M or by the
+> weight bytes. **The gemm's cost is set by the length of the k-chain and the warps available to hide it,
+> not by FLOPs and not by weight traffic.**
+>
+> So: the next session should measure the gemm's occupancy/latency behaviour (warps resident vs KSP) and
+> attack the CHAIN -- more independent loads in flight per thread, or a layout that makes the B walk
+> sequential -- NOT the weight format. Two roadmap claims of mine have now been falsified by a cheap
+> measurement before a rewrite; do that first, again.
 
 ### Traps this line cost real time (do not repeat)
 
