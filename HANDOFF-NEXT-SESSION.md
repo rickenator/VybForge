@@ -305,3 +305,69 @@ Key files:
 ## Reference checkpoint
 `.venv/bin/python native/gguf/decode_ref.py` (~28 min) rewrites the target token
 ids; `make -f native/Makefile prefill` still reproduces both prefill gates green.
+
+---
+
+## f32 resident engine: 2.777 -> 13.2 tok/s (4.7x), and the next 3-6x IDENTIFIED
+
+`make -C native resident-bench CHAT_GEN=3 RESIDENT_RUNS=10` = **13.0-13.2 tok/s, gold stream MATCH**
+(2.777 at the start of this line). Eight commits, each gated on identical greedy output:
+
+| commit | change | tok/s |
+|---|---|---|
+| `e2e7ab0` | f32 weight path | 2.78 -> 4.06 |
+| `49cfb9e` | f32 decode arithmetic | 4.06 -> 4.69 |
+| `ebb29ed` | **expand all 36 layers to f32 ONCE at load** | 4.70 -> 9.43 |
+| `a011af6` | one transfer per launch parameter block | 9.67 -> 10.73 |
+| `58fa9e7` | fold widen into the reduce | neutral (correct) |
+| `5e60914` | KSP 8 -> 32 + profiler bracket | 10.73 -> 11.34 |
+| `241c6ea` | **M-block 4 rows/thread in gemm32_p** | 11.34 -> 12.71 |
+| `5d1be56` | logits MACs in f32 | neutral (correct) |
+
+### THE NEXT WIN: incremental decode (measured, ~3-6x, NOT yet implemented)
+
+**Measured:** per-token time scales ~linearly with sequence length -- `VYB_GEN=3` = 75.7 ms/token
+(15 tokens), `VYB_GEN=24` = 198.6 ms/token (120 tokens). S grew 2.75x, time grew 2.62x.
+
+**Why:** the decode step is a FULL-SEQUENCE forward. Every generated token re-runs all 36 layers over
+all `Scur` rows: `Scur = SEEDLEN + g` (driver ~758), `run_layer(Scur, ...)` (~782), the final norm is
+launched over `Scur * D` elements (~800), and only the LAST row is used for logits (`s7 = Scur - 1`,
+~802). Causal attention means rows < S-1 cannot change, so every earlier row is recomputed identically
+each step. Gemm work per token is O(S) when it should be O(1).
+
+**The path (kernels already half-ready):**
+1. `qwen3rope` ALREADY supports incremental use: it takes `POS` (absolute position base; row r ->
+   POS+r) and the driver only ever passes 0. For decode, pass POS = S-1 with one row.
+2. `attn` does NOT: it takes one `S` used as BOTH query count and key count. It needs a query-row
+   offset plus a separate key length, so 1 query row can attend over the S-row cache.
+3. Feed the layer gemms M=1 (just the new row) while attention reads the persistent K/V cache -- the
+   `DK`/`DV` buffers are already `MAXS * NKV * 8`, i.e. the cache already exists and is merely
+   overwritten every step. There is prior art in this repo for a frozen context cache (`kvctx`, CK/CV).
+4. Norms / silu / resid / o-proj / ffn then run on that one row.
+
+**Expected:** per-token gemm work becomes O(1) and the floor becomes one pass over the f32 weights
+(14.5 GB at ~936 GB/s = ~15.5 ms/token), instead of ~76 ms at S=6 growing with context. ~3-6x at
+current lengths and, more importantly, FLAT instead of degrading as the context grows.
+
+### Traps this line cost real time (do not repeat)
+
+* **The f64 trap** (cost 3 rewrites, then won 12%): `ld_f32` has a Float64 SURFACE type, so writing the
+  load INLINE (`acc + av * ld_f32(pb)`) makes the MAC an f64 multiply + 4 conversions, and f64 is 1/64
+  rate on sm_86. The kernel gets ~10x slower while staying numerically CORRECT. **Bind every load to a
+  `<Float32>` local before the multiply.** `ptxas -v` confirms 44 regs / 0 spills; grep any should-be-f32
+  kernel's PTX for `mul.rn.f64`.
+* **`native/host/gemm32_harness.vyb` is the fast loop** (~2 s: `total=` ms for 300 reps + CPU-checked
+  C00). It had gone STALE (expecting the pre-`58fa9e7` f32 pass 2 + `widen32`, reporting `got=0`); it
+  is revived and takes a `REP` count. Use it -- do not bench kernel ideas through the whole model.
+* **nsys per-kernel TIMES are not trustworthy** (it serialises kernels; the reported total can
+  understate the wall). Shares are usable; end-to-end tok/s is the only verdict. Bracket with
+  `cuProfilerStart/Stop` + `--capture-range=cudaProfilerApi` to exclude the one-time load.
+* **Bench variance is ~±2%** -- use `RESIDENT_RUNS>=8` before believing anything under ~5%.
+* **A failing driver still prints "gold stream MATCH"** from the previous run's output FILE. Require
+  the final `RESIDENT-BENCH: PASS`.
+* **Never run two benches at once.** The engine wants ~20.5 GB of 24 GB, so a second run dies at the
+  weight allocation (exit 11), which looks like a regression and is not one.
+* `pkill -f` / `pgrep -f resident_driver` match their own shell; use `pkill -x vyb`.
+* Measured optima: gemm row-blocking **RB=4** (harness: RB=1 72 ms, RB=2 191-279 ms, RB=4 70-75 ms,
+  RB=8 95-98 ms); **KSP=32** (8->32 = +5.7%, 32->64 = -1.5%). GPU throttling is NOT a factor
+  (1950-1965 of 2100 MHz, mem 9501 MHz, 188-296 W of 350 W, 88-99% util).
