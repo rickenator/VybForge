@@ -624,6 +624,11 @@ attn_cx(p<Int>) -> {
 // gemm16_p is gemm32_p with B stored as IEEE half (2 bytes): the half is widened and bound to a <Float32>
 // local, so the MACs stay native f32 exactly as in gemm32_p (same params, same split-K, same gemm32_r).
 // The half copy rounds each dequantized weight to 11 significant bits; the gold stream is the gate.
+// 2 COLUMNS x 4 rows per thread (Ursela): each thread now loads 2 adjacent halves per k step and keeps
+// 8 accumulators. Swept in a standalone harness (1/2/4 columns x KSP 8..128) on both GPUs at M=1:
+// 2 columns wins on every Qwen3-4B shape, e.g. ffn_down (N=2560, K=9728) GB10 0.286 -> 0.183 ms and
+// q (N=4096) 3090 0.047 -> 0.035 ms at KSP=32. N must be even (all Qwen3 shapes are). The driver's
+// grid uses NBLK = ceil(MB * N/2 / 256), matching what the kernel derives here.
 gemm16_p(p<Int>) -> {
     A<Int> = ld_i64(p + 0)
     B<Int> = ld_i64(p + 8)
@@ -631,33 +636,31 @@ gemm16_p(p<Int>) -> {
     M<Int> = ld_i64(p + 24)
     N<Int> = ld_i64(p + 32)
     K<Int> = ld_i64(p + 40)
-    # M-BLOCKING: 4 rows per thread, one accumulator column. This kernel is L2-BANDWIDTH-bound -- with
-    # no reuse across M, every output row re-reads the whole weight matrix through L2 (~2 TB/s on this
-    # card), which caps it near 1 TFLOP/s. 4-way unrolling made it SLOWER (99 vs 72 ms in the harness),
-    # so ILP is not the answer; reuse is. One B load now feeds 4 MACs.
-    # Padded rows (M not a multiple of 4) are READ but never STORED: the A buffers carry 4 rows of
-    # slack and an accumulator that is never stored is harmless.
-    # NBLK is derived HERE (not read from the block) so it always matches the grid the driver computes.
     MB<Int> = (M + 3) / 4
-    NBLK<Int> = (MB * N + 255) / 256
+    NC<Int> = N / 2
+    NBLK<Int> = (MB * NC + 255) / 256
     KSP<Int> = ld_i64(p + 56)
     bx<Int> = blk_x()
     ks<Int> = bx / NBLK
     nb<Int> = bx % NBLK
     gid<Int> = nb * dim_x() + tid_x()
     total<Int> = M * N
-    if (gid < MB * N) {
-        mb<Int> = gid / N
-        nn<Int> = gid % N
+    if (gid < MB * NC) {
+        mb<Int> = gid / NC
+        nn<Int> = (gid % NC) * 2
         mm0<Int> = mb * 4
         kl<Int> = (K + KSP - 1) / KSP
         k0<Int> = ks * kl
         k1<Int> = k0 + kl
         if (k1 > K) { k1 = K }
-        a0<Float32> = 0.0
-        a1<Float32> = 0.0
-        a2<Float32> = 0.0
-        a3<Float32> = 0.0
+        a0_0<Float32> = 0.0
+        a0_1<Float32> = 0.0
+        a1_0<Float32> = 0.0
+        a1_1<Float32> = 0.0
+        a2_0<Float32> = 0.0
+        a2_1<Float32> = 0.0
+        a3_0<Float32> = 0.0
+        a3_1<Float32> = 0.0
         pa0<Int> = A + (mm0 * K + k0) * 4
         pa1<Int> = pa0 + K * 4
         pa2<Int> = pa0 + K * 8
@@ -666,28 +669,34 @@ gemm16_p(p<Int>) -> {
         pbx<Int> = N * 2
         kk<Int> = k0
         for (kk in k0..k1 - 1) {
-            # EVERY ld_f32 is BOUND to a <Float32> local before the multiply: `a0 + ld_f32(pa0) * bv`
-            # leaves the load's Float64 surface type in play and turns the MAC into f64 (1/64 rate on
-            # sm_86) -- exactly what made the first attempt at this M-blocking 8x slower.
-            bv<Float32> = ld_f16(pb)
+            bv0<Float32> = ld_f16(pb + 0)
+            bv1<Float32> = ld_f16(pb + 2)
             av0<Float32> = ld_f32(pa0)
             av1<Float32> = ld_f32(pa1)
             av2<Float32> = ld_f32(pa2)
             av3<Float32> = ld_f32(pa3)
-            a0 = a0 + av0 * bv
-            a1 = a1 + av1 * bv
-            a2 = a2 + av2 * bv
-            a3 = a3 + av3 * bv
+            a0_0 = a0_0 + av0 * bv0
+            a0_1 = a0_1 + av0 * bv1
+            a1_0 = a1_0 + av1 * bv0
+            a1_1 = a1_1 + av1 * bv1
+            a2_0 = a2_0 + av2 * bv0
+            a2_1 = a2_1 + av2 * bv1
+            a3_0 = a3_0 + av3 * bv0
+            a3_1 = a3_1 + av3 * bv1
             pa0 = pa0 + 4
             pa1 = pa1 + 4
             pa2 = pa2 + 4
             pa3 = pa3 + 4
             pb = pb + pbx
         }
-        st_f32(SK + (ks * total + mm0 * N + nn) * 4, a0)
-        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn) * 4, a1) }
-        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn) * 4, a2) }
-        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn) * 4, a3) }
+        { st_f32(SK + (ks * total + (mm0 + 0) * N + nn + 0) * 4, a0_0) }
+        { st_f32(SK + (ks * total + (mm0 + 0) * N + nn + 1) * 4, a0_1) }
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn + 0) * 4, a1_0) }
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn + 1) * 4, a1_1) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn + 0) * 4, a2_0) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn + 1) * 4, a2_1) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn + 0) * 4, a3_0) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn + 1) * 4, a3_1) }
     }
 }
 

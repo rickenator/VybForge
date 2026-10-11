@@ -208,7 +208,10 @@ struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     freedom {
-        NBLK<Int> = ((M + 3) / 4 * N + 255) / 256
+        # KSP carries the pass-1 column factor in its high bits: KSP = ksp + 65536 * (cf - 1).
+        CF<Int> = KSP / 65536 + 1
+        KSP = KSP % 65536
+        NBLK<Int> = ((M + 3) / 4 * (N / CF) + 255) / 256
         b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
         if (cuMemcpyAsync(GPB, loc(b1), 64, 0) != 0) { return 1 }
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gpn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
@@ -298,22 +301,25 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>,
           ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
-          rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>)<Int> -> {
+          rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
+        # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
+        KSPG<Int> = KSP
+        if (W16C == 2) { KSPG = KSP + 65536 }
         zro<Int> = 0
         rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
         # attn_norm + the f32 copy for the gemms in ONE launch (rms_blk), was norm2 (2) + cast1 (1)
         if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
         vdst<Int> = DV
         if (KC != 0) { vdst = VC + P0 * NKV * 8 }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
 
         if (QV == 0) { println("RLR qkvok") }
         # q/k norms: rows of HD, one block per (row, head); separate param blocks so the two stay in flight
@@ -352,20 +358,20 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
 
         rA = X1; rB = N2; rC = X1N
         if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
         gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
         gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
 
         if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPG, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         if (QV == 0) { println("RLR endok") }
         return 0
@@ -926,7 +932,7 @@ main()<Int> -> {
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
                                           amxf, aexf, asmf, anrf, EWB, MSB,
-                                          rbf, RBP, RBQ)
+                                          rbf, RBP, RBQ, W16 * 2)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
