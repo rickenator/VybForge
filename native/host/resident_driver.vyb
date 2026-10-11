@@ -258,6 +258,22 @@ normb(rbf<loc<CVoid>>, PB<Int>, X<Int>, W<Int>, Y<Int>, M<Int>, N<Int>, ep<Float
     return 0
 }
 
+// Fused quantized GEMV launch (Ursela): Y[M,N] (f64) = X[M,K] (f32) . W^T, W = resident Q4_K (ty 12)
+// or Q6_K (ty 14) rows. 48-byte param block {W, X, Y, M, N, K}; ceil(N/16) blocks x 512 threads.
+struct QGB { w<Int>, x<Int>, y<Int>, m<Int>, n<Int>, k<Int> }
+gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>)<Int> -> {
+    qb<QGB> = QGB { w = W, x = X, y = Y, m = M, n = N, k = K }
+    freedom {
+        cuMemcpyAsync(PB, loc(qb), 48, 0)
+        qfn<loc<CVoid>> = q4f
+        if (ty == 14) { qfn = q6f }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(qfn)), (N + 15) / 16, 1, 1, 512, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("GEMVQ_ERR rc=" + rc.to_string()); return 79 }
+        return 0
+    }
+    return 0
+}
+
 // f32-path helpers (VybForge#23). cast1 writes a 24-byte param block (src, dst, n) and launches the
 // elementwise cast; widen32 uses the same layout into its own block (they never overlap).
 cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
@@ -301,7 +317,9 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>,
           ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
-          rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>)<Int> -> {
+          rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
+          QG<Int>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, QPB<Int>,
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -315,14 +333,26 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         # attn_norm + the f32 copy for the gemms in ONE launch (rms_blk), was norm2 (2) + cast1 (1)
         if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, 12, QPB, Pq, XN32, DQ, S, NQ, D) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+        }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, 12, QPB, Pk, XN32, DK, S, NKV, D) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+        }
         # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
         vdst<Int> = DV
         if (KC != 0) { vdst = VC + P0 * NKV * 8 }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, Tv, QPB, Pv, XN32, vdst, S, NKV, D) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+        }
 
         if (QV == 0) { println("RLR qkvok") }
         # q/k norms: rows of HD, one block per (row, head); separate param blocks so the two stay in flight
@@ -363,20 +393,36 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, 12, QPB, Po, DC32, DO, S, D, NQ) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
 
         rA = X1; rB = N2; rC = X1N
         if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
         gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, 12, QPB, Pg, X132, Gr, S, FF, D) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+        }
         gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, 12, QPB, Pu, X132, Up, S, FF, D) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+        }
         cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
 
         if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
-        if (gemm2(g3p, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, Td, QPB, Pd, HU32, M, S, D, FF) != 0) { return 79 }
+        } else {
+            if (gemm2(g3p, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         if (QV == 0) { println("RLR endok") }
         return 0
@@ -426,6 +472,11 @@ main()<Int> -> {
     w32_s<String> = env_get("VYB_W32") else ""
     if (w32_s.len() > 0) { W16 = 0 }
     # Head table precision: f16 by default (0.78 GB streamed per token); VYB_HEAD32=1 keeps f32 (1.55 GB).
+    # Fused quantized GEMV for decode steps (S == 1) straight from the resident Q4_K/Q6_K blocks
+    # (Ursela, queue item 16). VYB_GEMV16=1 falls back to the expanded f16/f32 weights for every step.
+    QGON<Int> = 1
+    qg_s<String> = env_get("VYB_GEMV16") else ""
+    if (qg_s.len() > 0) { QGON = 0 }
     H16<Int> = 1
     h32_s<String> = env_get("VYB_HEAD32") else ""
     if (h32_s.len() > 0) { H16 = 0 }
@@ -547,6 +598,9 @@ main()<Int> -> {
         l32p<loc<CVoid>> = from<loc<CVoid>>(0); l32r<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(l32p), mw, "logits32_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(l32r), mw, "logits32_r") != 0) { return 10 }
+        q4f<loc<CVoid>> = from<loc<CVoid>>(0); q6f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
         l16p<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(l16p), mw, "logits16_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
@@ -668,6 +722,8 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LPART), VOCAB * 32 * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LPB), 64) != 0) { return 11 }
+        QPB<Int> = 0
+        if (cuMemAlloc_v2(loc(QPB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(EMB), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HA), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HB), MAXS * D * 8) != 0) { return 11 }
@@ -931,6 +987,8 @@ main()<Int> -> {
                             if ((L % 2) == 1) { tgt = HB }
                             KCl<Int> = 0; VCl<Int> = 0
                             if (KVON == 1) { KCl = KCA + L * MAXS * NKV * 8; VCl = VCA + L * MAXS * NKV * 8 }
+                            QGL<Int> = 0
+                            if (QGON == 1) { if (Srows == 1) { QGL = 1 } }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, WqA + L * wq_nl * WES, WkA + L * wk_nl * WES, WvA + L * wv_nl * WES,
@@ -941,7 +999,12 @@ main()<Int> -> {
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
                                           amxf, aexf, asmf, anrf, EWB, MSB,
-                                          rbf, RBP, RBQ, W16 * 2)
+                                          rbf, RBP, RBQ, W16 * 2,
+                                          QGL, q4f, q6f, QPB,
+                                          PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
+                                          PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),
+                                          tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")),
+                                          tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")))
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
