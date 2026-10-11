@@ -391,6 +391,21 @@ current lengths and, more importantly, FLAT instead of degrading as the context 
 > attack the CHAIN -- more independent loads in flight per thread, or a layout that makes the B walk
 > sequential -- NOT the weight format. Two roadmap claims of mine have now been falsified by a cheap
 > measurement before a rewrite; do that first, again.
+>
+> **AND THE TILED GEMM IS NOT BLOCKED ON THE COMPILER.** The Vyb kernel surface already exposes the
+> primitives (found in `src/vre/llvm/cgen_expr_kernel.cpp`; the header note claiming "no shared memory /
+> no barriers" is STALE):
+>
+> * `ld_shared_f64(off)` / `st_shared_f64(off, v)` -- a module-wide **32 KB addrspace(3) shared buffer**
+>   (4096 f64; the compiler notes the sm_86 static shared cap is 48 KB). Caller bounds-checks.
+> * `kernel_barrier()` -- block-wide `bar.sync 0`.
+> * `lane_id()`, `warp_size()`, `tid_x`/`tid_y`/`tid_z`, `blk_x`/`blk_y`/`blk_z`, `dim_x`, `grid_x`.
+> * `ld_f16` / `ld_bf16` (widening to f64).
+>
+> So the next real step is a SHARED-MEMORY TILED `gemm32_p`: cooperatively load a B tile coalesced,
+> `kernel_barrier()`, then accumulate out of shared instead of walking global B with a 10 KB stride
+> (which is the dependent chain that makes the kernel latency-bound -- see above). That attacks the
+> actual bottleneck, and it is kernel work, not compiler work.
 
 ### Traps this line cost real time (do not repeat)
 
