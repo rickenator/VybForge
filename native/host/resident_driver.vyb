@@ -189,6 +189,20 @@ parse_pids(s<String>)<Vec<Int>> -> {
 struct GP1 { a<Int>, b<Int>, sk<Int>, m<Int>, n<Int>, k<Int>, nblk<Int>, ksp<Int> }
 struct GP2 { sk<Int>, scr<Int>, m<Int>, n<Int>, pad1<Int>, pad2<Int>, ksp<Int> }
 struct GP3 { src<Int>, dst<Int>, n<Int> }
+// More parameter blocks as structs (Ursela): one cuMemcpyAsync per block instead of one per 8-byte field.
+// Field order == kernel offsets. Padding fields cover the unused slots of the big PD-layout blocks.
+//   rms_ss: X, SS, S, D, CH (+0..+32)      rms_apply: X, W, Y, SS, S, D, eps, NCH (+0..+56)
+//   rmsnorm: X, W, Y, M, N, eps (+0..+40)
+//   qwen3rope from +80: Q, K, Qd, Kd, [112..168 pad], FREQ@176, S@184, [192], HD@200, H@208, KVH@216, POS@224
+//   attention from +80: Q, K, V, Ctx, [112..176 pad], S@184, [192], HD@200, H@208, KVH@216, P0@224,
+//                       SC@232, T@240, EW@248, MS@256
+struct NP1 { x<Int>, ss<Int>, s<Int>, d<Int>, ch<Int> }
+struct NP2 { x<Int>, w<Int>, y<Int>, ss<Int>, s<Int>, d<Int>, ep<Float>, nch<Int> }
+struct RNB { x<Int>, w<Int>, y<Int>, m<Int>, n<Int>, ep<Float> }
+struct RPB { q<Int>, k<Int>, qd<Int>, kd<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>,
+             fr<Int>, s<Int>, z8<Int>, hd<Int>, h<Int>, kvh<Int>, pos<Int> }
+struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>, z8<Int>,
+             s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int> }
 
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
@@ -215,21 +229,12 @@ norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
       X<Int>, W<Int>, Y<Int>, S<Int>, D<Int>, ep<Float>, CH<Int>)<Int> -> {
     freedom {
         NCH<Int> = (D + CH - 1) / CH
-        cuMemcpyAsync(RSPB + 0, loc(X), 8, 0)
-        cuMemcpyAsync(RSPB + 8, loc(SNB), 8, 0)
-        cuMemcpyAsync(RSPB + 16, loc(S), 8, 0)
-        cuMemcpyAsync(RSPB + 24, loc(D), 8, 0)
-        cuMemcpyAsync(RSPB + 32, loc(CH), 8, 0)
+        n1b<NP1> = NP1 { x = X, ss = SNB, s = S, d = D, ch = CH }
+        cuMemcpyAsync(RSPB, loc(n1b), 40, 0)
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rsnp)), (S * NCH + 255) / 256, 1, 1, 256, 1, 1, RSPB, 0, 0, 0)
         if (rc1 != 0) { println("NORM2_SS_ERR rc=" + rc1.to_string()); return 75 }
-        cuMemcpyAsync(RSB + 0, loc(X), 8, 0)
-        cuMemcpyAsync(RSB + 8, loc(W), 8, 0)
-        cuMemcpyAsync(RSB + 16, loc(Y), 8, 0)
-        cuMemcpyAsync(RSB + 24, loc(SNB), 8, 0)
-        cuMemcpyAsync(RSB + 32, loc(S), 8, 0)
-        cuMemcpyAsync(RSB + 40, loc(D), 8, 0)
-        cuMemcpyAsync(RSB + 48, loc(ep), 8, 0)
-        cuMemcpyAsync(RSB + 56, loc(NCH), 8, 0)
+        n2b<NP2> = NP2 { x = X, w = W, y = Y, ss = SNB, s = S, d = D, ep = ep, nch = NCH }
+        cuMemcpyAsync(RSB, loc(n2b), 64, 0)
         rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(ranp)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RSB, 0, 0, 0)
         if (rc2 != 0) { println("NORM2_AP_ERR rc=" + rc2.to_string()); return 76 }
         return 0
@@ -297,42 +302,34 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
         if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
 
-        rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
-        cuMemcpyAsync(RN + 0, loc(rA), 8, 0); cuMemcpyAsync(RN + 8, loc(rB), 8, 0); cuMemcpyAsync(RN + 16, loc(rC), 8, 0)
         if (QV == 0) { println("RLR qkvok") }
-        cuMemcpyAsync(RN + 24, loc(gM), 8, 0); cuMemcpyAsync(RN + 32, loc(gN), 8, 0); cuMemcpyAsync(RN + 40, loc(EPS), 8, 0)
+        qnb<RNB> = RNB { x = DQ, w = Nq, y = DQN, m = S * H, n = HD, ep = EPS }
+        cuMemcpyAsync(RN, loc(qnb), 48, 0)
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-        rA = DK; rB = Nk; rC = DKN; gM = S * KVH; gN = HD
-        cuMemcpyAsync(RN + 0, loc(rA), 8, 0); cuMemcpyAsync(RN + 8, loc(rB), 8, 0); cuMemcpyAsync(RN + 16, loc(rC), 8, 0)
-        cuMemcpyAsync(RN + 24, loc(gM), 8, 0); cuMemcpyAsync(RN + 32, loc(gN), 8, 0); cuMemcpyAsync(RN + 40, loc(EPS), 8, 0)
+        knb<RNB> = RNB { x = DK, w = Nk, y = DKN, m = S * KVH, n = HD, ep = EPS }
+        cuMemcpyAsync(RN, loc(knb), 48, 0)
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
 
-        cuMemcpyAsync(ROP + 80, loc(DQN), 8, 0); cuMemcpyAsync(ROP + 88, loc(DKN), 8, 0)
         # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
         kdst<Int> = DKr
         if (KC != 0) { kdst = KC + P0 * NKV * 8 }
-        cuMemcpyAsync(ROP + 96, loc(DQr), 8, 0); cuMemcpyAsync(ROP + 104, loc(kdst), 8, 0)
-        cuMemcpyAsync(ROP + 176, loc(DF), 8, 0); cuMemcpyAsync(ROP + 184, loc(S), 8, 0)
-        cuMemcpyAsync(ROP + 200, loc(HD), 8, 0); cuMemcpyAsync(ROP + 208, loc(H), 8, 0); cuMemcpyAsync(ROP + 216, loc(KVH), 8, 0)
-        cuMemcpyAsync(ROP + 224, loc(P0), 8, 0)   # POS offset (qwen3rope +224): 0 for the full sequence, P0 with the KV cache
+        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = 0, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0,
+                         fr = DF, s = S, z8 = 0, hd = HD, h = H, kvh = KVH, pos = P0 }
+        cuMemcpyAsync(ROP + 80, loc(rpb), 152, 0)
         rope_total<Int> = S * H * HD + S * KVH * HD
         cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
         if (QV == 0) { println("RLR ropeok") }
 
-        cuMemcpyAsync(ATT + 80, loc(DQr), 8, 0); cuMemcpyAsync(ATT + 88, loc(DKr), 8, 0)
-        cuMemcpyAsync(ATT + 96, loc(DV), 8, 0); cuMemcpyAsync(ATT + 104, loc(DCtx), 8, 0)
-        cuMemcpyAsync(ATT + 184, loc(S), 8, 0); cuMemcpyAsync(ATT + 200, loc(HD), 8, 0)
-        cuMemcpyAsync(ATT + 208, loc(H), 8, 0); cuMemcpyAsync(ATT + 216, loc(KVH), 8, 0)
+        TT<Int> = P0 + S
+        akp<Int> = DKr; avp<Int> = DV
+        if (KC != 0) { akp = KC; avp = VC }
+        atb<ATB> = ATB { q = DQr, k = akp, v = avp, ctx = DCtx, z0 = 0, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0, z8 = 0,
+                         s = S, z9 = 0, hd = HD, h = H, kvh = KVH, p0 = P0, sc = SCB, t = TT, ew = EWB, ms = MSB }
+        cuMemcpyAsync(ATT + 80, loc(atb), 184, 0)
         if (KC != 0) {
-            cuMemcpyAsync(ATT + 88, loc(KC), 8, 0); cuMemcpyAsync(ATT + 96, loc(VC), 8, 0)
-            cuMemcpyAsync(ATT + 224, loc(P0), 8, 0)
-            # scores once per (row, head, position), then the context from them (attn_sc + attn_cx);
-            # bit-identical to attn_kv, minus its HD-fold redundant dot products.
-            TT<Int> = P0 + S
-            cuMemcpyAsync(ATT + 232, loc(SCB), 8, 0); cuMemcpyAsync(ATT + 240, loc(TT), 8, 0)
+            # scores once per (row, head, position); softmax once per (row, head[, position]); then the
+            # weighted V sum -- bit-identical to attn_kv / attn.
             cuda_launch4i(from<loc<CVoid>>(addr(ascf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
-            # softmax once per (row, head[, position]), then the weighted V sum (bit-identical to attn_cx)
-            cuMemcpyAsync(ATT + 248, loc(EWB), 8, 0); cuMemcpyAsync(ATT + 256, loc(MSB), 8, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(amxf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(aexf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(asmf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
@@ -907,8 +904,8 @@ main()<Int> -> {
                         if (QV == 0) { println("DECG forward done") }
                         phD<Int> = time_mono_millis()
                         rA = cur; rB = ON; rC = DH
-                        cuMemcpyAsync(RN + 0, loc(rA), 8, 0); cuMemcpyAsync(RN + 8, loc(rB), 8, 0); cuMemcpyAsync(RN + 16, loc(rC), 8, 0)
-                        cuMemcpyAsync(RN + 24, loc(Srows), 8, 0); cuMemcpyAsync(RN + 32, loc(D), 8, 0); cuMemcpyAsync(RN + 40, loc(EPS), 8, 0)
+                        hnb<RNB> = RNB { x = cur, w = ON, y = DH, m = Srows, n = D, ep = EPS }
+                        cuMemcpyAsync(RN, loc(hnb), 48, 0)
                         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Srows * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
                         s7<Int> = Srows - 1
                         # Coalesced tied head: 32 lanes per vocab row over the f32 table, then a lane reduce.
