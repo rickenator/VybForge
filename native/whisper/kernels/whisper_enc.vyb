@@ -15,7 +15,7 @@
 // Device math: kernel mode has no libm (an `exp`/`erf` call is a compile error —
 // "not available in NVPTX device code"), so transcendentals come from
 // native/kernels/vmath.vyb, which is pure arithmetic (vexp ~1e-9 rel).
-import vmath::{vexp}
+import vmath::{vexp, vsqrt}
 
 // ---------------------------------------------------------------------------
 // erf_approx: erf(x) to ~1.2e-7 absolute.
@@ -128,6 +128,46 @@ im2col_conv(p<Int>) -> {
             v = ld_f64(src + (i * TIn + pos) * 8)
         }
         st_f64(dst + gid * 8, v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// layernorm: Y[s][d] = (X[s][d] - mean_s) * invstd_s * W[d] + B[d]
+//   params: X, W, B, Y, S, D, eps (Float)
+// One thread per ROW (not per element): the row statistics are computed twice in
+// registers instead of being recomputed by every element thread. sqrt is the
+// pure-arithmetic Newton form from vmath — the libm `sqrt` does not lower
+// reliably in kernel mode.
+layernorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    B<Int> = ld_i64(p + 16)
+    Y<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 32)
+    D<Int> = ld_i64(p + 40)
+    eps<Float> = ld_f64(p + 48)
+    row<Int> = blk_x() * dim_x() + tid_x()
+    if (row < S) {
+        base<Int> = row * D
+        mean<Float> = 0.0
+        d<Int> = 0
+        for (d in 0..D - 1) {
+            mean = mean + ld_f64(X + (base + d) * 8)
+        }
+        mean = mean / (D as Float)
+        vari<Float> = 0.0           # `var` is a language keyword, not a name
+        for (d in 0..D - 1) {
+            dev<Float> = ld_f64(X + (base + d) * 8) - mean
+            vari = vari + dev * dev
+        }
+        vari = vari / (D as Float)
+        inv<Float> = 1.0 / vsqrt(vari + eps, 24)
+        for (d in 0..D - 1) {
+            wv<Float> = ld_f64(W + d * 8)
+            bv<Float> = ld_f64(B + d * 8)
+            xv<Float> = ld_f64(X + (base + d) * 8)
+            st_f64(Y + (base + d) * 8, (xv - mean) * inv * wv + bv)
+        }
     }
 }
 

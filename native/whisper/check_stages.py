@@ -20,6 +20,7 @@ SHAPES = {
     "conv2": (384, 1500), "e_conv2": (384, 1500),
     "e_pos": (1500, 384),
     "e_in": (1500, 384),
+    "e_l0_ln1": (1500, 384),
 }
 TOL = 1e-4
 
@@ -48,7 +49,7 @@ def main():
     sections = parse(sys.argv[1])
     only = sys.argv[2:]
     ok = True
-    for stage in ("conv1", "conv2", "e_pos", "e_in"):
+    for stage in ("conv1", "conv2", "e_pos", "e_in", "e_l0_ln1"):
         if only and stage not in only:
             print(f"{stage}: SKIP (not requested)")
             continue

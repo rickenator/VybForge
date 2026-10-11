@@ -178,6 +178,9 @@ main()<Int> -> {
     DBuf<Int> = dev_alloc(D * T2 * 8)                 # conv2 out (384, 1500)
     DT<Int> = dev_alloc(T2 * D * 8)                   # transposed (1500, 384)
     DE<Int> = dev_alloc(POS * D * 8)                  # + positional (1500, 384)
+    DLN<Int> = dev_alloc(POS * D * 8)                 # layer 0 self-attn norm output
+    DLNW<Int> = dev_alloc(D * 8)
+    DLNB<Int> = dev_alloc(D * 8)
     DPOS<Int> = dev_alloc(POS * D * 8)
     DW<Int> = dev_alloc(D * 1152 * 8)                 # biggest weight (conv2)
     DBI<Int> = dev_alloc(D * 8)
@@ -189,6 +192,7 @@ main()<Int> -> {
     # which surfaces as "stage failed" rather than as an obvious size error.
     RAW<Int> = dev_alloc(4 * 1024 * 1024)
     if (DM == 0 || DA == 0 || DBuf == 0 || DT == 0 || DE == 0 || DPOS == 0 ||
+        DLN == 0 || DLNW == 0 || DLNB == 0 ||
         DW == 0 || DBI == 0 || DX == 0 || DC == 0 || RAW == 0) {
         println("device alloc failed")
         return 4
@@ -206,7 +210,8 @@ main()<Int> -> {
     ftr<Int> = module_func(henc, "transpose2d")
     faddb<Int> = module_func(henc, "add_bias_row")
     fadd2<Int> = module_func(henc, "add2")
-    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0) {
+    fln<Int> = module_func(henc, "layernorm")
+    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0) {
         println("missing kernel symbol")
         return 7
     }
@@ -253,6 +258,22 @@ main()<Int> -> {
     if (launch1(fadd2, (POS * D + 255) / 256, 256, PK) != 0) { println("launch pos add failed"); return 26 }
     sync()
     if (want("e_in")) { section("e_in", DE, POS * D) }
+
+    # ---- encoder layer 0: self-attention layer norm --------------------------
+    # Whisper is pre-LN: ln1 feeds the attention block, and the block's input is
+    # added back as a residual afterwards.
+    e = widen(ckpt, ix, "model.encoder.layers.0.self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { println("ln weight widen failed"); return 27 }
+    e = widen(ckpt, ix, "model.encoder.layers.0.self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { println("ln bias widen failed"); return 28 }
+    if (pi(PK, 0, DE) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
+        pi(PK, 32, POS) != 0 || pi(PK, 40, D) != 0) {
+        println("params pack failed (layernorm)"); return 29
+    }
+    if (htod(PK + 48, 1e-5) != 0) { println("params pack failed (ln eps)"); return 30 }
+    if (launch1(fln, (POS + 255) / 256, 256, PK) != 0) { println("launch layernorm failed"); return 31 }
+    sync()
+    if (want("e_l0_ln1")) { section("e_l0_ln1", DLN, POS * D) }
 
     println("ENC_STAGES done")
     return 0
