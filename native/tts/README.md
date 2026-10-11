@@ -32,7 +32,32 @@ sequence, so a word starting with an unvoiced phone divided by zero and emitted 
 glottal pulses at all -- "hello" rendered its vowels as SILENCE and Whisper heard
 "[BLANK_AUDIO]"); with that fixed the vowels sound and Whisper calls it MUSIC.
 
-Whisper classifies the output as a non-speech SOUND, now with pitch in it. That is an honest and useful
+Whisper classifies the output as a non-speech SOUND, now with pitch in it. Four
+rounds of the obvious fixes did not change that category:
+
+    glottal tilt (2-pole) + per-class source amplitudes  -> "(singing)"
+    + amplitude levels actually applied                  -> "(singing)"
+    + pitch declination (1.12 -> 0.86 across the phrase)  -> "(singing)"
+
+THE PATTERN IS THE FINDING. What changed each time was the *label*, never the
+category: sound, then music, then singing. Whisper is a model of natural speech and
+has no acoustic model of a three-formant sounds-almost-right signal; "(singing)" and
+"(music)" are what it does with pitched non-speech, and Whisper never emits those
+labels for the jfk fixture, which is real speech. So this instrument cannot
+distinguish "my synthesiser is bad" from "my synthesiser is not what Whisper models",
+and every further tweak measures Whisper rather than the synthesiser.
+
+The honest next steps, in order:
+  1. change the ORACLE before changing the synthesiser further -- a vowel-only
+     stimulus (steady /a/, 500 ms) is the cheap decisive test: if Whisper labels a
+     single steady vowel as music too, the instrument is the problem, not the
+     sequence. A phone recogniser (or an ear) is the right judge for synthetic speech.
+  2. then, if ASR-recognisable speech is the requirement rather than "Vyb can speak",
+     this is the point to stop growing the formant synthesiser and port a neural
+     vocoder (VITS/HiFiGAN), which is the same scale of port as Whisper and is what
+     the formant core was always going to be replaced BY if intelligibility to ASR
+     is the bar. The formant core would remain the thing that makes the loop speak
+     with no checkpoint at all. That is a decision for Rick, not for me. That is an honest and useful
 result, and the diagnosis is not mysterious: the synthesiser renders each phone as
 a STATIONARY filter and concatenates them. Consonant-vowel formant TRANSITIONS are
 the main carrier of intelligibility in speech -- the /e/ into /l/ into /o/ movement

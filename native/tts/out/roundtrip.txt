@@ -1,14 +1,14 @@
 ENC_STAGES begin
 ARGMAX_ID
-20724
+357
 IDS n=
 5
-20724
-103
-17992
-103
+357
+12215
+278
+8
 50256
 TEXT
- ♪♪<|endoftext|>
+ (singing)<|endoftext|>
 DEC_STAGES done
 0
