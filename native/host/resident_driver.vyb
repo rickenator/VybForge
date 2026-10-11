@@ -731,6 +731,8 @@ main()<Int> -> {
         q416<loc<CVoid>> = from<loc<CVoid>>(0); q616<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q416), m4, "q4kdeqT") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q616), m6, "q6kdeqT") != 0) { return 10 }
+        q6h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q6h), m6, "q6kdeq16") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q632), m6, "q6kdeq32") != 0) { return 10 }
         c32n<loc<CVoid>> = from<loc<CVoid>>(0); g3p<loc<CVoid>> = from<loc<CVoid>>(0)
         g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -920,7 +922,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(TEP), te_nl / 256 * 210) != 0) { return 11 }
         # f32 copy of the tied embedding for the head (1.55 GB) + the 32-lane partials (VOCAB x 32 f32).
         DE32<Int> = 0; LPART<Int> = 0; LPB<Int> = 0
-        if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 }
+        if (H16 == 0) { if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 } }
         if (cuMemAlloc_v2(loc(LPART), VOCAB * 32 * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LPB), 64) != 0) { return 11 }
         QPB<Int> = 0
@@ -1110,8 +1112,7 @@ main()<Int> -> {
         println("EMB_PACKED_RESIDENT")
         # f32 head table straight from the packed rows: q6kdeq32's f32 d*sc*q rounds once, at the last
         # multiply (d*sc is exact), which is the same single rounding the old f64-then-cast took.
-        e = dequant_gpu(TEP, 0, DE32, te_nl, q632, 0); if (e != 0) { return 91 }
-        println("EMB_F32_COPY_DONE")
+        if (H16 == 0) { e = dequant_gpu(TEP, 0, DE32, te_nl, q632, 0); if (e != 0) { return 91 } }
         rtfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rtfn), mw, "rope_tab") != 0) { return 10 }
         e = cast1(rtfn, CPB, DF, DF + 512, MAXS * 64); if (e != 0) { return 91 }
@@ -1119,10 +1120,10 @@ main()<Int> -> {
         DEH<Int> = DE32
         lhp<loc<CVoid>> = l32p
         if (H16 == 1) {
+            # straight to f16 (q6kdeq16 = q6kdeq32's value rounded once more: what the f32 copy + cast16 gave),
+            # so the 1.55 GB f32 table never exists
             if (cuMemAlloc_v2(loc(DEH), te_nl * 2) != 0) { return 11 }
-            e = cast1(c16n, CPB, DE32, DEH, te_nl); if (e != 0) { return 91 }
-            cuCtxSynchronize()
-            cuMemFree_v2(DE32)
+            e = dequant_gpu(TEP, 0, DEH, te_nl, q6h, 0); if (e != 0) { return 91 }
             lhp = l16p
             println("EMB_F16_HEAD_DONE")
         }
