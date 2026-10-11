@@ -76,7 +76,16 @@ decoder() {
     # yet is not a failure — a gate that is permanently red for work that has not
     # been done teaches nothing (and hides the failure that matters).
     "$PY" check_stages.py out/vyb_dec.txt \
-        d_embed d_l0_ln1 d_l0_selfattn d_l0_res1 d_l0_crossattn d_l0_mlp
+        d_embed d_l0_ln1 d_l0_selfattn d_l0_res1 d_l0_crossattn d_l0_mlp d_step0_logits
+    # ACCEPTANCE: the first generated token. The driver prints "ARGMAX_ID" and the
+    # id on the next line; the reference text starts " And so my fellow Americans",
+    # and 843 IS " And" in this tokenizer.
+    ID=$(grep -A1 "^ARGMAX_ID$" "$here/out/vyb_dec.txt" | tail -1 | tr -d ' ')
+    if [ "$ID" = "843" ]; then
+        echo "first-token gate: OK (843 = ' And')"
+    else
+        echo "first-token gate: FAIL (got '$ID', want 843)"; exit 1
+    fi
 }
 
 weights() {

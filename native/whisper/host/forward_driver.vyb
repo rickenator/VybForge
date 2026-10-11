@@ -1,11 +1,18 @@
-// encoder_driver.vyb — the Whisper encoder's front half on the GPU, stage by stage.
+// forward_driver.vyb — the WHOLE Whisper forward pass on the GPU, stage by stage.
 //
-// Runs, in order, with a gate at each stage against fixtures/whisper/gold_stt:
-//   mel (Vyb, native/mel)  -> conv1 + GELU -> conv2 + GELU -> transpose -> +positional
-// which is everything before the transformer blocks (e_in).
+// Encoder and decoder live in one process on purpose: the decoder's
+// cross-attention needs the encoder's final output, and a Vyb tensor cannot
+// travel through a file.
 //
-//   ./build.sh stages            # all stages
+//   encoder: mel (Vyb, native/mel) -> conv1 -> conv2 -> transpose -> +positional
+//            -> four blocks -> final norm
+//   decoder: prompt gather -> four blocks (causal self-attn, cross-attn over the
+//            encoder output, MLP) -> final norm -> TIED head -> greedy argmax
+//
+//   ./build.sh stages             # encoder stages
+//   ./build.sh decoder            # decoder stages
 //   WHISPER_STAGES=conv2 ./build.sh stages
+//   WHISPER_STAGES=d_step0_logits ./build.sh decoder
 //
 // The conv stack is expressed as im2col + the verified f64 GEMM rather than as a
 // convolution kernel: conv1 is (80->384, k3, s1) and conv2 is (384->384, k3, s2),
@@ -13,7 +20,7 @@
 // from the safetensors checkpoint as f32 and are reordered+widened to the GEMM's
 // f64 layout by reorder_w(mode=1).
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, dev_free,
-                htod, htod_i, htod_vec, dtoh, sync, launch1}
+                htod, htod_i, htod_vec, dtoh, dtoh_i, sync, launch1}
 import mel::{log_mel, mel_filters}
 import wav::{load_wav}
 import safetensors::{st_open, st_find, StIndex}
@@ -36,6 +43,7 @@ FFN<Int> = 1536          // encoder/decoder MLP width
 ENC_LAYERS<Int> = 4     // tiny.en encoder depth
 VOCAB<Int> = 51864      // token table rows (also the tied output head)
 MAXPOS<Int> = 448       // decoder position table
+DEC_LAYERS<Int> = 4     // tiny.en decoder depth
 CL<Int> = 2             // decoder prompt length: <|startoftranscript|>, <|notimestamps|>
 PROMPT0<Int> = 50257
 PROMPT1<Int> = 50362
@@ -362,6 +370,142 @@ enc_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>,
     return 0
 }
 
+// ---------------------------------------------------------------------------
+// One decoder block. Differs from the encoder's three ways, all of them real:
+//   * self-attention is CAUSAL
+//   * there is a second attention whose K/V are a projection of the ENCODER's
+//     output (per layer -- each decoder layer owns its own encoder_attn.k/v_proj)
+//   * the layer's final norm feeds an MLP whose output is the residual addend
+// The prompt is only CL rows, so nothing here is large; the cross-attention K/V
+// are POS rows, which is where the arithmetic is.
+dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
+          DLN<Int>, DQ<Int>, DK<Int>, DV<Int>, DCTX<Int>, DATT<Int>, DLN2<Int>,
+          DFC1<Int>, DMLP<Int>, DKE<Int>, DVE<Int>, DLNW<Int>, DLNB<Int>,
+          DW<Int>, DBI<Int>, RAW<Int>, ford<Int>, fgemm<Int>, faddb<Int>,
+          fgelu<Int>, fln<Int>, fatt<Int>, fadd2<Int>, PG<Int>, PK<Int>,
+          dEnc<Int>, Tk<Int>, Tq<Int>)<Int> -> {
+    pfx<String> = "model.decoder.layers." + int_str(li) + "."
+
+    # --- ln1 + CAUSAL self-attention -----------------------------------------
+    e<Int> = widen(ckpt, ix, pfx + "self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 20 + li }
+    e = widen(ckpt, ix, pfx + "self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 24 + li }
+    if (pi(PK, 0, dIn) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
+        pi(PK, 32, Tq) != 0 || pi(PK, 40, D) != 0) { return 28 + li }
+    if (htod(PK + 48, 1e-5) != 0) { return 32 + li }
+    if (launch1(fln, (Tq + 255) / 256, 256, PK) != 0) { return 36 + li }
+    sync()
+    if (li == 0 && want("d_l0_ln1")) { section("d_l0_ln1", DLN, Tq * D) }
+
+    e = linear(ckpt, ix, pfx + "self_attn.q_proj.weight", pfx + "self_attn.q_proj.bias",
+               DLN, Tq, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 40 + li }
+    e = linear(ckpt, ix, pfx + "self_attn.k_proj.weight", "",
+               DLN, Tq, D, D, DW, DBI, DK, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 44 + li }
+    e = linear(ckpt, ix, pfx + "self_attn.v_proj.weight", pfx + "self_attn.v_proj.bias",
+               DLN, Tq, D, D, DW, DBI, DV, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 48 + li }
+    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DK) != 0 || pi(PK, 16, DV) != 0 || pi(PK, 24, DCTX) != 0 ||
+        pi(PK, 32, Tq) != 0 || pi(PK, 40, Tq) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
+        return 52 + li
+    }
+    if (htod(PK + 64, 0.125) != 0) { return 56 + li }
+    if (pi(PK, 72, 1) != 0) { return 58 + li }
+    if (launch1(fatt, (Tq * HEADS + 255) / 256, 256, PK) != 0) { return 60 + li }
+    sync()
+    e = linear(ckpt, ix, pfx + "self_attn.out_proj.weight", pfx + "self_attn.out_proj.bias",
+               DCTX, Tq, D, D, DW, DBI, DATT, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 64 + li }
+    if (li == 0 && want("d_l0_selfattn")) { section("d_l0_selfattn", DATT, Tq * D) }
+
+    if (pi(PK, 0, dIn) != 0 || pi(PK, 8, DATT) != 0 || pi(PK, 16, DR2) != 0 || pi(PK, 24, Tq * D) != 0) {
+        return 68 + li
+    }
+    if (launch1(fadd2, (Tq * D + 255) / 256, 256, PK) != 0) { return 72 + li }
+    sync()
+    if (li == 0 && want("d_l0_res1")) { section("d_l0_res1", DR2, Tq * D) }
+
+    # --- ln2 + CROSS-attention (Q from here, K/V from the encoder output) -----
+    e = widen(ckpt, ix, pfx + "encoder_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 76 + li }
+    e = widen(ckpt, ix, pfx + "encoder_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 80 + li }
+    if (pi(PK, 0, DR2) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, Tq) != 0 || pi(PK, 40, D) != 0) { return 84 + li }
+    if (htod(PK + 48, 1e-5) != 0) { return 88 + li }
+    if (launch1(fln, (Tq + 255) / 256, 256, PK) != 0) { return 90 + li }
+    sync()
+
+    e = linear(ckpt, ix, pfx + "encoder_attn.k_proj.weight", "",
+               dEnc, Tk, D, D, DW, DBI, DKE, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 92 + li }
+    e = linear(ckpt, ix, pfx + "encoder_attn.v_proj.weight", pfx + "encoder_attn.v_proj.bias",
+               dEnc, Tk, D, D, DW, DBI, DVE, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 94 + li }
+    e = linear(ckpt, ix, pfx + "encoder_attn.q_proj.weight", pfx + "encoder_attn.q_proj.bias",
+               DLN2, Tq, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 96 + li }
+    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DKE) != 0 || pi(PK, 16, DVE) != 0 || pi(PK, 24, DCTX) != 0 ||
+        pi(PK, 32, Tq) != 0 || pi(PK, 40, Tk) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
+        return 98 + li
+    }
+    if (htod(PK + 64, 0.125) != 0) { return 100 + li }
+    if (pi(PK, 72, 0) != 0) { return 102 + li }
+    if (launch1(fatt, (Tq * HEADS + 255) / 256, 256, PK) != 0) { return 104 + li }
+    sync()
+    e = linear(ckpt, ix, pfx + "encoder_attn.out_proj.weight", pfx + "encoder_attn.out_proj.bias",
+               DCTX, Tq, D, D, DW, DBI, DATT, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 106 + li }
+    if (li == 0 && want("d_l0_crossattn")) { section("d_l0_crossattn", DATT, Tq * D) }
+
+    if (pi(PK, 0, DR2) != 0 || pi(PK, 8, DATT) != 0 || pi(PK, 16, dOut) != 0 || pi(PK, 24, Tq * D) != 0) {
+        return 108 + li
+    }
+    if (launch1(fadd2, (Tq * D + 255) / 256, 256, PK) != 0) { return 110 + li }
+    sync()
+
+    # --- final norm + MLP + residual -----------------------------------------
+    e = widen(ckpt, ix, pfx + "final_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 112 + li }
+    e = widen(ckpt, ix, pfx + "final_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 114 + li }
+    if (pi(PK, 0, dOut) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, Tq) != 0 || pi(PK, 40, D) != 0) { return 116 + li }
+    if (htod(PK + 48, 1e-5) != 0) { return 118 + li }
+    if (launch1(fln, (Tq + 255) / 256, 256, PK) != 0) { return 120 + li }
+    sync()
+    e = linear(ckpt, ix, pfx + "fc1.weight", pfx + "fc1.bias",
+               DLN2, Tq, D, FFN, DW, DBI, DFC1, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 122 + li }
+    if (pi(PK, 0, DFC1) != 0 || pi(PK, 8, DFC1) != 0 || pi(PK, 16, Tq * FFN) != 0) { return 124 + li }
+    if (launch1(fgelu, (Tq * FFN + 255) / 256, 256, PK) != 0) { return 126 + li }
+    sync()
+    e = linear(ckpt, ix, pfx + "fc2.weight", pfx + "fc2.bias",
+               DFC1, Tq, FFN, D, DW, DBI, DMLP, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 128 + li }
+    if (li == 0 && want("d_l0_mlp")) { section("d_l0_mlp", DMLP, Tq * D) }
+    if (pi(PK, 0, dOut) != 0 || pi(PK, 8, DMLP) != 0 || pi(PK, 16, dOut) != 0 || pi(PK, 24, Tq * D) != 0) {
+        return 130 + li
+    }
+    if (launch1(fadd2, (Tq * D + 255) / 256, 256, PK) != 0) { return 132 + li }
+    sync()
+    return 0
+}
+
+// The tied head: logits = x @ table^T, where `table` is ALREADY the transposed
+// (D, VOCAB) f64 table (see stage_table) -- a plain GEMM, no weight load, no
+// transpose, and no second copy of the table.
+head_gemm(dIn<Int>, dTable<Int>, dOut<Int>, S<Int>, Kk<Int>, Nn<Int>, fgemm<Int>, PG<Int>)<Int> -> {
+    if (pi(PG, 0, dIn) != 0 || pi(PG, 8, dTable) != 0 || pi(PG, 16, dOut) != 0 ||
+        pi(PG, 24, S) != 0 || pi(PG, 32, Nn) != 0 || pi(PG, 40, Kk) != 0) { return 1 }
+    if (htod(PG + 48, 1.0) != 0 || htod(PG + 56, 0.0) != 0) { return 2 }
+    if (launch1(fgemm, (S * Nn + 255) / 256, 256, PG) != 0) { return 3 }
+    sync()
+    return 0
+}
+
 main()<Int> -> {
     println("ENC_STAGES begin")
     if (tensor_init() != 0) { println("tensor_init failed"); return 1 }
@@ -462,7 +606,8 @@ main()<Int> -> {
     fgelu<Int> = module_func(henc, "gelu")
     femb<Int> = module_func(henc, "embed")
     farg<Int> = module_func(henc, "argmax")
-    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0 || fatt == 0 || fgelu == 0 || femb == 0 || farg == 0) {
+    fstage<Int> = module_func(henc, "stage_table")
+    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0 || fatt == 0 || fgelu == 0 || femb == 0 || farg == 0 || fstage == 0) {
         println("missing kernel symbol")
         return 7
     }
@@ -550,8 +695,36 @@ main()<Int> -> {
     # The decoder runs in the same process as the encoder because cross-attention
     # needs the encoder's final output and a Vyb tensor cannot travel through a
     # file. The prompt is <|startoftranscript|>, <|notimestamps|>.
-    e = widen_chunked(ckpt, ix, "model.decoder.embed_tokens.weight", VOCAB * D, DTOK, RAW, ford, PK)
-    if (e != 0) { println("token table widen failed"); println_int(e); return 70 }
+    # The token table goes to the device TRANSPOSED, (D, VOCAB), because that is
+    # the operand layout the tied head needs: loading it once in that form means
+    # the gather reads it with one index change instead of a second 159 MB copy.
+    # Chunked over the input rows (5187 x 384 f32 = 7.97 MB per piece).
+    tidx<Int> = st_find(ix, "model.decoder.embed_tokens.weight")
+    if (tidx < 0) { println("MISSING token table"); return 68 }
+    tbase<Int> = ix.data_base + ix.doff.get(tidx)
+    trow<Int> = 0
+    while (trow < VOCAB) {
+        take<Int> = VOCAB - trow
+        if (take > 5187) { take = 5187 }
+        tdata<String> = ""
+        match (open_read(ckpt)) {
+            th -> {
+                match (read_at(th, tbase + trow * D * 4, take * D * 4)) {
+                    ts -> { tdata = ts }
+                    ? -> { }
+                }
+                close(th)
+            }
+            ? -> { }
+        }
+        if (tdata.len() < take * D * 4) { println("short token-table read"); return 69 }
+        if (bulk(tdata, RAW, take * D * 4) != 0) { println("token-table DMA failed"); return 69 }
+        if (pi(PK, 0, RAW) != 0 || pi(PK, 8, DTOK) != 0 || pi(PK, 16, take) != 0 ||
+            pi(PK, 24, D) != 0 || pi(PK, 32, VOCAB) != 0 || pi(PK, 40, trow) != 0) { return 69 }
+        if (launch1(fstage, (take * D + 255) / 256, 256, PK) != 0) { println("stage_table failed"); return 69 }
+        sync()
+        trow = trow + take
+    }
     e = widen_chunked(ckpt, ix, "model.decoder.embed_positions.weight", MAXPOS * D, DPOSD, RAW, ford, PK)
     if (e != 0) { println("decoder positions widen failed"); println_int(e); return 71 }
     if (htod_i(DIDS + 0, PROMPT0) != 0) { return 72 }
@@ -559,7 +732,7 @@ main()<Int> -> {
 
     # ---- token embedding gather + decoder positions --------------------------
     if (pi(PK, 0, DTOK) != 0 || pi(PK, 8, DIDS) != 0 || pi(PK, 16, DXC) != 0 ||
-        pi(PK, 24, CL) != 0 || pi(PK, 32, D) != 0) {
+        pi(PK, 24, CL) != 0 || pi(PK, 32, D) != 0 || pi(PK, 40, 1) != 0 || pi(PK, 48, VOCAB) != 0) {
         println("params pack failed (decoder embed)"); return 74
     }
     if (launch1(femb, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder embed failed"); return 75 }
@@ -570,131 +743,50 @@ main()<Int> -> {
     sync()
     if (want("d_embed")) { section("d_embed", DADD, CL * D) }
 
-    # ---- decoder layer 0: ln1, CAUSAL self-attention -------------------------
-    e = widen(ckpt, ix, "model.decoder.layers.0.self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
-    if (e != 0) { return 78 }
-    e = widen(ckpt, ix, "model.decoder.layers.0.self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
-    if (e != 0) { return 79 }
-    if (pi(PK, 0, DADD) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 80 }
-    if (htod(PK + 48, 1e-5) != 0) { return 81 }
-    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln1 failed"); return 82 }
-    sync()
-    if (want("d_l0_ln1")) { section("d_l0_ln1", DLN, CL * D) }
-
-    # q/k/v of the decoder's SELF attention (all three have biases here; the
-    # ENCODER's k_proj is the biasless one)
-    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.q_proj.weight",
-               "model.decoder.layers.0.self_attn.q_proj.bias",
-               DLN, CL, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 83 }
-    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.k_proj.weight",
-               "",      # EVERY k_proj in this checkpoint is biasless (0 occurrences
-                        # of "k_proj.bias" in the file) — self-attention in both
-                        # encoder and decoder, and the decoder's cross-attention
-               DLN, CL, D, D, DW, DBI, DK, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 84 }
-    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.v_proj.weight",
-               "model.decoder.layers.0.self_attn.v_proj.bias",
-               DLN, CL, D, D, DW, DBI, DV, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 85 }
-    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DK) != 0 || pi(PK, 16, DV) != 0 || pi(PK, 24, DCTX) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, CL) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
-        return 86
+    # ---- the four decoder layers (ping-pong, never in place) ----------------
+    dcur<Int> = DADD
+    dnxt<Int> = DXC
+    dli<Int> = 0
+    for (dli in 0..DEC_LAYERS - 1) {
+        e = dec_layer(ckpt, ix, dli, dcur, dnxt, DDR1, DLN, DQ, DK, DV, DCTX, DDATT, DLN2,
+                      DFC1, DDMLP, DKE, DVE, DLNW, DLNB, DW, DBI, RAW,
+                      ford, fgemm, faddb, fgelu, fln, fatt, fadd2, PG, PK,
+                      DE, POS, CL)
+        if (e != 0) { println("decoder layer failed"); println_int(dli); println_int(e); return 140 + dli }
+        dcur = dnxt
+        if (dnxt == DADD) {
+            dnxt = DXC
+        } else {
+            dnxt = DADD
+        }
     }
-    if (htod(PK + 64, 0.125) != 0) { return 87 }
-    if (pi(PK, 72, 1) != 0) { return 88 }        # CAUSAL: decoder self-attention
-    if (launch1(fatt, (CL * HEADS + 255) / 256, 256, PK) != 0) { println("launch decoder attn failed"); return 89 }
+
+    # ---- final decoder layer norm -------------------------------------------
+    e = widen(ckpt, ix, "model.decoder.layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 150 }
+    e = widen(ckpt, ix, "model.decoder.layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 151 }
+    if (pi(PK, 0, dcur) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 152 }
+    if (htod(PK + 48, 1e-5) != 0) { return 153 }
+    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch final decoder ln failed"); return 154 }
     sync()
-    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.out_proj.weight",
-               "model.decoder.layers.0.self_attn.out_proj.bias",
-               DCTX, CL, D, D, DW, DBI, DDATT, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 90 }
-    if (want("d_l0_selfattn")) { section("d_l0_selfattn", DDATT, CL * D) }
+    # No gold tensor for this one: the oracle captured the final norm applied to
+    # LAYER 0's output (a one-layer probe, gold_stt/d_layernorm_on_l0_out.f32),
+    # not the real four-layer path. That path is covered by d_step0_logits below,
+    # which is this same norm feeding the tied head. Kept as a named dump because
+    # it is what to look at when the logits are wrong.
+    if (want("d_final_ln_4layers")) { section("d_final_ln_4layers", DLN2, CL * D) }
 
-    if (pi(PK, 0, DADD) != 0 || pi(PK, 8, DDATT) != 0 || pi(PK, 16, DDR1) != 0 || pi(PK, 24, CL * D) != 0) {
-        return 91
-    }
-    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder residual failed"); return 92 }
+    # ---- the tied head, then greedy argmax on the LAST position -------------
+    e = head_gemm(DLN2, DTOK, DLOGITS, CL, D, VOCAB, fgemm, PG)
+    if (e != 0) { println("head gemm failed"); return 155 }
+    if (want("d_step0_logits")) { section("d_step0_logits", DLOGITS + (CL - 1) * VOCAB * 8, VOCAB) }
+    if (pi(PK, 0, DLOGITS + (CL - 1) * VOCAB * 8) != 0 || pi(PK, 8, DARGMAX) != 0 ||
+        pi(PK, 16, VOCAB) != 0) { return 156 }
+    if (launch1(farg, 1, 32, PK) != 0) { println("argmax failed"); return 157 }
     sync()
-    if (want("d_l0_res1")) { section("d_l0_res1", DDR1, CL * D) }
-
-    # ---- cross-attention: Q from the decoder, K/V from the ENCODER output ----
-    e = widen(ckpt, ix, "model.decoder.layers.0.encoder_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
-    if (e != 0) { return 93 }
-    e = widen(ckpt, ix, "model.decoder.layers.0.encoder_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
-    if (e != 0) { return 94 }
-    if (pi(PK, 0, DDR1) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 95 }
-    if (htod(PK + 48, 1e-5) != 0) { return 96 }
-    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln2 failed"); return 97 }
-    sync()
-
-    # K/V are a projection of the ENCODER output (DE), over all 1500 positions
-    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.k_proj.weight",
-               "",
-               DE, POS, D, D, DW, DBI, DKE, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 98 }
-    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.v_proj.weight",
-               "model.decoder.layers.0.encoder_attn.v_proj.bias",
-               DE, POS, D, D, DW, DBI, DVE, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 99 }
-    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.q_proj.weight",
-               "model.decoder.layers.0.encoder_attn.q_proj.bias",
-               DLN2, CL, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 100 }
-
-    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DKE) != 0 || pi(PK, 16, DVE) != 0 || pi(PK, 24, DCTX) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, POS) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
-        return 101
-    }
-    if (htod(PK + 64, 0.125) != 0) { return 102 }
-    if (pi(PK, 72, 0) != 0) { return 103 }       # NOT causal: the whole encoder output
-    if (launch1(fatt, (CL * HEADS + 255) / 256, 256, PK) != 0) { println("launch cross-attn failed"); return 104 }
-    sync()
-    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.out_proj.weight",
-               "model.decoder.layers.0.encoder_attn.out_proj.bias",
-               DCTX, CL, D, D, DW, DBI, DDATT, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 105 }
-    if (want("d_l0_crossattn")) { section("d_l0_crossattn", DDATT, CL * D) }
-
-    println("ENC_STAGES done")
-    # ---- residual after cross-attention, then the MLP ------------------------
-    # DXC is free here (its gather output was consumed by the positional add), so
-    # it becomes the post-cross-attention residual.
-    if (pi(PK, 0, DDR1) != 0 || pi(PK, 8, DDATT) != 0 || pi(PK, 16, DXC) != 0 || pi(PK, 24, CL * D) != 0) {
-        return 106
-    }
-    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder res2 failed"); return 107 }
-    sync()
-
-    e = widen(ckpt, ix, "model.decoder.layers.0.final_layer_norm.weight", D, DLNW, RAW, ford, PK)
-    if (e != 0) { return 108 }
-    e = widen(ckpt, ix, "model.decoder.layers.0.final_layer_norm.bias", D, DLNB, RAW, ford, PK)
-    if (e != 0) { return 109 }
-    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 110 }
-    if (htod(PK + 48, 1e-5) != 0) { return 111 }
-    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln3 failed"); return 112 }
-    sync()
-
-    e = linear(ckpt, ix, "model.decoder.layers.0.fc1.weight", "model.decoder.layers.0.fc1.bias",
-               DLN2, CL, D, FFN, DW, DBI, DFC1, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 113 }
-    if (pi(PK, 0, DFC1) != 0 || pi(PK, 8, DFC1) != 0 || pi(PK, 16, CL * FFN) != 0) { return 114 }
-    if (launch1(fgelu, (CL * FFN + 255) / 256, 256, PK) != 0) { println("launch decoder gelu failed"); return 115 }
-    sync()
-    e = linear(ckpt, ix, "model.decoder.layers.0.fc2.weight", "model.decoder.layers.0.fc2.bias",
-               DFC1, CL, FFN, D, DW, DBI, DDMLP, RAW, ford, fgemm, faddb, PG, PK)
-    if (e != 0) { return 116 }
-    if (want("d_l0_mlp")) { section("d_l0_mlp", DDMLP, CL * D) }
-
-    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DDMLP) != 0 || pi(PK, 16, DDLAY) != 0 || pi(PK, 24, CL * D) != 0) {
-        return 117
-    }
-    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder res3 failed"); return 118 }
-    sync()
-
-    println("DEC_LAYER0 done")
+    println("ARGMAX_ID")
+    println_int(dtoh_i(DARGMAX))
     return 0
 }

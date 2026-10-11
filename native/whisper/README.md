@@ -9,10 +9,11 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Piece | State | Gate |
 |---|---|---|
 | Checkpoint inventory | **done** | `./build.sh weights` — 167 tensors, names/dtypes/shapes/bytes exact |
-| Decoder: prompt embedding, causal self-attention, cross-attention, MLP | **done** | `./build.sh decoder` — layer 0 complete, 1.0e-06 … 2.6e-06 |
+| Decoder: prompt embedding, four layers, cross-attention, MLP | **done** | `./build.sh decoder` — 1.0e-06 … 2.6e-06 per stage |
 | Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — within 1.3e-5 of the real model |
 | Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
-| Decoder layers 1-3, tied head, greedy decode | not started | acceptance: the first 24 ids (**843**, ...) token-for-token |
+| Decoder: four layers, final norm, tied head, argmax | **done** | `./build.sh decoder` — logits 5.2e-05 over 51864 values; **first token 843** |
+| Greedy decode loop (24 tokens) + id-to-text | not started | acceptance: the first 24 ids token-for-token |
 
 ### Stage evidence (RTX 3090)
 
@@ -146,9 +147,35 @@ encoder's final output and a Vyb tensor cannot travel through a file, so one
 process is the honest shape of the thing. `./build.sh stages` gates the encoder
 stages, `./build.sh decoder` the decoder stages, same binary.
 
-**Next step**: layers 1-3 (the same sequence with a layer index — the encoder's
-`enc_layer` is the pattern to copy), then the final layer norm, the tied head, and
-greedy decode.
+The decoder is complete as a single step: `dec_layer` (causal self-attention,
+cross-attention over the encoder output, MLP, residuals) runs four times, the final
+norm feeds the tied head, and a single-thread argmax picks the token.
+
+```
+d_embed        768  max|diff| 1.0e-06      d_l0_crossattn  768  1.2e-06
+d_l0_ln1       768  max|diff| 1.1e-06      d_l0_mlp        768  2.6e-06
+d_l0_selfattn  768  max|diff| 1.0e-06      d_step0_logits 51864 2.5e-05
+d_l0_res1      768  max|diff| 1.0e-06
+first-token gate: OK (843 = " And")
+```
+
+**Next step**: the greedy loop — feed the sampled token back in, re-run, stop at
+50256 — and the id-to-text path. Note the decode loop must re-run the decoder per
+token (no KV cache yet): CL grows by one each step, which is correct but wasteful,
+and the first thing to optimise once the loop is honest.
+
+## A gold tensor whose NAME implied more than it measured
+
+`d_final_ln` was the oracle's final decoder norm applied to **layer 0's output** —
+a one-layer probe — while the name said "the decoder's final norm". The four-layer
+driver matched the logits to 1.2e-06 (rel) and the first token exactly, and failed
+that gate across all 768 values. The implementation was right and the CHECK was
+wrong, which is the more expensive way round to find out.
+
+The rule: when a gate fails and a downstream gate on the same data passes, question
+what the gold tensor IS before touching the code. It is renamed
+`d_layernorm_on_l0_out` in the gold set and in the oracle that generates it, and the
+real four-layer path is gated by `d_step0_logits` — the same norm, feeding the head.
 
 ## Facts about this checkpoint that the file itself settles
 

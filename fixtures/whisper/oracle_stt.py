@@ -147,7 +147,9 @@ with torch.no_grad():
     dump("d_l0_res1", r1[0].numpy())
     dump("d_l0_crossattn", c0[0].numpy())
     dump("d_l0_mlp", m0[0].numpy())
-    dump("d_final_ln", dec.layer_norm(r2 + m0)[0].numpy())
+    # NOTE: this is the final decoder norm applied to LAYER 0's output -- a
+    # one-layer probe, not the real four-layer path (which d_step0_logits covers).
+    dump("d_layernorm_on_l0_out", dec.layer_norm(r2 + m0)[0].numpy())
 
 text = proc.batch_decode(ids, skip_special_tokens=True)[0]
 print("ref text:", text)

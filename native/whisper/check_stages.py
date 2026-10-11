@@ -23,7 +23,10 @@ SHAPES = {
     "d_l0_res1": (2, 384),
     "d_l0_crossattn": (2, 384),
     "d_l0_mlp": (2, 384),
-    "d_final_ln": (2, 384),
+    # d_layernorm_on_l0_out is the final decoder norm applied to LAYER 0's output
+    # (a one-layer probe the oracle captured). The real four-layer path is covered
+    # by d_step0_logits, which is the same norm feeding the tied head.
+    "d_layernorm_on_l0_out": (2, 384),
     "d_step0_logits": (51864,),
     "conv1": (384, 3000), "e_conv1": (384, 3000),
     "conv2": (384, 1500), "e_conv2": (384, 1500),
@@ -81,7 +84,7 @@ def main():
                   "e_l0_res1", "e_l0_ln2", "e_l0_mlp",
                   "e_layer0", "e_layer1", "e_layer2", "e_layer3", "e_final",
                   "d_embed", "d_l0_ln1", "d_l0_selfattn", "d_l0_res1", "d_l0_crossattn",
-                  "d_l0_mlp", "d_final_ln", "d_step0_logits"):
+                  "d_l0_mlp", "d_step0_logits"):
         if only and stage not in only:
             print(f"{stage}: SKIP (not requested)")
             continue
