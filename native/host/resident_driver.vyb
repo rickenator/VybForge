@@ -323,7 +323,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
-          AT2<Int>, KV32<Int>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
+          AT2<Int>, KV32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
           Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
     freedom {
@@ -394,13 +394,21 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (KC != 0) {
             # scores once per (row, head, position); softmax once per (row, head[, position]); then the
             # weighted V sum -- bit-identical to attn_kv / attn.
+            if (AT2 == 3) {
+                # GQA-grouped parallel attention (Ursela, item 22)
+                cuda_launch4i(from<loc<CVoid>>(addr(as3f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(ac3f)), S * KVH * 32, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(acr3f)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            }
             if (AT2 == 1) {
                 # parallel attention (Ursela, item 22): 4 launches, f64, tree/chunked reductions
                 cuda_launch4i(from<loc<CVoid>>(addr(as2f)), S * H * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
                 cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
                 cuda_launch4i(from<loc<CVoid>>(addr(ac2f)), S * H * 8, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
                 cuda_launch4i(from<loc<CVoid>>(addr(acrf)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
-            } else {
+            }
+            if (AT2 == 0) {
             cuda_launch4i(from<loc<CVoid>>(addr(ascf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(amxf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(aexf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
@@ -504,6 +512,10 @@ main()<Int> -> {
     AT2ON<Int> = 1
     at1_s<String> = env_get("VYB_ATTN1") else ""
     if (at1_s.len() > 0) { AT2ON = 0 }
+    # VYB_ATTN=2 selects the per-head parallel kernels; default 3 = GQA-grouped (needs H/KVH == 4).
+    at_s<String> = env_get("VYB_ATTN") else ""
+    if (AT2ON == 1) { AT2ON = 3 }
+    if (at_s == "2") { AT2ON = 1 }
     QGON<Int> = 1
     qg_s<String> = env_get("VYB_GEMV16") else ""
     if (qg_s.len() > 0) { QGON = 0 }
@@ -599,6 +611,10 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(asxf), ml, "attn_smx") != 0) { return 10 }
         if (cuModuleGetFunction(loc(ac2f), ml, "attn_cx2") != 0) { return 10 }
         if (cuModuleGetFunction(loc(acrf), ml, "attn_cxr") != 0) { return 10 }
+        as3f<loc<CVoid>> = from<loc<CVoid>>(0); ac3f<loc<CVoid>> = from<loc<CVoid>>(0); acr3f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as3f), ml, "attn_sc3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(ac3f), ml, "attn_cx3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acr3f), ml, "attn_cxr3") != 0) { return 10 }
         if (cuModuleGetFunction(loc(acxf), ml, "attn_cxw") != 0) { return 10 }
         amxf<loc<CVoid>> = from<loc<CVoid>>(0); aexf<loc<CVoid>> = from<loc<CVoid>>(0)
         asmf<loc<CVoid>> = from<loc<CVoid>>(0); anrf<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -801,7 +817,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(MSB), MAXS * H * 16) != 0) { return 11 }
         # attn_cx2 chunk partials: rows x H x 8 chunks x HD f64 (rows = the prompt at prefill, 1 at decode)
         PCB<Int> = 0
-        if (cuMemAlloc_v2(loc(PCB), (SEEDLEN + 1) * H * 8 * HD * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PCB), (SEEDLEN + 1) * H * 32 * HD * 8) != 0) { return 11 }
         # inv_freq[64] then the rotary cos/sin table (MAXS x 64 x {cos,sin}) at DF + 512.
         if (cuMemAlloc_v2(loc(DF), 64 * 8 + MAXS * 64 * 16) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
@@ -1048,7 +1064,7 @@ main()<Int> -> {
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
                                           amxf, aexf, asmf, anrf, EWB, MSB,
                                           rbf, RBP, RBQ, W16 * 2,
-                                          AT2ON, KV32ON, as2f, asxf, ac2f, acrf, PCB,
+                                          AT2ON, KV32ON, as3f, ac3f, acr3f, as2f, asxf, ac2f, acrf, PCB,
                                           QGL, q4f, q6f, q4m, q6m, QPB,
                                           PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
                                           PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),
