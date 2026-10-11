@@ -406,6 +406,20 @@ current lengths and, more importantly, FLAT instead of degrading as the context 
 > `kernel_barrier()`, then accumulate out of shared instead of walking global B with a 10 KB stride
 > (which is the dependent chain that makes the kernel latency-bound -- see above). That attacks the
 > actual bottleneck, and it is kernel work, not compiler work.
+>
+> **TRIED IT -- IT LOSES TOO (5th falsification).** `gemm32_tiled` written exactly as above (block of
+> 256 = 256 output columns; stages a [16 k][256 col] B tile into the 4096-f64 shared buffer with fully
+> coalesced loads, barrier, accumulates from shared, barrier; same param block and grid as gemm32_p so
+> the driver needs no change). Result: **CORRECT (C00 verified) but 129 ms vs 74 ms in the harness --
+> 1.8x SLOWER.** Most likely the barriers: 2 per chunk x 76 chunks = 152 block-wide barriers, which
+> serialise the block's 8 warps, plus the staging traffic through shared on top of the loads that were
+> already happening. Not pursued further: the shared cap (4096 f64 = 32 KB) forces TK=16 at TN=256, so
+> the barrier count cannot be reduced without shrinking the column tile and changing the grid.
+>
+> **CONCLUSION on the gemm: it is at a local optimum for this kernel model, and every structural
+> alternative has now been measured and lost** -- RB=2/8, a 4-way unroll, KSP=64, f16/packed weights
+> (moot: not bandwidth-bound), [N][K] B layout, shared-memory tiling. The remaining gap to peak is real
+> but is not reachable by any single axis I have been able to measure.
 
 ### Traps this line cost real time (do not repeat)
 
