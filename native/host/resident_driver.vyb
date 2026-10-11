@@ -24,6 +24,8 @@ extern "C" {
     cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemFree_v2(dptr<Int>)<CInt>
     cuCtxSynchronize()<CInt>
+    cuProfilerStart()<CInt>
+    cuProfilerStop()<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
                   a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
@@ -520,7 +522,7 @@ main()<Int> -> {
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
         A5<Int> = 0; A6<Int> = 0; PVA<Int> = 0; PIA<Int> = 0; CHA<Int> = 256
-        NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
+        NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 32
         RSPB<Int> = 0; RSB<Int> = 0; SNB<Int> = 0; CHN<Int> = 256
         Wq32<Int> = 0; Wk32<Int> = 0; Wv32<Int> = 0; Wo32<Int> = 0; Wg32<Int> = 0; Wu32<Int> = 0; Wd32<Int> = 0
         WqA<Int> = 0; WkA<Int> = 0; WvA<Int> = 0; WoA<Int> = 0; WgA<Int> = 0; WuA<Int> = 0; WdA<Int> = 0
@@ -721,6 +723,10 @@ main()<Int> -> {
         tot_ms<Int> = 0
         tot_tok<Int> = 0
         rn<Int> = 0
+        # Bracket generation with the CUDA profiler API so `nsys profile --capture-range=cudaProfilerApi`
+        # captures ONLY the token loop: a whole-process profile is dominated by the one-time load (the
+        # weight expansion alone is 756 launches), which hides what a token actually costs.
+        freedom { cuProfilerStart() }
         for (rn in 0..NRUNS - 1) {
             t0<Int> = time_mono_millis()
             nmT = 0; dqT = 0; lyT = 0; hdT = 0
@@ -845,6 +851,7 @@ main()<Int> -> {
                     + " total_ms=" + drun.to_string() + " tokens=" + GEN.to_string())
         }
         tps<Float> = (tot_tok as Float) / ((tot_ms as Float) / 1000.0)
+        freedom { cuProfilerStop() }
         println("RESIDENT_RUNS=" + NRUNS.to_string() + " total_ms=" + tot_ms.to_string() + " total_tokens=" + tot_tok.to_string())
         println("RESIDENT_AVG_TOKENS_PER_SEC=" + tps.to_string())
 
