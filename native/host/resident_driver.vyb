@@ -254,9 +254,10 @@ gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, gan<loc<CVoid>>, TL<Int>, TK<Int>, grn<
         # TK = 1 (VYB_GTK=1): split-K only as deep as parallelism needs (>= 1536 warps), not the decode-tuned
         # KSP (32/64): at M = 512 the 32-deep partials were 637 MB written + read per ffn GEMM. Changes the
         # f32 summation grouping (not bit-identical to gemm16_p) -> gated on tokens.
-        if (TK == 1) {
+        TKW<Int> = TK
+        if (TK > 0) {
             itm<Int> = (M + 7) / 8 * (N / 256)
-            kt<Int> = (1536 + itm - 1) / itm
+            kt<Int> = (TKW + itm - 1) / itm
             if (kt < KSP) { KSP = kt }
             if (KSP < 1) { KSP = 1 }
         }
@@ -799,6 +800,10 @@ main()<Int> -> {
     GTK<Int> = 1
     gtk_s<String> = env_get("VYB_GTK") else ""
     if (gtk_s == "0") { GTK = 0 }
+    # GTKW: warp target of the adaptive split-K (VYB_GTKW, default 1536); passed to gemm2t as TK
+    GTKW<Int> = 3072   # GB10 512-token sweep: 768 536, 1536 514, 3072 474, 6144 463 ms (+75 ms reduce)
+    gtw_s<String> = env_get("VYB_GTKW") else ""
+    if (gtw_s.len() > 0) { GTKW = parse_u(gtw_s, 0, gtw_s.len()) }
     gt_s<String> = env_get("VYB_GTILE") else ""
     if (gt_s == "0") { GTILE = 0 }
     # MR2 = 1: the exact-M twins run 2 weight rows per warp (VYB_MR2=0: 1 row)
@@ -1202,7 +1207,7 @@ main()<Int> -> {
         # KSP x MAXS x FF x 8 (1.9 GB at 512 + 256). VYB_GTILE=0 / VYB_GTK=0 / f32 weights keep the old size.
         SKBSZ<Int> = KSP * MAXS * FF * 8
         if (TLx == 1) { if (GTK == 1) {
-            SKBSZ = 2 * KSP * 8 * FF * 8 + 4 * (1536 * 2048 + SEEDLEN * FF) + 4096 + (SEEDLEN + 8) * FF * 4 + 1048576
+            SKBSZ = 2 * KSP * 8 * FF * 8 + 4 * (GTKW * 2048 + SEEDLEN * FF) + 4096 + (SEEDLEN + 8) * FF * 4 + 1048576
             if (SKBSZ > KSP * MAXS * FF * 8) { SKBSZ = KSP * MAXS * FF * 8 }
         } }
         if (cuMemAlloc_v2(loc(SKB), SKBSZ) != 0) { return 11 }
@@ -1504,7 +1509,7 @@ main()<Int> -> {
                                           QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
-                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK, g16a, as5h, ac5h, APF, akth)
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK * GTKW, g16a, as5h, ac5h, APF, akth)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
