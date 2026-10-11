@@ -226,6 +226,7 @@ parse_pids(s<String>)<Vec<Int>> -> {
 struct GP1 { a<Int>, b<Int>, sk<Int>, m<Int>, n<Int>, k<Int>, nblk<Int>, ksp<Int> }
 struct GP2 { sk<Int>, scr<Int>, m<Int>, n<Int>, pad1<Int>, pad2<Int>, ksp<Int> }
 struct GP3 { src<Int>, dst<Int>, n<Int> }
+struct AP1 { s<Int>, d<Int>, m<Int>, k<Int> }
 // More parameter blocks as structs (Ursela): one cuMemcpyAsync per block instead of one per 8-byte field.
 // Field order == kernel offsets. Padding fields cover the unused slots of the big PD-layout blocks.
 //   rms_ss: X, SS, S, D, CH (+0..+32)      rms_apply: X, W, Y, SS, S, D, eps, NCH (+0..+56)
@@ -242,7 +243,7 @@ struct RPB { q<Int>, k<Int>, qd<Int>, kd<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int
 struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>, z8<Int>,
              s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int>, pc<Int>, ke<Int>, e32<Int> }
 
-gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, TL<Int>, TK<Int>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
+gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, gan<loc<CVoid>>, TL<Int>, TK<Int>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     # TL = 1: pass 1 is the register-tiled gemm16_t (M >= 8, N % 256 == 0, f16 B); else gemm2
     ok<Int> = 0
@@ -260,7 +261,14 @@ gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, TL<Int>, TK<Int>, grn<loc<CVoid>>, GPB<
             if (KSP < 1) { KSP = 1 }
         }
         NBLK<Int> = ((M + 7) / 8 * (N / 256) + 7) / 8
-        b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
+        # packed A lives in the split-K scratch past the KSP partial slices (SKB holds 32 x MAXS x FF x 8 bytes)
+        APK<Int> = SKB + ((KSP * M * N * 4 + 255) / 256) * 256
+        apb<Int> = APK + ((M + 7) / 8 * K * 32 + 255) / 256 * 256
+        ab<AP1> = AP1 { s = A, d = APK, m = M, k = K }
+        if (cuMemcpyAsync(apb, loc(ab), 32, 0) != 0) { return 1 }
+        rca<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gan)), ((M + 7) / 8 * K * 8 + 255) / 256, 1, 1, 256, 1, 1, apb, 0, 0, 0)
+        if (rca != 0) { println("APACK_ERR rc=" + rca.to_string()); return 73 }
+        b1<GP1> = GP1 { a = APK, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
         if (cuMemcpyAsync(GPB, loc(b1), 64, 0) != 0) { return 1 }
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gtn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
         if (rc1 != 0) { println("GEMM2T_ERR rc=" + rc1.to_string()); return 73 }
@@ -432,7 +440,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
-          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>)<Int> -> {
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>, g3a<loc<CVoid>>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -470,13 +478,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tq, QPB, Pq, XN32, DQ, S, NQ, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
             }
             gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tk, QPB, Pk, XN32, DK, S, NKV, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
             }
         }
         if (fz3 < 2) {
@@ -484,7 +492,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tv, QPB, Pv, XN32, vdst, S, NKV, D, VYE, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
             }
         }
 
@@ -575,7 +583,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (QG == 1) {
             if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, To, QPB, Po, DC32, DO, S, D, NQ, 8, MRr) != 0) { return 79 }
         } else {
-            if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+            if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
         }
@@ -591,13 +599,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tg, QPB, Pg, X132, Gr, S, FF, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
             }
             gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tu, QPB, Pu, X132, Up, S, FF, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
             }
         }
         if (FZ == 1) {
@@ -614,7 +622,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (QG == 1) {
             if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Td, QPB, Pd, HU32, M, S, D, FF, 8, MRr) != 0) { return 79 }
         } else {
-            if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+            if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         }
@@ -860,6 +868,8 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(qknf), ml, "qknrope") != 0) { return 10 }
         g16t<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(g16t), ml, "gemm16_t") != 0) { return 10 }
+        g16a<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16a), ml, "apack") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
@@ -1459,7 +1469,7 @@ main()<Int> -> {
                                           QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
-                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK)
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK, g16a)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
