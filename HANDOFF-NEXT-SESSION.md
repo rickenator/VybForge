@@ -326,8 +326,20 @@ ids; `make -f native/Makefile prefill` still reproduces both prefill gates green
 
 ### THE NEXT WIN: incremental decode (measured, ~3-6x, NOT yet implemented)
 
-**Measured:** per-token time scales ~linearly with sequence length -- `VYB_GEN=3` = 75.7 ms/token
-(15 tokens), `VYB_GEN=24` = 198.6 ms/token (120 tokens). S grew 2.75x, time grew 2.62x.
+**Measured** (`VYB_RUNS=5` at each length, per token):
+
+| GEN | S range | avg S | ms/token | tok/s |
+|---|---|---|---|---|
+| 3 | 5..7 | 6.0 | 75.7 | 13.2 |
+| 24 | 5..28 | 16.5 | 198.6 | 5.0 |
+| 64 | 5..68 | 36.5 | 628.6 | 1.6 |
+
+The first step is ~linear (S x2.75 -> time x2.62), but the second is SUPERLINEAR (S x2.21 -> time
+x3.16). Fitting `t = a*S + b*S^2` gives **a ~ 7.8 ms, b ~ 0.26 ms**: the LINEAR term is the
+full-sequence recompute through all 36 layers, and the QUADRATIC term is attention (S queries against S
+keys). Both are exactly what incremental decode removes -- the gemms become O(1) and attention becomes O(S)
+(1 query against S keys) -- so the case for it strengthens as the context grows, which is also when users
+notice: at S~36 the engine is already down to 1.6 tok/s.
 
 **Why:** the decode step is a FULL-SEQUENCE forward. Every generated token re-runs all 36 layers over
 all `Scur` rows: `Scur = SEEDLEN + g` (driver ~758), `run_layer(Scur, ...)` (~782), the final norm is
