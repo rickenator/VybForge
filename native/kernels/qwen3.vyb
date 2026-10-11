@@ -113,12 +113,19 @@ logits_slice(p<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < Vend - Vstart) {
         vs<Int> = Vstart + gid
-        acc<Float> = 0.0
+        # The MAC is done in f32, narrowed in register. f64 is 1/64 rate on sm_86, so an f64-MAC loop
+        # cannot be fast no matter how it is unrolled: this kernel measured 14.1 ms/token for ~39M MACs
+        # (28 GFLOP/s) while being 23.6% of a token. The VALUES are still f64 and the result is still
+        # stored f64 -- only the multiply/add is f32, exactly as the f32 weight path already is, and the
+        # gold stream (identical greedy output) is the gate that it costs nothing that matters.
+        acc<Float32> = 0.0
         d<Int> = 0
         for (d in 0..D - 1) {
             hv<Float> = ld_f64(H + (s * D + d) * 8)
             ev<Float> = ld_f64(Emb + (vs * D + d) * 8)
-            acc = acc + hv * ev
+            hv32<Float32> = hv
+            ev32<Float32> = ev
+            acc = acc + hv32 * ev32
         }
         st_f64(Log + (s * V + vs) * 8, acc)
     }
