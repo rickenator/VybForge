@@ -275,44 +275,57 @@ attn(p<Int>) -> {
         # pass 1: row max over causal t<=s
         mx<Float> = -1000000000000000000000000000000.0
         ta<Int> = 0
+        # The q.k MACs are done in f32 (values stay f64 in memory). f64 is 1/64 rate on sm_86 -- about
+        # 2 FMA/cycle/SM -- and this kernel does the score over HD THREE times (max, sum, context), so
+        # an f64 score loop made attn 22% of a token while being ~10% of its MACs. Same class of fix as
+        # logits_slice and the f32 gemm; the gold stream is the gate.
         for (ta in 0..s) {
-            sc<Float> = 0.0
+            sc<Float32> = 0.0
             ia<Int> = 0
             for (ia in 0..HD - 1) {
                 qv<Float> = ld_f64(qb + ia * 8)
                 kv<Float> = ld_f64(kb + (ta * KVH * HD + ia) * 8)
-                sc = sc + qv * kv
+                q32<Float32> = qv
+                k32<Float32> = kv
+                sc = sc + q32 * k32
             }
-            sc = sc * scale
-            if (sc > mx) { mx = sc }
+            scf<Float> = sc as Float
+            scf = scf * scale
+            if (scf > mx) { mx = scf }
         }
         # pass 2: sum of exp
         ssum<Float> = 0.0
         tb<Int> = 0
         for (tb in 0..s) {
-            sc2<Float> = 0.0
+            sc2<Float32> = 0.0
             ib<Int> = 0
             for (ib in 0..HD - 1) {
                 qv2<Float> = ld_f64(qb + ib * 8)
                 kv2<Float> = ld_f64(kb + (tb * KVH * HD + ib) * 8)
-                sc2 = sc2 + qv2 * kv2
+                q232<Float32> = qv2
+                k232<Float32> = kv2
+                sc2 = sc2 + q232 * k232
             }
-            sc2 = sc2 * scale
-            ssum = ssum + vexp(sc2 - mx)
+            sc2f<Float> = sc2 as Float
+            sc2f = sc2f * scale
+            ssum = ssum + vexp(sc2f - mx)
         }
         # pass 3: THIS thread's own context element (was: every element, per thread)
         acc<Float> = 0.0
         tc<Int> = 0
         for (tc in 0..s) {
-            sc3<Float> = 0.0
+            sc3<Float32> = 0.0
             jj<Int> = 0
             for (jj in 0..HD - 1) {
                 qv3<Float> = ld_f64(qb + jj * 8)
                 kv3<Float> = ld_f64(kb + (tc * KVH * HD + jj) * 8)
-                sc3 = sc3 + qv3 * kv3
+                q332<Float32> = qv3
+                k332<Float32> = kv3
+                sc3 = sc3 + q332 * k332
             }
-            sc3 = sc3 * scale
-            e<Float> = vexp(sc3 - mx)
+            sc3f<Float> = sc3 as Float
+            sc3f = sc3f * scale
+            e<Float> = vexp(sc3f - mx)
             w<Float> = e / ssum
             vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
             acc = acc + w * vv
