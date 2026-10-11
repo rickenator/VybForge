@@ -89,6 +89,7 @@ decoder() {
         echo "first-token gate: FAIL (got '$ID', want 843)"; exit 1
     fi
     "$PY" check_ids.py out/vyb_dec.txt ../../fixtures/whisper/gold_stt/d_ids.txt || exit 1
+    "$PY" check_text.py out/vyb_dec.txt ../../fixtures/whisper/gold_stt/ref_text.txt || exit 1
 }
 
 weights() {

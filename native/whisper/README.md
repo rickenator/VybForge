@@ -14,7 +14,7 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
 | Decoder: four layers, final norm, tied head, argmax | **done** | `./build.sh decoder` — logits 5.2e-05 over 51864 values; **first token 843** |
 | Greedy decode loop (24 tokens) | **done** | `./build.sh decoder` — all 24 ids token-for-token |
-| id-to-text (byte-level BPE detokenizer) | not started | — |
+| id-to-text (byte-level BPE detokenizer) | **done** | `./build.sh decoder` — text matches the reference character for character |
 
 ### Stage evidence (RTX 3090)
 
@@ -178,10 +178,20 @@ IDS_GATE: OK  (843 523 616 5891 3399 1265 ...)   all 24 ids, token for token
 Which is the reference text: "And so my fellow Americans, ask not what your country
 can do for you, ask what your country can do for you." (24 tokens, no EOT.)
 
-**Next step**: the id-to-text path — this is byte-level BPE, so ids map to token
-strings whose characters are the GPT-2 byte alphabet (byte 0x20 is `Ġ`), which then
-have to be mapped back to bytes and UTF-8 decoded. Until that exists the pipeline
-transcribes to ids, which is enough to gate but not enough to read.
+And then the text. The detokenizer is the stdlib's (`stdlib/vllm`) rather than a
+second implementation of the same byte alphabet — Whisper and Qwen are both
+GPT-2-style byte-level BPE, and that module's encode path is already verified
+against transformers. The tokenizer directory is derived from the checkpoint path,
+so there is no second hardcoded model location to keep in step.
+
+```
+TEXT_GATE: OK  (107 chars)
+ And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
+```
+
+**P2 (STT) is complete**: a WAV file goes in, text comes out, and there is no
+Python anywhere on that path. Next is L3 — handing that text to VybForge — and
+then L4, the synthesised voice.
 
 ## A gold tensor whose NAME implied more than it measured
 

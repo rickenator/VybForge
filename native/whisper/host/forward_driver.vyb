@@ -26,6 +26,7 @@ import wav::{load_wav}
 import safetensors::{st_open, st_find, StIndex}
 import io::{open_read, read_at, close}
 import env::{env_get}
+import vllm::{Model, model_load, model_decode}
 
 extern "C" {
     cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
@@ -829,6 +830,24 @@ main()<Int> -> {
     println_int(cnt)
     g<Int> = 0
     for (g in 0..cnt - 1) { println_int(dtoh_i(DIDS + (CL + g) * 8)) }
+
+    # ---- ids -> text ---------------------------------------------------------
+    # Byte-level BPE detokenization. This is the stdlib's verified detokenizer
+    # (stdlib/vllm, its encode path checked against transformers) rather than a
+    # second implementation of the same byte alphabet: Whisper and Qwen share it,
+    # both being GPT-2-style byte-level BPE.
+    #
+    # The tokenizer directory is DERIVED from the checkpoint path — no second
+    # hardcoded model location to keep in step.
+    parts<Vec<String>> = ckpt.split("/")
+    tdir<String> = ""
+    i2<Int> = 0
+    for (i2 in 0..parts.len() - 2) { tdir = tdir + parts.get(i2) + "/" }
+    ids<Vec<Int>> = Vec()
+    for (g in 0..cnt - 1) { ids.push(dtoh_i(DIDS + (CL + g) * 8)) }
+    mdl<Model> = model_load("whisper-tiny.en", tdir)
+    println("TEXT")
+    println(model_decode(mdl, ids))
 
     println("DEC_STAGES done")
     return 0
