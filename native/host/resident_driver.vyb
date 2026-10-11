@@ -414,6 +414,9 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
+        a1p<loc<CVoid>> = from<loc<CVoid>>(0); a1r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(a1p), mw, "argmax1_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(a1r), mw, "argmax1_r") != 0) { return 10 }
 
         ii0<Int> = find_nm(nmv, "blk.0.attn_q.weight"); wq_nl<Int> = nlv.get(ii0)
         ii0 = find_nm(nmv, "blk.0.attn_k.weight"); wk_nl<Int> = nlv.get(ii0)
@@ -470,6 +473,7 @@ main()<Int> -> {
         DCtx<Int> = 0; DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
+        A5<Int> = 0; A6<Int> = 0; PVA<Int> = 0; PIA<Int> = 0; CHA<Int> = 256
         NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
         RSPB<Int> = 0; RSB<Int> = 0; SNB<Int> = 0; CHN<Int> = 256
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
@@ -522,6 +526,12 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(A4), 32) != 0) { return 11 }
+        # Two-pass head argmax (VybForge#23): per-chunk partials, then a one-thread reduce.
+        # NCH = ceil(VOCAB/CHA) = 594 for VOCAB 151936; 1024 slots leave headroom.
+        if (cuMemAlloc_v2(loc(A5), 40) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(A6), 32) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PVA), 1024 * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PIA), 1024 * 8) != 0) { return 11 }
         fb<String> = read_bin("native/out/layer0_invfreq.bin")
         if (fb.len() < 64 * 8) { println("INVFREQ_MISSING"); return 35 }
         download(fb, DF, 64 * 8)
@@ -701,9 +711,19 @@ main()<Int> -> {
                             if (rc_sl != 0) { return 92 }
                             vs2 = ve2
                         }
-                        cuMemcpyHtoD_v2(A4 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A4 + 8, loc(AO), 8)
-                        cuMemcpyHtoD_v2(A4 + 16, loc(1), 8); cuMemcpyHtoD_v2(A4 + 24, loc(VOCAB), 8)
-                        cuda_launch4i(from<loc<CVoid>>(addr(arfn)), 1, 1, 1, 256, 1, 1, A4, 0, 0, 0)
+                        # Two-pass argmax (VybForge#23): `argmax_row` scans VOCAB with ONE thread
+                        # (14.4 ms per launch, measured); this splits the row into VOCAB/CHA chunks,
+                        # one thread each, then reduces ~594 partials in a single thread.
+                        nchA<Int> = (VOCAB + CHA - 1) / CHA
+                        cuMemcpyHtoD_v2(A5 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A5 + 8, loc(PVA), 8)
+                        cuMemcpyHtoD_v2(A5 + 16, loc(PIA), 8); cuMemcpyHtoD_v2(A5 + 24, loc(VOCAB), 8)
+                        cuMemcpyHtoD_v2(A5 + 32, loc(CHA), 8)
+                        rc_am<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(a1p)), (nchA + 255) / 256, 1, 1, 256, 1, 1, A5, 0, 0, 0)
+                        if (rc_am != 0) { println("ARGMAX1_P_ERR rc=" + rc_am.to_string()); return 93 }
+                        cuMemcpyHtoD_v2(A6 + 0, loc(PVA), 8); cuMemcpyHtoD_v2(A6 + 8, loc(PIA), 8)
+                        cuMemcpyHtoD_v2(A6 + 16, loc(AO), 8); cuMemcpyHtoD_v2(A6 + 24, loc(nchA), 8)
+                        rc_am = cuda_launch4i(from<loc<CVoid>>(addr(a1r)), 1, 1, 1, 256, 1, 1, A6, 0, 0, 0)
+                        if (rc_am != 0) { println("ARGMAX1_R_ERR rc=" + rc_am.to_string()); return 94 }
                         cuCtxSynchronize()
                         nxt = 0
                         cuMemcpyDtoH_v2(loc(nxt), AO, 8)

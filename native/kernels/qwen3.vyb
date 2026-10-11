@@ -188,3 +188,53 @@ argmax_row(p<Int>) -> {
         st_i64(Out + gid * 8, best)
     }
 }
+
+// Two-pass argmax over ONE logits row (VybForge#23). `argmax_row` launches S threads — for the decode
+// head S=1 — so that single thread scans V=151936 f64 values in a dependent chain: measured 14.4 ms for
+// one launch, ~1.4% of the f64 peak. Same shape as the old attn: not enough threads.
+//   argmax1_p  one thread per CHUNK of CH elements -> PV[g], PI[g] (value, absolute index)
+//   argmax1_r  ONE thread over the partials (V/CH ~ 594, not 151936) picks the winner
+// Ties: both passes compare strictly-greater over ascending indices, which reproduces the serial scan's
+// result exactly (earliest index attaining the max).
+// Params: argmax1_p +0 C, +8 PV, +16 PI, +24 V, +32 CH.  argmax1_r +0 PV, +8 PI, +16 Out, +24 NCH.
+argmax1_p(p<Int>) -> {
+    C<Int> = ld_i64(p + 0)
+    PV<Int> = ld_i64(p + 8)
+    PI<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    CH<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    nch<Int> = (V + CH - 1) / CH
+    if (gid < nch) {
+        i0<Int> = gid * CH
+        i1<Int> = i0 + CH
+        if (i1 > V) { i1 = V }
+        best<Int> = i0
+        bv<Float> = ld_f64(C + i0 * 8)
+        i<Int> = i0 + 1
+        for (i in i0 + 1..i1 - 1) {
+            v2<Float> = ld_f64(C + i * 8)
+            if (v2 > bv) { bv = v2; best = i }
+        }
+        st_f64(PV + gid * 8, bv)
+        st_i64(PI + gid * 8, best)
+    }
+}
+
+argmax1_r(p<Int>) -> {
+    PV<Int> = ld_i64(p + 0)
+    PI<Int> = ld_i64(p + 8)
+    Out<Int> = ld_i64(p + 16)
+    NCH<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < 1) {
+        best<Int> = ld_i64(PI + 0)
+        bv<Float> = ld_f64(PV + 0)
+        k<Int> = 1
+        for (k in 1..NCH - 1) {
+            v2<Float> = ld_f64(PV + k * 8)
+            if (v2 > bv) { bv = v2; best = ld_i64(PI + k * 8) }
+        }
+        st_i64(Out + 0, best)
+    }
+}
