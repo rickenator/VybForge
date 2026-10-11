@@ -324,7 +324,7 @@ ids; `make -f native/Makefile prefill` still reproduces both prefill gates green
 | `241c6ea` | **M-block 4 rows/thread in gemm32_p** | 11.34 -> 12.71 |
 | `5d1be56` | logits MACs in f32 | neutral (correct) |
 
-### THE NEXT WIN: incremental decode (measured, ~3-6x, NOT yet implemented)
+### incremental decode is worth ~1.45x, NOT 3-6x -- CORRECTED BY MEASUREMENT (see the note at the end of this section)
 
 **Measured** (`VYB_RUNS=5` at each length, per token):
 
@@ -360,6 +360,23 @@ each step. Gemm work per token is O(S) when it should be O(1).
 **Expected:** per-token gemm work becomes O(1) and the floor becomes one pass over the f32 weights
 (14.5 GB at ~936 GB/s = ~15.5 ms/token), instead of ~76 ms at S=6 growing with context. ~3-6x at
 current lengths and, more importantly, FLAT instead of degrading as the context grows.
+
+> **THIS 3-6x CLAIM WAS WRONG.** Measured by passing S=1 to `run_layer` in the decode step (output
+> invalid by construction -- no cache -- but the WORK is the right shape): full-sequence layer 60.3
+> ms/token vs one-row 36.7 ms/token, and the token only goes 75.7 -> 52.3 ms. That is **~1.45x**.
+>
+> The decomposition is the useful part: the layer phase is **~32 ms FIXED per token plus only ~4.7 ms
+> per row**. Incremental decode deletes the per-row term (worth ~23 ms at S=6, growing with context) and
+> leaves the 32 ms standing.
+>
+> **THE REAL TARGET IS THAT FIXED COST**, and the obvious candidate is re-streaming the f32 weights:
+> 14.5 GB read once per row-block per token, so at S=6 (RB=4 -> 2 row-blocks) ~29 GB = ~31 ms at
+> 936 GB/s -- which matches the ~32 ms almost exactly. So the next cheap test is not the decode rework
+> but SHRINKING THE WEIGHTS: keep them packed (q4k/q6k, ~2.3 GB) with the dequant fused INTO the gemm
+> (the llama.cpp approach), or as a cheaper intermediate store them f16/bf16 (7.25 GB) with a widening
+> load in the gemm. Halving the weight bytes should roughly halve that fixed cost. NB the earlier
+> `ebb29ed` win came from deleting a per-token dequant PASS, which is not the same as keeping weights
+> small -- it left them f32 and therefore fat.
 
 ### Traps this line cost real time (do not repeat)
 
