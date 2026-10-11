@@ -137,6 +137,21 @@ log_mel(pcm<Vec<Float>>, filters<Vec<Float>>)<Vec<Float>> -> {
         }
     }
 
+    # Re-lay the spectrogram band-major (band m at m*N_FRAMES + t), which is the
+    # layout the model consumes: conv1 treats it as (channels, time). The frame
+    # loop above builds it frame-major because that is how it fills, so this pass
+    # is where the two layouts meet — getting it wrong puts time where channels
+    # belong, which still produces plausible-looking numbers.
+    band<Vec<Float>> = Vec<Float>()
+    m2<Int> = 0
+    for (m2 in 0..N_MELS - 1) {
+        t2<Int> = 0
+        for (t2 in 0..N_FRAMES - 1) {
+            band.push(spec.get(t2 * N_MELS + m2))
+        }
+    }
+    spec = band
+
     # global floor + scale, over the whole spectrogram (reference semantics)
     best<Float> = 0.0 - 100.0
     i<Int> = 0

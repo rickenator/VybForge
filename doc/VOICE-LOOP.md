@@ -18,12 +18,17 @@ Against the reference: filterbank exact to 1e-12, the full 80x3000 log-mel withi
 1.3e-5 (float32-vs-float64 rounding) of `transformers.WhisperFeatureExtractor` on
 the same PCM.
 
-**P2 (STT) is staged, not started.** The reference forward is captured: the
-encoder's conv/positional stages, per-layer outputs and final norm, plus the
-decoder's prompt (`[50257, 50362]`), embedding, first-step logits and greedy ids for
-`jfk.wav`, are dumped under `fixtures/whisper/gold_stt/` by
-`fixtures/whisper/oracle_stt.py`. What that gate says the implementation must do is
-in the P2 section below.
+**P2 (STT) is in progress — the encoder's front half runs Vyb-native on the GPU
+and is gated.** `native/whisper` now does mel -> conv1 -> conv2 -> transpose ->
++positional on the GPU, each stage compared against the real model's own
+intermediate (max deviations 4.7e-6, 1.3e-5, 1.0e-6, 1.3e-5; nothing over 1e-4).
+Convolutions are im2col + the verified f64 GEMM rather than a new convolution
+kernel, the checkpoint's f32 weights are reordered and widened on the GPU in one
+pass, and device math comes from `native/kernels/vmath.vyb` because kernel mode has
+no libm (no `exp`, no `erf`). What remains is the four transformer blocks (needs
+`layernorm`, non-causal self-attention, cross-attention), the decoder, and greedy
+decode. The reference tensors for all of it are already captured under
+`fixtures/whisper/gold_stt/` by `fixtures/whisper/oracle_stt.py`.
 
 Nothing else exists: no command layer, no TTS.
 
@@ -157,7 +162,7 @@ Neural TTS is the highest-risk box (see risks). Order:
 |---|---|---|
 | P0 | `native/audio`: shim + binding + module; 16 kHz capture and playback | **DONE** — 4 s WAV from the host mic with levels matching two independent measurements; 440 Hz tone confirmed at the sink monitor (440.43 Hz, 99.9 % in band, amplitude exact). Earbud-specific replay still pending the earbuds being paired |
 | P1 | Vyb-native FFT + Hann + mel + log (`native/mel/`) | **DONE** — rfft vs numpy max|diff| 1.5e-6 (rel 4e-8); filterbank exact to 1e-12; full 80x3000 log-mel vs WhisperFeatureExtractor max|diff| 1.3e-5, 0 values over 2e-5 |
-| P2 | Vyb-native Whisper tiny.en on the GPU kernels: conv1d, gelu, layernorm, non-causal + cross attention, greedy decode | staged tensor match through `fixtures/whisper/gold_stt/`, then token-for-token on the first 24 ids of the jfk fixture |
+| P2 | Vyb-native Whisper tiny.en on the GPU kernels: conv1d, gelu, layernorm, non-causal + cross attention, greedy decode | **in progress** — encoder front half (conv1, conv2, +positional) gated at 1.3e-5 vs the real model; the transformer blocks, decoder and greedy decode remain; final acceptance is token-for-token on the first 24 ids of the jfk fixture |
 | P3 | VybForge command layer: action grammar + dispatch + fixture battery | N/N utterance -> action exact match, reported as a count |
 | P4a | Loop-closing Vyb synth | synth -> L2 STT round-trip string match |
 | P4b | Neural VITS/Piper-class TTS (transposed conv, ISTFT, G2P) | MCD vs reference audio + round-trip ASR match |

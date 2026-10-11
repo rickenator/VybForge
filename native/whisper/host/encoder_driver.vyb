@@ -1,0 +1,259 @@
+// encoder_driver.vyb — the Whisper encoder's front half on the GPU, stage by stage.
+//
+// Runs, in order, with a gate at each stage against fixtures/whisper/gold_stt:
+//   mel (Vyb, native/mel)  -> conv1 + GELU -> conv2 + GELU -> transpose -> +positional
+// which is everything before the transformer blocks (e_in).
+//
+//   ./build.sh stages            # all stages
+//   WHISPER_STAGES=conv2 ./build.sh stages
+//
+// The conv stack is expressed as im2col + the verified f64 GEMM rather than as a
+// convolution kernel: conv1 is (80->384, k3, s1) and conv2 is (384->384, k3, s2),
+// and both are x[C_out,T] = W[C_out, k*C_in] @ X_unf[k*C_in, T]. The weights come
+// from the safetensors checkpoint as f32 and are reordered+widened to the GEMM's
+// f64 layout by reorder_w(mode=1).
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, dev_free,
+                htod, htod_i, htod_vec, dtoh, sync, launch1}
+import mel::{log_mel, mel_filters}
+import wav::{load_wav}
+import safetensors::{st_open, st_find, StIndex}
+import io::{open_read, read_at, close}
+import env::{env_get}
+
+extern "C" {
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
+}
+
+MKF<Int> = 3              // conv kernel width (both convs)
+CIN1<Int> = 80            // conv1 input channels = mel bands
+D<Int> = 384              // model width (conv output channels)
+T<Int> = 3000             // mel frames
+T2<Int> = 1500            // conv2 output frames (stride 2)
+POS<Int> = 1500           // encoder positions
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+// Does the comma-separated `WHISPER_STAGES` list request `name`? An empty list
+// means all stages (the gate runs everything by default).
+want(name<String>)<Bool> -> {
+    list<String> = env("WHISPER_STAGES", "")
+    if (list == "") { return true }
+    parts<Vec<String>> = list.split(",")
+    i<Int> = 0
+    for (i in 0..parts.len() - 1) {
+        if (parts.get(i) == name) { return true }
+    }
+    return false
+}
+
+bulk(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+    }
+    sync()
+    return 0
+}
+
+// Bring a named f32 tensor from the checkpoint into a device buffer as raw bytes.
+load_f32_raw(path<String>, ix<StIndex>, name<String>, dst<Int>)<Int> -> {
+    idx<Int> = st_find(ix, name)
+    if (idx < 0) {
+        println("MISSING tensor " + name)
+        return 0
+    }
+    nbytes<Int> = ix.dlen.get(idx)
+    absoff<Int> = ix.data_base + ix.doff.get(idx)
+    data<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, absoff, nbytes)) {
+                s -> { data = s }
+                ? -> { }
+            }
+            close(f)
+        }
+        ? -> { }
+    }
+    if (data.len() < nbytes) {
+        println("SHORT read " + name)
+        return 0
+    }
+    if (bulk(data, dst, nbytes) != 0) {
+        println("DMA failed " + name)
+        return 0
+    }
+    return nbytes
+}
+
+pi(pp<Int>, off<Int>, v<Int>)<Int> -> {
+    return htod_i(pp + off, v)
+}
+
+// Widen an f32 tensor to f64 (mode 0) with `n` elements.
+widen(ckpt<String>, ix<StIndex>, name<String>, n<Int>, dOut<Int>, RAW<Int>,
+      ford<Int>, PK<Int>)<Int> -> {
+    if (load_f32_raw(ckpt, ix, name, RAW) == 0) { return 1 }
+    if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dOut) != 0 || pi(PK, 16, n) != 0 || pi(PK, 40, 0) != 0) { return 2 }
+    if (launch1(ford, (n + 255) / 256, 256, PK) != 0) { return 3 }
+    sync()
+    return 0
+}
+
+// One conv stage: out = gelu(W (*) in + bias), via im2col + gemm.
+//   in  : (C_in, T_in)   channel-major
+//   out : (D, T_out)     channel-major
+conv_stage(ckpt<String>, ix<StIndex>, wname<String>, bname<String>,
+           dIn<Int>, Cin<Int>, Tin<Int>, Tout<Int>, stride<Int>,
+           dW<Int>, dB<Int>, RAW<Int>, dX<Int>, dC<Int>, dOut<Int>,
+           fgemm<Int>, fcol<Int>, ford<Int>, fgel<Int>, PG<Int>, PK<Int>)<Int> -> {
+    KK<Int> = MKF * Cin
+
+    # weight: (D, C_in, K) f32 -> (D, K*C_in) f64 (tap outermost inside the row)
+    if (load_f32_raw(ckpt, ix, wname, RAW) == 0) { return 1 }
+    if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dW) != 0 || pi(PK, 16, D * KK) != 0 ||
+        pi(PK, 24, Cin) != 0 || pi(PK, 32, MKF) != 0 || pi(PK, 40, 1) != 0) { return 2 }
+    if (launch1(ford, (D * KK + 255) / 256, 256, PK) != 0) { return 3 }
+    sync()
+
+    # bias: f32 -> f64 (RAW is free again now the reorder is done)
+    if (load_f32_raw(ckpt, ix, bname, RAW) == 0) { return 4 }
+    if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dB) != 0 || pi(PK, 16, D) != 0 || pi(PK, 40, 0) != 0) { return 5 }
+    if (launch1(ford, (D + 255) / 256, 256, PK) != 0) { return 6 }
+    sync()
+
+    # im2col
+    if (pi(PK, 0, dIn) != 0 || pi(PK, 8, dX) != 0 || pi(PK, 16, Cin) != 0 || pi(PK, 24, Tin) != 0 ||
+        pi(PK, 32, Tout) != 0 || pi(PK, 40, MKF) != 0 || pi(PK, 48, 1) != 0 || pi(PK, 56, stride) != 0) {
+        return 7
+    }
+    if (launch1(fcol, (KK * Tout + 255) / 256, 256, PK) != 0) { return 8 }
+
+    # gemm: C(D,T_out) = W(D,KK) @ X(KK,T_out)
+    if (pi(PG, 0, dW) != 0 || pi(PG, 8, dX) != 0 || pi(PG, 16, dC) != 0 ||
+        pi(PG, 24, D) != 0 || pi(PG, 32, Tout) != 0 || pi(PG, 40, KK) != 0) { return 9 }
+    if (htod(PG + 48, 1.0) != 0 || htod(PG + 56, 0.0) != 0) { return 10 }
+    if (launch1(fgemm, (D * Tout + 255) / 256, 256, PG) != 0) { return 11 }
+
+    # gelu + bias
+    if (pi(PK, 0, dC) != 0 || pi(PK, 8, dB) != 0 || pi(PK, 16, dOut) != 0 ||
+        pi(PK, 24, D * Tout) != 0 || pi(PK, 32, Tout) != 0) { return 12 }
+    if (launch1(fgel, (D * Tout + 255) / 256, 256, PK) != 0) { return 13 }
+    sync()
+    return 0
+}
+
+dump_scaled(base<Int>, n<Int>, scale<Float>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        println_int((dtoh(base + i * 8) * scale) as Int)
+    }
+    return n
+}
+
+section(name<String>, base<Int>, n<Int>)<Int> -> {
+    println("SECTION " + name + " n=")
+    println_int(n)
+    dump_scaled(base, n, 1000000.0)
+    return 0
+}
+
+main()<Int> -> {
+    println("ENC_STAGES begin")
+    if (tensor_init() != 0) { println("tensor_init failed"); return 1 }
+
+    # ---- input: the mel front-end, in Vyb -----------------------------------
+    pcm<Vec<Float>> = Vec<Float>()
+    match (load_wav(env("WHISPER_WAV", "fixtures/audio/jfk.wav"))) {
+        v -> { pcm = v }
+        ? -> { println("cannot load fixture wav"); return 2 }
+    }
+    mel<Vec<Float>> = log_mel(pcm, mel_filters())
+    if (mel.len() != CIN1 * T) { println("unexpected mel size"); return 3 }
+
+    # ---- device buffers ------------------------------------------------------
+    DM<Int> = dev_alloc(CIN1 * T * 8)                 # mel (80, 3000)
+    DA<Int> = dev_alloc(D * T * 8)                    # conv1 out (384, 3000)
+    DBuf<Int> = dev_alloc(D * T2 * 8)                 # conv2 out (384, 1500)
+    DT<Int> = dev_alloc(T2 * D * 8)                   # transposed (1500, 384)
+    DE<Int> = dev_alloc(POS * D * 8)                  # + positional (1500, 384)
+    DPOS<Int> = dev_alloc(POS * D * 8)
+    DW<Int> = dev_alloc(D * 1152 * 8)                 # biggest weight (conv2)
+    DBI<Int> = dev_alloc(D * 8)
+    DX<Int> = dev_alloc(1152 * T * 8)                 # biggest im2col (conv1: 240*3000)
+    DC<Int> = dev_alloc(D * T * 8)
+    # f32 staging for weight uploads. Sized for the LARGEST tensor loaded this
+    # way (the positional table is 1500*384*4 = 2.3 MB, bigger than conv2's
+    # weight at 1.77 MB) — an undersized staging buffer makes the bulk DMA fail,
+    # which surfaces as "stage failed" rather than as an obvious size error.
+    RAW<Int> = dev_alloc(4 * 1024 * 1024)
+    if (DM == 0 || DA == 0 || DBuf == 0 || DT == 0 || DE == 0 || DPOS == 0 ||
+        DW == 0 || DBI == 0 || DX == 0 || DC == 0 || RAW == 0) {
+        println("device alloc failed")
+        return 4
+    }
+    if (htod_vec(DM, mel) != 0) { println("mel upload failed"); return 5 }
+
+    # ---- kernels -------------------------------------------------------------
+    hgemm<Int> = module_load_path(env("WHISPER_GEMM_PTX", "native/build/gemm.ptx"))
+    henc<Int> = module_load_path(env("WHISPER_ENC_PTX", "native/whisper/build/whisper_enc.ptx"))
+    if (hgemm == 0 || henc == 0) { println("cannot load PTX modules"); return 6 }
+    fgemm<Int> = module_func(hgemm, "gemm")
+    fcol<Int> = module_func(henc, "im2col_conv")
+    ford<Int> = module_func(henc, "reorder_w")
+    fgel<Int> = module_func(henc, "gelu_bias")
+    ftr<Int> = module_func(henc, "transpose2d")
+    faddb<Int> = module_func(henc, "add_bias_row")
+    fadd2<Int> = module_func(henc, "add2")
+    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0) {
+        println("missing kernel symbol")
+        return 7
+    }
+    PG<Int> = dev_alloc(64)
+    PK<Int> = dev_alloc(64)
+
+    ckpt<String> = env("VYBFORGE_ST_FILE", "/usr/export/LLM/hf/hub/models--openai--whisper-tiny.en/snapshots/87c7102498dcde7456f24cfd30239ca606ed9063/model.safetensors")
+    ix<StIndex> = st_open(ckpt)
+    if (ix.n <= 0) { println("cannot read checkpoint index"); return 8 }
+
+    # ---- conv1: (80,3000) -> (384,3000), stride 1 ----------------------------
+    e<Int> = conv_stage(ckpt, ix, "model.encoder.conv1.weight", "model.encoder.conv1.bias",
+                        DM, CIN1, T, T, 1, DW, DBI, RAW, DX, DC, DA,
+                        fgemm, fcol, ford, fgel, PG, PK)
+    if (e != 0) { println("conv1 stage failed"); println_int(e); return 20 }
+    if (want("conv1")) { section("conv1", DA, D * T) }
+
+    # ---- conv2: (384,3000) -> (384,1500), stride 2 ---------------------------
+    e = conv_stage(ckpt, ix, "model.encoder.conv2.weight", "model.encoder.conv2.bias",
+                   DA, D, T, T2, 2, DW, DBI, RAW, DX, DC, DBuf,
+                   fgemm, fcol, ford, fgel, PG, PK)
+    if (e != 0) { println("conv2 stage failed"); println_int(e); return 21 }
+    if (want("conv2")) { section("conv2", DBuf, D * T2) }
+
+    # ---- transpose (384,1500) -> (1500,384) ----------------------------------
+    if (pi(PK, 0, DBuf) != 0 || pi(PK, 8, DT) != 0 || pi(PK, 16, D) != 0 || pi(PK, 24, T2) != 0) {
+        println("params pack failed (transpose)"); return 22
+    }
+    if (launch1(ftr, (D * T2 + 255) / 256, 256, PK) != 0) { println("launch transpose failed"); return 23 }
+
+
+    # ---- + positional embedding ---------------------------------------------
+    e = widen(ckpt, ix, "model.encoder.embed_positions.weight", POS * D, DPOS, RAW, ford, PK)
+    if (e != 0) { println("positional widen failed"); println_int(e); return 24 }
+    if (want("e_pos")) { sync(); section("e_pos", DPOS, POS * D) }
+    # Elementwise, NOT add_bias_row: the positional table is a full (T, D) matrix,
+    # not a per-column bias. add_bias_row broadcasts B[d] across every row, which
+    # silently produces the right answer for row 0 and the wrong one everywhere
+    # else.
+    if (pi(PK, 0, DT) != 0 || pi(PK, 8, DPOS) != 0 || pi(PK, 16, DE) != 0 ||
+        pi(PK, 24, POS * D) != 0) {
+        println("params pack failed (pos add)"); return 25
+    }
+    if (launch1(fadd2, (POS * D + 255) / 256, 256, PK) != 0) { println("launch pos add failed"); return 26 }
+    sync()
+    if (want("e_in")) { section("e_in", DE, POS * D) }
+
+    println("ENC_STAGES done")
+    return 0
+}

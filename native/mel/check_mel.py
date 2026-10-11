@@ -75,9 +75,10 @@ def main():
     else:
         raw = np.asarray(sections["mel"]["vals"], dtype=np.float64) / SCALES["mel"]
         raw = raw[:80 * 3000]     # drop the trailing integer(s) main()'s return adds
-        # Vyb emits frame-major (80 bands per frame); the reference artifact is
-        # band-major (80 x 3000), so re-order before comparing.
-        got = raw.reshape(-1, 80).T.reshape(-1)
+        # Both sides are band-major (band m at m*3000 + t) now that log_mel emits
+        # the layout the model consumes — no transpose here on purpose: a
+        # transposed comparison would hide exactly the bug this gate exists for.
+        got = raw
         ref = np.load(f"{HERE}/gold/mel.npy").astype(np.float64).reshape(-1)
         if len(got) != len(ref):
             print(f"mel: LENGTH MISMATCH got {len(got)} want {len(ref)}")
@@ -99,7 +100,7 @@ def main():
                     print(f"   frame {t} band {m}: vyb={got[i]:.7f} ref={ref[i]:.7f} diff={got[i]-ref[i]:.3e}")
             # shape check: per-band mean, because a uniform offset would be caught
             # by the max-diff but a small systematic one is easier to read here
-            gr = raw.reshape(-1, 80).mean(0)
+            gr = raw.reshape(80, -1).mean(1)
             rr = np.load(f"{HERE}/gold/mel.npy").astype(np.float64).mean(1)
             print(f"mel: per-band mean max|diff|={np.abs(gr-rr).max():.3e} "
                   f"(freq resolution = {np.abs(rr).mean():.4f})")
