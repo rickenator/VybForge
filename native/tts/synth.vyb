@@ -120,6 +120,154 @@ render_vowel(v<Vowel>, sr<Int>, peak<Float>)<Vec<Float>> -> {
     return out
 }
 
+# ---------------------------------------------------------------------------
+# Consonants, and a phone SEQUENCE.
+#
+# A phone is a formant target plus a source: voiced phones drive the resonators
+# with the glottal impulse train, unvoiced ones with noise. That is the whole
+# difference between /m/ and /s/ here -- same filters, different excitation -- so
+# the gate can check the two properties separately (voicing on one side, spectral
+# shape on the other) instead of checking "does it sound like an ess".
+#
+# Stops are a two-part phone: a closure (near silence) and a burst (short noise
+# through the resonators). Modelling the burst as noise through the following
+# targets is a simplification -- real bursts are transient and coarticulated -- and
+# it is labelled as one rather than dressed up.
+
+share(all)
+struct Phone {
+    name<String>,
+    kind<Int>,      # 0 vowel, 1 fricative, 2 nasal, 3 stop, 4 liquid, 5 aspiration
+    f1<Float>, f2<Float>, f3<Float>,
+    bw1<Float>, bw2<Float>, bw3<Float>,
+    voiced<Int>,    # 1 = glottal pulses, 0 = noise
+    f0<Float>,
+    noise_hz<Float>,  # for the noise source: a single-pole high-pass corner
+    ms<Int>
+}
+
+# Gated on what it declares, so the same struct serves both the fixture phones and
+# the vowel table (vowels are kind 0 with voiced=1).
+share(all)
+phone_table()<Vec<Phone>> -> {
+    t<Vec<Phone>> = Vec()
+    # vowels (Peterson and Barney adult male), 400 ms for the spectral gate
+    t.push(Phone("i", 0, 270.0, 2290.0, 3010.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    t.push(Phone("a", 0, 730.0, 1090.0, 2440.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    t.push(Phone("u", 0, 300.0, 870.0, 2240.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    # nasals: low F1, a nasal formant near 250 Hz, voiced
+    t.push(Phone("m", 2, 300.0, 1100.0, 2300.0, 120.0, 120.0, 150.0, 1, 110.0, 0.0, 200))
+    t.push(Phone("n", 2, 300.0, 1700.0, 2600.0, 120.0, 130.0, 150.0, 1, 110.0, 0.0, 200))
+    # liquid
+    t.push(Phone("l", 4, 400.0, 1200.0, 2600.0, 100.0, 100.0, 140.0, 1, 110.0, 0.0, 160))
+    # fricatives: unvoiced noise, shaped high for /s/ and low for /sh/
+    t.push(Phone("s", 1, 3200.0, 5500.0, 7000.0, 400.0, 800.0, 1200.0, 0, 0.0, 3000.0, 250))
+    t.push(Phone("sh", 1, 2000.0, 2500.0, 3500.0, 300.0, 500.0, 800.0, 0, 0.0, 1200.0, 250))
+    # stops: closure then burst
+    # a stop BURST is a high-frequency transient, not a vowel: /t/ is the highest
+    # (2.5-5 kHz), /k/ lower (velar bursts sit near 1.5-2 kHz). Giving them a low F1
+    # was what dragged the burst centroid under 1 kHz.
+    t.push(Phone("t", 3, 1000.0, 3500.0, 5000.0, 300.0, 500.0, 700.0, 0, 0.0, 2500.0, 90))
+    t.push(Phone("k", 3, 900.0, 2200.0, 3200.0, 300.0, 400.0, 600.0, 0, 0.0, 2000.0, 90))
+    # aspiration
+    t.push(Phone("h", 5, 500.0, 1500.0, 2500.0, 200.0, 250.0, 300.0, 0, 0.0, 400.0, 80))
+    return t
+}
+
+# Deterministic noise, as a pure function of (index, seed) rather than an LCG with
+# carried state: a by-value Vec parameter is a copy, so the mutation could not reach
+# the caller anyway ("cannot call 'push' on parameter 'state'"), and a hash gives
+# the same reproducibility -- a phone renders the same samples every run, so a
+# failure is reproducible -- with no state to thread through.
+share(all)
+noise_at(i<Int>, seed<Int>)<Float> -> {
+    # Mixing, not just a linear map: `(i * A + seed) mod p` read out at bits 16..30
+    # is a SAWTOOTH (consecutive samples differ by a constant), and the first
+    # version of this scored 0.94 autocorrelation at pitch lags -- the "unvoiced"
+    # fricatives were periodic, so the gate was right to fail them. xorshift plus a
+    # multiply gives an actually uncorrelated sequence and stays well inside i64.
+    h<Int> = (i * 2654435761 + seed * 40503 + 1013904223) % 2147483648
+    if (h < 0) { h = 0 - h }
+    h = h ^ (h >> 13)
+    h = (h * 1274126177 + 1013904223) % 2147483648
+    h = h ^ (h >> 15)
+    return ((h % 65536) as Float / 32768.0) - 1.0
+}
+
+# Render one phone: source -> F1 -> F2 -> F3, faded, peak-normalised to `peak`.
+share(all)
+render_phone(p<Phone>, sr<Int>, peak<Float>, seed<Int>)<Vec<Float>> -> {
+    n<Int> = p.ms * sr / 1000
+    c1<Vec<Float>> = reson(p.f1, p.bw1, sr)
+    c2<Vec<Float>> = reson(p.f2, p.bw2, sr)
+    c3<Vec<Float>> = reson(p.f3, p.bw3, sr)
+    period<Float> = 900000.0
+    if (p.f0 > 0.0) { period = (sr as Float) / p.f0 }
+    s1a<Float> = 0.0
+    s1b<Float> = 0.0
+    s2a<Float> = 0.0
+    s2b<Float> = 0.0
+    s3a<Float> = 0.0
+    s3b<Float> = 0.0
+    since<Float> = period
+    prev<Float> = 0.0
+    prev2<Float> = 0.0
+    raw<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        src<Float> = 0.0
+        if (p.voiced == 1) {
+            if (since >= period) {
+                src = 1.0
+                since = since - period
+            }
+            since = since + 1.0
+        } else {
+            nz<Float> = noise_at(i, seed)
+            # one-pole high-pass at the phone's corner: differentiates below it
+            a<Float> = 1.0 - (2.0 * 3.141592653589793 * p.noise_hz / (sr as Float))
+            if (a < 0.0) { a = 0.0 }
+            # the high-pass twice: one pole is 6 dB/octave and lets a slow wander
+            # through, which is audible rumble in aspiration and reads as partial
+            # periodicity (autocorrelation 0.318 for /h/). Two poles is 12 dB/octave
+            # and is what "noise with no low-frequency energy" actually needs.
+            hp1<Float> = nz - a * prev
+            prev = nz
+            src = hp1 - a * prev2
+            prev2 = hp1
+        }
+        v1<Float> = c1.get(0) * src + c1.get(1) * s1a + c1.get(2) * s1b
+        s1b = s1a
+        s1a = v1
+        v2<Float> = c2.get(0) * v1 + c2.get(1) * s2a + c2.get(2) * s2b
+        s2b = s2a
+        s2a = v2
+        v3<Float> = c3.get(0) * v2 + c3.get(1) * s3a + c3.get(2) * s3b
+        s3b = s3a
+        s3a = v3
+        raw.push(v3)
+    }
+    mx<Float> = 0.0000001
+    for (i in 0..n - 1) {
+        av<Float> = raw.get(i)
+        if (av < 0.0) { av = 0.0 - av }
+        if (av > mx) { mx = av }
+    }
+    gain<Float> = peak / mx
+    fade<Int> = FADE_MS * sr / 1000
+    if (fade > n / 4) { fade = n / 4 }
+    out<Vec<Float>> = Vec()
+    for (i in 0..n - 1) {
+        g<Float> = gain
+        if (fade > 0) {
+            if (i < fade) { g = gain * (i as Float) / (fade as Float) }
+            if (i >= n - fade) { g = gain * ((n - i) as Float) / (fade as Float) }
+        }
+        out.push(raw.get(i) * g)
+    }
+    return out
+}
+
 # ---- WAV packing (16-bit PCM mono) --------------------------------------
 # Same canonical 44-byte header the capture probe writes, so a file from either
 # side of the loop reads with the same tools.

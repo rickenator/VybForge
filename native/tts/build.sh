@@ -16,3 +16,11 @@ TTS_OUT="$here/out" "$VYB" host/synth_probe.vyb \
     > out/synth.txt 2>&1 || true
 tail -1 out/synth.txt
 "$PY" check_vowels.py out/synth.txt
+
+echo "== L4 phone inventory (consonants: source shape, not just filters)"
+TTS_OUT="$here/out" "$VYB" host/phone_probe.vyb \
+    --module-path "$here" \
+    --module-path "$VYB_STDLIB" \
+    > out/phones.txt 2>&1 || true
+tail -1 out/phones.txt
+"$PY" check_phones.py out/phones.txt
