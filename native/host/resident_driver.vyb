@@ -278,7 +278,8 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
           rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>,
           P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>,
-          ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>)<Int> -> {
+          ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
+          amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         zro<Int> = 0
@@ -330,6 +331,12 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             TT<Int> = P0 + S
             cuMemcpyAsync(ATT + 232, loc(SCB), 8, 0); cuMemcpyAsync(ATT + 240, loc(TT), 8, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(ascf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            # softmax once per (row, head[, position]), then the weighted V sum (bit-identical to attn_cx)
+            cuMemcpyAsync(ATT + 248, loc(EWB), 8, 0); cuMemcpyAsync(ATT + 256, loc(MSB), 8, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(amxf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aexf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(asmf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(anrf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
             cuda_launch4i(from<loc<CVoid>>(addr(acxf)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         } else {
             cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
@@ -479,7 +486,13 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(akfn), ml, "attn_kv") != 0) { return 10 }
         ascf<loc<CVoid>> = from<loc<CVoid>>(0); acxf<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(ascf), ml, "attn_sc") != 0) { return 10 }
-        if (cuModuleGetFunction(loc(acxf), ml, "attn_cx") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acxf), ml, "attn_cxw") != 0) { return 10 }
+        amxf<loc<CVoid>> = from<loc<CVoid>>(0); aexf<loc<CVoid>> = from<loc<CVoid>>(0)
+        asmf<loc<CVoid>> = from<loc<CVoid>>(0); anrf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(amxf), ml, "attn_mx") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(aexf), ml, "attn_ex") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(asmf), ml, "attn_sum") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(anrf), ml, "attn_nrm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -660,6 +673,9 @@ main()<Int> -> {
         # attention score scratch [S <= MAXS, H, T <= MAXS] f64 (shared by all layers; ~MAXS^2 * H * 8 bytes)
         SCB<Int> = 0
         if (cuMemAlloc_v2(loc(SCB), MAXS * H * MAXS * 8) != 0) { return 11 }
+        EWB<Int> = 0; MSB<Int> = 0
+        if (cuMemAlloc_v2(loc(EWB), MAXS * H * MAXS * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(MSB), MAXS * H * 16) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
@@ -671,7 +687,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SNB), MAXS * 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(ATT), 248) != 0) { return 11 }   # +224 P0, +232 SC, +240 T for the KV attention
+        if (cuMemAlloc_v2(loc(ATT), 264) != 0) { return 11 }   # +224 P0, +232 SC, +240 T, +248 EW, +256 MS for the KV attention
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
@@ -881,7 +897,8 @@ main()<Int> -> {
                                           XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, gwp, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
-                                          P0, KCl, VCl, akfn, QV, ascf, acxf, SCB)
+                                          P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
+                                          amxf, aexf, asmf, anrf, EWB, MSB)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt

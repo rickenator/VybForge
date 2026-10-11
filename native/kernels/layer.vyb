@@ -702,3 +702,126 @@ cast16(p<Int>) -> {
         st_f16(DST + gid * 2, v)
     }
 }
+
+// Softmax split out of attn_cx (Ursela). attn_cx made each of the HD threads of a (row, head) evaluate
+// 2 x (P0+s+1) f64 vexp and a f64 divide per position -- HD-fold redundant transcendental work at the
+// 1/64 f64 rate of sm_86 (nsys, 3090, GEN=64: attn_cx 31% of GPU time, ~10 ms/token). The softmax is
+// now its own short pipeline, each step once per (row, head[, position]), with the SAME expressions in
+// the SAME order, so the weights -- and the context -- are bit-identical to attn_cx:
+//   attn_mx   (s,h):   mx = max_t SC                      -> MS[2*sh]
+//   attn_ex   (s,h,t): E = vexp(SC - mx)                  -> EW
+//   attn_sum  (s,h):   ssum = sum_t E (t ascending)       -> MS[2*sh+1]
+//   attn_nrm  (s,h,t): W = E / ssum                       -> EW (in place)
+//   attn_cxw  (s,h,ii): acc = sum_t W * V (t ascending)   -> Ctx
+// Params: the ATT block (+96 V cache, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH, +224 P0, +232 SC,
+// +240 T) plus +248 EW ([S, H, T] f64) and +256 MS ([S, H, 2] f64).
+attn_mx(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H) {
+        s<Int> = gid / H
+        sa<Int> = P0 + s
+        sb<Int> = SC + gid * T * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = ld_f64(sb + ta * 8)
+            if (sc > mx) { mx = sc }
+        }
+        st_f64(MS + gid * 16, mx)
+    }
+}
+attn_ex(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        sh<Int> = gid / T
+        s<Int> = sh / H
+        if (t <= P0 + s) {
+            mx<Float> = ld_f64(MS + sh * 16)
+            sc<Float> = ld_f64(SC + gid * 8)
+            st_f64(EW + gid * 8, vexp(sc - mx))
+        }
+    }
+}
+attn_sum(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H) {
+        s<Int> = gid / H
+        sa<Int> = P0 + s
+        eb<Int> = EW + gid * T * 8
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            ssum = ssum + ld_f64(eb + tb * 8)
+        }
+        st_f64(MS + gid * 16 + 8, ssum)
+    }
+}
+attn_nrm(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        sh<Int> = gid / T
+        s<Int> = sh / H
+        if (t <= P0 + s) {
+            ssum<Float> = ld_f64(MS + sh * 16 + 8)
+            e<Float> = ld_f64(EW + gid * 8)
+            st_f64(EW + gid * 8, e / ssum)
+        }
+    }
+}
+attn_cxw(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        wb<Int> = EW + gsh * T * 8
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            w<Float> = ld_f64(wb + tc * 8)
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
