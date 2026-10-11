@@ -110,6 +110,13 @@ rope(p<Int>) -> {
 // Grouped-query, causal, scaled-softmax attention: Q,K,V -> Ctx [S,H*HD].
 // kv head for q head h = h / (H/KVH).
 // PD offsets: +80 Q, +88 K, +96 V, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH.
+// Causal multi-head attention. One THREAD per (s, h, ii): each thread owns ONE context dimension and
+// walks the causal window, recomputing the score per position (the flash-decode form).
+// VybForge#23: the previous mapping was one thread per (s, h) — 64 threads for an 82-SM card — and
+// its third pass put the context dimension OUTSIDE the position loop, so the HD-wide score AND its
+// vexp were recomputed for every (ii, tc) pair: HD x redundant work, measured by nsys at 8.2 ms per
+// layer (295 ms/token; the largest kernel in the profile). The math and the per-element summation
+// order are unchanged, so the results are bit-identical.
 attn(p<Int>) -> {
     Q<Int> = ld_i64(p + 80)
     K<Int> = ld_i64(p + 88)
@@ -121,13 +128,16 @@ attn(p<Int>) -> {
     KVH<Int> = ld_i64(p + 216)
     scale<Float> = 1.0 / vsqrt(HD as Float, 16)
     hkv<Int> = H / KVH
-    total<Int> = S * H
+    total<Int> = S * H * HD
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < total) {
-        s<Int> = gid / H
-        h<Int> = gid % H
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
         kvh<Int> = h / hkv
         qb<Int> = Q + (s * H * HD + h * HD) * 8
+        kb<Int> = K + kvh * HD * 8
         # pass 1: row max over causal t<=s
         mx<Float> = -1000000000000000000000000000000.0
         ta<Int> = 0
@@ -136,13 +146,13 @@ attn(p<Int>) -> {
             ia<Int> = 0
             for (ia in 0..HD - 1) {
                 qv<Float> = ld_f64(qb + ia * 8)
-                kv<Float> = ld_f64(K + (ta * KVH * HD + kvh * HD + ia) * 8)
+                kv<Float> = ld_f64(kb + (ta * KVH * HD + ia) * 8)
                 sc = sc + qv * kv
             }
             sc = sc * scale
             if (sc > mx) { mx = sc }
         }
-        # pass 2: sum of exp over causal t<=s
+        # pass 2: sum of exp
         ssum<Float> = 0.0
         tb<Int> = 0
         for (tb in 0..s) {
@@ -150,33 +160,30 @@ attn(p<Int>) -> {
             ib<Int> = 0
             for (ib in 0..HD - 1) {
                 qv2<Float> = ld_f64(qb + ib * 8)
-                kv2<Float> = ld_f64(K + (tb * KVH * HD + kvh * HD + ib) * 8)
+                kv2<Float> = ld_f64(kb + (tb * KVH * HD + ib) * 8)
                 sc2 = sc2 + qv2 * kv2
             }
             sc2 = sc2 * scale
             ssum = ssum + vexp(sc2 - mx)
         }
-        # pass 3: weighted sum of V over causal t<=s (one thread per dim)
-        ii<Int> = 0
-        for (ii in 0..HD - 1) {
-            acc<Float> = 0.0
-            tc<Int> = 0
-            for (tc in 0..s) {
-                sc3<Float> = 0.0
-                jj<Int> = 0
-                for (jj in 0..HD - 1) {
-                    qv3<Float> = ld_f64(qb + jj * 8)
-                    kv3<Float> = ld_f64(K + (tc * KVH * HD + kvh * HD + jj) * 8)
-                    sc3 = sc3 + qv3 * kv3
-                }
-                sc3 = sc3 * scale
-                e<Float> = vexp(sc3 - mx)
-                w<Float> = e / ssum
-                vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
-                acc = acc + w * vv
+        # pass 3: THIS thread's own context element (was: every element, per thread)
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..s) {
+            sc3<Float> = 0.0
+            jj<Int> = 0
+            for (jj in 0..HD - 1) {
+                qv3<Float> = ld_f64(qb + jj * 8)
+                kv3<Float> = ld_f64(kb + (tc * KVH * HD + jj) * 8)
+                sc3 = sc3 + qv3 * kv3
             }
-            st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+            sc3 = sc3 * scale
+            e<Float> = vexp(sc3 - mx)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
         }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
     }
 }
 

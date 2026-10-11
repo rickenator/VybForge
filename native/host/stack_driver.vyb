@@ -243,7 +243,7 @@ main()<Int> -> {
             blk = (rtot + 255) / 256
             rc = cuda_launch4i(from<loc<CVoid>>(addr(hro)), blk, 1, 1, 256, 1, 1, PD, 0, 0, 0)
             if (rc != 0) { return 12 }
-            blk = (S * H + 255) / 256
+            blk = (S * H * HD + 255) / 256
             rc = cuda_launch4i(from<loc<CVoid>>(addr(hfa)), blk, 1, 1, 256, 1, 1, PD, 0, 0, 0)
             if (rc != 0) { return 12 }
             # o_proj + residual X1 = curIn + O

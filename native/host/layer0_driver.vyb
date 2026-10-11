@@ -408,7 +408,7 @@ main()<Int> -> {
         cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
         cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
         cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
 
         gA = DCtx; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
         cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)

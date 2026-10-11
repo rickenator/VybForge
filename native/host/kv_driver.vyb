@@ -204,7 +204,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
         cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
         cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         println("RLR attnok")
 
         gA = DCtx; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
@@ -306,7 +306,7 @@ run_kv(Sctx<Int>, P<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, N
         # attn: new q (DQr row P) over cached K/KV (KC/VC rows 0..P) -> ctx row P (S=Sctx)
         cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(KC), 8); cuMemcpyHtoD_v2(ATT + 96, loc(VC), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
         cuMemcpyHtoD_v2(ATT + 184, loc(Sctx), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8); cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (Sctx * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (Sctx * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         # o: ctx row P @ Wo -> DO row P (M=1,N=D,K=NQ)
         gA = DCtx + P * NQ * 8; gB = Wo; gC = DO + P * D * 8; gM = 1; gN = D; gK = NQ
         cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
