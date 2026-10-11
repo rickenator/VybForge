@@ -269,7 +269,8 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
           DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
           gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
-          rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>)<Int> -> {
+          rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>,
+          P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         zro<Int> = 0
@@ -281,12 +282,15 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
         if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
-        gA = XN; gB = DWv32; gC = DV; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, DV, S, NKV, D, AF, BF) != 0) { return 73 }
+        # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
+        vdst<Int> = DV
+        if (KC != 0) { vdst = VC + P0 * NKV * 8 }
+        gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
 
         rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-        println("RLR qkvok")
+        if (QV == 0) { println("RLR qkvok") }
         cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
         rA = DK; rB = Nk; rC = DKN; gM = S * KVH; gN = HD
@@ -295,20 +299,29 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
 
         cuMemcpyHtoD_v2(ROP + 80, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN), 8)
-        cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr), 8)
+        # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
+        kdst<Int> = DKr
+        if (KC != 0) { kdst = KC + P0 * NKV * 8 }
+        cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(kdst), 8)
         cuMemcpyHtoD_v2(ROP + 176, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 184, loc(S), 8)
         cuMemcpyHtoD_v2(ROP + 200, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 208, loc(H), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVH), 8)
-        cuMemcpyHtoD_v2(ROP + 224, loc(zro), 8)   # POS offset = 0 (full-sequence rope; qwen3rope +224)
+        cuMemcpyHtoD_v2(ROP + 224, loc(P0), 8)   # POS offset (qwen3rope +224): 0 for the full sequence, P0 with the KV cache
         rope_total<Int> = S * H * HD + S * KVH * HD
         cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
-        println("RLR ropeok")
+        if (QV == 0) { println("RLR ropeok") }
 
         cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(DKr), 8)
         cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
         cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
         cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
-        println("RLR attnok")
+        if (KC != 0) {
+            cuMemcpyHtoD_v2(ATT + 88, loc(KC), 8); cuMemcpyHtoD_v2(ATT + 96, loc(VC), 8)
+            cuMemcpyHtoD_v2(ATT + 224, loc(P0), 8)
+            cuda_launch4i(from<loc<CVoid>>(addr(akfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        } else {
+            cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        }
+        if (QV == 0) { println("RLR attnok") }
 
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
@@ -329,7 +342,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
         if (gemm2(g3p, g3r, GPB, SKB, KSP, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
-        println("RLR endok")
+        if (QV == 0) { println("RLR endok") }
         return 0
     }
     return 0
@@ -365,6 +378,12 @@ main()<Int> -> {
     qs<String> = env_get("VYB_QUIET") else ""
     if (qs.len() > 0) { QV = 1 }
     MAXS<Int> = SEEDLEN + GEN
+    # KV cache (default ON): prefill the prompt once, then run ONE row per generated token against the
+    # per-layer K/V cache. VYB_NOKV=1 restores the recompute-the-whole-prefix loop for A/B checks; the two
+    # paths are bit-identical (same per-row arithmetic in the same order), so the token streams must match.
+    KVON<Int> = 1
+    nkv_s<String> = env_get("VYB_NOKV") else ""
+    if (nkv_s.len() > 0) { KVON = 0 }
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -438,6 +457,8 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(gfn), ml, "gemm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(rfn), ml, "rmsnorm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(afn), ml, "attn") != 0) { return 10 }
+        akfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(akfn), ml, "attn_kv") != 0) { return 10 }
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -595,6 +616,10 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(M), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DL), MAXS * VOCAB * 8) != 0) { return 11 }   # [MAXS, V] rows for per-step logits
         if (cuMemAlloc_v2(loc(AO), 8) != 0) { return 11 }
+        # Per-layer K (post-norm, post-rope) and V caches: NLAYER x [MAXS, NKV] f64 each.
+        KCA<Int> = 0; VCA<Int> = 0
+        if (cuMemAlloc_v2(loc(KCA), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(VCA), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
@@ -606,7 +631,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SNB), MAXS * 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(ATT), 224) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(ATT), 232) != 0) { return 11 }   # +224 P0 for attn_kv
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
@@ -757,6 +782,13 @@ main()<Int> -> {
                     for (g in 0..GEN - 1) {
                         Scur = SEEDLEN + g
                         cur<Int> = EMB
+                        # Rows this step pushes through the layers: the whole prefix without the cache;
+                        # with it, the prompt on step 0 and then only the newest token at position P0.
+                        Srows<Int> = Scur
+                        P0<Int> = 0
+                        if (KVON == 1) {
+                            if (g > 0) { Srows = 1; P0 = Scur - 1; cur = EMB + P0 * D * 8 }
+                        }
                         if (QV == 0) { println("DECG step " + g.to_string() + " Scur=" + Scur.to_string()) }
                         L<Int> = 0
                         for (L in 0..NLAYER - 1) {
@@ -779,14 +811,17 @@ main()<Int> -> {
                             phC<Int> = time_mono_millis()
                             tgt<Int> = HA
                             if ((L % 2) == 1) { tgt = HB }
-                            e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
+                            KCl<Int> = 0; VCl<Int> = 0
+                            if (KVON == 1) { KCl = KCA + L * MAXS * NKV * 8; VCl = VCA + L * MAXS * NKV * 8 }
+                            e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, WqA + L * wq_nl * 4, WkA + L * wk_nl * 4, WvA + L * wv_nl * 4,
                                           Nq, Nk, DF, WoA + L * wo_nl * 4, N2,
                                           WgA + L * wg_nl * 4, WuA + L * wu_nl * 4, WdA + L * wd_nl * 4,
                                           XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
-                                          gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN)
+                                          gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
+                                          P0, KCl, VCl, akfn, QV)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
@@ -796,10 +831,10 @@ main()<Int> -> {
                         phD<Int> = time_mono_millis()
                         rA = cur; rB = ON; rC = DH
                         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-                        cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-                        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Scur * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+                        cuMemcpyHtoD_v2(RN + 24, loc(Srows), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+                        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Srows * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
                         LCH<Int> = 16384
-                        s7<Int> = Scur - 1
+                        s7<Int> = Srows - 1
                         vs2<Int> = 0
                         ve2<Int> = 0
                         rc_sl<CInt> = 0

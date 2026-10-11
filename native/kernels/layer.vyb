@@ -452,3 +452,78 @@ widen32(p<Int>) -> {
         st_f64(DST + gid * 8, w)
     }
 }
+
+// KV-cached causal attention (Ursela, VybForge#23 follow-up). Same math, loops and per-element summation
+// order as `attn`, but the S query rows sit at ABSOLUTE positions P0..P0+S-1 and K/V are the per-layer
+// CACHE ([MAXS, KVH*HD], rows 0..P0+S-1 already written). Query row s attends to cache rows 0..P0+s, so
+// with P0 = 0 and S = full length this is exactly `attn`; with S = 1 it is the decode step. Bit-identical
+// to the uncached path because every product and sum happens in the same order.
+// PD offsets: as attn (+80 Q, +88 K, +96 V, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH) plus +224 P0.
+attn_kv(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    total<Int> = S * H * HD
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        kb<Int> = K + kvh * HD * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = 0.0
+            ia<Int> = 0
+            for (ia in 0..HD - 1) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(kb + (ta * KVH * HD + ia) * 8)
+                sc = sc + qv * kv
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            sc2<Float> = 0.0
+            ib<Int> = 0
+            for (ib in 0..HD - 1) {
+                qv2<Float> = ld_f64(qb + ib * 8)
+                kv2<Float> = ld_f64(kb + (tb * KVH * HD + ib) * 8)
+                sc2 = sc2 + qv2 * kv2
+            }
+            sc2 = sc2 * scale
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            sc3<Float> = 0.0
+            jj<Int> = 0
+            for (jj in 0..HD - 1) {
+                qv3<Float> = ld_f64(qb + jj * 8)
+                kv3<Float> = ld_f64(kb + (tc * KVH * HD + jj) * 8)
+                sc3 = sc3 + qv3 * kv3
+            }
+            sc3 = sc3 * scale
+            e<Float> = vexp(sc3 - mx)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
