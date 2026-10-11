@@ -1193,7 +1193,16 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
         # Split-K gemm scratch (VybForge#23): KSP slices of the largest gemm (M <= MAXS, N <= FF).
         if (cuMemAlloc_v2(loc(GPB), 128) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(SKB), KSP * MAXS * FF * 8) != 0) { return 11 }
+        # With the tiled f16 prefill GEMM + adaptive split-K the scratch only needs: decode / M < 8 slices
+        # (2 KSP x 8 rows x FF, 8-byte slots as before), the prefill partials (adaptive depth x M x N <= 1536 x 2048
+        # + M x N floats) and the packed A copy (ceil(M/8) x 8 x K floats): ~94 MB at a 512-token prompt instead of
+        # KSP x MAXS x FF x 8 (1.9 GB at 512 + 256). VYB_GTILE=0 / VYB_GTK=0 / f32 weights keep the old size.
+        SKBSZ<Int> = KSP * MAXS * FF * 8
+        if (TLx == 1) { if (GTK == 1) {
+            SKBSZ = 2 * KSP * 8 * FF * 8 + 4 * (1536 * 2048 + SEEDLEN * FF) + 4096 + (SEEDLEN + 8) * FF * 4 + 1048576
+            if (SKBSZ > KSP * MAXS * FF * 8) { SKBSZ = KSP * MAXS * FF * 8 }
+        } }
+        if (cuMemAlloc_v2(loc(SKB), SKBSZ) != 0) { return 11 }
         # Two-pass norm: params buffers + the per-chunk sum-of-squares scratch (NCH <= 64 covers D=2560).
         if (cuMemAlloc_v2(loc(RSPB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
