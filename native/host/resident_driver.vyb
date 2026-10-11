@@ -203,7 +203,7 @@ struct RBB { x<Int>, w<Int>, y<Int>, m<Int>, n<Int>, ep<Float>, y32<Int> }   // 
 struct RPB { q<Int>, k<Int>, qd<Int>, kd<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>,
              fr<Int>, s<Int>, z8<Int>, hd<Int>, h<Int>, kvh<Int>, pos<Int> }
 struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>, z8<Int>,
-             s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int>, pc<Int> }
+             s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int>, pc<Int>, ke<Int> }
 
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
@@ -323,7 +323,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
-          AT2<Int>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
+          AT2<Int>, KV32<Int>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
           Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
     freedom {
@@ -352,7 +352,11 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         }
         # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
         vdst<Int> = DV
-        if (KC != 0) { vdst = VC + P0 * NKV * 8 }
+        # VYB_KV32 (KV32 == 1): the cache rows are f32; V/K land in the f64 scratch first and are
+        # narrowed into row P0 of the cache (cast32) -- the attention widens them back per element.
+        KEL<Int> = 8
+        if (KV32 == 1) { if (KC != 0) { if (AT2 == 1) { KEL = 4 } } }
+        if (KC != 0) { if (KEL == 8) { vdst = VC + P0 * NKV * 8 } }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
         if (QG == 1) {
             if (gemvq(q4f, q6f, q4m, q6m, Tv, QPB, Pv, XN32, vdst, S, NKV, D) != 0) { return 79 }
@@ -367,7 +371,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 
         # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
         kdst<Int> = DKr
-        if (KC != 0) { kdst = KC + P0 * NKV * 8 }
+        if (KC != 0) { if (KEL == 8) { kdst = KC + P0 * NKV * 8 } }
         rtb<Int> = 0
         if (HD == 128) { rtb = DF + 512 }
         rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = rtb, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0,
@@ -376,13 +380,17 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         rope_total<Int> = S * H * HD + S * KVH * HD
         cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
         if (QV == 0) { println("RLR ropeok") }
+        if (KEL == 4) {
+            if (cast1(c32n, CPB, DKr, KC + P0 * NKV * 4, S * NKV) != 0) { return 77 }
+            if (cast1(c32n, CPB, DV, VC + P0 * NKV * 4, S * NKV) != 0) { return 77 }
+        }
 
         TT<Int> = P0 + S
         akp<Int> = DKr; avp<Int> = DV
         if (KC != 0) { akp = KC; avp = VC }
         atb<ATB> = ATB { q = DQr, k = akp, v = avp, ctx = DCtx, z0 = 0, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0, z8 = 0,
-                         s = S, z9 = 0, hd = HD, h = H, kvh = KVH, p0 = P0, sc = SCB, t = TT, ew = EWB, ms = MSB, pc = PCB }
-        cuMemcpyAsync(ATT + 80, loc(atb), 192, 0)
+                         s = S, z9 = 0, hd = HD, h = H, kvh = KVH, p0 = P0, sc = SCB, t = TT, ew = EWB, ms = MSB, pc = PCB, ke = KEL }
+        cuMemcpyAsync(ATT + 80, loc(atb), 200, 0)
         if (KC != 0) {
             # scores once per (row, head, position); softmax once per (row, head[, position]); then the
             # weighted V sum -- bit-identical to attn_kv / attn.
@@ -489,6 +497,10 @@ main()<Int> -> {
     # Fused quantized GEMV for decode steps (S == 1) straight from the resident Q4_K/Q6_K blocks
     # (Ursela, queue item 16). VYB_GEMV16=1 falls back to the expanded f16/f32 weights for every step.
     # Parallel f64 attention (item 22); VYB_ATTN1=1 keeps the serial-per-head kernels (bit-exact old order).
+    # VYB_KV32=1: f32 K/V cache (half the per-token cache bytes); needs the parallel attention.
+    KV32ON<Int> = 0
+    kv32_s<String> = env_get("VYB_KV32") else ""
+    if (kv32_s.len() > 0) { KV32ON = 1 }
     AT2ON<Int> = 1
     at1_s<String> = env_get("VYB_ATTN1") else ""
     if (at1_s.len() > 0) { AT2ON = 0 }
@@ -805,7 +817,7 @@ main()<Int> -> {
         RBP<Int> = 0; RBQ<Int> = 0
         if (cuMemAlloc_v2(loc(RBP), 192) != 0) { return 11 }   # rms_blk blocks: +0 layer norms, +64 q norm, +128 head
         if (cuMemAlloc_v2(loc(RBQ), 64) != 0) { return 11 }    # k norm
-        if (cuMemAlloc_v2(loc(ATT), 272) != 0) { return 11 }   # +224 P0, +232 SC, +240 T, +248 EW, +256 MS for the KV attention
+        if (cuMemAlloc_v2(loc(ATT), 280) != 0) { return 11 }   # +224 P0, +232 SC, +240 T, +248 EW, +256 MS for the KV attention
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
@@ -1036,7 +1048,7 @@ main()<Int> -> {
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
                                           amxf, aexf, asmf, anrf, EWB, MSB,
                                           rbf, RBP, RBQ, W16 * 2,
-                                          AT2ON, as2f, asxf, ac2f, acrf, PCB,
+                                          AT2ON, KV32ON, as2f, asxf, ac2f, acrf, PCB,
                                           QGL, q4f, q6f, q4m, q6m, QPB,
                                           PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
                                           PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),

@@ -942,6 +942,7 @@ attn_sc2(p<Int>) -> {
     P0<Int> = ld_i64(p + 224)
     SC<Int> = ld_i64(p + 232)
     T<Int> = ld_i64(p + 240)
+    KE<Int> = ld_i64(p + 272)
     scale<Float> = 0.08838834764831845
     if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
     hkv<Int> = H / KVH
@@ -958,11 +959,21 @@ attn_sc2(p<Int>) -> {
     part<Float> = 0.0
     if (ok == 1) {
         qb<Int> = Q + (s * H * HD + h * HD) * 8
-        kb<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 8
         ia<Int> = l
-        while (ia < HD) {
-            part = part + ld_f64(qb + ia * 8) * ld_f64(kb + ia * 8)
-            ia = ia + 32
+        if (KE == 4) {
+            # f32 K cache (VYB_KV32): widen each element, the dot stays f64
+            kb4<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 4
+            while (ia < HD) {
+                kv4<Float32> = ld_f32(kb4 + ia * 4)
+                part = part + ld_f64(qb + ia * 8) * (kv4 as Float)
+                ia = ia + 32
+            }
+        } else {
+            kb<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 8
+            while (ia < HD) {
+                part = part + ld_f64(qb + ia * 8) * ld_f64(kb + ia * 8)
+                ia = ia + 32
+            }
         }
     }
     st_shared_f64(tid, part)
@@ -1042,6 +1053,7 @@ attn_cx2(p<Int>) -> {
     T<Int> = ld_i64(p + 240)
     EW<Int> = ld_i64(p + 248)
     PC<Int> = ld_i64(p + 264)
+    KE<Int> = ld_i64(p + 272)
     gsh<Int> = blk_x() / 8
     c<Int> = blk_x() % 8
     s<Int> = gsh / H
@@ -1056,9 +1068,17 @@ attn_cx2(p<Int>) -> {
     wb<Int> = EW + gsh * T * 8
     acc<Float> = 0.0
     tc<Int> = t0
-    while (tc < t1) {
-        acc = acc + ld_f64(wb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
-        tc = tc + 1
+    if (KE == 4) {
+        while (tc < t1) {
+            vv4<Float32> = ld_f32(V + (tc * KVH * HD + kvh * HD + ii) * 4)
+            acc = acc + ld_f64(wb + tc * 8) * (vv4 as Float)
+            tc = tc + 1
+        }
+    } else {
+        while (tc < t1) {
+            acc = acc + ld_f64(wb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            tc = tc + 1
+        }
     }
     st_f64(PC + ((gsh * 8 + c) * HD + ii) * 8, acc)
 }
