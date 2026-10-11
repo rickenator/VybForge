@@ -604,6 +604,12 @@ main()<Int> -> {
     # Default crossover (measured, 2-token gen after an N-row prompt): 3090 m8 vs scratch ~24 rows,
     # GB10 ~48 rows; set after the device query below.
     QPF<Int> = 0 - 1
+    # VYB_HEADQ=1 (item 20, opt-in): the tied head runs the fused Q6_K GEMV over the packed token_embd
+    # (0.32 GB per token instead of the 0.78 GB f16 table; no f16 table at all). f32 x and f32
+    # accumulation instead of the f16-table head: logits differ in the last bits -> measured, not default.
+    HQ<Int> = 0
+    hq_s<String> = env_get("VYB_HEADQ") else ""
+    if (hq_s.len() > 0) { HQ = 1 }
     qpf_s<String> = env_get("VYB_QPF") else ""
     if (qpf_s.len() > 0) { QPF = parse_u(qpf_s, 0, qpf_s.len()) }
     if (QPF == 0) { QPF = 1000000000 }
@@ -1122,8 +1128,10 @@ main()<Int> -> {
         if (H16 == 1) {
             # straight to f16 (q6kdeq16 = q6kdeq32's value rounded once more: what the f32 copy + cast16 gave),
             # so the 1.55 GB f32 table never exists
-            if (cuMemAlloc_v2(loc(DEH), te_nl * 2) != 0) { return 11 }
-            e = dequant_gpu(TEP, 0, DEH, te_nl, q6h, 0); if (e != 0) { return 91 }
+            if (HQ == 0) {
+                if (cuMemAlloc_v2(loc(DEH), te_nl * 2) != 0) { return 11 }
+                e = dequant_gpu(TEP, 0, DEH, te_nl, q6h, 0); if (e != 0) { return 91 }
+            }
             lhp = l16p
             println("EMB_F16_HEAD_DONE")
         }
@@ -1267,6 +1275,10 @@ main()<Int> -> {
                         e = normb(rbf, RBP + 128, cur, ON, DH, Srows, D, EPS, 0)
                         if (e != 0) { return 78 }
                         s7<Int> = Srows - 1
+                        if (HQ == 1) {
+                            e = cast1(c32n, CPB, DH + s7 * D * 8, XN32, D); if (e != 0) { return 92 }
+                            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 14, QPB, TEP, XN32, DL + s7 * VOCAB * 8, 1, VOCAB, D, 8) != 0) { return 92 }
+                        } else {
                         # Coalesced tied head: 32 lanes per vocab row over the f32 table, then a lane reduce.
                         lpb1<GP3> = GP3 { src = DH, dst = DEH, n = LPART }
                         cuMemcpyAsync(LPB + 0, loc(lpb1), 24, 0)
@@ -1277,6 +1289,7 @@ main()<Int> -> {
                         cuMemcpyAsync(LSP + 16, loc(s7), 8, 0); cuMemcpyAsync(LSP + 24, loc(VOCAB), 8, 0)
                         rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(l32r)), (VOCAB + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
                         if (rc_sl != 0) { println("LOGITS32_R_ERR rc=" + rc_sl.to_string()); return 92 }
+                        }
                         # Two-pass argmax (VybForge#23): `argmax_row` scans VOCAB with ONE thread
                         # (14.4 ms per launch, measured); this splits the row into VOCAB/CHA chunks,
                         # one thread each, then reduces ~594 partials in a single thread.
