@@ -544,7 +544,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
                 apv<Int> = 0
                 if (S >= APFy) { if (HD == 128) { apv = 1 } }
                 if (apv == 1) {
-                    cuda_launch4i(from<loc<CVoid>>(addr(aktf)), (TT * KVH * 128 + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(aktf)), (TT * KVH * 128 + S * H * 128 + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
                     cuda_launch4i(from<loc<CVoid>>(addr(as5f)), S * KVH * ((TT + 127) / 128), 1, 1, 128, 1, 1, ATT, 0, 0, 0)
                 } else {
                     cuda_launch4i(from<loc<CVoid>>(addr(as4f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
