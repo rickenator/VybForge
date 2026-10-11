@@ -11,6 +11,7 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import llm::{llm_load, llm_decode, llm_encode}
 import vllm::{Model}
 import env::{env_get}
+import time::{time_mono_millis}
 // S0.2: dimensions come from the model's own config, and buffer sizes from the tensor core.
 // Both are PURE (no CUDA, no allocation) — a module that pulls in cuda_binding cannot be
 // imported by a file declaring its own extern "C" (Vyb#442).
@@ -1056,6 +1057,8 @@ main()<Int> -> {
         # once: 16384 x 5120 x 8 = 671 MB, which fits beside the layer weights on a 24 GB card).
         DCH<Int> = 0; DCL<Int> = 0; DBV<Int> = 0; DAO<Int> = 0
         CH<Int> = 16384
+        t_pf0<Int> = 0
+t_pf1<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0; IDS<Int> = 0; EP<Int> = 0
         # unit 10 step 5: the Ridge attention branch's buffers (allocated only when JQG == 1)
         DQG<Int> = 0; DGT<Int> = 0; DGD<Int> = 0; AP1<Int> = 0
@@ -1285,6 +1288,7 @@ main()<Int> -> {
                 if (e != 0) { println("EMBED_ERR row " + ir.to_string() + " token " + dr.to_string() + " e=" + e.to_string()); return 91 }
             }
             println("EMBED_ROWS tokens=" + S.to_string() + " (the prompt's rows only; no table materialised)")
+            t_pf0 = time_mono_millis()
             if (LTR == 1) {
                 # The untied embed is NEW code (W2) and nothing else checks it: dump the first three
                 # components of each prompt row so a python Q6_K dequant of the same table rows can
@@ -1943,6 +1947,8 @@ main()<Int> -> {
             ? -> { return 17 }
         }
         println("PREFILL_HIDDEN_DONE (layers=" + MAXL.to_string() + ")")
+        t_pf1 = time_mono_millis()
+        println("PREFILL_TIMING S=" + S.to_string() + " ms=" + (t_pf1 - t_pf0).to_string() + " us_per_token=" + (((t_pf1 - t_pf0) * 1000) / S).to_string())
 
         if (DOLM == 1) {
             i0 = find_nm(nmv, "output_norm.weight")
