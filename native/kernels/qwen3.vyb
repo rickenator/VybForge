@@ -21,6 +21,7 @@ qwen3rope(p<Int>) -> {
     H<Int> = ld_i64(p + 208)
     KVH<Int> = ld_i64(p + 216)
     POS<Int> = ld_i64(p + 224)
+    TB<Int> = ld_i64(p + 112)
     half<Int> = HD / 2
     shd<Int> = S * H * HD
     skd<Int> = S * KVH * HD
@@ -32,9 +33,17 @@ qwen3rope(p<Int>) -> {
             rem<Int> = gid % (H * HD)
             hh<Int> = rem / HD
             i<Int> = rem % HD
-            ang<Float> = ((POS + s) as Float) * ld_f64(FR + (i % half) * 8)
-            c<Float> = vcos(ang)
-            sn<Float> = vsin(ang)
+            c<Float> = 0.0
+            sn<Float> = 0.0
+            if (TB != 0) {
+                tix<Int> = TB + ((POS + s) * half + i % half) * 16
+                c = ld_f64(tix)
+                sn = ld_f64(tix + 8)
+            } else {
+                ang<Float> = ((POS + s) as Float) * ld_f64(FR + (i % half) * 8)
+                c = vcos(ang)
+                sn = vsin(ang)
+            }
             src<Int> = Q + (s * H * HD + hh * HD) * 8
             v0<Float> = ld_f64(src + i * 8)
             if (i < half) {
@@ -50,9 +59,17 @@ qwen3rope(p<Int>) -> {
             rem2<Int> = g2 % (KVH * HD)
             hh2<Int> = rem2 / HD
             i2<Int> = rem2 % HD
-            ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + (i2 % half) * 8)
-            c2<Float> = vcos(ang2)
-            sn2<Float> = vsin(ang2)
+            c2<Float> = 0.0
+            sn2<Float> = 0.0
+            if (TB != 0) {
+                tix2<Int> = TB + ((POS + s2) * half + i2 % half) * 16
+                c2 = ld_f64(tix2)
+                sn2 = ld_f64(tix2 + 8)
+            } else {
+                ang2<Float> = ((POS + s2) as Float) * ld_f64(FR + (i2 % half) * 8)
+                c2 = vcos(ang2)
+                sn2 = vsin(ang2)
+            }
             src2<Int> = K + (s2 * KVH * HD + hh2 * HD) * 8
             v0<Float> = ld_f64(src2 + i2 * 8)
             if (i2 < half) {
@@ -325,5 +342,22 @@ logits16_p(p<Int>) -> {
             d = d + 32
         }
         st_f32(PART + gid * 4, acc)
+    }
+}
+
+// Rotary cos/sin table (Ursela): TB[pos*64 + i] = {vcos(pos*FR[i]), vsin(pos*FR[i])} for pos < MAXS,
+// built once at load with exactly the angle expression qwen3rope uses, so values are bit-identical.
+// qwen3rope reads it when its +112 slot is non-zero (HD=128 only). Params: GP3 {FR, TB, n = MAXS*64}.
+rope_tab(p<Int>) -> {
+    FR<Int> = ld_i64(p + 0)
+    TB<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        pos<Int> = gid / 64
+        i<Int> = gid % 64
+        ang<Float> = (pos as Float) * ld_f64(FR + i * 8)
+        st_f64(TB + gid * 16, vcos(ang))
+        st_f64(TB + gid * 16 + 8, vsin(ang))
     }
 }

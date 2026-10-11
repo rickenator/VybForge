@@ -332,7 +332,9 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
         kdst<Int> = DKr
         if (KC != 0) { kdst = KC + P0 * NKV * 8 }
-        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = 0, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0,
+        rtb<Int> = 0
+        if (HD == 128) { rtb = DF + 512 }
+        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = rtb, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0,
                          fr = DF, s = S, z8 = 0, hd = HD, h = H, kvh = KVH, pos = P0 }
         cuMemcpyAsync(ROP + 80, loc(rpb), 152, 0)
         rope_total<Int> = S * H * HD + S * KVH * HD
@@ -698,7 +700,8 @@ main()<Int> -> {
         EWB<Int> = 0; MSB<Int> = 0
         if (cuMemAlloc_v2(loc(EWB), MAXS * H * MAXS * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(MSB), MAXS * H * 16) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
+        # inv_freq[64] then the rotary cos/sin table (MAXS x 64 x {cos,sin}) at DF + 512.
+        if (cuMemAlloc_v2(loc(DF), 64 * 8 + MAXS * 64 * 16) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
         # Split-K gemm scratch (VybForge#23): KSP slices of the largest gemm (M <= MAXS, N <= FF).
@@ -828,6 +831,9 @@ main()<Int> -> {
         println("EMB_DEQUANT_DONE")
         e = cast1(c32n, CPB, DE, DE32, te_nl); if (e != 0) { return 91 }
         println("EMB_F32_COPY_DONE")
+        rtfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(rtfn), mw, "rope_tab") != 0) { return 10 }
+        e = cast1(rtfn, CPB, DF, DF + 512, MAXS * 64); if (e != 0) { return 91 }
         # f16 head table: narrow the f32 copy, then release the f32 one (the head reads only DEH).
         DEH<Int> = DE32
         lhp<loc<CVoid>> = l32p
