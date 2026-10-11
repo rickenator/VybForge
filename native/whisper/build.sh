@@ -64,6 +64,10 @@ decoder() {
     # output and Vyb tensors cannot travel through a file), so the decoder gate
     # is the same program with a different stage list.
     echo "== decoder stages (from the repo root, same driver as the encoder)"
+    # The driver dumps whatever WHISPER_STAGES names, and an UNSET value means
+    # "everything" — which for this driver is 8.6M lines and ~11 minutes. Set it
+    # to the implemented decoder stages unless the caller has chosen their own.
+    export WHISPER_STAGES="${WHISPER_STAGES:-d_embed,d_l0_ln1,d_l0_selfattn,d_l0_res1,d_l0_crossattn,d_l0_mlp,d_step0_logits}"
     ( cd "$ROOT" && "$VYB" native/whisper/host/forward_driver.vyb \
           --module-path native/mel \
           --module-path native/torchload \
@@ -77,15 +81,14 @@ decoder() {
     # been done teaches nothing (and hides the failure that matters).
     "$PY" check_stages.py out/vyb_dec.txt \
         d_embed d_l0_ln1 d_l0_selfattn d_l0_res1 d_l0_crossattn d_l0_mlp d_step0_logits
-    # ACCEPTANCE: the first generated token. The driver prints "ARGMAX_ID" and the
-    # id on the next line; the reference text starts " And so my fellow Americans",
-    # and 843 IS " And" in this tokenizer.
+    # ACCEPTANCE: the first generated token, and then the whole answer.
     ID=$(grep -A1 "^ARGMAX_ID$" "$here/out/vyb_dec.txt" | tail -1 | tr -d ' ')
     if [ "$ID" = "843" ]; then
         echo "first-token gate: OK (843 = ' And')"
     else
         echo "first-token gate: FAIL (got '$ID', want 843)"; exit 1
     fi
+    "$PY" check_ids.py out/vyb_dec.txt ../../fixtures/whisper/gold_stt/d_ids.txt || exit 1
 }
 
 weights() {

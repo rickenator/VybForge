@@ -13,7 +13,8 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — within 1.3e-5 of the real model |
 | Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
 | Decoder: four layers, final norm, tied head, argmax | **done** | `./build.sh decoder` — logits 5.2e-05 over 51864 values; **first token 843** |
-| Greedy decode loop (24 tokens) + id-to-text | not started | acceptance: the first 24 ids token-for-token |
+| Greedy decode loop (24 tokens) | **done** | `./build.sh decoder` — all 24 ids token-for-token |
+| id-to-text (byte-level BPE detokenizer) | not started | — |
 
 ### Stage evidence (RTX 3090)
 
@@ -157,12 +158,30 @@ d_l0_ln1       768  max|diff| 1.1e-06      d_l0_mlp        768  2.6e-06
 d_l0_selfattn  768  max|diff| 1.0e-06      d_step0_logits 51864 2.5e-05
 d_l0_res1      768  max|diff| 1.0e-06
 first-token gate: OK (843 = " And")
+IDS_GATE: OK  (843 523 616 5891 3399 1265 ...)   all 24 ids
 ```
 
-**Next step**: the greedy loop — feed the sampled token back in, re-run, stop at
-50256 — and the id-to-text path. Note the decode loop must re-run the decoder per
-token (no KV cache yet): CL grows by one each step, which is correct but wasteful,
-and the first thing to optimise once the loop is honest.
+Timing on the 3090: the whole thing — mel, encoder, and 24 greedy steps — is 88 s,
+of which the encoder is ~85 s. The 24 decode steps are therefore a few seconds
+TOTAL even with no cache, because the prompt is 25 rows and the per-step work that
+matters is the cross-attention (1500 keys). The quadratic shape is real but it is
+not what is slow; the encoder is.
+
+The greedy loop closes it: `decoder_pass` runs the whole decoder over the current
+sequence, the argmax picks the last position's token, the token goes back into the
+id buffer, and the loop stops at `<|endoftext|>` or 24 steps.
+
+```
+IDS_GATE: OK  (843 523 616 5891 3399 1265 ...)   all 24 ids, token for token
+```
+
+Which is the reference text: "And so my fellow Americans, ask not what your country
+can do for you, ask what your country can do for you." (24 tokens, no EOT.)
+
+**Next step**: the id-to-text path — this is byte-level BPE, so ids map to token
+strings whose characters are the GPT-2 byte alphabet (byte 0x20 is `Ġ`), which then
+have to be mapped back to bytes and UTF-8 decoded. Until that exists the pipeline
+transcribes to ids, which is enough to gate but not enough to read.
 
 ## A gold tensor whose NAME implied more than it measured
 

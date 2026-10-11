@@ -44,6 +44,9 @@ ENC_LAYERS<Int> = 4     // tiny.en encoder depth
 VOCAB<Int> = 51864      // token table rows (also the tied output head)
 MAXPOS<Int> = 448       // decoder position table
 DEC_LAYERS<Int> = 4     // tiny.en decoder depth
+CLMAX<Int> = 32         // decoder row capacity: prompt + generated tokens
+MAXNEW<Int> = 24        // greedy steps; the reference's 24 ids are the acceptance
+EOT<Int> = 50256        // <|endoftext|>
 CL<Int> = 2             // decoder prompt length: <|startoftranscript|>, <|notimestamps|>
 PROMPT0<Int> = 50257
 PROMPT1<Int> = 50362
@@ -378,7 +381,7 @@ enc_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>,
 //   * the layer's final norm feeds an MLP whose output is the residual addend
 // The prompt is only CL rows, so nothing here is large; the cross-attention K/V
 // are POS rows, which is where the arithmetic is.
-dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
+dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dmp<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
           DLN<Int>, DQ<Int>, DK<Int>, DV<Int>, DCTX<Int>, DATT<Int>, DLN2<Int>,
           DFC1<Int>, DMLP<Int>, DKE<Int>, DVE<Int>, DLNW<Int>, DLNB<Int>,
           DW<Int>, DBI<Int>, RAW<Int>, ford<Int>, fgemm<Int>, faddb<Int>,
@@ -396,7 +399,7 @@ dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
     if (htod(PK + 48, 1e-5) != 0) { return 32 + li }
     if (launch1(fln, (Tq + 255) / 256, 256, PK) != 0) { return 36 + li }
     sync()
-    if (li == 0 && want("d_l0_ln1")) { section("d_l0_ln1", DLN, Tq * D) }
+    if (dmp == 1 && li == 0 && want("d_l0_ln1")) { section("d_l0_ln1", DLN, Tq * D) }
 
     e = linear(ckpt, ix, pfx + "self_attn.q_proj.weight", pfx + "self_attn.q_proj.bias",
                DLN, Tq, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
@@ -418,14 +421,14 @@ dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
     e = linear(ckpt, ix, pfx + "self_attn.out_proj.weight", pfx + "self_attn.out_proj.bias",
                DCTX, Tq, D, D, DW, DBI, DATT, RAW, ford, fgemm, faddb, PG, PK)
     if (e != 0) { return 64 + li }
-    if (li == 0 && want("d_l0_selfattn")) { section("d_l0_selfattn", DATT, Tq * D) }
+    if (dmp == 1 && li == 0 && want("d_l0_selfattn")) { section("d_l0_selfattn", DATT, Tq * D) }
 
     if (pi(PK, 0, dIn) != 0 || pi(PK, 8, DATT) != 0 || pi(PK, 16, DR2) != 0 || pi(PK, 24, Tq * D) != 0) {
         return 68 + li
     }
     if (launch1(fadd2, (Tq * D + 255) / 256, 256, PK) != 0) { return 72 + li }
     sync()
-    if (li == 0 && want("d_l0_res1")) { section("d_l0_res1", DR2, Tq * D) }
+    if (dmp == 1 && li == 0 && want("d_l0_res1")) { section("d_l0_res1", DR2, Tq * D) }
 
     # --- ln2 + CROSS-attention (Q from here, K/V from the encoder output) -----
     e = widen(ckpt, ix, pfx + "encoder_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
@@ -458,7 +461,7 @@ dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
     e = linear(ckpt, ix, pfx + "encoder_attn.out_proj.weight", pfx + "encoder_attn.out_proj.bias",
                DCTX, Tq, D, D, DW, DBI, DATT, RAW, ford, fgemm, faddb, PG, PK)
     if (e != 0) { return 106 + li }
-    if (li == 0 && want("d_l0_crossattn")) { section("d_l0_crossattn", DATT, Tq * D) }
+    if (dmp == 1 && li == 0 && want("d_l0_crossattn")) { section("d_l0_crossattn", DATT, Tq * D) }
 
     if (pi(PK, 0, DR2) != 0 || pi(PK, 8, DATT) != 0 || pi(PK, 16, dOut) != 0 || pi(PK, 24, Tq * D) != 0) {
         return 108 + li
@@ -485,7 +488,7 @@ dec_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>, dOut<Int>, DR2<Int>,
     e = linear(ckpt, ix, pfx + "fc2.weight", pfx + "fc2.bias",
                DFC1, Tq, FFN, D, DW, DBI, DMLP, RAW, ford, fgemm, faddb, PG, PK)
     if (e != 0) { return 128 + li }
-    if (li == 0 && want("d_l0_mlp")) { section("d_l0_mlp", DMLP, Tq * D) }
+    if (dmp == 1 && li == 0 && want("d_l0_mlp")) { section("d_l0_mlp", DMLP, Tq * D) }
     if (pi(PK, 0, dOut) != 0 || pi(PK, 8, DMLP) != 0 || pi(PK, 16, dOut) != 0 || pi(PK, 24, Tq * D) != 0) {
         return 130 + li
     }
@@ -504,6 +507,64 @@ head_gemm(dIn<Int>, dTable<Int>, dOut<Int>, S<Int>, Kk<Int>, Nn<Int>, fgemm<Int>
     if (launch1(fgemm, (S * Nn + 255) / 256, 256, PG) != 0) { return 3 }
     sync()
     return 0
+}
+
+// ---------------------------------------------------------------------------
+// One full decoder pass over `n` rows: gather, positions, four blocks, final norm,
+// tied head -> dLogits (n x VOCAB). The caller reads the LAST row.
+//
+// `dmp` = 1 on the first pass only, so the step-0 stage dumps still land on the
+// prompt sequence the gold tensors were captured from.
+//
+// Everything is re-read and re-widened per call. That is the honest first version:
+// the weights and the per-layer K/V both belong in a cache, and until they are,
+// step k costs a full pass. Correct first, quadratic for now.
+decoder_pass(ckpt<String>, ix<StIndex>, n<Int>, dmp<Int>,
+             DTOK<Int>, DPOSD<Int>, DIDS<Int>, DXC<Int>, DADD<Int>, DDR1<Int>,
+             DDATT<Int>, DDMLP<Int>, DLOGITS<Int>, DLN<Int>, DLN2<Int>,
+             DQ<Int>, DK<Int>, DV<Int>, DCTX<Int>, DFC1<Int>, DKE<Int>, DVE<Int>,
+             DLNW<Int>, DLNB<Int>, DW<Int>, DBI<Int>, RAW<Int>,
+             ford<Int>, fgemm<Int>, faddb<Int>, fgelu<Int>, fln<Int>, fatt<Int>,
+             fadd2<Int>, femb<Int>, PG<Int>, PK<Int>, dEnc<Int>, Tk<Int>)<Int> -> {
+    if (pi(PK, 0, DTOK) != 0 || pi(PK, 8, DIDS) != 0 || pi(PK, 16, DXC) != 0 ||
+        pi(PK, 24, n) != 0 || pi(PK, 32, D) != 0 || pi(PK, 40, 1) != 0 ||
+        pi(PK, 48, VOCAB) != 0) { return 1 }
+    if (launch1(femb, (n * D + 255) / 256, 256, PK) != 0) { return 2 }
+    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DPOSD) != 0 || pi(PK, 16, DADD) != 0 ||
+        pi(PK, 24, n * D) != 0) { return 3 }
+    if (launch1(fadd2, (n * D + 255) / 256, 256, PK) != 0) { return 4 }
+    sync()
+    if (dmp == 1 && want("d_embed")) { section("d_embed", DADD, n * D) }
+
+    dcur<Int> = DADD
+    dnxt<Int> = DXC
+    dli<Int> = 0
+    for (dli in 0..DEC_LAYERS - 1) {
+        e<Int> = dec_layer(ckpt, ix, dli, dmp, dcur, dnxt, DDR1, DLN, DQ, DK, DV, DCTX,
+                           DDATT, DLN2, DFC1, DDMLP, DKE, DVE, DLNW, DLNB, DW, DBI, RAW,
+                           ford, fgemm, faddb, fgelu, fln, fatt, fadd2, PG, PK,
+                           dEnc, Tk, n)
+        if (e != 0) { println("decoder layer failed"); println_int(dli); println_int(e); return 20 + dli }
+        dcur = dnxt
+        if (dnxt == DADD) {
+            dnxt = DXC
+        } else {
+            dnxt = DADD
+        }
+    }
+
+    e<Int> = widen(ckpt, ix, "model.decoder.layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 40 }
+    e = widen(ckpt, ix, "model.decoder.layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 41 }
+    if (pi(PK, 0, dcur) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, n) != 0 || pi(PK, 40, D) != 0) { return 42 }
+    if (htod(PK + 48, 1e-5) != 0) { return 43 }
+    if (launch1(fln, (n + 255) / 256, 256, PK) != 0) { return 44 }
+    sync()
+    if (dmp == 1 && want("d_final_ln_4layers")) { section("d_final_ln_4layers", DLN2, n * D) }
+
+    return head_gemm(DLN2, DTOK, DLOGITS, n, D, VOCAB, fgemm, PG)
 }
 
 main()<Int> -> {
@@ -539,16 +600,16 @@ main()<Int> -> {
     # ---- decoder buffers -----------------------------------------------------
     DTOK<Int> = dev_alloc(VOCAB * D * 8)              # token table f64 (159 MB)
     DPOSD<Int> = dev_alloc(MAXPOS * D * 8)            # decoder position table
-    DIDS<Int> = dev_alloc(CL * 8)                     # prompt ids (device Int words)
-    DXC<Int> = dev_alloc(CL * D * 8)                  # decoder layer input
-    DADD<Int> = dev_alloc(CL * D * 8)                 # embedding + positions
+    DIDS<Int> = dev_alloc(CLMAX * 8)                     # prompt ids (device Int words)
+    DXC<Int> = dev_alloc(CLMAX * D * 8)                  # decoder layer input
+    DADD<Int> = dev_alloc(CLMAX * D * 8)                 # embedding + positions
     DKE<Int> = dev_alloc(POS * D * 8)                 # encoder-derived cross K/V
     DVE<Int> = dev_alloc(POS * D * 8)
-    DDATT<Int> = dev_alloc(CL * D * 8)
-    DDR1<Int> = dev_alloc(CL * D * 8)
-    DDMLP<Int> = dev_alloc(CL * D * 8)
-    DDLAY<Int> = dev_alloc(CL * D * 8)
-    DLOGITS<Int> = dev_alloc(CL * VOCAB * 8)
+    DDATT<Int> = dev_alloc(CLMAX * D * 8)
+    DDR1<Int> = dev_alloc(CLMAX * D * 8)
+    DDMLP<Int> = dev_alloc(CLMAX * D * 8)
+    DDLAY<Int> = dev_alloc(CLMAX * D * 8)
+    DLOGITS<Int> = dev_alloc(CLMAX * VOCAB * 8)
     DARGMAX<Int> = dev_alloc(8)
     DMLP<Int> = dev_alloc(POS * D * 8)                # fc2 output
     DLAY<Int> = dev_alloc(POS * D * 8)                # block output (residual + mlp)
@@ -730,63 +791,45 @@ main()<Int> -> {
     if (htod_i(DIDS + 0, PROMPT0) != 0) { return 72 }
     if (htod_i(DIDS + 8, PROMPT1) != 0) { return 73 }
 
-    # ---- token embedding gather + decoder positions --------------------------
-    if (pi(PK, 0, DTOK) != 0 || pi(PK, 8, DIDS) != 0 || pi(PK, 16, DXC) != 0 ||
-        pi(PK, 24, CL) != 0 || pi(PK, 32, D) != 0 || pi(PK, 40, 1) != 0 || pi(PK, 48, VOCAB) != 0) {
-        println("params pack failed (decoder embed)"); return 74
-    }
-    if (launch1(femb, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder embed failed"); return 75 }
-    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DPOSD) != 0 || pi(PK, 16, DADD) != 0 || pi(PK, 24, CL * D) != 0) {
-        println("params pack failed (decoder pos)"); return 76
-    }
-    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder pos failed"); return 77 }
-    sync()
-    if (want("d_embed")) { section("d_embed", DADD, CL * D) }
-
-    # ---- the four decoder layers (ping-pong, never in place) ----------------
-    dcur<Int> = DADD
-    dnxt<Int> = DXC
-    dli<Int> = 0
-    for (dli in 0..DEC_LAYERS - 1) {
-        e = dec_layer(ckpt, ix, dli, dcur, dnxt, DDR1, DLN, DQ, DK, DV, DCTX, DDATT, DLN2,
-                      DFC1, DDMLP, DKE, DVE, DLNW, DLNB, DW, DBI, RAW,
-                      ford, fgemm, faddb, fgelu, fln, fatt, fadd2, PG, PK,
-                      DE, POS, CL)
-        if (e != 0) { println("decoder layer failed"); println_int(dli); println_int(e); return 140 + dli }
-        dcur = dnxt
-        if (dnxt == DADD) {
-            dnxt = DXC
-        } else {
-            dnxt = DADD
+    # ---- greedy decode -------------------------------------------------------
+    # No KV cache and no weight cache: each step re-runs the whole decoder over a
+    # sequence one token longer. Correct, and quadratic -- and the first thing to
+    # fix once the loop is honest. Acceptance is the reference's own 24 ids,
+    # token for token, which fixtures/whisper/oracle_stt.py captured step by step.
+    cnt<Int> = 0
+    n<Int> = CL
+    step<Int> = 0
+    while (step < MAXNEW) {
+        dmp<Int> = 0
+        if (step == 0) { dmp = 1 }
+        e<Int> = decoder_pass(ckpt, ix, n, dmp, DTOK, DPOSD, DIDS, DXC, DADD, DDR1, DDATT,
+                         DDMLP, DLOGITS, DLN, DLN2, DQ, DK, DV, DCTX, DFC1, DKE, DVE,
+                         DLNW, DLNB, DW, DBI, RAW, ford, fgemm, faddb, fgelu, fln,
+                         fatt, fadd2, femb, PG, PK, DE, POS)
+        if (e != 0) { println("decoder pass failed"); println_int(step); println_int(e); return 160 + e }
+        if (dmp == 1 && want("d_step0_logits")) {
+            section("d_step0_logits", DLOGITS + (n - 1) * VOCAB * 8, VOCAB)
         }
+        if (pi(PK, 0, DLOGITS + (n - 1) * VOCAB * 8) != 0 || pi(PK, 8, DARGMAX) != 0 ||
+            pi(PK, 16, VOCAB) != 0) { return 190 }
+        if (launch1(farg, 1, 32, PK) != 0) { println("argmax failed"); return 191 }
+        sync()
+        tok<Int> = dtoh_i(DARGMAX)
+        if (step == 0) { println("ARGMAX_ID"); println_int(tok) }
+        # The generated ids land in DIDS right after the prompt, so there is no
+        # separate list to keep: the device buffer IS the record.
+        if (htod_i(DIDS + n * 8, tok) != 0) { return 192 }
+        cnt = cnt + 1
+        if (tok == EOT) { break }
+        n = n + 1
+        step = step + 1
     }
 
-    # ---- final decoder layer norm -------------------------------------------
-    e = widen(ckpt, ix, "model.decoder.layer_norm.weight", D, DLNW, RAW, ford, PK)
-    if (e != 0) { return 150 }
-    e = widen(ckpt, ix, "model.decoder.layer_norm.bias", D, DLNB, RAW, ford, PK)
-    if (e != 0) { return 151 }
-    if (pi(PK, 0, dcur) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
-        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 152 }
-    if (htod(PK + 48, 1e-5) != 0) { return 153 }
-    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch final decoder ln failed"); return 154 }
-    sync()
-    # No gold tensor for this one: the oracle captured the final norm applied to
-    # LAYER 0's output (a one-layer probe, gold_stt/d_layernorm_on_l0_out.f32),
-    # not the real four-layer path. That path is covered by d_step0_logits below,
-    # which is this same norm feeding the tied head. Kept as a named dump because
-    # it is what to look at when the logits are wrong.
-    if (want("d_final_ln_4layers")) { section("d_final_ln_4layers", DLN2, CL * D) }
+    println("IDS n=")
+    println_int(cnt)
+    g<Int> = 0
+    for (g in 0..cnt - 1) { println_int(dtoh_i(DIDS + (CL + g) * 8)) }
 
-    # ---- the tied head, then greedy argmax on the LAST position -------------
-    e = head_gemm(DLN2, DTOK, DLOGITS, CL, D, VOCAB, fgemm, PG)
-    if (e != 0) { println("head gemm failed"); return 155 }
-    if (want("d_step0_logits")) { section("d_step0_logits", DLOGITS + (CL - 1) * VOCAB * 8, VOCAB) }
-    if (pi(PK, 0, DLOGITS + (CL - 1) * VOCAB * 8) != 0 || pi(PK, 8, DARGMAX) != 0 ||
-        pi(PK, 16, VOCAB) != 0) { return 156 }
-    if (launch1(farg, 1, 32, PK) != 0) { println("argmax failed"); return 157 }
-    sync()
-    println("ARGMAX_ID")
-    println_int(dtoh_i(DARGMAX))
+    println("DEC_STAGES done")
     return 0
 }
