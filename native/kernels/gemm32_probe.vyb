@@ -1,0 +1,40 @@
+// gemm32_probe — input/output scaffolding for the standalone f32 gemm harness (VybForge#23).
+// t_fill32: fill an f32 buffer with a constant (mode 0 -> 1.0, mode 1 -> 2.0, mode 2 -> index).
+// t_sum64:  sum n f64 values into out[0], so the host reads back ONE number to verify.
+t_fill32(dst<Int>, n<Int>, mode<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = 0.0
+        if (mode == 0) { v = 1.0 }
+        if (mode == 1) { v = 2.0 }
+        if (mode == 2) { v = gid as Float }
+        st_f32(dst + gid * 4, v)
+    }
+}
+
+// t_fill64: fill an f64 buffer with index-derived values (mode 2) so an indexing error cannot hide.
+t_fill64(dst<Int>, n<Int>, mode<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = 0.0
+        if (mode == 0) { v = 1.0 }
+        if (mode == 2) { v = gid as Float }
+        st_f64(dst + gid * 8, v)
+    }
+}
+
+// t_peek: out[0] = src[idx] (one thread) -- lets the host check ONE element against a reference.
+t_peek(src<Int>, idx<Int>, out<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid == 0) { st_f64(out, ld_f64(src + idx * 8)) }
+}
+
+t_sum64(src<Int>, n<Int>, out<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid == 0) {
+        s<Float> = 0.0
+        i<Int> = 0
+        for (i in 0..n - 1) { s = s + ld_f64(src + i * 8) }
+        st_f64(out, s)
+    }
+}

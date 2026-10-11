@@ -227,12 +227,44 @@ norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
     return 0
 }
 
+// f32-path helpers (VybForge#23). cast1 writes a 24-byte param block (src, dst, n) and launches the
+// elementwise cast; widen32 uses the same layout into its own block (they never overlap).
+cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
+    freedom {
+        cuMemcpyHtoD_v2(PB + 0, loc(src), 8)
+        cuMemcpyHtoD_v2(PB + 8, loc(dst), 8)
+        cuMemcpyHtoD_v2(PB + 16, loc(n), 8)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("CAST32_ERR rc=" + rc.to_string()); return 77 }
+        return 0
+    }
+    return 0
+}
+
+// The widen as its own single launch (same shape as cast1, which is proven). The multi-launch
+// gemm32run helper was REMOVED: every launch it made faulted with CUDA 700 in this driver while the
+// identical launch through gemm2 ran clean, so rather than fight it the f32 path is assembled from
+// the proven pieces -- gemm2 for passes 1+2, this for pass 3.
+widen1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
+    freedom {
+        cuMemcpyHtoD_v2(PB + 0, loc(src), 8)
+        cuMemcpyHtoD_v2(PB + 8, loc(dst), 8)
+        cuMemcpyHtoD_v2(PB + 16, loc(n), 8)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("WIDEN1_ERR rc=" + rc.to_string()); return 80 }
+        return 0
+    }
+    return 0
+}
+
 run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           EPS<Float>, XI<Int>, XO<Int>,
           gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
           GM<Int>, RN<Int>, ATT<Int>, ROP<Int>,
-          N1<Int>, DWq<Int>, DWk<Int>, DWv<Int>, Nq<Int>, Nk<Int>, DF<Int>, DWo<Int>, N2<Int>,
-          DWg<Int>, DWu<Int>, DWd<Int>,
+          N1<Int>, DWq32<Int>, DWk32<Int>, DWv32<Int>, Nq<Int>, Nk<Int>, DF<Int>, DWo32<Int>, N2<Int>,
+          DWg32<Int>, DWu32<Int>, DWd32<Int>,
+          XN32<Int>, DC32<Int>, X132<Int>, HU32<Int>, SK32<Int>, SCR32<Int>, CPB<Int>, WPB<Int>, RDB<Int>,
+          c32n<loc<CVoid>>, g3p<loc<CVoid>>, g3r<loc<CVoid>>, w3n<loc<CVoid>>,
           XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
           DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
           gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
@@ -243,12 +275,16 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
         if (norm2(rsn, ran, RSPB, RSB, SNB, XI, N1, XN, S, D, EPS, CHN) != 0) { return 75 }
 
-        gA<Int> = XN; gB<Int> = DWq; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
-        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWq, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
-        gA = XN; gB = DWk; gC = DK; gM = S; gN = NKV; gK = D
-        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWk, DK, S, NKV, D, AF, BF) != 0) { return 73 }
-        gA = XN; gB = DWv; gC = DV; gM = S; gN = NKV; gK = D
-        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWv, DV, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (cast1(c32n, CPB, XN, XN32, S * D) != 0) { return 77 }
+        gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWq32, SCR32, S, NQ, D, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, DQ, S * NQ) != 0) { return 78 }
+        gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWk32, SCR32, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, DK, S * NKV) != 0) { return 78 }
+        gA = XN; gB = DWv32; gC = DV; gM = S; gN = NKV; gK = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, SCR32, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, DV, S * NKV) != 0) { return 78 }
 
         rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
@@ -276,21 +312,28 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         println("RLR attnok")
 
-        gA = DCtx; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
-        if (gemm2(gpn, grn, GPB, SKB, KSP, DCtx, DWo, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
+        gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, DC32, DWo32, SCR32, S, D, NQ, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, DO, S * D) != 0) { return 78 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
 
         rA = X1; rB = N2; rC = X1N
         if (norm2(rsn, ran, RSPB, RSB, SNB, X1, N2, X1N, S, D, EPS, CHN) != 0) { return 75 }
 
-        gA = X1N; gB = DWg; gC = Gr; gM = S; gN = FF; gK = D
-        if (gemm2(gpn, grn, GPB, SKB, KSP, X1N, DWg, Gr, S, FF, D, AF, BF) != 0) { return 73 }
-        gA = X1N; gB = DWu; gC = Up; gM = S; gN = FF; gK = D
-        if (gemm2(gpn, grn, GPB, SKB, KSP, X1N, DWu, Up, S, FF, D, AF, BF) != 0) { return 73 }
+        if (cast1(c32n, CPB, X1N, X132, S * D) != 0) { return 77 }
+        gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWg32, SCR32, S, FF, D, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, Gr, S * FF) != 0) { return 78 }
+        gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWu32, SCR32, S, FF, D, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, Up, S * FF) != 0) { return 78 }
         cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
 
-        gA = Hu; gB = DWd; gC = M; gM = S; gN = D; gK = FF
-        if (gemm2(gpn, grn, GPB, SKB, KSP, Hu, DWd, M, S, D, FF, AF, BF) != 0) { return 73 }
+        if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
+        gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
+        if (gemm2(g3p, g3r, GPB, SKB, KSP, HU32, DWd32, SCR32, S, D, FF, AF, BF) != 0) { return 73 }
+        if (widen1(w3n, CPB, SCR32, M, S * D) != 0) { return 78 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         println("RLR endok")
         return 0
@@ -406,6 +449,17 @@ main()<Int> -> {
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(grn), ml, "gemm_r") != 0) { return 10 }
+        # f32 path (VybForge#23, needs Vyb#488): f32 dequant twins, one cast, and the f32
+        # split-K triple -- pass 1 (f32 MACs), pass 2 (f32 reduce), pass 3 (widen to the f64 C).
+        q432<loc<CVoid>> = from<loc<CVoid>>(0); q632<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q432), m4, "q4kdeq32") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q632), m6, "q6kdeq32") != 0) { return 10 }
+        c32n<loc<CVoid>> = from<loc<CVoid>>(0); g3p<loc<CVoid>> = from<loc<CVoid>>(0)
+        g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(c32n), ml, "cast32") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(g3p), ml, "gemm32_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(g3r), ml, "gemm32_r") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(w3n), ml, "widen32") != 0) { return 10 }
         rsn<loc<CVoid>> = from<loc<CVoid>>(0); ran<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rsn), ml, "rms_ss") != 0) { return 10 }
         if (cuModuleGetFunction(loc(ran), ml, "rms_apply") != 0) { return 10 }
@@ -476,6 +530,9 @@ main()<Int> -> {
         A5<Int> = 0; A6<Int> = 0; PVA<Int> = 0; PIA<Int> = 0; CHA<Int> = 256
         NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
         RSPB<Int> = 0; RSB<Int> = 0; SNB<Int> = 0; CHN<Int> = 256
+        Wq32<Int> = 0; Wk32<Int> = 0; Wv32<Int> = 0; Wo32<Int> = 0; Wg32<Int> = 0; Wu32<Int> = 0; Wd32<Int> = 0
+        XN32<Int> = 0; DC32<Int> = 0; X132<Int> = 0; HU32<Int> = 0; SK32<Int> = 0; SCR32<Int> = 0
+        CPB<Int> = 0; WPB<Int> = 0; RDB<Int> = 0
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
@@ -483,6 +540,24 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Wg), wg_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wu), wu_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wd), wd_nl * 8) != 0) { return 11 }
+        # f32 path (VybForge#23): weights as f32, the four gemm A-operands as f32 copies, the f32
+        # partial scratch and reduce output, and two 24-byte param blocks + a 64-byte readback block.
+        if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wk32), wk_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wv32), wv_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wo32), wo_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(XN32), MAXS * D * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DC32), MAXS * NQ * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X132), MAXS * D * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(HU32), MAXS * FF * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(SK32), KSP * MAXS * FF * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(SCR32), MAXS * FF * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(CPB), 24) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WPB), 24) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(RDB), 64) != 0) { return 11 }
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
@@ -660,21 +735,21 @@ main()<Int> -> {
                             e<Int> = 0
                             nmT = nmT + (time_mono_millis() - phA)
                             phB<Int> = time_mono_millis()
-                            e = dequant_gpu(PK0, K0 * L, Wq, wq_nl, q4fn, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK1, K1 * L, Wk, wk_nl, q4fn, D); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK0, K0 * L, Wq32, wq_nl, q432, D); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK1, K1 * L, Wk32, wk_nl, q432, D); if (e != 0) { return 70 }
                             # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
                             avt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-                            avq<loc<CVoid>> = q4fn
-                            if (avt == 14) { avq = q6fn }
-                            e = dequant_gpu(PK2, ov2.get(L), Wv, wv_nl, avq, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK3, K3 * L, Wo, wo_nl, q4fn, NQ); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK4, K4 * L, Wg, wg_nl, q4fn, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK5, K5 * L, Wu, wu_nl, q4fn, D); if (e != 0) { return 70 }
+                            avq<loc<CVoid>> = q432
+                            if (avt == 14) { avq = q632 }
+                            e = dequant_gpu(PK2, ov2.get(L), Wv32, wv_nl, avq, D); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK3, K3 * L, Wo32, wo_nl, q432, NQ); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK4, K4 * L, Wg32, wg_nl, q432, D); if (e != 0) { return 70 }
+                            e = dequant_gpu(PK5, K5 * L, Wu32, wu_nl, q432, D); if (e != 0) { return 70 }
                             # ffn_down: kernel by this layer's real quant type
                             fdt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-                            fdq<loc<CVoid>> = q4fn
-                            if (fdt == 14) { fdq = q6fn }
-                            e = dequant_gpu(PK6, ov6.get(L), Wd, wd_nl, fdq, FF); if (e != 0) { return 70 }
+                            fdq<loc<CVoid>> = q432
+                            if (fdt == 14) { fdq = q632 }
+                            e = dequant_gpu(PK6, ov6.get(L), Wd32, wd_nl, fdq, FF); if (e != 0) { return 70 }
                             dqT = dqT + (time_mono_millis() - phB)
                             if (QV == 0) { println("DECG deqdone L" + L.to_string()) }
                             phC<Int> = time_mono_millis()
@@ -682,7 +757,8 @@ main()<Int> -> {
                             if ((L % 2) == 1) { tgt = HB }
                             e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                          N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
+                                          N1, Wq32, Wk32, Wv32, Nq, Nk, DF, Wo32, N2, Wg32, Wu32, Wd32,
+                                          XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }

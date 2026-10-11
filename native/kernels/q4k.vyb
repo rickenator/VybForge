@@ -70,3 +70,55 @@ q4kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         }
     }
 }
+
+// f32 twin of `q4kdeq` (VybForge#23): same decode, same mapping, both z contracts, 4-byte store.
+// Halves the dequant's write traffic, which nsys says is 111 ms of a 342 ms token in f64.
+q4kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        cw<Int> = 0
+        cc<Int> = 0
+        rr<Int> = 0
+        gsrc<Int> = gid
+        if (z > 0) {
+            cw = n / z
+            cc = gid / cw
+            rr = gid % cw
+            gsrc = rr * z + cc
+        }
+        block<Int> = gsrc / 256
+        e<Int> = gsrc % 256
+        bb<Int> = q + block * 144
+        t<Int> = e / 64
+        qbase<Int> = t * 32
+        l<Int> = e % 32
+        half<Int> = (e / 32) % 2
+        is<Int> = t * 2 + half
+        d<Float> = ld_f16(bb + 0)
+        min<Float> = ld_f16(bb + 2)
+        sc<Int> = 0
+        m<Int> = 0
+        if (is < 4) {
+            sc = (ld_i8(bb + 4 + is) as Int) & 63
+            m = (ld_i8(bb + 4 + is + 4) as Int) & 63
+        } else {
+            a<Int> = (ld_i8(bb + 4 + is + 4) as Int) & 255
+            b<Int> = (ld_i8(bb + 4 + is - 4) as Int) & 255
+            c<Int> = (ld_i8(bb + 4 + is) as Int) & 255
+            sc = (a & 15) | ((b >> 6) << 4)
+            m = (a >> 4) | ((c >> 6) << 4)
+        }
+        bq<Int> = (ld_i8(bb + 16 + qbase + l) as Int) & 255
+        bqb<Int> = 0
+        if (half == 0) { bqb = bq & 15 } else { bqb = bq >> 4 }
+        scf<Float> = sc as Float
+        mf<Float> = m as Float
+        nbf<Float> = (bqb) as Float
+        val<Float> = d * scf * nbf - min * mf
+        if (z > 0) {
+            st_f32(o + (cc * cw + rr) * 4, val)
+        } else {
+            st_f32(o + gid * 4, val)
+        }
+    }
+}

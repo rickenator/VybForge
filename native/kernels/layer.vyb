@@ -341,3 +341,90 @@ resid(a<Int>, b<Int>, y<Int>, n<Int>) -> {
         st_f64(y + gid * 8, av + bv)
     }
 }
+
+// f64 -> f32 cast, elementwise (VybForge#23). Params: +0 src (f64), +8 dst (f32), +16 n.
+cast32(p<Int>) -> {
+    SRC<Int> = ld_i64(p + 0)
+    DST<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        v<Float> = ld_f64(SRC + gid * 8)
+        st_f32(DST + gid * 4, v)
+    }
+}
+
+// Split-K GEMM in f32, pass 1 of 3 (VybForge#23). A, B and the partials are f32 and the MACs are
+// native `mul.rn.f32`/`add.rn.f32`. The Float32 LOCALS are load bearing: `ld_f32` has a Float64
+// surface type, so `ld_f32(pa) * ld_f32(pb)` would be an f64 multiply of two widened values with 4
+// conversions per MAC (f64 is 1/64 rate on sm_86). Binding first makes the MAC native and the
+// widen/narrow pair of an exactly-f32 value folds away -- verified in the emitted PTX.
+// Params: +0 A, +8 B, +16 SK, +24 M, +32 N, +40 K, +48 NBLK, +56 KSP.
+gemm32_p(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    SK<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    NBLK<Int> = ld_i64(p + 48)
+    KSP<Int> = ld_i64(p + 56)
+    bx<Int> = blk_x()
+    ks<Int> = bx / NBLK
+    nb<Int> = bx % NBLK
+    gid<Int> = nb * dim_x() + tid_x()
+    total<Int> = M * N
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        kl<Int> = (K + KSP - 1) / KSP
+        k0<Int> = ks * kl
+        k1<Int> = k0 + kl
+        if (k1 > K) { k1 = K }
+        acc<Float32> = 0.0
+        pa<Int> = A + (mm * K + k0) * 4
+        pb<Int> = B + (k0 * N + nn) * 4
+        kk<Int> = k0
+        for (kk in k0..k1 - 1) {
+            av<Float32> = ld_f32(pa)
+            bv<Float32> = ld_f32(pb)
+            acc = acc + av * bv
+            pa = pa + 4
+            pb = pb + N * 4
+        }
+        st_f32(SK + (ks * total + gid) * 4, acc)
+    }
+}
+
+// Split-K GEMM in f32, pass 2 of 3: f32 reduce, f32 store (the f32 store is what keeps the loop).
+// PARAM LAYOUT IS gemm_r's, deliberately: SK(+0), SCR(+8), M(+16), N(+24), alpha(+32), beta(+40),
+// KSP(+48). That lets the driver's PROVEN gemm2 helper drive this kernel as its pass 2 (it writes
+// those slots itself), instead of a hand-rolled multi-launch helper.
+gemm32_r(p<Int>) -> {
+    SK<Int> = ld_i64(p + 0)
+    SCR<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 24)
+    KSP<Int> = ld_i64(p + 48)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Float32> = 0.0
+        ks<Int> = 0
+        for (ks in 0..KSP - 1) { s = s + ld_f32(SK + (ks * total + gid) * 4) }
+        st_f32(SCR + gid * 4, s)
+    }
+}
+
+// Split-K GEMM in f32, pass 3 of 3: widen to the f64 C the layer reads. The one working f32->f64
+// idiom is a plain f32 load feeding an f64 store; keep it isolated here. Params: +0 src, +8 dst, +16 n.
+widen32(p<Int>) -> {
+    SRC<Int> = ld_i64(p + 0)
+    DST<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        w<Float32> = ld_f32(SRC + gid * 4)
+        st_f64(DST + gid * 8, w)
+    }
+}

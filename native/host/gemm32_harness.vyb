@@ -1,0 +1,141 @@
+// gemm32_harness — standalone tiny-dims check of the f32 split-K triple (VybForge#23).
+// Runs pass 1 (f32 MACs) -> pass 2 (f32 reduce) -> pass 3 (widen to f64) on M=2,N=4,K=8,KSP=2 with
+// A=1.0 and B=2.0, so every output element must be K*2.0 = 16.0 and the sum over M*N must be 128.0.
+// One HARNESS_* line per step pins a CUDA failure to the exact launch. All FFI lives in
+// freedom-wrapped helpers that traffic only in Int (a loc<CVoid> cannot be returned past a block).
+import io::{open_read, read_all, close}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+init_cuda()<Int> -> {
+    freedom {
+        if (cuInit(0) != 0) { return 1 }
+        dev<CInt> = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 2 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 3 }
+        return 0
+    }
+    return 9
+}
+
+// load the PTX, resolve the kernel, launch it: 90/91 = load/get failed, else the launch's rc.
+runk(ptx<String>, nm<String>, g<Int>, p<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 90 }
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, nm) != 0) { return 91 }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(f)), g, 1, 1, 256, 1, 1, p, a1, a2, a3)
+        return rc as Int
+    }
+    return 99
+}
+
+allocb(bytes<Int>)<Int> -> {
+    freedom {
+        p<Int> = 0
+        if (cuMemAlloc_v2(loc(p), bytes) != 0) { return 0 }
+        return p
+    }
+    return 0
+}
+
+sync_code()<Int> -> {
+    freedom { return cuCtxSynchronize() as Int }
+    return -1
+}
+
+wr(p<Int>, off<Int>, v<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(p + off, loc(v), 8) != 0) { return 1 }
+        return 0
+    }
+    return 1
+}
+
+read64(src<Int>)<Float> -> {
+    freedom {
+        v<Float> = 0.0
+        cuMemcpyDtoH_v2(loc(v), src, 8)
+        return v
+    }
+    return 0.0
+}
+
+main()<Int> -> {
+    M<Int> = 5; N<Int> = 2560; K<Int> = 9728; KSP<Int> = 8  # ffn_down shape
+    NBLK<Int> = (M * N + 255) / 256
+    println("HARNESS M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string() + " KSP=" + KSP.to_string() + " NBLK=" + NBLK.to_string())
+    e<Int> = init_cuda()
+    if (e != 0) { println("HARNESS_FAIL init code=" + e.to_string()); return 1 }
+    lp<String> = read_bin("native/build/layer.ptx")
+    pp<String> = read_bin("native/build/gemm32_probe.ptx")
+    if (lp.len() == 0 || pp.len() == 0) { println("HARNESS_FAIL ptx missing"); return 2 }
+    A<Int> = allocb(M * K * 4)
+    B<Int> = allocb(K * N * 4)
+    SK<Int> = allocb(KSP * M * N * 4)
+    SCR<Int> = allocb(M * N * 4)
+    CC<Int> = allocb(M * N * 8)
+    OUT<Int> = allocb(8)
+    GPB<Int> = allocb(192)
+    CPB<Int> = allocb(24)
+    S64<Int> = allocb(M * K * 8)
+    P2<Int> = allocb(24)
+    println("HARNESS_ALLOC2 S64=" + S64.to_string() + " P2=" + P2.to_string())
+    println("HARNESS_ALLOC A=" + A.to_string() + " B=" + B.to_string() + " SK=" + SK.to_string() + " SCR=" + SCR.to_string() + " C=" + CC.to_string() + " OUT=" + OUT.to_string())
+    if (A == 0 || B == 0 || SK == 0 || SCR == 0 || CC == 0 || OUT == 0 || GPB == 0 || CPB == 0) { println("HARNESS_FAIL alloc"); return 3 }
+    // A: fill an f64 source with INDEX values, then cast32 it into the f32 A operand -- the same
+    // data path the layer uses (cast32 of an activation). B: index values too, so a wrong index
+    // cannot cancel out the way constant data would.
+    println("HARNESS_FILLS rc=" + runk(pp, "t_fill64", (M * K + 255) / 256, S64, M * K, 2, 0).to_string())
+    wr(P2, 0, S64); wr(P2, 8, A); wr(P2, 16, M * K)
+    println("HARNESS_CAST rc=" + runk(lp, "cast32", (M * K + 255) / 256, P2, 0, 0, 0).to_string())
+    println("HARNESS_FILLB rc=" + runk(pp, "t_fill32", (K * N + 255) / 256, B, K * N, 2, 0).to_string())
+    println("HARNESS_SYNC0 code=" + sync_code().to_string())
+    wr(GPB, 0, A); wr(GPB, 8, B); wr(GPB, 16, SK); wr(GPB, 24, M); wr(GPB, 32, N); wr(GPB, 40, K); wr(GPB, 48, NBLK); wr(GPB, 56, KSP)
+    println("HARNESS_P1 rc=" + runk(lp, "gemm32_p", NBLK * KSP, GPB, 0, 0, 0).to_string())
+    println("HARNESS_SYNC1 code=" + sync_code().to_string())
+    wr(GPB, 64, SK); wr(GPB, 72, SCR); wr(GPB, 80, M); wr(GPB, 88, N); wr(GPB, 96, KSP)
+    println("HARNESS_P2 rc=" + runk(lp, "gemm32_r", (M * N + 255) / 256, GPB + 64, 0, 0, 0).to_string())
+    println("HARNESS_SYNC2 code=" + sync_code().to_string())
+    wr(CPB, 0, SCR); wr(CPB, 8, CC); wr(CPB, 16, M * N)
+    println("HARNESS_P3 rc=" + runk(lp, "widen32", (M * N + 255) / 256, CPB, 0, 0, 0).to_string())
+    println("HARNESS_SYNC3 code=" + sync_code().to_string())
+    println("HARNESS_SUM rc=" + runk(pp, "t_sum64", 1, CC, M * N, OUT, 0).to_string())
+    println("HARNESS_SYNC4 code=" + sync_code().to_string())
+    println("HARNESS_TOTAL=" + read64(OUT).to_string())
+    // element-level check: C[0][0] = sum_k A[0][k]*B[k][0] = sum_k k*(k*N) = N*sum(k^2)
+    runk(pp, "t_peek", 1, CC, 0, OUT, 0)
+    println("HARNESS_SYNC5 code=" + sync_code().to_string())
+    got<Float> = read64(OUT)
+    want<Float> = 0.0
+    kk<Int> = 0
+    for (kk in 0..K - 1) {
+        ak<Float> = kk as Float
+        bk<Float> = (kk * N) as Float
+        want = want + ak * bk
+    }
+    println("HARNESS_C00 got=" + got.to_string() + " want=" + want.to_string())
+    return 0
+}
