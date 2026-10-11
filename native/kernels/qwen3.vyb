@@ -245,3 +245,57 @@ argmax1_r(p<Int>) -> {
         st_i64(Out + 0, best)
     }
 }
+
+// Coalesced tied-head logits (Ursela, VybForge#23 follow-up). logits_slice gives each vocab row to ONE
+// thread that walks its 2560-element row of the f64 table alone: neighbouring threads touch addresses D*8
+// bytes apart, so every load is its own cache line, and on the GB10 it ran at ~107 GB/s -- 29 ms of a
+// ~120 ms token -- while the gemms run near DRAM peak. Making it one launch instead of ten chunks
+// changed nothing (measured), so the grid was not the problem; the access pattern was.
+// Here 32 consecutive threads share one row (lane = gid % 32) and read d = lane, lane+32, ... -- one
+// 128-byte line per warp step -- from an f32 COPY of the table (1.55 GB instead of 3.1 GB per token; the
+// copy is the f64 table narrowed, the same values logits_slice narrows in register). Pass 2 sums the
+// 32 lane partials per row in lane order and stores the f64 logit. The summation ORDER differs from
+// logits_slice (lane-strided partials), so logits differ at f32 rounding; the gold stream is the gate.
+// logits32_p params: +0 H (f64 [*, D]), +8 E32 (f32 [V, D]), +16 PART (f32 [V, 32]), +24 s, +32 D, +40 V
+logits32_p(p<Int>) -> {
+    H<Int> = ld_i64(p + 0)
+    E<Int> = ld_i64(p + 8)
+    PART<Int> = ld_i64(p + 16)
+    s<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    V<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < V * 32) {
+        v<Int> = gid / 32
+        ln<Int> = gid % 32
+        acc<Float32> = 0.0
+        hb<Int> = H + s * D * 8
+        eb<Int> = E + v * D * 4
+        d<Int> = ln
+        while (d < D) {
+            hv<Float> = ld_f64(hb + d * 8)
+            hv32<Float32> = hv
+            ev32<Float32> = ld_f32(eb + d * 4)
+            acc = acc + hv32 * ev32
+            d = d + 32
+        }
+        st_f32(PART + gid * 4, acc)
+    }
+}
+// logits32_r params: +0 PART, +8 Log (f64 [*, V]), +16 s, +24 V
+logits32_r(p<Int>) -> {
+    PART<Int> = ld_i64(p + 0)
+    Log<Int> = ld_i64(p + 8)
+    s<Int> = ld_i64(p + 16)
+    V<Int> = ld_i64(p + 24)
+    v<Int> = blk_x() * dim_x() + tid_x()
+    if (v < V) {
+        acc<Float32> = 0.0
+        ln<Int> = 0
+        for (ln in 0..31) {
+            pv<Float32> = ld_f32(PART + (v * 32 + ln) * 4)
+            acc = acc + pv
+        }
+        st_f64(Log + (s * V + v) * 8, acc)
+    }
+}

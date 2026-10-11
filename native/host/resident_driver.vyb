@@ -491,6 +491,9 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
+        l32p<loc<CVoid>> = from<loc<CVoid>>(0); l32r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(l32p), mw, "logits32_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(l32r), mw, "logits32_r") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
         a1p<loc<CVoid>> = from<loc<CVoid>>(0); a1r<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(a1p), mw, "argmax1_p") != 0) { return 10 }
@@ -603,6 +606,11 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
+        # f32 copy of the tied embedding for the head (1.55 GB) + the 32-lane partials (VOCAB x 32 f32).
+        DE32<Int> = 0; LPART<Int> = 0; LPB<Int> = 0
+        if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(LPART), VOCAB * 32 * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(LPB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(EMB), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HA), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HB), MAXS * D * 8) != 0) { return 11 }
@@ -739,6 +747,8 @@ main()<Int> -> {
 
         e = emb_dequant(MODEL, te_off0, te_nl, DPK, q6fn, DE); if (e != 0) { return 91 }
         println("EMB_DEQUANT_DONE")
+        e = cast1(c32n, CPB, DE, DE32, te_nl); if (e != 0) { return 91 }
+        println("EMB_F32_COPY_DONE")
 
         # NOTE: the 4 per-layer RMSNorm weights (attn_norm/attn_q_norm/attn_k_norm/
         # ffn_norm) DIFFER per layer and are loaded per-layer inside the gen loop
@@ -845,21 +855,17 @@ main()<Int> -> {
                         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
                         cuMemcpyHtoD_v2(RN + 24, loc(Srows), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
                         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Srows * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-                        LCH<Int> = 16384
                         s7<Int> = Srows - 1
-                        vs2<Int> = 0
-                        ve2<Int> = 0
-                        rc_sl<CInt> = 0
-                        while (vs2 < VOCAB) {
-                            ve2 = vs2 + LCH
-                            if (ve2 > VOCAB) { ve2 = VOCAB }
-                            cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
-                            cuMemcpyHtoD_v2(LSP + 24, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
-                            cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
-                            rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
-                            if (rc_sl != 0) { return 92 }
-                            vs2 = ve2
-                        }
+                        # Coalesced tied head: 32 lanes per vocab row over the f32 table, then a lane reduce.
+                        lpb1<GP3> = GP3 { src = DH, dst = DE32, n = LPART }
+                        cuMemcpyHtoD_v2(LPB + 0, loc(lpb1), 24)
+                        cuMemcpyHtoD_v2(LPB + 24, loc(s7), 8); cuMemcpyHtoD_v2(LPB + 32, loc(D), 8); cuMemcpyHtoD_v2(LPB + 40, loc(VOCAB), 8)
+                        rc_sl<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(l32p)), (VOCAB * 32 + 255) / 256, 1, 1, 256, 1, 1, LPB, 0, 0, 0)
+                        if (rc_sl != 0) { println("LOGITS32_P_ERR rc=" + rc_sl.to_string()); return 92 }
+                        cuMemcpyHtoD_v2(LSP + 0, loc(LPART), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DL), 8)
+                        cuMemcpyHtoD_v2(LSP + 16, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 24, loc(VOCAB), 8)
+                        rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(l32r)), (VOCAB + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
+                        if (rc_sl != 0) { println("LOGITS32_R_ERR rc=" + rc_sl.to_string()); return 92 }
                         # Two-pass argmax (VybForge#23): `argmax_row` scans VOCAB with ONE thread
                         # (14.4 ms per launch, measured); this splits the row into VOCAB/CHA chunks,
                         # one thread each, then reduces ~594 partials in a single thread.
