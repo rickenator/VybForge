@@ -22,7 +22,10 @@
 // the header.
 //
 // Written out per head rather than per state element so the whole head is one thread's sequential
-// work — no cross-thread reduction, no barrier, no shared memory.
+// work — deliberately no cross-thread reduction, no barrier and no shared memory HERE. That is a choice
+// for this kernel, NOT a language limit: Vyb has a 32 KB module-wide shared buffer (`ld_shared_f64`/
+// `st_shared_f64`) and `kernel_barrier` -> `bar.sync`, plus `Float32` arithmetic — see the CORRECTION
+// note in native/kernels/layer.vyb for the probe that established it.
 //
 // The read-out contraction is the one place this kernel can silently transpose: the op computes
 // out = m @ q, contracting q with the state's SECOND axis (out lives on the first), and delta with
