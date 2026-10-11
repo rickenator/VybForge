@@ -604,18 +604,21 @@ main()<Int> -> {
     # Default crossover (measured, 2-token gen after an N-row prompt): 3090 m8 vs scratch ~24 rows,
     # GB10 ~48 rows; set after the device query below.
     QPF<Int> = 0 - 1
-    # VYB_HEADQ=1 (item 20, opt-in): the tied head runs the fused Q6_K GEMV over the packed token_embd
+    # Head (item 20, default): the tied head runs the fused Q6_K GEMV over the packed token_embd
     # (0.32 GB per token instead of the 0.78 GB f16 table; no f16 table at all). f32 x and f32
-    # accumulation instead of the f16-table head: logits differ in the last bits -> measured, not default.
-    HQ<Int> = 0
+    # accumulation, so logits differ from the f16-table head in the last bits; token streams were
+    # identical on 5 prompts through GEN=512 (p0 through 1024) on the 3090 and the GB10.
+    # VYB_HEADQ=0 restores the f16-table head (VYB_HEAD32=1: the f32 table).
+    HQ<Int> = 1
     hq_s<String> = env_get("VYB_HEADQ") else ""
-    if (hq_s.len() > 0) { HQ = 1 }
+    if (hq_s == "0") { HQ = 0 }
     qpf_s<String> = env_get("VYB_QPF") else ""
     if (qpf_s.len() > 0) { QPF = parse_u(qpf_s, 0, qpf_s.len()) }
     if (QPF == 0) { QPF = 1000000000 }
     H16<Int> = 1
     h32_s<String> = env_get("VYB_HEAD32") else ""
     if (h32_s.len() > 0) { H16 = 0 }
+    if (H16 == 0) { HQ = 0 }
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
