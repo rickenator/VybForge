@@ -1,0 +1,179 @@
+# synth.vyb — L4's synthesis core: a Klatt-style cascade formant synthesiser, in Vyb.
+#
+# Why formant synthesis and not a neural vocoder yet: the honest first question is
+# "can Vyb make a sound whose SPECTRUM is the spectrum it was told to make", and
+# that question has a measurable answer. A neural vocoder (VITS/HiFiGAN) is the
+# same scale of port as Whisper; this core is what a neural path would replace, and
+# it is what has to exist for the loop to close at all.
+#
+# Klatt's cascade resonator, one two-pole filter per formant:
+#   C = -exp(-2*pi*BW/fs)
+#   B =  2*exp(-pi*BW/fs)*cos(2*pi*F/fs)
+#   A =  1 - B - C                (unit DC gain)
+#   y[n] = A*x[n] + B*y[n-1] + C*y[n-2]
+#
+# The source is a glottal impulse train at f0 — a strawman for a real glottal
+# pulse, and honest about being one: its harmonics show the formant envelope
+# clearly, which is what the gate measures.
+
+import io::{open_write, write_bytes}
+
+share(all)
+SR<Int> = 16000
+share(all)
+FADE_MS<Int> = 5
+# Formant bandwidths. Exported because the gate re-derives the predicted envelope
+# from them: the checker must not restate a number the model owns.
+share(all)
+BW1<Float> = 90.0
+share(all)
+BW2<Float> = 110.0
+share(all)
+BW3<Float> = 170.0
+
+share(all)
+struct Vowel { name<String>, f1<Float>, f2<Float>, f3<Float>, f0<Float>, ms<Int> }
+
+# The vowel table. Formant centres are Peterson & Barney's adult-male averages
+# (the standard numbers, not values tuned until a plot looked nice), f0 is a
+# mid-male 120 Hz, and every vowel is the same 400 ms so the gate compares like
+# with like.
+share(all)
+std_vowels()<Vec<Vowel>> -> {
+    t<Vec<Vowel>> = Vec()
+    t.push(Vowel("i", 270.0, 2290.0, 3010.0, 120.0, 400))
+    t.push(Vowel("e", 530.0, 1840.0, 2480.0, 120.0, 400))
+    t.push(Vowel("ae", 660.0, 1720.0, 2410.0, 120.0, 400))
+    t.push(Vowel("a", 730.0, 1090.0, 2440.0, 120.0, 400))
+    t.push(Vowel("o", 570.0, 840.0, 2410.0, 120.0, 400))
+    t.push(Vowel("u", 300.0, 870.0, 2240.0, 120.0, 400))
+    return t
+}
+
+# One two-pole resonator's coefficients, as (A, B, C).
+share(all)
+reson(cf<Float>, bw<Float>, sr<Int>)<Vec<Float>> -> {
+    r<Float> = (-3.141592653589793 * bw / (sr as Float))
+    c<Float> = -exp(-2.0 * 3.141592653589793 * bw / (sr as Float))
+    b<Float> = 2.0 * exp(r) * cos(2.0 * 3.141592653589793 * cf / (sr as Float))
+    a<Float> = 1.0 - b - c
+    out<Vec<Float>> = Vec()
+    out.push(a)
+    out.push(b)
+    out.push(c)
+    return out
+}
+
+# Render `ms` milliseconds of a vowel: impulse train -> F1 -> F2 -> F3, faded in
+# and out, then normalised to `peak` so the caller fixes the level rather than
+# discovering it (and so nothing clips).
+share(all)
+render_vowel(v<Vowel>, sr<Int>, peak<Float>)<Vec<Float>> -> {
+    n<Int> = v.ms * sr / 1000
+    c1<Vec<Float>> = reson(v.f1, BW1, sr)
+    c2<Vec<Float>> = reson(v.f2, BW2, sr)
+    c3<Vec<Float>> = reson(v.f3, BW3, sr)
+    period<Float> = (sr as Float) / v.f0
+    s1a<Float> = 0.0
+    s1b<Float> = 0.0
+    s2a<Float> = 0.0
+    s2b<Float> = 0.0
+    s3a<Float> = 0.0
+    s3b<Float> = 0.0
+    since<Float> = period
+    raw<Vec<Float>> = Vec()
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        src<Float> = 0.0
+        if (since >= period) {
+            src = 1.0
+            since = since - period
+        }
+        since = since + 1.0
+        v1<Float> = c1.get(0) * src + c1.get(1) * s1a + c1.get(2) * s1b
+        s1b = s1a
+        s1a = v1
+        v2<Float> = c2.get(0) * v1 + c2.get(1) * s2a + c2.get(2) * s2b
+        s2b = s2a
+        s2a = v2
+        v3<Float> = c3.get(0) * v2 + c3.get(1) * s3a + c3.get(2) * s3b
+        s3b = s3a
+        s3a = v3
+        raw.push(v3)
+    }
+    # peak-normalise
+    mx<Float> = 0.0000001
+    for (i in 0..n - 1) {
+        av<Float> = raw.get(i)
+        if (av < 0.0) { av = 0.0 - av }
+        if (av > mx) { mx = av }
+    }
+    gain<Float> = peak / mx
+    fade<Int> = FADE_MS * sr / 1000
+    out<Vec<Float>> = Vec()
+    for (i in 0..n - 1) {
+        g<Float> = gain
+        if (i < fade) { g = gain * (i as Float) / (fade as Float) }
+        if (i >= n - fade) { g = gain * ((n - i) as Float) / (fade as Float) }
+        out.push(raw.get(i) * g)
+    }
+    return out
+}
+
+# ---- WAV packing (16-bit PCM mono) --------------------------------------
+# Same canonical 44-byte header the capture probe writes, so a file from either
+# side of the loop reads with the same tools.
+
+share(all)
+push_ascii(out<their<Vec<UInt8>>>, s<String>)<Int> -> {
+    i<Int> = 0
+    n<Int> = s.len()
+    for (i in 0..n - 1) {
+        out.push(s.char_at(i) as UInt8)
+    }
+    return n
+}
+
+share(all)
+push_u32(out<their<Vec<UInt8>>>, v<Int>)<Int> -> {
+    out.push((v & 255) as UInt8)
+    out.push(((v >> 8) & 255) as UInt8)
+    out.push(((v >> 16) & 255) as UInt8)
+    out.push(((v >> 24) & 255) as UInt8)
+    return 4
+}
+
+share(all)
+push_i16(out<their<Vec<UInt8>>>, v<Int>)<Int> -> {
+    out.push((v & 255) as UInt8)
+    out.push(((v >> 8) & 255) as UInt8)
+    return 2
+}
+
+share(all)
+wav_of(samples<Vec<Float>>, sr<Int>)<Vec<UInt8>> -> {
+    out<Vec<UInt8>> = Vec<UInt8>()
+    frames<Int> = samples.len()
+    data_bytes<Int> = frames * 2
+    push_ascii(borrow(out), "RIFF")
+    push_u32(borrow(out), 36 + data_bytes)
+    push_ascii(borrow(out), "WAVE")
+    push_ascii(borrow(out), "fmt ")
+    push_u32(borrow(out), 16)
+    push_i16(borrow(out), 1)
+    push_i16(borrow(out), 1)
+    push_u32(borrow(out), sr)
+    push_u32(borrow(out), sr * 2)
+    push_i16(borrow(out), 2)
+    push_i16(borrow(out), 16)
+    push_ascii(borrow(out), "data")
+    push_u32(borrow(out), data_bytes)
+    i<Int> = 0
+    for (i in 0..frames - 1) {
+        s<Int> = (samples.get(i) * 32767.0) as Int
+        if (s > 32767) { s = 32767 }
+        if (s < -32768) { s = -32768 }
+        push_i16(borrow(out), s & 65535)
+    }
+    return out
+}

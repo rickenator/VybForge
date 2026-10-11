@@ -1,0 +1,87 @@
+SYNTH_PROBE begin
+WROTE /home/rick/Projects/VybForge/native/tts/out/i.wav bytes=12844
+SPEC
+27000
+229000
+301000
+12000
+400
+9000
+11000
+17000
+NAME
+i
+FILE
+/home/rick/Projects/VybForge/native/tts/out/i.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/e.wav bytes=12844
+SPEC
+53000
+184000
+248000
+12000
+400
+9000
+11000
+17000
+NAME
+e
+FILE
+/home/rick/Projects/VybForge/native/tts/out/e.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ae.wav bytes=12844
+SPEC
+66000
+172000
+241000
+12000
+400
+9000
+11000
+17000
+NAME
+ae
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ae.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/a.wav bytes=12844
+SPEC
+73000
+109000
+244000
+12000
+400
+9000
+11000
+17000
+NAME
+a
+FILE
+/home/rick/Projects/VybForge/native/tts/out/a.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/o.wav bytes=12844
+SPEC
+57000
+84000
+241000
+12000
+400
+9000
+11000
+17000
+NAME
+o
+FILE
+/home/rick/Projects/VybForge/native/tts/out/o.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/u.wav bytes=12844
+SPEC
+30000
+87000
+224000
+12000
+400
+9000
+11000
+17000
+NAME
+u
+FILE
+/home/rick/Projects/VybForge/native/tts/out/u.wav
+SYNTH_PROBE done
+0
