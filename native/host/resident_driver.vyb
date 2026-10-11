@@ -557,6 +557,13 @@ main()<Int> -> {
     QONLY<Int> = 0
     qo_s<String> = env_get("VYB_QONLY") else ""
     if (qo_s.len() > 0) { QONLY = 1; QGON = 1 }
+    # QONLY prefill of >= QPF rows (item 18): expand ONE layer at a time to f16 in a 0.2 GB scratch and
+    # run the f16 gemm (same f16 weights as the default path, so the same numbers); fewer rows use the
+    # 8-row fused twins. VYB_QPF=0 disables the scratch path.
+    QPF<Int> = 16
+    qpf_s<String> = env_get("VYB_QPF") else ""
+    if (qpf_s.len() > 0) { QPF = parse_u(qpf_s, 0, qpf_s.len()) }
+    if (QPF == 0) { QPF = 1000000000 }
     H16<Int> = 1
     h32_s<String> = env_get("VYB_HEAD32") else ""
     if (h32_s.len() > 0) { H16 = 0 }
@@ -677,6 +684,9 @@ main()<Int> -> {
         # split-K triple -- pass 1 (f32 MACs), pass 2 (f32 reduce), pass 3 (widen to the f64 C).
         q432<loc<CVoid>> = from<loc<CVoid>>(0); q632<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q432), m4, "q4kdeq32") != 0) { return 10 }
+        q416<loc<CVoid>> = from<loc<CVoid>>(0); q616<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q416), m4, "q4kdeq16") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q616), m6, "q6kdeq16") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q632), m6, "q6kdeq32") != 0) { return 10 }
         c32n<loc<CVoid>> = from<loc<CVoid>>(0); g3p<loc<CVoid>> = from<loc<CVoid>>(0)
         g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -848,6 +858,22 @@ main()<Int> -> {
         if (QONLY == 0) { if (cuMemAlloc_v2(loc(WgA), wg_nl * WES * NLAYER) != 0) { return 11 } }
         if (QONLY == 0) { if (cuMemAlloc_v2(loc(WuA), wu_nl * WES * NLAYER) != 0) { return 11 } }
         if (QONLY == 0) { if (cuMemAlloc_v2(loc(WdA), wd_nl * WES * NLAYER) != 0) { return 11 } }
+        SLq<Int> = 0; SLk<Int> = 0; SLv<Int> = 0; SLo<Int> = 0; SLg<Int> = 0; SLu<Int> = 0; SLd<Int> = 0; ST32<Int> = 0
+        if (QONLY == 1) { if (W16 == 1) { if (QPF > 0) {
+            mxn<Int> = wq_nl
+            if (wg_nl > mxn) { mxn = wg_nl }
+            if (wu_nl > mxn) { mxn = wu_nl }
+            if (wd_nl > mxn) { mxn = wd_nl }
+            if (wo_nl > mxn) { mxn = wo_nl }
+            if (cuMemAlloc_v2(loc(ST32), 256) != 0) { return 11 }   # enable flag (f16 deq writes the scratch directly)
+            if (cuMemAlloc_v2(loc(SLq), wq_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLk), wk_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLv), wv_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLo), wo_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLg), wg_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLu), wu_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLd), wd_nl * 2) != 0) { return 11 }
+        } } }
         println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * WES * NLAYER).to_string() + " bytes (" + WES.to_string() + " B/elem)")
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
@@ -1148,11 +1174,35 @@ main()<Int> -> {
                             QGL<Int> = 0
                             if (QGON == 1) { if (Srows == 1) { QGL = 1 } }
                             if (QONLY == 1) { QGL = 1 }
+                            pwq<Int> = WqA + L * wq_nl * WES; pwk<Int> = WkA + L * wk_nl * WES; pwv<Int> = WvA + L * wv_nl * WES
+                            pwo<Int> = WoA + L * wo_nl * WES; pwg<Int> = WgA + L * wg_nl * WES; pwu<Int> = WuA + L * wu_nl * WES
+                            pwd<Int> = WdA + L * wd_nl * WES
+                            if (ST32 != 0) { if (Srows >= QPF) {
+                                # long QONLY prefill: this layer's f16 weights into the one-layer scratch
+                                QGL = 0
+                                pwq = SLq; pwk = SLk; pwv = SLv; pwo = SLo; pwg = SLg; pwu = SLu; pwd = SLd
+                                dz<loc<CVoid>> = q416
+                                dz = q416; if (ltq.get(L) == 14) { dz = q616 }
+                                e = dequant_gpu(PK0, ovq.get(L), SLq, wq_nl, dz, D)
+                                dz = q416; if (ltk.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK1, ovk.get(L), SLk, wk_nl, dz, D) }
+                                dz = q416; if (ltv.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK2, ovv.get(L), SLv, wv_nl, dz, D) }
+                                dz = q416; if (lto.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK3, ovo.get(L), SLo, wo_nl, dz, NQ) }
+                                dz = q416; if (ltg.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK4, ovg.get(L), SLg, wg_nl, dz, D) }
+                                dz = q416; if (ltu.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK5, ovu.get(L), SLu, wu_nl, dz, D) }
+                                dz = q416; if (ltd.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = dequant_gpu(PK6, ovd.get(L), SLd, wd_nl, dz, FF) }
+                                if (e != 0) { println("QPF_EXPAND_ERR L=" + L.to_string()); return 72 }
+                            } }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                          N1, WqA + L * wq_nl * WES, WkA + L * wk_nl * WES, WvA + L * wv_nl * WES,
-                                          Nq, Nk, DF, WoA + L * wo_nl * WES, N2,
-                                          WgA + L * wg_nl * WES, WuA + L * wu_nl * WES, WdA + L * wd_nl * WES,
+                                          N1, pwq, pwk, pwv,
+                                          Nq, Nk, DF, pwo, N2,
+                                          pwg, pwu, pwd,
                                           XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, gwp, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,

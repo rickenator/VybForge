@@ -96,3 +96,56 @@ q6kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         }
     }
 }
+
+// f16-store twin (item 18): the QONLY long-prefill scratch takes f16 straight from the decode; the
+// value is the f32 `val` rounded once, exactly what q*deq32 + cast16 produced.
+q6kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        cw<Int> = 0
+        cc<Int> = 0
+        rr<Int> = 0
+        gsrc<Int> = gid
+        if (z > 0) {
+            cw = n / z
+            cc = gid / cw
+            rr = gid % cw
+            gsrc = rr * z + cc
+        }
+        block<Int> = gsrc / 256
+        bb<Int> = q + block * 210
+        g<Int> = (gsrc % 256) / 128
+        yl<Int> = gsrc % 128
+        quad<Int> = yl / 32
+        l<Int> = yl % 32
+        is2<Int> = l / 16
+        sidx<Int> = g * 8 + is2 + quad * 2
+        qlbase<Int> = g * 64
+        qhbase<Int> = g * 32
+        qloff<Int> = qlbase + (quad % 2) * 32 + l
+        # f32 decode arithmetic -- see q4kdeq32 for the measurement that motivates it.
+        d<Float> = ld_f16(bb + 208)
+        sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)
+        qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
+        qhb<Int> = (ld_i8(bb + 128 + qhbase + l) as Int) & 255
+        nib<Int> = 0
+        if (quad < 2) { nib = qlb & 15 } else { nib = qlb >> 4 }
+        hib<Int> = 0
+        if (quad == 0) { hib = (qhb >> 0) & 3 }
+        if (quad == 1) { hib = (qhb >> 2) & 3 }
+        if (quad == 2) { hib = (qhb >> 4) & 3 }
+        if (quad == 3) { hib = (qhb >> 6) & 3 }
+        qs<Int> = (nib | (hib << 4)) - 32
+        sf64<Float> = sc0 as Float
+        qf64<Float> = qs as Float
+        df<Float32> = d
+        sf<Float32> = sf64
+        qf<Float32> = qf64
+        val<Float32> = df * sf * qf
+        if (z > 0) {
+            st_f16(o + (cc * cw + rr) * 2, val)
+        } else {
+            st_f16(o + gid * 2, val)
+        }
+    }
+}
