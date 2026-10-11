@@ -808,7 +808,8 @@ main()<Int> -> {
         # M = 1 GEMV flavour (item 19): R = 2 packed-convert on Ampere (cc 8.x), R = 1 elsewhere
         GR = 1
         if (ccmaj == 8) { GR = 2 }
-        if (QPF < 0) { QPF = 48; if (ccmaj == 8) { QPF = 24 } }
+        # GB10 crossover re-swept after the tiled prefill GEMM: scratch path wins from ~32 rows (32: 176 vs 176 ms, 40: 197 vs 220); QPF=32 vs 48 gated identical on 6 prompts of 32..47 tokens x GEN=256
+        if (QPF < 0) { QPF = 32; if (ccmaj == 8) { QPF = 24 } }
         if (GR == 1) { if (GP == 1) { GR = 3 } }
         gr_s<String> = env_get("VYB_GEMVR") else ""
         if (gr_s == "1") { GR = 1 }
