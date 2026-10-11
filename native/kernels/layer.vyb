@@ -866,6 +866,18 @@ rms_blk(p<Int>) -> {
     xb<Int> = X + row * N * 8
     ss<Float> = 0.0
     d<Int> = t
+    # 4 loads in flight per trip (Ursela): same elements, same summation order -> bit-identical
+    while (d + 768 < N) {
+        a0<Float> = ld_f64(xb + d * 8)
+        a1<Float> = ld_f64(xb + (d + 256) * 8)
+        a2<Float> = ld_f64(xb + (d + 512) * 8)
+        a3<Float> = ld_f64(xb + (d + 768) * 8)
+        ss = ss + a0 * a0
+        ss = ss + a1 * a1
+        ss = ss + a2 * a2
+        ss = ss + a3 * a3
+        d = d + 1024
+    }
     while (d < N) {
         v<Float> = ld_f64(xb + d * 8)
         ss = ss + v * v
@@ -909,6 +921,21 @@ rms_blk(p<Int>) -> {
     r<Float> = ld_shared_f64(256)
     yb<Int> = Y + row * N * 8
     d2<Int> = t
+    while (d2 + 256 < N) {
+        xa<Float> = ld_f64(xb + d2 * 8)
+        xc<Float> = ld_f64(xb + (d2 + 256) * 8)
+        wa<Float> = ld_f64(W + d2 * 8)
+        wc<Float> = ld_f64(W + (d2 + 256) * 8)
+        ya<Float> = xa * r * wa
+        yc<Float> = xc * r * wc
+        st_f64(yb + d2 * 8, ya)
+        st_f64(yb + (d2 + 256) * 8, yc)
+        if (Y32 != 0) {
+            st_f32(Y32 + (row * N + d2) * 4, ya)
+            st_f32(Y32 + (row * N + d2 + 256) * 4, yc)
+        }
+        d2 = d2 + 512
+    }
     while (d2 < N) {
         xv<Float> = ld_f64(xb + d2 * 8)
         wv<Float> = ld_f64(W + d2 * 8)
