@@ -261,12 +261,17 @@ normb(rbf<loc<CVoid>>, PB<Int>, X<Int>, W<Int>, Y<Int>, M<Int>, N<Int>, ep<Float
 // Fused quantized GEMV launch (Ursela): Y[M,N] (f64) = X[M,K] (f32) . W^T, W = resident Q4_K (ty 12)
 // or Q6_K (ty 14) rows. 48-byte param block {W, X, Y, M, N, K}; ceil(N/16) blocks x 512 threads.
 struct QGB { w<Int>, x<Int>, y<Int>, m<Int>, n<Int>, k<Int> }
-gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>)<Int> -> {
+gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>)<Int> -> {
     qb<QGB> = QGB { w = W, x = X, y = Y, m = M, n = N, k = K }
     freedom {
         cuMemcpyAsync(PB, loc(qb), 48, 0)
+        # M > 1 (prefill): the 8-row twins reuse each decoded weight for 8 activation rows.
         qfn<loc<CVoid>> = q4f
         if (ty == 14) { qfn = q6f }
+        if (M > 1) {
+            qfn = q4m
+            if (ty == 14) { qfn = q6m }
+        }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(qfn)), (N + 15) / 16, 1, 1, 512, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("GEMVQ_ERR rc=" + rc.to_string()); return 79 }
         return 0
@@ -318,7 +323,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
-          QG<Int>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, QPB<Int>,
+          QG<Int>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
           Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
@@ -334,13 +339,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, 12, QPB, Pq, XN32, DQ, S, NQ, D) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, 12, QPB, Pq, XN32, DQ, S, NQ, D) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, 12, QPB, Pk, XN32, DK, S, NKV, D) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, 12, QPB, Pk, XN32, DK, S, NKV, D) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         }
@@ -349,7 +354,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (KC != 0) { vdst = VC + P0 * NKV * 8 }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, Tv, QPB, Pv, XN32, vdst, S, NKV, D) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, Tv, QPB, Pv, XN32, vdst, S, NKV, D) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
         }
@@ -394,7 +399,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
         if (QG == 1) {
-            if (gemvq(q4f, q6f, 12, QPB, Po, DC32, DO, S, D, NQ) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, 12, QPB, Po, DC32, DO, S, D, NQ) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         }
@@ -404,13 +409,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
         gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, 12, QPB, Pg, X132, Gr, S, FF, D) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, 12, QPB, Pg, X132, Gr, S, FF, D) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
         }
         gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, 12, QPB, Pu, X132, Up, S, FF, D) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, 12, QPB, Pu, X132, Up, S, FF, D) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
         }
@@ -419,7 +424,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
         if (QG == 1) {
-            if (gemvq(q4f, q6f, Td, QPB, Pd, HU32, M, S, D, FF) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, Td, QPB, Pd, HU32, M, S, D, FF) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         }
@@ -477,6 +482,11 @@ main()<Int> -> {
     QGON<Int> = 1
     qg_s<String> = env_get("VYB_GEMV16") else ""
     if (qg_s.len() > 0) { QGON = 0 }
+    # VYB_QONLY=1: no expanded weight copy at all (saves the 7.3 GB f16 block + 0.4 GB f32 scratch and
+    # the load-time expansion); prefill also runs the quantized GEMV (8-row twins).
+    QONLY<Int> = 0
+    qo_s<String> = env_get("VYB_QONLY") else ""
+    if (qo_s.len() > 0) { QONLY = 1; QGON = 1 }
     H16<Int> = 1
     h32_s<String> = env_get("VYB_HEAD32") else ""
     if (h32_s.len() > 0) { H16 = 0 }
@@ -601,6 +611,9 @@ main()<Int> -> {
         q4f<loc<CVoid>> = from<loc<CVoid>>(0); q6f<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
+        q4m<loc<CVoid>> = from<loc<CVoid>>(0); q6m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m), mw, "gemv_q4k_m8") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m), mw, "gemv_q6k_m8") != 0) { return 10 }
         l16p<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(l16p), mw, "logits16_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
@@ -679,13 +692,13 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Wd), wd_nl * 8) != 0) { return 11 }
         # f32 path (VybForge#23): weights as f32, the four gemm A-operands as f32 copies, the f32
         # partial scratch and reduce output, and two 24-byte param blocks + a 64-byte readback block.
-        if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wk32), wk_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wv32), wv_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wo32), wo_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wk32), wk_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wv32), wv_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wo32), wo_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 } }
         # (MAXS + 4) rows: gemm32_p covers 4 rows per thread and READS the padding (never stores it).
         if (cuMemAlloc_v2(loc(XN32), (MAXS + 4) * D * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DC32), (MAXS + 4) * NQ * 4) != 0) { return 11 }
@@ -704,13 +717,13 @@ main()<Int> -> {
         # (attn_v, ffn_down) changes the packed size, never the element count.
         WES<Int> = 4
         if (W16 == 1) { WES = 2 }   # bytes per resident weight element
-        if (cuMemAlloc_v2(loc(WqA), wq_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WkA), wk_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WvA), wv_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WoA), wo_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WgA), wg_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WuA), wu_nl * WES * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WdA), wd_nl * WES * NLAYER) != 0) { return 11 }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WqA), wq_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WkA), wk_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WvA), wv_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WoA), wo_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WgA), wg_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WuA), wu_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WdA), wd_nl * WES * NLAYER) != 0) { return 11 } }
         println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * WES * NLAYER).to_string() + " bytes (" + WES.to_string() + " B/elem)")
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
@@ -833,7 +846,8 @@ main()<Int> -> {
         # The per-token dequant recomputed weights that never change between tokens. With f32 (half
         # the f64 footprint) the whole expansion fits in the card, so it happens once here and the
         # token loop does no dequantizing at all.
-        for (L in 0..NLAYER - 1) {
+        if (QONLY == 1) { println("QONLY: no expanded weights (decode + prefill read the packed Q4_K/Q6_K blocks)") }
+        for (L in 0..(NLAYER * (1 - QONLY)) - 1) {
             avtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
             avqA<loc<CVoid>> = q432
             if (avtA == 14) { avqA = q632 }
@@ -989,6 +1003,7 @@ main()<Int> -> {
                             if (KVON == 1) { KCl = KCA + L * MAXS * NKV * 8; VCl = VCA + L * MAXS * NKV * 8 }
                             QGL<Int> = 0
                             if (QGON == 1) { if (Srows == 1) { QGL = 1 } }
+                            if (QONLY == 1) { QGL = 1 }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, WqA + L * wq_nl * WES, WkA + L * wk_nl * WES, WvA + L * wv_nl * WES,
@@ -1000,7 +1015,7 @@ main()<Int> -> {
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
                                           amxf, aexf, asmf, anrf, EWB, MSB,
                                           rbf, RBP, RBQ, W16 * 2,
-                                          QGL, q4f, q6f, QPB,
+                                          QGL, q4f, q6f, q4m, q6m, QPB,
                                           PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
                                           PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),
                                           tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")),
