@@ -413,6 +413,25 @@ gemv_q4k(p<Int>) -> {
     tid<Int> = tid_x()
     l<Int> = tid % 32
     n0<Int> = (blk_x() * 16 + tid / 32) * 2
+    # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
+    # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
+    NS2<Int> = ld_i64(p + 64)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
     nsb<Int> = K / 256
     c16<Float32> = 0.0000152587890625 as Float32
     c8<Float32> = 0.00390625 as Float32
@@ -710,6 +729,25 @@ gemv_q6k(p<Int>) -> {
     tid<Int> = tid_x()
     l<Int> = tid % 32
     n0<Int> = (blk_x() * 16 + tid / 32) * 2
+    # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
+    # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
+    NS2<Int> = ld_i64(p + 64)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
     nsb<Int> = K / 256
     c16<Float32> = 0.0000152587890625 as Float32
     c8<Float32> = 0.00390625 as Float32
@@ -1658,6 +1696,25 @@ gemv_q4k_p2(p<Int>) -> {
     tid<Int> = tid_x()
     l<Int> = tid % 32
     n0<Int> = (blk_x() * 8 + tid / 32) * 1
+    # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
+    # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
+    NS2<Int> = ld_i64(p + 64)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
     nsb<Int> = K / 256
     c16<Float32> = 0.0000152587890625 as Float32
     c8<Float32> = 0.00390625 as Float32
@@ -1901,6 +1958,25 @@ gemv_q6k_p2(p<Int>) -> {
     tid<Int> = tid_x()
     l<Int> = tid % 32
     n0<Int> = (blk_x() * 8 + tid / 32) * 1
+    # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
+    # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
+    NS2<Int> = ld_i64(p + 64)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
     nsb<Int> = K / 256
     c16<Float32> = 0.0000152587890625 as Float32
     c8<Float32> = 0.00390625 as Float32
