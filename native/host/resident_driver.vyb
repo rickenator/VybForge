@@ -339,7 +339,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
-          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -354,13 +354,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pq, XN32, DQ, S, NQ, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tq, QPB, Pq, XN32, DQ, S, NQ, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pk, XN32, DK, S, NKV, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tk, QPB, Pk, XN32, DK, S, NKV, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         }
@@ -449,7 +449,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Po, DC32, DO, S, D, NQ, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, To, QPB, Po, DC32, DO, S, D, NQ, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         }
@@ -459,13 +459,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
         gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pg, X132, Gr, S, FF, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tg, QPB, Pg, X132, Gr, S, FF, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
         }
         gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pu, X132, Up, S, FF, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tu, QPB, Pu, X132, Up, S, FF, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
         }
@@ -739,34 +739,58 @@ main()<Int> -> {
         ii0 = find_nm(nmv, "blk.0.ffn_norm.weight"); n2n<Int> = nlv.get(ii0)
         nstride<Int> = n1n + nqn + nkn + n2n
 
-        # Qwen3-4B-Q4_K_M MIXES quantization per layer: attn_v and ffn_down are
-        # Q6_K (ty 14, numel*210/256) on some layers, Q4_K (ty 12, numel*144/256)
-        # on others (verified in the TSV), so their PACKED SIZE varies per layer.
-        # The other 5 tensor kinds are uniformly Q4_K. Build per-layer cumulative
-        # packed byte offsets + sizes for the two variable kinds.
-        ov2<Vec<Int>> = Vec(); os2<Vec<Int>> = Vec()
-        ov6<Vec<Int>> = Vec(); os6<Vec<Int>> = Vec()
-        run2<Int> = 0; run6<Int> = 0
+        # Per-layer quant type of EVERY weight kind (item 23): Qwen3-4B-Q4_K_M already mixes Q6_K/Q4_K
+        # per layer for attn_v and ffn_down, and quality recipes (see the log) put Q6_K on any of the
+        # seven kinds. Each kind gets per-layer packed byte offsets, sizes and types; Q4_K (12) and
+        # Q6_K (14) are supported (fused GEMV, M-blocked prefill, f32/f16 expansion).
+        ovq<Vec<Int>> = Vec(); osq<Vec<Int>> = Vec(); ltq<Vec<Int>> = Vec(); runq<Int> = 0
+        ovk<Vec<Int>> = Vec(); osk<Vec<Int>> = Vec(); ltk<Vec<Int>> = Vec(); runk<Int> = 0
+        ovv<Vec<Int>> = Vec(); osv<Vec<Int>> = Vec(); ltv<Vec<Int>> = Vec(); runv<Int> = 0
+        ovo<Vec<Int>> = Vec(); oso<Vec<Int>> = Vec(); lto<Vec<Int>> = Vec(); runo<Int> = 0
+        ovg<Vec<Int>> = Vec(); osg<Vec<Int>> = Vec(); ltg<Vec<Int>> = Vec(); rung<Int> = 0
+        ovu<Vec<Int>> = Vec(); osu<Vec<Int>> = Vec(); ltu<Vec<Int>> = Vec(); runu<Int> = 0
+        ovd<Vec<Int>> = Vec(); osd<Vec<Int>> = Vec(); ltd<Vec<Int>> = Vec(); rund<Int> = 0
         Lx<Int> = 0
         for (Lx in 0..NLAYER - 1) {
-            t2<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_v.weight"))
-            sz2<Int> = 0
-            if (t2 == 12) { sz2 = wv_nl * 144 / 256 } else { sz2 = wv_nl * 210 / 256 }
-            ov2.push(run2); os2.push(sz2); run2 = run2 + sz2
-            t6<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_down.weight"))
-            sz6<Int> = 0
-            if (t6 == 12) { sz6 = wd_nl * 144 / 256 } else { sz6 = wd_nl * 210 / 256 }
-            ov6.push(run6); os6.push(sz6); run6 = run6 + sz6
+            tx<Int> = 0; sx<Int> = 0
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_q.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_q L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wq_nl, tx)
+            ovq.push(runq); osq.push(sx); ltq.push(tx); runq = runq + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_k.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_k L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wk_nl, tx)
+            ovk.push(runk); osk.push(sx); ltk.push(tx); runk = runk + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_v.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_v L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wv_nl, tx)
+            ovv.push(runv); osv.push(sx); ltv.push(tx); runv = runv + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_output.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_output L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wo_nl, tx)
+            ovo.push(runo); oso.push(sx); lto.push(tx); runo = runo + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_gate.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_gate L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wg_nl, tx)
+            ovg.push(rung); osg.push(sx); ltg.push(tx); rung = rung + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_up.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_up L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wu_nl, tx)
+            ovu.push(runu); osu.push(sx); ltu.push(tx); runu = runu + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_down.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_down L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wd_nl, tx)
+            ovd.push(rund); osd.push(sx); ltd.push(tx); rund = rund + sx
         }
 
         PK0<Int> = 0; PK1<Int> = 0; PK2<Int> = 0; PK3<Int> = 0; PK4<Int> = 0; PK5<Int> = 0; PK6<Int> = 0
-        if (cuMemAlloc_v2(loc(PK0), K0 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK1), K1 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK2), run2) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK3), K3 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK4), K4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK5), K5 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK6), run6) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK0), runq) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK1), runk) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK2), runv) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK3), runo) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK4), rung) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK5), runu) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK6), rund) != 0) { return 11 }
         Wq<Int> = 0; Wk<Int> = 0; Wv<Int> = 0; Wo<Int> = 0; Wg<Int> = 0; Wu<Int> = 0; Wd<Int> = 0
         N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; ON<Int> = 0
         DE<Int> = 0; EMB<Int> = 0; HA<Int> = 0; HB<Int> = 0; DH<Int> = 0
@@ -913,40 +937,40 @@ main()<Int> -> {
         L<Int> = 0
         e<Int> = 0
         for (L in 0..NLAYER - 1) {
-            # attn_q (uniform Q4_K)
-            pd<String> = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_q.weight")), K0)
-            if (pd.len() < K0) { println("SHORTED pk attn_q L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK0 + K0 * L, K0) }
+            # attn_q (per-layer type ltq)
+            pd<String> = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_q.weight")), osq.get(L))
+            if (pd.len() < osq.get(L)) { println("SHORTED pk attn_q L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK0 + ovq.get(L), osq.get(L)) }
             if (e != 0) { return 66 }
-            # attn_k (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_k.weight")), K1)
-            if (pd.len() < K1) { println("SHORTED pk attn_k L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK1 + K1 * L, K1) }
+            # attn_k (per-layer type ltk)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_k.weight")), osk.get(L))
+            if (pd.len() < osk.get(L)) { println("SHORTED pk attn_k L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK1 + ovk.get(L), osk.get(L)) }
             if (e != 0) { return 66 }
-            # attn_v (MIXED Q6_K/Q4_K per layer -> per-layer offset os2/ov2)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")), os2.get(L))
-            if (pd.len() < os2.get(L)) { println("SHORTED pk attn_v L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK2 + ov2.get(L), os2.get(L)) }
+            # attn_v (per-layer type ltv)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")), osv.get(L))
+            if (pd.len() < osv.get(L)) { println("SHORTED pk attn_v L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK2 + ovv.get(L), osv.get(L)) }
             if (e != 0) { return 66 }
-            # attn_output (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_output.weight")), K3)
-            if (pd.len() < K3) { println("SHORTED pk attn_output L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK3 + K3 * L, K3) }
+            # attn_output (per-layer type lto)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_output.weight")), oso.get(L))
+            if (pd.len() < oso.get(L)) { println("SHORTED pk attn_output L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK3 + ovo.get(L), oso.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_gate (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_gate.weight")), K4)
-            if (pd.len() < K4) { println("SHORTED pk ffn_gate L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK4 + K4 * L, K4) }
+            # ffn_gate (per-layer type ltg)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_gate.weight")), osg.get(L))
+            if (pd.len() < osg.get(L)) { println("SHORTED pk ffn_gate L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK4 + ovg.get(L), osg.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_up (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_up.weight")), K5)
-            if (pd.len() < K5) { println("SHORTED pk ffn_up L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK5 + K5 * L, K5) }
+            # ffn_up (per-layer type ltu)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_up.weight")), osu.get(L))
+            if (pd.len() < osu.get(L)) { println("SHORTED pk ffn_up L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK5 + ovu.get(L), osu.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_down (MIXED Q6_K/Q4_K per layer -> per-layer offset os6/ov6)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")), os6.get(L))
-            if (pd.len() < os6.get(L)) { println("SHORTED pk ffn_down L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK6 + ov6.get(L), os6.get(L)) }
+            # ffn_down (per-layer type ltd)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")), osd.get(L))
+            if (pd.len() < osd.get(L)) { println("SHORTED pk ffn_down L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK6 + ovd.get(L), osd.get(L)) }
             if (e != 0) { return 66 }
             if (L % 6 == 0) { println("PACKED_UPLOADED layer " + L.to_string() + "/36") }
         }
@@ -958,21 +982,29 @@ main()<Int> -> {
         # token loop does no dequantizing at all.
         if (QONLY == 1) { println("QONLY: no expanded weights (decode + prefill read the packed Q4_K/Q6_K blocks)") }
         for (L in 0..(NLAYER * (1 - QONLY)) - 1) {
-            avtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-            avqA<loc<CVoid>> = q432
-            if (avtA == 14) { avqA = q632 }
-            fdtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-            fdqA<loc<CVoid>> = q432
-            if (fdtA == 14) { fdqA = q632 }
+            dqq<loc<CVoid>> = q432
+            if (ltq.get(L) == 14) { dqq = q632 }
+            dqk<loc<CVoid>> = q432
+            if (ltk.get(L) == 14) { dqk = q632 }
+            dqv<loc<CVoid>> = q432
+            if (ltv.get(L) == 14) { dqv = q632 }
+            dqo<loc<CVoid>> = q432
+            if (lto.get(L) == 14) { dqo = q632 }
+            dqg<loc<CVoid>> = q432
+            if (ltg.get(L) == 14) { dqg = q632 }
+            dqu<loc<CVoid>> = q432
+            if (ltu.get(L) == 14) { dqu = q632 }
+            dqd<loc<CVoid>> = q432
+            if (ltd.get(L) == 14) { dqd = q632 }
             if (W16 == 1) {
                 # f32 into the per-layer scratch (Wq32..Wd32), then narrowed to f16 in the resident block.
-                e = dequant_gpu(PK0, K0 * L, Wq32, wq_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK1, K1 * L, Wk32, wk_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK2, ov2.get(L), Wv32, wv_nl, avqA, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK3, K3 * L, Wo32, wo_nl, q432, NQ); if (e != 0) { return 70 }
-                e = dequant_gpu(PK4, K4 * L, Wg32, wg_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK5, K5 * L, Wu32, wu_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK6, ov6.get(L), Wd32, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+                e = dequant_gpu(PK0, ovq.get(L), Wq32, wq_nl, dqq, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, ovk.get(L), Wk32, wk_nl, dqk, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ovv.get(L), Wv32, wv_nl, dqv, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, ovo.get(L), Wo32, wo_nl, dqo, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, ovg.get(L), Wg32, wg_nl, dqg, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, ovu.get(L), Wu32, wu_nl, dqu, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ovd.get(L), Wd32, wd_nl, dqd, FF); if (e != 0) { return 70 }
                 e = cast1(c16n, CPB, Wq32, WqA + L * wq_nl * 2, wq_nl); if (e != 0) { return 70 }
                 e = cast1(c16n, CPB, Wk32, WkA + L * wk_nl * 2, wk_nl); if (e != 0) { return 70 }
                 e = cast1(c16n, CPB, Wv32, WvA + L * wv_nl * 2, wv_nl); if (e != 0) { return 70 }
@@ -981,13 +1013,13 @@ main()<Int> -> {
                 e = cast1(c16n, CPB, Wu32, WuA + L * wu_nl * 2, wu_nl); if (e != 0) { return 70 }
                 e = cast1(c16n, CPB, Wd32, WdA + L * wd_nl * 2, wd_nl); if (e != 0) { return 70 }
             } else {
-                e = dequant_gpu(PK0, K0 * L, WqA + L * wq_nl * 4, wq_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK1, K1 * L, WkA + L * wk_nl * 4, wk_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK2, ov2.get(L), WvA + L * wv_nl * 4, wv_nl, avqA, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK3, K3 * L, WoA + L * wo_nl * 4, wo_nl, q432, NQ); if (e != 0) { return 70 }
-                e = dequant_gpu(PK4, K4 * L, WgA + L * wg_nl * 4, wg_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK5, K5 * L, WuA + L * wu_nl * 4, wu_nl, q432, D); if (e != 0) { return 70 }
-                e = dequant_gpu(PK6, ov6.get(L), WdA + L * wd_nl * 4, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+                e = dequant_gpu(PK0, ovq.get(L), WqA + L * wq_nl * 4, wq_nl, dqq, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, ovk.get(L), WkA + L * wk_nl * 4, wk_nl, dqk, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ovv.get(L), WvA + L * wv_nl * 4, wv_nl, dqv, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, ovo.get(L), WoA + L * wo_nl * 4, wo_nl, dqo, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, ovg.get(L), WgA + L * wg_nl * 4, wg_nl, dqg, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, ovu.get(L), WuA + L * wu_nl * 4, wu_nl, dqu, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ovd.get(L), WdA + L * wd_nl * 4, wd_nl, dqd, FF); if (e != 0) { return 70 }
             }
             if (L % 6 == 0) { println("WEIGHTS_EXPANDED layer " + L.to_string() + "/36") }
         }
@@ -1127,10 +1159,9 @@ main()<Int> -> {
                                           rbf, RBP, RBQ, W16 * 2,
                                           AT2ON, KV32ON, as4f, ac4f, EW32, as3f, ac3f, acr3f, as2f, asxf, ac2f, acrf, PCB,
                                           QGL, GR, q4s, q6s, q4f, q6f, q4m, q6m, QPB,
-                                          PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
-                                          PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),
-                                          tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")),
-                                          tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")))
+                                          PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
+                                          PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L))
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
