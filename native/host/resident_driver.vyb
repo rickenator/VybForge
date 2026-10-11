@@ -400,7 +400,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
-          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>)<Int> -> {
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -458,19 +458,27 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 
         if (QV == 0) { println("RLR qkvok") }
         # q/k norms: rows of HD, one block per (row, head); separate param blocks so the two stay in flight
+        fzn<Int> = 0
+        if (FZ == 1) { if (HD == 128) { fzn = 1 } }
+        if (fzn == 0) {
         if (normb(rbf, RBP + 64, DQ, Nq, DQN, S * H, HD, EPS, 0) != 0) { return 75 }
         if (normb(rbf, RBQ, DK, Nk, DKN, S * KVH, HD, EPS, 0) != 0) { return 75 }
+        }
 
         # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
         kdst<Int> = DKr
         if (KC != 0) { kdst = KC + P0 * NKV * KEL }
         rtb<Int> = 0
         if (HD == 128) { rtb = DF + 512 }
-        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = rtb, z1 = KEL, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0,
+        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = rtb, z1 = KEL, z2 = DQ, z3 = DK, z4 = Nq, z5 = Nk, z6 = RBP, z7 = 0,
                          fr = DF, s = S, z8 = 0, hd = HD, h = H, kvh = KVH, pos = P0 }
         cuMemcpyAsync(ROP + 80, loc(rpb), 152, 0)
         rope_total<Int> = S * H * HD + S * KVH * HD
-        cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        if (fzn == 1) {
+            cuda_launch4i(from<loc<CVoid>>(addr(qknf)), S * (H + KVH), 1, 1, 128, 1, 1, ROP, 0, 0, 0)
+        } else {
+            cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        }
         if (QV == 0) { println("RLR ropeok") }
         if (KEL == 4) { if (VYE == 8) {
             if (cast1(c32n, CPB, DV, VC + P0 * NKV * 4, S * NKV) != 0) { return 77 }
@@ -800,6 +808,8 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
         s32f<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(s32f), ml, "silu32") != 0) { return 10 }
+        qknf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(qknf), ml, "qknrope") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
@@ -1342,7 +1352,7 @@ main()<Int> -> {
                                           QGL, GR, q4s, q6s, q4f, q6f, q4m, q6m, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
-                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f)
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt

@@ -1372,3 +1372,99 @@ silu32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
         st_f32(h + gid * 4, hv)
     }
 }
+
+// q-norm + k-norm + RoPE in ONE launch (Ursela, launch fusion; was rms_blk x2 + qwen3rope). One block of
+// HD = 128 threads per (row, head) over the S*H q heads then the S*KVH k heads. Same f64 math as
+// rms_blk (its 256-thread tree's first step only adds the +0.0 partials of idle threads, exact) and
+// as qwen3rope's table path (TB != 0), so the rotated q/k are bit-identical. RoPE params at ROP+80
+// (RPB) plus z2 = q src, z3 = k src, z4 = q-norm weight, z5 = k-norm weight, z6 = a rms_blk param
+// block (eps at +40). q/k-norm outputs (xn rows) double as the rsqrt bit-trick scratch, as in rms_blk.
+qknrope(p<Int>) -> {
+    XQ<Int> = ld_i64(p + 80)
+    XK<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    TB<Int> = ld_i64(p + 112)
+    KE4<Int> = ld_i64(p + 120)
+    SQ<Int> = ld_i64(p + 128)
+    SK<Int> = ld_i64(p + 136)
+    WQ<Int> = ld_i64(p + 144)
+    WK<Int> = ld_i64(p + 152)
+    eps<Float> = ld_f64(ld_i64(p + 160) + 40)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    b<Int> = blk_x()
+    t<Int> = tid_x()
+    isq<Int> = 1
+    rb<Int> = b
+    if (b >= S * H) { isq = 0; rb = b - S * H }
+    src<Int> = SQ + rb * HD * 8
+    wt<Int> = WQ
+    xn<Int> = XQ + rb * HD * 8
+    s<Int> = rb / H
+    if (isq == 0) {
+        src = SK + rb * HD * 8
+        wt = WK
+        xn = XK + rb * HD * 8
+        s = rb / KVH
+    }
+    v<Float> = ld_f64(src + t * 8)
+    ss<Float> = 0.0
+    ss = ss + v * v
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 64
+    while (st2 > 0) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t == 0) {
+        x<Float> = ld_shared_f64(0) / (HD as Float) + eps
+        sq<Float> = 0.0
+        if (x > 0.000000001) {
+            if (x < 1000000000.0) {
+                st_f64(xn, x)
+                bits<Int> = ld_i64(xn)
+                st_i64(xn, 6910469410427058089 - bits / 2)
+                y<Float> = x * ld_f64(xn)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                sq = y
+            }
+        }
+        if (sq == 0.0) { sq = vsqrt(x, 24) }
+        st_shared_f64(256, 1.0 / sq)
+    }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    xv<Float> = ld_f64(src + t * 8)
+    wv<Float> = ld_f64(wt + t * 8)
+    yn<Float> = xv * r * wv
+    st_shared_f64(t, yn)
+    kernel_barrier()
+    tix<Int> = TB + ((POS + s) * half + t % half) * 16
+    c<Float> = ld_f64(tix)
+    sn<Float> = ld_f64(tix + 8)
+    o<Float> = 0.0
+    if (t < half) {
+        v1<Float> = ld_shared_f64(t + half)
+        o = yn * c - v1 * sn
+    } else {
+        v1b<Float> = ld_shared_f64(t - half)
+        o = yn * c + v1b * sn
+    }
+    if (isq == 1) {
+        st_f64(Qd + (rb * HD + t) * 8, o)
+    } else {
+        if (KE4 == 4) { st_f32(Kd + (rb * HD + t) * 4, o as Float32) } else { st_f64(Kd + (rb * HD + t) * 8, o) }
+    }
+}
