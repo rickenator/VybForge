@@ -440,7 +440,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
-          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>, g3a<loc<CVoid>>)<Int> -> {
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>, g3a<loc<CVoid>>, as5f<loc<CVoid>>, ac5f<loc<CVoid>>, APFy<Int>, aktf<loc<CVoid>>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -540,10 +540,22 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             # weighted V sum -- bit-identical to attn_kv / attn.
             if (AT2 == 4) { if (KEL == 4) {
                 # f32-math attention (VYB_ATTN=4 with VYB_KV32=1)
-                cuda_launch4i(from<loc<CVoid>>(addr(as4f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                # prefill (S >= APF, HD == 128): thread-per-score attn_sc5 + chunk-fused attn_cx5 (bit-identical)
+                apv<Int> = 0
+                if (S >= APFy) { if (HD == 128) { apv = 1 } }
+                if (apv == 1) {
+                    cuda_launch4i(from<loc<CVoid>>(addr(aktf)), (TT * KVH * 128 + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(as5f)), S * KVH * ((TT + 127) / 128), 1, 1, 128, 1, 1, ATT, 0, 0, 0)
+                } else {
+                    cuda_launch4i(from<loc<CVoid>>(addr(as4f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                }
                 cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
-                cuda_launch4i(from<loc<CVoid>>(addr(ac4f)), S * KVH * 32, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
-                cuda_launch4i(from<loc<CVoid>>(addr(acr3f)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                if (apv == 1) {
+                    cuda_launch4i(from<loc<CVoid>>(addr(ac5f)), S * KVH, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                } else {
+                    cuda_launch4i(from<loc<CVoid>>(addr(ac4f)), S * KVH * 32, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(acr3f)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                }
             } else { return 81 } }
             if (AT2 == 3) {
                 # GQA-grouped parallel attention (Ursela, item 22)
@@ -778,6 +790,10 @@ main()<Int> -> {
     MBX<Int> = 1
     # GTILE = 1: f16 prefill gemm pass 1 is the register-tiled gemm16_t (VYB_GTILE=0: gemm16_p)
     GTILE<Int> = 1
+    # APF: rows from which the f32 attention uses the prefill kernels attn_sc5/attn_cx5 (VYB_APF=0 off)
+    APF<Int> = 16
+    apf_s<String> = env_get("VYB_APF") else ""
+    if (apf_s == "0") { APF = 1000000000 }
     # GTK = 1 (default; VYB_GTK=0 off): adaptive split-K depth for the tiled prefill GEMM. Gated: 9 prompts of
     # 24..512 tokens x GEN=256 tokens identical to GTK=0 on GB10 and the 3090 (18/18).
     GTK<Int> = 1
@@ -871,6 +887,12 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(g16t), ml, "gemm16_t") != 0) { return 10 }
         g16a<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(g16a), ml, "apack") != 0) { return 10 }
+        as5h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as5h), ml, "attn_sc5") != 0) { return 10 }
+        ac5h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(ac5h), ml, "attn_cx5") != 0) { return 10 }
+        akth<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(akth), ml, "attn_kt") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
@@ -1470,7 +1492,7 @@ main()<Int> -> {
                                           QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
-                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK, g16a)
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK, g16a, as5h, ac5h, APF, akth)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
