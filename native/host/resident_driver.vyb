@@ -531,6 +531,7 @@ main()<Int> -> {
         NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
         RSPB<Int> = 0; RSB<Int> = 0; SNB<Int> = 0; CHN<Int> = 256
         Wq32<Int> = 0; Wk32<Int> = 0; Wv32<Int> = 0; Wo32<Int> = 0; Wg32<Int> = 0; Wu32<Int> = 0; Wd32<Int> = 0
+        WqA<Int> = 0; WkA<Int> = 0; WvA<Int> = 0; WoA<Int> = 0; WgA<Int> = 0; WuA<Int> = 0; WdA<Int> = 0
         XN32<Int> = 0; DC32<Int> = 0; X132<Int> = 0; HU32<Int> = 0; SK32<Int> = 0; SCR32<Int> = 0
         CPB<Int> = 0; WPB<Int> = 0; RDB<Int> = 0
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
@@ -558,6 +559,20 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(CPB), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(WPB), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RDB), 64) != 0) { return 11 }
+        # ALL 36 LAYERS' f32 WEIGHTS (VybForge#23): the per-token dequant was 112 ms of a 219 ms
+        # token (51%) recomputing weights that never change between tokens -- it was per-token only
+        # for capacity. The f64 expansion needs ~29 GB and does not fit; the f32 one is ~14.5 GB and
+        # does. This deletes the per-token dequant entirely. The per-layer SHAPES are uniform, so
+        # each tensor is one base pointer plus L * (numel * 4): the per-layer quant-type variation
+        # (attn_v, ffn_down) changes the packed size, never the element count.
+        if (cuMemAlloc_v2(loc(WqA), wq_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WkA), wk_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WvA), wv_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WoA), wo_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WgA), wg_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WuA), wu_nl * 4 * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WdA), wd_nl * 4 * NLAYER) != 0) { return 11 }
+        println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * 4 * NLAYER).to_string() + " bytes")
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
@@ -654,6 +669,28 @@ main()<Int> -> {
         }
         println("ALL_PACKED_RESIDENT")
 
+        # ---- expand ALL 36 layers to f32 ONCE (VybForge#23) ----
+        # The per-token dequant recomputed weights that never change between tokens. With f32 (half
+        # the f64 footprint) the whole expansion fits in the card, so it happens once here and the
+        # token loop does no dequantizing at all.
+        for (L in 0..NLAYER - 1) {
+            avtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
+            avqA<loc<CVoid>> = q432
+            if (avtA == 14) { avqA = q632 }
+            fdtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
+            fdqA<loc<CVoid>> = q432
+            if (fdtA == 14) { fdqA = q632 }
+            e = dequant_gpu(PK0, K0 * L, WqA + L * wq_nl * 4, wq_nl, q432, D); if (e != 0) { return 70 }
+            e = dequant_gpu(PK1, K1 * L, WkA + L * wk_nl * 4, wk_nl, q432, D); if (e != 0) { return 70 }
+            e = dequant_gpu(PK2, ov2.get(L), WvA + L * wv_nl * 4, wv_nl, avqA, D); if (e != 0) { return 70 }
+            e = dequant_gpu(PK3, K3 * L, WoA + L * wo_nl * 4, wo_nl, q432, NQ); if (e != 0) { return 70 }
+            e = dequant_gpu(PK4, K4 * L, WgA + L * wg_nl * 4, wg_nl, q432, D); if (e != 0) { return 70 }
+            e = dequant_gpu(PK5, K5 * L, WuA + L * wu_nl * 4, wu_nl, q432, D); if (e != 0) { return 70 }
+            e = dequant_gpu(PK6, ov6.get(L), WdA + L * wd_nl * 4, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+            if (L % 6 == 0) { println("WEIGHTS_EXPANDED layer " + L.to_string() + "/36") }
+        }
+        println("ALL_WEIGHTS_EXPANDED")
+
         # ---- all 36 layers' norms: expand ONCE, resident (VybForge#23) ----
         # Measured before this change: the four load_norm calls in the gen loop cost 7.5% of a token
         # (norm_ms in RESIDENT_BREAKDOWN) — 144 file reads + H2D uploads + launches per token, on
@@ -735,21 +772,9 @@ main()<Int> -> {
                             e<Int> = 0
                             nmT = nmT + (time_mono_millis() - phA)
                             phB<Int> = time_mono_millis()
-                            e = dequant_gpu(PK0, K0 * L, Wq32, wq_nl, q432, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK1, K1 * L, Wk32, wk_nl, q432, D); if (e != 0) { return 70 }
-                            # attn_v: kernel by this layer's real quant type (Q6_K ty14 -> q6fn, else q4fn)
-                            avt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-                            avq<loc<CVoid>> = q432
-                            if (avt == 14) { avq = q632 }
-                            e = dequant_gpu(PK2, ov2.get(L), Wv32, wv_nl, avq, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK3, K3 * L, Wo32, wo_nl, q432, NQ); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK4, K4 * L, Wg32, wg_nl, q432, D); if (e != 0) { return 70 }
-                            e = dequant_gpu(PK5, K5 * L, Wu32, wu_nl, q432, D); if (e != 0) { return 70 }
-                            # ffn_down: kernel by this layer's real quant type
-                            fdt<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-                            fdq<loc<CVoid>> = q432
-                            if (fdt == 14) { fdq = q632 }
-                            e = dequant_gpu(PK6, ov6.get(L), Wd32, wd_nl, fdq, FF); if (e != 0) { return 70 }
+                            # No per-token dequant: every layer was expanded to f32 once at load
+                            # (ALL_WEIGHTS_EXPANDED). dqT is kept so the breakdown stays comparable and
+                            # now measures the residual.
                             dqT = dqT + (time_mono_millis() - phB)
                             if (QV == 0) { println("DECG deqdone L" + L.to_string()) }
                             phC<Int> = time_mono_millis()
@@ -757,7 +782,9 @@ main()<Int> -> {
                             if ((L % 2) == 1) { tgt = HB }
                             e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                          N1, Wq32, Wk32, Wv32, Nq, Nk, DF, Wo32, N2, Wg32, Wu32, Wd32,
+                                          N1, WqA + L * wq_nl * 4, WkA + L * wk_nl * 4, WvA + L * wv_nl * 4,
+                                          Nq, Nk, DF, WoA + L * wo_nl * 4, N2,
+                                          WgA + L * wg_nl * 4, WuA + L * wu_nl * 4, WdA + L * wd_nl * 4,
                                           XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN)
