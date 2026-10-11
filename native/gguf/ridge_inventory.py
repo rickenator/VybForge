@@ -189,6 +189,20 @@ def main():
         fh.write("# name\tdims\ttype_id\ttype\trole\toffset\tbytes\n")
         for (name, dims, ttype, tname, off, nbytes) in rows:
             fh.write(f"{name}\t{dims}\t{ttype}\t{tname}\t{role_of(name)}\t{off + data_start}\t{nbytes}\n")
+    # Normalise the TSV to the format the ENGINE PARSES: name, dims, type, off=<n>, size=<n>, no
+    # comment header. model_driver.vyb reads the offset from an `off=`-prefixed field
+    # (`ofv.push(parse_u(bff, t3 + 1, t4))`); without that prefix it lands on the wrong substring and
+    # the driver silently seeks to a garbage offset -- it logged `token_embd off=6`, read the GGUF
+    # header as weights, and that surfaced far downstream as NaN hidden states and all-zero top1.
+    with open(args.tsv, encoding="utf-8") as _fh:
+        _rows = [l.rstrip("\n") for l in _fh if l.strip() and not l.startswith("#")]
+    _norm = []
+    for _l in _rows:
+        _f = _l.split("\t")
+        if len(_f) >= 6:
+            _norm.append("%s\t%s\t%s\toff=%s\tsize=0" % (_f[0], _f[1], _f[2], _f[5]))
+    with open(args.tsv, "w", encoding="utf-8") as _fh:
+        _fh.write("\n".join(_norm) + "\n")
     print(f"\nwrote inventory: {args.tsv}  ({len(rows)} tensors, offsets absolute, "
           f"data region starts at {data_start})")
     print(f"tensor bytes  : {total_bytes:,}  ({total_bytes / 2**30:.2f} GiB)  "
