@@ -3,7 +3,7 @@
 #
 #   ./build.sh weights    # checkpoint inventory: Vyb vs an independent parse
 #   ./build.sh stages     # the whole encoder on the GPU, stage-gated
-#   ./build.sh decoder    # the decoder on the GPU, stage-gated
+#   ./build.sh decoder    # the decoder stages (same driver: one forward pass)
 #   ./build.sh kernels    # recompile the Whisper PTX kernels only
 #   ./build.sh all        # weights + stages + kernels
 #   ./build.sh gold       # (re)generate the reference artifacts
@@ -42,7 +42,7 @@ stages() {
               --module-path "$ROOT/native/kernels" )
     fi
     echo "== encoder stages (from the repo root; module paths and PTX are repo-relative)"
-    ( cd "$ROOT" && "$VYB" native/whisper/host/encoder_driver.vyb \
+    ( cd "$ROOT" && "$VYB" native/whisper/host/forward_driver.vyb \
           --module-path native/mel \
           --module-path native/torchload \
           --module-path native/json \
@@ -50,13 +50,22 @@ stages() {
           --module-path "$VYBHOME/bindings/cuda" \
           > native/whisper/out/vyb_stages.txt 2>&1 ) || true
     tail -1 "$here/out/vyb_stages.txt"
-    "$PY" check_stages.py out/vyb_stages.txt
+    # The encoder stage list is explicit: the checker's no-argument default is
+    # "everything it knows about", which now includes decoder stages this run
+    # does not emit.
+    "$PY" check_stages.py out/vyb_stages.txt \
+        conv1 conv2 e_pos e_in e_l0_ln1 e_l0_attn e_l0_res1 e_l0_ln2 e_l0_mlp \
+        e_layer0 e_layer1 e_layer2 e_layer3 e_final
 }
 
 decoder() {
     kernels
-    echo "== decoder stages (from the repo root)"
-    ( cd "$ROOT" && "$VYB" native/whisper/host/decoder_driver.vyb \
+    # One driver runs the whole forward pass (the decoder needs the encoder's
+    # output and Vyb tensors cannot travel through a file), so the decoder gate
+    # is the same program with a different stage list.
+    echo "== decoder stages (from the repo root, same driver as the encoder)"
+    ( cd "$ROOT" && "$VYB" native/whisper/host/forward_driver.vyb \
+          --module-path native/mel \
           --module-path native/torchload \
           --module-path native/json \
           --module-path native/tensor \
@@ -66,7 +75,8 @@ decoder() {
     # GROW THIS LIST as decoder stages land. A stage the driver does not emit
     # yet is not a failure — a gate that is permanently red for work that has not
     # been done teaches nothing (and hides the failure that matters).
-    "$PY" check_stages.py out/vyb_dec.txt d_embed
+    "$PY" check_stages.py out/vyb_dec.txt \
+        d_embed d_l0_ln1 d_l0_selfattn d_l0_res1 d_l0_crossattn d_l0_mlp
 }
 
 weights() {

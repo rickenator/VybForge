@@ -9,10 +9,10 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Piece | State | Gate |
 |---|---|---|
 | Checkpoint inventory | **done** | `./build.sh weights` — 167 tensors, names/dtypes/shapes/bytes exact |
-| Decoder: token table + prompt embedding | **done** | `./build.sh decoder` — 1e-06 |
+| Decoder: prompt embedding, causal self-attention, cross-attention, MLP | **done** | `./build.sh decoder` — layer 0 complete, 1.0e-06 … 2.6e-06 |
 | Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — within 1.3e-5 of the real model |
 | Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
-| Decoder: causal self-attn, cross-attn, tied head, greedy decode | not started | — |
+| Decoder layers 1-3, tied head, greedy decode | not started | acceptance: the first 24 ids (**843**, ...) token-for-token |
 
 ### Stage evidence (RTX 3090)
 
@@ -140,10 +140,25 @@ but NOT in the file, so the 51864x384 token table is loaded once (in ~2M-element
 pieces — a single 79.7 MB Vyb String is a lot to hold) and used twice, as a gather
 for the input and as the transposed projection.
 
-**Next step**: the decoder layers need the encoder's final output in the same
-process. The clean way is to lift the shared helpers and the two stage drivers
-(conv_stage, the block function) out of `encoder_driver.vyb` into a module both
-drivers import; today the encoder pipeline lives in that driver's `main`.
+Rather than lift the encoder into a module two drivers share, the driver is now
+`host/forward_driver.vyb` and runs the whole forward pass — the decoder needs the
+encoder's final output and a Vyb tensor cannot travel through a file, so one
+process is the honest shape of the thing. `./build.sh stages` gates the encoder
+stages, `./build.sh decoder` the decoder stages, same binary.
+
+**Next step**: layers 1-3 (the same sequence with a layer index — the encoder's
+`enc_layer` is the pattern to copy), then the final layer norm, the tied head, and
+greedy decode.
+
+## Facts about this checkpoint that the file itself settles
+
+* `k_proj.bias` occurs ZERO times: every k_proj in the model is biasless — the
+  encoder's and the decoder's self-attention AND the decoder's cross-attention.
+  Three projections in the decoder look identical and are not.
+* `proj_out.weight` is in transformers' state_dict and absent from the file: the
+  head is tied to `embed_tokens`. The table is loaded once, TRANSPOSED
+  (`stage_table`), which is the layout the head needs as a GEMM operand — and the
+  gather then reads it with one index change instead of needing a second copy.
 
 ## What is left
 

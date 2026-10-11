@@ -34,6 +34,12 @@ HEADS<Int> = 6            // attention heads (tiny.en: 384 / 6 = 64 per head)
 HDIM<Int> = 64
 FFN<Int> = 1536          // encoder/decoder MLP width
 ENC_LAYERS<Int> = 4     // tiny.en encoder depth
+VOCAB<Int> = 51864      // token table rows (also the tied output head)
+MAXPOS<Int> = 448       // decoder position table
+CL<Int> = 2             // decoder prompt length: <|startoftranscript|>, <|notimestamps|>
+PROMPT0<Int> = 50257
+PROMPT1<Int> = 50362
+CHUNK_ELEMS<Int> = 2000000   // token-table pieces (79.7 MB f32 does not fit one String)
 
 env(n<String>, d<String>)<String> -> {
     return env_get(n) else d
@@ -93,6 +99,44 @@ load_f32_raw(path<String>, ix<StIndex>, name<String>, dst<Int>)<Int> -> {
 
 pi(pp<Int>, off<Int>, v<Int>)<Int> -> {
     return htod_i(pp + off, v)
+}
+
+// Widen an f32 tensor to f64 in pieces (mode 0). The token table is 19.9M
+// elements: read it whole into one Vyb String and the driver is holding 80 MB of
+// host string to copy a tensor that lives on the device.
+widen_chunked(ckpt<String>, ix<StIndex>, name<String>, N<Int>, dOut<Int>, RAW<Int>,
+              ford<Int>, PK<Int>)<Int> -> {
+    idx<Int> = st_find(ix, name)
+    if (idx < 0) {
+        println("MISSING tensor " + name)
+        return 1
+    }
+    absoff<Int> = ix.data_base + ix.doff.get(idx)
+    done<Int> = 0
+    while (done < N) {
+        want<Int> = N - done
+        if (want > CHUNK_ELEMS) { want = CHUNK_ELEMS }
+        nb<Int> = want * 4
+        data<String> = ""
+        match (open_read(ckpt)) {
+            h -> {
+                match (read_at(h, absoff + done * 4, nb)) {
+                    s -> { data = s }
+                    ? -> { }
+                }
+                close(h)
+            }
+            ? -> { }
+        }
+        if (data.len() < nb) { return 2 }
+        if (bulk(data, RAW, nb) != 0) { return 3 }
+        if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dOut + done * 8) != 0 || pi(PK, 16, want) != 0 ||
+            pi(PK, 40, 0) != 0) { return 4 }
+        if (launch1(ford, (want + 255) / 256, 256, PK) != 0) { return 5 }
+        sync()
+        done = done + want
+    }
+    return 0
 }
 
 // Widen an f32 tensor to f64 (mode 0) with `n` elements.
@@ -348,6 +392,20 @@ main()<Int> -> {
     DR1<Int> = dev_alloc(POS * D * 8)                 # residual after attention
     DLN2<Int> = dev_alloc(POS * D * 8)                # final_layer_norm output
     DFC1<Int> = dev_alloc(POS * FFN * 8)              # fc1 (1500, 1536)
+    # ---- decoder buffers -----------------------------------------------------
+    DTOK<Int> = dev_alloc(VOCAB * D * 8)              # token table f64 (159 MB)
+    DPOSD<Int> = dev_alloc(MAXPOS * D * 8)            # decoder position table
+    DIDS<Int> = dev_alloc(CL * 8)                     # prompt ids (device Int words)
+    DXC<Int> = dev_alloc(CL * D * 8)                  # decoder layer input
+    DADD<Int> = dev_alloc(CL * D * 8)                 # embedding + positions
+    DKE<Int> = dev_alloc(POS * D * 8)                 # encoder-derived cross K/V
+    DVE<Int> = dev_alloc(POS * D * 8)
+    DDATT<Int> = dev_alloc(CL * D * 8)
+    DDR1<Int> = dev_alloc(CL * D * 8)
+    DDMLP<Int> = dev_alloc(CL * D * 8)
+    DDLAY<Int> = dev_alloc(CL * D * 8)
+    DLOGITS<Int> = dev_alloc(CL * VOCAB * 8)
+    DARGMAX<Int> = dev_alloc(8)
     DMLP<Int> = dev_alloc(POS * D * 8)                # fc2 output
     DLAY<Int> = dev_alloc(POS * D * 8)                # block output (residual + mlp)
     DPOS<Int> = dev_alloc(POS * D * 8)
@@ -364,11 +422,24 @@ main()<Int> -> {
     # way (the positional table is 1500*384*4 = 2.3 MB, bigger than conv2's
     # weight at 1.77 MB) — an undersized staging buffer makes the bulk DMA fail,
     # which surfaces as "stage failed" rather than as an obvious size error.
-    RAW<Int> = dev_alloc(4 * 1024 * 1024)
+    # f32 staging for every upload. Size it from the LARGEST consumer, listed so
+    # the number can be re-derived rather than guessed:
+    #   token-table chunk  CHUNK_ELEMS * 4 = 8.0 MB   <- the largest
+    #   decoder positions  448 * 384 * 4   = 0.7 MB
+    #   conv2 weight       384 * 384 * 3 * 4 = 1.8 MB
+    #   encoder positions  1500 * 384 * 4  = 2.3 MB
+    #   FFN fc1 weight     1536 * 384 * 4  = 2.4 MB
+    # An undersized staging buffer fails the bulk DMA, which reads as "stage
+    # failed" with no size in the message — it has cost three separate debugging
+    # rounds on this slice.
+    RAW<Int> = dev_alloc(CHUNK_ELEMS * 4 + 65536)
     if (DM == 0 || DA == 0 || DBuf == 0 || DT == 0 || DE == 0 || DPOS == 0 ||
         DLN == 0 || DLNW == 0 || DLNB == 0 ||
         DQ == 0 || DK == 0 || DV == 0 || DCTX == 0 || DATT == 0 ||
         DR1 == 0 || DLN2 == 0 || DFC1 == 0 || DMLP == 0 || DLAY == 0 ||
+        DTOK == 0 || DPOSD == 0 || DIDS == 0 || DXC == 0 || DADD == 0 ||
+        DKE == 0 || DVE == 0 || DDATT == 0 || DDR1 == 0 || DDMLP == 0 ||
+        DDLAY == 0 || DLOGITS == 0 || DARGMAX == 0 ||
         DW == 0 || DBI == 0 || DX == 0 || DC == 0 || RAW == 0) {
         println("device alloc failed")
         return 4
@@ -389,7 +460,9 @@ main()<Int> -> {
     fln<Int> = module_func(henc, "layernorm")
     fatt<Int> = module_func(henc, "attn")
     fgelu<Int> = module_func(henc, "gelu")
-    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0 || fatt == 0 || fgelu == 0) {
+    femb<Int> = module_func(henc, "embed")
+    farg<Int> = module_func(henc, "argmax")
+    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0 || fatt == 0 || fgelu == 0 || femb == 0 || farg == 0) {
         println("missing kernel symbol")
         return 7
     }
@@ -473,6 +546,155 @@ main()<Int> -> {
     sync()
     if (want("e_final")) { section("e_final", DE, POS * D) }
 
+    # ==== DECODER =============================================================
+    # The decoder runs in the same process as the encoder because cross-attention
+    # needs the encoder's final output and a Vyb tensor cannot travel through a
+    # file. The prompt is <|startoftranscript|>, <|notimestamps|>.
+    e = widen_chunked(ckpt, ix, "model.decoder.embed_tokens.weight", VOCAB * D, DTOK, RAW, ford, PK)
+    if (e != 0) { println("token table widen failed"); println_int(e); return 70 }
+    e = widen_chunked(ckpt, ix, "model.decoder.embed_positions.weight", MAXPOS * D, DPOSD, RAW, ford, PK)
+    if (e != 0) { println("decoder positions widen failed"); println_int(e); return 71 }
+    if (htod_i(DIDS + 0, PROMPT0) != 0) { return 72 }
+    if (htod_i(DIDS + 8, PROMPT1) != 0) { return 73 }
+
+    # ---- token embedding gather + decoder positions --------------------------
+    if (pi(PK, 0, DTOK) != 0 || pi(PK, 8, DIDS) != 0 || pi(PK, 16, DXC) != 0 ||
+        pi(PK, 24, CL) != 0 || pi(PK, 32, D) != 0) {
+        println("params pack failed (decoder embed)"); return 74
+    }
+    if (launch1(femb, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder embed failed"); return 75 }
+    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DPOSD) != 0 || pi(PK, 16, DADD) != 0 || pi(PK, 24, CL * D) != 0) {
+        println("params pack failed (decoder pos)"); return 76
+    }
+    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder pos failed"); return 77 }
+    sync()
+    if (want("d_embed")) { section("d_embed", DADD, CL * D) }
+
+    # ---- decoder layer 0: ln1, CAUSAL self-attention -------------------------
+    e = widen(ckpt, ix, "model.decoder.layers.0.self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 78 }
+    e = widen(ckpt, ix, "model.decoder.layers.0.self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 79 }
+    if (pi(PK, 0, DADD) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 80 }
+    if (htod(PK + 48, 1e-5) != 0) { return 81 }
+    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln1 failed"); return 82 }
+    sync()
+    if (want("d_l0_ln1")) { section("d_l0_ln1", DLN, CL * D) }
+
+    # q/k/v of the decoder's SELF attention (all three have biases here; the
+    # ENCODER's k_proj is the biasless one)
+    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.q_proj.weight",
+               "model.decoder.layers.0.self_attn.q_proj.bias",
+               DLN, CL, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 83 }
+    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.k_proj.weight",
+               "",      # EVERY k_proj in this checkpoint is biasless (0 occurrences
+                        # of "k_proj.bias" in the file) — self-attention in both
+                        # encoder and decoder, and the decoder's cross-attention
+               DLN, CL, D, D, DW, DBI, DK, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 84 }
+    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.v_proj.weight",
+               "model.decoder.layers.0.self_attn.v_proj.bias",
+               DLN, CL, D, D, DW, DBI, DV, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 85 }
+    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DK) != 0 || pi(PK, 16, DV) != 0 || pi(PK, 24, DCTX) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, CL) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
+        return 86
+    }
+    if (htod(PK + 64, 0.125) != 0) { return 87 }
+    if (pi(PK, 72, 1) != 0) { return 88 }        # CAUSAL: decoder self-attention
+    if (launch1(fatt, (CL * HEADS + 255) / 256, 256, PK) != 0) { println("launch decoder attn failed"); return 89 }
+    sync()
+    e = linear(ckpt, ix, "model.decoder.layers.0.self_attn.out_proj.weight",
+               "model.decoder.layers.0.self_attn.out_proj.bias",
+               DCTX, CL, D, D, DW, DBI, DDATT, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 90 }
+    if (want("d_l0_selfattn")) { section("d_l0_selfattn", DDATT, CL * D) }
+
+    if (pi(PK, 0, DADD) != 0 || pi(PK, 8, DDATT) != 0 || pi(PK, 16, DDR1) != 0 || pi(PK, 24, CL * D) != 0) {
+        return 91
+    }
+    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder residual failed"); return 92 }
+    sync()
+    if (want("d_l0_res1")) { section("d_l0_res1", DDR1, CL * D) }
+
+    # ---- cross-attention: Q from the decoder, K/V from the ENCODER output ----
+    e = widen(ckpt, ix, "model.decoder.layers.0.encoder_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 93 }
+    e = widen(ckpt, ix, "model.decoder.layers.0.encoder_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 94 }
+    if (pi(PK, 0, DDR1) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 95 }
+    if (htod(PK + 48, 1e-5) != 0) { return 96 }
+    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln2 failed"); return 97 }
+    sync()
+
+    # K/V are a projection of the ENCODER output (DE), over all 1500 positions
+    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.k_proj.weight",
+               "",
+               DE, POS, D, D, DW, DBI, DKE, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 98 }
+    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.v_proj.weight",
+               "model.decoder.layers.0.encoder_attn.v_proj.bias",
+               DE, POS, D, D, DW, DBI, DVE, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 99 }
+    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.q_proj.weight",
+               "model.decoder.layers.0.encoder_attn.q_proj.bias",
+               DLN2, CL, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 100 }
+
+    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DKE) != 0 || pi(PK, 16, DVE) != 0 || pi(PK, 24, DCTX) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, POS) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
+        return 101
+    }
+    if (htod(PK + 64, 0.125) != 0) { return 102 }
+    if (pi(PK, 72, 0) != 0) { return 103 }       # NOT causal: the whole encoder output
+    if (launch1(fatt, (CL * HEADS + 255) / 256, 256, PK) != 0) { println("launch cross-attn failed"); return 104 }
+    sync()
+    e = linear(ckpt, ix, "model.decoder.layers.0.encoder_attn.out_proj.weight",
+               "model.decoder.layers.0.encoder_attn.out_proj.bias",
+               DCTX, CL, D, D, DW, DBI, DDATT, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 105 }
+    if (want("d_l0_crossattn")) { section("d_l0_crossattn", DDATT, CL * D) }
+
     println("ENC_STAGES done")
+    # ---- residual after cross-attention, then the MLP ------------------------
+    # DXC is free here (its gather output was consumed by the positional add), so
+    # it becomes the post-cross-attention residual.
+    if (pi(PK, 0, DDR1) != 0 || pi(PK, 8, DDATT) != 0 || pi(PK, 16, DXC) != 0 || pi(PK, 24, CL * D) != 0) {
+        return 106
+    }
+    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder res2 failed"); return 107 }
+    sync()
+
+    e = widen(ckpt, ix, "model.decoder.layers.0.final_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 108 }
+    e = widen(ckpt, ix, "model.decoder.layers.0.final_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 109 }
+    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, CL) != 0 || pi(PK, 40, D) != 0) { return 110 }
+    if (htod(PK + 48, 1e-5) != 0) { return 111 }
+    if (launch1(fln, (CL + 255) / 256, 256, PK) != 0) { println("launch decoder ln3 failed"); return 112 }
+    sync()
+
+    e = linear(ckpt, ix, "model.decoder.layers.0.fc1.weight", "model.decoder.layers.0.fc1.bias",
+               DLN2, CL, D, FFN, DW, DBI, DFC1, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 113 }
+    if (pi(PK, 0, DFC1) != 0 || pi(PK, 8, DFC1) != 0 || pi(PK, 16, CL * FFN) != 0) { return 114 }
+    if (launch1(fgelu, (CL * FFN + 255) / 256, 256, PK) != 0) { println("launch decoder gelu failed"); return 115 }
+    sync()
+    e = linear(ckpt, ix, "model.decoder.layers.0.fc2.weight", "model.decoder.layers.0.fc2.bias",
+               DFC1, CL, FFN, D, DW, DBI, DDMLP, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 116 }
+    if (want("d_l0_mlp")) { section("d_l0_mlp", DDMLP, CL * D) }
+
+    if (pi(PK, 0, DXC) != 0 || pi(PK, 8, DDMLP) != 0 || pi(PK, 16, DDLAY) != 0 || pi(PK, 24, CL * D) != 0) {
+        return 117
+    }
+    if (launch1(fadd2, (CL * D + 255) / 256, 256, PK) != 0) { println("launch decoder res3 failed"); return 118 }
+    sync()
+
+    println("DEC_LAYER0 done")
     return 0
 }

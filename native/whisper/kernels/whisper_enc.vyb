@@ -255,7 +255,13 @@ attn(p<Int>) -> {
 // ---------------------------------------------------------------------------
 // embed: gather rows of an embedding table by token id
 //   out[s*D + d] = table[id[s]*D + d]
-//   params: table, ids, out, S, D        (ids is a device buffer of Int words)
+//   params: table, ids, out, S, D, mode, vocab
+//   mode 0: table is (vocab, D) row-major      -> row `tok` starts at tok*D
+//   mode 1: table is (D, vocab) TRANSPOSED     -> element d of row `tok` is at
+//           d*vocab + tok
+//   The transposed form is the one the tied head needs as a GEMM operand, and
+//   loading the table once in that layout and gathering from it costs one index
+//   change instead of a second 159 MB copy.
 // The decoder needs this twice: to build the layer-0 input from the prompt, and
 // again for the tied output projection (proj_out IS embed_tokens in this model).
 embed(p<Int>) -> {
@@ -264,13 +270,41 @@ embed(p<Int>) -> {
     outp<Int> = ld_i64(p + 16)
     S<Int> = ld_i64(p + 24)
     D<Int> = ld_i64(p + 32)
+    mode<Int> = ld_i64(p + 40)
+    vocab<Int> = ld_i64(p + 48)
     gid<Int> = blk_x() * dim_x() + tid_x()
     total<Int> = S * D
     if (gid < total) {
         s<Int> = gid / D
         d<Int> = gid % D
         tok<Int> = ld_i64(ids + s * 8)
-        st_f64(outp + gid * 8, ld_f64(table + (tok * D + d) * 8))
+        if (mode == 0) {
+            st_f64(outp + gid * 8, ld_f64(table + (tok * D + d) * 8))
+        } else {
+            st_f64(outp + gid * 8, ld_f64(table + (d * vocab + tok) * 8))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stage_table: copy a chunk of the f32 token table into the f64 TRANSPOSED table
+//   out[d*vocab + (row_off + i)] = f32(in[i*D + d])
+//   params: in, out, nrows (this chunk), D, vocab, row_off
+// Chunked because the tensor is 79.7 MB f32 / 159 MB f64 — and transposing it
+// with the generic reorder kernel would need the whole tensor resident at once.
+stage_table(p<Int>) -> {
+    inp<Int> = ld_i64(p + 0)
+    outp<Int> = ld_i64(p + 8)
+    nrows<Int> = ld_i64(p + 16)
+    Dd<Int> = ld_i64(p + 24)
+    vocab<Int> = ld_i64(p + 32)
+    roff<Int> = ld_i64(p + 40)
+    total<Int> = nrows * Dd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        i<Int> = gid / Dd
+        d<Int> = gid % Dd
+        st_f64(outp + (d * vocab + roff + i) * 8, ld_f32(inp + (i * Dd + d) * 4))
     }
 }
 
