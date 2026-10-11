@@ -154,6 +154,32 @@ emb_dequant(path<String>, off<Int>, total<Int>, dpk<Int>, q6fn<loc<CVoid>>, de<I
     }
     return 0
 }
+# Item 21: the token-embedding table stays PACKED (Q6_K, 0.32 GB) on the GPU; a prompt/generated row is
+# decoded straight into EMB with the same f64 q6kdeq the old 3.1 GB f64 table was built with.
+emb_upload(path<String>, off<Int>, total<Int>, tep<Int>)<Int> -> {
+    CH<Int> = 65536 * 64
+    nb<Int> = total / 256 * 210
+    pos<Int> = 0
+    estr<Int> = 0
+    while (pos < nb) {
+        len<Int> = CH / 256 * 210
+        if (pos + len > nb) { len = nb - pos }
+        data<String> = read_model(path, off + pos, len)
+        if (data.len() < len) { return 61 }
+        freedom { e<Int> = download(data, tep + pos, len); if (e != 0) { estr = e } }
+        if (estr != 0) { return estr }
+        pos = pos + len
+    }
+    return 0
+}
+emb_row(q6fn<loc<CVoid>>, tep<Int>, tokenId<Int>, D<Int>, dst<Int>)<Int> -> {
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D + 255) / 256, 1, 1, 256, 1, 1, tep + tokenId * (D / 256) * 210, dst, D, 0)
+        if (rc != 0) { return 15 }
+        return 0
+    }
+    return 0
+}
 copy_row(de<Int>, tokenId<Int>, D<Int>, dst<Int>)<Int> -> {
     freedom {
         if (cuMemcpyDtoD_v2(dst, de + tokenId * D * 8, D * 8) != 0) { return 15 }
@@ -835,13 +861,6 @@ main()<Int> -> {
         WqA<Int> = 0; WkA<Int> = 0; WvA<Int> = 0; WoA<Int> = 0; WgA<Int> = 0; WuA<Int> = 0; WdA<Int> = 0
         XN32<Int> = 0; DC32<Int> = 0; X132<Int> = 0; HU32<Int> = 0; SK32<Int> = 0; SCR32<Int> = 0
         CPB<Int> = 0; WPB<Int> = 0; RDB<Int> = 0
-        if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wo), wo_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wg), wg_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wu), wu_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wd), wd_nl * 8) != 0) { return 11 }
         # f32 path (VybForge#23): weights as f32, the four gemm A-operands as f32 copies, the f32
         # partial scratch and reduce output, and two 24-byte param blocks + a 64-byte readback block.
         if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 } }
@@ -897,7 +916,8 @@ main()<Int> -> {
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
+        TEP<Int> = 0
+        if (cuMemAlloc_v2(loc(TEP), te_nl / 256 * 210) != 0) { return 11 }
         # f32 copy of the tied embedding for the head (1.55 GB) + the 32-lane partials (VOCAB x 32 f32).
         DE32<Int> = 0; LPART<Int> = 0; LPB<Int> = 0
         if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 }
@@ -1085,9 +1105,12 @@ main()<Int> -> {
         }
         println("ALL_NORMS_RESIDENT")
 
-        e = emb_dequant(MODEL, te_off0, te_nl, DPK, q6fn, DE); if (e != 0) { return 91 }
-        println("EMB_DEQUANT_DONE")
-        e = cast1(c32n, CPB, DE, DE32, te_nl); if (e != 0) { return 91 }
+        if (tyv.get(find_nm(nmv, "token_embd.weight")) != 14) { println("UNSUPPORTED_QTYPE token_embd (need Q6_K)"); return 67 }
+        e = emb_upload(MODEL, te_off0, te_nl, TEP); if (e != 0) { return 91 }
+        println("EMB_PACKED_RESIDENT")
+        # f32 head table straight from the packed rows: q6kdeq32's f32 d*sc*q rounds once, at the last
+        # multiply (d*sc is exact), which is the same single rounding the old f64-then-cast took.
+        e = dequant_gpu(TEP, 0, DE32, te_nl, q632, 0); if (e != 0) { return 91 }
         println("EMB_F32_COPY_DONE")
         rtfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rtfn), mw, "rope_tab") != 0) { return 10 }
@@ -1136,7 +1159,7 @@ main()<Int> -> {
             # seed EMB with the prompt rows (or [0,1])
             si<Int> = 0
             for (si in 0..SEEDLEN - 1) {
-                if (copy_row(DE, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
+                if (emb_row(q6fn, TEP, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
             }
 
             # Prompt mode writes the FULL sequence (prompt ids + generated) to
@@ -1270,7 +1293,7 @@ main()<Int> -> {
                         nxt = 0
                         cuMemcpyDtoH_v2(loc(nxt), AO, 8)
                         match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
-                        copy_row(DE, nxt, D, EMB + Scur * D * 8)
+                        emb_row(q6fn, TEP, nxt, D, EMB + Scur * D * 8)
                         hdT = hdT + (time_mono_millis() - phD)
                         if (QV == 0) { println("GEN step " + g.to_string() + " token=" + nxt.to_string()) }
                     }
