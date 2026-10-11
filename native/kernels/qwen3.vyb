@@ -976,6 +976,167 @@ gemv_q6k_s(p<Int>) -> {
     }
 }
 
+// R = 1 originals (16 warps, 1 row per warp, one convert per value): faster than the R = 2 pair on GB10
+// (sm_12x), so the driver keeps them there (VYB_GEMVR=1|2 overrides).
+gemv_q4k_r1(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = blk_x() * 16 + tid / 32
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    st2<Int> = 16
+    mm<Int> = 0
+    for (mm in 0..M - 1) {
+        acc<Float32> = 0.0
+        if (n < N) {
+            rb<Int> = W + n * nsb * 144
+            xr<Int> = X + (mm * K + (l / 8) * 64 + (l % 8) * 4) * 4
+            sb<Int> = 0
+            while (sb < nsb) {
+                bb0<Int> = rb + (sb + 0) * 144
+                xb0<Int> = xr + (sb + 0) * 1024
+                df0<Float32> = ld_f16(bb0)
+                mnf0<Float32> = ld_f16(bb0 + 2)
+                # get_scale_min_k4, branchless (see header): 3 aligned scale words, shifted to the lane's pair
+                b00<UInt32> = (ld_i32(bb0 + 4) as UInt32) >> sh
+                b10<UInt32> = (ld_i32(bb0 + 8) as UInt32) >> sh
+                b20<UInt32> = (ld_i32(bb0 + 12) as UInt32) >> sh
+                sc00<UInt32> = ((b00 & 63) & nmk) | (((b20 & 15) | (((b00 >> 6) & 3) << 4)) & mk)
+                m00<UInt32> = ((b10 & 63) & nmk) | ((((b20 >> 4) & 15) | (((b10 >> 6) & 3) << 4)) & mk)
+                sc10<UInt32> = (((b00 >> 8) & 63) & nmk) | ((((b20 >> 8) & 15) | (((b00 >> 14) & 3) << 4)) & mk)
+                m10<UInt32> = (((b10 >> 8) & 63) & nmk) | ((((b20 >> 12) & 15) | (((b10 >> 14) & 3) << 4)) & mk)
+                ds00<Float32> = df0 * (sc00 as Float32)
+                dm00<Float32> = mnf0 * (m00 as Float32)
+                ds10<Float32> = df0 * (sc10 as Float32)
+                dm10<Float32> = mnf0 * (m10 as Float32)
+                qw0<UInt32> = ld_i32(bb0 + 16 + l4) as UInt32
+                xv10<Float32> = ld_f32(xb0)
+                acc = acc + xv10 * (ds00 * ((qw0 & 15) as Float32) - dm00)
+                xv20<Float32> = ld_f32(xb0 + 4)
+                acc = acc + xv20 * (ds00 * (((qw0 >> 8) & 15) as Float32) - dm00)
+                xv30<Float32> = ld_f32(xb0 + 8)
+                acc = acc + xv30 * (ds00 * (((qw0 >> 16) & 15) as Float32) - dm00)
+                xv40<Float32> = ld_f32(xb0 + 12)
+                acc = acc + xv40 * (ds00 * (((qw0 >> 24) & 15) as Float32) - dm00)
+                xv50<Float32> = ld_f32(xb0 + 128)
+                acc = acc + xv50 * (ds10 * (((qw0 >> 4) & 15) as Float32) - dm10)
+                xv60<Float32> = ld_f32(xb0 + 132)
+                acc = acc + xv60 * (ds10 * (((qw0 >> 12) & 15) as Float32) - dm10)
+                xv70<Float32> = ld_f32(xb0 + 136)
+                acc = acc + xv70 * (ds10 * (((qw0 >> 20) & 15) as Float32) - dm10)
+                xv80<Float32> = ld_f32(xb0 + 140)
+                acc = acc + xv80 * (ds10 * (((qw0 >> 28) & 15) as Float32) - dm10)
+                sb = sb + 1
+            }
+        }
+        st_shared_f64(tid, acc as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l == 0) {
+            if (n < N) {
+                if (YE == 4) { st_f32(Y + (mm * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n) * 8, ld_shared_f64(tid)) }
+            }
+        }
+        kernel_barrier()
+    }
+}
+gemv_q6k_r1(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n<Int> = blk_x() * 16 + tid / 32
+    nsb<Int> = K / 256
+    g<Int> = l / 16
+    jj<Int> = (l % 16) * 2
+    g8is<Int> = g * 8 + jj / 16
+    g64jj<Int> = g * 64 + jj
+    g32jj<Int> = g * 32 + jj
+    st2<Int> = 16
+    mm<Int> = 0
+    for (mm in 0..M - 1) {
+        acc<Float32> = 0.0
+        if (n < N) {
+            rb<Int> = W + n * nsb * 210
+            xr<Int> = X + (mm * K + g * 128 + jj) * 4
+            sb<Int> = 0
+            while (sb < nsb) {
+                bb0<Int> = rb + (sb + 0) * 210
+                xq0<Int> = xr + (sb + 0) * 1024
+                df0<Float32> = ld_f16(bb0 + 208)
+                sbase0<Int> = bb0 + 192 + g8is
+                da0<Float32> = df0 * ((ld_i8(sbase0) as Int32) as Float32)
+                db0<Float32> = df0 * ((ld_i8(sbase0 + 2) as Int32) as Float32)
+                dc0<Float32> = df0 * ((ld_i8(sbase0 + 4) as Int32) as Float32)
+                dd0<Float32> = df0 * ((ld_i8(sbase0 + 6) as Int32) as Float32)
+                qla0<UInt32> = (ld_u16(bb0 + g64jj) as UInt32) & 65535
+                qlb0<UInt32> = (ld_u16(bb0 + g64jj + 32) as UInt32) & 65535
+                qhw0<UInt32> = (ld_u16(bb0 + 128 + g32jj) as UInt32) & 65535
+                q1e00<Int32> = ((((qla0 >> 0) & 15) | ((((qhw0 >> 0) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv1e00<Float32> = ld_f32(xq0 + 0)
+                acc = acc + xv1e00 * (da0 * (q1e00 as Float32))
+                q2e00<Int32> = ((((qlb0 >> 0) & 15) | ((((qhw0 >> 2) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv2e00<Float32> = ld_f32(xq0 + 128)
+                acc = acc + xv2e00 * (db0 * (q2e00 as Float32))
+                q3e00<Int32> = ((((qla0 >> 4) & 15) | ((((qhw0 >> 4) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv3e00<Float32> = ld_f32(xq0 + 256)
+                acc = acc + xv3e00 * (dc0 * (q3e00 as Float32))
+                q4e00<Int32> = ((((qlb0 >> 4) & 15) | ((((qhw0 >> 6) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv4e00<Float32> = ld_f32(xq0 + 384)
+                acc = acc + xv4e00 * (dd0 * (q4e00 as Float32))
+                q1e10<Int32> = ((((qla0 >> 8) & 15) | ((((qhw0 >> 8) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv1e10<Float32> = ld_f32(xq0 + 4)
+                acc = acc + xv1e10 * (da0 * (q1e10 as Float32))
+                q2e10<Int32> = ((((qlb0 >> 8) & 15) | ((((qhw0 >> 10) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv2e10<Float32> = ld_f32(xq0 + 132)
+                acc = acc + xv2e10 * (db0 * (q2e10 as Float32))
+                q3e10<Int32> = ((((qla0 >> 12) & 15) | ((((qhw0 >> 12) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv3e10<Float32> = ld_f32(xq0 + 260)
+                acc = acc + xv3e10 * (dc0 * (q3e10 as Float32))
+                q4e10<Int32> = ((((qlb0 >> 12) & 15) | ((((qhw0 >> 14) & 3)) << 4)) as Int32) - (32 as Int32)
+                xv4e10<Float32> = ld_f32(xq0 + 388)
+                acc = acc + xv4e10 * (dd0 * (q4e10 as Float32))
+                sb = sb + 1
+            }
+        }
+        st_shared_f64(tid, acc as Float)
+        kernel_barrier()
+        st2 = 16
+        while (st2 > 0) {
+            if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l == 0) {
+            if (n < N) {
+                if (YE == 4) { st_f32(Y + (mm * N + n) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n) * 8, ld_shared_f64(tid)) }
+            }
+        }
+        kernel_barrier()
+    }
+}
+
 // Prefill twins (S > 1) of gemv_q4k / gemv_q6k: each decoded weight is applied to 8 activation rows
 // at once (8 f32 accumulators), so a prompt of S rows streams the quantized weights ceil(S/8) times
 // instead of S times. Rows past M are clamped for the loads and not stored. Same decode, same

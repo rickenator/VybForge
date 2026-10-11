@@ -14,6 +14,7 @@ extern "C" {
     cuInit(flags<CUInt>)<CInt>
     cuDeviceGetCount(count<loc<CInt>>)<CInt>
     cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuDeviceGetAttribute(pi<loc<CInt>>, attrib<CInt>, dev<CInt>)<CInt>
     cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
@@ -261,7 +262,7 @@ normb(rbf<loc<CVoid>>, PB<Int>, X<Int>, W<Int>, Y<Int>, M<Int>, N<Int>, ep<Float
 // Fused quantized GEMV launch (Ursela): Y[M,N] (f64) = X[M,K] (f32) . W^T, W = resident Q4_K (ty 12)
 // or Q6_K (ty 14) rows. 48-byte param block {W, X, Y, M, N, K}; ceil(N/16) blocks x 512 threads.
 struct QGB { w<Int>, x<Int>, y<Int>, m<Int>, n<Int>, k<Int>, ye<Int> }
-gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>, YE<Int>)<Int> -> {
+gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, GR<Int>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>, YE<Int>)<Int> -> {
     qb<QGB> = QGB { w = W, x = X, y = Y, m = M, n = N, k = K, ye = YE }
     freedom {
         cuMemcpyAsync(PB, loc(qb), 56, 0)
@@ -275,7 +276,7 @@ gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<lo
         # M = 1: 2 rows per warp (item 19); 16-warp blocks, or 4-warp blocks for N <= 1024
         gx<Int> = (N + 15) / 16
         bx<Int> = 512
-        if (M == 1) {
+        if (M == 1) { if (GR == 2) {
             if (N % 2 != 0) { println("GEMVQ_ERR odd N"); return 78 }
             gx = (N + 31) / 32
             if (N <= 1024) {
@@ -284,7 +285,7 @@ gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<lo
                 gx = (N + 7) / 8
                 bx = 128
             }
-        }
+        } }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(qfn)), gx, 1, 1, bx, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("GEMVQ_ERR rc=" + rc.to_string()); return 79 }
         return 0
@@ -337,7 +338,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
-          QG<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
+          QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
           Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tv<Int>, Td<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
@@ -353,13 +354,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, 12, QPB, Pq, XN32, DQ, S, NQ, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pq, XN32, DQ, S, NQ, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, 12, QPB, Pk, XN32, DK, S, NKV, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pk, XN32, DK, S, NKV, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         }
@@ -375,7 +376,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (KEL == 4) { if (QG == 1) { vdst = VC + P0 * NKV * 4; VYE = 4 } }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, Tv, QPB, Pv, XN32, vdst, S, NKV, D, VYE) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tv, QPB, Pv, XN32, vdst, S, NKV, D, VYE) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
         }
@@ -448,7 +449,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, 12, QPB, Po, DC32, DO, S, D, NQ, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Po, DC32, DO, S, D, NQ, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         }
@@ -458,13 +459,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
         gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, 12, QPB, Pg, X132, Gr, S, FF, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pg, X132, Gr, S, FF, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
         }
         gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, 12, QPB, Pu, X132, Up, S, FF, D, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 12, QPB, Pu, X132, Up, S, FF, D, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
         }
@@ -473,7 +474,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
         if (QG == 1) {
-            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, Td, QPB, Pd, HU32, M, S, D, FF, 8) != 0) { return 79 }
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Td, QPB, Pd, HU32, M, S, D, FF, 8) != 0) { return 79 }
         } else {
             if (gemm2(g3p, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         }
@@ -599,6 +600,7 @@ main()<Int> -> {
     K5<Int> = packed_bytes(nlv.get(find_nm(nmv, "blk.0.ffn_up.weight")), tyv.get(find_nm(nmv, "blk.0.ffn_up.weight")))
     K6<Int> = packed_bytes(nlv.get(find_nm(nmv, "blk.0.ffn_down.weight")), tyv.get(find_nm(nmv, "blk.0.ffn_down.weight")))
 
+    GR<Int> = 1
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> ndev = 0
@@ -607,6 +609,14 @@ main()<Int> -> {
         if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
         ctx<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+        var<CInt> ccmaj = 0
+        if (cuDeviceGetAttribute(loc(ccmaj), 75, dev) != 0) { ccmaj = 0 }
+        # M = 1 GEMV flavour (item 19): R = 2 packed-convert on Ampere (cc 8.x), R = 1 elsewhere
+        GR = 1
+        if (ccmaj == 8) { GR = 2 }
+        gr_s<String> = env_get("VYB_GEMVR") else ""
+        if (gr_s == "1") { GR = 1 }
+        if (gr_s == "2") { GR = 2 }
     }
 
     freedom {
@@ -688,8 +698,13 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(l32p), mw, "logits32_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(l32r), mw, "logits32_r") != 0) { return 10 }
         q4f<loc<CVoid>> = from<loc<CVoid>>(0); q6f<loc<CVoid>> = from<loc<CVoid>>(0)
-        if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
-        if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
+        if (GR == 2) {
+            if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
+            if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
+        } else {
+            if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_r1") != 0) { return 10 }
+            if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_r1") != 0) { return 10 }
+        }
         q4s<loc<CVoid>> = from<loc<CVoid>>(0); q6s<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q4s), mw, "gemv_q4k_s") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q6s), mw, "gemv_q6k_s") != 0) { return 10 }
@@ -1110,7 +1125,7 @@ main()<Int> -> {
                                           amxf, aexf, asmf, anrf, EWB, MSB,
                                           rbf, RBP, RBQ, W16 * 2,
                                           AT2ON, KV32ON, as4f, ac4f, EW32, as3f, ac3f, acr3f, as2f, asxf, ac2f, acrf, PCB,
-                                          QGL, q4s, q6s, q4f, q6f, q4m, q6m, QPB,
+                                          QGL, GR, q4s, q6s, q4f, q6f, q4m, q6m, QPB,
                                           PK0 + K0 * L, PK1 + K1 * L, PK2 + ov2.get(L), PK3 + K3 * L,
                                           PK4 + K4 * L, PK5 + K5 * L, PK6 + ov6.get(L),
                                           tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")),
