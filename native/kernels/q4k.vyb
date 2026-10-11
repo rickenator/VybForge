@@ -204,3 +204,74 @@ q4kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         }
     }
 }
+
+// Tiled transposing twin of q4kdeq16 (item 18): one block = 16 output rows x 256 output columns. Phase 1
+// decodes 16 source rows x one 256-value super-block (coalesced reads; q4kdeq16 walked the source with
+// stride z, one scattered sector per byte load), into the f64 shared array (exact for f32 values),
+// XOR-swizzled; phase 2 writes 16 consecutive f16 (32 bytes) per output column. Same per-element
+// expression, so the same f16 values. Needs (n/z) % 16 == 0 and z % 256 == 0; grid n/4096 x 256.
+q4kdeqT(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    tx<Int> = tid_x()
+    cw<Int> = n / z
+    nbc<Int> = z / 256
+    rb<Int> = blk_x() / nbc
+    cb<Int> = blk_x() - rb * nbc
+    r<Int> = 0
+    while (r < 16) {
+        gsrc<Int> = (rb * 16 + r) * z + cb * 256 + tx
+            block<Int> = gsrc / 256
+            e<Int> = gsrc % 256
+            bb<Int> = q + block * 144
+            t<Int> = e / 64
+            qbase<Int> = t * 32
+            l<Int> = e % 32
+            half<Int> = (e / 32) % 2
+            is<Int> = t * 2 + half
+            # f32 DECODE ARITHMETIC (VybForge#23): the decode is 4 f64 ops per element and f64 runs at
+            # 1/64 rate on sm_86. nsys says this kernel is 52% of a token, and halving the STORE width did
+            # not help (the extra cvt cost more than the bytes saved) -- so it is COMPUTE-bound, not
+            # store-bound. Narrow the operands to Float32 first (the f16 scales by assignment, the 6-bit
+            # integers via Float then assignment) and run the mul/sub at full FP32 rate. The stored value
+            # is f32 either way; the only change is where the rounding happens.
+            # all-f32 converts (no f64 hop: ~5 f64-pipe cvts per element made this 0.4 ms per tensor on GA102)
+            d<Float32> = ld_f16(bb + 0)
+            min<Float32> = ld_f16(bb + 2)
+            sc<Int> = 0
+            m<Int> = 0
+            if (is < 4) {
+                sc = (ld_i8(bb + 4 + is) as Int) & 63
+                m = (ld_i8(bb + 4 + is + 4) as Int) & 63
+            } else {
+                a<Int> = (ld_i8(bb + 4 + is + 4) as Int) & 255
+                b<Int> = (ld_i8(bb + 4 + is - 4) as Int) & 255
+                c<Int> = (ld_i8(bb + 4 + is) as Int) & 255
+                sc = (a & 15) | ((b >> 6) << 4)
+                m = (a >> 4) | ((c >> 6) << 4)
+            }
+            bq<Int> = (ld_i8(bb + 16 + qbase + l) as Int) & 255
+            bqb<Int> = 0
+            if (half == 0) { bqb = bq & 15 } else { bqb = bq >> 4 }
+            scf64<Float32> = (sc as Int32) as Float32
+            mf64<Float32> = (m as Int32) as Float32
+            nbf64<Float32> = (bqb as Int32) as Float32
+            df<Float32> = d
+            mnf<Float32> = min
+            scf<Float32> = scf64
+            mf<Float32> = mf64
+            nbf<Float32> = nbf64
+            val<Float32> = df * scf * nbf - mnf * mf
+        vv<Float> = val as Float
+        st_shared_f64(r * 256 + (tx ^ r), vv)
+        r = r + 1
+    }
+    kernel_barrier()
+    ii<Int> = 0
+    while (ii < 16) {
+        idx<Int> = ii * 256 + tx
+        rr<Int> = idx % 16
+        c<Int> = idx / 16
+        w<Float32> = ld_shared_f64(rr * 256 + (c ^ rr))
+        st_f16(o + ((cb * 256 + c) * cw + rb * 16 + rr) * 2, w)
+        ii = ii + 1
+    }
+}

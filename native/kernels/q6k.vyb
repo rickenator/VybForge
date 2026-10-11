@@ -157,3 +157,64 @@ q6kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         }
     }
 }
+
+// Tiled transposing twin of q6kdeq16 (item 18): one block = 16 output rows x 256 output columns. Phase 1
+// decodes 16 source rows x one 256-value super-block (coalesced reads; q6kdeq16 walked the source with
+// stride z, one scattered sector per byte load), into the f64 shared array (exact for f32 values),
+// XOR-swizzled; phase 2 writes 16 consecutive f16 (32 bytes) per output column. Same per-element
+// expression, so the same f16 values. Needs (n/z) % 16 == 0 and z % 256 == 0; grid n/4096 x 256.
+q6kdeqT(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    tx<Int> = tid_x()
+    cw<Int> = n / z
+    nbc<Int> = z / 256
+    rb<Int> = blk_x() / nbc
+    cb<Int> = blk_x() - rb * nbc
+    r<Int> = 0
+    while (r < 16) {
+        gsrc<Int> = (rb * 16 + r) * z + cb * 256 + tx
+            block<Int> = gsrc / 256
+            bb<Int> = q + block * 210
+            g<Int> = (gsrc % 256) / 128
+            yl<Int> = gsrc % 128
+            quad<Int> = yl / 32
+            l<Int> = yl % 32
+            is2<Int> = l / 16
+            sidx<Int> = g * 8 + is2 + quad * 2
+            qlbase<Int> = g * 64
+            qhbase<Int> = g * 32
+            qloff<Int> = qlbase + (quad % 2) * 32 + l
+            # all-f32 converts (no f64 hop: ~5 f64-pipe cvts per element made this 0.4 ms per tensor on GA102)
+            # f32 decode arithmetic -- see q4kdeq32 for the measurement that motivates it.
+            d<Float32> = ld_f16(bb + 208)
+            sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)
+            qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
+            qhb<Int> = (ld_i8(bb + 128 + qhbase + l) as Int) & 255
+            nib<Int> = 0
+            if (quad < 2) { nib = qlb & 15 } else { nib = qlb >> 4 }
+            hib<Int> = 0
+            if (quad == 0) { hib = (qhb >> 0) & 3 }
+            if (quad == 1) { hib = (qhb >> 2) & 3 }
+            if (quad == 2) { hib = (qhb >> 4) & 3 }
+            if (quad == 3) { hib = (qhb >> 6) & 3 }
+            qs<Int> = (nib | (hib << 4)) - 32
+            sf64<Float32> = (sc0 as Int32) as Float32
+            qf64<Float32> = (qs as Int32) as Float32
+            df<Float32> = d
+            sf<Float32> = sf64
+            qf<Float32> = qf64
+            val<Float32> = df * sf * qf
+        vv<Float> = val as Float
+        st_shared_f64(r * 256 + (tx ^ r), vv)
+        r = r + 1
+    }
+    kernel_barrier()
+    ii<Int> = 0
+    while (ii < 16) {
+        idx<Int> = ii * 256 + tx
+        rr<Int> = idx % 16
+        c<Int> = idx / 16
+        w<Float32> = ld_shared_f64(rr * 256 + (c ^ rr))
+        st_f16(o + ((cb * 256 + c) * cw + rb * 16 + rr) * 2, w)
+        ii = ii + 1
+    }
+}

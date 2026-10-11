@@ -105,6 +105,16 @@ dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)
     }
     return 0
 }
+deqT_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
+    if ((numel / inz) % 16 != 0) { return 34 }
+    if (inz % 256 != 0) { return 34 }
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), numel / 4096, 1, 1, 256, 1, 1, pkb + off, dout, numel, inz)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
 load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path, off, numel * 4)
     if (data.len() < numel * 4) { return 32 }
@@ -685,8 +695,8 @@ main()<Int> -> {
         q432<loc<CVoid>> = from<loc<CVoid>>(0); q632<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q432), m4, "q4kdeq32") != 0) { return 10 }
         q416<loc<CVoid>> = from<loc<CVoid>>(0); q616<loc<CVoid>> = from<loc<CVoid>>(0)
-        if (cuModuleGetFunction(loc(q416), m4, "q4kdeq16") != 0) { return 10 }
-        if (cuModuleGetFunction(loc(q616), m6, "q6kdeq16") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q416), m4, "q4kdeqT") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q616), m6, "q6kdeqT") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q632), m6, "q6kdeq32") != 0) { return 10 }
         c32n<loc<CVoid>> = from<loc<CVoid>>(0); g3p<loc<CVoid>> = from<loc<CVoid>>(0)
         g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -1183,19 +1193,19 @@ main()<Int> -> {
                                 pwq = SLq; pwk = SLk; pwv = SLv; pwo = SLo; pwg = SLg; pwu = SLu; pwd = SLd
                                 dz<loc<CVoid>> = q416
                                 dz = q416; if (ltq.get(L) == 14) { dz = q616 }
-                                e = dequant_gpu(PK0, ovq.get(L), SLq, wq_nl, dz, D)
+                                e = deqT_gpu(PK0, ovq.get(L), SLq, wq_nl, dz, D)
                                 dz = q416; if (ltk.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK1, ovk.get(L), SLk, wk_nl, dz, D) }
+                                if (e == 0) { e = deqT_gpu(PK1, ovk.get(L), SLk, wk_nl, dz, D) }
                                 dz = q416; if (ltv.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK2, ovv.get(L), SLv, wv_nl, dz, D) }
+                                if (e == 0) { e = deqT_gpu(PK2, ovv.get(L), SLv, wv_nl, dz, D) }
                                 dz = q416; if (lto.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK3, ovo.get(L), SLo, wo_nl, dz, NQ) }
+                                if (e == 0) { e = deqT_gpu(PK3, ovo.get(L), SLo, wo_nl, dz, NQ) }
                                 dz = q416; if (ltg.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK4, ovg.get(L), SLg, wg_nl, dz, D) }
+                                if (e == 0) { e = deqT_gpu(PK4, ovg.get(L), SLg, wg_nl, dz, D) }
                                 dz = q416; if (ltu.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK5, ovu.get(L), SLu, wu_nl, dz, D) }
+                                if (e == 0) { e = deqT_gpu(PK5, ovu.get(L), SLu, wu_nl, dz, D) }
                                 dz = q416; if (ltd.get(L) == 14) { dz = q616 }
-                                if (e == 0) { e = dequant_gpu(PK6, ovd.get(L), SLd, wd_nl, dz, FF) }
+                                if (e == 0) { e = deqT_gpu(PK6, ovd.get(L), SLd, wd_nl, dz, FF) }
                                 if (e != 0) { println("QPF_EXPAND_ERR L=" + L.to_string()); return 72 }
                             } } }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
