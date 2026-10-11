@@ -169,27 +169,28 @@ parse_pids(s<String>)<Vec<Int>> -> {
 // them and applies alpha/beta — i.e. exactly `C = alpha A@B + beta C`, with the K reduction done
 // across slices so the grid carries KSP times as many blocks. Params buffer: pass 1 at +0..+56,
 // pass 2 at +64..+112 (SK, C, M, N, alpha, beta, KSP).
+// ---- launch-parameter blocks, one transfer each (VybForge#23) ----
+// Every launch was preceded by 3-8 separate 8-byte cuMemcpyHtoD calls -- ~4,500 per token, the gemm
+// path alone ~126 per layer -- and the host side is ~30 ms of a 98 ms token. A Vyb struct lays its
+// fields out in DECLARATION order, so a struct of Int fields IS the parameter block the kernel reads:
+// fill the fields (stack work, ~free) and copy the block once. Order must match the kernel offsets:
+//   pass 1 (gemm32_p): A, B, SK, M, N, K, NBLK, KSP       +0..+56
+//   pass 2 (gemm32_r): SK, SCR, M, N, alpha, beta, KSP    +0..+48 (alpha/beta are not read)
+//   cast32 / widen32:  src, dst, n                        +0..+16
+struct GP1 { a<Int>, b<Int>, sk<Int>, m<Int>, n<Int>, k<Int>, nblk<Int>, ksp<Int> }
+struct GP2 { sk<Int>, scr<Int>, m<Int>, n<Int>, pad1<Int>, pad2<Int>, ksp<Int> }
+struct GP3 { src<Int>, dst<Int>, n<Int> }
+
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     freedom {
         NBLK<Int> = (M * N + 255) / 256
-        cuMemcpyHtoD_v2(GPB + 0, loc(A), 8)
-        cuMemcpyHtoD_v2(GPB + 8, loc(B), 8)
-        cuMemcpyHtoD_v2(GPB + 16, loc(SKB), 8)
-        cuMemcpyHtoD_v2(GPB + 24, loc(M), 8)
-        cuMemcpyHtoD_v2(GPB + 32, loc(N), 8)
-        cuMemcpyHtoD_v2(GPB + 40, loc(K), 8)
-        cuMemcpyHtoD_v2(GPB + 48, loc(NBLK), 8)
-        cuMemcpyHtoD_v2(GPB + 56, loc(KSP), 8)
+        b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
+        if (cuMemcpyHtoD_v2(GPB, loc(b1), 64) != 0) { return 1 }
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gpn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
         if (rc1 != 0) { println("GEMM2_P_ERR rc=" + rc1.to_string() + " grid=" + (NBLK * KSP).to_string() + " M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string()); return 73 }
-        cuMemcpyHtoD_v2(GPB + 64, loc(SKB), 8)
-        cuMemcpyHtoD_v2(GPB + 72, loc(C), 8)
-        cuMemcpyHtoD_v2(GPB + 80, loc(M), 8)
-        cuMemcpyHtoD_v2(GPB + 88, loc(N), 8)
-        cuMemcpyHtoD_v2(GPB + 96, loc(al), 8)
-        cuMemcpyHtoD_v2(GPB + 104, loc(be), 8)
-        cuMemcpyHtoD_v2(GPB + 112, loc(KSP), 8)
+        b2<GP2> = GP2 { sk = SKB, scr = C, m = M, n = N, pad1 = 0, pad2 = 0, ksp = KSP }
+        if (cuMemcpyHtoD_v2(GPB + 64, loc(b2), 56) != 0) { return 1 }
         # pass 2 reads its params from GPB + 64, NOT from GPB: launching it with the base pointer fed it
         # pointer values as M/N and made it write through the weights buffer (illegal address 700).
         rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(grn)), (M * N + 255) / 256, 1, 1, 256, 1, 1, GPB + 64, 0, 0, 0)
@@ -230,10 +231,9 @@ norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
 // f32-path helpers (VybForge#23). cast1 writes a 24-byte param block (src, dst, n) and launches the
 // elementwise cast; widen32 uses the same layout into its own block (they never overlap).
 cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
+    b3<GP3> = GP3 { src = src, dst = dst, n = n }
     freedom {
-        cuMemcpyHtoD_v2(PB + 0, loc(src), 8)
-        cuMemcpyHtoD_v2(PB + 8, loc(dst), 8)
-        cuMemcpyHtoD_v2(PB + 16, loc(n), 8)
+        if (cuMemcpyHtoD_v2(PB, loc(b3), 24) != 0) { return 1 }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("CAST32_ERR rc=" + rc.to_string()); return 77 }
         return 0
@@ -246,10 +246,9 @@ cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
 // identical launch through gemm2 ran clean, so rather than fight it the f32 path is assembled from
 // the proven pieces -- gemm2 for passes 1+2, this for pass 3.
 widen1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
+    b3<GP3> = GP3 { src = src, dst = dst, n = n }
     freedom {
-        cuMemcpyHtoD_v2(PB + 0, loc(src), 8)
-        cuMemcpyHtoD_v2(PB + 8, loc(dst), 8)
-        cuMemcpyHtoD_v2(PB + 16, loc(n), 8)
+        if (cuMemcpyHtoD_v2(PB, loc(b3), 24) != 0) { return 1 }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("WIDEN1_ERR rc=" + rc.to_string()); return 80 }
         return 0
