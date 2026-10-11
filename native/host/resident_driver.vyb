@@ -390,6 +390,11 @@ main()<Int> -> {
     KVON<Int> = 1
     nkv_s<String> = env_get("VYB_NOKV") else ""
     if (nkv_s.len() > 0) { KVON = 0 }
+    # Resident weight precision: VYB_W32=1 keeps the f32 copy (14.5 GB); default is f16 (7.3 GB), which
+    # halves the bytes every token streams. W16 = 1 -> f16 path.
+    W16<Int> = 1
+    w32_s<String> = env_get("VYB_W32") else ""
+    if (w32_s.len() > 0) { W16 = 0 }
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -482,6 +487,12 @@ main()<Int> -> {
         g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(c32n), ml, "cast32") != 0) { return 10 }
         if (cuModuleGetFunction(loc(g3p), ml, "gemm32_p") != 0) { return 10 }
+        g16p<loc<CVoid>> = from<loc<CVoid>>(0); c16n<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16p), ml, "gemm16_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(c16n), ml, "cast16") != 0) { return 10 }
+        # gemm pass 1 used by the layers: f16 weights unless VYB_W32=1
+        gwp<loc<CVoid>> = g3p
+        if (W16 == 1) { gwp = g16p }
         if (cuModuleGetFunction(loc(g3r), ml, "gemm32_r") != 0) { return 10 }
         if (cuModuleGetFunction(loc(w3n), ml, "widen32") != 0) { return 10 }
         rsn<loc<CVoid>> = from<loc<CVoid>>(0); ran<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -593,14 +604,16 @@ main()<Int> -> {
         # does. This deletes the per-token dequant entirely. The per-layer SHAPES are uniform, so
         # each tensor is one base pointer plus L * (numel * 4): the per-layer quant-type variation
         # (attn_v, ffn_down) changes the packed size, never the element count.
-        if (cuMemAlloc_v2(loc(WqA), wq_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WkA), wk_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WvA), wv_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WoA), wo_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WgA), wg_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WuA), wu_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WdA), wd_nl * 4 * NLAYER) != 0) { return 11 }
-        println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * 4 * NLAYER).to_string() + " bytes")
+        WES<Int> = 4
+        if (W16 == 1) { WES = 2 }   # bytes per resident weight element
+        if (cuMemAlloc_v2(loc(WqA), wq_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WkA), wk_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WvA), wv_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WoA), wo_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WgA), wg_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WuA), wu_nl * WES * NLAYER) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(WdA), wd_nl * WES * NLAYER) != 0) { return 11 }
+        println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * WES * NLAYER).to_string() + " bytes (" + WES.to_string() + " B/elem)")
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
@@ -720,13 +733,31 @@ main()<Int> -> {
             fdtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
             fdqA<loc<CVoid>> = q432
             if (fdtA == 14) { fdqA = q632 }
-            e = dequant_gpu(PK0, K0 * L, WqA + L * wq_nl * 4, wq_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK1, K1 * L, WkA + L * wk_nl * 4, wk_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK2, ov2.get(L), WvA + L * wv_nl * 4, wv_nl, avqA, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK3, K3 * L, WoA + L * wo_nl * 4, wo_nl, q432, NQ); if (e != 0) { return 70 }
-            e = dequant_gpu(PK4, K4 * L, WgA + L * wg_nl * 4, wg_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK5, K5 * L, WuA + L * wu_nl * 4, wu_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK6, ov6.get(L), WdA + L * wd_nl * 4, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+            if (W16 == 1) {
+                # f32 into the per-layer scratch (Wq32..Wd32), then narrowed to f16 in the resident block.
+                e = dequant_gpu(PK0, K0 * L, Wq32, wq_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, K1 * L, Wk32, wk_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ov2.get(L), Wv32, wv_nl, avqA, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, K3 * L, Wo32, wo_nl, q432, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, K4 * L, Wg32, wg_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, K5 * L, Wu32, wu_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ov6.get(L), Wd32, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wq32, WqA + L * wq_nl * 2, wq_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wk32, WkA + L * wk_nl * 2, wk_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wv32, WvA + L * wv_nl * 2, wv_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wo32, WoA + L * wo_nl * 2, wo_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wg32, WgA + L * wg_nl * 2, wg_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wu32, WuA + L * wu_nl * 2, wu_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wd32, WdA + L * wd_nl * 2, wd_nl); if (e != 0) { return 70 }
+            } else {
+                e = dequant_gpu(PK0, K0 * L, WqA + L * wq_nl * 4, wq_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, K1 * L, WkA + L * wk_nl * 4, wk_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ov2.get(L), WvA + L * wv_nl * 4, wv_nl, avqA, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, K3 * L, WoA + L * wo_nl * 4, wo_nl, q432, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, K4 * L, WgA + L * wg_nl * 4, wg_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, K5 * L, WuA + L * wu_nl * 4, wu_nl, q432, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ov6.get(L), WdA + L * wd_nl * 4, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+            }
             if (L % 6 == 0) { println("WEIGHTS_EXPANDED layer " + L.to_string() + "/36") }
         }
         println("ALL_WEIGHTS_EXPANDED")
@@ -837,10 +868,10 @@ main()<Int> -> {
                             if (KVON == 1) { KCl = KCA + L * MAXS * NKV * 8; VCl = VCA + L * MAXS * NKV * 8 }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                          N1, WqA + L * wq_nl * 4, WkA + L * wk_nl * 4, WvA + L * wv_nl * 4,
-                                          Nq, Nk, DF, WoA + L * wo_nl * 4, N2,
-                                          WgA + L * wg_nl * 4, WuA + L * wu_nl * 4, WdA + L * wd_nl * 4,
-                                          XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
+                                          N1, WqA + L * wq_nl * WES, WkA + L * wk_nl * WES, WvA + L * wv_nl * WES,
+                                          Nq, Nk, DF, WoA + L * wo_nl * WES, N2,
+                                          WgA + L * wg_nl * WES, WuA + L * wu_nl * WES, WdA + L * wd_nl * WES,
+                                          XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, gwp, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
                                           P0, KCl, VCl, akfn, QV, ascf, acxf, SCB)
