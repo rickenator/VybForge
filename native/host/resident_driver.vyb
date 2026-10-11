@@ -770,9 +770,11 @@ main()<Int> -> {
     MBX<Int> = 1
     # GTILE = 1: f16 prefill gemm pass 1 is the register-tiled gemm16_t (VYB_GTILE=0: gemm16_p)
     GTILE<Int> = 1
-    GTK<Int> = 0
+    # GTK = 1 (default; VYB_GTK=0 off): adaptive split-K depth for the tiled prefill GEMM. Gated: 9 prompts of
+    # 24..512 tokens x GEN=256 tokens identical to GTK=0 on GB10 and the 3090 (18/18).
+    GTK<Int> = 1
     gtk_s<String> = env_get("VYB_GTK") else ""
-    if (gtk_s == "1") { GTK = 1 }
+    if (gtk_s == "0") { GTK = 0 }
     gt_s<String> = env_get("VYB_GTILE") else ""
     if (gt_s == "0") { GTILE = 0 }
     # MR2 = 1: the exact-M twins run 2 weight rows per warp (VYB_MR2=0: 1 row)
