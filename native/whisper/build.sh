@@ -2,7 +2,8 @@
 # build.sh — gates for the Whisper slice (voice loop, native/whisper).
 #
 #   ./build.sh weights    # checkpoint inventory: Vyb vs an independent parse
-#   ./build.sh stages     # encoder front half on the GPU: conv1, conv2, +positional
+#   ./build.sh stages     # the whole encoder on the GPU, stage-gated
+#   ./build.sh decoder    # the decoder on the GPU, stage-gated
 #   ./build.sh kernels    # recompile the Whisper PTX kernels only
 #   ./build.sh all        # weights + stages + kernels
 #   ./build.sh gold       # (re)generate the reference artifacts
@@ -52,6 +53,22 @@ stages() {
     "$PY" check_stages.py out/vyb_stages.txt
 }
 
+decoder() {
+    kernels
+    echo "== decoder stages (from the repo root)"
+    ( cd "$ROOT" && "$VYB" native/whisper/host/decoder_driver.vyb \
+          --module-path native/torchload \
+          --module-path native/json \
+          --module-path native/tensor \
+          --module-path "$VYBHOME/bindings/cuda" \
+          > native/whisper/out/vyb_dec.txt 2>&1 ) || true
+    tail -1 "$here/out/vyb_dec.txt"
+    # GROW THIS LIST as decoder stages land. A stage the driver does not emit
+    # yet is not a failure — a gate that is permanently red for work that has not
+    # been done teaches nothing (and hides the failure that matters).
+    "$PY" check_stages.py out/vyb_dec.txt d_embed
+}
+
 weights() {
     echo "== checkpoint: $ST"
     # --module-path is repeatable; it does NOT take a colon-separated list
@@ -77,6 +94,10 @@ case "${1:-all}" in
         [ -f "$ST" ] || { echo "SKIP: checkpoint not found at $ST (set VYBFORGE_ST_FILE)"; exit 0; }
         export VYBFORGE_ST_FILE="$ST"
         stages ;;
+    decoder)
+        [ -f "$ST" ] || { echo "SKIP: checkpoint not found at $ST (set VYBFORGE_ST_FILE)"; exit 0; }
+        export VYBFORGE_ST_FILE="$ST"
+        decoder ;;
     kernels) kernels ;;
     all)
         [ -f "$ST" ] || { echo "SKIP: checkpoint not found at $ST (set VYBFORGE_ST_FILE)"; exit 0; }

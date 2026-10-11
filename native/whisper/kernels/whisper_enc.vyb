@@ -160,7 +160,12 @@ im2col_conv(p<Int>) -> {
 // ---------------------------------------------------------------------------
 // attn: scaled dot-product attention, no mask, separate K/V source
 //   out[i, :] over head h = softmax_j( scale * q_i . k_j ) v_j
-//   params: Q, K, V, OUT, T_q, T_k, H, HD, scale (Float)
+//   params: Q, K, V, OUT, T_q, T_k, H, HD, scale (Float), causal
+//   causal = 0: every query sees every key (encoder self-attention and the
+//               decoder's cross-attention over the encoder output)
+//   causal != 0: query i sees keys 0..i (the decoder's self-attention)
+//   The mode is a param word rather than a second kernel: the score loops are
+//   identical apart from the key bound.
 //   Q/OUT are (T_q, H*HD); K/V are (T_k, H*HD); row-major, heads inside the row.
 //
 // One thread per (head, query). Whisper attention is NOT causal (the encoder sees
@@ -184,6 +189,7 @@ attn(p<Int>) -> {
     H<Int> = ld_i64(p + 48)
     HD<Int> = ld_i64(p + 56)
     scale<Float> = ld_f64(p + 64)
+    cau<Int> = ld_i64(p + 72)
     total<Int> = Tq * H
     pid<Int> = blk_x() * dim_x() + tid_x()
     if (pid < total) {
@@ -193,9 +199,16 @@ attn(p<Int>) -> {
         qb<Int> = i * D + h * HD
         kb<Int> = h * HD
 
+        # causal: only keys up to and including this query
+        jmax<Int> = Tk - 1
+        if (cau != 0) {
+            jmax = i
+            if (jmax > Tk - 1) { jmax = Tk - 1 }
+        }
+
         best<Float> = -1000000.0
         j<Int> = 0
-        for (j in 0..Tk - 1) {
+        for (j in 0..jmax) {
             s<Float> = 0.0
             d<Int> = 0
             for (d in 0..HD - 1) {
@@ -206,7 +219,7 @@ attn(p<Int>) -> {
         }
 
         z<Float> = 0.0
-        for (j in 0..Tk - 1) {
+        for (j in 0..jmax) {
             s<Float> = 0.0
             d<Int> = 0
             for (d in 0..HD - 1) {
@@ -219,7 +232,7 @@ attn(p<Int>) -> {
         acc<[Float; 128]>
         d<Int> = 0
         for (d in 0..HD - 1) { acc[d] = 0.0 }
-        for (j in 0..Tk - 1) {
+        for (j in 0..jmax) {
             s<Float> = 0.0
             d = 0
             for (d in 0..HD - 1) {
@@ -236,6 +249,53 @@ attn(p<Int>) -> {
         for (d in 0..HD - 1) {
             st_f64(OUT + (qb + d) * 8, acc[d])
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embed: gather rows of an embedding table by token id
+//   out[s*D + d] = table[id[s]*D + d]
+//   params: table, ids, out, S, D        (ids is a device buffer of Int words)
+// The decoder needs this twice: to build the layer-0 input from the prompt, and
+// again for the tied output projection (proj_out IS embed_tokens in this model).
+embed(p<Int>) -> {
+    table<Int> = ld_i64(p + 0)
+    ids<Int> = ld_i64(p + 8)
+    outp<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    total<Int> = S * D
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        tok<Int> = ld_i64(ids + s * 8)
+        st_f64(outp + gid * 8, ld_f64(table + (tok * D + d) * 8))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// argmax: index of the largest value in `n` floats
+//   params: x, out (one Int word), n
+// ONE thread scans the whole row. That is a deliberately simple first cut: the
+// vote is 51864 sequential loads (~0.5 ms measured), which is noise next to the
+// rest of a decode step. A block reduction is the optimisation if it ever matters.
+argmax(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    if (blk_x() * dim_x() + tid_x() == 0) {
+        best<Float> = -1.0e300
+        bi<Int> = 0
+        i<Int> = 0
+        for (i in 0..N - 1) {
+            v<Float> = ld_f64(X + i * 8)
+            if (v > best) {
+                best = v
+                bi = i
+            }
+        }
+        st_i64(O, bi)
     }
 }
 

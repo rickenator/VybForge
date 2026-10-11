@@ -269,6 +269,9 @@ enc_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>,
         return 13
     }
     if (htod(PK + 64, 0.125) != 0) { return 14 }
+    # causal = 0: encoder self-attention sees the whole utterance. The decoder's
+    # self-attention passes 1 through the same word.
+    if (pi(PK, 72, 0) != 0) { return 17 }
     if (launch1(fatt, (POS * HEADS + 255) / 256, 256, PK) != 0) { return 15 }
     sync()
     e = linear(ckpt, ix, pfx + "self_attn.out_proj.weight", pfx + "self_attn.out_proj.bias",

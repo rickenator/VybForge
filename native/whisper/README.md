@@ -9,9 +9,10 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Piece | State | Gate |
 |---|---|---|
 | Checkpoint inventory | **done** | `./build.sh weights` — 167 tensors, names/dtypes/shapes/bytes exact |
+| Decoder: token table + prompt embedding | **done** | `./build.sh decoder` — 1e-06 |
 | Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — within 1.3e-5 of the real model |
 | Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
-| Decoder + greedy decode | not started | — |
+| Decoder: causal self-attn, cross-attn, tied head, greedy decode | not started | — |
 
 ### Stage evidence (RTX 3090)
 
@@ -125,6 +126,24 @@ Reference answer for the fixture (`jfk.wav`):
 WHISPER_STAGES=conv2 ./build.sh stages     # one stage while iterating
 ./build.sh gold       # regenerate every reference artifact
 ```
+
+## Decoder (in progress)
+
+`host/decoder_driver.vyb` + the same `attn`/`embed`/`layerwise` kernels. Two
+differences the existing kernels already cover: the decoder's self-attention is
+CAUSAL (attn's `causal` param word — 0 for the encoder and cross-attention, 1 for
+decoder self-attention) and its cross-attention is the same entry point with K/V
+pointing at the encoder's output.
+
+The tied head matters here: `proj_out.weight` exists in transformers' state_dict
+but NOT in the file, so the 51864x384 token table is loaded once (in ~2M-element
+pieces — a single 79.7 MB Vyb String is a lot to hold) and used twice, as a gather
+for the input and as the transposed projection.
+
+**Next step**: the decoder layers need the encoder's final output in the same
+process. The clean way is to lift the shared helpers and the two stage drivers
+(conv_stage, the block function) out of `encoder_driver.vyb` into a module both
+drivers import; today the encoder pipeline lives in that driver's `main`.
 
 ## What is left
 

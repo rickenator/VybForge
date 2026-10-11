@@ -16,6 +16,15 @@ HERE = __file__.rsplit("/", 1)[0]
 GOLD = f"{HERE}/../../fixtures/whisper/gold_stt"
 
 SHAPES = {
+    # ---- decoder (native/whisper/host/decoder_driver.vyb) -------------------
+    "d_embed": (2, 384),
+    "d_l0_ln1": (2, 384),
+    "d_l0_selfattn": (2, 384),
+    "d_l0_res1": (2, 384),
+    "d_l0_crossattn": (2, 384),
+    "d_l0_mlp": (2, 384),
+    "d_final_ln": (2, 384),
+    "d_step0_logits": (51864,),
     "conv1": (384, 3000), "e_conv1": (384, 3000),
     "conv2": (384, 1500), "e_conv2": (384, 1500),
     "e_pos": (1500, 384),
@@ -70,7 +79,9 @@ def main():
     ok = True
     for stage in ("conv1", "conv2", "e_pos", "e_in", "e_l0_ln1", "e_l0_attn",
                   "e_l0_res1", "e_l0_ln2", "e_l0_mlp",
-                  "e_layer0", "e_layer1", "e_layer2", "e_layer3", "e_final"):
+                  "e_layer0", "e_layer1", "e_layer2", "e_layer3", "e_final",
+                  "d_embed", "d_l0_ln1", "d_l0_selfattn", "d_l0_res1", "d_l0_crossattn",
+                  "d_l0_mlp", "d_final_ln", "d_step0_logits"):
         if only and stage not in only:
             print(f"{stage}: SKIP (not requested)")
             continue
@@ -80,7 +91,10 @@ def main():
             continue
         n = int(np.prod(SHAPES[stage]))
         got = np.asarray(sections[stage][:n], dtype=np.float64) / 1e6
-        gold_name = stage if stage.startswith("e_") else "e_" + stage
+        if stage.startswith("d_"):
+            gold_name = stage
+        else:
+            gold_name = stage if stage.startswith("e_") else "e_" + stage
         ref = np.fromfile(f"{GOLD}/{gold_name}.f32", dtype="<f4").astype(np.float64)
         if len(got) != len(ref):
             print(f"{stage}: LENGTH MISMATCH vyb={len(got)} ref={len(ref)} -> FAIL")
