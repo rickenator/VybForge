@@ -456,3 +456,123 @@ So "Numerics differ from 1536 -> gate pending" does NOT reproduce at GEN=128 on 
 token stream is bit-identical and both settings match the gold stream. The change also buys no
 measurable DECODE time (47.6 vs 48.4 tok/s, inside the run-to-run spread), consistent with GTKW being a
 PREFILL-side knob (GB10 512-token prefill gemm16_t 514 -> 474 ms per the commit message). Kept.
+
+---
+
+# HANDOFF -- 27B Ridge bring-up (session write-up)
+
+## State at handoff
+
+- Branch `perf/ursela-lefty`, pushed to origin. Working tree CLEAN (only `.ubench.sh` untracked --
+  that is this line's own bench harness, left alone).
+- **The 27B runs and PASSES its oracle verification** on lefty (GB10):
+  `make -C native ridge-forward` -> per-position top1 5/5, 1/1, 2/2, 3/3 agree; hidden
+  cos(post-output_norm) 0.9992..0.9997; `RIDGE_FORWARD_VERIFY_DONE`. A whole 64-block hybrid
+  attention+GDN forward reproduces llama.cpp's own hidden and top1.
+- **Measured throughput: 0.32 tok/s** (`PREFILL_TIMING S=3 ms=9292 us_per_token=3097333`). It is
+  streaming-bound, not GPU-bound -- see the bottleneck note below.
+- Nothing is running; no model server holds the GPUs. `righty` is UNTOUCHED.
+
+## How to run the 27B
+
+```
+# model (12.6 GB) is already staged on lefty; mmproj-*.gguf is the vision tower, not the model
+export RIDGE_GGUF=$(ls ~/Models/qwen38-27b-ridge/*.gguf | grep -v mmproj | head -1)
+cd ~/Projects/VybForge-perf
+make -C native ridge-forward        # must PASS; add VYB_RIDGE_TRACE=1 for the embed-row dump
+grep -E "PREFILL_TIMING|PREFILL_LAYER" native/out/ridge_forward_driver.log   # throughput + heartbeat
+```
+The verifier echoes only an ALLOWLIST of driver lines, so read the raw log for anything new.
+
+## Immediate next step: the resident 27B path (target ~20 tok/s)
+
+Both drivers each have HALF of what is needed:
+
+- `resident_driver.vyb` (4B, 48 tok/s) -- the machinery to copy: all 36 layers' PACKED weights resident
+  on-GPU with ONE upload (per-tensor `cuMemAlloc_v2` blocks, then one HtoD each), plus a fused quantized
+  GEMV for decode straight from the resident blocks. BUT hardcoded to 4B dims, pure attention,
+  Q4_K/Q6_K only -- no GDN, no qwen35, no untied head, no IQ2_S/IQ3_S.
+- `model_driver.vyb` (27B) -- the correctness half, all VERIFIED: hybrid config, GDN, untied chunked
+  head, IQ2_S/IQ3_S grid codecs. But it streams every weight from the file on every forward.
+
+So this is a PORT, not new research: give model_driver resident allocations + one upload each (the
+resident_driver pattern), keep the 3.7bpw weights PACKED (~12.6 GB fits the Spark's 121 GB easily; f16
+would be 27 GB and is unnecessary), and dequantize fused at use. Do NOT touch the ridge config / GDN /
+untied-head logic -- it is verified and passing.
+
+Suggested FIRST SLICE (bounded, self-contained, verifiable): make ONE layer's tensors resident, leave
+the other 64 streaming, then (1) `make -C native ridge-forward` must still PASS, and (2) compare
+`PREFILL_TIMING` against 3.10 s/token. If one layer moves the number, extending to 65 is mechanical.
+That seam lets a session stop with a working faster engine instead of a broken half-rewrite.
+
+Why it will pay: the model is ALREADY page-cached (19 GB in buff/cache) yet streaming reaches only
+12.6 GB / 9.29 s = 1.36 GB/s -- so the cost is the per-tensor read->String->HtoD plumbing, not I/O.
+Residency removes the plumbing; the ceiling then becomes memory bandwidth:
+12.6 GB / 273 GB/s ~= 46 ms/forward ~= 20 tok/s (vs 0.32 today).
+
+There is NO residency switch to flip -- the full env-hook list for model_driver is prompts, model and
+tokenizer paths, the four probe hooks, MTP and the trace flag. It is streaming-only by construction.
+
+## What was fixed in this session (all pushed)
+
+- `660ac8c` fix(gate): the oracle provenance check compared the whole llama-server version string
+  verbatim, which is UNPASSABLE for anyone who rebuilds the oracle at the pinned commit (git
+  abbreviates the commit differently: 7 chars in the fixture, 9 in a fresh build). Now compares build
+  number exactly, commit by PREFIX, base version exactly, gguf hash verbatim.
+- `940de8c` fix(27b): migrate `model_driver`'s 12 two-arg `put_i(base + off, value)` calls to the 3-arg
+  form (`put_i` is 3-arg, defined at gdn_layer_driver.vyb:67 -- the driver did not COMPILE before this).
+  Also builds the kernel modules the ridge config needs (rope, q8_0, gdn, attn35, q5k, iq2s, iq3s --
+  only layer/q4k/q6k/qwen3 ship) and generates the iq2s/iq3s grid images.
+- `0d67d61` fix(inventory): **THE NaN ROOT CAUSE.** `ridge_inventory.py` wrote its TSV with extra
+  columns and no `off=` prefix; the driver parses offsets from an `off=`-prefixed field, so `te_off`
+  became garbage (it logged `token_embd off=6`) and the engine read token_embd from file offset 6 --
+  the GGUF header -- as weights. Garbage embeddings -> NaN hidden -> top1 0. The tool now emits
+  `name, dims, type, off=<n>, size=<n>`, so regenerating cannot reintroduce it.
+- `9688cf2` perf(ridge): prefill timing (`PREFILL_TIMING`). First 27B throughput number.
+- `a908d46` docs: closed the VYB_GTKW 1536->3072 gate (bit-identical at GEN=128 on GB10, gold MATCH
+  both ways -- the "gate pending" note in f06957c does not reproduce).
+
+## Also established about this line
+
+- The perf line does ~48 tok/s on the 4B (`.ubench.sh gtw3072 GEN=128`), vs 15.5 tok/s on the 3090
+  branch -- the SPARK line is the better one. `.ubench.sh <label> GEN=128` is the tool that settles a
+  commit whose message says "gate pending" (it is hidden -- `./ubench.sh` fails).
+- The line is 56 ahead / 10 behind `origin/main`; the 10 are the 3090 line's #23 commits, including an
+  attention rework that COMPETES with this line's own `attn_sc5`/`attn_cx5`. Do not blind-merge.
+
+## Traps that cost real time in this session (do not re-walk)
+
+- Vyb CONSTANT-FOLDS `x != x` to false, so a NaN count built on it reports 0 while the printed value
+  is literally `nan`. Print values via `to_string()`; never trust a comparison-based NaN count.
+- A local declared at one point in `model_driver` is NOT in scope at another -- the file is deeply
+  nested. Hoist timing/locals to the top-level init block (`DPK<Int> = 0; ...`).
+- The driver cannot be invoked bare: `llm` resolves via `--module-path native/llm`. Use the make target.
+  If a patch breaks the driver, `git checkout -- native/host/model_driver.vyb` restores the passing state.
+- A PRETTY-PRINTED `vocab.json` encodes every token to id 0 (stdlib/vllm's `build_vocab_from` stops
+  `read_int` at the first non-digit). The HF `Qwen/Qwen3.8-27B` vocab downloads pretty-printed.
+  Symptom: correct-looking forward pass with `PROMPT_IDS=0 0 0 0 0`.
+- The 27B vocab is 248044 tokens, NOT the 4B's 151936. `hf download Qwen/Qwen3.8-27B vocab.json
+  merges.txt --local-dir artifacts/ridge-tokenizer` (needs huggingface-hub; the `hf` script lands in
+  ~/.local/bin, often not on PATH).
+- An independent gguf-py reference is the way to settle dequant questions, but read the tensor through
+  the reader's OWN accessor (`r.tensors`, then `tensor.data`) -- do NOT hand-compute
+  `reader.data_offset + tensor.data_offset`, which is what produced my own garbage readings and a
+  wrong "the file is broken" conclusion.
+
+## Rest of the queue
+
+1. Resident 27B (above) -- the real performance work; target ~20 tok/s.
+2. `ridge-mtp` gate -- the `blk.64` nextn MTP draft head is already identified and excluded from the
+   main pass.
+3. Merge this perf line to `main`, attention resolved toward `attn_sc5`/`attn_cx5`.
+4. Port the two genuine wins from the 3090 line onto this one: the `bench_n` harness fix (the old
+   `runk()` reloaded/re-JIT'd the PTX module per call, so its timings measured module loading) and the
+   f64-binding rule (`ld_f32` carries a Float64 surface type; bind every load to a <Float32> local or
+   every MAC silently becomes f64).
+5. Stage the 27B on righty so both Sparks can benchmark in parallel.
+
+## Reference
+
+Skill `dgx-spark-two-node-serving` carries the full detail: the 27B bring-up steps, the root cause and
+the format comparison, the verification result, and the eliminations (Q6_K kernel verified OK, offsets
+and stride verified correct, `download` helper verified identical to the working 4B's).
