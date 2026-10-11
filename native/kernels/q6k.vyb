@@ -102,15 +102,22 @@ q6kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
 q6kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < n) {
+        # 32-bit index math (64-bit div/mod by a runtime divisor is a long emulated sequence; every
+        # value here is < 2^31). Same indices, so the same element lands in the same place.
         cw<Int> = 0
         cc<Int> = 0
         rr<Int> = 0
         gsrc<Int> = gid
         if (z > 0) {
-            cw = n / z
-            cc = gid / cw
-            rr = gid % cw
-            gsrc = rr * z + cc
+            g32<Int32> = gid as Int32
+            z32<Int32> = z as Int32
+            cw32<Int32> = (n as Int32) / z32
+            cc32<Int32> = g32 / cw32
+            rr32<Int32> = g32 - cc32 * cw32
+            cw = cw32 as Int
+            cc = cc32 as Int
+            rr = rr32 as Int
+            gsrc = (rr32 * z32 + cc32) as Int
         }
         block<Int> = gsrc / 256
         bb<Int> = q + block * 210
