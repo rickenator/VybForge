@@ -1037,10 +1037,19 @@ attn_smx(p<Int>) -> {
         st3 = st3 / 2
     }
     tot<Float> = ld_shared_f64(0)
+    E32<Int> = ld_i64(p + 280)
     t3<Int> = tid
-    while (t3 < n) {
-        st_f64(eb + t3 * 8, ld_f64(eb + t3 * 8) / tot)
-        t3 = t3 + 256
+    if (E32 != 0) {
+        e3<Int> = E32 + gsh * T * 4
+        while (t3 < n) {
+            st_f32(e3 + t3 * 4, (ld_f64(eb + t3 * 8) / tot) as Float32)
+            t3 = t3 + 256
+        }
+    } else {
+        while (t3 < n) {
+            st_f64(eb + t3 * 8, ld_f64(eb + t3 * 8) / tot)
+            t3 = t3 + 256
+        }
     }
 }
 attn_cx2(p<Int>) -> {
@@ -1229,4 +1238,122 @@ attn_cxr3(p<Int>) -> {
         for (c in 0..31) { acc = acc + ld_f64(PC + ((gsh * 32 + c) * HD + ii) * 8) }
         st_f64(Ctx + gid * 8, acc)
     }
+}
+
+// f32-math attention (Ursela, item 22, VYB_ATTN=4; needs the f32 K/V cache). GB10 runs f64 at a small
+// fraction of f32, and at T ~ 1k the f64 FMAs of the score dots and the weighted V sum were the cost
+// (KV bytes were not: halving them changed nothing). Scores: Q narrowed to f32 per lane, f32 dots, then
+// the tree on the widened partials (Vyb has no f32 shared-memory ops), stored f64 for the (unchanged, f64) softmax; the softmax also writes f32
+// weights (EW32) that attn_cx4 consumes with f32 V into f32 accumulators; chunk partials are stored f64
+// and attn_cxr3 sums them as before. Same grids as attn_sc3 / attn_cx3.
+attn_sc4(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    TB<Int> = (T + 7) / 8
+    gk<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    t<Int> = tb * 8 + tid / 32
+    ok<Int> = 0
+    if (t < T) { if (t <= P0 + s) { ok = 1 } }
+    z<Float32> = 0.0 as Float32
+    p0<Float32> = z
+    p1<Float32> = z
+    p2<Float32> = z
+    p3<Float32> = z
+    if (ok == 1) {
+        qb<Int> = Q + (s * H * HD + g * 4 * HD) * 8
+        kb<Int> = K + (t * KVH * HD + g * HD) * 4
+        ia<Int> = l
+        while (ia < HD) {
+            kv<Float32> = ld_f32(kb + ia * 4)
+            q0<Float32> = ld_f64(qb + ia * 8) as Float32
+            q1<Float32> = ld_f64(qb + (HD + ia) * 8) as Float32
+            q2<Float32> = ld_f64(qb + (2 * HD + ia) * 8) as Float32
+            q3<Float32> = ld_f64(qb + (3 * HD + ia) * 8) as Float32
+            p0 = p0 + q0 * kv
+            p1 = p1 + q1 * kv
+            p2 = p2 + q2 * kv
+            p3 = p3 + q3 * kv
+            ia = ia + 32
+        }
+    }
+    // no f32 shared-memory intrinsics in Vyb (only ld/st_shared_f64): the tree runs on the widened partials
+    st_shared_f64(tid * 4, p0 as Float)
+    st_shared_f64(tid * 4 + 1, p1 as Float)
+    st_shared_f64(tid * 4 + 2, p2 as Float)
+    st_shared_f64(tid * 4 + 3, p3 as Float)
+    kernel_barrier()
+    st2<Int> = 16
+    while (st2 > 0) {
+        if (l < st2) {
+            j<Int> = 0
+            for (j in 0..3) { st_shared_f64(tid * 4 + j, ld_shared_f64(tid * 4 + j) + ld_shared_f64((tid + st2) * 4 + j)) }
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (l < 4) {
+        if (ok == 1) {
+            hh<Int> = g * 4 + l
+            st_f64(SC + ((s * H + hh) * T + t) * 8, ld_shared_f64((tid - l) * 4 + l) * scale)
+        }
+    }
+}
+attn_cx4(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    PC<Int> = ld_i64(p + 264)
+    E32<Int> = ld_i64(p + 280)
+    gk<Int> = blk_x() / 32
+    c<Int> = blk_x() % 32
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 31) / 32
+    t0<Int> = c * cl
+    t1<Int> = t0 + cl
+    if (t1 > n) { t1 = n }
+    w0<Int> = E32 + (s * H + g * 4) * T * 4
+    z<Float32> = 0.0 as Float32
+    a0<Float32> = z
+    a1<Float32> = z
+    a2<Float32> = z
+    a3<Float32> = z
+    tc<Int> = t0
+    while (tc < t1) {
+        vv<Float32> = ld_f32(V + (tc * KVH * HD + g * HD + ii) * 4)
+        e0<Float32> = ld_f32(w0 + tc * 4)
+        e1<Float32> = ld_f32(w0 + (T + tc) * 4)
+        e2<Float32> = ld_f32(w0 + (2 * T + tc) * 4)
+        e3<Float32> = ld_f32(w0 + (3 * T + tc) * 4)
+        a0 = a0 + e0 * vv
+        a1 = a1 + e1 * vv
+        a2 = a2 + e2 * vv
+        a3 = a3 + e3 * vv
+        tc = tc + 1
+    }
+    hb<Int> = s * H + g * 4
+    st_f64(PC + (((hb + 0) * 32 + c) * HD + ii) * 8, a0 as Float)
+    st_f64(PC + (((hb + 1) * 32 + c) * HD + ii) * 8, a1 as Float)
+    st_f64(PC + (((hb + 2) * 32 + c) * HD + ii) * 8, a2 as Float)
+    st_f64(PC + (((hb + 3) * 32 + c) * HD + ii) * 8, a3 as Float)
 }
