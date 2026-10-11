@@ -918,3 +918,163 @@ rms_blk(p<Int>) -> {
         d2 = d2 + 256
     }
 }
+
+// ---- Parallel KV attention (Ursela, queue item 22). The attn_mx/attn_sum pair ran ONE thread per
+// (row, head) -- 32 threads on the whole GPU at decode -- looping serially over all T positions, and
+// attn_cxw one thread per (row, head, dim) looping over T; attn_sc read each K row with one thread
+// (8-byte loads 8 KB apart across a warp, 25% sector use). Cost grew linearly with position at very
+// low parallelism. Same math, still f64 throughout, only reduction ORDER changes (tree / chunked):
+// attn_sc2  block = 8 warps = 8 positions of one (row, head); lane l takes dims l, l+32, l+64, l+96
+//           (coalesced K reads), 32-lane tree in shared memory.        grid S*H*ceil(T/8) x 256
+// attn_smx  block per (row, head): tree max (exact), vexp as attn_ex, tree sum, normalize -- the four
+//           mx/ex/sum/nrm launches in one.                              grid S*H x 256
+// attn_cx2  block per (row, head, chunk of positions), thread per dim: serial f64 sum over its
+//           chunk into PC.                                              grid S*H*CS x HD
+// attn_cxr  Ctx = sum of the CS chunk partials in chunk order.          grid ceil(S*H*HD/256) x 256
+// Params as attn_sc/attn_cxw, plus PC (chunk partials) @264; CS is fixed at 8.
+attn_sc2(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    TB<Int> = (T + 7) / 8
+    gsh<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gsh / H
+    h<Int> = gsh % H
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    t<Int> = tb * 8 + tid / 32
+    ok<Int> = 0
+    if (t < T) { if (t <= P0 + s) { ok = 1 } }
+    part<Float> = 0.0
+    if (ok == 1) {
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        kb<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 8
+        ia<Int> = l
+        while (ia < HD) {
+            part = part + ld_f64(qb + ia * 8) * ld_f64(kb + ia * 8)
+            ia = ia + 32
+        }
+    }
+    st_shared_f64(tid, part)
+    kernel_barrier()
+    st2<Int> = 16
+    while (st2 > 0) {
+        if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (l == 0) { if (ok == 1) { st_f64(SC + (gsh * T + t) * 8, ld_shared_f64(tid) * scale) } }
+}
+attn_smx(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    gsh<Int> = blk_x()
+    s<Int> = gsh / H
+    n<Int> = P0 + s + 1
+    tid<Int> = tid_x()
+    sb<Int> = SC + gsh * T * 8
+    eb<Int> = EW + gsh * T * 8
+    mx<Float> = -1000000000000000000000000000000.0
+    t<Int> = tid
+    while (t < n) {
+        v<Float> = ld_f64(sb + t * 8)
+        if (v > mx) { mx = v }
+        t = t + 256
+    }
+    st_shared_f64(tid, mx)
+    kernel_barrier()
+    st2<Int> = 128
+    while (st2 > 0) {
+        if (tid < st2) {
+            a<Float> = ld_shared_f64(tid)
+            b<Float> = ld_shared_f64(tid + st2)
+            if (b > a) { st_shared_f64(tid, b) }
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    gm<Float> = ld_shared_f64(0)
+    kernel_barrier()
+    ss<Float> = 0.0
+    t2<Int> = tid
+    while (t2 < n) {
+        e<Float> = vexp(ld_f64(sb + t2 * 8) - gm)
+        st_f64(eb + t2 * 8, e)
+        ss = ss + e
+        t2 = t2 + 256
+    }
+    st_shared_f64(tid, ss)
+    kernel_barrier()
+    st3<Int> = 128
+    while (st3 > 0) {
+        if (tid < st3) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st3)) }
+        kernel_barrier()
+        st3 = st3 / 2
+    }
+    tot<Float> = ld_shared_f64(0)
+    t3<Int> = tid
+    while (t3 < n) {
+        st_f64(eb + t3 * 8, ld_f64(eb + t3 * 8) / tot)
+        t3 = t3 + 256
+    }
+}
+attn_cx2(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    PC<Int> = ld_i64(p + 264)
+    gsh<Int> = blk_x() / 8
+    c<Int> = blk_x() % 8
+    s<Int> = gsh / H
+    h<Int> = gsh % H
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 7) / 8
+    t0<Int> = c * cl
+    t1<Int> = t0 + cl
+    if (t1 > n) { t1 = n }
+    kvh<Int> = h / (H / KVH)
+    wb<Int> = EW + gsh * T * 8
+    acc<Float> = 0.0
+    tc<Int> = t0
+    while (tc < t1) {
+        acc = acc + ld_f64(wb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+        tc = tc + 1
+    }
+    st_f64(PC + ((gsh * 8 + c) * HD + ii) * 8, acc)
+}
+attn_cxr(p<Int>) -> {
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    PC<Int> = ld_i64(p + 264)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        gsh<Int> = gid / HD
+        ii<Int> = gid % HD
+        acc<Float> = 0.0
+        c<Int> = 0
+        for (c in 0..7) { acc = acc + ld_f64(PC + ((gsh * 8 + c) * HD + ii) * 8) }
+        st_f64(Ctx + gid * 8, acc)
+    }
+}
