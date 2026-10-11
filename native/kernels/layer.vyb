@@ -367,32 +367,63 @@ gemm32_p(p<Int>) -> {
     M<Int> = ld_i64(p + 24)
     N<Int> = ld_i64(p + 32)
     K<Int> = ld_i64(p + 40)
-    NBLK<Int> = ld_i64(p + 48)
+    # M-BLOCKING: 4 rows per thread, one accumulator column. This kernel is L2-BANDWIDTH-bound -- with
+    # no reuse across M, every output row re-reads the whole weight matrix through L2 (~2 TB/s on this
+    # card), which caps it near 1 TFLOP/s. 4-way unrolling made it SLOWER (99 vs 72 ms in the harness),
+    # so ILP is not the answer; reuse is. One B load now feeds 4 MACs.
+    # Padded rows (M not a multiple of 4) are READ but never STORED: the A buffers carry 4 rows of
+    # slack and an accumulator that is never stored is harmless.
+    # NBLK is derived HERE (not read from the block) so it always matches the grid the driver computes.
+    MB<Int> = (M + 3) / 4
+    NBLK<Int> = (MB * N + 255) / 256
     KSP<Int> = ld_i64(p + 56)
     bx<Int> = blk_x()
     ks<Int> = bx / NBLK
     nb<Int> = bx % NBLK
     gid<Int> = nb * dim_x() + tid_x()
     total<Int> = M * N
-    if (gid < total) {
-        mm<Int> = gid / N
+    if (gid < MB * N) {
+        mb<Int> = gid / N
         nn<Int> = gid % N
+        mm0<Int> = mb * 4
         kl<Int> = (K + KSP - 1) / KSP
         k0<Int> = ks * kl
         k1<Int> = k0 + kl
         if (k1 > K) { k1 = K }
-        acc<Float32> = 0.0
-        pa<Int> = A + (mm * K + k0) * 4
+        a0<Float32> = 0.0
+        a1<Float32> = 0.0
+        a2<Float32> = 0.0
+        a3<Float32> = 0.0
+        pa0<Int> = A + (mm0 * K + k0) * 4
+        pa1<Int> = pa0 + K * 4
+        pa2<Int> = pa0 + K * 8
+        pa3<Int> = pa0 + K * 12
         pb<Int> = B + (k0 * N + nn) * 4
+        pbx<Int> = N * 4
         kk<Int> = k0
         for (kk in k0..k1 - 1) {
-            av<Float32> = ld_f32(pa)
+            # EVERY ld_f32 is BOUND to a <Float32> local before the multiply: `a0 + ld_f32(pa0) * bv`
+            # leaves the load's Float64 surface type in play and turns the MAC into f64 (1/64 rate on
+            # sm_86) -- exactly what made the first attempt at this M-blocking 8x slower.
             bv<Float32> = ld_f32(pb)
-            acc = acc + av * bv
-            pa = pa + 4
-            pb = pb + N * 4
+            av0<Float32> = ld_f32(pa0)
+            av1<Float32> = ld_f32(pa1)
+            av2<Float32> = ld_f32(pa2)
+            av3<Float32> = ld_f32(pa3)
+            a0 = a0 + av0 * bv
+            a1 = a1 + av1 * bv
+            a2 = a2 + av2 * bv
+            a3 = a3 + av3 * bv
+            pa0 = pa0 + 4
+            pa1 = pa1 + 4
+            pa2 = pa2 + 4
+            pa3 = pa3 + 4
+            pb = pb + pbx
         }
-        st_f32(SK + (ks * total + gid) * 4, acc)
+        st_f32(SK + (ks * total + mm0 * N + nn) * 4, a0)
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn) * 4, a1) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn) * 4, a2) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn) * 4, a3) }
     }
 }
 

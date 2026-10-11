@@ -4,6 +4,7 @@
 // One HARNESS_* line per step pins a CUDA failure to the exact launch. All FFI lives in
 // freedom-wrapped helpers that traffic only in Int (a loc<CVoid> cannot be returned past a block).
 import io::{open_read, read_all, close}
+import time::{time_mono_millis}
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -85,17 +86,21 @@ read64(src<Int>)<Float> -> {
 
 main()<Int> -> {
     M<Int> = 5; N<Int> = 2560; K<Int> = 9728; KSP<Int> = 8  # ffn_down shape
-    NBLK<Int> = (M * N + 255) / 256
-    println("HARNESS M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string() + " KSP=" + KSP.to_string() + " NBLK=" + NBLK.to_string())
+    NBLK<Int> = ((M + 3) / 4 * N + 255) / 256   # gemm32_p blocks 4 rows/thread
+    R<Int> = 300
+    println("HARNESS M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string() + " KSP=" + KSP.to_string() + " NBLK=" + NBLK.to_string() + " REP=" + R.to_string())
     e<Int> = init_cuda()
     if (e != 0) { println("HARNESS_FAIL init code=" + e.to_string()); return 1 }
     lp<String> = read_bin("native/build/layer.ptx")
     pp<String> = read_bin("native/build/gemm32_probe.ptx")
     if (lp.len() == 0 || pp.len() == 0) { println("HARNESS_FAIL ptx missing"); return 2 }
-    A<Int> = allocb(M * K * 4)
+    A<Int> = allocb((M + 4) * K * 4)   # 4 rows of slack: gemm32_p READS the padded rows
     B<Int> = allocb(K * N * 4)
     SK<Int> = allocb(KSP * M * N * 4)
     SCR<Int> = allocb(M * N * 4)
+    # CC is the FUSED pass-2 destination: since 58fa9e7 gemm32_r stores f64 directly and there is no
+    # widen32 step, so this buffer is f64 and pass 3 is gone. (The stale f32 CC + widen32 is what made
+    # this harness report got=0.)
     CC<Int> = allocb(M * N * 8)
     OUT<Int> = allocb(8)
     GPB<Int> = allocb(192)
@@ -116,12 +121,27 @@ main()<Int> -> {
     wr(GPB, 0, A); wr(GPB, 8, B); wr(GPB, 16, SK); wr(GPB, 24, M); wr(GPB, 32, N); wr(GPB, 40, K); wr(GPB, 48, NBLK); wr(GPB, 56, KSP)
     println("HARNESS_P1 rc=" + runk(lp, "gemm32_p", NBLK * KSP, GPB, 0, 0, 0).to_string())
     println("HARNESS_SYNC1 code=" + sync_code().to_string())
-    wr(GPB, 64, SK); wr(GPB, 72, SCR); wr(GPB, 80, M); wr(GPB, 88, N); wr(GPB, 96, KSP)
-    println("HARNESS_P2 rc=" + runk(lp, "gemm32_r", (M * N + 255) / 256, GPB + 64, 0, 0, 0).to_string())
+    # ---- timed: pass 1 (the split-K gemm -- the kernel that is ~94% of a token) ----
+    t0<Int> = time_mono_millis()
+    rr<Int> = 0
+    for (rr in 0..R - 1) { e = runk(lp, "gemm32_p", NBLK * KSP, GPB, 0, 0, 0) }
+    println("HARNESS_SYNC1B code=" + sync_code().to_string())
+    t1<Int> = time_mono_millis()
+    println("HARNESS_P1_MS_PER=" + ((t1 - t0) / R).to_string() + " total=" + (t1 - t0).to_string())
+    # ---- timed: pass 2 (fused f64 store) ----
+    wr(GPB + 64, 0, SK); wr(GPB + 64, 8, CC); wr(GPB + 64, 16, M); wr(GPB + 64, 24, N); wr(GPB + 64, 48, KSP)
+    # control: 300 launches of a TRIVIAL kernel (1 block). If this is ~70 ms the 240 us/gemm above is
+    # LAUNCH overhead, not kernel time.
+    t5<Int> = time_mono_millis()
+    for (rr in 0..R - 1) { e = runk(pp, "t_sum64", 1, CC, M * N, OUT, 0) }
+    e = sync_code()
+    t6<Int> = time_mono_millis()
+    println("HARNESS_TRIVIAL_MS_TOTAL=" + (t6 - t5).to_string() + " per_launch_us=" + (((t6 - t5) * 1000) / R).to_string())
+    t2<Int> = time_mono_millis()
+    for (rr in 0..R - 1) { e = runk(lp, "gemm32_r", (M * N + 255) / 256, GPB + 64, 0, 0, 0) }
     println("HARNESS_SYNC2 code=" + sync_code().to_string())
-    wr(CPB, 0, SCR); wr(CPB, 8, CC); wr(CPB, 16, M * N)
-    println("HARNESS_P3 rc=" + runk(lp, "widen32", (M * N + 255) / 256, CPB, 0, 0, 0).to_string())
-    println("HARNESS_SYNC3 code=" + sync_code().to_string())
+    t3<Int> = time_mono_millis()
+    println("HARNESS_P2_MS_PER=" + ((t3 - t2) / R).to_string())
     println("HARNESS_SUM rc=" + runk(pp, "t_sum64", 1, CC, M * N, OUT, 0).to_string())
     println("HARNESS_SYNC4 code=" + sync_code().to_string())
     println("HARNESS_TOTAL=" + read64(OUT).to_string())

@@ -186,7 +186,7 @@ struct GP3 { src<Int>, dst<Int>, n<Int> }
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     freedom {
-        NBLK<Int> = (M * N + 255) / 256
+        NBLK<Int> = ((M + 3) / 4 * N + 255) / 256
         b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
         if (cuMemcpyHtoD_v2(GPB, loc(b1), 64) != 0) { return 1 }
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gpn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
@@ -544,10 +544,11 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(XN32), MAXS * D * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DC32), MAXS * NQ * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(X132), MAXS * D * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(HU32), MAXS * FF * 4) != 0) { return 11 }
+        # (MAXS + 4) rows: gemm32_p covers 4 rows per thread and READS the padding (never stores it).
+        if (cuMemAlloc_v2(loc(XN32), (MAXS + 4) * D * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(DC32), (MAXS + 4) * NQ * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(X132), (MAXS + 4) * D * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(HU32), (MAXS + 4) * FF * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SK32), KSP * MAXS * FF * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SCR32), MAXS * FF * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(CPB), 24) != 0) { return 11 }
