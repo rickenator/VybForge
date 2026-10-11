@@ -1,0 +1,72 @@
+# dispatch_probe.vyb — run the L3 dispatcher over a fixture of utterances.
+#
+# The clock is a parameter of the dispatcher, and this probe prints the epoch and
+# the UTC offset it used, so the checker can compute the expected local time
+# INDEPENDENTLY (Python's zoneinfo) from the same two numbers. The offset under
+# test is the TZif parser's, not the checker's.
+#
+#   VOICE_TZFILE=/usr/share/zoneinfo/America/Los_Angeles \
+#   VOICE_UTTERANCES=../../fixtures/voice/utterances.txt \
+#   vyb host/dispatch_probe.vyb
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_epoch_secs}
+import tz::{read_tz_file, tzif_offset}
+import dispatch::{Reply, dispatch}
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+main()<Int> -> {
+    println("DISPATCH_PROBE begin")
+    tzf<String> = env("VOICE_TZFILE", "/usr/share/zoneinfo/America/Los_Angeles")
+    blob<String> = read_tz_file(tzf)
+    if (blob.len() < 44) {
+        println("cannot read TZif: " + tzf)
+        return 1
+    }
+    ep<Int> = 0
+    match (time_epoch_secs()) {
+        v -> { ep = v }
+        ? -> { ep = 0 }
+    }
+    off<Int> = tzif_offset(blob, ep)
+    println("TZFILE")
+    println(tzf)
+    println("NOW")
+    println_int(ep)
+    println("OFFSET")
+    println_int(off)
+
+    up<String> = env("VOICE_UTTERANCES", "../../fixtures/voice/utterances.txt")
+    text<String> = ""
+    match (open_read(up)) {
+        f -> {
+            match (read_all(f)) {
+                all -> { close(f); text = all }
+                ? -> { close(f) }
+            }
+        }
+        ? -> { }
+    }
+    if (text == "") {
+        println("cannot read utterances: " + up)
+        return 2
+    }
+
+    lines<Vec<String>> = text.split("\n")
+    i<Int> = 0
+    for (i in 0..lines.len() - 1) {
+        u<String> = lines.get(i)
+        r<Reply> = dispatch(u, ep, off)
+        println("UTT")
+        println(u)
+        println("REPLY")
+        println(r.text)
+        println("QUIT")
+        if (r.quit) { println("1") } else { println("0") }
+    }
+    println("DISPATCH_PROBE done")
+    return 0
+}

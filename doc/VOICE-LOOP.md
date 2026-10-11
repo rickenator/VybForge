@@ -18,6 +18,18 @@ Against the reference: filterbank exact to 1e-12, the full 80x3000 log-mel withi
 1.3e-5 (float32-vs-float64 rounding) of `transformers.WhisperFeatureExtractor` on
 the same PCM.
 
+**P3 (dispatch) is done.** `native/voice/dispatch.vyb` routes a normalised
+utterance to a reply, with the clock as a PARAMETER (text, epoch, utc offset) so
+every case is reproducible rather than "whatever time it happened to be". It is
+deliberately not a model: a fixed phrase set routed through an LLM adds a second
+thing that can be wrong and makes the layer untestable. What it needed first was a
+local time, and Vyb has none — the stdlib gives epoch seconds and nothing else — so
+`native/voice/tz.vyb` parses the TZif (zoneinfo) file directly rather than shelling
+out to `date` or adding a C shim, both of which would put a non-Vyb dependency in a
+path the mandate says is self-contained. The gate recomputes the expected time and
+date in Python from the same epoch and offset, so the calendar conversion is
+checked rather than echoed.
+
 **P2 (STT) — the whole Whisper encoder runs Vyb-native on the GPU and is gated
 stage by stage.** `native/whisper` computes mel -> conv1 -> conv2 -> transpose ->
 +positional -> four transformer blocks -> final layer norm, with all 14 stages
@@ -165,6 +177,7 @@ Neural TTS is the highest-risk box (see risks). Order:
 |---|---|---|
 | P0 | `native/audio`: shim + binding + module; 16 kHz capture and playback | **DONE** — 4 s WAV from the host mic with levels matching two independent measurements; 440 Hz tone confirmed at the sink monitor (440.43 Hz, 99.9 % in band, amplitude exact). Earbud-specific replay still pending the earbuds being paired |
 | P1 | Vyb-native FFT + Hann + mel + log (`native/mel/`) | **DONE** — rfft vs numpy max|diff| 1.5e-6 (rel 4e-8); filterbank exact to 1e-12; full 80x3000 log-mel vs WhisperFeatureExtractor max|diff| 1.3e-5, 0 values over 2e-5 |
+| P3 | Vyb-native text->action dispatch (no model, but a real clock) | **done** — `./native/voice/build.sh`, 12 utterances, time/date recomputed independently |
 | P2 | Vyb-native Whisper tiny.en on the GPU kernels | **encoder done** — 14 stages gated vs the real model, relative error 1e-06..3e-05; the decoder and greedy decode remain; final acceptance is token-for-token on the first 24 ids of the jfk fixture |
 | P3 | VybForge command layer: action grammar + dispatch + fixture battery | N/N utterance -> action exact match, reported as a count |
 | P4a | Loop-closing Vyb synth | synth -> L2 STT round-trip string match |

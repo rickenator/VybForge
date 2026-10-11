@@ -1,0 +1,155 @@
+# tz.vyb — local time from a TZif file, in Vyb.
+#
+# Why this exists: Vyb's stdlib gives epoch seconds and a monotonic clock, and
+# nothing else. A voice loop that cannot say the time is not a voice loop, and
+# `date`-style shelling out or a C shim would both put a non-Vyb dependency in a
+# path that Rick's mandate says is entirely self-contained.
+#
+# So the zoneinfo file is parsed directly. TZif (RFC 8536) is small and regular:
+#
+#   offset  size            field
+#   0       4               magic "TZif"
+#   4       1               version ('\0', '2', '3', '4')
+#   5       15              reserved
+#   20      4 (u32 be)      isutcnt      (v1 counts; the v2 block repeats)
+#   24      4 (u32 be)      isstdcnt
+#   28      4 (u32 be)      leapcnt
+#   32      4 (u32 be)      timecnt
+#   36      4 (u32 be)      typecnt
+#   40      4 (u32 be)      charcnt
+#   44      4*timecnt       transition times, int32 BE seconds
+#   ...     timecnt         type indices, one byte each
+#   ...     typecnt x 6     ttinfo: int32 utoff BE, byte isdst, byte desigidx
+#
+# The v1 block's 32-bit transition times cover 1901..2038 and carry the SAME
+# offsets as the 64-bit v2 block, so the v1 block is enough to answer "what is
+# the offset now" — and the v2 block is skipped rather than parsed twice.
+
+import io::{open_read, read_all, close}
+
+share(all)
+be32(s<String>, off<Int>)<Int> -> {
+    return ((s.char_at(off) as Int) & 255) * 16777216 +
+           ((s.char_at(off + 1) as Int) & 255) * 65536 +
+           ((s.char_at(off + 2) as Int) & 255) * 256 +
+           ((s.char_at(off + 3) as Int) & 255)
+}
+
+# Signed int32 (transition times are signed: pre-1970 zones go negative).
+share(all)
+be32s(s<String>, off<Int>)<Int> -> {
+    v<Int> = be32(s, off)
+    if (v >= 2147483648) { return v - 4294967296 }
+    return v
+}
+
+share(all)
+read_tz_file(path<String>)<String> -> {
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                cont -> { close(f); return cont }
+                ? -> { close(f); return "" }
+            }
+        }
+        ? -> { return "" }
+    }
+}
+
+# UTC offset in seconds for `epoch`, from a TZif image. Falls back to 0 (UTC)
+# on anything unusable, which is a wrong answer only until the file is readable
+# -- and it is reported as 0 rather than guessed at.
+share(all)
+tzif_offset(blob<String>, epoch<Int>)<Int> -> {
+    if (blob.len() < 44) { return 0 }
+    # 84 = "T": char_at returns a Char, and comparing a Char to a String literal
+    # crashes the compiler (LLVM ICmp on mismatched operand types), so the byte
+    # is taken out as an Int first.
+    if (((blob.char_at(0) as Int) & 255) != 84) { return 0 }
+    timecnt<Int> = be32(blob, 32)
+    typecnt<Int> = be32(blob, 36)
+    if (typecnt < 1) { return 0 }
+    trans_base<Int> = 44
+    idx_base<Int> = trans_base + 4 * timecnt
+    info_base<Int> = idx_base + timecnt
+    if (info_base + 6 * typecnt > blob.len()) { return 0 }
+
+    # the LAST transition at or before `epoch` decides the type in effect
+    t<Int> = 0
+    chosen<Int> = 0
+    for (t in 0..timecnt - 1) {
+        if (be32s(blob, trans_base + 4 * t) <= epoch) {
+            chosen = (blob.char_at(idx_base + t) as Int) & 255
+        }
+    }
+    if (chosen >= typecnt) { return 0 }
+    return be32s(blob, info_base + 6 * chosen)
+}
+
+# Local wall-clock fields for `epoch` with `off` seconds of offset.
+share(all)
+struct Clock { y<Int>, mo<Int>, d<Int>, h<Int>, mi<Int>, s<Int>, wd<Int> }
+
+# Days from civil (Howard Hinnant's algorithm, the inverse of the usual one):
+# exact for the whole proleptic Gregorian range, no lookup tables, no leap-second
+# special cases because Unix time does not count them either.
+share(all)
+civil_from_days(z<Int>)<Vec<Int>> -> {
+    zz<Int> = z + 719468
+    era<Int> = zz / 146097
+    if (zz < 0) { if (zz % 146097 != 0) { era = era - 1 } }
+    doe<Int> = zz - era * 146097
+    yoe<Int> = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y<Int> = yoe + era * 400
+    doy<Int> = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp<Int> = (5 * doy + 2) / 153
+    d<Int> = doy - (153 * mp + 2) / 5 + 1
+    mo<Int> = mp + 3
+    if (mp >= 10) { mo = mp - 9 }
+    if (mo <= 2) { y = y + 1 }
+    r<Vec<Int>> = Vec()
+    r.push(y)
+    r.push(mo)
+    r.push(d)
+    return r
+}
+
+share(all)
+clock_of(epoch<Int>, off<Int>)<Clock> -> {
+    # NOT `loc`: that is a reserved word in Vyb (the loc<T> FFI qualifier)
+    local_s<Int> = epoch + off
+    days<Int> = local_s / 86400
+    rem<Int> = local_s % 86400
+    if (rem < 0) {
+        rem = rem + 86400
+        days = days - 1
+    }
+    ymd<Vec<Int>> = civil_from_days(days)
+    c<Clock> = Clock()
+    c.y = ymd.get(0)
+    c.mo = ymd.get(1)
+    c.d = ymd.get(2)
+    c.h = rem / 3600
+    c.mi = (rem % 3600) / 60
+    c.s = rem % 60
+    # 1970-01-01 was a Thursday (4)
+    c.wd = (days + 4) % 7
+    if (c.wd < 0) { c.wd = c.wd + 7 }
+    return c
+}
+
+share(all)
+pad2(v<Int>)<String> -> {
+    if (v < 10) { return "0" + v.to_string() }
+    return v.to_string()
+}
+
+share(all)
+hhmm(epoch<Int>, off<Int>)<String> -> {
+    c<Clock> = clock_of(epoch, off)
+    h12<Int> = c.h % 12
+    if (h12 == 0) { h12 = 12 }
+    ampm<String> = "AM"
+    if (c.h >= 12) { ampm = "PM" }
+    return h12.to_string() + ":" + pad2(c.mi) + " " + ampm
+}

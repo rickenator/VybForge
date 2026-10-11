@@ -1,0 +1,121 @@
+# dispatch.vyb — L3 of the voice loop: text in, action, response text out.
+#
+# Deliberately NOT a model. The mandate is that text commands trigger actions;
+# routing a fixed phrase set through a language model would add a second thing
+# that can be wrong and would make the layer untestable. Matching is on the
+# normalised utterance, the responses are the layer's contract with L4 (TTS reads
+# them aloud), and the whole thing is a pure function of (text, epoch, utc offset)
+# -- the clock is a PARAMETER, not a hidden input, so every case is reproducible.
+#
+# The intent set is small on purpose: it is the smallest set that exercises every
+# shape the layer needs -- a deterministic answer, an argument-free action, a
+# state-changing reply (quit), and the fallback.
+
+import tz::{Clock, clock_of, hhmm}
+
+share(all)
+struct Reply { text<String>, quit<Bool> }
+
+share(all)
+norm(s<String>)<String> -> {
+    t<String> = s.to_lower().trim()
+    out<String> = ""
+    prev_sp<Bool> = false
+    i<Int> = 0
+    n<Int> = t.len()
+    for (i in 0..n - 1) {
+        c<Int> = (t.char_at(i) as Int) & 255
+        if (c == 32) {
+            if (prev_sp == false) { out = out + " " }
+            prev_sp = true
+        } else {
+            out = out + t.substring(i, i + 1)
+            prev_sp = false
+        }
+    }
+    return out
+}
+
+share(all)
+has(s<String>, sub<String>)<Bool> -> {
+    return s.index_of(sub) >= 0
+}
+
+share(all)
+month_name(m<Int>)<String> -> {
+    if (m == 1) { return "January" }
+    if (m == 2) { return "February" }
+    if (m == 3) { return "March" }
+    if (m == 4) { return "April" }
+    if (m == 5) { return "May" }
+    if (m == 6) { return "June" }
+    if (m == 7) { return "July" }
+    if (m == 8) { return "August" }
+    if (m == 9) { return "September" }
+    if (m == 10) { return "October" }
+    if (m == 11) { return "November" }
+    return "December"
+}
+
+share(all)
+weekday_name(w<Int>)<String> -> {
+    if (w == 0) { return "Sunday" }
+    if (w == 1) { return "Monday" }
+    if (w == 2) { return "Tuesday" }
+    if (w == 3) { return "Wednesday" }
+    if (w == 4) { return "Thursday" }
+    if (w == 5) { return "Friday" }
+    return "Saturday"
+}
+
+share(all)
+help_text()<String> -> {
+    return "I can tell you the time or the date, and I can transcribe a recording. Say goodbye to stop."
+}
+
+share(all)
+fallback()<String> -> {
+    return "I don't know how to do that yet. Say help to hear what I can do."
+}
+
+share(all)
+dispatch(raw<String>, epoch<Int>, off<Int>)<Reply> -> {
+    s<String> = norm(raw)
+    r<Reply> = Reply()
+    r.text = fallback()
+    r.quit = false
+
+    if (s == "") {
+        r.text = "I didn't catch that."
+        return r
+    }
+    # state-changing first: a request to stop must not be second-guessed
+    if (s == "stop" || s == "exit" || s == "quit" || has(s, "goodbye") || has(s, "bye")) {
+        r.text = "Goodbye."
+        r.quit = true
+        return r
+    }
+    if (has(s, "hello") || s == "hi" || has(s, "hi ") || has(s, "hey")) {
+        r.text = "Hello. I'm listening."
+        return r
+    }
+    if (has(s, "help") || has(s, "what can you do")) {
+        r.text = help_text()
+        return r
+    }
+    if (has(s, "time")) {
+        r.text = "It is " + hhmm(epoch, off) + "."
+        return r
+    }
+    if (has(s, "date") || has(s, "what day")) {
+        c<Clock> = clock_of(epoch, off)
+        r.text = "Today is " + weekday_name(c.wd) + ", " + month_name(c.mo) + " " +
+                 c.d.to_string() + ", " + c.y.to_string() + "."
+        return r
+    }
+    if (has(s, "transcribe")) {
+        r.text = "Give me a WAV file and I can transcribe it locally with the Vyb Whisper model."
+        return r
+    }
+    return r
+}
