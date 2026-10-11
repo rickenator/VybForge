@@ -313,6 +313,11 @@ gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<lo
         }
         # gemv_q4k_m8 runs 8-warp blocks (80 registers; item 18)
         if (M > 1) { if (ty == 12) { gx = (N + 7) / 8; bx = 256 } }
+        if (M == 1) { if (GR == 3) { if (N > 0) {
+            if ((K / 256) % 2 != 0) { println("GEMVQ_ERR p2 needs K/256 even"); return 78 }
+            gx = (N + 7) / 8
+            bx = 256
+        } } }
         # M = 1: 2 rows per warp (item 19); 16-warp blocks, or 4-warp blocks for N <= 1024
         if (M == 1) { if (GR == 2) {
             if (N % 2 != 0) { println("GEMVQ_ERR odd N"); return 78 }
@@ -663,6 +668,10 @@ main()<Int> -> {
     K6<Int> = packed_bytes(nlv.get(find_nm(nmv, "blk.0.ffn_down.weight")), tyv.get(find_nm(nmv, "blk.0.ffn_down.weight")))
 
     GR<Int> = 1
+    # GP = 1: R=1 GEMV is the software-pipelined twin (gemv_q*k_p2, 8 warps); VYB_GEMVP=0 keeps gemv_q*k_r1.
+    GP<Int> = 1
+    gp_s<String> = env_get("VYB_GEMVP") else ""
+    if (gp_s == "0") { GP = 0 }
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> ndev = 0
@@ -677,6 +686,7 @@ main()<Int> -> {
         GR = 1
         if (ccmaj == 8) { GR = 2 }
         if (QPF < 0) { QPF = 48; if (ccmaj == 8) { QPF = 24 } }
+        if (GR == 1) { if (GP == 1) { GR = 3 } }
         gr_s<String> = env_get("VYB_GEMVR") else ""
         if (gr_s == "1") { GR = 1 }
         if (gr_s == "2") { GR = 2 }
@@ -770,8 +780,13 @@ main()<Int> -> {
             if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
             if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
         } else {
-            if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_r1") != 0) { return 10 }
-            if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_r1") != 0) { return 10 }
+            if (GP == 1) {
+                if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_p2") != 0) { return 10 }
+                if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_p2") != 0) { return 10 }
+            } else {
+                if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_r1") != 0) { return 10 }
+                if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_r1") != 0) { return 10 }
+            }
         }
         q4s<loc<CVoid>> = from<loc<CVoid>>(0); q6s<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q4s), mw, "gemv_q4k_s") != 0) { return 10 }
