@@ -260,7 +260,10 @@ attn(p<Int>) -> {
     HD<Int> = ld_i64(p + 200)
     H<Int> = ld_i64(p + 208)
     KVH<Int> = ld_i64(p + 216)
-    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
     hkv<Int> = H / KVH
     total<Int> = S * H * HD
     gid<Int> = blk_x() * dim_x() + tid_x()
@@ -469,7 +472,10 @@ attn_kv(p<Int>) -> {
     H<Int> = ld_i64(p + 208)
     KVH<Int> = ld_i64(p + 216)
     P0<Int> = ld_i64(p + 224)
-    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
     hkv<Int> = H / KVH
     total<Int> = S * H * HD
     gid<Int> = blk_x() * dim_x() + tid_x()
@@ -548,7 +554,10 @@ attn_sc(p<Int>) -> {
     P0<Int> = ld_i64(p + 224)
     SC<Int> = ld_i64(p + 232)
     T<Int> = ld_i64(p + 240)
-    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
     hkv<Int> = H / KVH
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < S * H * T) {
