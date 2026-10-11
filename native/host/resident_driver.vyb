@@ -562,15 +562,22 @@ main()<Int> -> {
     QGON<Int> = 1
     qg_s<String> = env_get("VYB_GEMV16") else ""
     if (qg_s.len() > 0) { QGON = 0 }
-    # VYB_QONLY=1: no expanded weight copy at all (saves the 7.3 GB f16 block + 0.4 GB f32 scratch and
-    # the load-time expansion); prefill also runs the quantized GEMV (8-row twins).
-    QONLY<Int> = 0
+    # QONLY (default, item 18): no expanded weight copy at all (saves the 7.3 GB f16 block + 0.4 GB f32
+    # scratch and the load-time expansion). Decode runs the fused Q4_K/Q6_K GEMV; short prefills the
+    # 8-row twins, long prefills (>= QPF rows) the f16 gemm over a one-layer f16 scratch. VYB_QONLY=0
+    # (or VYB_W32=1 / VYB_GEMV16=1, which need the expanded copy) restores the resident f16/f32 block.
+    QONLY<Int> = 1
     qo_s<String> = env_get("VYB_QONLY") else ""
-    if (qo_s.len() > 0) { QONLY = 1; QGON = 1 }
+    if (qo_s == "0") { QONLY = 0 }
+    if (W16 == 0) { QONLY = 0 }
+    if (QGON == 0) { QONLY = 0 }
+    if (QONLY == 1) { QGON = 1 }
     # QONLY prefill of >= QPF rows (item 18): expand ONE layer at a time to f16 in a 0.2 GB scratch and
     # run the f16 gemm (same f16 weights as the default path, so the same numbers); fewer rows use the
     # 8-row fused twins. VYB_QPF=0 disables the scratch path.
-    QPF<Int> = 16
+    # Default crossover (measured, 2-token gen after an N-row prompt): 3090 m8 vs scratch ~24 rows,
+    # GB10 ~48 rows; set after the device query below.
+    QPF<Int> = 0 - 1
     qpf_s<String> = env_get("VYB_QPF") else ""
     if (qpf_s.len() > 0) { QPF = parse_u(qpf_s, 0, qpf_s.len()) }
     if (QPF == 0) { QPF = 1000000000 }
@@ -634,6 +641,7 @@ main()<Int> -> {
         # M = 1 GEMV flavour (item 19): R = 2 packed-convert on Ampere (cc 8.x), R = 1 elsewhere
         GR = 1
         if (ccmaj == 8) { GR = 2 }
+        if (QPF < 0) { QPF = 48; if (ccmaj == 8) { QPF = 24 } }
         gr_s<String> = env_get("VYB_GEMVR") else ""
         if (gr_s == "1") { GR = 1 }
         if (gr_s == "2") { GR = 2 }
