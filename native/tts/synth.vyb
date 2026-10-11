@@ -155,6 +155,9 @@ phone_table()<Vec<Phone>> -> {
     t.push(Phone("i", 0, 270.0, 2290.0, 3010.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
     t.push(Phone("a", 0, 730.0, 1090.0, 2440.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
     t.push(Phone("u", 0, 300.0, 870.0, 2240.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    t.push(Phone("e", 0, 530.0, 1840.0, 2480.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    t.push(Phone("o", 0, 570.0, 840.0, 2410.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
+    t.push(Phone("ae", 0, 660.0, 1720.0, 2410.0, BW1, BW2, BW3, 1, 120.0, 0.0, 400))
     # nasals: low F1, a nasal formant near 250 Hz, voiced
     t.push(Phone("m", 2, 300.0, 1100.0, 2300.0, 120.0, 120.0, 150.0, 1, 110.0, 0.0, 200))
     t.push(Phone("n", 2, 300.0, 1700.0, 2600.0, 120.0, 130.0, 150.0, 1, 110.0, 0.0, 200))
@@ -169,6 +172,12 @@ phone_table()<Vec<Phone>> -> {
     # was what dragged the burst centroid under 1 kHz.
     t.push(Phone("t", 3, 1000.0, 3500.0, 5000.0, 300.0, 500.0, 700.0, 0, 0.0, 2500.0, 90))
     t.push(Phone("k", 3, 900.0, 2200.0, 3200.0, 300.0, 400.0, 600.0, 0, 0.0, 2000.0, 90))
+    # the other stops: voiced ones (/b/ /d/ /g/) keep the glottal source through the
+    # closure, which is what makes them sound different from /p/ /t/ /k/
+    t.push(Phone("p", 3, 800.0, 1200.0, 2200.0, 300.0, 400.0, 600.0, 0, 0.0, 1500.0, 90))
+    t.push(Phone("b", 3, 400.0, 1000.0, 2100.0, 250.0, 350.0, 500.0, 1, 110.0, 0.0, 70))
+    t.push(Phone("d", 3, 400.0, 1800.0, 2600.0, 250.0, 350.0, 500.0, 1, 110.0, 0.0, 70))
+    t.push(Phone("g", 3, 400.0, 1900.0, 2400.0, 250.0, 350.0, 500.0, 1, 110.0, 0.0, 70))
     # aspiration
     t.push(Phone("h", 5, 500.0, 1500.0, 2500.0, 200.0, 250.0, 300.0, 0, 0.0, 400.0, 80))
     return t

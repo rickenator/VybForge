@@ -1,0 +1,95 @@
+# lex.vyb — text to phones, for the vocabulary this loop actually speaks.
+#
+# A pronunciation DICTIONARY with a letter-to-sound fallback, not a general
+# text-to-speech front end: the dispatcher's replies are a closed set, so the closed
+# set is spelled out exactly, and anything else falls through to a crude LTS so the
+# system still says something instead of going silent.
+#
+# The LTS fallback is honestly crude -- one phone per letter, no digraphs, no
+# silent letters, no stress. It exists so that an unmapped word is audible and
+# obviously wrong rather than absent, which is the failure mode you can act on.
+#
+# Phone names are the ones in synth.vyb's table.
+
+import io::{open_read, read_all, close}
+
+share(all)
+struct Word { w<String>, p<String> }
+
+share(all)
+dictionary()<Vec<Word>> -> {
+    t<Vec<Word>> = Vec()
+    t.push(Word("hello", "h e l o"))
+    t.push(Word("hi", "h a i"))
+    t.push(Word("help", "h e l p"))
+    t.push(Word("stop", "s t a p"))
+    t.push(Word("goodbye", "g u d b a i"))
+    t.push(Word("time", "t a i m"))
+    t.push(Word("the", "d a"))
+    t.push(Word("is", "i s"))
+    t.push(Word("it", "i t"))
+    t.push(Word("what", "w a t"))
+    t.push(Word("good", "g u d"))
+    t.push(Word("day", "d a i"))
+    t.push(Word("bye", "b a i"))
+    t.push(Word("listen", "l i s e n"))
+    t.push(Word("sorry", "s o r i"))
+    return t
+}
+
+# One phone per letter, for words not in the dictionary. Vowels get their short
+# value, everything else maps to a plausible consonant; unmapped letters are
+# dropped rather than guessed at.
+share(all)
+letter_phone(c<String>)<String> -> {
+    if (c == "a") { return "ae" }
+    if (c == "e") { return "e" }
+    if (c == "i") { return "i" }
+    if (c == "o") { return "o" }
+    if (c == "u") { return "u" }
+    if (c == "y") { return "i" }
+    if (c == "b") { return "b" }
+    if (c == "c") { return "k" }
+    if (c == "d") { return "d" }
+    if (c == "f") { return "h" }
+    if (c == "g") { return "g" }
+    if (c == "h") { return "h" }
+    if (c == "j") { return "sh" }
+    if (c == "k") { return "k" }
+    if (c == "l") { return "l" }
+    if (c == "m") { return "m" }
+    if (c == "n") { return "n" }
+    if (c == "p") { return "p" }
+    if (c == "r") { return "l" }
+    if (c == "s") { return "s" }
+    if (c == "t") { return "t" }
+    if (c == "v") { return "b" }
+    if (c == "w") { return "w" }
+    if (c == "z") { return "s" }
+    return ""
+}
+
+share(all)
+lts(word<String>)<String> -> {
+    out<String> = ""
+    i<Int> = 0
+    n<Int> = word.len()
+    for (i in 0..n - 1) {
+        ph<String> = letter_phone(word.substring(i, i + 1))
+        if (ph != "") {
+            if (out != "") { out = out + " " }
+            out = out + ph
+        }
+    }
+    return out
+}
+
+share(all)
+word_phones(word<String>)<String> -> {
+    dict<Vec<Word>> = dictionary()
+    i<Int> = 0
+    for (i in 0..dict.len() - 1) {
+        if (dict.get(i).w == word) { return dict.get(i).p }
+    }
+    return lts(word)
+}

@@ -1,0 +1,88 @@
+# say_probe.vyb — text in, audio out. The L4 front door.
+#
+#   VOICE_TEXT="hello" TTS_OUT=out vyb host/say_probe.vyb --module-path .. 
+#
+# Text -> words -> phones (lex.vyb) -> one phone at a time (synth.vyb) -> one WAV.
+# Phones are separated by 10 ms and words by 60 ms of silence: no transitions, no
+# prosody, no stress. That is the state of this synthesiser and the file says so
+# rather than pretending a coarticulation model exists.
+import synth::{Phone, SR, phone_table, render_phone, wav_of}
+import lex::{word_phones}
+import io::{open_write, write_bytes}
+import env::{env_get}
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+find_phone(ts<Vec<Phone>>, name<String>)<Phone> -> {
+    i<Int> = 0
+    for (i in 0..ts.len() - 1) {
+        if (ts.get(i).name == name) { return ts.get(i) }
+    }
+    println("UNKNOWN PHONE " + name)
+    return ts.get(0)
+}
+
+append_all(dst<their<Vec<Float>>>, src<Vec<Float>>) -> {
+    i<Int> = 0
+    for (i in 0..src.len() - 1) { dst.push(src.get(i)) }
+}
+
+append_silence(dst<their<Vec<Float>>>, ms<Int>) -> {
+    n<Int> = ms * SR / 1000
+    i<Int> = 0
+    for (i in 0..n - 1) { dst.push(0.0) }
+}
+
+main()<Int> -> {
+    println("SAY_PROBE begin")
+    outdir<String> = env("TTS_OUT", "out")
+    text<String> = env("VOICE_TEXT", "hello")
+    println("TEXT")
+    println(text)
+    ts<Vec<Phone>> = phone_table()
+    words<Vec<String>> = text.to_lower().trim().split(" ")
+    samples<Vec<Float>> = Vec()
+    seed<Int> = 12345
+    w<Int> = 0
+    for (w in 0..words.len() - 1) {
+        word<String> = words.get(w)
+        if (word == "") { continue }
+        phones<String> = word_phones(word)
+        println("WORD " + word + " -> " + phones)
+        names<Vec<String>> = phones.split(" ")
+        p<Int> = 0
+        for (p in 0..names.len() - 1) {
+            nm<String> = names.get(p)
+            if (nm == "") { continue }
+            ph<Phone> = find_phone(ts, nm)
+            samples_ph<Vec<Float>> = render_phone(ph, SR, 0.35, seed)
+            seed = seed + 7919
+            append_all(borrow(samples), samples_ph)
+            append_silence(borrow(samples), 10)
+        }
+        append_silence(borrow(samples), 50)
+    }
+    # trailing release so playback does not click
+    append_silence(borrow(samples), 100)
+    path<String> = outdir + "/say.wav"
+    wav<Vec<UInt8>> = wav_of(samples, SR)
+    match (open_write(path)) {
+        f -> {
+            match (write_bytes(f, borrow(wav))) {
+                n -> {
+                    println("WROTE " + path)
+                    println("FRAMES")
+                    println_int(samples.len())
+                    println("BYTES")
+                    println_int(n)
+                }
+                ? -> { println("WRITE FAILED"); return 2 }
+            }
+        }
+        ? -> { println("OPEN FAILED"); return 1 }
+    }
+    println("SAY_PROBE done")
+    return 0
+}

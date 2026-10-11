@@ -13,6 +13,28 @@ in; a WAV comes out whose spectrum is the cascade response those targets imply.
 | `host/synth_probe.vyb` | renders the table to `out/*.wav` and prints the SPEC it used |
 | `check_vowels.py` | measures the WAVs (LPC envelope) against the response re-derived in numpy |
 
+## The closed loop, and where it currently stands
+
+`./native/tts/round_trip.sh hello` synthesises a word and transcribes it with the
+Vyb Whisper. It does not pass:
+
+    sent:     hello
+    heard:    (bell dings)
+
+Whisper classifies the output as a non-speech SOUND. That is an honest and useful
+result, and the diagnosis is not mysterious: the synthesiser renders each phone as
+a STATIONARY filter and concatenates them. Consonant-vowel formant TRANSITIONS are
+the main carrier of intelligibility in speech -- the /e/ into /l/ into /o/ movement
+is most of what makes "hello" that word -- and there are none here. The spectrum is
+right (the vowel gate proves the filters do what they are told); the DYNAMICS are
+absent.
+
+So the next step is a time-varying formant track: interpolate F1/F2/F3 across phone
+boundaries (recomputing the resonator coefficients along the way) instead of
+rendering each phone in isolation, then prosody. This script exists as a measurement
+rather than a gate until it passes, because a gate that is permanently red for work
+not yet done hides the failures that matter.
+
 ## What is deliberately NOT here yet
 
 Text. This is the acoustic core: it takes formant targets, not letters. Text ->
