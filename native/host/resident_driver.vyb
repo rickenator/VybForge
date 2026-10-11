@@ -735,6 +735,9 @@ main()<Int> -> {
     # GP = 1: R=1 GEMV is the software-pipelined twin (gemv_q*k_p2, 8 warps); VYB_GEMVP=0 keeps gemv_q*k_r1.
     GP<Int> = 1
     FZON<Int> = 1
+    MBX<Int> = 1
+    mbx_s<String> = env_get("VYB_MBX") else ""
+    if (mbx_s == "0") { MBX = 0 }
     fz_s<String> = env_get("VYB_FUSE") else ""
     if (fz_s == "0") { FZON = 0 }
     gp_s<String> = env_get("VYB_GEMVP") else ""
@@ -865,6 +868,24 @@ main()<Int> -> {
         q4m<loc<CVoid>> = from<loc<CVoid>>(0); q6m<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q4m), mw, "gemv_q4k_m8") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q6m), mw, "gemv_q6k_m8") != 0) { return 10 }
+        q4m2<loc<CVoid>> = from<loc<CVoid>>(0); q6m2<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m2), mw, "gemv_q4k_m2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m2), mw, "gemv_q6k_m2") != 0) { return 10 }
+        q4m3<loc<CVoid>> = from<loc<CVoid>>(0); q6m3<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m3), mw, "gemv_q4k_m3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m3), mw, "gemv_q6k_m3") != 0) { return 10 }
+        q4m4<loc<CVoid>> = from<loc<CVoid>>(0); q6m4<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m4), mw, "gemv_q4k_m4") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m4), mw, "gemv_q6k_m4") != 0) { return 10 }
+        q4m5<loc<CVoid>> = from<loc<CVoid>>(0); q6m5<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m5), mw, "gemv_q4k_m5") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m5), mw, "gemv_q6k_m5") != 0) { return 10 }
+        q4m6<loc<CVoid>> = from<loc<CVoid>>(0); q6m6<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m6), mw, "gemv_q4k_m6") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m6), mw, "gemv_q6k_m6") != 0) { return 10 }
+        q4m7<loc<CVoid>> = from<loc<CVoid>>(0); q6m7<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m7), mw, "gemv_q4k_m7") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m7), mw, "gemv_q6k_m7") != 0) { return 10 }
         l16p<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(l16p), mw, "logits16_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
@@ -1287,6 +1308,16 @@ main()<Int> -> {
                             if (g > 0) { Srows = 1; P0 = Scur - 1; cur = EMB + P0 * D * 8 }
                         }
                         if (QV == 0) { println("DECG step " + g.to_string() + " Scur=" + Scur.to_string()) }
+                        # exact-M prefill twin for 2..7 rows (VYB_MBX=0: always the 8-row kernel)
+                        q4mx<loc<CVoid>> = q4m; q6mx<loc<CVoid>> = q6m
+                        if (MBX == 1) {
+                            if (Srows == 2) { q4mx = q4m2; q6mx = q6m2 }
+                            if (Srows == 3) { q4mx = q4m3; q6mx = q6m3 }
+                            if (Srows == 4) { q4mx = q4m4; q6mx = q6m4 }
+                            if (Srows == 5) { q4mx = q4m5; q6mx = q6m5 }
+                            if (Srows == 6) { q4mx = q4m6; q6mx = q6m6 }
+                            if (Srows == 7) { q4mx = q4m7; q6mx = q6m7 }
+                        }
                         L<Int> = 0
                         for (L in 0..NLAYER - 1) {
                             if (QV == 0) { println("DECG L" + L.to_string() + " deqstart") }
@@ -1349,7 +1380,7 @@ main()<Int> -> {
                                           amxf, aexf, asmf, anrf, EWB, MSB,
                                           rbf, RBP, RBQ, W16 * 2,
                                           AT2ON, KV32ON, as4f, ac4f, EW32, as3f, ac3f, acr3f, as2f, asxf, ac2f, acrf, PCB,
-                                          QGL, GR, q4s, q6s, q4f, q6f, q4m, q6m, QPB,
+                                          QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
                                           ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf)
