@@ -1521,6 +1521,7 @@ gemm16_t(p<Int>) -> {
     lane<Int> = tid_x() % 32
     total<Int> = M * N
     if (w < items) {
+        # consecutive warps take consecutive ROW blocks of the same columns (shared B lines in L1)
         mb<Int> = w / NG
         cg<Int> = w % NG
         mm0<Int> = mb * 8

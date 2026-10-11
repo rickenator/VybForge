@@ -242,7 +242,7 @@ struct RPB { q<Int>, k<Int>, qd<Int>, kd<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int
 struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>, z8<Int>,
              s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int>, pc<Int>, ke<Int>, e32<Int> }
 
-gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, TL<Int>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
+gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, TL<Int>, TK<Int>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     # TL = 1: pass 1 is the register-tiled gemm16_t (M >= 8, N % 256 == 0, f16 B); else gemm2
     ok<Int> = 0
@@ -250,6 +250,15 @@ gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, TL<Int>, grn<loc<CVoid>>, GPB<Int>, SKB
     if (ok == 0) { return gemm2(gpn, grn, GPB, SKB, KSP, A, B, C, M, N, K, al, be) }
     freedom {
         KSP = KSP % 65536   # the column-factor bits only matter to gemm16_p
+        # TK = 1 (VYB_GTK=1): split-K only as deep as parallelism needs (>= 1536 warps), not the decode-tuned
+        # KSP (32/64): at M = 512 the 32-deep partials were 637 MB written + read per ffn GEMM. Changes the
+        # f32 summation grouping (not bit-identical to gemm16_p) -> gated on tokens.
+        if (TK == 1) {
+            itm<Int> = (M + 7) / 8 * (N / 256)
+            kt<Int> = (1536 + itm - 1) / itm
+            if (kt < KSP) { KSP = kt }
+            if (KSP < 1) { KSP = 1 }
+        }
         NBLK<Int> = ((M + 7) / 8 * (N / 256) + 7) / 8
         b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
         if (cuMemcpyAsync(GPB, loc(b1), 64, 0) != 0) { return 1 }
@@ -423,7 +432,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
           AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
           QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
-          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>)<Int> -> {
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
@@ -461,13 +470,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tq, QPB, Pq, XN32, DQ, S, NQ, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
             }
             gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tk, QPB, Pk, XN32, DK, S, NKV, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
             }
         }
         if (fz3 < 2) {
@@ -475,7 +484,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tv, QPB, Pv, XN32, vdst, S, NKV, D, VYE, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
             }
         }
 
@@ -566,7 +575,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (QG == 1) {
             if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, To, QPB, Po, DC32, DO, S, D, NQ, 8, MRr) != 0) { return 79 }
         } else {
-            if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+            if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
         }
@@ -582,13 +591,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tg, QPB, Pg, X132, Gr, S, FF, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
             }
             gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
             if (QG == 1) {
                 if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tu, QPB, Pu, X132, Up, S, FF, D, 8, MRr) != 0) { return 79 }
             } else {
-                if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+                if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
             }
         }
         if (FZ == 1) {
@@ -605,7 +614,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (QG == 1) {
             if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Td, QPB, Pd, HU32, M, S, D, FF, 8, MRr) != 0) { return 79 }
         } else {
-            if (gemm2t(g3p, g3t, TLy, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+            if (gemm2t(g3p, g3t, TLy, TKy, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         }
@@ -761,6 +770,9 @@ main()<Int> -> {
     MBX<Int> = 1
     # GTILE = 1: f16 prefill gemm pass 1 is the register-tiled gemm16_t (VYB_GTILE=0: gemm16_p)
     GTILE<Int> = 1
+    GTK<Int> = 0
+    gtk_s<String> = env_get("VYB_GTK") else ""
+    if (gtk_s == "1") { GTK = 1 }
     gt_s<String> = env_get("VYB_GTILE") else ""
     if (gt_s == "0") { GTILE = 0 }
     # MR2 = 1: the exact-M twins run 2 weight rows per warp (VYB_MR2=0: 1 row)
@@ -1445,7 +1457,7 @@ main()<Int> -> {
                                           QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
                                           PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
                                           PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
-                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx)
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
