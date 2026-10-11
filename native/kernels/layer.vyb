@@ -272,13 +272,15 @@ attn(p<Int>) -> {
         kvh<Int> = h / hkv
         qb<Int> = Q + (s * H * HD + h * HD) * 8
         kb<Int> = K + kvh * HD * 8
-        # passes 1+2 FUSED into ONE online-softmax walk (VybForge#23). The kernel walked the keys three
-        # times (row max, exp sum, context), re-loading the q row and every k row on each walk; tracking
-        # the running max plus a rescaled running sum yields both the max and the denominator in a single
-        # walk, so only the context pass re-walks. The q.k MACs are f32 (values stay f64 in memory) --
-        # f64 is 1/64 rate on sm_86 and made a cheap part of the model expensive.
+        # ONE flash-style walk (VybForge#23). The kernel used to walk the keys THREE times -- row max,
+        # exp sum, then context -- re-loading the q row and every k row each time (2 f64 loads = 16 B
+        # per MAC), so its cost was the LOADS, not the arithmetic: making the MACs f32 bought only
+        # +3-4%, while deleting a walk bought +7.2%. This merges the context pass in, so each key's
+        # score is computed once: the running max is tracked and the output accumulator is RESCALED
+        # whenever the max advances, then divided by the running sum at the end.
         mx<Float> = -1000000000000000000000000000000.0
         ssum<Float> = 0.0
+        acc<Float> = 0.0
         ta<Int> = 0
         for (ta in 0..s) {
             sc<Float32> = 0.0
@@ -293,32 +295,18 @@ attn(p<Int>) -> {
             scf<Float> = sc as Float
             scf = scf * scale
             if (scf > mx) {
-                ssum = ssum * vexp(mx - scf)
+                rs<Float> = vexp(mx - scf)
+                ssum = ssum * rs
+                acc = acc * rs
                 mx = scf
             }
-            ssum = ssum + vexp(scf - mx)
+            p<Float> = vexp(scf - mx)
+            ssum = ssum + p
+            vv<Float> = ld_f64(V + (ta * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + p * vv
         }
-        # pass 3: THIS thread's own context element (was: every element, per thread)
-        acc<Float> = 0.0
-        tc<Int> = 0
-        for (tc in 0..s) {
-            sc3<Float32> = 0.0
-            jj<Int> = 0
-            for (jj in 0..HD - 1) {
-                qv3<Float> = ld_f64(qb + jj * 8)
-                kv3<Float> = ld_f64(kb + (tc * KVH * HD + jj) * 8)
-                q332<Float32> = qv3
-                k332<Float32> = kv3
-                sc3 = sc3 + q332 * k332
-            }
-            sc3f<Float> = sc3 as Float
-            sc3f = sc3f * scale
-            e<Float> = vexp(sc3f - mx)
-            w<Float> = e / ssum
-            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
-            acc = acc + w * vv
-        }
-        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+        out<Float> = acc / ssum
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, out)
     }
 }
 
