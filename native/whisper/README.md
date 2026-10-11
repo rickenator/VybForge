@@ -9,18 +9,36 @@ Whisper tiny.en as the loop's speech recogniser: 80 x 3000 log-mel in (from
 | Piece | State | Gate |
 |---|---|---|
 | Checkpoint inventory | **done** | `./build.sh weights` — 167 tensors, names/dtypes/shapes/bytes exact |
-| Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — all four stages within 1.3e-5 of the real model |
-| Encoder transformer blocks (layernorm, attention, MLP) | not started | — |
+| Encoder front half (conv1, conv2, +positional) on the GPU | **done** | `./build.sh stages` — within 1.3e-5 of the real model |
+| Encoder transformer blocks (attention, MLP, residuals) + final norm | **done** | all 14 stages green in one run |
 | Decoder + greedy decode | not started | — |
 
 ### Stage evidence (RTX 3090)
 
 ```
-conv1: n=1152000 max|diff|=4.710e-06 rel=6.469e-07 over 1e-4: 0  [ok]
-conv2: n= 576000 max|diff|=1.288e-05 rel=3.857e-06 over 1e-4: 0  [ok]
-e_pos: n= 576000 max|diff|=9.995e-07 rel=9.995e-07 over 1e-4: 0  [ok]
-e_in:  n= 576000 max|diff|=1.274e-05 rel=3.015e-06 over 1e-4: 0  [ok]
+conv1     1152000  max|diff| 4.710e-06  rel 6.5e-07
+conv2      576000  max|diff| 1.288e-05  rel 3.9e-06
+e_pos      576000  max|diff| 9.995e-07  rel 1.0e-06
+e_in       576000  max|diff| 1.274e-05  rel 3.0e-06
+e_l0_ln1   576000  max|diff| 1.650e-05  rel 1.1e-06     layer 0 sub-stages:
+e_l0_attn  576000  max|diff| 6.656e-06  rel 1.7e-06       ln1, attn, residual,
+e_l0_res1  576000  max|diff| 1.257e-05  rel 4.6e-06       ln2, mlp
+e_l0_ln2   576000  max|diff| 6.618e-05  rel 4.6e-06
+e_l0_mlp   576000  max|diff| 2.022e-05  rel 3.8e-06
+e_layer0   576000  max|diff| 2.269e-05  rel 3.3e-06
+e_layer1   576000  max|diff| 2.384e-05  rel 2.9e-06
+e_layer2   576000  max|diff| 2.214e-05  rel 2.2e-06
+e_layer3   576000  max|diff| 1.439e-02  rel 2.3e-05     activations to 631
+e_final    576000  max|diff| 3.975e-05  rel 3.3e-06
+STAGES_GATE: OK
 ```
+
+The last block's absolute figure is the float32 REFERENCE's own accumulation
+noise, not this implementation's: an independent float64 numpy implementation of
+that block, fed this implementation's own `e_layer2`, differs from the float32
+reference by 1.46e-02 on exactly the same three entries. The gate's bar is set
+from that measurement (abs 1e-3 / rel 3e-4) — an order above the measured
+reference noise, three orders below a real bug's signature.
 
 ### How the front half works
 
@@ -38,16 +56,28 @@ e_in:  n= 576000 max|diff|=1.274e-05 rel=3.015e-06 over 1e-4: 0  [ok]
 
 ### Traps hit here (each looked like a kernel bug, none was)
 
-1. **A checker that swallows the element-count line** shifts every comparison by
+1. **A transpose mode validated only on square matrices.** The linear-weight
+   transpose passed every attention projection (all 384x384) and then folded the
+   FFN's non-square weights, because the routine was handed the row/column words
+   in the wrong order — invisible at 384x384. Test a layout mode at a
+   non-degenerate geometry, or it will pass exactly where you are looking.
+2. **A scratch buffer sized for the model width, not for the widest consumer.**
+   A 384-value bias staging buffer was reused for a 1536-value FFN bias, so the
+   widen pass ran off the end into the weight buffer next to it. The result was a
+   *partially* wrong MLP (correlation ~0.5 with the reference) — not an error,
+   not obvious, and it survived one round of "fixed it" because the second
+   problem was hiding behind the first.
+
+3. **A checker that swallows the element-count line** shifts every comparison by
    one and reads exactly like a one-frame kernel shift. The dump format is
    `SECTION <name> n=` + count + values, and the count is not a value.
-2. **`add_bias_row` is not an elementwise add.** Using it for the positional
+4. **`add_bias_row` is not an elementwise add.** Using it for the positional
    table (a full `(T, D)` matrix) gives the right answer for row 0 and the wrong
    one for the other 1499. Elementwise is `add2`.
-3. **An undersized f32 staging buffer makes the bulk DMA fail**, surfacing as
+5. **An undersized f32 staging buffer makes the bulk DMA fail**, surfacing as
    "stage failed" with no size in the message. Size it for the largest tensor
    uploaded that way (the positional table here is bigger than conv2's weight).
-4. `their<[Float; N]>` parameters cannot be written element-wise, and a struct
+6. `their<[Float; N]>` parameters cannot be written element-wise, and a struct
    cannot hold a readable fixed array — kernels take/return packed by-value
    arrays (skill `vyb-native-audio-io`).
 

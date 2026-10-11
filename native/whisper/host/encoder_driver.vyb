@@ -30,6 +30,10 @@ D<Int> = 384              // model width (conv output channels)
 T<Int> = 3000             // mel frames
 T2<Int> = 1500            // conv2 output frames (stride 2)
 POS<Int> = 1500           // encoder positions
+HEADS<Int> = 6            // attention heads (tiny.en: 384 / 6 = 64 per head)
+HDIM<Int> = 64
+FFN<Int> = 1536          // encoder/decoder MLP width
+ENC_LAYERS<Int> = 4     // tiny.en encoder depth
 
 env(n<String>, d<String>)<String> -> {
     return env_get(n) else d
@@ -144,6 +148,47 @@ conv_stage(ckpt<String>, ix<StIndex>, wname<String>, bname<String>,
     return 0
 }
 
+// One torch-style linear layer: out = x @ W^T + b.
+//   weight (Nn, Kk) f32 -> (Kk, Nn) f64 by TRANSPOSE (reorder_w mode 2), because
+//   the GEMM computes A@B and torch stores W as (out, in).
+//   `dW` and `dBias` are scratch the caller owns; the bias is added in place.
+linear(ckpt<String>, ix<StIndex>, wname<String>, bname<String>,
+       dIn<Int>, S<Int>, Kk<Int>, Nn<Int>, dW<Int>, dBias<Int>, dOut<Int>, RAW<Int>,
+       ford<Int>, fgemm<Int>, faddb<Int>, PG<Int>, PK<Int>)<Int> -> {
+    if (load_f32_raw(ckpt, ix, wname, RAW) == 0) { return 1 }
+    # mode 2 takes the file tensor's OWN shape: (out_features, in_features) =
+    # (Nn, Kk), i.e. rows = Nn and cols = Kk. Passing them the other way round is
+    # invisible on a square projection (q/k/v/out_proj are 384x384) and silently
+    # folds the data on a non-square one (the FFN's 1536x384 / 384x1536).
+    if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dW) != 0 || pi(PK, 16, Kk * Nn) != 0 ||
+        pi(PK, 24, Nn) != 0 || pi(PK, 32, Kk) != 0 || pi(PK, 40, 2) != 0) { return 2 }
+    if (launch1(ford, (Kk * Nn + 255) / 256, 256, PK) != 0) { return 3 }
+
+    # An empty bias name means a biasless layer. That is not hypothetical: the
+    # ENCODER's k_proj has no bias in this checkpoint (transformers builds it with
+    # bias=False) while its q/v/out_proj and every decoder projection do — a
+    # missing tensor that reads as a loader failure if you assume symmetry.
+    if (bname != "") {
+        if (load_f32_raw(ckpt, ix, bname, RAW) == 0) { return 4 }
+        if (pi(PK, 0, RAW) != 0 || pi(PK, 8, dBias) != 0 || pi(PK, 16, Nn) != 0 || pi(PK, 40, 0) != 0) { return 5 }
+        if (launch1(ford, (Nn + 255) / 256, 256, PK) != 0) { return 6 }
+    }
+    sync()
+
+    if (pi(PG, 0, dIn) != 0 || pi(PG, 8, dW) != 0 || pi(PG, 16, dOut) != 0 ||
+        pi(PG, 24, S) != 0 || pi(PG, 32, Nn) != 0 || pi(PG, 40, Kk) != 0) { return 7 }
+    if (htod(PG + 48, 1.0) != 0 || htod(PG + 56, 0.0) != 0) { return 8 }
+    if (launch1(fgemm, (S * Nn + 255) / 256, 256, PG) != 0) { return 9 }
+
+    if (bname != "") {
+        if (pi(PK, 0, dOut) != 0 || pi(PK, 8, dBias) != 0 || pi(PK, 16, dOut) != 0 ||
+            pi(PK, 24, S) != 0 || pi(PK, 32, Nn) != 0) { return 10 }
+        if (launch1(faddb, (S * Nn + 255) / 256, 256, PK) != 0) { return 11 }
+    }
+    sync()
+    return 0
+}
+
 dump_scaled(base<Int>, n<Int>, scale<Float>)<Int> -> {
     i<Int> = 0
     for (i in 0..n - 1) {
@@ -156,6 +201,117 @@ section(name<String>, base<Int>, n<Int>)<Int> -> {
     println("SECTION " + name + " n=")
     println_int(n)
     dump_scaled(base, n, 1000000.0)
+    return 0
+}
+
+int_str(v<Int>)<String> -> {
+    if (v == 0) { return "0" }
+    d<String> = ""
+    x<Int> = v
+    while (x > 0) {
+        d = digit_char(x % 10) + d
+        x = x / 10
+    }
+    return d
+}
+
+digit_char(v<Int>)<String> -> {
+    if (v == 0) { return "0" }
+    if (v == 1) { return "1" }
+    if (v == 2) { return "2" }
+    if (v == 3) { return "3" }
+    if (v == 4) { return "4" }
+    if (v == 5) { return "5" }
+    if (v == 6) { return "6" }
+    if (v == 7) { return "7" }
+    if (v == 8) { return "8" }
+    return "9"
+}
+
+// One encoder block, entirely on the GPU:
+//   ln1 -> q,k,v -> attention -> out_proj -> +residual
+//       -> ln2 -> fc1 -> gelu -> fc2 -> +residual
+// Whisper is pre-LN, and the ENCODER's k_proj is biasless (see `linear`).
+// `li` selects the layer's weights by name; the caller owns every buffer, so the
+// same scratch set serves all four blocks.
+enc_layer(ckpt<String>, ix<StIndex>, li<Int>, dIn<Int>,
+          DLN<Int>, DQ<Int>, DK<Int>, DV<Int>, DCTX<Int>, DATT<Int>,
+          DR1<Int>, DLN2<Int>, DFC1<Int>, DMLP<Int>, dOut<Int>,
+          DLNW<Int>, DLNB<Int>, DW<Int>, DBI<Int>, RAW<Int>,
+          ford<Int>, fgemm<Int>, faddb<Int>, fgelu<Int>, fln<Int>, fatt<Int>, fadd2<Int>,
+          PG<Int>, PK<Int>)<Int> -> {
+    pfx<String> = "model.encoder.layers." + int_str(li) + "."
+
+    # --- ln1 ----------------------------------------------------------------
+    e<Int> = widen(ckpt, ix, pfx + "self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 1 }
+    e = widen(ckpt, ix, pfx + "self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 2 }
+    if (pi(PK, 0, dIn) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
+        pi(PK, 32, POS) != 0 || pi(PK, 40, D) != 0) { return 3 }
+    if (htod(PK + 48, 1e-5) != 0) { return 4 }
+    if (launch1(fln, (POS + 255) / 256, 256, PK) != 0) { return 5 }
+    sync()
+    if (li == 0 && want("e_l0_ln1")) { section("e_l0_ln1", DLN, POS * D) }
+
+    # --- q / k / v, attention, out_proj -------------------------------------
+    e = linear(ckpt, ix, pfx + "self_attn.q_proj.weight", pfx + "self_attn.q_proj.bias",
+               DLN, POS, D, D, DW, DBI, DQ, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 10 }
+    e = linear(ckpt, ix, pfx + "self_attn.k_proj.weight", "",
+               DLN, POS, D, D, DW, DBI, DK, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 11 }
+    e = linear(ckpt, ix, pfx + "self_attn.v_proj.weight", pfx + "self_attn.v_proj.bias",
+               DLN, POS, D, D, DW, DBI, DV, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 12 }
+    if (pi(PK, 0, DQ) != 0 || pi(PK, 8, DK) != 0 || pi(PK, 16, DV) != 0 || pi(PK, 24, DCTX) != 0 ||
+        pi(PK, 32, POS) != 0 || pi(PK, 40, POS) != 0 || pi(PK, 48, HEADS) != 0 || pi(PK, 56, HDIM) != 0) {
+        return 13
+    }
+    if (htod(PK + 64, 0.125) != 0) { return 14 }
+    if (launch1(fatt, (POS * HEADS + 255) / 256, 256, PK) != 0) { return 15 }
+    sync()
+    e = linear(ckpt, ix, pfx + "self_attn.out_proj.weight", pfx + "self_attn.out_proj.bias",
+               DCTX, POS, D, D, DW, DBI, DATT, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 16 }
+    if (li == 0 && want("e_l0_attn")) { section("e_l0_attn", DATT, POS * D) }
+
+    # --- residual, ln2 -------------------------------------------------------
+    if (pi(PK, 0, dIn) != 0 || pi(PK, 8, DATT) != 0 || pi(PK, 16, DR1) != 0 || pi(PK, 24, POS * D) != 0) {
+        return 20
+    }
+    if (launch1(fadd2, (POS * D + 255) / 256, 256, PK) != 0) { return 21 }
+    sync()
+    if (li == 0 && want("e_l0_res1")) { section("e_l0_res1", DR1, POS * D) }
+
+    e = widen(ckpt, ix, pfx + "final_layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { return 22 }
+    e = widen(ckpt, ix, pfx + "final_layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { return 23 }
+    if (pi(PK, 0, DR1) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN2) != 0 ||
+        pi(PK, 32, POS) != 0 || pi(PK, 40, D) != 0) { return 24 }
+    if (htod(PK + 48, 1e-5) != 0) { return 25 }
+    if (launch1(fln, (POS + 255) / 256, 256, PK) != 0) { return 26 }
+    sync()
+    if (li == 0 && want("e_l0_ln2")) { section("e_l0_ln2", DLN2, POS * D) }
+
+    # --- MLP -----------------------------------------------------------------
+    e = linear(ckpt, ix, pfx + "fc1.weight", pfx + "fc1.bias",
+               DLN2, POS, D, FFN, DW, DBI, DFC1, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 30 }
+    if (pi(PK, 0, DFC1) != 0 || pi(PK, 8, DFC1) != 0 || pi(PK, 16, POS * FFN) != 0) { return 31 }
+    if (launch1(fgelu, (POS * FFN + 255) / 256, 256, PK) != 0) { return 32 }
+    sync()
+    e = linear(ckpt, ix, pfx + "fc2.weight", pfx + "fc2.bias",
+               DFC1, POS, FFN, D, DW, DBI, DMLP, RAW, ford, fgemm, faddb, PG, PK)
+    if (e != 0) { return 33 }
+    if (li == 0 && want("e_l0_mlp")) { section("e_l0_mlp", DMLP, POS * D) }
+
+    if (pi(PK, 0, DR1) != 0 || pi(PK, 8, DMLP) != 0 || pi(PK, 16, dOut) != 0 || pi(PK, 24, POS * D) != 0) {
+        return 34
+    }
+    if (launch1(fadd2, (POS * D + 255) / 256, 256, PK) != 0) { return 35 }
+    sync()
     return 0
 }
 
@@ -181,9 +337,24 @@ main()<Int> -> {
     DLN<Int> = dev_alloc(POS * D * 8)                 # layer 0 self-attn norm output
     DLNW<Int> = dev_alloc(D * 8)
     DLNB<Int> = dev_alloc(D * 8)
+    DQ<Int> = dev_alloc(POS * D * 8)                  # q/k/v and attention outputs
+    DK<Int> = dev_alloc(POS * D * 8)
+    DV<Int> = dev_alloc(POS * D * 8)
+    DCTX<Int> = dev_alloc(POS * D * 8)
+    DATT<Int> = dev_alloc(POS * D * 8)
+    DR1<Int> = dev_alloc(POS * D * 8)                 # residual after attention
+    DLN2<Int> = dev_alloc(POS * D * 8)                # final_layer_norm output
+    DFC1<Int> = dev_alloc(POS * FFN * 8)              # fc1 (1500, 1536)
+    DMLP<Int> = dev_alloc(POS * D * 8)                # fc2 output
+    DLAY<Int> = dev_alloc(POS * D * 8)                # block output (residual + mlp)
     DPOS<Int> = dev_alloc(POS * D * 8)
-    DW<Int> = dev_alloc(D * 1152 * 8)                 # biggest weight (conv2)
-    DBI<Int> = dev_alloc(D * 8)
+    # Biggest weight is the FFN's fc1 at 1536x384 (4.7 MB), not conv2 (3.5 MB).
+    DW<Int> = dev_alloc(FFN * D * 8 + 65536)
+    # Sized for the WIDEST bias, not the model width: the FFN's fc1 bias is 1536
+    # values (12 KB). At 384 the widen pass runs off the end into the weight
+    # buffer next to it, which corrupts the weights and shows up as a partially
+    # wrong MLP (correlation ~0.5 with the reference) rather than as an error.
+    DBI<Int> = dev_alloc(FFN * 8 + 4096)
     DX<Int> = dev_alloc(1152 * T * 8)                 # biggest im2col (conv1: 240*3000)
     DC<Int> = dev_alloc(D * T * 8)
     # f32 staging for weight uploads. Sized for the LARGEST tensor loaded this
@@ -193,6 +364,8 @@ main()<Int> -> {
     RAW<Int> = dev_alloc(4 * 1024 * 1024)
     if (DM == 0 || DA == 0 || DBuf == 0 || DT == 0 || DE == 0 || DPOS == 0 ||
         DLN == 0 || DLNW == 0 || DLNB == 0 ||
+        DQ == 0 || DK == 0 || DV == 0 || DCTX == 0 || DATT == 0 ||
+        DR1 == 0 || DLN2 == 0 || DFC1 == 0 || DMLP == 0 || DLAY == 0 ||
         DW == 0 || DBI == 0 || DX == 0 || DC == 0 || RAW == 0) {
         println("device alloc failed")
         return 4
@@ -211,12 +384,16 @@ main()<Int> -> {
     faddb<Int> = module_func(henc, "add_bias_row")
     fadd2<Int> = module_func(henc, "add2")
     fln<Int> = module_func(henc, "layernorm")
-    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0) {
+    fatt<Int> = module_func(henc, "attn")
+    fgelu<Int> = module_func(henc, "gelu")
+    if (fgemm == 0 || fcol == 0 || ford == 0 || fgel == 0 || ftr == 0 || faddb == 0 || fadd2 == 0 || fln == 0 || fatt == 0 || fgelu == 0) {
         println("missing kernel symbol")
         return 7
     }
-    PG<Int> = dev_alloc(64)
-    PK<Int> = dev_alloc(64)
+    # 128 bytes, not 64: the attention kernel takes 9 words (its scale is a Float
+    # at byte 64), and a params buffer that is one word short fails at launch.
+    PG<Int> = dev_alloc(128)
+    PK<Int> = dev_alloc(128)
 
     ckpt<String> = env("VYBFORGE_ST_FILE", "/usr/export/LLM/hf/hub/models--openai--whisper-tiny.en/snapshots/87c7102498dcde7456f24cfd30239ca606ed9063/model.safetensors")
     ix<StIndex> = st_open(ckpt)
@@ -259,21 +436,39 @@ main()<Int> -> {
     sync()
     if (want("e_in")) { section("e_in", DE, POS * D) }
 
-    # ---- encoder layer 0: self-attention layer norm --------------------------
-    # Whisper is pre-LN: ln1 feeds the attention block, and the block's input is
-    # added back as a residual afterwards.
-    e = widen(ckpt, ix, "model.encoder.layers.0.self_attn_layer_norm.weight", D, DLNW, RAW, ford, PK)
-    if (e != 0) { println("ln weight widen failed"); return 27 }
-    e = widen(ckpt, ix, "model.encoder.layers.0.self_attn_layer_norm.bias", D, DLNB, RAW, ford, PK)
-    if (e != 0) { println("ln bias widen failed"); return 28 }
-    if (pi(PK, 0, DE) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DLN) != 0 ||
-        pi(PK, 32, POS) != 0 || pi(PK, 40, D) != 0) {
-        println("params pack failed (layernorm)"); return 29
+    # ---- the four encoder blocks ---------------------------------------------
+    # Ping-pong between two buffers: each block reads the previous output and
+    # writes the other, so no block ever aliases its own input.
+    cur<Int> = DE
+    nxt<Int> = DA
+    li<Int> = 0
+    for (li in 0..ENC_LAYERS - 1) {
+        e = enc_layer(ckpt, ix, li, cur, DLN, DQ, DK, DV, DCTX, DATT,
+                      DR1, DLN2, DFC1, DMLP, nxt, DLNW, DLNB, DW, DBI, RAW,
+                      ford, fgemm, faddb, fgelu, fln, fatt, fadd2, PG, PK)
+        if (e != 0) { println("encoder layer failed"); println_int(li); println_int(e); return 52 + li }
+        if (want("e_layer" + int_str(li))) { section("e_layer" + int_str(li), nxt, POS * D) }
+        cur = nxt
+        if (nxt == DA) {
+            nxt = DBuf
+        } else {
+            nxt = DA
+        }
     }
-    if (htod(PK + 48, 1e-5) != 0) { println("params pack failed (ln eps)"); return 30 }
-    if (launch1(fln, (POS + 255) / 256, 256, PK) != 0) { println("launch layernorm failed"); return 31 }
+
+    # ---- final encoder layer norm -------------------------------------------
+    e = widen(ckpt, ix, "model.encoder.layer_norm.weight", D, DLNW, RAW, ford, PK)
+    if (e != 0) { println("final ln weight widen failed"); return 60 }
+    e = widen(ckpt, ix, "model.encoder.layer_norm.bias", D, DLNB, RAW, ford, PK)
+    if (e != 0) { println("final ln bias widen failed"); return 61 }
+    if (pi(PK, 0, cur) != 0 || pi(PK, 8, DLNW) != 0 || pi(PK, 16, DLNB) != 0 || pi(PK, 24, DE) != 0 ||
+        pi(PK, 32, POS) != 0 || pi(PK, 40, D) != 0) {
+        println("params pack failed (final ln)"); return 62
+    }
+    if (htod(PK + 48, 1e-5) != 0) { println("params pack failed (final ln eps)"); return 63 }
+    if (launch1(fln, (POS + 255) / 256, 256, PK) != 0) { println("launch final ln failed"); return 64 }
     sync()
-    if (want("e_l0_ln1")) { section("e_l0_ln1", DLN, POS * D) }
+    if (want("e_final")) { section("e_final", DE, POS * D) }
 
     println("ENC_STAGES done")
     return 0

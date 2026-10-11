@@ -71,6 +71,21 @@ gelu_bias(p<Int>) -> {
 }
 
 // ---------------------------------------------------------------------------
+// gelu: Y[i] = gelu(X[i])   (no bias — the bias belongs to the linear layer that
+// precedes it, so adding it here would double-count)
+//   params: X, Y, N
+gelu(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        xv<Float> = ld_f64(X + gid * 8)
+        st_f64(Y + gid * 8, 0.5 * xv * (1.0 + erf_approx(xv * 0.7071067811865476)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reorder_w: read the checkpoint's f32 weights once, write them as f64 in the
 // layout the GEMM expects.
 //   params: in, out, N (output element count), C_in, K (conv kernel width), mode
@@ -79,6 +94,11 @@ gelu_bias(p<Int>) -> {
 //            (torch's Conv1d weight is (C_out, C_in, K); the GEMM needs
 //             (C_out, K*C_in) with the kernel tap as the OUTER of the two, so
 //             that the im2col rows line up with it)
+//   mode 2 — linear weight: out is the TRANSPOSE, out[col*R + row] = f64(in[row*C + col])
+//            with R = +24 and C = +32. Every torch linear layer stores (out, in)
+//            and computes y = x @ W^T, which is the GEMM's B = W^T.
+//            A square (384,384) projection is its own shape either way, so this
+//            mode is invisible unless it is missing entirely.
 reorder_w(p<Int>) -> {
     inp<Int> = ld_i64(p + 0)
     outp<Int> = ld_i64(p + 8)
@@ -89,6 +109,12 @@ reorder_w(p<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < N) {
         src<Int> = gid
+        if (mode == 2) {
+            # R and C are read from the +24/+32 words in this mode
+            col<Int> = gid / CIn
+            row<Int> = gid % CIn
+            src = row * K + col
+        }
         if (mode == 1) {
             c<Int> = gid / (K * CIn)
             r<Int> = gid % (K * CIn)
@@ -128,6 +154,88 @@ im2col_conv(p<Int>) -> {
             v = ld_f64(src + (i * TIn + pos) * 8)
         }
         st_f64(dst + gid * 8, v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attn: scaled dot-product attention, no mask, separate K/V source
+//   out[i, :] over head h = softmax_j( scale * q_i . k_j ) v_j
+//   params: Q, K, V, OUT, T_q, T_k, H, HD, scale (Float)
+//   Q/OUT are (T_q, H*HD); K/V are (T_k, H*HD); row-major, heads inside the row.
+//
+// One thread per (head, query). Whisper attention is NOT causal (the encoder sees
+// the whole utterance) and the decoder's cross-attention differs only in where
+// K/V come from, so one kernel covers both.
+//
+// Three passes over the scores rather than a scratch buffer: max, then the exp
+// sum, then the weighted V accumulation. That trades ~2x arithmetic for zero
+// extra memory (a per-thread score row would be 9000 x 1500 doubles here).
+//
+// The exponent is vmath's vexp, which clamps its argument at -20: a probability
+// below ~2e-9 is indistinguishable from zero at this precision, and the reference
+// (torch softmax) differs from that by less than the gate tolerance.
+attn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    KK<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    OUT<Int> = ld_i64(p + 24)
+    Tq<Int> = ld_i64(p + 32)
+    Tk<Int> = ld_i64(p + 40)
+    H<Int> = ld_i64(p + 48)
+    HD<Int> = ld_i64(p + 56)
+    scale<Float> = ld_f64(p + 64)
+    total<Int> = Tq * H
+    pid<Int> = blk_x() * dim_x() + tid_x()
+    if (pid < total) {
+        h<Int> = pid % H
+        i<Int> = pid / H
+        D<Int> = H * HD
+        qb<Int> = i * D + h * HD
+        kb<Int> = h * HD
+
+        best<Float> = -1000000.0
+        j<Int> = 0
+        for (j in 0..Tk - 1) {
+            s<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            if (s > best) { best = s }
+        }
+
+        z<Float> = 0.0
+        for (j in 0..Tk - 1) {
+            s<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            z = z + vexp(s - best)
+        }
+
+        acc<[Float; 128]>
+        d<Int> = 0
+        for (d in 0..HD - 1) { acc[d] = 0.0 }
+        for (j in 0..Tk - 1) {
+            s<Float> = 0.0
+            d = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            w<Float> = vexp(s - best) / z
+            d = 0
+            for (d in 0..HD - 1) {
+                acc[d] = acc[d] + w * ld_f64(V + (j * D + kb + d) * 8)
+            }
+        }
+        d = 0
+        for (d in 0..HD - 1) {
+            st_f64(OUT + (qb + d) * 8, acc[d])
+        }
     }
 }
 

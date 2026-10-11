@@ -21,8 +21,27 @@ SHAPES = {
     "e_pos": (1500, 384),
     "e_in": (1500, 384),
     "e_l0_ln1": (1500, 384),
+    "e_l0_attn": (1500, 384),
+    "e_l0_res1": (1500, 384),
+    "e_l0_ln2": (1500, 384),
+    "e_l0_mlp": (1500, 384),
+    "e_layer0": (1500, 384),
+    "e_layer1": (1500, 384),
+    "e_layer2": (1500, 384),
+    "e_layer3": (1500, 384),
+    "e_final": (1500, 384),
 }
-TOL = 1e-4
+# Scale-aware tolerance, and the numbers are MEASURED rather than guessed.
+# The reference is the model running in float32; this is float64. On the last
+# encoder block (activations to ~630) an INDEPENDENT float64 numpy implementation
+# of the same block differs from that float32 reference by up to 1.46e-02 absolute
+# and 2.3e-05 relative, on exactly the same three entries this gate used to flag —
+# i.e. the residual is the reference's accumulation noise, not an implementation
+# error. The bar is therefore an order of magnitude above that measured noise and
+# still three orders below the signature of a real bug (the wrong-transpose bug
+# here put 99.98% of values out by O(1)).
+TOL_ABS = 1e-3
+TOL_REL = 3e-4
 
 
 def parse(path):
@@ -49,7 +68,9 @@ def main():
     sections = parse(sys.argv[1])
     only = sys.argv[2:]
     ok = True
-    for stage in ("conv1", "conv2", "e_pos", "e_in", "e_l0_ln1"):
+    for stage in ("conv1", "conv2", "e_pos", "e_in", "e_l0_ln1", "e_l0_attn",
+                  "e_l0_res1", "e_l0_ln2", "e_l0_mlp",
+                  "e_layer0", "e_layer1", "e_layer2", "e_layer3", "e_final"):
         if only and stage not in only:
             print(f"{stage}: SKIP (not requested)")
             continue
@@ -67,15 +88,22 @@ def main():
             continue
         d = np.abs(got - ref)
         peak = max(1.0, np.abs(ref).max())
-        bad = int((d > TOL).sum())
+        allowed = np.maximum(TOL_ABS, TOL_REL * np.abs(ref))
+        bad = int((d > allowed).sum())
         verdict = "ok" if bad == 0 else "FAIL"
         print(f"{stage}: n={len(got)} max|diff|={d.max():.3e} rel={d.max()/peak:.3e} "
-              f"over {TOL:g}: {bad}  [{verdict}]")
+              f"ref_peak={peak:.3g} over abs {TOL_ABS:g}/rel {TOL_REL:g}: {bad}  [{verdict}]")
         if bad:
             ok = False
-            for i in np.argsort(-d)[:6]:
+            # print the actual FAILURES (not the largest diffs — a scale-aware bar
+            # means the largest diffs are usually legitimate float32 noise)
+            for i in np.argsort(-(d - allowed))[:8]:
+                if d[i] <= allowed[i]:
+                    break
                 row, col = divmod(int(i), SHAPES[stage][1])
-                print(f"   row {row} col {col}: vyb={got[i]:.7f} ref={ref[i]:.7f} diff={got[i]-ref[i]:.3e}")
+                print(f"   row {row} col {col}: vyb={got[i]:.7f} ref={ref[i]:.7f} "
+                      f"diff={got[i]-ref[i]:.3e} allowed={allowed[i]:.3e} "
+                      f"(|ref|={abs(ref[i]):.3g})")
     print("STAGES_GATE:", "OK" if ok else "FAIL")
     return 0 if ok else 1
 
