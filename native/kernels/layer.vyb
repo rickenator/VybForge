@@ -1292,52 +1292,62 @@ attn_sc4(p<Int>) -> {
     tb<Int> = blk_x() % TB
     s<Int> = gk / KVH
     g<Int> = gk % KVH
-    tid<Int> = tid_x()
-    l<Int> = tid % 32
-    t<Int> = tb * 8 + tid / 32
-    ok<Int> = 0
-    if (t < T) { if (t <= P0 + s) { ok = 1 } }
-    z<Float32> = 0.0 as Float32
-    p0<Float32> = z
-    p1<Float32> = z
-    p2<Float32> = z
-    p3<Float32> = z
-    if (ok == 1) {
-        qb<Int> = Q + (s * H * HD + g * 4 * HD) * 8
-        kb<Int> = K + (t * KVH * HD + g * HD) * 4
-        ia<Int> = l
-        while (ia < HD) {
-            kv<Float32> = ld_f32(kb + ia * 4)
-            q0<Float32> = ld_f64(qb + ia * 8) as Float32
-            q1<Float32> = ld_f64(qb + (HD + ia) * 8) as Float32
-            q2<Float32> = ld_f64(qb + (2 * HD + ia) * 8) as Float32
-            q3<Float32> = ld_f64(qb + (3 * HD + ia) * 8) as Float32
-            p0 = p0 + q0 * kv
-            p1 = p1 + q1 * kv
-            p2 = p2 + q2 * kv
-            p3 = p3 + q3 * kv
-            ia = ia + 32
-        }
-    }
-    // no f32 shared-memory intrinsics in Vyb (only ld/st_shared_f64): the tree runs on the widened partials
-    st_shared_f64(tid * 4, p0 as Float)
-    st_shared_f64(tid * 4 + 1, p1 as Float)
-    st_shared_f64(tid * 4 + 2, p2 as Float)
-    st_shared_f64(tid * 4 + 3, p3 as Float)
-    kernel_barrier()
-    st2<Int> = 16
-    while (st2 > 0) {
-        if (l < st2) {
-            j<Int> = 0
-            for (j in 0..3) { st_shared_f64(tid * 4 + j, ld_shared_f64(tid * 4 + j) + ld_shared_f64((tid + st2) * 4 + j)) }
-        }
-        kernel_barrier()
-        st2 = st2 / 2
-    }
-    if (l < 4) {
+    # causal early exit (Ursela, prefill): a block whose first position is past every query row it serves
+    # has nothing to store; it now skips the dot products and the shared tree (block-uniform branch)
+    if (tb * 8 <= P0 + s) {
+        tid<Int> = tid_x()
+        l<Int> = tid % 32
+        t<Int> = tb * 8 + tid / 32
+        ok<Int> = 0
+        if (t < T) { if (t <= P0 + s) { ok = 1 } }
+        z<Float32> = 0.0 as Float32
+        p0<Float32> = z
+        p1<Float32> = z
+        p2<Float32> = z
+        p3<Float32> = z
         if (ok == 1) {
-            hh<Int> = g * 4 + l
-            st_f64(SC + ((s * H + hh) * T + t) * 8, ld_shared_f64((tid - l) * 4 + l) * scale)
+            qb<Int> = Q + (s * H * HD + g * 4 * HD) * 8
+            kb<Int> = K + (t * KVH * HD + g * HD) * 4
+            ia<Int> = l
+            while (ia < HD) {
+                kv<Float32> = ld_f32(kb + ia * 4)
+                q0<Float32> = ld_f64(qb + ia * 8) as Float32
+                q1<Float32> = ld_f64(qb + (HD + ia) * 8) as Float32
+                q2<Float32> = ld_f64(qb + (2 * HD + ia) * 8) as Float32
+                q3<Float32> = ld_f64(qb + (3 * HD + ia) * 8) as Float32
+                p0 = p0 + q0 * kv
+                p1 = p1 + q1 * kv
+                p2 = p2 + q2 * kv
+                p3 = p3 + q3 * kv
+                ia = ia + 32
+            }
+        }
+        // no f32 shared-memory intrinsics in Vyb (only ld/st_shared_f64): the tree runs on the widened partials
+        st_shared_f64(tid * 4, p0 as Float)
+        st_shared_f64(tid * 4 + 1, p1 as Float)
+        st_shared_f64(tid * 4 + 2, p2 as Float)
+        st_shared_f64(tid * 4 + 3, p3 as Float)
+        kernel_barrier()
+        # packed tree (Ursela): the 4 values' active pairs share the 32 lanes (2+1+1+1+1 warp steps instead of
+        # 5 x 4 serial f64 adds); same pairs, same order -> bit-identical
+        wb<Int> = (tid - l) * 4
+        st2<Int> = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 4 * st2) {
+                jv<Int> = pc / st2
+                li<Int> = pc % st2
+                st_shared_f64(wb + li * 4 + jv, ld_shared_f64(wb + li * 4 + jv) + ld_shared_f64(wb + (li + st2) * 4 + jv))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 4) {
+            if (ok == 1) {
+                hh<Int> = g * 4 + l
+                st_f64(SC + ((s * H + hh) * T + t) * 8, ld_shared_f64((tid - l) * 4 + l) * scale)
+            }
         }
     }
 }
