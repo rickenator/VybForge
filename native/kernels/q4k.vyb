@@ -170,8 +170,9 @@ q4kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         # store-bound. Narrow the operands to Float32 first (the f16 scales by assignment, the 6-bit
         # integers via Float then assignment) and run the mul/sub at full FP32 rate. The stored value
         # is f32 either way; the only change is where the rounding happens.
-        d<Float> = ld_f16(bb + 0)
-        min<Float> = ld_f16(bb + 2)
+        # all-f32 converts (no f64 hop: ~5 f64-pipe cvts per element made this 0.4 ms per tensor on GA102)
+        d<Float32> = ld_f16(bb + 0)
+        min<Float32> = ld_f16(bb + 2)
         sc<Int> = 0
         m<Int> = 0
         if (is < 4) {
@@ -187,9 +188,9 @@ q4kdeq16(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         bq<Int> = (ld_i8(bb + 16 + qbase + l) as Int) & 255
         bqb<Int> = 0
         if (half == 0) { bqb = bq & 15 } else { bqb = bq >> 4 }
-        scf64<Float> = sc as Float
-        mf64<Float> = m as Float
-        nbf64<Float> = (bqb) as Float
+        scf64<Float32> = (sc as Int32) as Float32
+        mf64<Float32> = (m as Int32) as Float32
+        nbf64<Float32> = (bqb as Int32) as Float32
         df<Float32> = d
         mnf<Float32> = min
         scf<Float32> = scf64
