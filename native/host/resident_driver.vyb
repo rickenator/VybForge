@@ -825,7 +825,10 @@ main()<Int> -> {
         GR = 1
         if (ccmaj == 8) { GR = 2 }
         # GB10 crossover re-swept after the tiled prefill GEMM: scratch path wins from ~32 rows (32: 176 vs 176 ms, 40: 197 vs 220); QPF=32 vs 48 gated identical on 6 prompts of 32..47 tokens x GEN=256
-        if (QPF < 0) { QPF = 32; if (ccmaj == 8) { QPF = 24 } }
+        # 3090 re-swept at 7c7c459: scratch path wins from ~17 rows (16: 75 vs 71 ms, 20: 82 vs 98); QPF=18 vs 24 gated
+        # identical on 18..23-token prompts x GEN=256. GB10 QPF=26 was tried and DIVERGED (30-token prompt, generated
+        # token 110: the two prefill paths round differently) -> GB10 stays 32.
+        if (QPF < 0) { QPF = 32; if (ccmaj == 8) { QPF = 18 } }
         if (GR == 1) { if (GP == 1) { GR = 3 } }
         gr_s<String> = env_get("VYB_GEMVR") else ""
         if (gr_s == "1") { GR = 1 }
