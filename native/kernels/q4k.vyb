@@ -14,10 +14,22 @@ q4kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         # consecutive rr (the destination's fast index), which makes the 8-byte f64 stores contiguous
         # and pushes the scatter onto the packed source (~0.56 B/element, ~14x less traffic). The
         # element's source position is gsrc = rr*z + cc, decoded exactly as before.
-        cw<Int> = n / z
-        cc<Int> = gid / cw
-        rr<Int> = gid % cw
-        gsrc<Int> = rr * z + cc
+        #
+        # z == 0 IS A DIFFERENT CONTRACT: a flat, untransposed output written at o + gid*8, with the
+        # element taken straight from gid. It must be guarded — the transposed mapping divides by z, so
+        # running it with z = 0 is an integer division by zero (garbage), which is exactly how this
+        # kernel broke the GDN layer gate (native/host/gdn_layer_driver.vyb launches it with z = 0 three
+        # times). Every dequant kernel here has both paths for that reason; do not collapse them.
+        cw<Int> = 0
+        cc<Int> = 0
+        rr<Int> = 0
+        gsrc<Int> = gid
+        if (z > 0) {
+            cw = n / z
+            cc = gid / cw
+            rr = gid % cw
+            gsrc = rr * z + cc
+        }
         block<Int> = gsrc / 256
         e<Int> = gsrc % 256
         bb<Int> = q + block * 144
