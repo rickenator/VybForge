@@ -412,7 +412,11 @@ gemm32_r(p<Int>) -> {
         s<Float32> = 0.0
         ks<Int> = 0
         for (ks in 0..KSP - 1) { s = s + ld_f32(SK + (ks * total + gid) * 4) }
-        st_f32(SCR + gid * 4, s)
+        # The f64 store folds the widen INTO the reduce (VybForge#23): the widen was a whole extra
+        # launch per site (252 per token) plus 4 bytes/element out and 4+8 back through those buffers.
+        # Writing f64 here removes the launch and HALVES that traffic (16 -> 8 bytes/element). Same
+        # idiom as widen32: a plain f32 value feeding an f64 store.
+        st_f64(SCR + gid * 8, s)
     }
 }
 
