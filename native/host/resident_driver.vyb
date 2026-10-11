@@ -307,6 +307,9 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
         KSPG<Int> = KSP
         if (W16C == 2) { KSPG = KSP + 65536 }
+        # Per-shape split-K (harness sweep, d0419ba): the narrow-N gemms (attn_k/v N=1024, ffn_down N=2560
+        # over K=9728) want twice the slices to fill the card; the wide ones stay at KSP.
+        KSPW<Int> = KSPG + KSP
         zro<Int> = 0
         rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
         # attn_norm + the f32 copy for the gemms in ONE launch (rms_blk), was norm2 (2) + cast1 (1)
@@ -314,12 +317,12 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
         if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
         vdst<Int> = DV
         if (KC != 0) { vdst = VC + P0 * NKV * 8 }
         gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
 
         if (QV == 0) { println("RLR qkvok") }
         # q/k norms: rows of HD, one block per (row, head); separate param blocks so the two stay in flight
@@ -371,7 +374,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
 
         if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
-        if (gemm2(g3p, g3r, GPB, SKB, KSPG, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        if (gemm2(g3p, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         if (QV == 0) { println("RLR endok") }
         return 0
