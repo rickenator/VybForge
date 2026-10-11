@@ -825,3 +825,53 @@ attn_cxw(p<Int>) -> {
         st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
     }
 }
+
+// Block-per-row RMSNorm with a shared-memory reduction (Ursela). nsys, 3090, GEN=64, after 7f6dfdd: the
+// norms were 26% of GPU time (rmsnorm 15%, rms_apply 6%, rms_ss 5%). rmsnorm has every thread re-sum
+// the whole row and every thread runs vsqrt(.., 24) -- a 24-step f64 software sqrt at the 1/64 f64
+// rate; the two-pass pair still runs the sqrt per element. Here ONE block (256 threads) owns a row:
+// strided coalesced sum of squares, a shared-memory tree reduce, ONE sqrt per row by thread 0, then
+// each thread scales its elements. Optional fused f32 copy of the output (Y32 != 0) feeds the f32/f16
+// gemm directly and removes the separate cast32 launch. Summation order differs from rmsnorm (strided
+// partials + tree), so outputs differ at f64 rounding (~1e-16 relative); the gold stream is the gate.
+// Params: +0 X, +8 W, +16 Y, +24 M (rows), +32 N (row length), +40 eps, +48 Y32 (0 = none).
+// Grid = M blocks of 256 threads. Shared slots 0..255 partials, 256 the row's 1/rms.
+rms_blk(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    Y32<Int> = ld_i64(p + 48)
+    row<Int> = blk_x()
+    t<Int> = tid_x()
+    xb<Int> = X + row * N * 8
+    ss<Float> = 0.0
+    d<Int> = t
+    while (d < N) {
+        v<Float> = ld_f64(xb + d * 8)
+        ss = ss + v * v
+        d = d + 256
+    }
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 128
+    while (st2 > 0) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t == 0) { st_shared_f64(256, 1.0 / vsqrt(ld_shared_f64(0) / (N as Float) + eps, 24)) }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    yb<Int> = Y + row * N * 8
+    d2<Int> = t
+    while (d2 < N) {
+        xv<Float> = ld_f64(xb + d2 * 8)
+        wv<Float> = ld_f64(W + d2 * 8)
+        y<Float> = xv * r * wv
+        st_f64(yb + d2 * 8, y)
+        if (Y32 != 0) { st_f32(Y32 + (row * N + d2) * 4, y) }
+        d2 = d2 + 256
+    }
+}
