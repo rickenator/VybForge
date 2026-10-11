@@ -1,0 +1,101 @@
+# weights_probe.vyb — inventory a safetensors checkpoint from Vyb.
+#
+#   VYBFORGE_ST_FILE=<checkpoint> vyb weights_probe.vyb --module-path .:<vyb>/bindings/... 
+#
+# Run via ../whisper/build.sh, which resolves the checkpoint (env override, then a
+# candidate list) — a model path is never hardcoded.
+#
+# Prints one line per tensor:  name <TAB> dtype <TAB> dim0 x dim1 x ...
+# check_weights.py compares that against an independent parse of the same file
+# (and against transformers' own state_dict).
+#
+# Why this exists: implementing a new architecture starts with an inventory of the
+# file's tensor types and shapes. Getting a shape or a dtype wrong here shows up
+# much later as a plausible-but-wrong forward pass, so it gets its own gate.
+import io::{open_write, write_str, close}
+import env::{env_get}
+import safetensors
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+int_str(v<Int>)<String> -> {
+    if (v == 0) { return "0" }
+    neg<Bool> = false
+    x<Int> = v
+    if (x < 0) { neg = true; x = 0 - x }
+    d<String> = ""
+    while (x > 0) {
+        d = digit_char(x % 10) + d
+        x = x / 10
+    }
+    if (neg) { d = "-" + d }
+    return d
+}
+
+digit_char(d<Int>)<String> -> {
+    if (d == 0) { return "0" }
+    if (d == 1) { return "1" }
+    if (d == 2) { return "2" }
+    if (d == 3) { return "3" }
+    if (d == 4) { return "4" }
+    if (d == 5) { return "5" }
+    if (d == 6) { return "6" }
+    if (d == 7) { return "7" }
+    if (d == 8) { return "8" }
+    return "9"
+}
+
+# "a x b x c" for tensor `i`.
+shape_str(ix<StIndex>, i<Int>)<String> -> {
+    s<String> = ""
+    sh<Vec<Int>> = st_shape(ix, i)
+    k<Int> = 0
+    for (k in 0..sh.len() - 1) {
+        if (k > 0) { s = s + "x" }
+        s = s + int_str(sh.get(k))
+    }
+    if (sh.len() == 0) { s = "scalar" }
+    return s
+}
+
+main()<Int> -> {
+    path<String> = env("VYBFORGE_ST_FILE", "")
+    out<String> = env("VYBFORGE_ST_OUT", "native/out/weights_listing_vyb.txt")
+    if (path == "") {
+        println("WEIGHTS_PROBE_FAIL no path (set VYBFORGE_ST_FILE)")
+        return 2
+    }
+    ix<StIndex> = st_open(path)
+    if (ix.n <= 0) {
+        println("WEIGHTS_PROBE_FAIL cannot parse " + path)
+        return 3
+    }
+
+    lines<String> = ""
+    total<Int> = 0
+    i<Int> = 0
+    for (i in 0..ix.n - 1) {
+        nm<String> = ix.names.get(i)
+        dt<String> = ix.dtypes.get(i)
+        lines = lines + nm + "\t" + dt + "\t" + shape_str(ix, i) + "\n"
+        total = total + ix.dlen.get(i)
+    }
+    lines = lines + "TOTAL_BYTES\t\t" + int_str(total) + "\n"
+    lines = lines + "TENSORS\t\t" + int_str(ix.n) + "\n"
+
+    match (open_write(out)) {
+        f -> {
+            match (write_str(f, lines)) {
+                n -> { println("WEIGHTS_PROBE wrote " + out) }
+                ? -> { println("WEIGHTS_PROBE_FAIL write") ; return 4 }
+            }
+            close(f)
+        }
+        ? -> { println("WEIGHTS_PROBE_FAIL open out"); return 4 }
+    }
+    println("WEIGHTS_PROBE_OK tensors=")
+    println_int(ix.n)
+    return 0
+}

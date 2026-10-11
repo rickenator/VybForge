@@ -1,0 +1,175 @@
+# mel.vyb — Whisper's log-mel front-end, Vyb-native.
+#
+# This is the bridge between the audio module (raw 16 kHz frames) and any speech
+# model: 30 s of mono audio -> an 80 x 3000 log-mel "image".
+#
+# It reproduces the reference path (torch.stft inside transformers'
+# WhisperFeatureExtractor) step for step, because STT accuracy depends on the
+# model seeing the distribution it was trained on:
+#
+#   1. zero-pad/truncate the audio to exactly 480000 samples (30 s)
+#   2. reflect-pad by n_fft/2 = 200 (torch 'reflect': the edge sample is NOT
+#      repeated), so frame t starts at t*160 in the padded signal
+#   3. periodic Hann window of 400, rfft(400), power |X|^2 for bins 0..200
+#   4. mel: 80 Slaney filters (fmin 0, fmax 8000, Slaney norm and mel scale)
+#   5. log10(clamp(mel, 1e-10)); floor at (max - 8); (x + 4) / 4
+#   6. drop nothing: the reference's `stft[..., :-1]` removes the frame that a
+#      3001-frame transform would end with, which is exactly what the
+#      480000-sample padding makes frame 3000 — so we generate 3000 frames
+#      directly and never compute it.
+#
+# The filterbank is computed here (not loaded from a data file) so the whole
+# front-end is auditable Vyb; mel_probe.vyb checks it against the reference
+# matrix that transformers built with librosa's algorithm.
+import fft::{rfft}
+
+RATE<Int> = 16000
+N_FFT<Int> = 400
+HOP<Int> = 160
+N_MELS<Int> = 80
+N_BINS<Int> = 201
+PAD<Int> = 200
+N_SAMPLES<Int> = 480000
+N_FRAMES<Int> = 3000
+
+# --- mel scale, Slaney ------------------------------------------------------
+# Below 1 kHz the scale is linear (200/3 Hz per mel); above it is logarithmic.
+F_SP<Float> = 200.0 / 3.0
+MIN_LOG_HZ<Float> = 1000.0
+MIN_LOG_MEL<Float> = 15.0
+LOGSTEP<Float> = 0.06875177742094912          # ln(6.4) / 27
+
+share(all)
+hz_to_mel(f<Float>)<Float> -> {
+    if (f < MIN_LOG_HZ) { return f / F_SP }
+    return MIN_LOG_MEL + log(f / MIN_LOG_HZ) / LOGSTEP
+}
+
+share(all)
+mel_to_hz(m<Float>)<Float> -> {
+    if (m < MIN_LOG_MEL) { return m * F_SP }
+    return MIN_LOG_HZ * exp((m - MIN_LOG_MEL) * LOGSTEP)
+}
+
+# The 80 x 201 Slaney filterbank, row-major. Each filter is a triangle between
+# three consecutive mel points, scaled by the Slaney enorm factor 2/(f[i+2]-f[i]).
+share(all)
+mel_filters()<Vec<Float>> -> {
+    lo_mel<Float> = hz_to_mel(0.0)
+    hi_mel<Float> = hz_to_mel(8000.0)
+
+    pts<[Float; 82]>
+    i<Int> = 0
+    for (i in 0..81) {
+        m<Float> = lo_mel + (hi_mel - lo_mel) * (i as Float) / 81.0
+        pts[i] = mel_to_hz(m)
+    }
+
+    out<Vec<Float>> = Vec<Float>()
+    m2<Int> = 0
+    for (m2 in 0..N_MELS - 1) {
+        lo<Float> = pts[m2]
+        mid<Float> = pts[m2 + 1]
+        hi<Float> = pts[m2 + 2]
+        enorm<Float> = 2.0 / (hi - lo)
+        b<Int> = 0
+        for (b in 0..N_BINS - 1) {
+            f<Float> = 8000.0 * (b as Float) / 200.0    # linspace(0, sr/2, 201)
+            w<Float> = 0.0
+            if (f >= lo && f <= mid) {
+                if (mid > lo) { w = (f - lo) / (mid - lo) }
+            }
+            if (f > mid && f <= hi) {
+                if (hi > mid) { w = (hi - f) / (hi - mid) }
+            }
+            out.push(w * enorm)
+        }
+    }
+    return out
+}
+
+# Log-mel spectrogram of a 16 kHz mono signal: N_MELS * N_FRAMES values,
+# row-major (one mel band per N_FRAMES block). The audio is truncated or
+# zero-padded to 30 s, exactly like the reference front-end.
+share(all)
+log_mel(pcm<Vec<Float>>, filters<Vec<Float>>)<Vec<Float>> -> {
+    n<Int> = pcm.len()
+    if (n > N_SAMPLES) { n = N_SAMPLES }
+
+    spec<Vec<Float>> = Vec<Float>()
+    frame<[Float; 1024]>
+    t<Int> = 0
+    for (t in 0..N_FRAMES - 1) {
+        # --- windowed, reflect-padded frame ---
+        w<Int> = 0
+        for (w in 0..N_FFT - 1) {
+            idx<Int> = t * HOP + w
+            src<Int> = 0
+            if (idx < PAD) {
+                src = PAD - idx
+            } else if (idx < PAD + N_SAMPLES) {
+                src = idx - PAD
+            } else {
+                src = 2 * N_SAMPLES - 2 - (idx - PAD)
+            }
+            v<Float> = 0.0
+            if (src >= 0 && src < n) { v = pcm.get(src) }
+            # periodic Hann: 0.5 - 0.5*cos(2*pi*i/400)
+            hann<Float> = 0.5 - 0.5 * cos(2.0 * 3.141592653589793 * (w as Float) / 400.0)
+            frame[w] = v * hann
+        }
+        for (w in N_FFT..1023) { frame[w] = 0.0 }
+
+        s<Vec<Float>> = rfft_frame(frame)
+        # --- mel projection + first log step ---
+        m<Int> = 0
+        for (m in 0..N_MELS - 1) {
+            acc<Float> = 0.0
+            b<Int> = 0
+            for (b in 0..N_BINS - 1) {
+                re<Float> = s.get(2 * b)
+                im<Float> = s.get(2 * b + 1)
+                p<Float> = re * re + im * im
+                fw<Float> = filters.get(m * N_BINS + b)
+                if (fw > 0.0) { acc = acc + fw * p }
+            }
+            spec.push(acc)
+        }
+    }
+
+    # global floor + scale, over the whole spectrogram (reference semantics)
+    best<Float> = 0.0 - 100.0
+    i<Int> = 0
+    total<Int> = spec.len()
+    for (i in 0..total - 1) {
+        x<Float> = log10_or_min(spec.get(i))
+        spec.set(i, x)
+        if (x > best) { best = x }
+    }
+    floor<Float> = best - 8.0
+    for (i in 0..total - 1) {
+        x<Float> = spec.get(i)
+        if (x < floor) { x = floor }
+        spec.set(i, (x + 4.0) / 4.0)
+    }
+    return spec
+}
+
+# log10 of a power value, clamped at 1e-10 like the reference.
+share(all)
+log10_or_min(p<Float>)<Float> -> {
+    if (p < 1e-10) { p = 1e-10 }
+    return log10(p)
+}
+
+# rfft of a 400-sample frame held in a fixed buffer (a small shim so the frame
+# array can live on the stack without a Vec round-trip in the hot loop).
+share(all)
+rfft_frame(frame<[Float; 1024]>)<Vec<Float>> -> {
+    x<Vec<Float>> = Vec<Float>()
+    i<Int> = 0
+    for (i in 0..N_FFT - 1) {
+        x.push(frame[i])
+    }
+    return rfft(x, N_FFT)
+}

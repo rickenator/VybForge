@@ -1,0 +1,170 @@
+# fft.vyb — Vyb-native FFT for the voice loop's mel front-end.
+#
+# Whisper's front-end uses a 400-point FFT (n_fft=400, 25 ms at 16 kHz), which is
+# 2^4 * 5^2 — not a power of two, and numpy/torch must be matched exactly, so the
+# transform cannot be approximated by a 512-point one.
+#
+# Two pieces:
+#   * fft_pow2 — iterative radix-2 Cooley-Tukey, in place over a packed complex
+#                buffer (real part in [0,n), imaginary in [n,2n)).
+#   * rfft     — real-input DFT of arbitrary N via **Bluestein's** chirp-z
+#                algorithm: M = next power of two >= 2N-1 (1024 for N=400), so a
+#                single radix-2 routine serves every window size the loop needs.
+#
+# Buffers are packed and passed BY VALUE, with the result returned. Two Vyb facts
+# force that shape: `their<[Float; N]>` parameters cannot be written element-wise
+# ("could not determine type of LHS or RHS"), and a struct cannot hold a fixed
+# array whose elements are then read back. By-value arrays and array returns both
+# work. The copy is 16 KB per call — nothing next to the arithmetic.
+#
+# Everything is float64 (`Float`); the reference path (torch.stft) is float32, so
+# the gate compares against the reference and allows for its own rounding.
+#
+# Chirp angles are reduced modulo 2N before multiplying (angle = pi*(i*i mod 2N)/N):
+# i*i for i=399 is 159201, and reducing keeps cos/sin accurate.
+
+PI<Float> = 3.141592653589793
+
+# Packed complex buffer length used by the radix-2 kernel.
+BUF<Int> = 2048
+HALF<Int> = 1024
+
+# In-place complex FFT of length `n` (power of two) over `buf`, where
+# buf[0..n) holds the real part and buf[HALF..HALF+n) the imaginary part.
+# `inverse` flips the twiddle sign and applies the 1/n scale.
+share(all)
+fft_pow2(buf<[Float; 2048]>, n<Int>, inverse<Bool>)<[Float; 2048]> -> {
+    # --- bit-reversal permutation ---
+    j<Int> = 0
+    i<Int> = 1
+    while (i < n) {
+        bit<Int> = n / 2
+        while ((j & bit) != 0) {
+            j = j ^ bit
+            bit = bit / 2
+        }
+        j = j | bit
+        if (i < j) {
+            tr<Float> = buf[i]
+            buf[i] = buf[j]
+            buf[j] = tr
+            ti<Float> = buf[HALF + i]
+            buf[HALF + i] = buf[HALF + j]
+            buf[HALF + j] = ti
+        }
+        i = i + 1
+    }
+
+    # --- butterflies ---
+    sign<Float> = -1.0
+    if (inverse) { sign = 1.0 }
+    size<Int> = 2
+    while (size <= n) {
+        half<Int> = size / 2
+        ang<Float> = sign * 2.0 * PI / (size as Float)
+        wr_step<Float> = cos(ang)
+        wi_step<Float> = sin(ang)
+        base<Int> = 0
+        while (base < n) {
+            wr<Float> = 1.0
+            wi<Float> = 0.0
+            k<Int> = 0
+            for (k in 0..half - 1) {
+                a<Int> = base + k
+                b<Int> = a + half
+                xr<Float> = buf[a]
+                xi<Float> = buf[HALF + a]
+                yr<Float> = buf[b] * wr - buf[HALF + b] * wi
+                yi<Float> = buf[b] * wi + buf[HALF + b] * wr
+                buf[a] = xr + yr
+                buf[HALF + a] = xi + yi
+                buf[b] = xr - yr
+                buf[HALF + b] = xi - yi
+                nwr<Float> = wr * wr_step - wi * wi_step
+                wi = wr * wi_step + wi * wr_step
+                wr = nwr
+            }
+            base = base + size
+        }
+        size = size * 2
+    }
+
+    if (inverse) {
+        i = 0
+        for (i in 0..n - 1) {
+            buf[i] = buf[i] / (n as Float)
+            buf[HALF + i] = buf[HALF + i] / (n as Float)
+        }
+    }
+    return buf
+}
+
+# Real-input DFT of length `n` (n <= 512), returned as interleaved (re, im) pairs
+# for bins 0..n/2 inclusive — n+2 floats.
+#
+# Bluestein: X[k] = conj(w[k]) * ((x . conj(w)) (*) b)[k], where
+# w[i] = exp(i*pi*i*i/n) and b = conj(w) wrapped into a length-M circular buffer.
+share(all)
+rfft(x<Vec<Float>>, n<Int>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec<Float>()
+    m<Int> = 1024
+    half<Int> = n / 2 + 1
+
+    cr<[Float; 1024]>
+    ci<[Float; 1024]>
+    a<[Float; 2048]>
+    b<[Float; 2048]>
+
+    # chirp table; a = x . conj(w); b = conj(w)
+    i<Int> = 0
+    for (i in 0..m - 1) {
+        a[i] = 0.0
+        a[HALF + i] = 0.0
+        b[i] = 0.0
+        b[HALF + i] = 0.0
+        cr[i] = 0.0
+        ci[i] = 0.0
+    }
+    for (i in 0..n - 1) {
+        ang<Float> = PI * (((i * i) % (2 * n)) as Float) / (n as Float)
+        c<Float> = cos(ang)
+        s<Float> = sin(ang)
+        cr[i] = c
+        ci[i] = s
+        xv<Float> = x.get(i)
+        a[i] = xv * c
+        a[HALF + i] = 0.0 - xv * s
+        # the convolution kernel is w, the CONJUGATE of the factor in a:
+        # X[k] = conj(w[k]) * sum_n (x[n] conj(w[n])) w[k-n]
+        b[i] = c
+        b[HALF + i] = s
+    }
+    # wrap b: b[m-i] = b[i] for i in 1..n-1
+    i = 1
+    for (i in 1..n - 1) {
+        b[m - i] = b[i]
+        b[HALF + m - i] = b[HALF + i]
+    }
+
+    a = fft_pow2(a, m, false)
+    b = fft_pow2(b, m, false)
+
+    # pointwise product; the inverse transform performs the convolution
+    for (i in 0..m - 1) {
+        pr<Float> = a[i] * b[i] - a[HALF + i] * b[HALF + i]
+        pi<Float> = a[i] * b[HALF + i] + a[HALF + i] * b[i]
+        a[i] = pr
+        a[HALF + i] = pi
+    }
+    a = fft_pow2(a, m, true)
+
+    # X[k] = conj(w[k]) * c[k],  conj(w[k]) = cos - i*sin
+    k<Int> = 0
+    for (k in 0..half - 1) {
+        c<Float> = cr[k]
+        s<Float> = ci[k]
+        out.push(a[k] * c + a[HALF + k] * s)
+        out.push(a[HALF + k] * c - a[k] * s)
+    }
+    return out
+}

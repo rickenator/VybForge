@@ -1,0 +1,142 @@
+# audio — the voice loop's native audio input/output module (L1).
+#
+# Vyb-friendly surface over the ALSA shim in vyb_audio.c: open a capture or
+# playback device, read blocks of float frames, write blocks, close. Every raw
+# FFI detail (loc/from/addr, loc<CVoid> handles) stays inside the `freedom`
+# blocks here; callers only ever see Int handles and Vec<Float>.
+#
+# Devices: "default" follows the system default (PipeWire), so it tracks the
+# selected source/sink — the BT earbuds once they are paired, the USB audio
+# device otherwise. "plughw:X,Y" addresses a raw card.
+#
+# Frames are mono float64 in [-1, 1] at the rate you open with (the shim widens
+# to/from the device's float32). The voice loop opens 16000 Hz mono both ways:
+# 16 kHz is Whisper's native rate and the widest the Bluetooth headset profile
+# (mSBC) provides, so nothing in the chain resamples for reasons of its own.
+import vyb_audio_binding::{va_init, va_lasterr, va_error, va_open, va_read, va_write, va_close, strlen}
+
+# Frames per FFI call. One 1024-frame block is 64 ms at 16 kHz.
+CHUNK<Int> = 1024
+
+# Load libasound and resolve the entry points. Present (true) on success.
+share(all)
+start()<Bool?> -> {
+    freedom {
+        if (va_init() != 0) { return Bool?() }
+    }
+    return Bool?(true)
+}
+
+# Text of the last shim failure (never empty; "ok" when nothing failed).
+share(all)
+last_error()<String> -> {
+    msg<String> = "ok"
+    freedom {
+        p<loc<CChar>> = va_lasterr()
+        msg = String::from_bytes(p, strlen(p) as Int)
+    }
+    return msg
+}
+
+# ALSA error number -> text.
+share(all)
+error_text(rc<Int>)<String> -> {
+    msg<String> = ""
+    freedom {
+        p<loc<CChar>> = va_error(rc as CInt)
+        msg = String::from_bytes(p, strlen(p) as Int)
+    }
+    return msg
+}
+
+# Open the capture device, mono at `rate`. Returns an opaque handle (>0) or 0
+# (call last_error()).
+#
+# Capture and playback are separate entry points on purpose. A single
+# `open(dev, rate, channels, capture)` with a Bool parameter produced a handle
+# whose reads always returned 0 frames (the shim was fine: the same call made
+# with literal arguments read real audio). Two literal-argument entry points
+# dodge the miscompile and are the honest API anyway — the voice loop is mono
+# 16 kHz in both directions.
+share(all)
+open_capture(device<String>, rate<Int>)<Int> -> {
+    h<Int> = 0
+    freedom {
+        handle<loc<CVoid>> = va_open(device, rate as CUInt, 1 as CUInt, 1 as CInt)
+        if (handle == from<loc<CVoid>>(0)) { return 0 }
+        h = addr(handle)
+    }
+    return h
+}
+
+# Open the playback device, mono at `rate`. Returns an opaque handle (>0) or 0.
+share(all)
+open_playback(device<String>, rate<Int>)<Int> -> {
+    h<Int> = 0
+    freedom {
+        handle<loc<CVoid>> = va_open(device, rate as CUInt, 1 as CUInt, 0 as CInt)
+        if (handle == from<loc<CVoid>>(0)) { return 0 }
+        h = addr(handle)
+    }
+    return h
+}
+
+# Read exactly `frames` mono frames from handle `h`. Absent on error.
+# Reads block; a short device read is continued so the count is honoured.
+share(all)
+read_block(h<Int>, frames<Int>)<Vec<Float>?> -> {
+    if (frames <= 0) { return Vec<Float>() }
+    out<Vec<Float>> = Vec<Float>()
+    freedom {
+        buf<[Float; 1024]>
+        got<Int> = 0
+        while (got < frames) {
+            want<Int> = frames - got
+            if (want > CHUNK) { want = CHUNK }
+            n<Int> = (va_read(from<loc<CVoid>>(h), loc(buf), want as CUInt) as Int)
+            if (n < 0) { return Vec<Float>?() }
+            i<Int> = 0
+            for (i in 0..n - 1) {
+                out.push(buf[i])
+            }
+            got = got + n
+            if (n == 0) { break }
+        }
+    }
+    return out
+}
+
+# Write `samples` (mono float) to handle `h`. Returns frames written, -1 on error.
+share(all)
+write_block(h<Int>, samples<Vec<Float>>)<Int> -> {
+    written<Int> = 0
+    freedom {
+        buf<[Float; 1024]>
+        i<Int> = 0
+        total<Int> = samples.len()
+        while (i < total) {
+            want<Int> = total - i
+            if (want > CHUNK) { want = CHUNK }
+            j<Int> = 0
+            for (j in 0..want - 1) {
+                buf[j] = samples.get(i + j)
+            }
+            n<Int> = (va_write(from<loc<CVoid>>(h), loc(buf), want as CUInt) as Int)
+            if (n < 0) { return -1 }
+            written = written + n
+            i = i + want
+        }
+    }
+    return written
+}
+
+# Close a handle. drain=true flushes pending playback first.
+share(all)
+stop(h<Int>, drain<Bool>)<Bool?> -> {
+    freedom {
+        d<CInt> = 0
+        if (drain) { d = 1 }
+        va_close(from<loc<CVoid>>(h), d)
+    }
+    return Bool?(true)
+}

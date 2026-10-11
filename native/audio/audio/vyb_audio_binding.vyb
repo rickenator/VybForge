@@ -1,0 +1,43 @@
+# vyb_audio_binding.vyb — FFI binding for the L1 audio module (voice loop).
+#
+# Hand-written in the exact shape `vyb bindgen` emits for a curated C header
+# (same file style as bindings/libgit2/git2_binding.vyb). The bindgen tool binary
+# is not built in this checkout and the shim header is 8 declarations, so the
+# derived file is written by hand and kept byte-for-byte in bindgen's form:
+# one `share(all)` + signature per function, opaque pointers as loc<CVoid>.
+#
+# Two deliberate deviations from a naive bindgen of vyb_audio.h:
+#   * `const char *` returns are declared loc<CChar> (not the CString view) so a
+#     wrapper can strlen + String::from_bytes them — the bindings/sqlite posting
+#     documents this same trick.
+#   * `float *` buffers are declared CDouble: Vyb's Float is float64 and the
+#     compiler has no CFloat->Float cast, so the shim widens/narrows instead.
+#
+# The library is libvybaudio.so (native/audio/vyb_audio.c). It is NOT on the
+# compiler's RTLD_GLOBAL preload list, so a JIT run needs it visible to the ORC
+# process-symbol generator (LD_PRELOAD=.../libvybaudio.so), while a native
+# `vyb --build ... --link .../libvybaudio.so` links it directly. See README.md.
+
+share(all)
+va_init()<CInt>
+
+share(all)
+va_lasterr()<loc<CChar>>
+
+share(all)
+va_error(rc<CInt>)<loc<CChar>>
+
+share(all)
+strlen(s<loc<CChar>>)<CSize>
+
+share(all)
+va_open(device<CString>, rate<CUInt>, channels<CUInt>, capture<CInt>)<loc<CVoid>>
+
+share(all)
+va_read(h<loc<CVoid>>, buf<loc<CDouble>>, frames<CUInt>)<CInt>
+
+share(all)
+va_write(h<loc<CVoid>>, buf<loc<CDouble>>, frames<CUInt>)<CInt>
+
+share(all)
+va_close(h<loc<CVoid>>, drain<CInt>)<CVoid>

@@ -1,0 +1,6 @@
+gold/
+vyb_fft.txt
+vyb_mel.txt
+fft_probe
+mel_probe
+*.o

@@ -1,0 +1,41 @@
+# mel_probe.vyb — gate for the Vyb mel front-end.
+#
+#   ./build.sh mel          # from native/mel
+#
+# Dumps everything through the integer channel (Vyb's float->String keeps only 6
+# significant digits): the filterbank at 1e12, the log-mel at 1e6. check_mel.py
+# compares both against the reference artifacts the oracle wrote.
+import wav::{load_wav, read_info, WavInfo}
+import mel::{mel_filters, log_mel}
+
+dump_floats(vals<Vec<Float>>, scale<Float>)<Int> -> {
+    i<Int> = 0
+    n<Int> = vals.len()
+    for (i in 0..n - 1) {
+        println_int((vals.get(i) * scale) as Int)
+    }
+    return n
+}
+
+main()<Int> -> {
+    pcm<Vec<Float>> = Vec<Float>()
+    match (load_wav("../../fixtures/audio/jfk.wav")) {
+        v -> { pcm = v }
+        ? -> { println("LOAD_FAIL jfk"); return 1 }
+    }
+    println("PCM n=")
+    println_int(pcm.len())
+
+    f<Vec<Float>> = mel_filters()
+    println("SECTION filters n=")
+    println_int(f.len())
+    dump_floats(f, 1000000000000.0)
+
+    s<Vec<Float>> = log_mel(pcm, f)
+    println("SECTION mel n=")
+    println_int(s.len())
+    dump_floats(s, 1000000.0)
+
+    println("MEL_PROBE done")
+    return 0
+}
