@@ -53,6 +53,27 @@ runk(ptx<String>, nm<String>, g<Int>, p<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> ->
     return 99
 }
 
+// TIMED LOOP WITHOUT THE PER-CALL MODULE LOAD. `runk()` calls cuModuleLoadData + cuModuleGetFunction on
+// EVERY call, so each "launch" it performs includes a PTX JIT compile -- a fixed ~65-75 ms per 300
+// calls regardless of grid, K, M or bytes. That is why every sweep taken with it looked work-
+// INDEPENDENT (M=1 vs M=5, K x4, KSP x4 all ~64-74 ms) and why the diagnosis "the gemm is
+// latency-bound, not bandwidth-bound" was WRONG. This loads the module ONCE and then launches reps
+// times, so the timing measures the kernels.
+bench_n(ptx<String>, nm<String>, g<Int>, p<Int>, reps<Int>)<Int> -> {
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 90 }
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, nm) != 0) { return 91 }
+        rr<Int> = 0
+        for (rr in 0..reps - 1) {
+            cuda_launch4i(from<loc<CVoid>>(addr(f)), g, 1, 1, 256, 1, 1, p, 0, 0, 0)
+        }
+        return cuCtxSynchronize() as Int
+    }
+    return 99
+}
+
 allocb(bytes<Int>)<Int> -> {
     freedom {
         p<Int> = 0
@@ -85,7 +106,7 @@ read64(src<Int>)<Float> -> {
 }
 
 main()<Int> -> {
-    M<Int> = 5; N<Int> = 2560; K<Int> = 9728; KSP<Int> = 8  # ffn_down shape
+    M<Int> = 5; N<Int> = 2560; K<Int> = 9728; KSP<Int> = 32
     NBLK<Int> = ((M + 3) / 4 * N + 255) / 256   # gemm32_p blocks 4 rows/thread
     R<Int> = 300
     println("HARNESS M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string() + " KSP=" + KSP.to_string() + " NBLK=" + NBLK.to_string() + " REP=" + R.to_string())
@@ -123,11 +144,9 @@ main()<Int> -> {
     println("HARNESS_SYNC1 code=" + sync_code().to_string())
     # ---- timed: pass 1 (the split-K gemm -- the kernel that is ~94% of a token) ----
     t0<Int> = time_mono_millis()
-    rr<Int> = 0
-    for (rr in 0..R - 1) { e = runk(lp, "gemm32_p", NBLK * KSP, GPB, 0, 0, 0) }
-    println("HARNESS_SYNC1B code=" + sync_code().to_string())
+    e = bench_n(lp, "gemm32_p", NBLK * KSP, GPB, R)
     t1<Int> = time_mono_millis()
-    println("HARNESS_P1_MS_PER=" + ((t1 - t0) / R).to_string() + " total=" + (t1 - t0).to_string())
+    println("HARNESS_P1_TOTAL_MS=" + (t1 - t0).to_string() + " per_us=" + ((t1 - t0) * 1000 / R).to_string())
     # ---- timed: pass 2 (fused f64 store) ----
     wr(GPB + 64, 0, SK); wr(GPB + 64, 8, CC); wr(GPB + 64, 16, M); wr(GPB + 64, 24, N); wr(GPB + 64, 48, KSP)
     # control: 300 launches of a TRIVIAL kernel (1 block). If this is ~70 ms the 240 us/gemm above is
