@@ -270,7 +270,8 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
           gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
           rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>,
-          P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>)<Int> -> {
+          P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>,
+          ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         zro<Int> = 0
@@ -317,7 +318,12 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         if (KC != 0) {
             cuMemcpyHtoD_v2(ATT + 88, loc(KC), 8); cuMemcpyHtoD_v2(ATT + 96, loc(VC), 8)
             cuMemcpyHtoD_v2(ATT + 224, loc(P0), 8)
-            cuda_launch4i(from<loc<CVoid>>(addr(akfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            # scores once per (row, head, position), then the context from them (attn_sc + attn_cx);
+            # bit-identical to attn_kv, minus its HD-fold redundant dot products.
+            TT<Int> = P0 + S
+            cuMemcpyHtoD_v2(ATT + 232, loc(SCB), 8); cuMemcpyHtoD_v2(ATT + 240, loc(TT), 8)
+            cuda_launch4i(from<loc<CVoid>>(addr(ascf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(acxf)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         } else {
             cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
         }
@@ -459,6 +465,9 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(afn), ml, "attn") != 0) { return 10 }
         akfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(akfn), ml, "attn_kv") != 0) { return 10 }
+        ascf<loc<CVoid>> = from<loc<CVoid>>(0); acxf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(ascf), ml, "attn_sc") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acxf), ml, "attn_cx") != 0) { return 10 }
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -620,6 +629,9 @@ main()<Int> -> {
         KCA<Int> = 0; VCA<Int> = 0
         if (cuMemAlloc_v2(loc(KCA), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(VCA), NLAYER * MAXS * NKV * 8) != 0) { return 11 }
+        # attention score scratch [S <= MAXS, H, T <= MAXS] f64 (shared by all layers; ~MAXS^2 * H * 8 bytes)
+        SCB<Int> = 0
+        if (cuMemAlloc_v2(loc(SCB), MAXS * H * MAXS * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
@@ -631,7 +643,7 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SNB), MAXS * 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(ATT), 232) != 0) { return 11 }   # +224 P0 for attn_kv
+        if (cuMemAlloc_v2(loc(ATT), 248) != 0) { return 11 }   # +224 P0, +232 SC, +240 T for the KV attention
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
@@ -821,7 +833,7 @@ main()<Int> -> {
                                           XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
                                           gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
-                                          P0, KCl, VCl, akfn, QV)
+                                          P0, KCl, VCl, akfn, QV, ascf, acxf, SCB)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt

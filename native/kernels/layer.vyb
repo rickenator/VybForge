@@ -527,3 +527,93 @@ attn_kv(p<Int>) -> {
         st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
     }
 }
+
+// Two-kernel KV attention (Ursela, VybForge#23 follow-up). attn/attn_kv give each of the HD threads of a
+// (row, head) its OWN copy of every score: 3 passes x (P0+s+1) positions x HD MACs per thread, all f64 --
+// HD-fold redundant, and it made a 128-token generation 4x slower per token than a 3-token one. Here the
+// score is computed ONCE per (row, head, position) into scratch SC, and the context kernel only reads it.
+// Every score is the same sequential HD dot product times scale, and the context thread runs the same
+// max / sum-of-exp / weighted-sum loops in the same order over the same values, so the output is
+// BIT-IDENTICAL to attn_kv (and attn).
+// Params: the ATT block (+80 Q, +88 K cache, +96 V cache, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH,
+// +224 P0) plus +232 SC (scratch, [S, H, T] f64) and +240 T = P0 + S (cache rows valid).
+// attn_sc: one thread per (s, h, t), t < T; positions t > P0 + s are causal-masked and never read.
+attn_sc(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        gsh<Int> = gid / T
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        if (t <= P0 + s) {
+            kvh<Int> = h / hkv
+            qb<Int> = Q + (s * H * HD + h * HD) * 8
+            kb<Int> = K + (t * KVH * HD + kvh * HD) * 8
+            sc<Float> = 0.0
+            ia<Int> = 0
+            for (ia in 0..HD - 1) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(kb + ia * 8)
+                sc = sc + qv * kv
+            }
+            st_f64(SC + gid * 8, sc * scale)
+        }
+    }
+}
+
+// attn_cx: one thread per (s, h, ii) -- the context element -- reading the precomputed scores.
+attn_cx(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        sb<Int> = SC + (s * H + h) * T * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = ld_f64(sb + ta * 8)
+            if (sc > mx) { mx = sc }
+        }
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            sc2<Float> = ld_f64(sb + tb * 8)
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            sc3<Float> = ld_f64(sb + tc * 8)
+            e<Float> = vexp(sc3 - mx)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
