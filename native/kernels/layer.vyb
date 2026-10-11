@@ -1229,6 +1229,7 @@ attn_cxr3(p<Int>) -> {
     HD<Int> = ld_i64(p + 200)
     H<Int> = ld_i64(p + 208)
     PC<Int> = ld_i64(p + 264)
+    C32<Int> = ld_i64(p + 192)   # optional f32 copy of the context (replaces the cast32 launch)
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < S * H * HD) {
         gsh<Int> = gid / HD
@@ -1237,6 +1238,7 @@ attn_cxr3(p<Int>) -> {
         c<Int> = 0
         for (c in 0..31) { acc = acc + ld_f64(PC + ((gsh * 32 + c) * HD + ii) * 8) }
         st_f64(Ctx + gid * 8, acc)
+        if (C32 != 0) { st_f32(C32 + gid * 4, acc) }
     }
 }
 
@@ -1356,4 +1358,17 @@ attn_cx4(p<Int>) -> {
     st_f64(PC + (((hb + 1) * 32 + c) * HD + ii) * 8, a1 as Float)
     st_f64(PC + (((hb + 2) * 32 + c) * HD + ii) * 8, a2 as Float)
     st_f64(PC + (((hb + 3) * 32 + c) * HD + ii) * 8, a3 as Float)
+}
+
+// silu with the f32 store (Ursela, launch fusion): the same f64 silu value, narrowed like cast32 does, so
+// the down-projection input is bit-identical and the separate cast32 launch disappears.
+silu32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        hv<Float> = gv * sg * uv
+        st_f32(h + gid * 4, hv)
+    }
 }

@@ -416,6 +416,7 @@ gemv_q4k(p<Int>) -> {
     # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
     # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
     NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)   # residual: Y = RS + W x (first segment, f64 output), fused resid
     NS3<Int> = ld_i64(p + 96)
     if (n0 >= N) {
         if (n0 < N + NS2) {
@@ -549,7 +550,9 @@ gemv_q4k(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 0 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 0) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { yv0<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv0 = ld_f64(RS + (mm * N + n0 + 0) * 8) + yv0 }
+                    st_f64(Y + (mm * N + n0 + 0) * 8, yv0) }
             }
         }
         kernel_barrier()
@@ -563,7 +566,9 @@ gemv_q4k(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 1 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 1) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 1) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 1) * 4, ld_shared_f64(tid) as Float32) } else { yv1<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv1 = ld_f64(RS + (mm * N + n0 + 1) * 8) + yv1 }
+                    st_f64(Y + (mm * N + n0 + 1) * 8, yv1) }
             }
         }
         kernel_barrier()
@@ -732,6 +737,7 @@ gemv_q6k(p<Int>) -> {
     # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
     # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
     NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)   # residual: Y = RS + W x (first segment, f64 output), fused resid
     NS3<Int> = ld_i64(p + 96)
     if (n0 >= N) {
         if (n0 < N + NS2) {
@@ -855,7 +861,9 @@ gemv_q6k(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 0 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 0) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { yv0<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv0 = ld_f64(RS + (mm * N + n0 + 0) * 8) + yv0 }
+                    st_f64(Y + (mm * N + n0 + 0) * 8, yv0) }
             }
         }
         kernel_barrier()
@@ -869,7 +877,9 @@ gemv_q6k(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 1 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 1) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 1) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 1) * 4, ld_shared_f64(tid) as Float32) } else { yv1<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv1 = ld_f64(RS + (mm * N + n0 + 1) * 8) + yv1 }
+                    st_f64(Y + (mm * N + n0 + 1) * 8, yv1) }
             }
         }
         kernel_barrier()
@@ -1699,6 +1709,7 @@ gemv_q4k_p2(p<Int>) -> {
     # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
     # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
     NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)   # residual: Y = RS + W x (first segment, f64 output), fused resid
     NS3<Int> = ld_i64(p + 96)
     if (n0 >= N) {
         if (n0 < N + NS2) {
@@ -1940,7 +1951,9 @@ gemv_q4k_p2(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 0 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 0) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { yv0<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv0 = ld_f64(RS + (mm * N + n0 + 0) * 8) + yv0 }
+                    st_f64(Y + (mm * N + n0 + 0) * 8, yv0) }
             }
         }
         kernel_barrier()
@@ -1961,6 +1974,7 @@ gemv_q6k_p2(p<Int>) -> {
     # up to 3 row segments (fused launches of GEMVs that share x, e.g. q|k|v, gate|up): rows
     # [0,N) -> W/Y/YE, then N2 rows -> W2/Y2/YE2 @56.., then N3 rows @88..; N2 = N3 = 0 = one matrix.
     NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)   # residual: Y = RS + W x (first segment, f64 output), fused resid
     NS3<Int> = ld_i64(p + 96)
     if (n0 >= N) {
         if (n0 < N + NS2) {
@@ -2232,7 +2246,9 @@ gemv_q6k_p2(p<Int>) -> {
         }
         if (l == 0) {
             if (n0 + 0 < N) {
-                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { st_f64(Y + (mm * N + n0 + 0) * 8, ld_shared_f64(tid)) }
+                if (YE == 4) { st_f32(Y + (mm * N + n0 + 0) * 4, ld_shared_f64(tid) as Float32) } else { yv0<Float> = ld_shared_f64(tid)
+                    if (RS != 0) { yv0 = ld_f64(RS + (mm * N + n0 + 0) * 8) + yv0 }
+                    st_f64(Y + (mm * N + n0 + 0) * 8, yv0) }
             }
         }
         kernel_barrier()
