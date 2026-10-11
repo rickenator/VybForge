@@ -1177,7 +1177,7 @@ main()<Int> -> {
                             pwq<Int> = WqA + L * wq_nl * WES; pwk<Int> = WkA + L * wk_nl * WES; pwv<Int> = WvA + L * wv_nl * WES
                             pwo<Int> = WoA + L * wo_nl * WES; pwg<Int> = WgA + L * wg_nl * WES; pwu<Int> = WuA + L * wu_nl * WES
                             pwd<Int> = WdA + L * wd_nl * WES
-                            if (ST32 != 0) { if (Srows >= QPF) {
+                            if (ST32 != 0) { if (Srows >= QPF) { if (Srows > 1) {
                                 # long QONLY prefill: this layer's f16 weights into the one-layer scratch
                                 QGL = 0
                                 pwq = SLq; pwk = SLk; pwv = SLv; pwo = SLo; pwg = SLg; pwu = SLu; pwd = SLd
@@ -1197,7 +1197,7 @@ main()<Int> -> {
                                 dz = q416; if (ltd.get(L) == 14) { dz = q616 }
                                 if (e == 0) { e = dequant_gpu(PK6, ovd.get(L), SLd, wd_nl, dz, FF) }
                                 if (e != 0) { println("QPF_EXPAND_ERR L=" + L.to_string()); return 72 }
-                            } }
+                            } } }
                             e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, pwq, pwk, pwv,
