@@ -34,6 +34,71 @@ gemm(p<Int>) -> {
     }
 }
 
+// Split-K GEMM, pass 1 of 2: PARTIAL sums (VybForge#23). Same A/B as `gemm`, but K is cut into KSP
+// slices and each BLOCK computes ONE slice for its 256 output elements, writing the raw partial to
+// SK[ks][m][n] (no alpha/beta). Grid = NBLK * KSP, NBLK = ceil(M*N/256).
+// Why: `gemm` at decode shapes launches 10-38 blocks for an 82-SM card — the same defect nsys showed
+// for `attn` (ONE block, 21x slow). Splitting K multiplies the block count by KSP for the price of a
+// scratch buffer and one extra launch. The summation ORDER changes (each slice sums its own range, then
+// pass 2 adds the slices), so results differ from `gemm` at ~1e-16 relative — f64 rounding.
+// Params: +0 A, +8 B, +16 SK, +24 M, +32 N, +40 K, +48 NBLK, +56 KSP.
+gemm_p(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    SK<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    NBLK<Int> = ld_i64(p + 48)
+    KSP<Int> = ld_i64(p + 56)
+    bx<Int> = blk_x()
+    ks<Int> = bx / NBLK
+    nb<Int> = bx % NBLK
+    gid<Int> = nb * dim_x() + tid_x()
+    total<Int> = M * N
+    if (gid < total) {
+        mm<Int> = gid / N
+        nn<Int> = gid % N
+        kl<Int> = (K + KSP - 1) / KSP
+        k0<Int> = ks * kl
+        k1<Int> = k0 + kl
+        if (k1 > K) { k1 = K }
+        acc<Float> = 0.0
+        pa<Int> = A + (mm * K + k0) * 8
+        pb<Int> = B + (k0 * N + nn) * 8
+        kk<Int> = k0
+        for (kk in k0..k1 - 1) {
+            acc = acc + ld_f64(pa) * ld_f64(pb)
+            pa = pa + 8
+            pb = pb + N * 8
+        }
+        st_f64(SK + (ks * total + gid) * 8, acc)
+    }
+}
+
+// Split-K GEMM, pass 2 of 2: sum the KSP partials, then apply alpha/beta and write C — i.e. exactly
+// `C = alpha A@B + beta C` with the reduction done across slices instead of inside one thread.
+// Params: +0 SK, +8 C, +16 M, +24 N, +32 alpha, +40 beta, +48 KSP. Grid = ceil(M*N/256).
+gemm_r(p<Int>) -> {
+    SK<Int> = ld_i64(p + 0)
+    C<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 24)
+    alpha<Float> = ld_f64(p + 32)
+    beta<Float> = ld_f64(p + 40)
+    KSP<Int> = ld_i64(p + 48)
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Float> = 0.0
+        ks<Int> = 0
+        for (ks in 0..KSP - 1) { s = s + ld_f64(SK + (ks * total + gid) * 8) }
+        cval<Float> = 0.0
+        if (beta != 0.0) { cval = ld_f64(C + gid * 8) }
+        st_f64(C + gid * 8, alpha * s + beta * cval)
+    }
+}
+
 // RMSNorm y[s][d] = x[s][d] * 1/sqrt(mean(rowsq)+eps) * w[d]. Small 48-B params.
 rmsnorm(p<Int>) -> {
     X<Int> = ld_i64(p + 0)

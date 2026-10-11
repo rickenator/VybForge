@@ -165,6 +165,40 @@ parse_pids(s<String>)<Vec<Int>> -> {
     return r
 }
 
+// The split-K gemm pair as one call (VybForge#23): pass 1 writes KSP partial slices, pass 2 reduces
+// them and applies alpha/beta — i.e. exactly `C = alpha A@B + beta C`, with the K reduction done
+// across slices so the grid carries KSP times as many blocks. Params buffer: pass 1 at +0..+56,
+// pass 2 at +64..+112 (SK, C, M, N, alpha, beta, KSP).
+gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
+      A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
+    freedom {
+        NBLK<Int> = (M * N + 255) / 256
+        cuMemcpyHtoD_v2(GPB + 0, loc(A), 8)
+        cuMemcpyHtoD_v2(GPB + 8, loc(B), 8)
+        cuMemcpyHtoD_v2(GPB + 16, loc(SKB), 8)
+        cuMemcpyHtoD_v2(GPB + 24, loc(M), 8)
+        cuMemcpyHtoD_v2(GPB + 32, loc(N), 8)
+        cuMemcpyHtoD_v2(GPB + 40, loc(K), 8)
+        cuMemcpyHtoD_v2(GPB + 48, loc(NBLK), 8)
+        cuMemcpyHtoD_v2(GPB + 56, loc(KSP), 8)
+        rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gpn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
+        if (rc1 != 0) { println("GEMM2_P_ERR rc=" + rc1.to_string() + " grid=" + (NBLK * KSP).to_string() + " M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string()); return 73 }
+        cuMemcpyHtoD_v2(GPB + 64, loc(SKB), 8)
+        cuMemcpyHtoD_v2(GPB + 72, loc(C), 8)
+        cuMemcpyHtoD_v2(GPB + 80, loc(M), 8)
+        cuMemcpyHtoD_v2(GPB + 88, loc(N), 8)
+        cuMemcpyHtoD_v2(GPB + 96, loc(al), 8)
+        cuMemcpyHtoD_v2(GPB + 104, loc(be), 8)
+        cuMemcpyHtoD_v2(GPB + 112, loc(KSP), 8)
+        # pass 2 reads its params from GPB + 64, NOT from GPB: launching it with the base pointer fed it
+        # pointer values as M/N and made it write through the weights buffer (illegal address 700).
+        rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(grn)), (M * N + 255) / 256, 1, 1, 256, 1, 1, GPB + 64, 0, 0, 0)
+        if (rc2 != 0) { return 74 }
+        return 0
+    }
+    return 0
+}
+
 run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           EPS<Float>, XI<Int>, XO<Int>,
           gfn<loc<CVoid>>, rfn<loc<CVoid>>, rpfn<loc<CVoid>>, afn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
@@ -172,7 +206,8 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           N1<Int>, DWq<Int>, DWk<Int>, DWv<Int>, Nq<Int>, Nk<Int>, DF<Int>, DWo<Int>, N2<Int>,
           DWg<Int>, DWu<Int>, DWd<Int>,
           XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
-          DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>)<Int> -> {
+          DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
+          gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
         zro<Int> = 0
@@ -182,20 +217,11 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
 
         gA<Int> = XN; gB<Int> = DWq; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWq, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
         gA = XN; gB = DWk; gC = DK; gM = S; gN = NKV; gK = D
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWk, DK, S, NKV, D, AF, BF) != 0) { return 73 }
         gA = XN; gB = DWv; gC = DV; gM = S; gN = NKV; gK = D
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, XN, DWv, DV, S, NKV, D, AF, BF) != 0) { return 73 }
 
         rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
         cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
@@ -224,10 +250,7 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         println("RLR attnok")
 
         gA = DCtx; gB = DWo; gC = DO; gM = S; gN = D; gK = NQ
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, DCtx, DWo, DO, S, D, NQ, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
 
         rA = X1; rB = N2; rC = X1N
@@ -236,22 +259,13 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
         cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
 
         gA = X1N; gB = DWg; gC = Gr; gM = S; gN = FF; gK = D
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, X1N, DWg, Gr, S, FF, D, AF, BF) != 0) { return 73 }
         gA = X1N; gB = DWu; gC = Up; gM = S; gN = FF; gK = D
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, X1N, DWu, Up, S, FF, D, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
 
         gA = Hu; gB = DWd; gC = M; gM = S; gN = D; gK = FF
-        cuMemcpyHtoD_v2(GM + 0, loc(gA), 8); cuMemcpyHtoD_v2(GM + 8, loc(gB), 8); cuMemcpyHtoD_v2(GM + 16, loc(gC), 8)
-        cuMemcpyHtoD_v2(GM + 24, loc(gM), 8); cuMemcpyHtoD_v2(GM + 32, loc(gN), 8); cuMemcpyHtoD_v2(GM + 40, loc(gK), 8)
-        cuMemcpyHtoD_v2(GM + 48, loc(AF), 8); cuMemcpyHtoD_v2(GM + 56, loc(BF), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
+        if (gemm2(gpn, grn, GPB, SKB, KSP, Hu, DWd, M, S, D, FF, AF, BF) != 0) { return 73 }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         println("RLR endok")
         return 0
@@ -364,6 +378,9 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(afn), ml, "attn") != 0) { return 10 }
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
+        gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(grn), ml, "gemm_r") != 0) { return 10 }
         rpfn<loc<CVoid>> = from<loc<CVoid>>(0); efn<loc<CVoid>> = from<loc<CVoid>>(0); lsfn<loc<CVoid>> = from<loc<CVoid>>(0); arfn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
@@ -425,7 +442,7 @@ main()<Int> -> {
         DCtx<Int> = 0; DO<Int> = 0; X1<Int> = 0; X1N<Int> = 0; Gr<Int> = 0; Up<Int> = 0; Hu<Int> = 0; M<Int> = 0
         DL<Int> = 0; AO<Int> = 0; DF<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; LSP<Int> = 0; A4<Int> = 0
-        NB<Int> = 0
+        NB<Int> = 0; GPB<Int> = 0; SKB<Int> = 0; KSP<Int> = 8
         if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
@@ -463,6 +480,9 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
+        # Split-K gemm scratch (VybForge#23): KSP slices of the largest gemm (M <= MAXS, N <= FF).
+        if (cuMemAlloc_v2(loc(GPB), 128) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(SKB), KSP * MAXS * FF * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ATT), 224) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
@@ -620,8 +640,9 @@ main()<Int> -> {
                             e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
                                           N1, Wq, Wk, Wv, Nq, Nk, DF, Wo, N2, Wg, Wu, Wd,
-                                          XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M)
-                            if (e != 0) { return 71 }
+                                          XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
+                                          gpn, grn, GPB, SKB, KSP)
+                            if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
                             if (QV == 0) { println("DECG layer " + L.to_string() + " done") }
