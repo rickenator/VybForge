@@ -414,6 +414,10 @@ main()<Int> -> {
     W16<Int> = 1
     w32_s<String> = env_get("VYB_W32") else ""
     if (w32_s.len() > 0) { W16 = 0 }
+    # Head table precision: f16 by default (0.78 GB streamed per token); VYB_HEAD32=1 keeps f32 (1.55 GB).
+    H16<Int> = 1
+    h32_s<String> = env_get("VYB_HEAD32") else ""
+    if (h32_s.len() > 0) { H16 = 0 }
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
@@ -532,6 +536,8 @@ main()<Int> -> {
         l32p<loc<CVoid>> = from<loc<CVoid>>(0); l32r<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(l32p), mw, "logits32_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(l32r), mw, "logits32_r") != 0) { return 10 }
+        l16p<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(l16p), mw, "logits16_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
         a1p<loc<CVoid>> = from<loc<CVoid>>(0); a1r<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(a1p), mw, "argmax1_p") != 0) { return 10 }
@@ -813,6 +819,17 @@ main()<Int> -> {
         println("EMB_DEQUANT_DONE")
         e = cast1(c32n, CPB, DE, DE32, te_nl); if (e != 0) { return 91 }
         println("EMB_F32_COPY_DONE")
+        # f16 head table: narrow the f32 copy, then release the f32 one (the head reads only DEH).
+        DEH<Int> = DE32
+        lhp<loc<CVoid>> = l32p
+        if (H16 == 1) {
+            if (cuMemAlloc_v2(loc(DEH), te_nl * 2) != 0) { return 11 }
+            e = cast1(c16n, CPB, DE32, DEH, te_nl); if (e != 0) { return 91 }
+            cuCtxSynchronize()
+            cuMemFree_v2(DE32)
+            lhp = l16p
+            println("EMB_F16_HEAD_DONE")
+        }
 
         # NOTE: the 4 per-layer RMSNorm weights (attn_norm/attn_q_norm/attn_k_norm/
         # ffn_norm) DIFFER per layer and are loaded per-layer inside the gen loop
@@ -922,10 +939,10 @@ main()<Int> -> {
                         if (e != 0) { return 78 }
                         s7<Int> = Srows - 1
                         # Coalesced tied head: 32 lanes per vocab row over the f32 table, then a lane reduce.
-                        lpb1<GP3> = GP3 { src = DH, dst = DE32, n = LPART }
+                        lpb1<GP3> = GP3 { src = DH, dst = DEH, n = LPART }
                         cuMemcpyAsync(LPB + 0, loc(lpb1), 24, 0)
                         cuMemcpyAsync(LPB + 24, loc(s7), 8, 0); cuMemcpyAsync(LPB + 32, loc(D), 8, 0); cuMemcpyAsync(LPB + 40, loc(VOCAB), 8, 0)
-                        rc_sl<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(l32p)), (VOCAB * 32 + 255) / 256, 1, 1, 256, 1, 1, LPB, 0, 0, 0)
+                        rc_sl<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(lhp)), (VOCAB * 32 + 255) / 256, 1, 1, 256, 1, 1, LPB, 0, 0, 0)
                         if (rc_sl != 0) { println("LOGITS32_P_ERR rc=" + rc_sl.to_string()); return 92 }
                         cuMemcpyAsync(LSP + 0, loc(LPART), 8, 0); cuMemcpyAsync(LSP + 8, loc(DL), 8, 0)
                         cuMemcpyAsync(LSP + 16, loc(s7), 8, 0); cuMemcpyAsync(LSP + 24, loc(VOCAB), 8, 0)

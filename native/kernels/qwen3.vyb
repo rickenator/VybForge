@@ -299,3 +299,31 @@ logits32_r(p<Int>) -> {
         st_f64(Log + (s * V + v) * 8, acc)
     }
 }
+
+// logits32_p over an f16 copy of the tied embedding (Ursela): 0.78 GB per token instead of 1.55 GB.
+// Same lanes, same order; only the table element is rounded to half. VYB_HEAD32=1 keeps the f32 table.
+logits16_p(p<Int>) -> {
+    H<Int> = ld_i64(p + 0)
+    E<Int> = ld_i64(p + 8)
+    PART<Int> = ld_i64(p + 16)
+    s<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    V<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < V * 32) {
+        v<Int> = gid / 32
+        ln<Int> = gid % 32
+        acc<Float32> = 0.0
+        hb<Int> = H + s * D * 8
+        eb<Int> = E + v * D * 2
+        d<Int> = ln
+        while (d < D) {
+            hv<Float> = ld_f64(hb + d * 8)
+            hv32<Float32> = hv
+            ev32<Float32> = ld_f16(eb + d * 2)
+            acc = acc + hv32 * ev32
+            d = d + 32
+        }
+        st_f32(PART + gid * 4, acc)
+    }
+}
