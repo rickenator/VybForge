@@ -443,3 +443,16 @@ current lengths and, more importantly, FLAT instead of degrading as the context 
 * Measured optima: gemm row-blocking **RB=4** (harness: RB=1 72 ms, RB=2 191-279 ms, RB=4 70-75 ms,
   RB=8 95-98 ms); **KSP=32** (8->32 = +5.7%, 32->64 = -1.5%). GPU throttling is NOT a factor
   (1950-1965 of 2100 MHz, mem 9501 MHz, 188-296 W of 350 W, 88-99% util).
+## Gate record: VYB_GTKW 1536 -> 3072 (f06957c) -- GATED, the "gate pending" note is closed
+
+Re-ran the numerics gate on GB10 (lefty) at GEN=128, 10 runs per setting:
+
+  VYB_GTKW=1536   median 48.39 tok/s   gold stream MATCH   ids 785 6722 315 9625 374 12095 11 323
+  VYB_GTKW=3072   median 47.62 tok/s   gold stream MATCH   ids IDENTICAL
+
+  cmp of native/out/chatgen_ids_vyb.txt between the two -> IDENTICAL
+
+So "Numerics differ from 1536 -> gate pending" does NOT reproduce at GEN=128 on GB10: the generated
+token stream is bit-identical and both settings match the gold stream. The change also buys no
+measurable DECODE time (47.6 vs 48.4 tok/s, inside the run-to-run spread), consistent with GTKW being a
+PREFILL-side knob (GB10 512-token prefill gemm16_t 514 -> 474 ms per the commit message). Kept.
