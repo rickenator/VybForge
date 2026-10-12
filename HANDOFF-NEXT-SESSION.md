@@ -576,3 +576,86 @@ tokenizer paths, the four probe hooks, MTP and the trace flag. It is streaming-o
 Skill `dgx-spark-two-node-serving` carries the full detail: the 27B bring-up steps, the root cause and
 the format comparison, the verification result, and the eliminations (Q6_K kernel verified OK, offsets
 and stride verified correct, `download` helper verified identical to the working 4B's).
+
+---
+
+# HANDOFF — the f16 port of the 27B (opened 2026-10-11, branch `perf/ursela-lefty`)
+
+## Why the "resident path" in the earlier section was wrong, and what replaced it
+
+That section's premise ("the cost is the per-read/HtoD plumbing — 12.6 GB / 9.29 s = 1.36 GB/s") is
+FALSE, measured. `546d8d6` adds `VYB_RES_N` (keep the first N blocks' PACKED weights in one device
+buffer) and `VYB_PHASE` (per-layer staging accumulator). S=3 forward, `PREFILL_TIMING ms`:
+
+```
+N=0 streaming   9558 / 9531 / 9607
+N=1   172 MB    9351 / 9257 / 9445
+N=4   698 MB    9544 / 9539
+N=64  9692 MB   10701 / 12977     848/848 tensors staged from device, gate PASS
+```
+N=64 removes the read+HtoD path ENTIRELY and is 1.2-3.4 s SLOWER (the one-time upload is charged
+inside the window; the streaming it removes costs less). So the read path is < ~1 s of 9.5 s.
+
+`VYB_PHASE=1` prices the real target: `PHASE_SPLIT staging_ms=34707 total_ms=45616 staging_pct=76`.
+Read as a WORK RATIO (the syncs serialize what normally overlaps): staging — read + HtoD + the
+DEQUANT it launches — is ~3.2x the layer math. **The port target is the per-token dequant, not the
+file read.** Note the syncs inflate the absolute total (45.6 s vs ~9.5 s unsynced).
+
+## f16 is safe — measured on the model's own tensors before writing any kernel
+
+`/tmp/f16_precision.py` (CPU only, gguf-py dequant, `blk.N.ffn_*` + `attn_qkv`, round to f16,
+recompute the block output vs the exact f64 path):
+
+```
+blk.0  (FFN IQ3_S)  ffn_out rel_l2 9.5e-05  cos 1.00000000   residual cos 1.00000000
+blk.17 (FFN IQ2_S)  ffn_out rel_l2 3.2e-04  cos 0.99999995   residual cos 0.99999999
+blk.40 (FFN IQ2_S)  ffn_out rel_l2 3.4e-04  cos 0.99999994   residual cos 0.99999999
+attn_qkv (Q4_K)     proj    rel_l2 2.1e-04  cos 0.99999998
+```
+The gate's bar is hidden cos >= 0.99 (met today at 0.9992..0.9997 in f64), so f16 has 3-4 orders of
+magnitude of headroom. Nothing in the port's risk profile is numerics.
+
+## What is ALREADY LANDED (compiles, gate green, inert)
+
+`native/host/model_driver.vyb` (uncommitted at time of writing, on top of `546d8d6`):
+- `cuMemcpyAsync(dst, src, bytes, stream)` added to the extern block (the 4B's param-block idiom).
+- structs `GP16 {a,b,sk,m,n,k,nblk,ksp}`, `GP16R {sk,scr,m,n,p1,p2,ksp}`, `GP3C {src,dst,n}` —
+  field order == kernel offsets, copied ONCE per launch instead of per field.
+- `cast_elem(cfn, pb, src, dst, n)` — the 4B's `cast1` (f64->f32 with `cast32`, f32->f16 with `cast16`).
+- `gemm_split(cfn, grn, pb, skb, ksp, a, b, c, m, n, k)` — the 4B's `gemm2`: pass 1 `gemm16_p`
+  (grid `nblk*ksp`), pass 2 `gemm32_r` at **`pb + 64`** (with the base pointer it faults rc 700).
+  `ksp` = split + 65536 * (cf - 1); gemm16_p is the 2-column kernel, so callers pass `split + 65536`.
+  `nblk = ((m+3)/4 * (n/cf) + 255)/256`.
+- Handles `g16p/g3r/c32n/c16n` loaded from `ml` (layer.ptx) with a loud `MODLOAD_FAIL` — verified
+  present: `F16_PATH kernels gemm16_p/gemm32_r/cast32/cast16 loaded from layer.ptx`.
+NO new kernel is needed: `cast32`, `cast16`, `gemm16_p`, `gemm32_r` all exist in `native/kernels/layer.vyb`
+and are gated by the 4B driver. `gemm32_r` STORES f64, so every caller keeps the dtype it already had.
+
+## The remaining build (in order; each step ends with `make -C native ridge-forward` GREEN or revert)
+
+1. **FFN trio** (the biggest single chunk: 3 x 89,128,960 elements x 64 blocks = 34 GB of the ~49 GB
+   resident). Allocate `WGA/WUA/WDA` f16 slabs, `T32` (f32 scratch D*FF*4), `SKX` (split-K partials,
+   ksp*S*FF*4), `X32` (S*D f32), `H32` (S*FF f32), a 128-byte param buffer.
+   One-time pass before the layer loop: per block, `stage_one(ffn_gate) -> DWg` (f64, already the
+   TRANSPOSED [D,FF] layout the GEMM wants — `inz` does that) -> `cast_elem(c32n, DWg->T32)` ->
+   `cast_elem(c16n, T32 -> WGA + L*D*FF*2)`; same for up/down.
+   New `run_ffn16` = rmsnorm (unchanged, X1N f64) -> cast X1N->X32 -> `gemm_split` x2 (A=X32 f32,
+   B=slab + L*D*FF*2, C=Gr/Up f64) -> silu (unchanged) -> cast Hu->H32 -> `gemm_split` (C=M f64) ->
+   resid (unchanged). Dispatch behind `VYB_FFN16=1` (default OFF, so the default path stays
+   byte-for-byte the streaming one) and SKIP the per-token FFN `stage_one` calls when it is on.
+   Verify: gate green in BOTH modes, then `PREFILL_TIMING` with the rig down.
+2. **Mixer families** (the GDN block's `attn_qkv`/`attn_gate`/`ssm_out`; the attention block's
+   `attn_q`/`k`/`v`/`output`) — same pattern, per-kind slabs indexed by absolute block.
+3. **The attention block's split/gate path** (`qg_split`, the per-head norms, `gate_mul`) — the one
+   piece the 4B has no equivalent of; its A operands need the f32 copies too.
+4. Then re-measure. The floor is the layer math (~25% of today's staged work), and the f16 GEMMs are
+   faster than the f64 ones, so the target is well below the current 9.5 s/forward at S=3.
+
+## Timings are only valid with the rig DOWN
+
+The DSv4.1 rig holds 106.5 GiB of the GB10's 121 GiB per node and the 27B forward is memory-bandwidth
+bound: the same binary that times 9391 ms on a free GPU times 42587-52932 ms while the rig serves
+(measured, twice). Every timing claim needs `docker stop` on both nodes first; see the
+`dgx-spark-two-node-serving` skill for the exact commands (the `~/ds41-serve.sh` wrapper is STALE —
+its `stop-server.sh` is gone; the stack is `dsv41-exl3-head` on lefty + `dsv41-exl3-worker` on righty,
+both must stop, and `dsv41-exl3-nfs` is NOT a GPU holder).
