@@ -656,6 +656,46 @@ run_ffn(S<Int>, D<Int>, FF<Int>, gfn<loc<CVoid>>, rfn<loc<CVoid>>, sfn<loc<CVoid
     return 0
 }
 
+# ───── the f16 FFN: same stages, same order, weights read from the resident f16 slabs ─────
+# run_ffn's twin for VYB_FFN16=1. Three differences and no others: both A operands are cast to f32
+# first (gemm16_p reads A with ld_f32), the weights come from the slab built ONCE per block, and each
+# GEMM is the split-K pair (gemm16_p + gemm32_r) instead of the f64 element-per-thread `gemm`. The
+# rmsnorm / silu / residual stages are byte-for-byte the same calls, and gemm32_r stores f64 — so
+# every buffer, dtype and summation order downstream is unchanged. KSP is passed as KSP + 65536
+# because gemm16_p is the 2-column kernel (see gemm_split).
+run_ffn16(S<Int>, D<Int>, FF<Int>, g16p<loc<CVoid>>, g3r<loc<CVoid>>, c32n<loc<CVoid>>,
+          rfn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
+          GM<Int>, RN<Int>, EPS<Float>, X1<Int>, N2<Int>, WGA<Int>, WUA<Int>, WDA<Int>, Lb<Int>,
+          X32<Int>, H32<Int>, SKX<Int>, PB<Int>, KSP<Int>,
+          X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>, XO<Int>)<Int> -> {
+    rA<Int> = X1; rB<Int> = N2; rC<Int> = X1N
+    freedom {
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        rn1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        if (rn1 != 0) { return 93 }
+    }
+    f1<Int> = cast_elem(c32n, PB, X1N, X32, S * D)
+    if (f1 != 0) { println("FFN16_ERR cast X"); return 94 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, X32, WGA + Lb * D * FF * 2, Gr, S, FF, D)
+    if (f1 != 0) { println("FFN16_ERR gate"); return 95 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, X32, WUA + Lb * D * FF * 2, Up, S, FF, D)
+    if (f1 != 0) { println("FFN16_ERR up"); return 96 }
+    freedom {
+        sl1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
+        if (sl1 != 0) { return 97 }
+    }
+    f1 = cast_elem(c32n, PB, Hu, H32, S * FF)
+    if (f1 != 0) { println("FFN16_ERR cast H"); return 94 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, H32, WDA + Lb * D * FF * 2, M, S, D, FF)
+    if (f1 != 0) { println("FFN16_ERR down"); return 98 }
+    freedom {
+        rf1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
+        if (rf1 != 0) { return 99 }
+    }
+    return 0
+}
+
 main()<Int> -> {
     # ---- prompt source --------------------------------------------------------
     # VYB_PROMPT_RAW=1  -> the synthetic 2-token prefix [0,1]. No tokenizer, no chat
@@ -1274,6 +1314,32 @@ t_pf1<Int> = 0
         println("PK_STAGE bytes=" + pk_max.to_string() + " (the largest tensor staged whole)")
         if (cuMemAlloc_v2(loc(DPK), pk_max) != 0) { return 11 }
 
+        # ---- VYB_FFN16: the FFN's weights dequantized ONCE into resident f16 slabs ----
+        # The measured target: per-token staging (read + HtoD + dequant) is ~3.2x the layer math, and
+        # the read/HtoD half of it is not the cost (546d8d6). So the three FFN matrices — the largest
+        # tensors in the file — are staged once, narrowed to f16, and the GEMMs read the slabs. f16
+        # was cleared numerically first: rounding these tensors costs rel_l2 1-3e-4 and cos
+        # >= 0.99999994 per block against a gate bar of 0.99.
+        fn16s<String> = env_get("VYB_FFN16") else ""
+        FN16<Int> = 0
+        if (fn16s == "1") { FN16 = 1 }
+        WGA<Int> = 0; WUA<Int> = 0; WDA<Int> = 0
+        T32<Int> = 0; X32<Int> = 0; H32<Int> = 0; SKX<Int> = 0; F16PB<Int> = 0
+        FKSP<Int> = 16
+        if (FN16 == 1) {
+            if (cuMemAlloc_v2(loc(WGA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(WUA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(WDA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(T32), D * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(X32), S * D * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(H32), S * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SKX), FKSP * S * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(F16PB), 128) != 0) { return 11 }
+            println("FFN16_ALLOC slabs=" + (((D * FF * 2 * NTL) / 1048576) * 3).to_string()
+                    + " MB (3 x f16), scratch T32=" + ((D * FF * 4) / 1048576).to_string()
+                    + " MB, split-K KSP=" + FKSP.to_string())
+        }
+
         # ---- unit 10 step 5: the Ridge attention branch's own buffers ----
         # DQG holds the JOINT q+gate projection (S x 2*NQ), which nothing else allocates; DGT the
         # gate half after the split, DGD the gated context, AP1 the split/gate kernels' param block.
@@ -1641,6 +1707,43 @@ t_pf1<Int> = 0
             println("RESIDENT_SLICE off: every tensor streams from the file")
         }
 
+        # ---- FFN16: build the three f16 slabs, ONCE for the whole model ----
+        # One pass over the blocks: stage each FFN matrix through the engine's own staging path (the
+        # dequant stays the verified one), narrow it f64 -> f32 -> f16 with the two cast kernels, and
+        # write it into the slab. This is the same staging work the loop used to do PER TOKEN, paid
+        # once per process — which is the whole point of the port.
+        if (FN16 == 1) {
+            println("FFN16_BUILD " + NTL.to_string() + " blocks x 3 matrices, one-time")
+            t_bs<Int> = time_mono_millis()
+            L16<Int> = 0
+            e16<Int> = 0
+            for (L16 in 0..NTL - 1) {
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK)
+                if (e16 != 0) { println("FFN16_ERR stage gate L=" + L16.to_string()); return 74 }
+                e16 = cast_elem(c32n, F16PB, DWg, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast gate"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WGA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow gate"); return 70 }
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK)
+                if (e16 != 0) { println("FFN16_ERR stage up L=" + L16.to_string()); return 75 }
+                e16 = cast_elem(c32n, F16PB, DWu, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast up"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WUA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow up"); return 70 }
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK)
+                if (e16 != 0) { println("FFN16_ERR stage down L=" + L16.to_string()); return 76 }
+                e16 = cast_elem(c32n, F16PB, DWd, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast down"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WDA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow down"); return 70 }
+                if (L16 % 8 == 0) { println("FFN16_BUILD " + L16.to_string() + "/" + NTL.to_string()) }
+            }
+            cuCtxSynchronize()
+            t_be<Int> = time_mono_millis()
+            println("FFN16_READY slabs built (f16, " + (((D * FF * 2 * NTL) / 1048576) * 3).to_string() + " MB)"
+                    + " build_ms=" + (t_be - t_bs).to_string())
+        }
+
         LST<Int> = 0 ; LEP<Int> = NTL
         if (MTPM == 1) { LST = NTL ; LEP = NTL + 1 }
         # ---- W4b: the CHAINED draft's step loop (VYB_MTP_CHAIN=<N>, default off) ----
@@ -1792,9 +1895,11 @@ t_pf1<Int> = 0
                 if (l_fn < 0) { println("GDN_ERR blk." + L.to_string() + " has no FFN pre-norm tensor"); return 7 }
                 e = load_norm(MODEL, PF, DPK, N2, ofv.get(l_fn), nlv.get(l_fn), efn)
                 if (e != 0) { println("GDN_ERR stage ffn pre-norm"); return 80 }
+                if (FN16 == 0) {
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 74 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 75 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { return 76 }
+                }
                 if (PHASE == 1) {
                     freedom { cuCtxSynchronize() }
                     t_lx<Int> = time_mono_millis()
@@ -2069,9 +2174,11 @@ t_pf1<Int> = 0
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 71 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 72 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q5fn, q6fn, efn, NQ, GK); if (e != 0) { return 73 }
+            if (FN16 == 0) {
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 74 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 75 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { return 76 }
+            }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 77 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 78 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 79 }
@@ -2084,9 +2191,16 @@ t_pf1<Int> = 0
             if (e != 0) { return 81 }
             }
             }
+            if (FN16 == 1) {
+                e = run_ffn16(S, D, FF, g16p, g3r, c32n, rfn, sfn, refn, GM, RN, EPS,
+                              X1, N2, WGA, WUA, WDA, L, X32, H32, SKX, F16PB, FKSP,
+                              X1N, Gr, Up, Hu, M, XO)
+                if (e != 0) { println("FFN16_ERR run_ffn16 L=" + L.to_string()); return 82 }
+            } else {
             e = run_ffn(S, D, FF, gfn, rfn, sfn, refn, GM, RN, EPS,
                         X1, N2, DWg, DWu, DWd, X1N, Gr, Up, Hu, M, XO)
             if (e != 0) { return 82 }
+            }
             if (LTR == 1) {
                 match (open_write("native/out/ridge_trace_L" + L.to_string() + ".txt")) {
                     tw -> {
