@@ -28,6 +28,10 @@ extern "C" {
     cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
     cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
     cuCtxSynchronize()<CInt>
+    cuMemAllocHost_v2(pp<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemFreeHost(p<Int>)<CInt>
+    cuMemcpy(dst<Int>, src<Int>, ByteCount<Int>)<CInt>
+    pread(fd<CInt>, buf<Int>, n<Int>, off<Int>)<Int>
     cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
@@ -441,14 +445,38 @@ main()<Int> -> {
     if (RBA == 0) { println("ERR alloc region"); return 20 }
     CHK<Int> = 268435456
     pos<Int> = 0
-    while (pos < RBYTES) {
-        len<Int> = CHK
-        if (pos + len > RBYTES) { len = RBYTES - pos }
-        data<String> = read_model(MODEL, RLO + pos, len)
-        if (data.len() < len) { println("ERR short read at " + pos.to_string()); return 21 }
-        if (download(data, RBA + pos, len) != 0) { return 22 }
-        pos = pos + len
+    // One pinned 256 MB host buffer, reused for every chunk: pread straight into it, then
+    // cuMemcpy to the region. (Each read_model String chunk was never freed: ~12.5 GB of host RSS.)
+    HB<Int> = 0
+    hrc<Int> = 0
+    freedom { hrc = cuMemAllocHost_v2(loc(HB), CHK) as Int }
+    if (hrc != 0 || HB == 0) { println("ERR pinned alloc " + hrc.to_string()); return 20 }
+    urc<Int> = 0
+    match (open_read(MODEL)) {
+        mf -> {
+            while (pos < RBYTES && urc == 0) {
+                len<Int> = CHK
+                if (pos + len > RBYTES) { len = RBYTES - pos }
+                got<Int> = 0
+                while (got < len && urc == 0) {
+                    n<Int> = 0
+                    freedom { n = pread(mf.fd, HB + got, len - got, RLO + pos + got) }
+                    if (n <= 0) { println("ERR short read at " + (pos + got).to_string()); urc = 21 }
+                    got = got + n
+                }
+                if (urc == 0) {
+                    c<Int> = 0
+                    freedom { c = cuMemcpy(RBA + pos, HB, len) as Int }
+                    if (c != 0) { urc = 22 }
+                }
+                pos = pos + len
+            }
+            close(mf)
+        }
+        ? -> { urc = 21 }
     }
+    freedom { cuMemFreeHost(HB) }
+    if (urc != 0) { return urc }
     tw1<Int> = time_mono_millis()
     println("RESIDENT_WEIGHTS bytes=" + RBYTES.to_string() + " upload_ms=" + (tw1 - tw0).to_string())
     g2s<String> = read_bin("native/out/iq2s_grid.bin")
