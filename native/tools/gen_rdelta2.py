@@ -179,4 +179,7 @@ srw = src.replace("delta_step_v32(", "delta_step_w32(").replace("delta_step_v(",
 srw = re.sub(r"( +)s(\d+)<Float> = (.*)\n", lambda m: f"{m.group(1)}s{m.group(2)}<Float> = {m.group(3)}\n{m.group(1)}st_shared_f64(512 + (ib + {m.group(2)}) * {JB} + tid_x(), s{m.group(2)})\n", srw)
 srw = re.sub(r"( +)r(\d+)<Float> = .*\n", lambda m: f"{m.group(1)}r{m.group(2)}<Float> = ld_shared_f64(512 + (ib + {m.group(2)}) * {JB} + tid_x())\n", srw)
 assert srw.count("ld_shared_f64(512 +") == 2 * UL
-open(OUT, "a").write("\n".join(L2) + "\n" + src + "\n" + srw + "\n")
+# argv[5] = 1 also emits delta_step_w (40 KB static shared, which every kernel in the module then
+# reserves): build it as its own module (rdelta2w, --kernel-shared 40960); rdelta2 itself at 12288.
+WK = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+open(OUT, "a").write("\n".join(L2) + "\n" + src + "\n" + (srw + "\n" if WK else ""))

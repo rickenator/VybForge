@@ -474,21 +474,16 @@ main()<Int> -> {
             DSP = 1
             println("GDN_STEP delta_step_p tpb=" + DSPT.to_string())
         }
-        if ((env_get("VYB_DSU") else "") == "1") {
-            // delta_step_t with batched state loads (bit-identical in f64)
-            mdu<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
-            if (mdu == 0) { println("ERR load rdelta2") ; return 1 }
-            if (GDN32 == 1) { hdst = get_fn(mdu, "delta_step_u32") } else { hdst = get_fn(mdu, "delta_step_u") }
-            if (hdst == 0) { println("ERR delta_step_u") ; return 1 }
-            println("GDN_STEP delta_step_u")
-        }
         if ((env_get("VYB_DSV") else "") == "1") {
             // delta_step_u work split JB columns per block (grid Hv*S/JB); bit-identical in f64
             mdv<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
             if (mdv == 0) { println("ERR load rdelta2") ; return 1 }
             if (GDN32 == 1) { hdst = get_fn(mdv, "delta_step_v32") } else { hdst = get_fn(mdv, "delta_step_v") }
             if ((env_get("VYB_DSW") else "") == "1") {
-                if (GDN32 == 1) { hdst = get_fn(mdv, "delta_step_w32") } else { hdst = get_fn(mdv, "delta_step_w") }
+                // delta_step_w needs 40 KB static shared, so it lives in its own module (gen_rdelta2.py ... 1)
+                mdw<Int> = load_mod(env_get("VYB_DSWPTX") else "native/build/rdelta2w.ptx")
+                if (mdw == 0) { println("ERR load rdelta2w") ; return 1 }
+                if (GDN32 == 1) { hdst = get_fn(mdw, "delta_step_w32") } else { hdst = get_fn(mdw, "delta_step_w") }
             }
             if (hdst == 0) { println("ERR delta_step_v") ; return 1 }
             djb<String> = env_get("VYB_DSVJB") else "32"
@@ -496,6 +491,15 @@ main()<Int> -> {
             DSPT = DSPG
             DSP = 1
             println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
+        }
+        // VYB_DSU (default 1 unless VYB_DSP/VYB_DSV picked a kernel): delta_step_t with batched state loads
+        // (rdelta2 delta_step_u, 62 vs 71 us; bit-identical in f64). VYB_DSU=0 = plain delta_step_t.
+        if ((env_get("VYB_DSU") else "1") == "1" && DSP == 0) {
+            mdu<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdu == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdu, "delta_step_u32") } else { hdst = get_fn(mdu, "delta_step_u") }
+            if (hdst == 0) { println("ERR delta_step_u") ; return 1 }
+            println("GDN_STEP delta_step_u")
         }
     }
     dsfs<String> = env_get("VYB_DSF") else "1"
