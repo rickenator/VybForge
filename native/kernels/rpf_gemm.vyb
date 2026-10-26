@@ -2,7 +2,7 @@
 # Generate native/kernels/rpf_gemm.vyb: tiled tensor-core GEMMs that read packed GGUF weights in
 # place (batched prefill).  Y[m, n] (f64, row stride LDY) = RS[m, n] + sum_k X[m, k] * W[n, k]
 # X: f32 [S][K] (16-byte aligned rows), W: packed rows of type T (Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S).
-# Tile 64 tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
+# Tile 64 (--bm128: 128) tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
 # 32x32 via mma.m16n8k16 (f16 in, f32 accumulate).  Shared: A [64][72] halves @0, B [128][72] @9216.
 # Params: W@0 X@8 Y@16 S@24 N@32 K@40 LDY@48 RS@56 G@64 NMT@72.  Grid = NMT * ceil(N/128), block 256.
 # Compile: vyb --kernel --gpu sm_80 --kernel-shared 27648 (ursela/gpu-features compiler).
@@ -74,43 +74,43 @@ gemm_q4k(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -832,43 +832,43 @@ gemm_q5k(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -1599,43 +1599,43 @@ gemm_q6k(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -2347,43 +2347,43 @@ gemm_q80(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -3087,43 +3087,43 @@ gemm_iq2s(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -3150,10 +3150,14 @@ gemm_iq2s(p<Int>) -> {
             dl0<Float32> = dd * (((scb & 15) as Float32) + (0.5 as Float32)) * (0.25 as Float32)
             dl1<Float32> = dd * (((scb >> 4) as Float32) + (0.5 as Float32)) * (0.25 as Float32)
             qhb<Int> = (ld_i8(bb + 66 + sub) as Int) & 255
-            ix0<Int> = ((ld_i8(bb + 2 + 4 * sub + 0) as Int) & 255) | ((qhb << 8) & 768)
+            qw0<Int> = ld_u16(bb + 2 + 4 * sub) as Int
+            qw1<Int> = ld_u16(bb + 4 + 4 * sub) as Int
+            sw0<UInt32> = (ld_u16(bb + 34 + 4 * sub) as Int) as UInt32
+            sw1<UInt32> = (ld_u16(bb + 36 + 4 * sub) as Int) as UInt32
+            ix0<Int> = ((qw0 >> 0) & 255) | ((qhb << 8) & 768)
             ga0<UInt32> = ld_v2_u32(G + ix0 * 8, 0)
             gb0<UInt32> = ld_v2_u32(G + ix0 * 8, 1)
-            sg0<UInt32> = (((ld_i8(bb + 34 + 4 * sub + 0) as Int) & 255) as UInt32)
+            sg0<UInt32> = sw0 >> 0
             dw0<Float32> = dl0 * ((((ga0 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 0) & 1) as Float32)))
             dw1<Float32> = dl0 * ((((ga0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 1) & 1) as Float32)))
             dw2<Float32> = dl0 * ((((ga0 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 2) & 1) as Float32)))
@@ -3162,10 +3166,10 @@ gemm_iq2s(p<Int>) -> {
             dw5<Float32> = dl0 * ((((gb0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 5) & 1) as Float32)))
             dw6<Float32> = dl0 * ((((gb0 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 6) & 1) as Float32)))
             dw7<Float32> = dl0 * ((((gb0 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 7) & 1) as Float32)))
-            ix1<Int> = ((ld_i8(bb + 2 + 4 * sub + 1) as Int) & 255) | ((qhb << 6) & 768)
+            ix1<Int> = ((qw0 >> 8) & 255) | ((qhb << 6) & 768)
             ga1<UInt32> = ld_v2_u32(G + ix1 * 8, 0)
             gb1<UInt32> = ld_v2_u32(G + ix1 * 8, 1)
-            sg1<UInt32> = (((ld_i8(bb + 34 + 4 * sub + 1) as Int) & 255) as UInt32)
+            sg1<UInt32> = sw0 >> 8
             dw8<Float32> = dl0 * ((((ga1 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 0) & 1) as Float32)))
             dw9<Float32> = dl0 * ((((ga1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 1) & 1) as Float32)))
             dw10<Float32> = dl0 * ((((ga1 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 2) & 1) as Float32)))
@@ -3174,10 +3178,10 @@ gemm_iq2s(p<Int>) -> {
             dw13<Float32> = dl0 * ((((gb1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 5) & 1) as Float32)))
             dw14<Float32> = dl0 * ((((gb1 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 6) & 1) as Float32)))
             dw15<Float32> = dl0 * ((((gb1 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 7) & 1) as Float32)))
-            ix2<Int> = ((ld_i8(bb + 2 + 4 * sub + 2) as Int) & 255) | ((qhb << 4) & 768)
+            ix2<Int> = ((qw1 >> 0) & 255) | ((qhb << 4) & 768)
             ga2<UInt32> = ld_v2_u32(G + ix2 * 8, 0)
             gb2<UInt32> = ld_v2_u32(G + ix2 * 8, 1)
-            sg2<UInt32> = (((ld_i8(bb + 34 + 4 * sub + 2) as Int) & 255) as UInt32)
+            sg2<UInt32> = sw1 >> 0
             dw16<Float32> = dl1 * ((((ga2 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 0) & 1) as Float32)))
             dw17<Float32> = dl1 * ((((ga2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 1) & 1) as Float32)))
             dw18<Float32> = dl1 * ((((ga2 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 2) & 1) as Float32)))
@@ -3186,10 +3190,10 @@ gemm_iq2s(p<Int>) -> {
             dw21<Float32> = dl1 * ((((gb2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 5) & 1) as Float32)))
             dw22<Float32> = dl1 * ((((gb2 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 6) & 1) as Float32)))
             dw23<Float32> = dl1 * ((((gb2 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 7) & 1) as Float32)))
-            ix3<Int> = ((ld_i8(bb + 2 + 4 * sub + 3) as Int) & 255) | ((qhb << 2) & 768)
+            ix3<Int> = ((qw1 >> 8) & 255) | ((qhb << 2) & 768)
             ga3<UInt32> = ld_v2_u32(G + ix3 * 8, 0)
             gb3<UInt32> = ld_v2_u32(G + ix3 * 8, 1)
-            sg3<UInt32> = (((ld_i8(bb + 34 + 4 * sub + 3) as Int) & 255) as UInt32)
+            sg3<UInt32> = sw1 >> 8
             dw24<Float32> = dl1 * ((((ga3 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 0) & 1) as Float32)))
             dw25<Float32> = dl1 * ((((ga3 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 1) & 1) as Float32)))
             dw26<Float32> = dl1 * ((((ga3 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 2) & 1) as Float32)))
@@ -3847,43 +3851,43 @@ gemm_iq3s(p<Int>) -> {
     c133<Float32> = 0.0
     k0<Int> = 0
     while (k0 < K) {
-        xu0<UInt32> = 0 as UInt32
-        xu1<UInt32> = 0 as UInt32
-        xu2<UInt32> = 0 as UInt32
-        xu3<UInt32> = 0 as UInt32
-        xu4<UInt32> = 0 as UInt32
-        xu5<UInt32> = 0 as UInt32
-        xu6<UInt32> = 0 as UInt32
-        xu7<UInt32> = 0 as UInt32
-        if (arow < S) {
-            xa<Int> = X + (arow * K + k0 + akq) * 4
-            xf0<Float32> = ld_v4_f32(xa + 0, 0)
-            xf1<Float32> = ld_v4_f32(xa + 0, 1)
-            xf2<Float32> = ld_v4_f32(xa + 0, 2)
-            xf3<Float32> = ld_v4_f32(xa + 0, 3)
-            xf4<Float32> = ld_v4_f32(xa + 16, 0)
-            xf5<Float32> = ld_v4_f32(xa + 16, 1)
-            xf6<Float32> = ld_v4_f32(xa + 16, 2)
-            xf7<Float32> = ld_v4_f32(xa + 16, 3)
-            xf8<Float32> = ld_v4_f32(xa + 32, 0)
-            xf9<Float32> = ld_v4_f32(xa + 32, 1)
-            xf10<Float32> = ld_v4_f32(xa + 32, 2)
-            xf11<Float32> = ld_v4_f32(xa + 32, 3)
-            xf12<Float32> = ld_v4_f32(xa + 48, 0)
-            xf13<Float32> = ld_v4_f32(xa + 48, 1)
-            xf14<Float32> = ld_v4_f32(xa + 48, 2)
-            xf15<Float32> = ld_v4_f32(xa + 48, 3)
-            xu0 = h2_pack(xf0, xf1)
-            xu1 = h2_pack(xf2, xf3)
-            xu2 = h2_pack(xf4, xf5)
-            xu3 = h2_pack(xf6, xf7)
-            xu4 = h2_pack(xf8, xf9)
-            xu5 = h2_pack(xf10, xf11)
-            xu6 = h2_pack(xf12, xf13)
-            xu7 = h2_pack(xf14, xf15)
+        xu0_0<UInt32> = 0 as UInt32
+        xu1_0<UInt32> = 0 as UInt32
+        xu2_0<UInt32> = 0 as UInt32
+        xu3_0<UInt32> = 0 as UInt32
+        xu4_0<UInt32> = 0 as UInt32
+        xu5_0<UInt32> = 0 as UInt32
+        xu6_0<UInt32> = 0 as UInt32
+        xu7_0<UInt32> = 0 as UInt32
+        if (arow + 0 < S) {
+            xa0<Int> = X + ((arow + 0) * K + k0 + akq) * 4
+            xf0_0<Float32> = ld_v4_f32(xa0 + 0, 0)
+            xf1_0<Float32> = ld_v4_f32(xa0 + 0, 1)
+            xf2_0<Float32> = ld_v4_f32(xa0 + 0, 2)
+            xf3_0<Float32> = ld_v4_f32(xa0 + 0, 3)
+            xf4_0<Float32> = ld_v4_f32(xa0 + 16, 0)
+            xf5_0<Float32> = ld_v4_f32(xa0 + 16, 1)
+            xf6_0<Float32> = ld_v4_f32(xa0 + 16, 2)
+            xf7_0<Float32> = ld_v4_f32(xa0 + 16, 3)
+            xf8_0<Float32> = ld_v4_f32(xa0 + 32, 0)
+            xf9_0<Float32> = ld_v4_f32(xa0 + 32, 1)
+            xf10_0<Float32> = ld_v4_f32(xa0 + 32, 2)
+            xf11_0<Float32> = ld_v4_f32(xa0 + 32, 3)
+            xf12_0<Float32> = ld_v4_f32(xa0 + 48, 0)
+            xf13_0<Float32> = ld_v4_f32(xa0 + 48, 1)
+            xf14_0<Float32> = ld_v4_f32(xa0 + 48, 2)
+            xf15_0<Float32> = ld_v4_f32(xa0 + 48, 3)
+            xu0_0 = h2_pack(xf0_0, xf1_0)
+            xu1_0 = h2_pack(xf2_0, xf3_0)
+            xu2_0 = h2_pack(xf4_0, xf5_0)
+            xu3_0 = h2_pack(xf6_0, xf7_0)
+            xu4_0 = h2_pack(xf8_0, xf9_0)
+            xu5_0 = h2_pack(xf10_0, xf11_0)
+            xu6_0 = h2_pack(xf12_0, xf13_0)
+            xu7_0 = h2_pack(xf14_0, xf15_0)
         }
-        st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)
-        st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)
+        st_shared_v4_u32(aso + 0, xu0_0, xu1_0, xu2_0, xu3_0)
+        st_shared_v4_u32(aso + 16, xu4_0, xu5_0, xu6_0, xu7_0)
         wq0<UInt32> = 0 as UInt32
         wq1<UInt32> = 0 as UInt32
         wq2<UInt32> = 0 as UInt32
@@ -3909,12 +3913,14 @@ gemm_iq3s(p<Int>) -> {
             nib<Int> = (((ld_i8(bb + 106 + sub / 2) as Int) & 255) >> (4 * (sub % 2))) & 15
             db<Float32> = dd * ((1 + 2 * nib) as Float32)
             qhb<Int> = (ld_i8(bb + 66 + sub) as Int) & 255
-            qo0<Int> = bb + 2 + 8 * sub + 0
-            ia0<Int> = ((ld_i8(qo0) as Int) & 255) | ((qhb << 8) & 256)
-            ib0<Int> = ((ld_i8(qo0 + 1) as Int) & 255) | ((qhb << 7) & 256)
+            sw0<UInt32> = (ld_u16(bb + 74 + 4 * sub) as Int) as UInt32
+            sw1<UInt32> = (ld_u16(bb + 76 + 4 * sub) as Int) as UInt32
+            qp0<Int> = ld_u16(bb + 2 + 8 * sub + 0) as Int
+            ia0<Int> = (qp0 & 255) | ((qhb << 8) & 256)
+            ib0<Int> = ((qp0 >> 8) & 255) | ((qhb << 7) & 256)
             ga0<UInt32> = ld_u32(G + ia0 * 4)
             gb0<UInt32> = ld_u32(G + ib0 * 4)
-            sg0<UInt32> = (((ld_i8(bb + 74 + 4 * sub + 0) as Int) & 255) as UInt32)
+            sg0<UInt32> = sw0 >> 0
             dw0<Float32> = db * ((((ga0 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 0) & 1) as Float32)))
             dw1<Float32> = db * ((((ga0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 1) & 1) as Float32)))
             dw2<Float32> = db * ((((ga0 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 2) & 1) as Float32)))
@@ -3923,12 +3929,12 @@ gemm_iq3s(p<Int>) -> {
             dw5<Float32> = db * ((((gb0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 5) & 1) as Float32)))
             dw6<Float32> = db * ((((gb0 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 6) & 1) as Float32)))
             dw7<Float32> = db * ((((gb0 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 7) & 1) as Float32)))
-            qo1<Int> = bb + 2 + 8 * sub + 2
-            ia1<Int> = ((ld_i8(qo1) as Int) & 255) | ((qhb << 6) & 256)
-            ib1<Int> = ((ld_i8(qo1 + 1) as Int) & 255) | ((qhb << 5) & 256)
+            qp1<Int> = ld_u16(bb + 2 + 8 * sub + 2) as Int
+            ia1<Int> = (qp1 & 255) | ((qhb << 6) & 256)
+            ib1<Int> = ((qp1 >> 8) & 255) | ((qhb << 5) & 256)
             ga1<UInt32> = ld_u32(G + ia1 * 4)
             gb1<UInt32> = ld_u32(G + ib1 * 4)
-            sg1<UInt32> = (((ld_i8(bb + 74 + 4 * sub + 1) as Int) & 255) as UInt32)
+            sg1<UInt32> = sw0 >> 8
             dw8<Float32> = db * ((((ga1 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 0) & 1) as Float32)))
             dw9<Float32> = db * ((((ga1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 1) & 1) as Float32)))
             dw10<Float32> = db * ((((ga1 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 2) & 1) as Float32)))
@@ -3937,12 +3943,12 @@ gemm_iq3s(p<Int>) -> {
             dw13<Float32> = db * ((((gb1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 5) & 1) as Float32)))
             dw14<Float32> = db * ((((gb1 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 6) & 1) as Float32)))
             dw15<Float32> = db * ((((gb1 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 7) & 1) as Float32)))
-            qo2<Int> = bb + 2 + 8 * sub + 4
-            ia2<Int> = ((ld_i8(qo2) as Int) & 255) | ((qhb << 4) & 256)
-            ib2<Int> = ((ld_i8(qo2 + 1) as Int) & 255) | ((qhb << 3) & 256)
+            qp2<Int> = ld_u16(bb + 2 + 8 * sub + 4) as Int
+            ia2<Int> = (qp2 & 255) | ((qhb << 4) & 256)
+            ib2<Int> = ((qp2 >> 8) & 255) | ((qhb << 3) & 256)
             ga2<UInt32> = ld_u32(G + ia2 * 4)
             gb2<UInt32> = ld_u32(G + ib2 * 4)
-            sg2<UInt32> = (((ld_i8(bb + 74 + 4 * sub + 2) as Int) & 255) as UInt32)
+            sg2<UInt32> = sw1 >> 0
             dw16<Float32> = db * ((((ga2 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 0) & 1) as Float32)))
             dw17<Float32> = db * ((((ga2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 1) & 1) as Float32)))
             dw18<Float32> = db * ((((ga2 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 2) & 1) as Float32)))
@@ -3951,12 +3957,12 @@ gemm_iq3s(p<Int>) -> {
             dw21<Float32> = db * ((((gb2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 5) & 1) as Float32)))
             dw22<Float32> = db * ((((gb2 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 6) & 1) as Float32)))
             dw23<Float32> = db * ((((gb2 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 7) & 1) as Float32)))
-            qo3<Int> = bb + 2 + 8 * sub + 6
-            ia3<Int> = ((ld_i8(qo3) as Int) & 255) | ((qhb << 2) & 256)
-            ib3<Int> = ((ld_i8(qo3 + 1) as Int) & 255) | ((qhb << 1) & 256)
+            qp3<Int> = ld_u16(bb + 2 + 8 * sub + 6) as Int
+            ia3<Int> = (qp3 & 255) | ((qhb << 2) & 256)
+            ib3<Int> = ((qp3 >> 8) & 255) | ((qhb << 1) & 256)
             ga3<UInt32> = ld_u32(G + ia3 * 4)
             gb3<UInt32> = ld_u32(G + ib3 * 4)
-            sg3<UInt32> = (((ld_i8(bb + 74 + 4 * sub + 3) as Int) & 255) as UInt32)
+            sg3<UInt32> = sw1 >> 8
             dw24<Float32> = db * ((((ga3 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 0) & 1) as Float32)))
             dw25<Float32> = db * ((((ga3 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 1) & 1) as Float32)))
             dw26<Float32> = db * ((((ga3 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 2) & 1) as Float32)))

@@ -801,7 +801,7 @@ main()<Int> -> {
         hpg8 = get_fn(mpg, "gemm_q80") ; hpgi2 = get_fn(mpg, "gemm_iq2s") ; hpgi3 = get_fn(mpg, "gemm_iq3s")
         hpds = get_fn(mpg, "delta_seq")
         if (BIG == 128) {
-            mpg2<Int> = load_mod("native/build/rpf_gemm128.ptx")
+            mpg2<Int> = load_mod(env_get("VYB_PFG128PTX") else "native/build/rpf_gemm128.ptx")
             if (mpg2 == 0) { println("ERR load rpf_gemm128 ptx") ; return 10 }
             hpg6 = get_fn(mpg2, "gemm_q6k") ; hpgi2 = get_fn(mpg2, "gemm_iq2s") ; hpgi3 = get_fn(mpg2, "gemm_iq3s")
         }

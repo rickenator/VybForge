@@ -91,6 +91,51 @@ def deq_iq3s(o):
             wd = f"ga{l3}" if j < 4 else f"gb{l3}"
             o.append(f"dw{8 * l3 + j}<Float32> = db * (((({wd} >> {8 * (j % 4)}) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg{l3} >> {j}) & 1) as Float32)))")
 
+def _fw(o, sc, wd, sg, base):
+    # 4 weights from grid word wd, sign bits sg >> base (same float formula as deq_iq2s/deq_iq3s)
+    for j in range(4):
+        o.append(f"dw{base + j}<Float32> = {sc} * (((({wd} >> {8 * j}) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * ((({sg} >> {base % 8 + j}) & 1) as Float32)))")
+
+def deq_iq2s_v(o):
+    # --vdeq: same math as deq_iq2s (bit-identical) with the per-sub-block qs / sign bytes fetched as
+    # 2 x u16 each (blocks are 82 B, so 2-byte aligned) instead of 8 byte loads
+    o.append("bb<Int> = rb + sbi * 82")
+    o.append("dd<Float32> = ld_f16(bb)")
+    o.append("scb<Int> = (ld_i8(bb + 74 + sub) as Int) & 255")
+    o.append("dl0<Float32> = dd * (((scb & 15) as Float32) + (0.5 as Float32)) * (0.25 as Float32)")
+    o.append("dl1<Float32> = dd * (((scb >> 4) as Float32) + (0.5 as Float32)) * (0.25 as Float32)")
+    o.append("qhb<Int> = (ld_i8(bb + 66 + sub) as Int) & 255")
+    o.append("qw0<Int> = ld_u16(bb + 2 + 4 * sub) as Int")
+    o.append("qw1<Int> = ld_u16(bb + 4 + 4 * sub) as Int")
+    o.append("sw0<UInt32> = (ld_u16(bb + 34 + 4 * sub) as Int) as UInt32")
+    o.append("sw1<UInt32> = (ld_u16(bb + 36 + 4 * sub) as Int) as UInt32")
+    for l2 in range(4):
+        qw = f"qw{l2 // 2}"
+        o.append(f"ix{l2}<Int> = (({qw} >> {8 * (l2 % 2)}) & 255) | ((qhb << {8 - 2 * l2}) & 768)")
+        o.append(f"ga{l2}<UInt32> = ld_v2_u32(G + ix{l2} * 8, 0)")
+        o.append(f"gb{l2}<UInt32> = ld_v2_u32(G + ix{l2} * 8, 1)")
+        o.append(f"sg{l2}<UInt32> = sw{l2 // 2} >> {8 * (l2 % 2)}")
+        _fw(o, f"dl{l2 // 2}", f"ga{l2}", f"sg{l2}", 8 * l2)
+        _fw(o, f"dl{l2 // 2}", f"gb{l2}", f"sg{l2}", 8 * l2 + 4)
+
+def deq_iq3s_v(o):
+    o.append("bb<Int> = rb + sbi * 110")
+    o.append("dd<Float32> = ld_f16(bb)")
+    o.append("nib<Int> = (((ld_i8(bb + 106 + sub / 2) as Int) & 255) >> (4 * (sub % 2))) & 15")
+    o.append("db<Float32> = dd * ((1 + 2 * nib) as Float32)")
+    o.append("qhb<Int> = (ld_i8(bb + 66 + sub) as Int) & 255")
+    o.append("sw0<UInt32> = (ld_u16(bb + 74 + 4 * sub) as Int) as UInt32")
+    o.append("sw1<UInt32> = (ld_u16(bb + 76 + 4 * sub) as Int) as UInt32")
+    for l3 in range(4):
+        o.append(f"qp{l3}<Int> = ld_u16(bb + 2 + 8 * sub + {2 * l3}) as Int")
+        o.append(f"ia{l3}<Int> = (qp{l3} & 255) | ((qhb << {8 - 2 * l3}) & 256)")
+        o.append(f"ib{l3}<Int> = ((qp{l3} >> 8) & 255) | ((qhb << {7 - 2 * l3}) & 256)")
+        o.append(f"ga{l3}<UInt32> = ld_u32(G + ia{l3} * 4)")
+        o.append(f"gb{l3}<UInt32> = ld_u32(G + ib{l3} * 4)")
+        o.append(f"sg{l3}<UInt32> = sw{l3 // 2} >> {8 * (l3 % 2)}")
+        _fw(o, "db", f"ga{l3}", f"sg{l3}", 8 * l3)
+        _fw(o, "db", f"gb{l3}", f"sg{l3}", 8 * l3 + 4)
+
 TYPES = {
     "q4k": (lambda o: deq_q4k(o, False), "(K / 256) * 144"),
     "q5k": (lambda o: deq_q4k(o, True), "(K / 256) * 176"),
@@ -100,7 +145,10 @@ TYPES = {
     "iq3s": (deq_iq3s, "(K / 256) * 110"),
 }
 
-def gen(name, deq, rowbytes, BM=64):
+VDEQ = {"iq2s": None, "iq3s": None}  # filled below (--vdeq: vsub4 sign-folded IQ dequant)
+
+
+def gen(name, deq, rowbytes, BM=64, PF=False):
     MI = BM // 32
     BOFF = BM * 144
     o = []
@@ -119,38 +167,90 @@ def gen(name, deq, rowbytes, BM=64):
         for ni in range(4):
             for e in range(4):
                 I(f"c{mi}{ni}{e}<Float32> = 0.0")
-    I("k0<Int> = 0")
-    I("while (k0 < K) {")
-    for pa in range(BM // 64):
-        for i in range(8):
-            I(f"xu{i}_{pa}<UInt32> = 0 as UInt32", 2)
-        I(f"if (arow + {64 * pa} < S) {{", 2)
-        I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + k0 + akq) * 4", 3)
+    def tile_load(KE, n, decl):
+        # global loads + dequant of the k-tile at KE into registers xu*/wq* (declared at function scope)
+        for pa in range(BM // 64):
+            for i in range(8):
+                I(f"xu{i}_{pa} = 0 as UInt32", n)
+            I(f"if (arow + {64 * pa} < S) {{", n)
+            I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + {KE} + akq) * 4", n + 1)
+            for v in range(4):
+                for e in range(4):
+                    I(f"xf{4 * v + e}_{pa}<Float32> = ld_v4_f32(xa{pa} + {16 * v}, {e})", n + 1)
+            for i in range(8):
+                I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", n + 1)
+            I("}", n)
+        for i in range(16):
+            I(f"wq{i} = 0 as UInt32", n)
+        I("if (nrow < N) {", n)
+        I(f"kofs<Int> = {KE} + 32 * hf", n + 1)
+        I("sbi<Int> = kofs / 256", n + 1)
+        I("sub<Int> = (kofs % 256) / 32", n + 1)
+        d = []
+        deq(d)
+        for s_ in d:
+            I(s_, n + 1)
+        for i in range(16):
+            I(f"wq{i} = h2_pack(dw{2 * i}, dw{2 * i + 1})", n + 1)
+        I("}", n)
+    def tile_store(n):
+        for pa in range(BM // 64):
+            I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", n)
+            I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", n)
         for v in range(4):
-            for e in range(4):
-                I(f"xf{4 * v + e}_{pa}<Float32> = ld_v4_f32(xa{pa} + {16 * v}, {e})", 3)
-        for i in range(8):
-            I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", 3)
+            I(f"st_shared_v4_u32(bso + {16 * v}, wq{4 * v}, wq{4 * v + 1}, wq{4 * v + 2}, wq{4 * v + 3})", n)
+    if PF:
+        # register prefetch: the next tile's global loads + dequant are issued before this tile's MMAs
+        for pa in range(BM // 64):
+            for i in range(8):
+                I(f"xu{i}_{pa}<UInt32> = 0 as UInt32")
+        for i in range(16):
+            I(f"wq{i}<UInt32> = 0 as UInt32")
+        I("if (K > 0) {")
+        tile_load("0", 2, False)
+        I("}")
+        tile_store(1)
+        I("kernel_barrier()")
+        I("k0<Int> = 0")
+        I("while (k0 < K) {")
+        I("if (k0 + 64 < K) {", 2)
+        tile_load("k0 + 64", 3, False)
         I("}", 2)
-    for pa in range(BM // 64):
-        I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", 2)
-        I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", 2)
-    for i in range(16):
-        I(f"wq{i}<UInt32> = 0 as UInt32", 2)
-    I("if (nrow < N) {", 2)
-    I("kofs<Int> = k0 + 32 * hf", 3)
-    I("sbi<Int> = kofs / 256", 3)
-    I("sub<Int> = (kofs % 256) / 32", 3)
-    d = []
-    deq(d)
-    for s in d:
-        I(s, 3)
-    for i in range(16):
-        I(f"wq{i} = h2_pack(dw{2 * i}, dw{2 * i + 1})", 3)
-    I("}", 2)
-    for v in range(4):
-        I(f"st_shared_v4_u32(bso + {16 * v}, wq{4 * v}, wq{4 * v + 1}, wq{4 * v + 2}, wq{4 * v + 3})", 2)
-    I("kernel_barrier()", 2)
+    else:
+        I("k0<Int> = 0")
+        I("while (k0 < K) {")
+    if not PF:
+        for pa in range(BM // 64):
+            for i in range(8):
+                I(f"xu{i}_{pa}<UInt32> = 0 as UInt32", 2)
+            I(f"if (arow + {64 * pa} < S) {{", 2)
+            I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + k0 + akq) * 4", 3)
+            for v in range(4):
+                for e in range(4):
+                    I(f"xf{4 * v + e}_{pa}<Float32> = ld_v4_f32(xa{pa} + {16 * v}, {e})", 3)
+            for i in range(8):
+                I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", 3)
+            I("}", 2)
+        for pa in range(BM // 64):
+            I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", 2)
+            I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", 2)
+        for i in range(16):
+            I(f"wq{i}<UInt32> = 0 as UInt32", 2)
+        I("if (nrow < N) {", 2)
+        I("kofs<Int> = k0 + 32 * hf", 3)
+        I("sbi<Int> = kofs / 256", 3)
+        I("sub<Int> = (kofs % 256) / 32", 3)
+        d = []
+        deq(d)
+        for s in d:
+            I(s, 3)
+        for i in range(16):
+            I(f"wq{i} = h2_pack(dw{2 * i}, dw{2 * i + 1})", 3)
+        I("}", 2)
+        for v in range(4):
+            I(f"st_shared_v4_u32(bso + {16 * v}, wq{4 * v}, wq{4 * v + 1}, wq{4 * v + 2}, wq{4 * v + 3})", 2)
+    if not PF:
+        I("kernel_barrier()", 2)
     for kk in range(4):
         for mi in range(MI):
             base = f"fa + {mi * 16 * 144 + kk * 32}"
@@ -171,6 +271,11 @@ def gen(name, deq, rowbytes, BM=64):
                 for e in range(4):
                     I(f"c{mi}{ni}{e} = n{mi}{ni}{e}_{kk}", 2)
     I("kernel_barrier()", 2)
+    if PF:
+        I("if (k0 + 64 < K) {", 2)
+        tile_store(3)
+        I("}", 2)
+        I("kernel_barrier()", 2)
     I("k0 = k0 + 64", 2)
     I("}")
     for mi in range(MI):
@@ -241,13 +346,20 @@ def gen_delta_seq():
     return "\n".join(o)
 
 
+VDEQ["iq2s"] = deq_iq2s_v
+VDEQ["iq3s"] = deq_iq3s_v
+
+
 if __name__ == "__main__":
     BM = 128 if "--bm128" in sys.argv else 64
     names = [a for a in sys.argv[1:] if not a.startswith("-")] or list(TYPES)
     out = ["# GENERATED by native/tools/gen_rpf.py -- tensor-core GEMMs over packed GGUF weights (Ridge batched prefill).",
            "# " + __doc__.strip().replace("\n", "\n# "), "import vmath::{vexp}", ""]
     for n in names:
-        out.append(gen(n, *TYPES[n], BM=BM))
+        dq, rbx = TYPES[n]
+        if "--vdeq" in sys.argv and n in VDEQ:
+            dq = VDEQ[n]
+        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv))
         out.append("")
     if "--ds" in sys.argv or not names or not [a for a in sys.argv[1:] if not a.startswith("-")]:
         out.append(gen_delta_seq())
