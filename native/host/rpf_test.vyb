@@ -224,7 +224,12 @@ main()<Int> -> {
         ctx<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
     }
-    mg<Int> = load_mod("native/build/rpf_gemm.ptx")
+    // VYB_BM=128: the 128-token tile GEMMs (gen_rpf.py --bm128 -> rpf_gemm128)
+    BMt<Int> = 64
+    if ((env_get("VYB_BM") else "") == "128") { BMt = 128 }
+    gpx<String> = "native/build/rpf_gemm.ptx"
+    if (BMt == 128) { gpx = "native/build/rpf_gemm128.ptx" }
+    mg<Int> = load_mod(gpx)
     mp<Int> = load_mod("native/build/rpf.ptx")
     mq3<Int> = load_mod("native/build/qwen3.ptx")
     mrg<Int> = load_mod("native/build/rgemv.ptx")
@@ -252,7 +257,7 @@ main()<Int> -> {
     PB<Int> = dalloc(4096) ; OUT<Int> = dalloc(64)
     put_i(PB, 0, X) ; put_i(PB, 8, S * K) ; put_i(PB, 16, 7) ; put_f(PB, 24, 1.0)
     lk(hf, (S * K + 255) / 256, 256, PB)
-    NMT<Int> = (S + 63) / 64
+    NMT<Int> = (S + BMt - 1) / BMt
     PG<Int> = PB + 256
     put_i(PG, 0, WB) ; put_i(PG, 8, X) ; put_i(PG, 16, Y1) ; put_i(PG, 24, S) ; put_i(PG, 32, N) ; put_i(PG, 40, K)
     put_i(PG, 48, N) ; put_i(PG, 56, 0) ; put_i(PG, 64, GR) ; put_i(PG, 72, NMT)

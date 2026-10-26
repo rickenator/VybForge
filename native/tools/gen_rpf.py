@@ -2,7 +2,7 @@
 """Generate native/kernels/rpf_gemm.vyb: tiled tensor-core GEMMs that read packed GGUF weights in
 place (batched prefill).  Y[m, n] (f64, row stride LDY) = RS[m, n] + sum_k X[m, k] * W[n, k]
 X: f32 [S][K] (16-byte aligned rows), W: packed rows of type T (Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S).
-Tile 64 tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
+Tile 64 (--bm128: 128) tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
 32x32 via mma.m16n8k16 (f16 in, f32 accumulate).  Shared: A [64][72] halves @0, B [128][72] @9216.
 Params: W@0 X@8 Y@16 S@24 N@32 K@40 LDY@48 RS@56 G@64 NMT@72.  Grid = NMT * ceil(N/128), block 256.
 Compile: vyb --kernel --gpu sm_80 --kernel-shared 27648 (ursela/gpu-features compiler)."""
@@ -100,37 +100,41 @@ TYPES = {
     "iq3s": (deq_iq3s, "(K / 256) * 110"),
 }
 
-def gen(name, deq, rowbytes):
+def gen(name, deq, rowbytes, BM=64):
+    MI = BM // 32
+    BOFF = BM * 144
     o = []
     I = lambda s, n=1: o.append("    " * n + s)
     o.append(f"gemm_{name}(p<Int>) -> {{")
     for nm, off in [("W", 0), ("X", 8), ("Y", 16), ("S", 24), ("N", 32), ("K", 40), ("LDY", 48), ("RS", 56), ("G", 64), ("NMT", 72)]:
         I(f"{nm}<Int> = ld_i64(p + {off})")
     for s in ["tid<Int> = tid_x()", "lane<Int> = tid % 32", "wp<Int> = tid / 32", "wm<Int> = wp / 4", "wn<Int> = wp % 4",
-              "g<Int> = lane / 4", "t4<Int> = lane % 4", "bid<Int> = blk_x()", "m0<Int> = (bid % NMT) * 64",
+              "g<Int> = lane / 4", "t4<Int> = lane % 4", "bid<Int> = blk_x()", f"m0<Int> = (bid % NMT) * {BM}",
               "n0<Int> = (bid / NMT) * 128", "ar<Int> = tid / 4", "akq<Int> = (tid % 4) * 16", "arow<Int> = m0 + ar",
               "nl<Int> = tid / 2", "hf<Int> = tid % 2", "nrow<Int> = n0 + nl", f"rb<Int> = W + nrow * {rowbytes}",
-              "aso<Int> = ar * 144 + akq * 2", "bso<Int> = 9216 + nl * 144 + hf * 64",
-              "fa<Int> = (wm * 32 + g) * 144 + t4 * 4", "fb<Int> = 9216 + (wn * 32 + g) * 144 + t4 * 4"]:
+              "aso<Int> = ar * 144 + akq * 2", f"bso<Int> = {BOFF} + nl * 144 + hf * 64",
+              f"fa<Int> = (wm * {BM // 2} + g) * 144 + t4 * 4", f"fb<Int> = {BOFF} + (wn * 32 + g) * 144 + t4 * 4"]:
         I(s)
-    for mi in range(2):
+    for mi in range(MI):
         for ni in range(4):
             for e in range(4):
                 I(f"c{mi}{ni}{e}<Float32> = 0.0")
     I("k0<Int> = 0")
     I("while (k0 < K) {")
-    for i in range(8):
-        I(f"xu{i}<UInt32> = 0 as UInt32", 2)
-    I("if (arow < S) {", 2)
-    I("xa<Int> = X + (arow * K + k0 + akq) * 4", 3)
-    for v in range(4):
-        for e in range(4):
-            I(f"xf{4 * v + e}<Float32> = ld_v4_f32(xa + {16 * v}, {e})", 3)
-    for i in range(8):
-        I(f"xu{i} = h2_pack(xf{2 * i}, xf{2 * i + 1})", 3)
-    I("}", 2)
-    I("st_shared_v4_u32(aso, xu0, xu1, xu2, xu3)", 2)
-    I("st_shared_v4_u32(aso + 16, xu4, xu5, xu6, xu7)", 2)
+    for pa in range(BM // 64):
+        for i in range(8):
+            I(f"xu{i}_{pa}<UInt32> = 0 as UInt32", 2)
+        I(f"if (arow + {64 * pa} < S) {{", 2)
+        I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + k0 + akq) * 4", 3)
+        for v in range(4):
+            for e in range(4):
+                I(f"xf{4 * v + e}_{pa}<Float32> = ld_v4_f32(xa{pa} + {16 * v}, {e})", 3)
+        for i in range(8):
+            I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", 3)
+        I("}", 2)
+    for pa in range(BM // 64):
+        I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", 2)
+        I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", 2)
     for i in range(16):
         I(f"wq{i}<UInt32> = 0 as UInt32", 2)
     I("if (nrow < N) {", 2)
@@ -148,7 +152,7 @@ def gen(name, deq, rowbytes):
         I(f"st_shared_v4_u32(bso + {16 * v}, wq{4 * v}, wq{4 * v + 1}, wq{4 * v + 2}, wq{4 * v + 3})", 2)
     I("kernel_barrier()", 2)
     for kk in range(4):
-        for mi in range(2):
+        for mi in range(MI):
             base = f"fa + {mi * 16 * 144 + kk * 32}"
             I(f"a{mi}0_{kk}<UInt32> = ld_shared_u32({base})", 2)
             I(f"a{mi}1_{kk}<UInt32> = ld_shared_u32({base} + {8 * 144})", 2)
@@ -158,7 +162,7 @@ def gen(name, deq, rowbytes):
             base = f"fb + {ni * 8 * 144 + kk * 32}"
             I(f"b{ni}0_{kk}<UInt32> = ld_shared_u32({base})", 2)
             I(f"b{ni}1_{kk}<UInt32> = ld_shared_u32({base} + 16)", 2)
-        for mi in range(2):
+        for mi in range(MI):
             for ni in range(4):
                 c = [f"c{mi}{ni}{e}" for e in range(4)]
                 args = f"a{mi}0_{kk}, a{mi}1_{kk}, a{mi}2_{kk}, a{mi}3_{kk}, b{ni}0_{kk}, b{ni}1_{kk}, {', '.join(c)}"
@@ -169,9 +173,9 @@ def gen(name, deq, rowbytes):
     I("kernel_barrier()", 2)
     I("k0 = k0 + 64", 2)
     I("}")
-    for mi in range(2):
+    for mi in range(MI):
         for hh in range(2):
-            I(f"r{mi}{hh}<Int> = m0 + wm * 32 + {mi * 16 + hh * 8} + g")
+            I(f"r{mi}{hh}<Int> = m0 + wm * {BM // 2} + {mi * 16 + hh * 8} + g")
             I(f"if (r{mi}{hh} < S) {{")
             for ni in range(4):
                 for e in range(2):
@@ -238,13 +242,14 @@ def gen_delta_seq():
 
 
 if __name__ == "__main__":
+    BM = 128 if "--bm128" in sys.argv else 64
     names = [a for a in sys.argv[1:] if not a.startswith("-")] or list(TYPES)
     out = ["# GENERATED by native/tools/gen_rpf.py -- tensor-core GEMMs over packed GGUF weights (Ridge batched prefill).",
            "# " + __doc__.strip().replace("\n", "\n# "), "import vmath::{vexp}", ""]
     for n in names:
-        out.append(gen(n, *TYPES[n]))
+        out.append(gen(n, *TYPES[n], BM=BM))
         out.append("")
-    if "--ds" in sys.argv or not sys.argv[1:]:
+    if "--ds" in sys.argv or not names or not [a for a in sys.argv[1:] if not a.startswith("-")]:
         out.append(gen_delta_seq())
         out.append("")
     print("\n".join(out))
