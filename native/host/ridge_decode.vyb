@@ -867,7 +867,9 @@ main()<Int> -> {
         QGb<Int> = dalloc(S * 2 * NQ * 8) ; QBb<Int> = dalloc(S * NQ * 8) ; GTb<Int> = dalloc(S * NQ * 8) ; KRb<Int> = dalloc(S * NKV * 8)
         QNMb<Int> = dalloc(S * NQ * 8) ; KNMb<Int> = dalloc(S * NKV * 8) ; QRb<Int> = dalloc(S * NQ * 8) ; CTXb<Int> = dalloc(S * NQ * 8)
         GDb<Int> = dalloc(S * NQ * 8)
-        GRb = dalloc(S * FF * 8) ; UPb = dalloc(S * FF * 8) ; H32b = dalloc(S * FF * 4)
+        GUB<Int> = 8
+        if (GLDY < 0) { GUB = 4 }
+        GRb = dalloc(S * FF * GUB) ; UPb = dalloc(S * FF * GUB) ; H32b = dalloc(S * FF * 4)
         XN16b = XN32b ; E16b = E32b ; H16b = H32b ; E32o = E32b
         if (XHM == 1) { XN16b = dalloc(S * D * 2) ; E16b = dalloc(S * NQ * 2) ; H16b = dalloc(S * FF * 2) }
         if (H32b == 0 || GRb == 0 || UPb == 0) { println("ERR alloc prefill buffers") ; return 25 }
