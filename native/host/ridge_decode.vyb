@@ -359,7 +359,7 @@ main()<Int> -> {
     if ((env_get("VYB_ACX") else "") == "0") { ACX = 0 }
     mrax<Int> = load_mod("native/build/rattn.ptx")
     if (mrax == 0) { println("ERR load rattn") ; return 1 }
-    hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx")
+    hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx") ; hrxw<Int> = get_fn(mrax, "rax_w") ; hrcw<Int> = get_fn(mrax, "rax_cw")
     RXM<Int> = dalloc(4096)
     hs32<Int> = get_fn(mlay, "silu32") ; hc32<Int> = get_fn(mlay, "cast32")
     hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
@@ -1098,7 +1098,8 @@ main()<Int> -> {
                     lk4(hrxm, 1, 32, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrxe, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrxs, 1, 32, pb + 8 * 256, RXM, 0, 0)
-                    lk4(hrxc, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxw, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrcw, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                 } else { lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256) }
                 lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
                 lk(hc32, (NQ + 255) / 256, 256, pb + 10 * 256)

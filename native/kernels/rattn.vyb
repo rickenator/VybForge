@@ -61,6 +61,51 @@ rax_sum(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     }
 }
 
+// w = e / ssum in place (same expression as attn_cx's per-lane w)
+rax_w(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        gsh<Int> = gid / T
+        ssum<Float> = ld_f64(M + gsh * 16 + 8)
+        a<Int> = SC + gid * 8
+        st_f64(a, ld_f64(a) / ssum)
+    }
+}
+
+// SC holds w already (rax_w)
+rax_cw(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        sb<Int> = SC + (s * H + h) * T * 8
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            acc = acc + ld_f64(sb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
 rax_cx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     V<Int> = ld_i64(p + 96)
     Ctx<Int> = ld_i64(p + 104)
