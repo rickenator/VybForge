@@ -439,6 +439,7 @@ main()<Int> -> {
     hdst<Int> = 0
     htr<Int> = 0
     GDN32<Int> = 0
+    DSP<Int> = 0 ; DSPT<Int> = 256 ; DSPG<Int> = 32
     if ((env_get("VYB_DST") else "1") != "0") {
         mdt<Int> = load_mod("native/build/rdelta.ptx")
         if (mdt == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
@@ -450,6 +451,39 @@ main()<Int> -> {
             if (hdst == 0 || htr == 0) { println("ERR rdelta f32 kernels") ; return 1 }
             GDN32 = 1
             println("GDN_STATE f32 (VYB_GDN32)")
+        }
+        if ((env_get("VYB_DSP") else "") == "1") {
+            // parallel state update (rdelta2, gen_rdelta2.py): Hv*S/32 blocks, NW warps split the i loop; not bit-exact
+            mdp<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdp == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdp, "delta_step_p32") } else { hdst = get_fn(mdp, "delta_step_p") }
+            dpw<String> = env_get("VYB_DSPNW") else "8"
+            DSPT = 32 * parse_u(dpw, 0, dpw.len())
+            DSP = 1
+            println("GDN_STEP delta_step_p tpb=" + DSPT.to_string())
+        }
+        if ((env_get("VYB_DSU") else "") == "1") {
+            // delta_step_t with batched state loads (bit-identical in f64)
+            mdu<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdu == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdu, "delta_step_u32") } else { hdst = get_fn(mdu, "delta_step_u") }
+            if (hdst == 0) { println("ERR delta_step_u") ; return 1 }
+            println("GDN_STEP delta_step_u")
+        }
+        if ((env_get("VYB_DSV") else "") == "1") {
+            // delta_step_u work split JB columns per block (grid Hv*S/JB); bit-identical in f64
+            mdv<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdv == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdv, "delta_step_v32") } else { hdst = get_fn(mdv, "delta_step_v") }
+            if ((env_get("VYB_DSW") else "") == "1") {
+                if (GDN32 == 1) { hdst = get_fn(mdv, "delta_step_w32") } else { hdst = get_fn(mdv, "delta_step_w") }
+            }
+            if (hdst == 0) { println("ERR delta_step_v") ; return 1 }
+            djb<String> = env_get("VYB_DSVJB") else "32"
+            DSPG = parse_u(djb, 0, djb.len())
+            DSPT = DSPG
+            DSP = 1
+            println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
         }
     }
     dsfs<String> = env_get("VYB_DSF") else "1"
@@ -915,7 +949,7 @@ main()<Int> -> {
                 if (RK2 >= 1) {
                     if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
                         lk(hl2b, 2 * HK, SS, pb + 20 * 256)
-                        if (DST == 1) { lk(hdst, HV, SS, pb + 12 * 256) } else { if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) } }
+                        if (DST == 1) { if (DSP == 1) { lk(hdst, HV * SS / DSPG, DSPT, pb + 12 * 256) } else { lk(hdst, HV, SS, pb + 12 * 256) } } else { if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) } }
                         lk(hngb, HV, SS, pb + 13 * 256)
                     }
                 } else {
