@@ -305,3 +305,65 @@ st_tr(src<Int>, dst<Int>, S<Int>, n<Int>) -> {
         st_f64(dst + (hh * ss + ii * S + jj) * 8, ld_f64(src + e * 8))
     }
 }
+
+// delta_step_t32: delta_step_t with the column-major GDN state stored as f32 (VYB_GDN32=1). Same f64
+// arithmetic and order; only the state loads/stores round to f32, so the state traffic per token halves.
+delta_step_t32(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    if (j < S) {
+        st_shared_f64(j, ld_f64(Kp + (j + S * hk) * 8))
+        st_shared_f64(256 + j, ld_f64(Q + (j + S * hk) * 8))
+    }
+    kernel_barrier()
+    if (j < S) {
+        gexp<Float> = vexp(ld_f64(G + h * 8))
+        be<Float> = ld_f64(BE + h * 8)
+        kq<Float> = 0.0
+        i<Int> = 0
+        for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+        rw<Int> = SIN + (S * S * h + j) * 4
+        st4<Int> = S * 4
+        acc<Float> = 0.0
+        acq<Float> = 0.0
+        i = 0
+        for (i in 0..S - 1) {
+            sv<Float> = (ld_f32(rw + i * st4) as Float)
+            acc = acc + sv * ld_shared_f64(i)
+            acq = acq + sv * ld_shared_f64(256 + i)
+        }
+        del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+        st_f64(OUT + (j + S * h) * 8, sc * (gexp * acq + del * kq))
+        ww<Int> = SOUT + (S * S * h + j) * 4
+        i = 0
+        for (i in 0..S - 1) {
+            sv3<Float> = (ld_f32(rw + i * st4) as Float)
+            st_f32(ww + i * st4, ((gexp * sv3 + del * ld_shared_f64(i)) as Float32))
+        }
+    }
+}
+
+// st_tr32: st_tr writing an f32 destination (n f64 in, n f32 out).
+st_tr32(src<Int>, dst<Int>, S<Int>, n<Int>) -> {
+    e<Int> = blk_x() * dim_x() + tid_x()
+    if (e < n) {
+        ss<Int> = S * S
+        hh<Int> = e / ss
+        r<Int> = e % ss
+        jj<Int> = r / S
+        ii<Int> = r % S
+        st_f32(dst + (hh * ss + ii * S + jj) * 4, (ld_f64(src + e * 8) as Float32))
+    }
+}

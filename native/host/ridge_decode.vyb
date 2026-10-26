@@ -438,12 +438,19 @@ main()<Int> -> {
     DST<Int> = 0
     hdst<Int> = 0
     htr<Int> = 0
+    GDN32<Int> = 0
     if ((env_get("VYB_DST") else "1") != "0") {
         mdt<Int> = load_mod("native/build/rdelta.ptx")
         if (mdt == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
         hdst = get_fn(mdt, "delta_step_t") ; htr = get_fn(mdt, "st_tr")
         DST = 1
         println("GDN_STATE column-major delta_step_t")
+        if ((env_get("VYB_GDN32") else "") == "1") {
+            hdst = get_fn(mdt, "delta_step_t32") ; htr = get_fn(mdt, "st_tr32")
+            if (hdst == 0 || htr == 0) { println("ERR rdelta f32 kernels") ; return 1 }
+            GDN32 = 1
+            println("GDN_STATE f32 (VYB_GDN32)")
+        }
     }
     dsfs<String> = env_get("VYB_DSF") else "1"
     if (DST == 1) { dsfs = "0" }
@@ -885,7 +892,7 @@ main()<Int> -> {
                 for (L in 0..NL - 1) {
                     if (kind.get(L) == 1) {
                         lk4(htr, (NST + 255) / 256, 256, l5v.get(L), TSCR, SS, NST)
-                        freedom { cuMemcpyDtoD_v2(l5v.get(L), TSCR, NST * 8) }
+                        freedom { cuMemcpyDtoD_v2(l5v.get(L), TSCR, NST * (8 - 4 * GDN32)) }
                     }
                 }
             }
