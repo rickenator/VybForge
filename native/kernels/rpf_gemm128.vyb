@@ -5425,6 +5425,13 @@ gemm_iq2s(p<Int>) -> {
     bso<Int> = 18432 + nl * 144 + hf * 64
     fa<Int> = (wm * 64 + g) * 144 + t4 * 4
     fb<Int> = 18432 + (wn * 32 + g) * 144 + t4 * 4
+    if (tid + 0 < 512) {
+        st_shared_v4_u32(36864 + (tid + 0) * 16, ld_v4_u32(G + (tid + 0) * 16, 0), ld_v4_u32(G + (tid + 0) * 16, 1), ld_v4_u32(G + (tid + 0) * 16, 2), ld_v4_u32(G + (tid + 0) * 16, 3))
+    }
+    if (tid + 256 < 512) {
+        st_shared_v4_u32(36864 + (tid + 256) * 16, ld_v4_u32(G + (tid + 256) * 16, 0), ld_v4_u32(G + (tid + 256) * 16, 1), ld_v4_u32(G + (tid + 256) * 16, 2), ld_v4_u32(G + (tid + 256) * 16, 3))
+    }
+    kernel_barrier()
     c000<Float32> = 0.0
     c001<Float32> = 0.0
     c002<Float32> = 0.0
@@ -5596,8 +5603,8 @@ gemm_iq2s(p<Int>) -> {
             sw0<UInt32> = (ld_u16(bb + 34 + 4 * sub) as Int) as UInt32
             sw1<UInt32> = (ld_u16(bb + 36 + 4 * sub) as Int) as UInt32
             ix0<Int> = ((qw0 >> 0) & 255) | ((qhb << 8) & 768)
-            ga0<UInt32> = ld_v2_u32(G + ix0 * 8, 0)
-            gb0<UInt32> = ld_v2_u32(G + ix0 * 8, 1)
+            ga0<UInt32> = ld_shared_u32(36864 + ix0 * 8)
+            gb0<UInt32> = ld_shared_u32(36868 + ix0 * 8)
             sg0<UInt32> = sw0 >> 0
             dw0<Float32> = dl0 * ((((ga0 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 0) & 1) as Float32)))
             dw1<Float32> = dl0 * ((((ga0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 1) & 1) as Float32)))
@@ -5608,8 +5615,8 @@ gemm_iq2s(p<Int>) -> {
             dw6<Float32> = dl0 * ((((gb0 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 6) & 1) as Float32)))
             dw7<Float32> = dl0 * ((((gb0 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 7) & 1) as Float32)))
             ix1<Int> = ((qw0 >> 8) & 255) | ((qhb << 6) & 768)
-            ga1<UInt32> = ld_v2_u32(G + ix1 * 8, 0)
-            gb1<UInt32> = ld_v2_u32(G + ix1 * 8, 1)
+            ga1<UInt32> = ld_shared_u32(36864 + ix1 * 8)
+            gb1<UInt32> = ld_shared_u32(36868 + ix1 * 8)
             sg1<UInt32> = sw0 >> 8
             dw8<Float32> = dl0 * ((((ga1 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 0) & 1) as Float32)))
             dw9<Float32> = dl0 * ((((ga1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 1) & 1) as Float32)))
@@ -5620,8 +5627,8 @@ gemm_iq2s(p<Int>) -> {
             dw14<Float32> = dl0 * ((((gb1 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 6) & 1) as Float32)))
             dw15<Float32> = dl0 * ((((gb1 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 7) & 1) as Float32)))
             ix2<Int> = ((qw1 >> 0) & 255) | ((qhb << 4) & 768)
-            ga2<UInt32> = ld_v2_u32(G + ix2 * 8, 0)
-            gb2<UInt32> = ld_v2_u32(G + ix2 * 8, 1)
+            ga2<UInt32> = ld_shared_u32(36864 + ix2 * 8)
+            gb2<UInt32> = ld_shared_u32(36868 + ix2 * 8)
             sg2<UInt32> = sw1 >> 0
             dw16<Float32> = dl1 * ((((ga2 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 0) & 1) as Float32)))
             dw17<Float32> = dl1 * ((((ga2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 1) & 1) as Float32)))
@@ -5632,8 +5639,8 @@ gemm_iq2s(p<Int>) -> {
             dw22<Float32> = dl1 * ((((gb2 >> 16) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 6) & 1) as Float32)))
             dw23<Float32> = dl1 * ((((gb2 >> 24) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 7) & 1) as Float32)))
             ix3<Int> = ((qw1 >> 8) & 255) | ((qhb << 2) & 768)
-            ga3<UInt32> = ld_v2_u32(G + ix3 * 8, 0)
-            gb3<UInt32> = ld_v2_u32(G + ix3 * 8, 1)
+            ga3<UInt32> = ld_shared_u32(36864 + ix3 * 8)
+            gb3<UInt32> = ld_shared_u32(36868 + ix3 * 8)
             sg3<UInt32> = sw1 >> 8
             dw24<Float32> = dl1 * ((((ga3 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 0) & 1) as Float32)))
             dw25<Float32> = dl1 * ((((ga3 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 1) & 1) as Float32)))
@@ -6782,6 +6789,10 @@ gemm_iq3s(p<Int>) -> {
     bso<Int> = 18432 + nl * 144 + hf * 64
     fa<Int> = (wm * 64 + g) * 144 + t4 * 4
     fb<Int> = 18432 + (wn * 32 + g) * 144 + t4 * 4
+    if (tid + 0 < 128) {
+        st_shared_v4_u32(36864 + (tid + 0) * 16, ld_v4_u32(G + (tid + 0) * 16, 0), ld_v4_u32(G + (tid + 0) * 16, 1), ld_v4_u32(G + (tid + 0) * 16, 2), ld_v4_u32(G + (tid + 0) * 16, 3))
+    }
+    kernel_barrier()
     c000<Float32> = 0.0
     c001<Float32> = 0.0
     c002<Float32> = 0.0
@@ -6952,8 +6963,8 @@ gemm_iq3s(p<Int>) -> {
             qp0<Int> = ld_u16(bb + 2 + 8 * sub + 0) as Int
             ia0<Int> = (qp0 & 255) | ((qhb << 8) & 256)
             ib0<Int> = ((qp0 >> 8) & 255) | ((qhb << 7) & 256)
-            ga0<UInt32> = ld_u32(G + ia0 * 4)
-            gb0<UInt32> = ld_u32(G + ib0 * 4)
+            ga0<UInt32> = ld_shared_u32(36864 + ia0 * 4)
+            gb0<UInt32> = ld_shared_u32(36864 + ib0 * 4)
             sg0<UInt32> = sw0 >> 0
             dw0<Float32> = db * ((((ga0 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 0) & 1) as Float32)))
             dw1<Float32> = db * ((((ga0 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg0 >> 1) & 1) as Float32)))
@@ -6966,8 +6977,8 @@ gemm_iq3s(p<Int>) -> {
             qp1<Int> = ld_u16(bb + 2 + 8 * sub + 2) as Int
             ia1<Int> = (qp1 & 255) | ((qhb << 6) & 256)
             ib1<Int> = ((qp1 >> 8) & 255) | ((qhb << 5) & 256)
-            ga1<UInt32> = ld_u32(G + ia1 * 4)
-            gb1<UInt32> = ld_u32(G + ib1 * 4)
+            ga1<UInt32> = ld_shared_u32(36864 + ia1 * 4)
+            gb1<UInt32> = ld_shared_u32(36864 + ib1 * 4)
             sg1<UInt32> = sw0 >> 8
             dw8<Float32> = db * ((((ga1 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 0) & 1) as Float32)))
             dw9<Float32> = db * ((((ga1 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg1 >> 1) & 1) as Float32)))
@@ -6980,8 +6991,8 @@ gemm_iq3s(p<Int>) -> {
             qp2<Int> = ld_u16(bb + 2 + 8 * sub + 4) as Int
             ia2<Int> = (qp2 & 255) | ((qhb << 4) & 256)
             ib2<Int> = ((qp2 >> 8) & 255) | ((qhb << 3) & 256)
-            ga2<UInt32> = ld_u32(G + ia2 * 4)
-            gb2<UInt32> = ld_u32(G + ib2 * 4)
+            ga2<UInt32> = ld_shared_u32(36864 + ia2 * 4)
+            gb2<UInt32> = ld_shared_u32(36864 + ib2 * 4)
             sg2<UInt32> = sw1 >> 0
             dw16<Float32> = db * ((((ga2 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 0) & 1) as Float32)))
             dw17<Float32> = db * ((((ga2 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg2 >> 1) & 1) as Float32)))
@@ -6994,8 +7005,8 @@ gemm_iq3s(p<Int>) -> {
             qp3<Int> = ld_u16(bb + 2 + 8 * sub + 6) as Int
             ia3<Int> = (qp3 & 255) | ((qhb << 2) & 256)
             ib3<Int> = ((qp3 >> 8) & 255) | ((qhb << 1) & 256)
-            ga3<UInt32> = ld_u32(G + ia3 * 4)
-            gb3<UInt32> = ld_u32(G + ib3 * 4)
+            ga3<UInt32> = ld_shared_u32(36864 + ia3 * 4)
+            gb3<UInt32> = ld_shared_u32(36864 + ib3 * 4)
             sg3<UInt32> = sw1 >> 8
             dw24<Float32> = db * ((((ga3 >> 0) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 0) & 1) as Float32)))
             dw25<Float32> = db * ((((ga3 >> 8) & 255) as Float32) * ((1.0 as Float32) - (2.0 as Float32) * (((sg3 >> 1) & 1) as Float32)))

@@ -5,7 +5,9 @@ X: f32 [S][K] (16-byte aligned rows), W: packed rows of type T (Q4_K/Q5_K/Q6_K/Q
 Tile 64 (--bm128: 128) tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
 32x32 via mma.m16n8k16 (f16 in, f32 accumulate).  Shared: A [64][72] halves @0, B [128][72] @9216.
 Params: W@0 X@8 Y@16 S@24 N@32 K@40 LDY@48 RS@56 G@64 NMT@72.  Grid = NMT * ceil(N/128), block 256.
-Compile: vyb --kernel --gpu sm_80 --kernel-shared 27648 (ursela/gpu-features compiler)."""
+Compile: vyb --kernel --gpu sm_80 --kernel-shared 27648 (ursela/gpu-features compiler).
+--bm128 --vdeq --gsh (rpf_gemm128, the default IQ prefill tiles): --kernel-shared 45056 (A+B tiles + 8 KB IQ grid)."""
+import re
 import sys
 
 def deq_q4k(o, q5=False):
@@ -148,7 +150,7 @@ TYPES = {
 VDEQ = {"iq2s": None, "iq3s": None}  # filled below (--vdeq: vsub4 sign-folded IQ dequant)
 
 
-def gen(name, deq, rowbytes, BM=64, PF=False):
+def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False):
     MI = BM // 32
     BOFF = BM * 144
     o = []
@@ -163,6 +165,23 @@ def gen(name, deq, rowbytes, BM=64, PF=False):
               "aso<Int> = ar * 144 + akq * 2", f"bso<Int> = {BOFF} + nl * 144 + hf * 64",
               f"fa<Int> = (wm * {BM // 2} + g) * 144 + t4 * 4", f"fb<Int> = {BOFF} + (wn * 32 + g) * 144 + t4 * 4"]:
         I(s)
+    GB = {"iq2s": 8192, "iq3s": 2048}.get(name, 0) if GSH else 0
+    GOFF = BOFF + 128 * 144
+    if GB:
+        # --gsh: copy the IQ grid table (GB bytes) into shared memory after the A/B tiles and read it there
+        for c in range(0, GB // 16, 256):
+            I(f"if (tid + {c} < {GB // 16}) {{")
+            I(f"st_shared_v4_u32({GOFF} + (tid + {c}) * 16, ld_v4_u32(G + (tid + {c}) * 16, 0), ld_v4_u32(G + (tid + {c}) * 16, 1), ld_v4_u32(G + (tid + {c}) * 16, 2), ld_v4_u32(G + (tid + {c}) * 16, 3))", 2)
+            I("}")
+        I("kernel_barrier()")
+        deq0 = deq
+        def deq(d):
+            t = []
+            deq0(t)
+            t = [re.sub(r"ld_v2_u32\(G \+ (\w+) \* 8, 0\)", lambda m: f"ld_shared_u32({GOFF} + {m.group(1)} * 8)", x) for x in t]
+            t = [re.sub(r"ld_v2_u32\(G \+ (\w+) \* 8, 1\)", lambda m: f"ld_shared_u32({GOFF + 4} + {m.group(1)} * 8)", x) for x in t]
+            t = [re.sub(r"ld_u32\(G \+ (\w+) \* 4\)", lambda m: f"ld_shared_u32({GOFF} + {m.group(1)} * 4)", x) for x in t]
+            d.extend(t)
     for mi in range(MI):
         for ni in range(4):
             for e in range(4):
@@ -359,7 +378,7 @@ if __name__ == "__main__":
         dq, rbx = TYPES[n]
         if "--vdeq" in sys.argv and n in VDEQ:
             dq = VDEQ[n]
-        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv))
+        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv, GSH="--gsh" in sys.argv))
         out.append("")
     if "--ds" in sys.argv or not names or not [a for a in sys.argv[1:] if not a.startswith("-")]:
         out.append(gen_delta_seq())
