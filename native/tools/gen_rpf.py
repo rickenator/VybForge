@@ -151,7 +151,9 @@ TYPES = {
 VDEQ = {"iq2s": None, "iq3s": None}  # filled below (--vdeq: vsub4 sign-folded IQ dequant)
 
 
-def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
+# --cpa (with --xh, needs vyb-wt cp_async_*): cp.async f16 A tile; bit-identical but slower (578 vs 620 tok/s pp512;
+# single-buffered, no static-shared room for a 2nd 128-row A tile). Not used by default.
+def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False, CPA=False):
     MI = BM // 32
     BOFF = BM * 144
     o = []
@@ -237,9 +239,26 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
         tile_load("k0 + 64", 3, False)
         I("}", 2)
     else:
+        if CPA:
+            # --cpa (with --xh): the f16 A tile is copied global->shared with cp.async (no registers, no st.shared);
+            # rows >= S are zeroed once (never overwritten), the next k-tile's copy is issued right after the
+            # post-MMA barrier so it overlaps the next B dequant. Same bytes in shared -> bit-identical.
+            for pa in range(BM // 64):
+                I(f"if (arow + {64 * pa} >= S) {{")
+                z = "0 as UInt32"
+                I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, {z}, {z}, {z}, {z})", 2)
+                I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, {z}, {z}, {z}, {z})", 2)
+                I("} else {")
+                I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + akq) * 2", 2)
+                I(f"cp_async_16(aso + {64 * 144 * pa}, xa{pa})", 2)
+                I(f"cp_async_16(aso + {64 * 144 * pa + 16}, xa{pa} + 16)", 2)
+                I("}")
+            I("cp_async_commit()")
         I("k0<Int> = 0")
         I("while (k0 < K) {")
-    if not PF and XH:
+    if CPA:
+        pass
+    elif not PF and XH:
         # --xh: X is f16 [S][K] (converted once by cvt_h): two 16-byte loads straight into the A fragment words
         for pa in range(BM // 64):
             for i in range(8):
@@ -262,7 +281,7 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
                 I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", 3)
             I("}", 2)
     if not PF:
-        for pa in range(BM // 64):
+        for pa in range(BM // 64 if not CPA else 0):
             I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", 2)
             I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", 2)
         for i in range(16):
@@ -281,6 +300,8 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
         for v in range(4):
             I(f"st_shared_v4_u32(bso + {16 * v}, wq{4 * v}, wq{4 * v + 1}, wq{4 * v + 2}, wq{4 * v + 3})", 2)
     if not PF:
+        if CPA:
+            I("cp_async_wait(0)", 2)
         I("kernel_barrier()", 2)
     for kk in range(4):
         for mi in range(MI):
@@ -302,6 +323,16 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
                 for e in range(4):
                     I(f"c{mi}{ni}{e} = n{mi}{ni}{e}_{kk}", 2)
     I("kernel_barrier()", 2)
+    if CPA:
+        I("if (k0 + 64 < K) {", 2)
+        for pa in range(BM // 64):
+            I(f"if (arow + {64 * pa} < S) {{", 3)
+            I(f"xn{pa}<Int> = X + ((arow + {64 * pa}) * K + k0 + 64 + akq) * 2", 4)
+            I(f"cp_async_16(aso + {64 * 144 * pa}, xn{pa})", 4)
+            I(f"cp_async_16(aso + {64 * 144 * pa + 16}, xn{pa} + 16)", 4)
+            I("}", 3)
+        I("cp_async_commit()", 3)
+        I("}", 2)
     if PF:
         I("if (k0 + 64 < K) {", 2)
         tile_store(3)
@@ -395,7 +426,8 @@ if __name__ == "__main__":
         dq, rbx = TYPES[n]
         if "--vdeq" in sys.argv and n in VDEQ:
             dq = VDEQ[n]
-        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv, GSH="--gsh" in sys.argv, XH="--xh" in sys.argv))
+        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv, GSH="--gsh" in sys.argv, XH="--xh" in sys.argv,
+                       CPA="--cpa" in sys.argv and "--xh" in sys.argv and "--pf" not in sys.argv))
         out.append("")
     if "--xh" in sys.argv:
         out += ["// cvt_h: f32 -> f16 copy of a GEMM activation (once per producer, not once per N tile)",
