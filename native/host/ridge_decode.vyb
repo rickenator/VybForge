@@ -377,6 +377,25 @@ main()<Int> -> {
             hi3f = get_fn(mr4, "gemv_iq3s_f")
             if (hi2f != 0 && hi3f != 0) { FUS = 1 }
         }
+        // VYB_RGMAP=1: llama.cpp-style lane map (gen_rgemv6.py: one ib32 per lane, 4 super-blocks per warp
+        // trip, 16-bit raw loads). NOT bit-identical to the default; validated by greedy match + KLD.
+        if ((env_get("VYB_RGMAP") else "") == "1") {
+            m6<Int> = load_mod(env_get("VYB_RG6PTX") else "native/build/rgemv6.ptx")
+            if (m6 == 0) { println("ERR load rgemv6") ; return 1 }
+            hi2 = get_fn(m6, "gemv_iq2s_m")
+            hi3 = get_fn(m6, "gemv_iq3s_m")
+            rg6t<String> = env_get("VYB_RG6TPB") else "512"
+            ITH = parse_u(rg6t, 0, rg6t.len())
+            RK2 = 1
+            rg6w<String> = env_get("VYB_RG6WPR") else "1"
+            IRB = ITH / 32 / parse_u(rg6w, 0, rg6w.len())
+            FUS = 0
+            rgp = "rgemv6(map)"
+            if ((env_get("VYB_RG6PERM") else "1") == "1") {
+                hxp = get_fn(m6, "xperm6")
+                if (hxp != 0) { XPM = 1 ; rgp = "rgemv6(map,perm)" }
+            }
+        }
         println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string())
     }
     // VYB_Q4KPTX=native/build/rq4k.ptx (gen_rq4k.py R D): decode Q4_K GEMV gemv_q4k_v (M=1, vector x
