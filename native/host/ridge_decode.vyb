@@ -231,8 +231,8 @@ gemv_h(ty<Int>, hq4<Int>, hq6<Int>, hq5<Int>, hq8<Int>, hi2<Int>, hi3<Int>)<Int>
     if (ty == 21) { return hi3 }
     return 0
 }
-gemv_g(ty<Int>, N<Int>, rk2<Int>)<Int> -> {
-    if (ty == 12) { return (N + 31) / 32 }
+gemv_g(ty<Int>, N<Int>, rk2<Int>, q4g<Int>)<Int> -> {
+    if (ty == 12) { return (N + q4g - 1) / q4g }
     if (ty == 14) { return (N + 31) / 32 }
     if (rk2 >= 1) {
         if (ty == 22) { return (N + 16 * rk2 - 1) / (16 * rk2) }
@@ -352,6 +352,19 @@ main()<Int> -> {
             hxp = get_fn(mr4, "xperm")
         }
         println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string())
+    }
+    // VYB_Q4KPTX=native/build/rq4k.ptx (gen_rq4k.py R D): decode Q4_K GEMV gemv_q4k_v (M=1, vector x
+    // loads, R rows/warp, D-deep prefetch, shuffle reduction; same arithmetic as qwen3 gemv_q4k, bit-exact).
+    // Default rq4k.ptx = gen_rq4k.py 1 3 (~7% faster in situ). VYB_Q4KPTX=none = qwen3.ptx gemv_q4k.
+    Q4G<Int> = 32
+    q4p<String> = env_get("VYB_Q4KPTX") else "native/build/rq4k.ptx"
+    if (q4p != "none") {
+        mq4v<Int> = load_mod(q4p)
+        if (mq4v == 0) { println("ERR load " + q4p) ; return 1 }
+        hq4 = get_fn(mq4v, "gemv_q4k_v")
+        q4r<String> = env_get("VYB_Q4KR") else "1"
+        Q4G = 16 * parse_u(q4r, 0, q4r.len())
+        println("Q4K_GEMV ptx=" + q4p + " rows_per_block=" + Q4G.to_string())
     }
     // VYB_DSC=1: delta_step_c (4 threads per state row); default delta_step_b (measured faster)
     DSC<Int> = 0
@@ -746,7 +759,7 @@ main()<Int> -> {
             pb<Int> = pbase.get(L)
             lk(hrms, 1, 256, pb)
             if (kind.get(L) == 1) {
-                lk(hq4, (QKV + VAL + 31) / 32, 512, pb + 256)
+                lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256)
                 lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
                 lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
                 lk(hsg, 1, 64, pb + 4 * 256)
@@ -766,7 +779,7 @@ main()<Int> -> {
                     lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
                 }
                 lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
-                lk(hq4, (D + 31) / 32, 512, pb + 15 * 256)
+                lk(hq4, (D + Q4G - 1) / Q4G, 512, pb + 15 * 256)
             } else {
                 a<Int> = aidx.get(L)
                 KC2<Int> = KCv.get(a) ; VC2<Int> = VCv.get(a)
@@ -792,13 +805,13 @@ main()<Int> -> {
             if (XPM == 1) {
                 if (is_iq(tg) + is_iq(tu) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
             }
-            lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF, RK2), 512, pfb + 256)
-            lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, RK2), 512, pfb + 512)
+            lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF, RK2, Q4G), 512, pfb + 256)
+            lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, RK2, Q4G), 512, pfb + 512)
             lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF)
             if (XPM == 1) {
                 if (is_iq(tdn) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
             }
-            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, RK2), 512, pfb + 768)
+            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, RK2, Q4G), 512, pfb + 768)
         }
         }
         if (p >= NP - 1) {
