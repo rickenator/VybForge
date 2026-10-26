@@ -32,6 +32,8 @@ extern "C" {
     cuMemFreeHost(p<Int>)<CInt>
     cuMemcpy(dst<Int>, src<Int>, ByteCount<Int>)<CInt>
     pread(fd<CInt>, buf<Int>, n<Int>, off<Int>)<Int>
+    creat(path<CString>, mode<CInt>)<CInt>
+    write(fd<CInt>, buf<Int>, n<Int>)<Int>
     cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
@@ -808,6 +810,20 @@ main()<Int> -> {
     }
 
     // ---- the token loop ----
+    // Reference checks (KLD vs llama.cpp): VYB_FORCE_IDS feeds these ids instead of the argmax (teacher forcing);
+    // VYB_LOGDUMP=path writes the f64 logits of every emitted position (VOCAB floats each).
+    fstr<String> = env_get("VYB_FORCE_IDS") else ""
+    fv<Vec<Int>> = parse_ids(fstr)
+    ldp<String> = env_get("VYB_LOGDUMP") else ""
+    LFD<CInt> = -1
+    LHB<Int> = 0
+    if (ldp.len() > 0) {
+        freedom {
+            LFD = creat(ldp, 420)
+            cuMemAllocHost_v2(loc(LHB), VOCAB * 8)
+        }
+        if (LFD < 0) { println("ERR open logdump") ; return 1 }
+    }
     gen<Vec<Int>> = Vec()
     cur<Int> = prids.get(0)
     TOTAL<Int> = NP + GEN - 1
@@ -958,6 +974,15 @@ main()<Int> -> {
             }
             gen.push(nid)
             cur = nid
+            if (gen.len() <= fv.len()) { cur = fv.get(gen.len() - 1) }
+            if (LFD >= 0) {
+                wn<Int> = 0
+                freedom {
+                    cuMemcpy(LHB, LOGB, VOCAB * 8)
+                    wn = write(LFD, LHB, VOCAB * 8)
+                }
+                if (wn != VOCAB * 8) { println("ERR logdump write") ; return 1 }
+            }
             if (p == NP - 1) { tpf1 = time_mono_millis() }
             if (p == NP) { tfirst = time_mono_millis() }
             if ((env_get("VYB_TOKTEXT") else "").len() > 0) {
@@ -968,6 +993,7 @@ main()<Int> -> {
         }
     }
     freedom { cuCtxSynchronize() }
+    if (LFD >= 0) { freedom { cuMemFreeHost(LHB) } }
     tend<Int> = time_mono_millis()
     freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
     resp<String> = llm_decode(tok, gen)
