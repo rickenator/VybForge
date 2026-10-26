@@ -569,6 +569,10 @@ main()<Int> -> {
     PB2<Int> = 0 ; XCb<Int> = 0 ; S<Int> = NP
     hpg4<Int> = 0 ; hpg5<Int> = 0 ; hpg6<Int> = 0 ; hpg8<Int> = 0 ; hpgi2<Int> = 0 ; hpgi3<Int> = 0
     hpds<Int> = 0 ; hpag<Int> = 0 ; hpcv<Int> = 0 ; hpcs<Int> = 0 ; hpl2<Int> = 0 ; hpat<Int> = 0
+    // f32-compute chunk kernels (rpf32.vyb; GB10 f64 is slow): default with VYB_PFB, VYB_PFB64=1 = the f64 ones
+    P32<Int> = 1
+    if ((env_get("VYB_PFB64") else "").len() > 0) { P32 = 0 }
+    hng32<Int> = 0 ; hsl32<Int> = 0
     XN32b<Int> = 0 ; GRb<Int> = 0 ; UPb<Int> = 0 ; H32b<Int> = 0
     if (PFB == 1) {
         mpg<Int> = load_mod("native/build/rpf_gemm.ptx")
@@ -579,6 +583,13 @@ main()<Int> -> {
         hpds = get_fn(mpg, "delta_seq")
         hpag = get_fn(mpk, "ag_b") ; hpcv = get_fn(mpk, "conv_b") ; hpcs = get_fn(mpk, "conv_save")
         hpl2 = get_fn(mpk, "l2n_bs") ; hpat = get_fn(mpk, "attn_pf")
+        if (P32 == 1) {
+            mp32<Int> = load_mod("native/build/rpf32.ptx")
+            if (mp32 == 0) { println("ERR load rpf32 ptx") ; return 10 }
+            hpds = get_fn(mp32, "delta_seq32") ; hpl2 = get_fn(mp32, "l2n_b32") ; hpat = get_fn(mp32, "attn_pf2")
+            hng32 = get_fn(mp32, "ng_b32") ; hsl32 = get_fn(mp32, "silu_b32")
+            if (hng32 == 0 || hsl32 == 0) { return 10 }
+        }
         if (hpg4 == 0 || hpgi3 == 0 || hpds == 0 || hpat == 0 || hpl2 == 0) { return 10 }
         XCb = dalloc(S * D * 8) ; XMb<Int> = dalloc(S * D * 8) ; XNb<Int> = dalloc(S * D * 8) ; XN32b = dalloc(S * D * 4)
         QKVXb<Int> = dalloc(S * QKV * 8) ; ZBb<Int> = dalloc(S * VAL * 8) ; BRAWb<Int> = dalloc(S * HV * 8) ; ARAWb<Int> = dalloc(S * HV * 8)
@@ -611,13 +622,14 @@ main()<Int> -> {
                 put_i(q8, 0, CVLl) ; put_i(q8, 8, QKVXb) ; put_i(q8, 16, S) ; put_i(q8, 24, QKV)
                 q9<Int> = qb + 9 * 256
                 put_i(q9, 0, CONVSb) ; put_i(q9, 8, QNb) ; put_i(q9, 16, KNb) ; put_i(q9, 24, HK) ; put_i(q9, 32, SS)
-                put_i(q9, 40, QKV) ; put_i(q9, 48, GKEY) ; put_f(q9, 56, EPS)
+                put_i(q9, 40, QKV) ; put_i(q9, 48, GKEY) ; put_f(q9, 56, EPS) ; put_i(q9, 64, S * 2 * HK)
                 q10<Int> = qb + 10 * 256
                 put_i(q10, 0, QNb) ; put_i(q10, 8, KNb) ; put_i(q10, 16, CONVSb + 2 * GKEY * 8) ; put_i(q10, 24, GATEb)
                 put_i(q10, 32, BETAb) ; put_i(q10, 40, STLl) ; put_i(q10, 48, GOUTb) ; put_i(q10, 56, S) ; put_i(q10, 64, SS)
                 put_i(q10, 72, HK) ; put_i(q10, 80, HV) ; put_f(q10, 88, SCLV) ; put_i(q10, 96, QKV) ; put_i(q10, 104, GKEY)
                 q11<Int> = qb + 11 * 256
                 put_i(q11, 0, GOUTb) ; put_i(q11, 8, ZBb) ; put_i(q11, 16, SNWl) ; put_i(q11, 24, EPIb) ; put_i(q11, 32, S * HV) ; put_i(q11, 40, SS) ; put_f(q11, 48, EPS)
+                if (P32 == 1) { put_i(q11, 24, E32b) }
                 q12<Int> = qb + 12 * 256
                 put_i(q12, 0, EPIb) ; put_i(q12, 8, E32b) ; put_i(q12, 16, S * VAL)
                 set_gemm(qb + 13 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_out.weight")) - RLO, E32b, XMb, S, D, VAL, D, XCb, 0)
@@ -637,7 +649,7 @@ main()<Int> -> {
                 put_i(r7, 0, QNMb) ; put_i(r7, 8, KNMb) ; put_i(r7, 16, QRb) ; put_i(r7, 24, KCl) ; put_i(r7, 32, FR)
                 put_i(r7, 40, S) ; put_i(r7, 48, HD) ; put_i(r7, 56, H) ; put_i(r7, 64, KVH) ; put_i(r7, 72, 0) ; put_i(r7, 80, NROT)
                 r8<Int> = qb + 8 * 256
-                put_i(r8, 0, QRb) ; put_i(r8, 8, KCl) ; put_i(r8, 16, VCl) ; put_i(r8, 24, CTXb) ; put_i(r8, 32, H) ; put_i(r8, 40, KVH) ; put_i(r8, 48, HD) ; put_i(r8, 56, 0)
+                put_i(r8, 0, QRb) ; put_i(r8, 8, KCl) ; put_i(r8, 16, VCl) ; put_i(r8, 24, CTXb) ; put_i(r8, 32, H) ; put_i(r8, 40, KVH) ; put_i(r8, 48, HD) ; put_i(r8, 56, 0) ; put_i(r8, 64, S)
                 r9<Int> = qb + 9 * 256
                 put_i(r9, 0, CTXb) ; put_i(r9, 8, GTb) ; put_i(r9, 16, GDb) ; put_i(r9, 24, S * NQ)
                 r10<Int> = qb + 10 * 256
@@ -679,10 +691,16 @@ main()<Int> -> {
                     lk(hpag, (S * HV + 255) / 256, 256, qb2 + 6 * 256)
                     lk(hpcv, (S * QKV + 255) / 256, 256, qb2 + 7 * 256)
                     lk(hpcs, (QKV + 255) / 256, 256, qb2 + 8 * 256)
-                    lk(hpl2, S * 2 * HK, SS, qb2 + 9 * 256)
-                    lk(hpds, HV * 4, 128, qb2 + 10 * 256)
-                    lk(hngb, S * HV, SS, qb2 + 11 * 256)
-                    lk(hc32, (S * VAL + 255) / 256, 256, qb2 + 12 * 256)
+                    if (P32 == 1) {
+                        lk(hpl2, (S * 2 * HK + 7) / 8, 256, qb2 + 9 * 256)
+                        lk(hpds, HV * 4, 128, qb2 + 10 * 256)
+                        lk(hng32, (S * HV + 7) / 8, 256, qb2 + 11 * 256)
+                    } else {
+                        lk(hpl2, S * 2 * HK, SS, qb2 + 9 * 256)
+                        lk(hpds, HV * 4, 128, qb2 + 10 * 256)
+                        lk(hngb, S * HV, SS, qb2 + 11 * 256)
+                        lk(hc32, (S * VAL + 255) / 256, 256, qb2 + 12 * 256)
+                    }
                     lk(hpg4, gemm_grid(S, D), 256, qb2 + 13 * 256)
                 } else {
                     lk(hpg5, gemm_grid(S, 2 * NQ), 256, qb2 + 256)
@@ -692,7 +710,7 @@ main()<Int> -> {
                     lk(hrms, S * H, 256, qb2 + 5 * 256)
                     lk(hrms, S * KVH, 256, qb2 + 6 * 256)
                     lk(hrope, (S * (NQ + NKV) + 255) / 256, 256, qb2 + 7 * 256)
-                    lk(hpat, S * H, 256, qb2 + 8 * 256)
+                    if (P32 == 1) { lk(hpat, ((S + 7) / 8) * KVH, 256, qb2 + 8 * 256) } else { lk(hpat, S * H, 256, qb2 + 8 * 256) }
                     lk(hgm, (S * NQ + 255) / 256, 256, qb2 + 9 * 256)
                     lk(hc32, (S * NQ + 255) / 256, 256, qb2 + 10 * 256)
                     lk(hpg6, gemm_grid(S, D), 256, qb2 + 11 * 256)
@@ -701,7 +719,7 @@ main()<Int> -> {
                 lk(hrms, S, 256, qf2)
                 lk(gemm_h(fty.get(L * 3), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF), 256, qf2 + 256)
                 lk(gemm_h(fty.get(L * 3 + 1), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF), 256, qf2 + 512)
-                lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF)
+                if (P32 == 1) { lk4(hsl32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) }
                 lk(gemm_h(fty.get(L * 3 + 2), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, D), 256, qf2 + 768)
             }
             freedom { cuMemcpyDtoD_v2(XC, XCb + (S - 1) * D * 8, D * 8) }
