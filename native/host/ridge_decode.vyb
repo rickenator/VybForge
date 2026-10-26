@@ -414,7 +414,11 @@ main()<Int> -> {
         }
         // VYB_RGMAP=1: llama.cpp-style lane map (gen_rgemv6.py: one ib32 per lane, 4 super-blocks per warp
         // trip, 16-bit raw loads). NOT bit-identical to the default; validated by greedy match + KLD.
-        if ((env_get("VYB_RGMAP") else "") == "1") {
+        // Opt-in (VYB_RGMAP=1 [+VYB_RGQ8=1]). Measured 2026-10-26 after rgemv8/rq6k8: RGMAP+RGQ8 tg128 13.40 vs
+        // exact rgemv8 default 13.44, so the lossy map buys nothing now and stays off; VYB_EXACT=1 forces it off.
+        dfrg<String> = "0"
+        if ((env_get("VYB_EXACT") else "") == "1") { dfrg = "0" }
+        if ((env_get("VYB_RGMAP") else dfrg) == "1") {
             m6<Int> = load_mod(env_get("VYB_RG6PTX") else "native/build/rgemv6.ptx")
             if (m6 == 0) { println("ERR load rgemv6") ; return 1 }
             hi2 = get_fn(m6, "gemv_iq2s_m")
@@ -433,7 +437,7 @@ main()<Int> -> {
             // VYB_RGQ8=1: q8_1 activations + dp4a (gen_rgemv7.py) for IQ2_S; IQ3_S stays on rgemv6 (its
             // dp4a variant is slower, 243 vs 227 us) unless VYB_RGQ8_IQ3=1. xq8 writes XNQ/H32Q (K int8 then
             // K/32 f32 scales). NOT bit-identical; validated by KLD.
-            if ((env_get("VYB_RGQ8") else "") == "1") {
+            if ((env_get("VYB_RGQ8") else dfrg) == "1") {
                 m7<Int> = load_mod(env_get("VYB_RG7PTX") else "native/build/rgemv7.ptx")
                 if (m7 == 0) { println("ERR load rgemv7") ; return 1 }
                 hi2 = get_fn(m7, "gemv_iq2s_q")
@@ -867,9 +871,11 @@ main()<Int> -> {
             hpg6 = get_fn(mpg2, "gemm_q6k") ; hpgi2 = get_fn(mpg2, "gemm_iq2s") ; hpgi3 = get_fn(mpg2, "gemm_iq3s")
         }
         hpag = get_fn(mpk, "ag_b") ; hpcv = get_fn(mpk, "conv_b") ; hpcs = get_fn(mpk, "conv_save")
-        // VYB_CONV32=1 (opt-in, NOT bit-identical): GDN short conv with the SiLU in f32 (rconv32.vyb conv_b32;
+        // VYB_CONV32 (DEFAULT on; =0 or VYB_EXACT=1 for exact; NOT bit-identical): GDN short conv with the SiLU in f32 (rconv32.vyb conv_b32;
         // 4-tap dot still f64). conv_b is FP64-bound on the f64 vexp + div.
-        if ((env_get("VYB_CONV32") else "") == "1") {
+        dfcv<String> = "1"
+        if ((env_get("VYB_EXACT") else "") == "1") { dfcv = "0" }
+        if ((env_get("VYB_CONV32") else dfcv) == "1") {
             mcv32<Int> = load_mod("native/build/rconv32.ptx")
             if (mcv32 == 0) { println("ERR load rconv32.ptx") ; return 10 }
             hpcv = get_fn(mcv32, "conv_b32")
