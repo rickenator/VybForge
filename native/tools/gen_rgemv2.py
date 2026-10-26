@@ -2,6 +2,21 @@
 # (x is loaded once per super-block and reused across R rows), plus block-parallel GDN kernels.
 import sys
 R = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+U = int(sys.argv[3]) if len(sys.argv) > 3 else 1   # super-blocks per loop trip (K/256 must be a multiple of U)
+P = int(sys.argv[4]) if len(sys.argv) > 4 else 0   # 1: x is pre-permuted by xperm (coalesced x loads)
+import re
+IDS = re.compile(r"\b(xb|x\d|bb\d|d\d|scb\d|dl\d|idx\d|g[01]_\d|sg_\d|w\d_\d|pt\d|db\d|qhb\d|qso\d|i[12]_\d)\b")
+def unroll(start):
+    body = out[start:]
+    del out[start:]
+    for u in range(U):
+        for ln in body:
+            if u == 0:
+                out.append(ln)
+            else:
+                ln2 = IDS.sub(lambda m: m.group(1) + "u" + str(u), ln)
+                ln2 = re.sub(r"\bsb\b", "(sb + %d)" % u, ln2)
+                out.append(ln2)
 out = []
 w = out.append
 w(f"""// GENERATED (R={R} rows per warp). Ridge resident-decode kernels, second generation:
@@ -36,13 +51,14 @@ def hdr(name):
     c2<Float32> = 2.0 as Float32
     ch<Float32> = 0.5 as Float32
     cq<Float32> = 0.25 as Float32""")
+    w(f"    XLS<Int> = {4 if P else 32}")
     for r in range(R):
         w(f"    acc{r}<Float32> = 0.0")
 
 def xloads(ind):
     w(f"{ind}xb<Int> = xr + sb * 1024")
     for e in range(8):
-        w(f"{ind}x{e}<Float32> = ld_f32(xb + {4*e})")
+        w(f"{ind}x{e}<Float32> = ld_f32(xb + {128*e if P else 4*e})")
 
 def dot(ind, r, scale):
     for e in range(8):
@@ -86,10 +102,11 @@ w(f"""    if (n0 < N) {{
         l2<Int> = l % 4
         shs<Int> = (l2 / 2) * 4
         shq<Int> = 8 - 2 * l2
-        xr<Int> = X + l * 32
+        xr<Int> = X + l * XLS
         rbs<Int> = nsb * 82
         sb<Int> = 0
         while (sb < nsb) {{""")
+st0 = len(out)
 xloads("            ")
 for r in range(R):
     ind = "            "
@@ -104,9 +121,10 @@ for r in range(R):
     w(f"{ind}g1_{r}<UInt32> = ld_i32(G + idx{r} * 8 + 4) as UInt32")
     w(f"{ind}sg_{r}<UInt32> = (((ld_i8(bb{r} + 34 + l) as Int) & 255) as UInt32)")
     dot(ind, r, f"dl{r}")
-w("""            sb = sb + 1
-        }
-    }""")
+unroll(st0)
+w(f"""            sb = sb + {U}
+        }}
+    }}""")
 tail()
 
 # ---- IQ3_S ----
@@ -118,10 +136,11 @@ w(f"""    if (n0 < N) {{
         shs<Int> = hf * 4
         sh1<Int> = 8 - 2 * l3
         sh2<Int> = 7 - 2 * l3
-        xr<Int> = X + l * 32
+        xr<Int> = X + l * XLS
         rbs<Int> = nsb * 110
         sb<Int> = 0
         while (sb < nsb) {{""")
+st0 = len(out)
 xloads("            ")
 for r in range(R):
     ind = "            "
@@ -139,9 +158,10 @@ for r in range(R):
     w(f"{ind}g1_{r}<UInt32> = ld_i32(G + i2_{r} * 4) as UInt32")
     w(f"{ind}sg_{r}<UInt32> = (((ld_i8(bb{r} + 74 + 8 * g + 4 * hf + l3) as Int) & 255) as UInt32)")
     dot(ind, r, f"db{r}")
-w("""            sb = sb + 1
-        }
-    }""")
+unroll(st0)
+w(f"""            sb = sb + {U}
+        }}
+    }}""")
 tail()
 
 w("""// l2norm over q (rows1 rows) and k (rows1 rows) in one launch: +0 X1 +8 Y1 +16 X2 +24 Y2
@@ -266,6 +286,23 @@ delta_step_c(p<Int>) -> {
         sv3<Float> = ld_f64(rw + m * 8)
         st_f64(ww + m * 8, gexp * sv3 + del2 * ld_shared_f64(m))
         m = m + 4
+    }
+}
+""")
+if P:
+    w("""
+// x permute for the P=1 GEMVs: Y[sb*256 + e*32 + l] = X[sb*256 + l*8 + e] (f32), so lane l's 8 x values
+// for its 8-weight group are 128 B apart and each load instruction is one coalesced 128 B line.
+// +0 X +8 Y +16 K. Grid ceil(K/256) x 256.
+xperm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    K<Int> = ld_i64(p + 16)
+    i<Int> = blk_x() * 256 + tid_x()
+    if (i < K) {
+        sb<Int> = i / 256
+        r<Int> = i % 256
+        st_f32(Y + i * 4, ld_f32(X + (sb * 256 + (r % 32) * 8 + r / 32) * 4))
     }
 }
 """)

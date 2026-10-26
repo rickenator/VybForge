@@ -28,6 +28,7 @@ gemv_iq2s_r(p<Int>) -> {
     c2<Float32> = 2.0 as Float32
     ch<Float32> = 0.5 as Float32
     cq<Float32> = 0.25 as Float32
+    XLS<Int> = 32
     acc0<Float32> = 0.0
     acc1<Float32> = 0.0
     if (n0 < N) {
@@ -35,7 +36,7 @@ gemv_iq2s_r(p<Int>) -> {
         l2<Int> = l % 4
         shs<Int> = (l2 / 2) * 4
         shq<Int> = 8 - 2 * l2
-        xr<Int> = X + l * 32
+        xr<Int> = X + l * XLS
         rbs<Int> = nsb * 82
         sb<Int> = 0
         while (sb < nsb) {
@@ -157,6 +158,7 @@ gemv_iq3s_r(p<Int>) -> {
     c2<Float32> = 2.0 as Float32
     ch<Float32> = 0.5 as Float32
     cq<Float32> = 0.25 as Float32
+    XLS<Int> = 32
     acc0<Float32> = 0.0
     acc1<Float32> = 0.0
     if (n0 < N) {
@@ -166,7 +168,7 @@ gemv_iq3s_r(p<Int>) -> {
         shs<Int> = hf * 4
         sh1<Int> = 8 - 2 * l3
         sh2<Int> = 7 - 2 * l3
-        xr<Int> = X + l * 32
+        xr<Int> = X + l * XLS
         rbs<Int> = nsb * 110
         sb<Int> = 0
         while (sb < nsb) {
