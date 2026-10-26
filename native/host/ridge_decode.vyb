@@ -123,11 +123,12 @@ read_bin(path<String>)<String> -> {
     r<String> = ""
     match (open_read(path)) {
         f -> {
-            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            match (read_all(f)) { s -> { r = s } ? -> { println("WARN read_bin: read failed: " + path) ; r = "" } }
             close(f)
         }
-        ? -> { r = "" }
+        ? -> { println("WARN read_bin: cannot open " + path) ; r = "" }
     }
+    if (r.len() == 0) { println("WARN read_bin: empty file " + path) }
     return r
 }
 download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
