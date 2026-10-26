@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ridge-chat: interactive chat with the 27B Ridge (qwen35) model on the all-Vyb engine
+# (native/host/ridge_decode.vyb). This script only builds the command line and filters output;
+# tokenizing, the chat template, inference and streaming all happen in Vyb.
+#
+#   ./ridge-chat                 interactive (/reset clears history, /quit or Ctrl-D exits)
+#   ./ridge-chat -1 "question"   one-shot answer, then exit
+#
+# env: VYB_BIN (vyb binary, default ~/Projects/Vyb/build/vyb), VYB_STDLIB (default <vyb>/../../stdlib),
+#      VYB_MODEL (GGUF, default ~/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf),
+#      RIDGE_GEN (max new tokens, 1024), RIDGE_SYS (system prompt), VYB_THINK=1 (thinking on),
+#      VYB_EXACT=1 (bit-exact gold path), RIDGE_STATS=0 (hide the tok/s line), VYB_MAXS (context, 4096).
+set -u
+cd "$(dirname "$(readlink -f "$0")")"
+VYB_BIN=${VYB_BIN:-$HOME/Projects/Vyb/build/vyb}
+export VYB_STDLIB=${VYB_STDLIB:-$(dirname "$(dirname "$(readlink -f "$VYB_BIN")")")/stdlib}
+GEN=${RIDGE_GEN:-1024}
+PREV=""
+
+# print only the text between the STREAM_BEGIN and STREAM_END lines, char by char as it arrives
+stream_filter() {
+  local line c held="" bol=1
+  while IFS= read -r line; do
+    [[ $line == STREAM_BEGIN ]] && break
+    [[ $line == ERR* ]] && echo "$line" >&2
+  done
+  while IFS= read -r -d '' -n1 c; do
+    [[ -z $c ]] && continue
+    if (( bol )); then
+      held+="$c"
+      if [[ "STREAM_END" == "$held"* ]]; then
+        [[ $held == STREAM_END ]] && break
+        continue
+      fi
+      printf '%s' "$held"; held=""
+    else
+      printf '%s' "$c"
+    fi
+    [[ $c == $'\n' ]] && bol=1 || bol=0
+  done
+  grep -E "^ERR" >&2
+}
+
+turn() {
+  local out pids gids
+  out=$(mktemp)
+  VYB_PFB=2 VYB_CHAT=1 VYB_GEN=$GEN VYB_MAXS=${VYB_MAXS:-4096} VYB_PROMPT="$1" VYB_CHAT_PREV="$PREV" \
+    VYB_CHAT_SYS="${RIDGE_SYS:-}" "$VYB_BIN" native/host/ridge_decode.vyb --module-path native/config \
+    --module-path native/json --module-path native/tensor --module-path native/dtype --module-path native/llm \
+    2>&1 | tee "$out" | stream_filter
+  pids=$(grep 'PROMPT_IDS=' "$out" | tail -1 | sed 's/.*PROMPT_IDS=//')
+  gids=$(grep '^GEN_IDS=' "$out" | sed 's/^GEN_IDS=//')
+  if [[ -n $gids ]]; then
+    [[ $gids == *" 248046" ]] || gids="$gids 248046"
+    PREV="$pids$gids 198"
+  else
+    echo "[ridge-chat] run failed, see $out" >&2; return 1
+  fi
+  [[ ${RIDGE_STATS:-1} == 1 ]] && grep -E '^TIMING' "$out" | sed 's/^/[/;s/$/]/' >&2
+  rm -f "$out"
+}
+
+if [[ ${1:-} == -1 ]]; then turn "${2:?usage: ridge-chat -1 \"message\"}"; exit; fi
+echo "ridge-chat: 27B Ridge on Vyb ($( [[ ${VYB_EXACT:-} == 1 ]] && echo exact || echo default) path). /reset, /quit." >&2
+while IFS= read -r -e -p "you> " msg; do
+  case "$msg" in
+    /quit|/exit) break ;;
+    /reset) PREV=""; echo "[history cleared]" >&2; continue ;;
+    "") continue ;;
+  esac
+  printf 'ridge> '
+  turn "$msg"
+done

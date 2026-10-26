@@ -10,7 +10,8 @@
 //      VYB_MAXS (2048).
 import io::{open_read, read_at, read_all, close}
 import llm::{llm_load, llm_decode, llm_encode}
-import vllm::{Model}
+import vllm::{Model, build_revvocab_from, lead_width, glyph2byte}
+import collections
 import env::{env_get}
 import time::{time_mono_millis}
 
@@ -280,6 +281,42 @@ grid_of(ty<Int>, g2<Int>, g3<Int>)<Int> -> {
     return 0
 }
 
+// ---- chat mode (VYB_CHAT=1) ----
+// enc_ids: " id id ..." for a text segment (empty for "").
+enc_ids(tok<Model>, s<String>)<String> -> {
+    out<String> = ""
+    if (s.len() == 0) { return out }
+    e<Vec<Int>> = llm_encode(tok, s)
+    j<Int> = 0
+    for (j in 0..e.len() - 1) { out = out + " " + e.get(j).to_string() }
+    return out
+}
+// Qwen3.x ChatML prompt (GGUF tokenizer.chat_template): optional VYB_CHAT_SYS, VYB_CHAT_N prior turns
+// (VYB_CHAT_U<i> / VYB_CHAT_A<i>), then msg and the generation prompt. Thinking off unless VYB_THINK=1.
+// Special ids from the Ridge GGUF vocab: 248045 <|im_start|>, 248046 <|im_end|>, 248068 <think>, 248069 </think>.
+chat_ids(tok<Model>, msg<String>)<String> -> {
+    S<String> = " 248045"
+    E<String> = " 248046"
+    NL<String> = enc_ids(tok, "\n")
+    r<String> = ""
+    sys<String> = env_get("VYB_CHAT_SYS") else ""
+    if (sys.len() > 0) { r = r + S + enc_ids(tok, "system\n" + sys) + E + NL }
+    ns<String> = env_get("VYB_CHAT_N") else "0"
+    n<Int> = parse_u(ns, 0, ns.len())
+    i<Int> = 0
+    if (n > 0) {
+        for (i in 0..n - 1) {
+            u<String> = env_get("VYB_CHAT_U" + i.to_string()) else ""
+            a<String> = env_get("VYB_CHAT_A" + i.to_string()) else ""
+            r = r + S + enc_ids(tok, "user\n" + u) + E + NL
+            r = r + S + enc_ids(tok, "assistant\n" + a) + E + NL
+        }
+    }
+    r = r + S + enc_ids(tok, "user\n" + msg) + E + NL
+    r = r + S + enc_ids(tok, "assistant\n") + " 248068"
+    if ((env_get("VYB_THINK") else "") == "1") { r = r + NL } else { r = r + enc_ids(tok, "\n\n") + " 248069" + enc_ids(tok, "\n\n") }
+    return r
+}
 main()<Int> -> {
     hm<String> = env_get("HOME") else "/home/rick"
     MODEL<String> = env_get("VYB_MODEL") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
@@ -297,7 +334,20 @@ main()<Int> -> {
     prids<Vec<Int>> = Vec()
     pids<String> = env_get("VYB_PROMPT_IDS") else ""
     pstr<String> = env_get("VYB_PROMPT") else "The capital of France is"
-    if (pids.len() > 0) { prids = parse_ids(pids) } else { prids = llm_encode(tok, pstr) }
+    CHAT<Int> = 0
+    if ((env_get("VYB_CHAT") else "") == "1") { CHAT = 1 }
+    // VYB_STREAM=1 (default in chat mode): print each generated token's text as it lands, stop at <|im_end|>
+    // / <|endoftext|>; text sits between STREAM_BEGIN and STREAM_END lines.
+    STRM<Int> = CHAT
+    if ((env_get("VYB_STREAM") else "") == "1") { STRM = 1 }
+    if ((env_get("VYB_STREAM") else "") == "0") { STRM = 0 }
+    STOPD<Int> = 0
+    // reverse vocab built ONCE (llm_decode rebuilds it from vocab.json per call, ~2 s)
+    rvm<HashMap<Int, String>> = HashMap<Int, String>()
+    if (STRM == 1) { rvm = build_revvocab_from(TOKDIR) }
+    if (pids.len() > 0) { prids = parse_ids(pids) } else {
+        if (CHAT == 1) { prids = parse_ids(chat_ids(tok, pstr)) } else { prids = llm_encode(tok, pstr) }
+    }
     NP<Int> = prids.len()
     pl<String> = ""
     pi<Int> = 0
@@ -990,6 +1040,7 @@ main()<Int> -> {
     cur<Int> = prids.get(0)
     TOTAL<Int> = NP + GEN - 1
     tpf0<Int> = time_mono_millis() ; tpf1<Int> = 0 ; tfirst<Int> = 0
+    if (STRM == 1) { println("STREAM_BEGIN") }
     p<Int> = 0
     for (p in 0..TOTAL - 1) {
         if (p < NP) { cur = prids.get(p) }
@@ -1175,6 +1226,20 @@ main()<Int> -> {
                 }
                 if (wn != VOCAB * 8) { println("ERR logdump write") ; return 1 }
             }
+            if (STRM == 1) {
+                if (nid == 248046 || nid == 248044) { STOPD = 1 } else {
+                    stk<String> = rvm.get(nid) else ""
+                    sout<String> = ""
+                    sn<Int> = stk.len()
+                    si<Int> = 0
+                    while (si < sn) {
+                        slw<Int> = lead_width((stk.char_at(si) as Int) & 255)
+                        sout = sout.concat(String::from_byte(glyph2byte(stk.substring(si, si + slw))))
+                        si = si + slw
+                    }
+                    print(sout)
+                }
+            }
             if (p == NP - 1) { tpf1 = time_mono_millis() }
             if (p == NP) { tfirst = time_mono_millis() }
             if ((env_get("VYB_TOKTEXT") else "").len() > 0) {
@@ -1183,7 +1248,9 @@ main()<Int> -> {
                 println("TOK " + (p + 1).to_string() + " id=" + nid.to_string() + " <" + llm_decode(tok, sofar) + ">")
             }
         }
+        if (STOPD == 1) { break }
     }
+    if (STRM == 1) { println("") ; println("STREAM_END") }
     freedom { cuCtxSynchronize() }
     if (LFD >= 0) { freedom { cuMemFreeHost(LHB) } }
     tend<Int> = time_mono_millis()
