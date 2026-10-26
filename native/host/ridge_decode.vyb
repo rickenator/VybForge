@@ -19,6 +19,7 @@ extern "C" {
     cuInit(flags<CUInt>)<CInt>
     cuDeviceGetCount(count<loc<CInt>>)<CInt>
     cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuDeviceGetAttribute(pi<loc<CInt>>, attrib<CInt>, dev<CInt>)<CInt>
     cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
@@ -384,10 +385,14 @@ main()<Int> -> {
     RBYTES<Int> = RHI - RLO
     println("TSV tensors=" + nmv.len().to_string() + " region=[" + RLO.to_string() + "," + RHI.to_string() + ") bytes=" + RBYTES.to_string())
 
+    CCMAJ<Int> = 0
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> dev = 0
         if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        var<CInt> ccmaj = 0
+        cuDeviceGetAttribute(loc(ccmaj), 75, dev)
+        CCMAJ = (ccmaj as Int)
         ctx<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
     }
@@ -466,7 +471,11 @@ main()<Int> -> {
         // trip, 16-bit raw loads). NOT bit-identical to the default; validated by greedy match + KLD.
         // Opt-in (VYB_RGMAP=1 [+VYB_RGQ8=1]). Measured 2026-10-26 after rgemv8/rq6k8: RGMAP+RGQ8 tg128 13.40 vs
         // exact rgemv8 default 13.44, so the lossy map buys nothing now and stays off; VYB_EXACT=1 forces it off.
+        // 2026-10-26 RTX 3090 (sm_86, 936 GB/s): the exact rgemv8 IQ2_S kernel is ALU/latency-bound there
+        // (~244 GB/s); RGMAP+RGQ8(+IQ3 dp4a) gives tg128 26.9 vs 20.8, KLD 0.00380, ppl 3.2404 -> default on
+        // CC major 8 (Ampere). GB10 (CC 12) keeps the exact map. VYB_EXACT=1 still forces all off.
         dfrg<String> = "0"
+        if (CCMAJ == 8) { dfrg = "1" }
         if ((env_get("VYB_EXACT") else "") == "1") { dfrg = "0" }
         if ((env_get("VYB_RGMAP") else dfrg) == "1") {
             m6<Int> = load_mod(env_get("VYB_RG6PTX") else "native/build/rgemv6.ptx")
@@ -495,14 +504,14 @@ main()<Int> -> {
                 IRB = ITH / 32
                 RQ8 = 1
                 rgp = rgp + "+rgemv7(q8_1,dp4a iq2s)"
-                if ((env_get("VYB_RGQ8_IQ3") else "") == "1") {
+                if ((env_get("VYB_RGQ8_IQ3") else dfrg) == "1") {
                     hi3 = get_fn(m7, "gemv_iq3s_q")
                     RQ83 = 1
                     rgp = rgp + "+iq3s"
                 }
             }
         }
-        println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string())
+        println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string() + " cc_major=" + CCMAJ.to_string())
     }
     // VYB_Q4KPTX=native/build/rq4k.ptx (gen_rq4k.py R D): decode Q4_K GEMV gemv_q4k_v (M=1, vector x
     // loads, R rows/warp, D-deep prefetch, shuffle reduction; same arithmetic as qwen3 gemv_q4k, bit-exact).
@@ -663,6 +672,8 @@ main()<Int> -> {
     println("RESIDENT_WEIGHTS bytes=" + RBYTES.to_string() + " upload_ms=" + (tw1 - tw0).to_string())
     g2s<String> = read_bin("native/out/iq2s_grid.bin")
     g3s<String> = read_bin("native/out/iq3s_grid.bin")
+    // A missing grid file used to read as "" and silently produce garbage tokens (3090 bring-up).
+    if (g2s.len() != 8192 || g3s.len() != 2048) { println("ERR iq2s/iq3s grid files missing or wrong size (native/out/iq2s_grid.bin, iq3s_grid.bin)") ; return 3 }
     G2<Int> = dalloc(8192) ; G3<Int> = dalloc(2048)
     download(g2s, G2, 8192) ; download(g3s, G3, 2048)
     fb<String> = read_bin(FIP)
