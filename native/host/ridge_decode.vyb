@@ -403,6 +403,18 @@ main()<Int> -> {
     }
     // VYB_DSC=1: delta_step_c (4 threads per state row); default delta_step_b (measured faster)
     DSC<Int> = 0
+    // VYB_DSF (default 1): fused l2norm_b + delta_step_b + norm_gated_b (rdelta.vyb delta_step_f,
+    // same arithmetic and reduction trees, bit-identical; 2 fewer launches per GDN layer). 0 = 3 kernels.
+    DSF<Int> = 0
+    hdsf<Int> = 0
+    dsfs<String> = env_get("VYB_DSF") else "1"
+    if (dsfs == "1") {
+        mdf<Int> = load_mod("native/build/rdelta.ptx")
+        if (mdf == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
+        hdsf = get_fn(mdf, "delta_step_f")
+        DSF = 1
+        println("GDN_FUSED delta_step_f")
+    }
     if ((env_get("VYB_DSC") else "").len() > 0) { DSC = 1 }
     println("KERNELS rk2=" + RK2.to_string())
     if (hds == 0 || hi3 == 0 || hrope == 0 || hq4 == 0) { return 10 }
@@ -804,9 +816,11 @@ main()<Int> -> {
                 lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
                 lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
                 if (RK2 >= 1) {
-                    lk(hl2b, 2 * HK, SS, pb + 20 * 256)
-                    if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) }
-                    lk(hngb, HV, SS, pb + 13 * 256)
+                    if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
+                        lk(hl2b, 2 * HK, SS, pb + 20 * 256)
+                        if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) }
+                        lk(hngb, HV, SS, pb + 13 * 256)
+                    }
                 } else {
                     lk(hl2, (GKEY + 255) / 256, 256, pb + 10 * 256)
                     lk(hl2, (GKEY + 255) / 256, 256, pb + 11 * 256)

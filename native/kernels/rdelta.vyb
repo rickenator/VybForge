@@ -1,0 +1,103 @@
+// Ridge decode: fused GDN step for one value head per block (grid Hv x S threads, S = head dim).
+// delta_step_f(p): p = delta_step_b params (pb + 12*256); the l2norm_b params are at p + 8*256
+// (pb + 20*256) and the norm_gated_b params at p + 256 (pb + 13*256). Does l2norm_b (row h % Hk of q = X1 -> Y1 and
+// k = X2 -> Y2) + delta_step_b + norm_gated_b in one launch with the same per-thread arithmetic
+// and the same shared-memory reduction trees, so the outputs are bit-identical to the 3-kernel path.
+import vmath::{vexp, vsqrt}
+
+delta_step_f(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    pl<Int> = p + 2048
+    X1<Int> = ld_i64(pl + 0)
+    Y1<Int> = ld_i64(pl + 8)
+    X2<Int> = ld_i64(pl + 16)
+    Y2<Int> = ld_i64(pl + 24)
+    DL<Int> = ld_i64(pl + 40)
+    epsl<Float> = ld_f64(pl + 48)
+    pg<Int> = p + 256
+    GZ<Int> = ld_i64(pg + 8)
+    GW<Int> = ld_i64(pg + 16)
+    GY<Int> = ld_i64(pg + 24)
+    DG<Int> = ld_i64(pg + 40)
+    epsg<Float> = ld_f64(pg + 48)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    // l2norm_b of row hk of X1 and of X2 (trees at shared 512.. and 768..)
+    v1<Float> = ld_f64(X1 + (hk * DL + j) * 8)
+    v2<Float> = ld_f64(X2 + (hk * DL + j) * 8)
+    st_shared_f64(512 + j, v1 * v1)
+    st_shared_f64(768 + j, v2 * v2)
+    kernel_barrier()
+    st2<Int> = DL / 2
+    while (st2 > 0) {
+        if (j < st2) {
+            st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2))
+            st_shared_f64(768 + j, ld_shared_f64(768 + j) + ld_shared_f64(768 + j + st2))
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    n1<Float> = vsqrt(ld_shared_f64(512), 40)
+    if (n1 < epsl) { n1 = epsl }
+    n2<Float> = vsqrt(ld_shared_f64(768), 40)
+    if (n2 < epsl) { n2 = epsl }
+    y1<Float> = v1 / n1
+    y2<Float> = v2 / n2
+    if (h == hk) {
+        st_f64(Y1 + (hk * DL + j) * 8, y1)
+        st_f64(Y2 + (hk * DL + j) * 8, y2)
+    }
+    kv<Float> = y2
+    qv<Float> = y1
+    st_shared_f64(j, kv)
+    st_shared_f64(256 + j, qv)
+    kernel_barrier()
+    gexp<Float> = vexp(ld_f64(G + h * 8))
+    be<Float> = ld_f64(BE + h * 8)
+    kq<Float> = 0.0
+    i<Int> = 0
+    for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+    rw<Int> = SIN + (S * S * h + j * S) * 8
+    acc<Float> = 0.0
+    acq<Float> = 0.0
+    i = 0
+    for (i in 0..S - 1) {
+        sv<Float> = ld_f64(rw + i * 8)
+        acc = acc + sv * ld_shared_f64(i)
+        acq = acq + sv * ld_shared_f64(256 + i)
+    }
+    del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+    ov<Float> = sc * (gexp * acq + del * kq)
+    st_f64(OUT + (j + S * h) * 8, ov)
+    ww<Int> = SOUT + (S * S * h + j * S) * 8
+    i = 0
+    for (i in 0..S - 1) {
+        sv3<Float> = ld_f64(rw + i * 8)
+        st_f64(ww + i * 8, gexp * sv3 + del * ld_shared_f64(i))
+    }
+    // norm_gated_b of row h (tree at shared 512..)
+    st_shared_f64(512 + j, ov * ov)
+    kernel_barrier()
+    st2 = DG / 2
+    while (st2 > 0) {
+        if (j < st2) { st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    rinv<Float> = 1.0 / vsqrt(ld_shared_f64(512) / (DG as Float) + epsg, 40)
+    wv<Float> = ld_f64(GW + j * 8)
+    zv<Float> = ld_f64(GZ + (h * DG + j) * 8)
+    sg<Float> = 1.0 + vexp(0.0 - zv)
+    st_f64(GY + (h * DG + j) * 8, ov * rinv * wv * (zv / sg))
+}
