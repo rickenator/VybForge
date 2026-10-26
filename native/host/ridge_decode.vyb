@@ -202,9 +202,13 @@ gemv_h(ty<Int>, hq4<Int>, hq6<Int>, hq5<Int>, hq8<Int>, hi2<Int>, hi3<Int>)<Int>
     if (ty == 21) { return hi3 }
     return 0
 }
-gemv_g(ty<Int>, N<Int>)<Int> -> {
+gemv_g(ty<Int>, N<Int>, rk2<Int>)<Int> -> {
     if (ty == 12) { return (N + 31) / 32 }
     if (ty == 14) { return (N + 31) / 32 }
+    if (rk2 == 1) {
+        if (ty == 22) { return (N + 31) / 32 }
+        if (ty == 21) { return (N + 31) / 32 }
+    }
     return (N + 15) / 16
 }
 grid_of(ty<Int>, g2<Int>, g3<Int>)<Int> -> {
@@ -281,7 +285,11 @@ main()<Int> -> {
     ma35<Int> = load_mod("native/build/attn35.ptx")
     mq6<Int> = load_mod("native/build/q6k.ptx")
     mrg<Int> = load_mod("native/build/rgemv.ptx")
-    if (mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
+    mr2<Int> = load_mod("native/build/rgemv2.ptx")
+    // VYB_RK1=1: first-generation kernels (1 row/warp grid GEMVs, gdn.vyb l2norm/norm_gated, delta_step_b)
+    RK2<Int> = 1
+    if ((env_get("VYB_RK1") else "").len() > 0) { RK2 = 0 }
+    if (mr2 == 0 || mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
     hrms<Int> = get_fn(mlay, "rms_blk") ; hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
     hs32<Int> = get_fn(mlay, "silu32") ; hc32<Int> = get_fn(mlay, "cast32")
     hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
@@ -293,6 +301,12 @@ main()<Int> -> {
     hq6d<Int> = get_fn(mq6, "q6kdeq")
     hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
     hi3<Int> = get_fn(mrg, "gemv_iq3s") ; hds<Int> = get_fn(mrg, "delta_step_b")
+    hl2b<Int> = get_fn(mr2, "l2norm_b") ; hngb<Int> = get_fn(mr2, "norm_gated_b") ; hdsc<Int> = get_fn(mr2, "delta_step_c")
+    if (RK2 == 1) {
+        hi2 = get_fn(mr2, "gemv_iq2s_r")
+        hi3 = get_fn(mr2, "gemv_iq3s_r")
+    }
+    println("KERNELS rk2=" + RK2.to_string())
     if (hds == 0 || hi3 == 0 || hrope == 0 || hq4 == 0) { return 10 }
 
     // ---- resident weights: the whole tensor region, once ----
@@ -416,6 +430,9 @@ main()<Int> -> {
             put_i(p10, 0, CONVS) ; put_i(p10, 8, QN) ; put_i(p10, 16, HK) ; put_i(p10, 24, SS) ; put_f(p10, 32, EPS)
             p11<Int> = pb0 + 11 * 256
             put_i(p11, 0, CONVS + GKEY * 8) ; put_i(p11, 8, KN) ; put_i(p11, 16, HK) ; put_i(p11, 24, SS) ; put_f(p11, 32, EPS)
+            p20<Int> = pb0 + 20 * 256
+            put_i(p20, 0, CONVS) ; put_i(p20, 8, QN) ; put_i(p20, 16, CONVS + GKEY * 8) ; put_i(p20, 24, KN)
+            put_i(p20, 32, HK) ; put_i(p20, 40, SS) ; put_f(p20, 48, EPS)
             p12<Int> = pb0 + 12 * 256
             put_i(p12, 0, QN) ; put_i(p12, 8, KN) ; put_i(p12, 16, CONVS + 2 * GKEY * 8) ; put_i(p12, 24, GATE)
             put_i(p12, 32, BETA) ; put_i(p12, 40, STL) ; put_i(p12, 48, STL) ; put_i(p12, 56, GOUT) ; put_i(p12, 64, 0)
@@ -460,7 +477,7 @@ main()<Int> -> {
             set_gemv(pb0 + 11 * 256, RBA + ofv.get(io) - RLO, E32, XM, D, NQ, 8, XC, 0)
             na = na + 1
         }
-        np = np + 20
+        np = np + 24
     }
     // head
     ion<Int> = find_nm(nmv, "output_norm.weight") ; iow<Int> = find_nm(nmv, "output.weight") ; iem<Int> = find_nm(nmv, "token_embd.weight")
@@ -505,10 +522,16 @@ main()<Int> -> {
                 lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
                 lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
                 lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
-                lk(hl2, (GKEY + 255) / 256, 256, pb + 10 * 256)
-                lk(hl2, (GKEY + 255) / 256, 256, pb + 11 * 256)
-                lk(hds, HV, SS, pb + 12 * 256)
-                lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
+                if (RK2 == 1) {
+                    lk(hl2b, 2 * HK, SS, pb + 20 * 256)
+                    lk(hdsc, HV * SS / 32, 128, pb + 12 * 256)
+                    lk(hngb, HV, SS, pb + 13 * 256)
+                } else {
+                    lk(hl2, (GKEY + 255) / 256, 256, pb + 10 * 256)
+                    lk(hl2, (GKEY + 255) / 256, 256, pb + 11 * 256)
+                    lk(hds, HV, SS, pb + 12 * 256)
+                    lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
+                }
                 lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
                 lk(hq4, (D + 31) / 32, 512, pb + 15 * 256)
             } else {
@@ -533,10 +556,10 @@ main()<Int> -> {
             pfb<Int> = pb + 16 * 256
             tg<Int> = fty.get(L * 3) ; tu<Int> = fty.get(L * 3 + 1) ; tdn<Int> = fty.get(L * 3 + 2)
             lk(hrms, 1, 256, pfb)
-            lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF), 512, pfb + 256)
-            lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF), 512, pfb + 512)
+            lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF, RK2), 512, pfb + 256)
+            lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, RK2), 512, pfb + 512)
             lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF)
-            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D), 512, pfb + 768)
+            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, RK2), 512, pfb + 768)
         }
         if (p >= NP - 1) {
             lk(hrms, 1, 256, PH)
