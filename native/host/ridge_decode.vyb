@@ -867,6 +867,14 @@ main()<Int> -> {
             hpg6 = get_fn(mpg2, "gemm_q6k") ; hpgi2 = get_fn(mpg2, "gemm_iq2s") ; hpgi3 = get_fn(mpg2, "gemm_iq3s")
         }
         hpag = get_fn(mpk, "ag_b") ; hpcv = get_fn(mpk, "conv_b") ; hpcs = get_fn(mpk, "conv_save")
+        // VYB_CONV32=1 (opt-in, NOT bit-identical): GDN short conv with the SiLU in f32 (rconv32.vyb conv_b32;
+        // 4-tap dot still f64). conv_b is FP64-bound on the f64 vexp + div.
+        if ((env_get("VYB_CONV32") else "") == "1") {
+            mcv32<Int> = load_mod("native/build/rconv32.ptx")
+            if (mcv32 == 0) { println("ERR load rconv32.ptx") ; return 10 }
+            hpcv = get_fn(mcv32, "conv_b32")
+            println("CONV32 conv_b32 (f32 silu)")
+        }
         hpl2 = get_fn(mpk, "l2n_bs") ; hpat = get_fn(mpk, "attn_pf")
         if (P32 == 1) {
             mp32<Int> = load_mod("native/build/rpf32.ptx")
