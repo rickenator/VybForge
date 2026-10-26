@@ -404,16 +404,32 @@ main()<Int> -> {
     // VYB_DSC=1: delta_step_c (4 threads per state row); default delta_step_b (measured faster)
     DSC<Int> = 0
     // VYB_DSF (default 1): fused l2norm_b + delta_step_b + norm_gated_b (rdelta.vyb delta_step_f,
-    // same arithmetic and reduction trees, bit-identical; 2 fewer launches per GDN layer). 0 = 3 kernels.
+    // same arithmetic and reduction trees, bit-identical; 2 fewer launches per GDN layer). 0 = 3 kernels,
+    // 8 = delta_step_f8 (state-row loops unrolled 8-wide).
     DSF<Int> = 0
     hdsf<Int> = 0
+    // VYB_DST (default 1): column-major GDN state + delta_step_t (coalesced state loads; bit-identical). Uses the
+    // 3-kernel GDN path; a batched prefill's state is transposed once (st_tr) before decode. 0 = row-major.
+    DST<Int> = 0
+    hdst<Int> = 0
+    htr<Int> = 0
+    if ((env_get("VYB_DST") else "1") != "0") {
+        mdt<Int> = load_mod("native/build/rdelta.ptx")
+        if (mdt == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
+        hdst = get_fn(mdt, "delta_step_t") ; htr = get_fn(mdt, "st_tr")
+        DST = 1
+        println("GDN_STATE column-major delta_step_t")
+    }
     dsfs<String> = env_get("VYB_DSF") else "1"
-    if (dsfs == "1") {
+    if (DST == 1) { dsfs = "0" }
+    if (dsfs == "1" || dsfs == "8") {
         mdf<Int> = load_mod("native/build/rdelta.ptx")
         if (mdf == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
-        hdsf = get_fn(mdf, "delta_step_f")
+        dsfn<String> = "delta_step_f"
+        if (dsfs == "8") { dsfn = "delta_step_f8" }
+        hdsf = get_fn(mdf, dsfn)
         DSF = 1
-        println("GDN_FUSED delta_step_f")
+        println("GDN_FUSED " + dsfn)
     }
     if ((env_get("VYB_DSC") else "").len() > 0) { DSC = 1 }
     println("KERNELS rk2=" + RK2.to_string())
@@ -799,6 +815,17 @@ main()<Int> -> {
                 lk(gemm_h(fty.get(L * 3 + 2), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, D, bm_of(fty.get(L * 3 + 2), BIG)), 256, qf2 + 768)
             }
             freedom { cuMemcpyDtoD_v2(XC, XCb + (S - 1) * D * 8, D * 8) }
+            if (DST == 1) {
+                NST<Int> = HV * SS * SS
+                TSCR<Int> = dalloc(NST * 8)
+                if (TSCR == 0) { println("ERR alloc st_tr scratch") ; return 23 }
+                for (L in 0..NL - 1) {
+                    if (kind.get(L) == 1) {
+                        lk4(htr, (NST + 255) / 256, 256, l5v.get(L), TSCR, SS, NST)
+                        freedom { cuMemcpyDtoD_v2(l5v.get(L), TSCR, NST * 8) }
+                    }
+                }
+            }
         }
         if (PFB == 0 || p >= NP) {
         lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
@@ -818,7 +845,7 @@ main()<Int> -> {
                 if (RK2 >= 1) {
                     if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
                         lk(hl2b, 2 * HK, SS, pb + 20 * 256)
-                        if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) }
+                        if (DST == 1) { lk(hdst, HV, SS, pb + 12 * 256) } else { if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) } }
                         lk(hngb, HV, SS, pb + 13 * 256)
                     }
                 } else {
