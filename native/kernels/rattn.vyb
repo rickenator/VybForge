@@ -1,0 +1,95 @@
+// Decode attention context, split so the softmax is computed once per (s, h) row instead of once per
+// output lane (attn_cx recomputes max/sum/exp for each of the HD lanes). Same expressions, same
+// summation order as attn_cx -> bit-identical. Params block is attn_cx's (V@96 Ctx@104 S@184 HD@200
+// H@208 KVH@216 P0@224 SC@232 T@240); M = rows*2 f64 scratch (mx, ssum). SC is overwritten with exp.
+import vmath::{vexp}
+
+rax_mx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gsh<Int> = blk_x() * dim_x() + tid_x()
+    if (gsh < S * H) {
+        s<Int> = gsh / H
+        h<Int> = gsh % H
+        sa<Int> = P0 + s
+        sb<Int> = SC + (s * H + h) * T * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = ld_f64(sb + ta * 8)
+            if (sc > mx) { mx = sc }
+        }
+        st_f64(M + gsh * 16, mx)
+    }
+}
+
+rax_e(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        gsh<Int> = gid / T
+        mx<Float> = ld_f64(M + gsh * 16)
+        a<Int> = SC + gid * 8
+        st_f64(a, vexp(ld_f64(a) - mx))
+    }
+}
+
+rax_sum(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gsh<Int> = blk_x() * dim_x() + tid_x()
+    if (gsh < S * H) {
+        s<Int> = gsh / H
+        h<Int> = gsh % H
+        sa<Int> = P0 + s
+        sb<Int> = SC + (s * H + h) * T * 8
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            ssum = ssum + ld_f64(sb + tb * 8)
+        }
+        st_f64(M + gsh * 16 + 8, ssum)
+    }
+}
+
+rax_cx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        sb<Int> = SC + (s * H + h) * T * 8
+        ssum<Float> = ld_f64(M + gsh * 16 + 8)
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            e<Float> = ld_f64(sb + tc * 8)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}

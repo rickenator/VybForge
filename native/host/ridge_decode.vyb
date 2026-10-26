@@ -354,6 +354,13 @@ main()<Int> -> {
     if ((env_get("VYB_RK1") else "").len() > 0) { RK2 = 0 }
     if (mr2 == 0 || mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
     hrms<Int> = get_fn(mlay, "rms_blk") ; hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
+    // decode attention context: softmax once per head row (rattn.vyb), bit-identical to attn_cx. VYB_ACX=0 off.
+    ACX<Int> = 1
+    if ((env_get("VYB_ACX") else "") == "0") { ACX = 0 }
+    mrax<Int> = load_mod("native/build/rattn.ptx")
+    if (mrax == 0) { println("ERR load rattn") ; return 1 }
+    hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx")
+    RXM<Int> = dalloc(4096)
     hs32<Int> = get_fn(mlay, "silu32") ; hc32<Int> = get_fn(mlay, "cast32")
     hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
     hamp<Int> = get_fn(mq3, "argmax1_p") ; hamr<Int> = get_fn(mq3, "argmax1_r") ; hexp<Int> = get_fn(mq3, "f32expand")
@@ -1087,7 +1094,12 @@ main()<Int> -> {
                 lk(hrms, KVH, 256, pb + 6 * 256)
                 lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
                 lk(hasc, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256)
-                lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256)
+                if (ACX == 1) {
+                    lk4(hrxm, 1, 32, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxe, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxs, 1, 32, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxc, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                } else { lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256) }
                 lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
                 lk(hc32, (NQ + 255) / 256, 256, pb + 10 * 256)
                 lk(hq6, (D + Q6G - 1) / Q6G, 512, pb + 11 * 256)
