@@ -397,6 +397,18 @@ main()<Int> -> {
                 hxp = get_fn(m6, "xperm6")
                 if (hxp != 0) { XPM = 1 ; rgp = "rgemv6(map,perm)" }
             }
+            // VYB_RGQ8=1: q8_1 activations + dp4a (gen_rgemv7.py); xq8 replaces xperm6 in the same XNP/H32P
+            // scratch (K int8 + K/32 f32 scales <= 4K bytes). NOT bit-identical; validated by KLD.
+            if ((env_get("VYB_RGQ8") else "") == "1") {
+                m7<Int> = load_mod(env_get("VYB_RG7PTX") else "native/build/rgemv7.ptx")
+                if (m7 == 0) { println("ERR load rgemv7") ; return 1 }
+                hi2 = get_fn(m7, "gemv_iq2s_q")
+                hi3 = get_fn(m7, "gemv_iq3s_q")
+                hxp = get_fn(m7, "xq8")
+                IRB = ITH / 32
+                XPM = 1
+                rgp = "rgemv7(q8_1,dp4a)"
+            }
         }
         println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string())
     }
