@@ -150,7 +150,7 @@ TYPES = {
 VDEQ = {"iq2s": None, "iq3s": None}  # filled below (--vdeq: vsub4 sign-folded IQ dequant)
 
 
-def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False):
+def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
     MI = BM // 32
     BOFF = BM * 144
     o = []
@@ -238,7 +238,17 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False):
     else:
         I("k0<Int> = 0")
         I("while (k0 < K) {")
-    if not PF:
+    if not PF and XH:
+        # --xh: X is f16 [S][K] (converted once by cvt_h): two 16-byte loads straight into the A fragment words
+        for pa in range(BM // 64):
+            for i in range(8):
+                I(f"xu{i}_{pa}<UInt32> = 0 as UInt32", 2)
+            I(f"if (arow + {64 * pa} < S) {{", 2)
+            I(f"xa{pa}<Int> = X + ((arow + {64 * pa}) * K + k0 + akq) * 2", 3)
+            for i in range(8):
+                I(f"xu{i}_{pa} = ld_v4_u32(xa{pa} + {16 * (i // 4)}, {i % 4})", 3)
+            I("}", 2)
+    elif not PF:
         for pa in range(BM // 64):
             for i in range(8):
                 I(f"xu{i}_{pa}<UInt32> = 0 as UInt32", 2)
@@ -250,6 +260,7 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False):
             for i in range(8):
                 I(f"xu{i}_{pa} = h2_pack(xf{2 * i}_{pa}, xf{2 * i + 1}_{pa})", 3)
             I("}", 2)
+    if not PF:
         for pa in range(BM // 64):
             I(f"st_shared_v4_u32(aso + {64 * 144 * pa}, xu0_{pa}, xu1_{pa}, xu2_{pa}, xu3_{pa})", 2)
             I(f"st_shared_v4_u32(aso + {64 * 144 * pa + 16}, xu4_{pa}, xu5_{pa}, xu6_{pa}, xu7_{pa})", 2)
@@ -378,8 +389,13 @@ if __name__ == "__main__":
         dq, rbx = TYPES[n]
         if "--vdeq" in sys.argv and n in VDEQ:
             dq = VDEQ[n]
-        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv, GSH="--gsh" in sys.argv))
+        out.append(gen(n, dq, rbx, BM=BM, PF="--pf" in sys.argv, GSH="--gsh" in sys.argv, XH="--xh" in sys.argv))
         out.append("")
+    if "--xh" in sys.argv:
+        out += ["// cvt_h: f32 -> f16 copy of a GEMM activation (once per producer, not once per N tile)",
+                "cvt_h(src<Int>, dst<Int>, n<Int>, z<Int>) -> {",
+                "    gid<Int> = blk_x() * dim_x() + tid_x()",
+                "    if (gid < n) { st_f16(dst + gid * 2, ld_f32(src + gid * 4)) }", "}", ""]
     if "--ds" in sys.argv or not names or not [a for a in sys.argv[1:] if not a.startswith("-")]:
         out.append(gen_delta_seq())
         out.append("")
