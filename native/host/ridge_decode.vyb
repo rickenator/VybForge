@@ -534,6 +534,15 @@ main()<Int> -> {
     dfq4<String> = "0"
     if (CCMAJ == 8) { dfq4 = "1" }
     if ((env_get("VYB_EXACT") else "") == "1") { dfq4 = "0" }
+    // VYB_Q8SK (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): GDN alpha+beta Q8_0 GEMVs as ONE split-K
+    // launch (rq80s.vyb gemv_q8_0_sk; one block per row). NOT bit-identical; validated by KLD.
+    Q8SK<Int> = 0 ; hq8s<Int> = 0
+    if ((env_get("VYB_Q8SK") else dfq4) == "1") {
+        mq8s<Int> = load_mod("native/build/rq80s.ptx")
+        if (mq8s == 0) { println("ERR load rq80s") ; return 1 }
+        hq8s = get_fn(mq8s, "gemv_q8_0_sk") ; Q8SK = 1
+        println("Q8_0_GEMV gdn alpha+beta split-K (rq80s)")
+    }
     if ((env_get("VYB_Q4Q8") else dfq4) == "1") {
         mq4q<Int> = load_mod("native/build/rq4kq.ptx")
         m7b<Int> = load_mod("native/build/rgemv7.ptx")
@@ -1141,8 +1150,10 @@ main()<Int> -> {
                     lk(hxq4, (D + 255) / 256, 256, PXNQ)
                     lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256)
                 } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
-                lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
-                lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
+                if (Q8SK == 1) { lk(hq8s, 2 * HV, 256, pb + 2 * 256) } else {
+                    lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
+                    lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
+                }
                 lk(hsg, 1, 64, pb + 4 * 256)
                 lk(hag, 1, 64, pb + 5 * 256)
                 lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)

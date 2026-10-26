@@ -1,0 +1,58 @@
+// rq80s.vyb (2026-10-26, Ridge 3090): split-K Q8_0 decode GEMV for the tiny GDN alpha/beta projections
+// (HV rows x K=D). The rgemv gemv_q8_0 runs one row per warp, so HV=48 rows is 3 blocks and the kernel is
+// pure latency (~19 us). Here one 256-thread block per row, 8 lanes per 32-value q8_0 block, and BOTH
+// projections in one launch: blocks [0,N) use the param block at p, [N,2N) the one at p + 256 (same N).
+// NOT bit-identical (different summation order); default only where VYB_EXACT is off, validated by KLD.
+gemv_q8_0_sk(p<Int>) -> {
+    b<Int> = blk_x()
+    N<Int> = ld_i64(p + 32)
+    q<Int> = p
+    n0<Int> = b
+    if (b >= N) {
+        q = p + 256
+        n0 = b - N
+    }
+    W<Int> = ld_i64(q + 0)
+    X<Int> = ld_i64(q + 8)
+    Y<Int> = ld_i64(q + 16)
+    K<Int> = ld_i64(q + 40)
+    YE<Int> = ld_i64(q + 48)
+    RS<Int> = ld_i64(q + 120)
+    t<Int> = tid_x()
+    nb<Int> = K / 32
+    rb<Int> = W + n0 * nb * 34
+    acc<Float32> = 0.0
+    j<Int> = t / 8
+    e<Int> = (t % 8) * 4
+    while (j < nb) {
+        bb<Int> = rb + j * 34
+        d<Float32> = ld_f16(bb)
+        qb<Int> = bb + 2 + e
+        xb<Int> = X + (j * 32 + e) * 4
+        x0<Float32> = ld_v4_f32(xb, 0)
+        x1<Float32> = ld_v4_f32(xb, 1)
+        x2<Float32> = ld_v4_f32(xb, 2)
+        x3<Float32> = ld_v4_f32(xb, 3)
+        pq<Float32> = x0 * ((ld_i8(qb + 0) as Int) as Float32)
+        pq = pq + x1 * ((ld_i8(qb + 1) as Int) as Float32)
+        pq = pq + x2 * ((ld_i8(qb + 2) as Int) as Float32)
+        pq = pq + x3 * ((ld_i8(qb + 3) as Int) as Float32)
+        acc = acc + d * pq
+        j = j + 32
+    }
+    acc = acc + shfl_xor_f32(acc, 16)
+    acc = acc + shfl_xor_f32(acc, 8)
+    acc = acc + shfl_xor_f32(acc, 4)
+    acc = acc + shfl_xor_f32(acc, 2)
+    acc = acc + shfl_xor_f32(acc, 1)
+    if (t % 32 == 0) { st_shared_f64(t / 32, acc as Float) }
+    kernel_barrier()
+    if (t == 0) {
+        s<Float> = ld_shared_f64(0) + ld_shared_f64(1) + ld_shared_f64(2) + ld_shared_f64(3)
+        s = s + ld_shared_f64(4) + ld_shared_f64(5) + ld_shared_f64(6) + ld_shared_f64(7)
+        if (YE == 4) { st_f32(Y + n0 * 4, s as Float32) } else {
+            if (RS != 0) { s = ld_f64(RS + n0 * 8) + s }
+            st_f64(Y + n0 * 8, s)
+        }
+    }
+}
