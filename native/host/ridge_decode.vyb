@@ -807,6 +807,10 @@ main()<Int> -> {
     // f32-compute chunk kernels (rpf32.vyb; GB10 f64 is slow): default with VYB_PFB, VYB_PFB64=1 = the f64 ones
     P32<Int> = 1
     if ((env_get("VYB_PFB64") else "").len() > 0) { P32 = 0 }
+    // gate/up GEMMs write f32 (LDY<0) for silu_f32: bit-identical (silu_b32 casts the f64 to f32); VYB_PFG32=0 off
+    GLDY<Int> = 0 - FF
+    if ((env_get("VYB_PFG32") else "") == "0" || P32 == 0) { GLDY = FF }
+    hsf32<Int> = 0
     hng32<Int> = 0 ; hsl32<Int> = 0
     // VYB_PFBM=64: every prefill GEMM on the 64-token tile (default: q6k/iq2s/iq3s on the 128 one)
     BIG<Int> = 128
@@ -843,7 +847,7 @@ main()<Int> -> {
             mp32<Int> = load_mod("native/build/rpf32.ptx")
             if (mp32 == 0) { println("ERR load rpf32 ptx") ; return 10 }
             hpds = get_fn(mp32, "delta_seq32") ; hpl2 = get_fn(mp32, "l2n_b32") ; hpat = get_fn(mp32, "attn_pf2")
-            hng32 = get_fn(mp32, "ng_b32") ; hsl32 = get_fn(mp32, "silu_b32")
+            hng32 = get_fn(mp32, "ng_b32") ; hsl32 = get_fn(mp32, "silu_b32") ; hsf32 = get_fn(mp32, "silu_f32")
             if (hng32 == 0 || hsl32 == 0) { return 10 }
         }
         if (hpg4 == 0 || hpgi3 == 0 || hpds == 0 || hpat == 0 || hpl2 == 0) { return 10 }
@@ -917,8 +921,8 @@ main()<Int> -> {
             qf<Int> = qb + 16 * 256
             put_i(qf, 0, XMb) ; put_i(qf, 8, panwv.get(L)) ; put_i(qf, 16, XNb) ; put_i(qf, 24, S) ; put_i(qf, 32, D) ; put_f(qf, 40, EPS) ; put_i(qf, 48, XN32b)
             tg2<Int> = fty.get(L * 3) ; tu2<Int> = fty.get(L * 3 + 1) ; td2<Int> = fty.get(L * 3 + 2)
-            set_gemm(qf + 256, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_gate.weight")) - RLO, xsel(bm_of(tg2, BIG), XN32b, XN16b), GRb, S, FF, D, FF, 0, grid_of(tg2, G2, G3), bm_of(tg2, BIG))
-            set_gemm(qf + 512, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_up.weight")) - RLO, xsel(bm_of(tu2, BIG), XN32b, XN16b), UPb, S, FF, D, FF, 0, grid_of(tu2, G2, G3), bm_of(tu2, BIG))
+            set_gemm(qf + 256, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_gate.weight")) - RLO, xsel(bm_of(tg2, BIG), XN32b, XN16b), GRb, S, FF, D, GLDY, 0, grid_of(tg2, G2, G3), bm_of(tg2, BIG))
+            set_gemm(qf + 512, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_up.weight")) - RLO, xsel(bm_of(tu2, BIG), XN32b, XN16b), UPb, S, FF, D, GLDY, 0, grid_of(tu2, G2, G3), bm_of(tu2, BIG))
             set_gemm(qf + 768, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_down.weight")) - RLO, xsel(bm_of(td2, BIG), H32b, H16b), XCb, S, D, FF, D, XMb, grid_of(td2, G2, G3), bm_of(td2, BIG))
         }
         dsync()
@@ -993,7 +997,7 @@ main()<Int> -> {
                 if (XHM == 1) { lk4(hcvh, (S * D + 255) / 256, 256, XN32b, XN16b, S * D, 0) }
                 lk(gemm_h(fty.get(L * 3), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF, bm_of(fty.get(L * 3), BIG)), 256, qf2 + 256)
                 lk(gemm_h(fty.get(L * 3 + 1), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF, bm_of(fty.get(L * 3 + 1), BIG)), 256, qf2 + 512)
-                if (P32 == 1) { lk4(hsl32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) }
+                if (P32 == 1 && GLDY < 0) { lk4(hsf32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { if (P32 == 1) { lk4(hsl32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } }
                 if (XHM == 1) { lk4(hcvh, (S * FF + 255) / 256, 256, H32b, H16b, S * FF, 0) }
                 lk(gemm_h(fty.get(L * 3 + 2), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, D, bm_of(fty.get(L * 3 + 2), BIG)), 256, qf2 + 768)
             }

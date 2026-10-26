@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate native/kernels/rpf_gemm.vyb: tiled tensor-core GEMMs that read packed GGUF weights in
 place (batched prefill).  Y[m, n] (f64, row stride LDY) = RS[m, n] + sum_k X[m, k] * W[n, k]
+(LDY < 0: Y is f32, row stride -LDY, RS ignored.)
 X: f32 [S][K] (16-byte aligned rows), W: packed rows of type T (Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S).
 Tile 64 (--bm128: 128) tokens x 128 outputs x 64 k, 256 threads = 8 warps (2 along M x 4 along N), each warp
 32x32 via mma.m16n8k16 (f16 in, f32 accumulate).  Shared: A [64][72] halves @0, B [128][72] @9216.
@@ -317,10 +318,15 @@ def gen(name, deq, rowbytes, BM=64, PF=False, GSH=False, XH=False):
                     col = f"n0 + wn * 32 + {ni * 8 + e} + t4 * 2"
                     I(f"cl{mi}{hh}{ni}{e}<Int> = {col}", 2)
                     I(f"if (cl{mi}{hh}{ni}{e} < N) {{", 2)
-                    I(f"yo{mi}{hh}{ni}{e}<Int> = (r{mi}{hh} * LDY + cl{mi}{hh}{ni}{e}) * 8", 3)
-                    I(f"yv{mi}{hh}{ni}{e}<Float> = c{mi}{ni}{2 * hh + e} as Float", 3)
-                    I(f"if (RS != 0) {{ yv{mi}{hh}{ni}{e} = yv{mi}{hh}{ni}{e} + ld_f64(RS + yo{mi}{hh}{ni}{e}) }}", 3)
-                    I(f"st_f64(Y + yo{mi}{hh}{ni}{e}, yv{mi}{hh}{ni}{e})", 3)
+                    # LDY < 0: Y is f32 with row stride -LDY (no RS); exact when the consumer casts f64 -> f32 anyway
+                    I("if (LDY < 0) {", 3)
+                    I(f"st_f32n(Y + (r{mi}{hh} * (0 - LDY) + cl{mi}{hh}{ni}{e}) * 4, c{mi}{ni}{2 * hh + e})", 4)
+                    I("} else {", 3)
+                    I(f"yo{mi}{hh}{ni}{e}<Int> = (r{mi}{hh} * LDY + cl{mi}{hh}{ni}{e}) * 8", 4)
+                    I(f"yv{mi}{hh}{ni}{e}<Float> = c{mi}{ni}{2 * hh + e} as Float", 4)
+                    I(f"if (RS != 0) {{ yv{mi}{hh}{ni}{e} = yv{mi}{hh}{ni}{e} + ld_f64(RS + yo{mi}{hh}{ni}{e}) }}", 4)
+                    I(f"st_f64(Y + yo{mi}{hh}{ni}{e}, yv{mi}{hh}{ni}{e})", 4)
+                    I("}", 3)
                     I("}", 2)
             I("}")
     o.append("}")

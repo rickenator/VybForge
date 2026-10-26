@@ -791,3 +791,13 @@ silu_b32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
     }
 }
 
+
+// silu_f32: silu(g)*u with f32 gate/up (GEMM LDY<0 outputs) -> f32; same maths as silu_b32
+silu_f32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float32> = ld_f32(g + gid * 4)
+        uv<Float32> = ld_f32(u + gid * 4)
+        st_f32n(h + gid * 4, gv * uv / ((1.0 as Float32) + ex2_f32(gv * (-1.4426950408889634 as Float32))))
+    }
+}
