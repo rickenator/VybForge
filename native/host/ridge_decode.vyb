@@ -196,6 +196,18 @@ is_iq(ty<Int>)<Int> -> {
     if (ty == 22) { return 1 }
     return 0
 }
+// VYB_RGQ8: does a tensor of type ty read q8_1 activations (IQ2_S always, IQ3_S only with VYB_RGQ8_IQ3)?
+uses_q8(ty<Int>, q3<Int>)<Int> -> {
+    if (ty == 22) { return 1 }
+    if (ty == 21 && q3 == 1) { return 1 }
+    return 0
+}
+// does it read the xperm6-permuted f32 copy (an IQ type not on the q8_1 path)?
+perm_x(ty<Int>, q8<Int>, q3<Int>)<Int> -> {
+    if (is_iq(ty) == 0) { return 0 }
+    if (q8 == 1 && uses_q8(ty, q3) == 1) { return 0 }
+    return 1
+}
 // one GEMV param block (gemv_q4k layout + GRID@128), single segment
 set_gemv(pb<Int>, W<Int>, X<Int>, Y<Int>, N<Int>, K<Int>, YE<Int>, RS<Int>, G<Int>) -> {
     put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, 1)
@@ -346,6 +358,7 @@ main()<Int> -> {
     // VYB_XPERM=1 (with an xperm-capable VYB_RGPTX, gen_rgemv2.py ... 1 1): IQ GEMVs read a permuted
     // copy of x so every x load is a coalesced 128 B line.
     XPM<Int> = 0
+    RQ8<Int> = 0 ; RQ83<Int> = 0 ; hxq<Int> = 0
     hxp<Int> = 0
     ITH<Int> = 512
     IRB<Int> = 16 * RK2
@@ -397,17 +410,22 @@ main()<Int> -> {
                 hxp = get_fn(m6, "xperm6")
                 if (hxp != 0) { XPM = 1 ; rgp = "rgemv6(map,perm)" }
             }
-            // VYB_RGQ8=1: q8_1 activations + dp4a (gen_rgemv7.py); xq8 replaces xperm6 in the same XNP/H32P
-            // scratch (K int8 + K/32 f32 scales <= 4K bytes). NOT bit-identical; validated by KLD.
+            // VYB_RGQ8=1: q8_1 activations + dp4a (gen_rgemv7.py) for IQ2_S; IQ3_S stays on rgemv6 (its
+            // dp4a variant is slower, 243 vs 227 us) unless VYB_RGQ8_IQ3=1. xq8 writes XNQ/H32Q (K int8 then
+            // K/32 f32 scales). NOT bit-identical; validated by KLD.
             if ((env_get("VYB_RGQ8") else "") == "1") {
                 m7<Int> = load_mod(env_get("VYB_RG7PTX") else "native/build/rgemv7.ptx")
                 if (m7 == 0) { println("ERR load rgemv7") ; return 1 }
                 hi2 = get_fn(m7, "gemv_iq2s_q")
-                hi3 = get_fn(m7, "gemv_iq3s_q")
-                hxp = get_fn(m7, "xq8")
+                hxq = get_fn(m7, "xq8")
                 IRB = ITH / 32
-                XPM = 1
-                rgp = "rgemv7(q8_1,dp4a)"
+                RQ8 = 1
+                rgp = rgp + "+rgemv7(q8_1,dp4a iq2s)"
+                if ((env_get("VYB_RGQ8_IQ3") else "") == "1") {
+                    hi3 = get_fn(m7, "gemv_iq3s_q")
+                    RQ83 = 1
+                    rgp = rgp + "+iq3s"
+                }
             }
         }
         println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string())
@@ -584,6 +602,9 @@ main()<Int> -> {
     XNP<Int> = dalloc(D * 4) ; H32P<Int> = dalloc(FF * 4) ; PXN<Int> = dalloc(256) ; PXH<Int> = dalloc(256)
     put_i(PXN, 0, XN32) ; put_i(PXN, 8, XNP) ; put_i(PXN, 16, D)
     put_i(PXH, 0, H32) ; put_i(PXH, 8, H32P) ; put_i(PXH, 16, FF)
+    XNQ<Int> = dalloc(D * 2) ; H32Q<Int> = dalloc(FF * 2) ; PXNQ<Int> = dalloc(256) ; PXHQ<Int> = dalloc(256)
+    put_i(PXNQ, 0, XN32) ; put_i(PXNQ, 8, XNQ) ; put_i(PXNQ, 16, D)
+    put_i(PXHQ, 0, H32) ; put_i(PXHQ, 8, H32Q) ; put_i(PXHQ, 16, FF)
     LOGB<Int> = dalloc(VOCAB * 8) ; NCH<Int> = (VOCAB + 255) / 256
     PV<Int> = dalloc(NCH * 8) ; PI<Int> = dalloc(NCH * 8) ; OUTI<Int> = dalloc(8)
     SCLV<Float> = 1.0 / sqrt(SS as Float)
@@ -629,6 +650,11 @@ main()<Int> -> {
             if (is_iq(tyv.get(ig)) == 1) { xg = XNP }
             if (is_iq(tyv.get(iu)) == 1) { xu = XNP }
             if (is_iq(tyv.get(idn)) == 1) { xd = H32P }
+        }
+        if (RQ8 == 1) {
+            if (uses_q8(tyv.get(ig), RQ83) == 1) { xg = XNQ }
+            if (uses_q8(tyv.get(iu), RQ83) == 1) { xu = XNQ }
+            if (uses_q8(tyv.get(idn), RQ83) == 1) { xd = H32Q }
         }
         set_gemv(pfn + 256, RBA + ofv.get(ig) - RLO, xg, GR, FF, D, 8, 0, grid_of(tyv.get(ig), G2, G3))
         set_gemv(pfn + 512, RBA + ofv.get(iu) - RLO, xu, UP, FF, D, 8, 0, grid_of(tyv.get(iu), G2, G3))
@@ -999,7 +1025,10 @@ main()<Int> -> {
             tg<Int> = fty.get(L * 3) ; tu<Int> = fty.get(L * 3 + 1) ; tdn<Int> = fty.get(L * 3 + 2)
             lk(hrms, 1, 256, pfb)
             if (XPM == 1) {
-                if (is_iq(tg) + is_iq(tu) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
+                if (perm_x(tg, RQ8, RQ83) + perm_x(tu, RQ8, RQ83) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
+            }
+            if (RQ8 == 1) {
+                if (uses_q8(tg, RQ83) + uses_q8(tu, RQ83) > 0) { lk(hxq, (D + 255) / 256, 256, PXNQ) }
             }
             fgu<Int> = 0
             if (FUS == 1 && tg == tu && is_iq(tg) == 1) { fgu = 1 }
@@ -1013,7 +1042,10 @@ main()<Int> -> {
             }
             lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF)
             if (XPM == 1) {
-                if (is_iq(tdn) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
+                if (perm_x(tdn, RQ8, RQ83) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
+            }
+            if (RQ8 == 1) {
+                if (uses_q8(tdn, RQ83) == 1) { lk(hxq, (FF + 255) / 256, 256, PXHQ) }
             }
             lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, IRB, Q4G, Q6G), gemv_t(tdn, ITH), pfb + 768)
         }
