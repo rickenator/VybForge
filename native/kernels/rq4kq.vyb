@@ -1,0 +1,89 @@
+// Ridge Q4_K decode GEMV on q8_1 activations with dp4a (opt-in, VYB_Q4Q8=1; not bit-exact -> KLD-checked).
+// Same row/lane layout and param block as gemv_q4k_v (rq4k.vyb): 16 warps x 1 row, lane l owns the 4 qs
+// bytes at 16 + 4l of each super-block (8 values: 4 of sub-block 2t, 4 of 2t+1, t = l / 8).  X here is the
+// xq8 layout: K int8 then K/32 f32 scales.  Per sub-block: d*sc*dx*dot(q, xq) - dmin*m*dx*sum(xq).
+// Q4_K layout from ggml-quants.c (MIT, see THIRD-PARTY.md).
+
+gemv_q4k_q(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    n0<Int> = blk_x() * 16 + tid / 32
+    NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
+    nsb<Int> = K / 256
+    t<Int> = l / 8
+    l4<Int> = l * 4
+    sh<UInt32> = ((t % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((t / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - t / 2) as UInt32)
+    one4<UInt32> = 16843009 as UInt32
+    m4<UInt32> = 252645135 as UInt32
+    acc0<Float32> = 0.0
+    if (n0 < N) {
+        xq<Int> = X + t * 64 + (l % 8) * 4
+        xs<Int> = X + K + (2 * t) * 4
+        rb0<Int> = W + n0 * nsb * 144
+        sb<Int> = 0
+        while (sb < nsb) {
+            bb<Int> = rb0 + sb * 144
+            df0<Float32> = ld_f16(bb)
+            mnf0<Float32> = ld_f16(bb + 2)
+            ba0<UInt32> = ld_u32(bb + 4)
+            bc0<UInt32> = ld_u32(bb + 8)
+            be0<UInt32> = ld_u32(bb + 12)
+            qw0<UInt32> = ld_u32(bb + 16 + l4)
+            xl<UInt32> = ld_u32(xq + sb * 256)
+            xh<UInt32> = ld_u32(xq + sb * 256 + 32)
+            dxl<Float32> = ld_f32(xs + sb * 32)
+            dxh<Float32> = ld_f32(xs + sb * 32 + 4)
+            b00<UInt32> = ba0 >> sh
+            b10<UInt32> = bc0 >> sh
+            b20<UInt32> = be0 >> sh
+            sc00<UInt32> = ((b00 & 63) & nmk) | (((b20 & 15) | (((b00 >> 6) & 3) << 4)) & mk)
+            m00<UInt32> = ((b10 & 63) & nmk) | ((((b20 >> 4) & 15) | (((b10 >> 6) & 3) << 4)) & mk)
+            sc10<UInt32> = (((b00 >> 8) & 63) & nmk) | ((((b20 >> 8) & 15) | (((b00 >> 14) & 3) << 4)) & mk)
+            m10<UInt32> = (((b10 >> 8) & 63) & nmk) | ((((b20 >> 12) & 15) | (((b10 >> 14) & 3) << 4)) & mk)
+            dl<CInt> = dp4a_s32(qw0 & m4, xl, 0)
+            dh<CInt> = dp4a_s32((qw0 >> 4) & m4, xh, 0)
+            sl<CInt> = dp4a_s32(one4, xl, 0)
+            shh<CInt> = dp4a_s32(one4, xh, 0)
+            acc0 = acc0 + dxl * (df0 * (sc00 as Float32) * (dl as Float32) - mnf0 * (m00 as Float32) * (sl as Float32))
+            acc0 = acc0 + dxh * (df0 * (sc10 as Float32) * (dh as Float32) - mnf0 * (m10 as Float32) * (shh as Float32))
+            sb = sb + 1
+        }
+        s0<Float> = acc0 as Float
+        s0 = s0 + shfl_down_f64(s0, 16)
+        s0 = s0 + shfl_down_f64(s0, 8)
+        s0 = s0 + shfl_down_f64(s0, 4)
+        s0 = s0 + shfl_down_f64(s0, 2)
+        s0 = s0 + shfl_down_f64(s0, 1)
+        if (l == 0) {
+            if (YE == 4) { st_f32(Y + n0 * 4, s0 as Float32) } else {
+                if (RS != 0) { s0 = ld_f64(RS + n0 * 8) + s0 }
+                st_f64(Y + n0 * 8, s0)
+            }
+        }
+    }
+}

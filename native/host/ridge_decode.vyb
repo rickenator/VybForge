@@ -448,6 +448,16 @@ main()<Int> -> {
         Q4G = 16 * parse_u(q4r, 0, q4r.len())
         println("Q4K_GEMV ptx=" + q4p + " rows_per_block=" + Q4G.to_string())
     }
+    // VYB_Q4Q8=1: the GDN Q4_K decode GEMVs (qkv+gate, ssm_out) on q8_1 activations + dp4a (rq4kq.vyb,
+    // xq8 from rgemv7). NOT bit-identical; validated by KLD.
+    Q4Q8<Int> = 0 ; hq4q<Int> = 0 ; hxq4<Int> = 0
+    if ((env_get("VYB_Q4Q8") else "") == "1") {
+        mq4q<Int> = load_mod("native/build/rq4kq.ptx")
+        m7b<Int> = load_mod("native/build/rgemv7.ptx")
+        if (mq4q == 0 || m7b == 0) { println("ERR load rq4kq / rgemv7") ; return 1 }
+        hq4q = get_fn(mq4q, "gemv_q4k_q") ; hxq4 = get_fn(m7b, "xq8") ; Q4Q8 = 1
+        println("Q4K_GEMV gdn=q8_1 dp4a (rq4kq)")
+    }
     // VYB_Q6KPTX: Q6_K decode GEMV gemv_q6k_v (gen_rq6k.py R D; default rq6k.ptx = gen_rq6k.py 1 2: 1 row/warp,
     // 2-deep prefetch, shuffle reduction; bit-identical to qwen3 gemv_q6k). VYB_Q6KR = rows per warp.
     // VYB_Q6KPTX=none = qwen3.ptx gemv_q6k (32 rows/block).
@@ -610,6 +620,8 @@ main()<Int> -> {
     XNQ<Int> = dalloc(D * 2) ; H32Q<Int> = dalloc(FF * 2) ; PXNQ<Int> = dalloc(256) ; PXHQ<Int> = dalloc(256)
     put_i(PXNQ, 0, XN32) ; put_i(PXNQ, 8, XNQ) ; put_i(PXNQ, 16, D)
     put_i(PXHQ, 0, H32) ; put_i(PXHQ, 8, H32Q) ; put_i(PXHQ, 16, FF)
+    EQ<Int> = dalloc(VAL * 2) ; PEQ<Int> = dalloc(256)
+    put_i(PEQ, 0, E32) ; put_i(PEQ, 8, EQ) ; put_i(PEQ, 16, VAL)
     LOGB<Int> = dalloc(VOCAB * 8) ; NCH<Int> = (VOCAB + 255) / 256
     PV<Int> = dalloc(NCH * 8) ; PI<Int> = dalloc(NCH * 8) ; OUTI<Int> = dalloc(8)
     SCLV<Float> = 1.0 / sqrt(SS as Float)
@@ -687,6 +699,7 @@ main()<Int> -> {
             // 1: qkv + gate (2 segments)
             p1<Int> = pb0 + 256
             set_gemv(p1, RBA + ofv.get(iqkv) - RLO, XN32, QKVX, QKV, D, 8, 0, 0)
+            if (Q4Q8 == 1) { put_i(p1, 8, XNQ) }
             put_i(p1, 56, RBA + ofv.get(iga) - RLO) ; put_i(p1, 64, VAL) ; put_i(p1, 72, ZB) ; put_i(p1, 80, 8)
             set_gemv(pb0 + 2 * 256, RBA + ofv.get(ibe) - RLO, XN32, BRAW, HV, D, 8, 0, 0)
             set_gemv(pb0 + 3 * 256, RBA + ofv.get(ial) - RLO, XN32, ARAW, HV, D, 8, 0, 0)
@@ -718,6 +731,7 @@ main()<Int> -> {
             p14<Int> = pb0 + 14 * 256
             put_i(p14, 0, EPI) ; put_i(p14, 8, E32) ; put_i(p14, 16, VAL)
             set_gemv(pb0 + 15 * 256, RBA + ofv.get(iou) - RLO, E32, XM, D, VAL, 8, XC, 0)
+            if (Q4Q8 == 1) { put_i(pb0 + 15 * 256, 8, EQ) }
         } else {
             aidx.push(na)
             iq<Int> = find_nm(nmv, pf + "attn_q.weight") ; ik<Int> = find_nm(nmv, pf + "attn_k.weight") ; iv<Int> = find_nm(nmv, pf + "attn_v.weight")
@@ -1002,7 +1016,10 @@ main()<Int> -> {
             pb<Int> = pbase.get(L)
             lk(hrms, 1, 256, pb)
             if (kind.get(L) == 1) {
-                lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256)
+                if (Q4Q8 == 1) {
+                    lk(hxq4, (D + 255) / 256, 256, PXNQ)
+                    lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256)
+                } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
                 lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
                 lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
                 lk(hsg, 1, 64, pb + 4 * 256)
@@ -1024,7 +1041,10 @@ main()<Int> -> {
                     lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
                 }
                 lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
-                lk(hq4, (D + Q4G - 1) / Q4G, 512, pb + 15 * 256)
+                if (Q4Q8 == 1) {
+                    lk(hxq4, (VAL + 255) / 256, 256, PEQ)
+                    lk(hq4q, (D + 15) / 16, 512, pb + 15 * 256)
+                } else { lk(hq4, (D + Q4G - 1) / Q4G, 512, pb + 15 * 256) }
             } else {
                 a<Int> = aidx.get(L)
                 KC2<Int> = KCv.get(a) ; VC2<Int> = VCv.get(a)
