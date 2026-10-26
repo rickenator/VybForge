@@ -529,8 +529,12 @@ main()<Int> -> {
     }
     // VYB_Q4Q8=1: the GDN Q4_K decode GEMVs (qkv+gate, ssm_out) on q8_1 activations + dp4a (rq4kq.vyb,
     // xq8 from rgemv7). NOT bit-identical; validated by KLD.
+    // 2026-10-26 RTX 3090: default on CC major 8 (tg128 26.9 -> 28.4, KLD 0.00394, ppl 3.2437); =0 or VYB_EXACT=1 off.
     Q4Q8<Int> = 0 ; hq4q<Int> = 0 ; hxq4<Int> = 0
-    if ((env_get("VYB_Q4Q8") else "") == "1") {
+    dfq4<String> = "0"
+    if (CCMAJ == 8) { dfq4 = "1" }
+    if ((env_get("VYB_EXACT") else "") == "1") { dfq4 = "0" }
+    if ((env_get("VYB_Q4Q8") else dfq4) == "1") {
         mq4q<Int> = load_mod("native/build/rq4kq.ptx")
         m7b<Int> = load_mod("native/build/rgemv7.ptx")
         if (mq4q == 0 || m7b == 0) { println("ERR load rq4kq / rgemv7") ; return 1 }
