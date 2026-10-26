@@ -231,6 +231,11 @@ bm_of(ty<Int>, BIG<Int>)<Int> -> {
     return 64
 }
 // f16 activation buffer for the 128-token GEMMs under VYB_PFXH (x16 == x32 otherwise)
+q4x(f<Int>, a<Int>, b<Int>)<Int> -> {
+    if (f == 1) { return b }
+    return a
+}
+
 xsel(bm<Int>, x32<Int>, x16<Int>)<Int> -> {
     if (bm == 128) { return x16 }
     return x32
@@ -822,6 +827,9 @@ main()<Int> -> {
     XHM<Int> = 0
     if (BIG == 128) { XHM = 1 ; PQB = 64 }
     if ((env_get("VYB_PFXH") else "") == "0") { XHM = 0 ; PQB = BIG }
+    // GDN q4k projections on the 128 f16 tile (XN16b / E16b converted per layer); default with XHM, VYB_PFQ4H=0 off
+    Q4H<Int> = 0
+    if (XHM == 1 && (env_get("VYB_PFQ4H") else "") != "0") { Q4H = 1 ; PQB = 128 }
     hcvh<Int> = 0
     XN32b<Int> = 0 ; GRb<Int> = 0 ; UPb<Int> = 0 ; H32b<Int> = 0
     XN16b<Int> = 0 ; E16b<Int> = 0 ; H16b<Int> = 0 ; E32o<Int> = 0
@@ -870,8 +878,8 @@ main()<Int> -> {
             put_i(qb, 0, XCb) ; put_i(qb, 8, anwv.get(L)) ; put_i(qb, 16, XNb) ; put_i(qb, 24, S) ; put_i(qb, 32, D) ; put_f(qb, 40, EPS) ; put_i(qb, 48, XN32b)
             if (kind.get(L) == 1) {
                 CWl<Int> = l1v.get(L) ; SNWl<Int> = l2v.get(L) ; DTWl<Int> = l3v.get(L) ; SAWl<Int> = l4v.get(L) ; STLl<Int> = l5v.get(L) ; CVLl<Int> = l6v.get(L)
-                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_qkv.weight")) - RLO, XN32b, QKVXb, S, QKV, D, QKV, 0, 0, PQB)
-                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_gate.weight")) - RLO, XN32b, ZBb, S, VAL, D, VAL, 0, 0, PQB)
+                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_qkv.weight")) - RLO, q4x(Q4H, XN32b, XN16b), QKVXb, S, QKV, D, QKV, 0, 0, PQB)
+                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_gate.weight")) - RLO, q4x(Q4H, XN32b, XN16b), ZBb, S, VAL, D, VAL, 0, 0, PQB)
                 set_gemm(qb + 3 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_beta.weight")) - RLO, XN32b, BRAWb, S, HV, D, HV, 0, 0, 64)
                 set_gemm(qb + 4 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_alpha.weight")) - RLO, XN32b, ARAWb, S, HV, D, HV, 0, 0, 64)
                 q5<Int> = qb + 5 * 256
@@ -894,7 +902,7 @@ main()<Int> -> {
                 if (P32 == 1) { put_i(q11, 24, E32b) }
                 q12<Int> = qb + 12 * 256
                 put_i(q12, 0, EPIb) ; put_i(q12, 8, E32b) ; put_i(q12, 16, S * VAL)
-                set_gemm(qb + 13 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_out.weight")) - RLO, E32b, XMb, S, D, VAL, D, XCb, 0, PQB)
+                set_gemm(qb + 13 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_out.weight")) - RLO, q4x(Q4H, E32b, E16b), XMb, S, D, VAL, D, XCb, 0, PQB)
             } else {
                 a2<Int> = aidx.get(L)
                 KCl<Int> = KCv.get(a2) ; VCl<Int> = VCv.get(a2)
@@ -959,6 +967,7 @@ main()<Int> -> {
                 qb2<Int> = PB2 + L * 32 * 256
                 lk(hrms, S, 256, qb2)
                 if (kind.get(L) == 1) {
+                    if (Q4H == 1) { lk4(hcvh, (S * D + 255) / 256, 256, XN32b, XN16b, S * D, 0) }
                     lk(hpg4, gemm_grid(S, QKV, PQB), 256, qb2 + 256)
                     lk(hpg4, gemm_grid(S, VAL, PQB), 256, qb2 + 2 * 256)
                     lk(hpg8, gemm_grid(S, HV, 64), 256, qb2 + 3 * 256)
@@ -977,6 +986,7 @@ main()<Int> -> {
                         lk(hngb, S * HV, SS, qb2 + 11 * 256)
                         lk(hc32, (S * VAL + 255) / 256, 256, qb2 + 12 * 256)
                     }
+                    if (Q4H == 1) { lk4(hcvh, (S * VAL + 255) / 256, 256, E32o, E16b, S * VAL, 0) }
                     lk(hpg4, gemm_grid(S, D, PQB), 256, qb2 + 13 * 256)
                 } else {
                     lk(hpg5, gemm_grid(S, 2 * NQ, 64), 256, qb2 + 256)
