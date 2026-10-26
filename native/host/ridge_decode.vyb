@@ -477,7 +477,9 @@ main()<Int> -> {
     // 2-deep prefetch, shuffle reduction; bit-identical to qwen3 gemv_q6k). VYB_Q6KR = rows per warp.
     // VYB_Q6KPTX=none = qwen3.ptx gemv_q6k (32 rows/block).
     Q6G<Int> = 32
-    q6p<String> = env_get("VYB_Q6KPTX") else "native/build/rq6k.ptx"
+    // Default now rq6k8.ptx (gen_rq6k8.py rq6k8.vyb 4 1): same lane map/arithmetic (bit-identical) with the row
+    // streamed as coalesced u32 loads + shfl_idx extract, 318 vs 385 us/call. VYB_Q6KPTX=native/build/rq6k.ptx = previous.
+    q6p<String> = env_get("VYB_Q6KPTX") else "native/build/rq6k8.ptx"
     if (q6p != "none") {
         mq6v<Int> = load_mod(q6p)
         if (mq6v == 0) { println("ERR load " + q6p) ; return 1 }
