@@ -26,6 +26,81 @@ rax_mx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     }
 }
 
+// warp-parallel row max (max is exact in any order): one 32-thread block per row
+rax_mx2(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gsh<Int> = blk_x()
+    lane<Int> = tid_x()
+    s<Int> = gsh / H
+    h<Int> = gsh % H
+    n<Int> = P0 + s + 1
+    sb<Int> = SC + (s * H + h) * T * 8
+    mx<Float> = -1000000000000000000000000000000.0
+    ta<Int> = lane
+    while (ta < n) {
+        sc<Float> = ld_f64(sb + ta * 8)
+        if (sc > mx) { mx = sc }
+        ta = ta + 32
+    }
+    o<Float> = shfl_down_f64(mx, 16)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 8)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 4)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 2)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 1)
+    if (o > mx) { mx = o }
+    if (lane == 0) { st_f64(M + gsh * 16, mx) }
+}
+
+// rax_sum with the loads batched 8 ahead; adds stay sequential in tb order
+rax_sum8(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    gsh<Int> = blk_x() * dim_x() + tid_x()
+    if (gsh < S * H) {
+        s<Int> = gsh / H
+        h<Int> = gsh % H
+        n<Int> = P0 + s + 1
+        sb<Int> = SC + (s * H + h) * T * 8
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        while (tb + 8 <= n) {
+            a<Int> = sb + tb * 8
+            v0<Float> = ld_f64(a)
+            v1<Float> = ld_f64(a + 8)
+            v2<Float> = ld_f64(a + 16)
+            v3<Float> = ld_f64(a + 24)
+            v4<Float> = ld_f64(a + 32)
+            v5<Float> = ld_f64(a + 40)
+            v6<Float> = ld_f64(a + 48)
+            v7<Float> = ld_f64(a + 56)
+            ssum = ssum + v0
+            ssum = ssum + v1
+            ssum = ssum + v2
+            ssum = ssum + v3
+            ssum = ssum + v4
+            ssum = ssum + v5
+            ssum = ssum + v6
+            ssum = ssum + v7
+            tb = tb + 8
+        }
+        while (tb < n) {
+            ssum = ssum + ld_f64(sb + tb * 8)
+            tb = tb + 1
+        }
+        st_f64(M + gsh * 16 + 8, ssum)
+    }
+}
+
 rax_e(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     S<Int> = ld_i64(p + 184)
     H<Int> = ld_i64(p + 208)
