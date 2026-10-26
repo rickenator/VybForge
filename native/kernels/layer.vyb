@@ -886,10 +886,21 @@ rms_blk(p<Int>) -> {
     st_shared_f64(t, ss)
     kernel_barrier()
     st2<Int> = 128
-    while (st2 > 0) {
+    # strides 128/64/32 through shared, 16..1 by warp shuffle: lane t adds lane t+st exactly as the
+    # shared tree did (same pairs, same order) -> bit-identical, 5 fewer block barriers (2026-10-26).
+    while (st2 > 16) {
         if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
         kernel_barrier()
         st2 = st2 / 2
+    }
+    if (t < 32) {
+        sw<Float> = ld_shared_f64(t)
+        sw = sw + shfl_down_f64(sw, 16)
+        sw = sw + shfl_down_f64(sw, 8)
+        sw = sw + shfl_down_f64(sw, 4)
+        sw = sw + shfl_down_f64(sw, 2)
+        sw = sw + shfl_down_f64(sw, 1)
+        if (t == 0) { st_shared_f64(0, sw) }
     }
     if (t == 0) {
         # Seeded Newton (Ursela): vsqrt(x, 24) from y0=x is 24 dependent f64 divides on one thread
