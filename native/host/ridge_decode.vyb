@@ -1,0 +1,582 @@
+// Ridge (qwen35 27B) RESIDENT greedy decode, Vyb-native: GDN + gated attention + IQ2_S/IQ3_S FFN.
+// The GGUF's tensor region is uploaded ONCE, packed, into one device buffer (12.6 GB); every
+// projection is a fused dequant GEMV that reads the packed bytes in place (qwen3.vyb gemv_q4k /
+// gemv_q6k, rgemv.vyb gemv_q5k / gemv_q8_0 / gemv_iq2s / gemv_iq3s). Activations stay f64 as in
+// the verified prefill driver (model_driver.vyb); GEMV inputs are f32 copies (rms_blk's Y32 /
+// cast32 / silu32) and outputs f64. KV cache f64 [MAXS, NKV] per attention layer, delta-net
+// state f64 [Hv, S, S] per GDN layer updated in place (delta_step_b), conv window per GDN layer.
+// The prompt is fed token by token through the same decode step (no batched prefill yet).
+// Env: VYB_MODEL, VYB_TSV, VYB_INVFREQ, VYB_LLM_DIR, VYB_PROMPT, VYB_PROMPT_IDS, VYB_GEN (16),
+//      VYB_MAXS (2048).
+import io::{open_read, read_at, read_all, close}
+import llm::{llm_load, llm_decode, llm_encode}
+import vllm::{Model}
+import env::{env_get}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
+    cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) {
+        if ((s.char_at(i) as Int) == nd) { return i }
+    }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+parse_ids(s<String>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec()
+    n<Int> = s.len()
+    cur<Int> = -1
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) {
+                if (cur < 0) { cur = 0 }
+                cur = cur * 10 + (c - 48)
+            }
+        } else {
+            if (cur >= 0) { v.push(cur) ; cur = -1 }
+        }
+    }
+    if (cur >= 0) { v.push(cur) }
+    return v
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1
+    seg<Int> = frm
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        if ((s.char_at(i) as Int) == 120) {
+            n = n * parse_u(s, seg, i)
+            seg = i + 1
+        }
+    }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 13) { return numel * 176 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    if (ty == 22) { return numel * 82 / 256 }
+    if (ty == 21) { return numel * 110 / 256 }
+    if (ty == 8) { return numel * 34 / 32 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (nmv.get(i) == nm) { return i }
+    }
+    return -1
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
+        return 0
+    }
+    return 0
+}
+dalloc(n<Int>)<Int> -> {
+    dp<Int> = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(dp), n) != 0) { return 0 }
+        cuMemsetD8_v2(dp, 0, n)
+    }
+    return dp
+}
+dsync() -> {
+    freedom { cuCtxSynchronize() }
+}
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+load_mod(path<String>)<Int> -> {
+    img<String> = read_bin(path)
+    if (img.len() < 16) { return 0 }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), img) != 0) { return 0 }
+        return addr(m)
+    }
+    return 0
+}
+get_fn(mi<Int>, nm<String>)<Int> -> {
+    freedom {
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), from<loc<CVoid>>(mi), nm) != 0) { println("NO_KERNEL " + nm); return 0 }
+        return addr(f)
+    }
+    return 0
+}
+lk(h<Int>, gx<Int>, bx<Int>, p<Int>)<Int> -> {
+    freedom {
+        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, p, 0, 0, 0) != 0) { return 1 }
+    }
+    if ((env_get("VYB_DBG") else "").len() > 0) {
+        t0<Int> = time_mono_millis()
+        freedom {
+            rc<CInt> = cuCtxSynchronize()
+            println("DBG h=" + h.to_string() + " p=" + p.to_string() + " grid=" + gx.to_string() + " rc=" + (rc as Int).to_string() + " ms=" + (time_mono_millis() - t0).to_string())
+        }
+    }
+    return 0
+}
+lk4(h<Int>, gx<Int>, bx<Int>, a0<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    freedom {
+        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, a0, a1, a2, a3) != 0) { return 1 }
+        return 0
+    }
+    return 0
+}
+// one GEMV param block (gemv_q4k layout + GRID@128), single segment
+set_gemv(pb<Int>, W<Int>, X<Int>, Y<Int>, N<Int>, K<Int>, YE<Int>, RS<Int>, G<Int>) -> {
+    put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, 1)
+    put_i(pb, 32, N) ; put_i(pb, 40, K) ; put_i(pb, 48, YE)
+    put_i(pb, 56, 0) ; put_i(pb, 64, 0) ; put_i(pb, 72, 0) ; put_i(pb, 80, 8)
+    put_i(pb, 88, 0) ; put_i(pb, 96, 0) ; put_i(pb, 104, 0) ; put_i(pb, 112, 8)
+    put_i(pb, 120, RS) ; put_i(pb, 128, G)
+}
+// kernel handle / grid for a weight type (packed GEMV): q4k/q6k take 2 rows per warp
+gemv_h(ty<Int>, hq4<Int>, hq6<Int>, hq5<Int>, hq8<Int>, hi2<Int>, hi3<Int>)<Int> -> {
+    if (ty == 12) { return hq4 }
+    if (ty == 14) { return hq6 }
+    if (ty == 13) { return hq5 }
+    if (ty == 8) { return hq8 }
+    if (ty == 22) { return hi2 }
+    if (ty == 21) { return hi3 }
+    return 0
+}
+gemv_g(ty<Int>, N<Int>)<Int> -> {
+    if (ty == 12) { return (N + 31) / 32 }
+    if (ty == 14) { return (N + 31) / 32 }
+    return (N + 15) / 16
+}
+grid_of(ty<Int>, g2<Int>, g3<Int>)<Int> -> {
+    if (ty == 22) { return g2 }
+    if (ty == 21) { return g3 }
+    return 0
+}
+
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "/home/rick"
+    MODEL<String> = env_get("VYB_MODEL") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
+    TSV<String> = env_get("VYB_TSV") else "native/out/ridge_tensors.tsv"
+    FIP<String> = env_get("VYB_INVFREQ") else "native/out/ridge_invfreq.bin"
+    TOKDIR<String> = env_get("VYB_LLM_DIR") else "artifacts/ridge-tokenizer"
+    GEN<Int> = parse_u(env_get("VYB_GEN") else "16", 0, (env_get("VYB_GEN") else "16").len())
+    MAXS<Int> = parse_u(env_get("VYB_MAXS") else "2048", 0, (env_get("VYB_MAXS") else "2048").len())
+    D<Int> = 5120 ; H<Int> = 24 ; KVH<Int> = 4 ; HD<Int> = 256 ; FF<Int> = 17408
+    NQ<Int> = 6144 ; NKV<Int> = 1024 ; VOCAB<Int> = 248320 ; NL<Int> = 64
+    EPS<Float> = 0.000001
+    SS<Int> = 128 ; HK<Int> = 16 ; HV<Int> = 48 ; DC<Int> = 4 ; QKV<Int> = 10240 ; GKEY<Int> = 2048 ; VAL<Int> = 6144
+
+    tok<Model> = llm_load("qwen3", TOKDIR)
+    prids<Vec<Int>> = Vec()
+    pids<String> = env_get("VYB_PROMPT_IDS") else ""
+    pstr<String> = env_get("VYB_PROMPT") else "The capital of France is"
+    if (pids.len() > 0) { prids = parse_ids(pids) } else { prids = llm_encode(tok, pstr) }
+    NP<Int> = prids.len()
+    pl<String> = ""
+    pi<Int> = 0
+    for (pi in 0..NP - 1) { pl = pl + " " + prids.get(pi).to_string() }
+    println("PROMPT_SRC=<" + pstr + "> PROMPT_N=" + NP.to_string() + " PROMPT_IDS=" + pl)
+    if (NP + GEN > MAXS) { println("ERR prompt+gen exceeds VYB_MAXS"); return 2 }
+
+    // ---- tensor index ----
+    nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+    bff<String> = read_bin(TSV)
+    ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                t2<Int> = strchr(bff, 9, t1 + 1)
+                t3<Int> = strchr(bff, 9, t2 + 1)
+                t4<Int> = strchr(bff, 9, t3 + 1)
+                if (t4 < 0) { t4 = i }
+                nmv.push(bff.substring(st, t1))
+                tyv.push(parse_u(bff, t2 + 1, t3))
+                nlv.push(parse_numel(bff, t1 + 1, t2))
+                ofv.push(parse_u(bff, t3 + 1, t4))
+            }
+            st = i + 1
+        }
+    }
+    RLO<Int> = ofv.get(0) ; RHI<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (ofv.get(i) < RLO) { RLO = ofv.get(i) }
+        en<Int> = ofv.get(i) + packed_bytes(nlv.get(i), tyv.get(i))
+        if (en > RHI) { RHI = en }
+    }
+    RBYTES<Int> = RHI - RLO
+    println("TSV tensors=" + nmv.len().to_string() + " region=[" + RLO.to_string() + "," + RHI.to_string() + ") bytes=" + RBYTES.to_string())
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    mlay<Int> = load_mod("native/build/layer.ptx")
+    mq3<Int> = load_mod("native/build/qwen3.ptx")
+    mgd<Int> = load_mod("native/build/gdn.ptx")
+    mrp<Int> = load_mod("native/build/rope.ptx")
+    ma35<Int> = load_mod("native/build/attn35.ptx")
+    mq6<Int> = load_mod("native/build/q6k.ptx")
+    mrg<Int> = load_mod("native/build/rgemv.ptx")
+    if (mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
+    hrms<Int> = get_fn(mlay, "rms_blk") ; hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
+    hs32<Int> = get_fn(mlay, "silu32") ; hc32<Int> = get_fn(mlay, "cast32")
+    hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
+    hamp<Int> = get_fn(mq3, "argmax1_p") ; hamr<Int> = get_fn(mq3, "argmax1_r") ; hexp<Int> = get_fn(mq3, "f32expand")
+    hl2<Int> = get_fn(mgd, "l2norm") ; hng<Int> = get_fn(mgd, "norm_gated") ; hsg<Int> = get_fn(mgd, "sigmoid_k")
+    hag<Int> = get_fn(mgd, "alpha_gate") ; hsv<Int> = get_fn(mgd, "silu_k") ; hcv<Int> = get_fn(mgd, "conv1d_k")
+    hil<Int> = get_fn(mgd, "interleave_qkv") ; hsh<Int> = get_fn(mgd, "conv_shift")
+    hrope<Int> = get_fn(mrp, "rope_nrot") ; hqgs<Int> = get_fn(ma35, "qg_split") ; hgm<Int> = get_fn(ma35, "gate_mul")
+    hq6d<Int> = get_fn(mq6, "q6kdeq")
+    hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
+    hi3<Int> = get_fn(mrg, "gemv_iq3s") ; hds<Int> = get_fn(mrg, "delta_step_b")
+    if (hds == 0 || hi3 == 0 || hrope == 0 || hq4 == 0) { return 10 }
+
+    // ---- resident weights: the whole tensor region, once ----
+    tw0<Int> = time_mono_millis()
+    RBA<Int> = dalloc(RBYTES)
+    if (RBA == 0) { println("ERR alloc region"); return 20 }
+    CHK<Int> = 268435456
+    pos<Int> = 0
+    while (pos < RBYTES) {
+        len<Int> = CHK
+        if (pos + len > RBYTES) { len = RBYTES - pos }
+        data<String> = read_model(MODEL, RLO + pos, len)
+        if (data.len() < len) { println("ERR short read at " + pos.to_string()); return 21 }
+        if (download(data, RBA + pos, len) != 0) { return 22 }
+        pos = pos + len
+    }
+    tw1<Int> = time_mono_millis()
+    println("RESIDENT_WEIGHTS bytes=" + RBYTES.to_string() + " upload_ms=" + (tw1 - tw0).to_string())
+    g2s<String> = read_bin("native/out/iq2s_grid.bin")
+    g3s<String> = read_bin("native/out/iq3s_grid.bin")
+    G2<Int> = dalloc(8192) ; G3<Int> = dalloc(2048)
+    download(g2s, G2, 8192) ; download(g3s, G3, 2048)
+    fb<String> = read_bin(FIP)
+    NROT<Int> = (fb.len() / 8) * 2
+    FR<Int> = dalloc(1024)
+    download(fb, FR, fb.len())
+    println("ROPE_TABLE entries=" + (fb.len() / 8).to_string() + " NROT=" + NROT.to_string())
+
+    PA<Int> = dalloc(256 * 4096)
+    np<Int> = 0
+    // f32 -> f64 copies of the small F32 tensors
+    tidx<Vec<Int>> = Vec()
+    // activations
+    XC<Int> = dalloc(D * 8) ; XM<Int> = dalloc(D * 8) ; XN<Int> = dalloc(D * 8) ; XN32<Int> = dalloc(D * 4)
+    QKVX<Int> = dalloc(QKV * 8) ; ZB<Int> = dalloc(VAL * 8) ; BRAW<Int> = dalloc(HV * 8) ; ARAW<Int> = dalloc(HV * 8)
+    BETA<Int> = dalloc(HV * 8) ; GATE<Int> = dalloc(HV * 8) ; CRAW<Int> = dalloc(QKV * 8) ; CONVS<Int> = dalloc(QKV * 8)
+    QN<Int> = dalloc(GKEY * 8) ; KN<Int> = dalloc(GKEY * 8) ; GOUT<Int> = dalloc(VAL * 8) ; EPI<Int> = dalloc(VAL * 8)
+    E32<Int> = dalloc(VAL * 4)
+    QG<Int> = dalloc(2 * NQ * 8) ; QB<Int> = dalloc(NQ * 8) ; GT<Int> = dalloc(NQ * 8) ; KR<Int> = dalloc(NKV * 8)
+    QNM<Int> = dalloc(NQ * 8) ; KNM<Int> = dalloc(NKV * 8) ; QR<Int> = dalloc(NQ * 8) ; CTX<Int> = dalloc(NQ * 8)
+    GD<Int> = dalloc(NQ * 8) ; SCR<Int> = dalloc(H * MAXS * 8)
+    GR<Int> = dalloc(FF * 8) ; UP<Int> = dalloc(FF * 8) ; H32<Int> = dalloc(FF * 4)
+    LOGB<Int> = dalloc(VOCAB * 8) ; NCH<Int> = (VOCAB + 255) / 256
+    PV<Int> = dalloc(NCH * 8) ; PI<Int> = dalloc(NCH * 8) ; OUTI<Int> = dalloc(8)
+    SCLV<Float> = 1.0 / sqrt(SS as Float)
+
+    // per-layer launch plan: kind, and the param-block base of each step (8 blocks per slot)
+    kind<Vec<Int>> = Vec() ; pbase<Vec<Int>> = Vec() ; aidx<Vec<Int>> = Vec()
+    fty<Vec<Int>> = Vec()      // gate, up, down types (3 per layer)
+    gdn_bytes<Int> = 0 ; kv_bytes<Int> = 0
+    KCv<Vec<Int>> = Vec() ; VCv<Vec<Int>> = Vec()
+    na<Int> = 0
+    L<Int> = 0
+    for (L in 0..NL - 1) {
+        pf<String> = "blk." + L.to_string() + "."
+        isg<Int> = 0
+        if (find_nm(nmv, pf + "attn_qkv.weight") >= 0) { isg = 1 }
+        kind.push(isg)
+        pb0<Int> = PA + np * 256
+        pbase.push(pb0)
+        // F32 small tensors -> f64
+        an<Int> = find_nm(nmv, pf + "attn_norm.weight")
+        pan<Int> = find_nm(nmv, pf + "post_attention_norm.weight")
+        ANW<Int> = dalloc(D * 8) ; PANW<Int> = dalloc(D * 8)
+        put_i(PA, 255 * 256 * 16 + 0, 0)
+        // a scratch param block at the arena's end for the expand launches
+        XP<Int> = PA + 4095 * 256
+        put_i(XP, 0, RBA + ofv.get(an) - RLO) ; put_i(XP, 8, ANW) ; put_i(XP, 16, D)
+        lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
+        put_i(XP, 0, RBA + ofv.get(pan) - RLO) ; put_i(XP, 8, PANW) ; put_i(XP, 16, D)
+        lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
+        ig<Int> = find_nm(nmv, pf + "ffn_gate.weight") ; iu<Int> = find_nm(nmv, pf + "ffn_up.weight") ; idn<Int> = find_nm(nmv, pf + "ffn_down.weight")
+        fty.push(tyv.get(ig)) ; fty.push(tyv.get(iu)) ; fty.push(tyv.get(idn))
+        // block 0: attn_norm (rms_blk XC -> XN, XN32)
+        p0<Int> = pb0
+        put_i(p0, 0, XC) ; put_i(p0, 8, ANW) ; put_i(p0, 16, XN) ; put_i(p0, 24, 1) ; put_i(p0, 32, D) ; put_f(p0, 40, EPS) ; put_i(p0, 48, XN32)
+        // FFN blocks at slots 16..19
+        pfn<Int> = pb0 + 16 * 256
+        put_i(pfn, 0, XM) ; put_i(pfn, 8, PANW) ; put_i(pfn, 16, XN) ; put_i(pfn, 24, 1) ; put_i(pfn, 32, D) ; put_f(pfn, 40, EPS) ; put_i(pfn, 48, XN32)
+        set_gemv(pfn + 256, RBA + ofv.get(ig) - RLO, XN32, GR, FF, D, 8, 0, grid_of(tyv.get(ig), G2, G3))
+        set_gemv(pfn + 512, RBA + ofv.get(iu) - RLO, XN32, UP, FF, D, 8, 0, grid_of(tyv.get(iu), G2, G3))
+        set_gemv(pfn + 768, RBA + ofv.get(idn) - RLO, H32, XC, D, FF, 8, XM, grid_of(tyv.get(idn), G2, G3))
+        if (isg == 1) {
+            aidx.push(-1)
+            iqkv<Int> = find_nm(nmv, pf + "attn_qkv.weight") ; iga<Int> = find_nm(nmv, pf + "attn_gate.weight")
+            ibe<Int> = find_nm(nmv, pf + "ssm_beta.weight") ; ial<Int> = find_nm(nmv, pf + "ssm_alpha.weight")
+            iou<Int> = find_nm(nmv, pf + "ssm_out.weight") ; icw<Int> = find_nm(nmv, pf + "ssm_conv1d.weight")
+            isn<Int> = find_nm(nmv, pf + "ssm_norm.weight") ; idt<Int> = find_nm(nmv, pf + "ssm_dt.bias")
+            iaa<Int> = find_nm(nmv, pf + "ssm_a")
+            CW<Int> = dalloc(QKV * DC * 8) ; SNW<Int> = dalloc(SS * 8) ; DTW<Int> = dalloc(HV * 8) ; SAW<Int> = dalloc(HV * 8)
+            put_i(XP, 0, RBA + ofv.get(icw) - RLO) ; put_i(XP, 8, CW) ; put_i(XP, 16, QKV * DC)
+            lk(hexp, (QKV * DC + 255) / 256, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(isn) - RLO) ; put_i(XP, 8, SNW) ; put_i(XP, 16, SS)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(idt) - RLO) ; put_i(XP, 8, DTW) ; put_i(XP, 16, HV)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(iaa) - RLO) ; put_i(XP, 8, SAW) ; put_i(XP, 16, HV)
+            lk(hexp, 1, 256, XP) ; dsync()
+            STL<Int> = dalloc(HV * SS * SS * 8) ; CVL<Int> = dalloc(QKV * DC * 8)
+            gdn_bytes = gdn_bytes + HV * SS * SS * 8 + QKV * DC * 8
+            if (STL == 0 || CVL == 0) { println("ERR alloc gdn state"); return 23 }
+            // 1: qkv + gate (2 segments)
+            p1<Int> = pb0 + 256
+            set_gemv(p1, RBA + ofv.get(iqkv) - RLO, XN32, QKVX, QKV, D, 8, 0, 0)
+            put_i(p1, 56, RBA + ofv.get(iga) - RLO) ; put_i(p1, 64, VAL) ; put_i(p1, 72, ZB) ; put_i(p1, 80, 8)
+            set_gemv(pb0 + 2 * 256, RBA + ofv.get(ibe) - RLO, XN32, BRAW, HV, D, 8, 0, 0)
+            set_gemv(pb0 + 3 * 256, RBA + ofv.get(ial) - RLO, XN32, ARAW, HV, D, 8, 0, 0)
+            p4<Int> = pb0 + 4 * 256
+            put_i(p4, 0, BRAW) ; put_i(p4, 8, BETA) ; put_i(p4, 16, HV)
+            p5<Int> = pb0 + 5 * 256
+            put_i(p5, 0, ARAW) ; put_i(p5, 8, DTW) ; put_i(p5, 16, SAW) ; put_i(p5, 24, GATE) ; put_i(p5, 32, HV)
+            p6<Int> = pb0 + 6 * 256
+            put_i(p6, 0, CVL) ; put_i(p6, 8, QKV) ; put_i(p6, 16, DC)
+            p7<Int> = pb0 + 7 * 256
+            put_i(p7, 0, QKVX) ; put_i(p7, 8, CVL) ; put_i(p7, 16, QKV) ; put_i(p7, 24, DC) ; put_i(p7, 32, 1)
+            p8<Int> = pb0 + 8 * 256
+            put_i(p8, 0, CVL) ; put_i(p8, 8, CW) ; put_i(p8, 16, CRAW) ; put_i(p8, 24, QKV) ; put_i(p8, 32, DC) ; put_i(p8, 40, 1)
+            p9<Int> = pb0 + 9 * 256
+            put_i(p9, 0, CRAW) ; put_i(p9, 8, CONVS) ; put_i(p9, 16, QKV)
+            p10<Int> = pb0 + 10 * 256
+            put_i(p10, 0, CONVS) ; put_i(p10, 8, QN) ; put_i(p10, 16, HK) ; put_i(p10, 24, SS) ; put_f(p10, 32, EPS)
+            p11<Int> = pb0 + 11 * 256
+            put_i(p11, 0, CONVS + GKEY * 8) ; put_i(p11, 8, KN) ; put_i(p11, 16, HK) ; put_i(p11, 24, SS) ; put_f(p11, 32, EPS)
+            p12<Int> = pb0 + 12 * 256
+            put_i(p12, 0, QN) ; put_i(p12, 8, KN) ; put_i(p12, 16, CONVS + 2 * GKEY * 8) ; put_i(p12, 24, GATE)
+            put_i(p12, 32, BETA) ; put_i(p12, 40, STL) ; put_i(p12, 48, STL) ; put_i(p12, 56, GOUT) ; put_i(p12, 64, 0)
+            put_i(p12, 72, SS) ; put_i(p12, 80, HK) ; put_i(p12, 88, HV) ; put_f(p12, 96, SCLV)
+            p13<Int> = pb0 + 13 * 256
+            put_i(p13, 0, GOUT) ; put_i(p13, 8, ZB) ; put_i(p13, 16, SNW) ; put_i(p13, 24, EPI) ; put_i(p13, 32, HV) ; put_i(p13, 40, SS) ; put_f(p13, 48, EPS)
+            p14<Int> = pb0 + 14 * 256
+            put_i(p14, 0, EPI) ; put_i(p14, 8, E32) ; put_i(p14, 16, VAL)
+            set_gemv(pb0 + 15 * 256, RBA + ofv.get(iou) - RLO, E32, XM, D, VAL, 8, XC, 0)
+        } else {
+            aidx.push(na)
+            iq<Int> = find_nm(nmv, pf + "attn_q.weight") ; ik<Int> = find_nm(nmv, pf + "attn_k.weight") ; iv<Int> = find_nm(nmv, pf + "attn_v.weight")
+            io<Int> = find_nm(nmv, pf + "attn_output.weight") ; iqn<Int> = find_nm(nmv, pf + "attn_q_norm.weight") ; ikn<Int> = find_nm(nmv, pf + "attn_k_norm.weight")
+            QNW<Int> = dalloc(HD * 8) ; KNW<Int> = dalloc(HD * 8)
+            put_i(XP, 0, RBA + ofv.get(iqn) - RLO) ; put_i(XP, 8, QNW) ; put_i(XP, 16, HD)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(ikn) - RLO) ; put_i(XP, 8, KNW) ; put_i(XP, 16, HD)
+            lk(hexp, 1, 256, XP) ; dsync()
+            KC<Int> = dalloc(MAXS * NKV * 8) ; VC<Int> = dalloc(MAXS * NKV * 8)
+            if (KC == 0 || VC == 0) { println("ERR alloc kv"); return 24 }
+            kv_bytes = kv_bytes + 2 * MAXS * NKV * 8
+            KCv.push(KC) ; VCv.push(VC)
+            set_gemv(pb0 + 256, RBA + ofv.get(iq) - RLO, XN32, QG, 2 * NQ, D, 8, 0, 0)
+            set_gemv(pb0 + 2 * 256, RBA + ofv.get(ik) - RLO, XN32, KR, NKV, D, 8, 0, 0)
+            set_gemv(pb0 + 3 * 256, RBA + ofv.get(iv) - RLO, XN32, VC, NKV, D, 8, 0, 0)   // Y = V cache row p (per token)
+            p4a<Int> = pb0 + 4 * 256
+            put_i(p4a, 0, QG) ; put_i(p4a, 8, QB) ; put_i(p4a, 16, GT) ; put_i(p4a, 24, 1) ; put_i(p4a, 32, H) ; put_i(p4a, 40, HD)
+            p5a<Int> = pb0 + 5 * 256
+            put_i(p5a, 0, QB) ; put_i(p5a, 8, QNW) ; put_i(p5a, 16, QNM) ; put_i(p5a, 24, H) ; put_i(p5a, 32, HD) ; put_f(p5a, 40, EPS) ; put_i(p5a, 48, 0)
+            p6a<Int> = pb0 + 6 * 256
+            put_i(p6a, 0, KR) ; put_i(p6a, 8, KNW) ; put_i(p6a, 16, KNM) ; put_i(p6a, 24, KVH) ; put_i(p6a, 32, HD) ; put_f(p6a, 40, EPS) ; put_i(p6a, 48, 0)
+            p7a<Int> = pb0 + 7 * 256
+            put_i(p7a, 0, QNM) ; put_i(p7a, 8, KNM) ; put_i(p7a, 16, QR) ; put_i(p7a, 24, KC) ; put_i(p7a, 32, FR)
+            put_i(p7a, 40, 1) ; put_i(p7a, 48, HD) ; put_i(p7a, 56, H) ; put_i(p7a, 64, KVH) ; put_i(p7a, 72, 0) ; put_i(p7a, 80, NROT)
+            p8a<Int> = pb0 + 8 * 256
+            put_i(p8a, 80, QR) ; put_i(p8a, 88, KC) ; put_i(p8a, 96, VC) ; put_i(p8a, 104, CTX) ; put_i(p8a, 184, 1)
+            put_i(p8a, 200, HD) ; put_i(p8a, 208, H) ; put_i(p8a, 216, KVH) ; put_i(p8a, 224, 0) ; put_i(p8a, 232, SCR) ; put_i(p8a, 240, 1)
+            p9a<Int> = pb0 + 9 * 256
+            put_i(p9a, 0, CTX) ; put_i(p9a, 8, GT) ; put_i(p9a, 16, GD) ; put_i(p9a, 24, NQ)
+            p10a<Int> = pb0 + 10 * 256
+            put_i(p10a, 0, GD) ; put_i(p10a, 8, E32) ; put_i(p10a, 16, NQ)
+            set_gemv(pb0 + 11 * 256, RBA + ofv.get(io) - RLO, E32, XM, D, NQ, 8, XC, 0)
+            na = na + 1
+        }
+        np = np + 20
+    }
+    // head
+    ion<Int> = find_nm(nmv, "output_norm.weight") ; iow<Int> = find_nm(nmv, "output.weight") ; iem<Int> = find_nm(nmv, "token_embd.weight")
+    ONW<Int> = dalloc(D * 8)
+    XP2<Int> = PA + 4095 * 256
+    put_i(XP2, 0, RBA + ofv.get(ion) - RLO) ; put_i(XP2, 8, ONW) ; put_i(XP2, 16, D)
+    lk(hexp, (D + 255) / 256, 256, XP2) ; dsync()
+    PH<Int> = PA + np * 256
+    put_i(PH, 0, XC) ; put_i(PH, 8, ONW) ; put_i(PH, 16, XN) ; put_i(PH, 24, 1) ; put_i(PH, 32, D) ; put_f(PH, 40, EPS) ; put_i(PH, 48, XN32)
+    set_gemv(PH + 256, RBA + ofv.get(iow) - RLO, XN32, LOGB, VOCAB, D, 8, 0, 0)
+    PH2<Int> = PH + 512
+    put_i(PH2, 0, LOGB) ; put_i(PH2, 8, PV) ; put_i(PH2, 16, PI) ; put_i(PH2, 24, VOCAB) ; put_i(PH2, 32, 256)
+    PH3<Int> = PH + 768
+    put_i(PH3, 0, PV) ; put_i(PH3, 8, PI) ; put_i(PH3, 16, OUTI) ; put_i(PH3, 24, NCH)
+    TEMB<Int> = RBA + ofv.get(iem) - RLO
+    dsync()
+    mfree<Int> = 0 ; mtot<Int> = 0
+    freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+    println("MEM weights=" + RBYTES.to_string() + " gdn_state=" + gdn_bytes.to_string() + " kv=" + kv_bytes.to_string()
+            + " dev_used=" + (mtot - mfree).to_string() + " dev_total=" + mtot.to_string())
+    println("PLAN layers=" + NL.to_string() + " attn=" + na.to_string() + " param_blocks=" + np.to_string())
+
+    // ---- the token loop ----
+    gen<Vec<Int>> = Vec()
+    cur<Int> = prids.get(0)
+    TOTAL<Int> = NP + GEN - 1
+    tpf0<Int> = time_mono_millis() ; tpf1<Int> = 0 ; tfirst<Int> = 0
+    p<Int> = 0
+    for (p in 0..TOTAL - 1) {
+        if (p < NP) { cur = prids.get(p) }
+        lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
+        for (L in 0..NL - 1) {
+            pb<Int> = pbase.get(L)
+            lk(hrms, 1, 256, pb)
+            if (kind.get(L) == 1) {
+                lk(hq4, (QKV + VAL + 31) / 32, 512, pb + 256)
+                lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
+                lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
+                lk(hsg, 1, 64, pb + 4 * 256)
+                lk(hag, 1, 64, pb + 5 * 256)
+                lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
+                lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
+                lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
+                lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                lk(hl2, (GKEY + 255) / 256, 256, pb + 10 * 256)
+                lk(hl2, (GKEY + 255) / 256, 256, pb + 11 * 256)
+                lk(hds, HV, SS, pb + 12 * 256)
+                lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
+                lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
+                lk(hq4, (D + 31) / 32, 512, pb + 15 * 256)
+            } else {
+                a<Int> = aidx.get(L)
+                KC2<Int> = KCv.get(a) ; VC2<Int> = VCv.get(a)
+                put_i(pb + 3 * 256, 16, VC2 + p * NKV * 8)
+                put_i(pb + 7 * 256, 24, KC2 + p * NKV * 8) ; put_i(pb + 7 * 256, 72, p)
+                put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
+                lk(hq5, (2 * NQ + 15) / 16, 512, pb + 256)
+                lk(hq5, (NKV + 15) / 16, 512, pb + 2 * 256)
+                lk(hq5, (NKV + 15) / 16, 512, pb + 3 * 256)
+                lk(hqgs, (NQ + 255) / 256, 256, pb + 4 * 256)
+                lk(hrms, H, 256, pb + 5 * 256)
+                lk(hrms, KVH, 256, pb + 6 * 256)
+                lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
+                lk(hasc, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256)
+                lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256)
+                lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
+                lk(hc32, (NQ + 255) / 256, 256, pb + 10 * 256)
+                lk(hq6, (D + 31) / 32, 512, pb + 11 * 256)
+            }
+            pfb<Int> = pb + 16 * 256
+            tg<Int> = fty.get(L * 3) ; tu<Int> = fty.get(L * 3 + 1) ; tdn<Int> = fty.get(L * 3 + 2)
+            lk(hrms, 1, 256, pfb)
+            lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF), 512, pfb + 256)
+            lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF), 512, pfb + 512)
+            lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF)
+            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D), 512, pfb + 768)
+        }
+        if (p >= NP - 1) {
+            lk(hrms, 1, 256, PH)
+            lk(hq6, (VOCAB + 31) / 32, 512, PH + 256)
+            lk(hamp, (NCH + 255) / 256, 256, PH2)
+            lk(hamr, 1, 32, PH3)
+            nid<Int> = 0
+            freedom {
+                rc<CInt> = cuCtxSynchronize()
+                if (rc != 0) { println("ERR cuda " + (rc as Int).to_string() + " at pos " + p.to_string()); return 30 }
+                cuMemcpyDtoH_v2(loc(nid), OUTI, 8)
+            }
+            gen.push(nid)
+            cur = nid
+            if (p == NP - 1) { tpf1 = time_mono_millis() }
+            if (p == NP) { tfirst = time_mono_millis() }
+            if ((env_get("VYB_TOKTEXT") else "").len() > 0) {
+                sofar<Vec<Int>> = Vec()
+                sofar.push(nid)
+                println("TOK " + (p + 1).to_string() + " id=" + nid.to_string() + " <" + llm_decode(tok, sofar) + ">")
+            }
+        }
+    }
+    freedom { cuCtxSynchronize() }
+    tend<Int> = time_mono_millis()
+    freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+    resp<String> = llm_decode(tok, gen)
+    gl<String> = ""
+    gi<Int> = 0
+    for (gi in 0..gen.len() - 1) { gl = gl + " " + gen.get(gi).to_string() }
+    println("GEN_IDS=" + gl)
+    println("GEN_TEXT=<" + resp + ">")
+    pfms<Int> = tpf1 - tpf0
+    dms<Int> = tend - tpf1
+    ndec<Int> = gen.len() - 1
+    println("TIMING prefill_tokens=" + NP.to_string() + " prefill_ms=" + pfms.to_string()
+            + " decode_tokens=" + ndec.to_string() + " decode_ms=" + dms.to_string())
+    if (pfms > 0) { println("PREFILL_TOK_S=" + ((NP as Float) * 1000.0 / (pfms as Float)).to_string()) }
+    if (dms > 0) { println("DECODE_TOK_S=" + ((ndec as Float) * 1000.0 / (dms as Float)).to_string()) }
+    println("MEM_END dev_used=" + (mtot - mfree).to_string())
+    println("DECODE_DONE")
+    return 0
+}
