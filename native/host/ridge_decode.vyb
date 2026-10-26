@@ -28,6 +28,7 @@ extern "C" {
     cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
     cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
     cuCtxSynchronize()<CInt>
+    cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
                   a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
@@ -196,6 +197,23 @@ set_gemv(pb<Int>, W<Int>, X<Int>, Y<Int>, N<Int>, K<Int>, YE<Int>, RS<Int>, G<In
     put_i(pb, 56, 0) ; put_i(pb, 64, 0) ; put_i(pb, 72, 0) ; put_i(pb, 80, 8)
     put_i(pb, 88, 0) ; put_i(pb, 96, 0) ; put_i(pb, 104, 0) ; put_i(pb, 112, 8)
     put_i(pb, 120, RS) ; put_i(pb, 128, G)
+}
+// one batched-prefill GEMM param block (gen_rpf.py layout): Y[s, n] (+= RS) = sum_k W[n, k] X[s, k]
+set_gemm(pb<Int>, W<Int>, X<Int>, Y<Int>, S<Int>, N<Int>, K<Int>, LDY<Int>, RS<Int>, G<Int>) -> {
+    put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, S) ; put_i(pb, 32, N)
+    put_i(pb, 40, K) ; put_i(pb, 48, LDY) ; put_i(pb, 56, RS) ; put_i(pb, 64, G) ; put_i(pb, 72, (S + 63) / 64)
+}
+gemm_grid(S<Int>, N<Int>)<Int> -> {
+    return ((S + 63) / 64) * ((N + 127) / 128)
+}
+gemm_h(ty<Int>, g4<Int>, g6<Int>, g5<Int>, g8<Int>, gi2<Int>, gi3<Int>)<Int> -> {
+    if (ty == 12) { return g4 }
+    if (ty == 14) { return g6 }
+    if (ty == 13) { return g5 }
+    if (ty == 8) { return g8 }
+    if (ty == 22) { return gi2 }
+    if (ty == 21) { return gi3 }
+    return 0
 }
 // kernel handle / grid for a weight type (packed GEMV): q4k/q6k take 2 rows per warp
 gemv_h(ty<Int>, hq4<Int>, hq6<Int>, hq5<Int>, hq8<Int>, hi2<Int>, hi3<Int>)<Int> -> {
@@ -385,6 +403,8 @@ main()<Int> -> {
     fty<Vec<Int>> = Vec()      // gate, up, down types (3 per layer)
     gdn_bytes<Int> = 0 ; kv_bytes<Int> = 0
     KCv<Vec<Int>> = Vec() ; VCv<Vec<Int>> = Vec()
+    anwv<Vec<Int>> = Vec() ; panwv<Vec<Int>> = Vec() ; l1v<Vec<Int>> = Vec() ; l2v<Vec<Int>> = Vec() ; l3v<Vec<Int>> = Vec()
+    l4v<Vec<Int>> = Vec() ; l5v<Vec<Int>> = Vec() ; l6v<Vec<Int>> = Vec()
     na<Int> = 0
     L<Int> = 0
     for (L in 0..NL - 1) {
@@ -405,6 +425,7 @@ main()<Int> -> {
         lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
         put_i(XP, 0, RBA + ofv.get(pan) - RLO) ; put_i(XP, 8, PANW) ; put_i(XP, 16, D)
         lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
+        anwv.push(ANW) ; panwv.push(PANW)
         ig<Int> = find_nm(nmv, pf + "ffn_gate.weight") ; iu<Int> = find_nm(nmv, pf + "ffn_up.weight") ; idn<Int> = find_nm(nmv, pf + "ffn_down.weight")
         fty.push(tyv.get(ig)) ; fty.push(tyv.get(iu)) ; fty.push(tyv.get(idn))
         // block 0: attn_norm (rms_blk XC -> XN, XN32)
@@ -441,6 +462,7 @@ main()<Int> -> {
             STL<Int> = dalloc(HV * SS * SS * 8) ; CVL<Int> = dalloc(QKV * DC * 8)
             gdn_bytes = gdn_bytes + HV * SS * SS * 8 + QKV * DC * 8
             if (STL == 0 || CVL == 0) { println("ERR alloc gdn state"); return 23 }
+            l1v.push(CW) ; l2v.push(SNW) ; l3v.push(DTW) ; l4v.push(SAW) ; l5v.push(STL) ; l6v.push(CVL)
             // 1: qkv + gate (2 segments)
             p1<Int> = pb0 + 256
             set_gemv(p1, RBA + ofv.get(iqkv) - RLO, XN32, QKVX, QKV, D, 8, 0, 0)
@@ -488,6 +510,7 @@ main()<Int> -> {
             if (KC == 0 || VC == 0) { println("ERR alloc kv"); return 24 }
             kv_bytes = kv_bytes + 2 * MAXS * NKV * 8
             KCv.push(KC) ; VCv.push(VC)
+            l1v.push(QNW) ; l2v.push(KNW) ; l3v.push(0) ; l4v.push(0) ; l5v.push(0) ; l6v.push(0)
             set_gemv(pb0 + 256, RBA + ofv.get(iq) - RLO, XN32, QG, 2 * NQ, D, 8, 0, 0)
             set_gemv(pb0 + 2 * 256, RBA + ofv.get(ik) - RLO, XN32, KR, NKV, D, 8, 0, 0)
             set_gemv(pb0 + 3 * 256, RBA + ofv.get(iv) - RLO, XN32, VC, NKV, D, 8, 0, 0)   // Y = V cache row p (per token)
@@ -533,6 +556,106 @@ main()<Int> -> {
             + " dev_used=" + (mtot - mfree).to_string() + " dev_total=" + mtot.to_string())
     println("PLAN layers=" + NL.to_string() + " attn=" + na.to_string() + " param_blocks=" + np.to_string())
 
+    // ---- batched prefill (VYB_PFB=<min prompt tokens>; off by default so gold stays on the token path) ----
+    // The whole prompt goes through each layer at once: tensor-core GEMMs straight on the packed weights
+    // (rpf_gemm.vyb, f16 activations / f32 accumulate), chunk kernels for conv / l2norm / causal attention
+    // (rpf.vyb), delta_seq for the GDN recurrence, then the decode state (GDN state, conv window, KV rows
+    // 0..NP-1) is exactly where the token path would have left it. One chunk: NP <= 2048.
+    PFB<Int> = 0
+    pfbs<String> = env_get("VYB_PFB") else ""
+    if (pfbs.len() > 0) {
+        if (NP >= parse_u(pfbs, 0, pfbs.len()) && NP <= 2048 && NP > 1) { PFB = 1 }
+    }
+    PB2<Int> = 0 ; XCb<Int> = 0 ; S<Int> = NP
+    hpg4<Int> = 0 ; hpg5<Int> = 0 ; hpg6<Int> = 0 ; hpg8<Int> = 0 ; hpgi2<Int> = 0 ; hpgi3<Int> = 0
+    hpds<Int> = 0 ; hpag<Int> = 0 ; hpcv<Int> = 0 ; hpcs<Int> = 0 ; hpl2<Int> = 0 ; hpat<Int> = 0
+    XN32b<Int> = 0 ; GRb<Int> = 0 ; UPb<Int> = 0 ; H32b<Int> = 0
+    if (PFB == 1) {
+        mpg<Int> = load_mod("native/build/rpf_gemm.ptx")
+        mpk<Int> = load_mod("native/build/rpf.ptx")
+        if (mpg == 0 || mpk == 0) { println("ERR load rpf ptx") ; return 10 }
+        hpg4 = get_fn(mpg, "gemm_q4k") ; hpg5 = get_fn(mpg, "gemm_q5k") ; hpg6 = get_fn(mpg, "gemm_q6k")
+        hpg8 = get_fn(mpg, "gemm_q80") ; hpgi2 = get_fn(mpg, "gemm_iq2s") ; hpgi3 = get_fn(mpg, "gemm_iq3s")
+        hpds = get_fn(mpg, "delta_seq")
+        hpag = get_fn(mpk, "ag_b") ; hpcv = get_fn(mpk, "conv_b") ; hpcs = get_fn(mpk, "conv_save")
+        hpl2 = get_fn(mpk, "l2n_bs") ; hpat = get_fn(mpk, "attn_pf")
+        if (hpg4 == 0 || hpgi3 == 0 || hpds == 0 || hpat == 0 || hpl2 == 0) { return 10 }
+        XCb = dalloc(S * D * 8) ; XMb<Int> = dalloc(S * D * 8) ; XNb<Int> = dalloc(S * D * 8) ; XN32b = dalloc(S * D * 4)
+        QKVXb<Int> = dalloc(S * QKV * 8) ; ZBb<Int> = dalloc(S * VAL * 8) ; BRAWb<Int> = dalloc(S * HV * 8) ; ARAWb<Int> = dalloc(S * HV * 8)
+        BETAb<Int> = dalloc(S * HV * 8) ; GATEb<Int> = dalloc(S * HV * 8) ; CONVSb<Int> = dalloc(S * QKV * 8)
+        QNb<Int> = dalloc(S * GKEY * 8) ; KNb<Int> = dalloc(S * GKEY * 8) ; GOUTb<Int> = dalloc(S * VAL * 8) ; EPIb<Int> = dalloc(S * VAL * 8)
+        E32b<Int> = dalloc(S * NQ * 4)
+        QGb<Int> = dalloc(S * 2 * NQ * 8) ; QBb<Int> = dalloc(S * NQ * 8) ; GTb<Int> = dalloc(S * NQ * 8) ; KRb<Int> = dalloc(S * NKV * 8)
+        QNMb<Int> = dalloc(S * NQ * 8) ; KNMb<Int> = dalloc(S * NKV * 8) ; QRb<Int> = dalloc(S * NQ * 8) ; CTXb<Int> = dalloc(S * NQ * 8)
+        GDb<Int> = dalloc(S * NQ * 8)
+        GRb = dalloc(S * FF * 8) ; UPb = dalloc(S * FF * 8) ; H32b = dalloc(S * FF * 4)
+        if (H32b == 0 || GRb == 0 || UPb == 0) { println("ERR alloc prefill buffers") ; return 25 }
+        PB2 = dalloc(NL * 32 * 256)
+        for (L in 0..NL - 1) {
+            pf2<String> = "blk." + L.to_string() + "."
+            qb<Int> = PB2 + L * 32 * 256
+            put_i(qb, 0, XCb) ; put_i(qb, 8, anwv.get(L)) ; put_i(qb, 16, XNb) ; put_i(qb, 24, S) ; put_i(qb, 32, D) ; put_f(qb, 40, EPS) ; put_i(qb, 48, XN32b)
+            if (kind.get(L) == 1) {
+                CWl<Int> = l1v.get(L) ; SNWl<Int> = l2v.get(L) ; DTWl<Int> = l3v.get(L) ; SAWl<Int> = l4v.get(L) ; STLl<Int> = l5v.get(L) ; CVLl<Int> = l6v.get(L)
+                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_qkv.weight")) - RLO, XN32b, QKVXb, S, QKV, D, QKV, 0, 0)
+                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_gate.weight")) - RLO, XN32b, ZBb, S, VAL, D, VAL, 0, 0)
+                set_gemm(qb + 3 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_beta.weight")) - RLO, XN32b, BRAWb, S, HV, D, HV, 0, 0)
+                set_gemm(qb + 4 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_alpha.weight")) - RLO, XN32b, ARAWb, S, HV, D, HV, 0, 0)
+                q5<Int> = qb + 5 * 256
+                put_i(q5, 0, BRAWb) ; put_i(q5, 8, BETAb) ; put_i(q5, 16, S * HV)
+                q6<Int> = qb + 6 * 256
+                put_i(q6, 0, ARAWb) ; put_i(q6, 8, DTWl) ; put_i(q6, 16, SAWl) ; put_i(q6, 24, GATEb) ; put_i(q6, 32, S * HV) ; put_i(q6, 40, HV)
+                q7<Int> = qb + 7 * 256
+                put_i(q7, 0, QKVXb) ; put_i(q7, 8, CVLl) ; put_i(q7, 16, CWl) ; put_i(q7, 24, CONVSb) ; put_i(q7, 32, S) ; put_i(q7, 40, QKV)
+                q8<Int> = qb + 8 * 256
+                put_i(q8, 0, CVLl) ; put_i(q8, 8, QKVXb) ; put_i(q8, 16, S) ; put_i(q8, 24, QKV)
+                q9<Int> = qb + 9 * 256
+                put_i(q9, 0, CONVSb) ; put_i(q9, 8, QNb) ; put_i(q9, 16, KNb) ; put_i(q9, 24, HK) ; put_i(q9, 32, SS)
+                put_i(q9, 40, QKV) ; put_i(q9, 48, GKEY) ; put_f(q9, 56, EPS)
+                q10<Int> = qb + 10 * 256
+                put_i(q10, 0, QNb) ; put_i(q10, 8, KNb) ; put_i(q10, 16, CONVSb + 2 * GKEY * 8) ; put_i(q10, 24, GATEb)
+                put_i(q10, 32, BETAb) ; put_i(q10, 40, STLl) ; put_i(q10, 48, GOUTb) ; put_i(q10, 56, S) ; put_i(q10, 64, SS)
+                put_i(q10, 72, HK) ; put_i(q10, 80, HV) ; put_f(q10, 88, SCLV) ; put_i(q10, 96, QKV) ; put_i(q10, 104, GKEY)
+                q11<Int> = qb + 11 * 256
+                put_i(q11, 0, GOUTb) ; put_i(q11, 8, ZBb) ; put_i(q11, 16, SNWl) ; put_i(q11, 24, EPIb) ; put_i(q11, 32, S * HV) ; put_i(q11, 40, SS) ; put_f(q11, 48, EPS)
+                q12<Int> = qb + 12 * 256
+                put_i(q12, 0, EPIb) ; put_i(q12, 8, E32b) ; put_i(q12, 16, S * VAL)
+                set_gemm(qb + 13 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_out.weight")) - RLO, E32b, XMb, S, D, VAL, D, XCb, 0)
+            } else {
+                a2<Int> = aidx.get(L)
+                KCl<Int> = KCv.get(a2) ; VCl<Int> = VCv.get(a2)
+                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_q.weight")) - RLO, XN32b, QGb, S, 2 * NQ, D, 2 * NQ, 0, 0)
+                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_k.weight")) - RLO, XN32b, KRb, S, NKV, D, NKV, 0, 0)
+                set_gemm(qb + 3 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_v.weight")) - RLO, XN32b, VCl, S, NKV, D, NKV, 0, 0)
+                r4<Int> = qb + 4 * 256
+                put_i(r4, 0, QGb) ; put_i(r4, 8, QBb) ; put_i(r4, 16, GTb) ; put_i(r4, 24, S) ; put_i(r4, 32, H) ; put_i(r4, 40, HD)
+                r5<Int> = qb + 5 * 256
+                put_i(r5, 0, QBb) ; put_i(r5, 8, l1v.get(L)) ; put_i(r5, 16, QNMb) ; put_i(r5, 24, S * H) ; put_i(r5, 32, HD) ; put_f(r5, 40, EPS) ; put_i(r5, 48, 0)
+                r6<Int> = qb + 6 * 256
+                put_i(r6, 0, KRb) ; put_i(r6, 8, l2v.get(L)) ; put_i(r6, 16, KNMb) ; put_i(r6, 24, S * KVH) ; put_i(r6, 32, HD) ; put_f(r6, 40, EPS) ; put_i(r6, 48, 0)
+                r7<Int> = qb + 7 * 256
+                put_i(r7, 0, QNMb) ; put_i(r7, 8, KNMb) ; put_i(r7, 16, QRb) ; put_i(r7, 24, KCl) ; put_i(r7, 32, FR)
+                put_i(r7, 40, S) ; put_i(r7, 48, HD) ; put_i(r7, 56, H) ; put_i(r7, 64, KVH) ; put_i(r7, 72, 0) ; put_i(r7, 80, NROT)
+                r8<Int> = qb + 8 * 256
+                put_i(r8, 0, QRb) ; put_i(r8, 8, KCl) ; put_i(r8, 16, VCl) ; put_i(r8, 24, CTXb) ; put_i(r8, 32, H) ; put_i(r8, 40, KVH) ; put_i(r8, 48, HD) ; put_i(r8, 56, 0)
+                r9<Int> = qb + 9 * 256
+                put_i(r9, 0, CTXb) ; put_i(r9, 8, GTb) ; put_i(r9, 16, GDb) ; put_i(r9, 24, S * NQ)
+                r10<Int> = qb + 10 * 256
+                put_i(r10, 0, GDb) ; put_i(r10, 8, E32b) ; put_i(r10, 16, S * NQ)
+                set_gemm(qb + 11 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_output.weight")) - RLO, E32b, XMb, S, D, NQ, D, XCb, 0)
+            }
+            qf<Int> = qb + 16 * 256
+            put_i(qf, 0, XMb) ; put_i(qf, 8, panwv.get(L)) ; put_i(qf, 16, XNb) ; put_i(qf, 24, S) ; put_i(qf, 32, D) ; put_f(qf, 40, EPS) ; put_i(qf, 48, XN32b)
+            tg2<Int> = fty.get(L * 3) ; tu2<Int> = fty.get(L * 3 + 1) ; td2<Int> = fty.get(L * 3 + 2)
+            set_gemm(qf + 256, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_gate.weight")) - RLO, XN32b, GRb, S, FF, D, FF, 0, grid_of(tg2, G2, G3))
+            set_gemm(qf + 512, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_up.weight")) - RLO, XN32b, UPb, S, FF, D, FF, 0, grid_of(tu2, G2, G3))
+            set_gemm(qf + 768, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_down.weight")) - RLO, H32b, XCb, S, D, FF, D, XMb, grid_of(td2, G2, G3))
+        }
+        dsync()
+        freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+        println("PFB batched prefill S=" + S.to_string() + " dev_used=" + (mtot - mfree).to_string())
+    }
+
     // ---- the token loop ----
     gen<Vec<Int>> = Vec()
     cur<Int> = prids.get(0)
@@ -541,6 +664,49 @@ main()<Int> -> {
     p<Int> = 0
     for (p in 0..TOTAL - 1) {
         if (p < NP) { cur = prids.get(p) }
+        if (PFB == 1 && p == 0) {
+            s2<Int> = 0
+            for (s2 in 0..S - 1) { lk4(hq6d, (D + 255) / 256, 256, TEMB + prids.get(s2) * (D / 256) * 210, XCb + s2 * D * 8, D, 0) }
+            for (L in 0..NL - 1) {
+                qb2<Int> = PB2 + L * 32 * 256
+                lk(hrms, S, 256, qb2)
+                if (kind.get(L) == 1) {
+                    lk(hpg4, gemm_grid(S, QKV), 256, qb2 + 256)
+                    lk(hpg4, gemm_grid(S, VAL), 256, qb2 + 2 * 256)
+                    lk(hpg8, gemm_grid(S, HV), 256, qb2 + 3 * 256)
+                    lk(hpg8, gemm_grid(S, HV), 256, qb2 + 4 * 256)
+                    lk(hsg, (S * HV + 255) / 256, 256, qb2 + 5 * 256)
+                    lk(hpag, (S * HV + 255) / 256, 256, qb2 + 6 * 256)
+                    lk(hpcv, (S * QKV + 255) / 256, 256, qb2 + 7 * 256)
+                    lk(hpcs, (QKV + 255) / 256, 256, qb2 + 8 * 256)
+                    lk(hpl2, S * 2 * HK, SS, qb2 + 9 * 256)
+                    lk(hpds, HV * 4, 128, qb2 + 10 * 256)
+                    lk(hngb, S * HV, SS, qb2 + 11 * 256)
+                    lk(hc32, (S * VAL + 255) / 256, 256, qb2 + 12 * 256)
+                    lk(hpg4, gemm_grid(S, D), 256, qb2 + 13 * 256)
+                } else {
+                    lk(hpg5, gemm_grid(S, 2 * NQ), 256, qb2 + 256)
+                    lk(hpg5, gemm_grid(S, NKV), 256, qb2 + 2 * 256)
+                    lk(hpg5, gemm_grid(S, NKV), 256, qb2 + 3 * 256)
+                    lk(hqgs, (S * NQ + 255) / 256, 256, qb2 + 4 * 256)
+                    lk(hrms, S * H, 256, qb2 + 5 * 256)
+                    lk(hrms, S * KVH, 256, qb2 + 6 * 256)
+                    lk(hrope, (S * (NQ + NKV) + 255) / 256, 256, qb2 + 7 * 256)
+                    lk(hpat, S * H, 256, qb2 + 8 * 256)
+                    lk(hgm, (S * NQ + 255) / 256, 256, qb2 + 9 * 256)
+                    lk(hc32, (S * NQ + 255) / 256, 256, qb2 + 10 * 256)
+                    lk(hpg6, gemm_grid(S, D), 256, qb2 + 11 * 256)
+                }
+                qf2<Int> = qb2 + 16 * 256
+                lk(hrms, S, 256, qf2)
+                lk(gemm_h(fty.get(L * 3), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF), 256, qf2 + 256)
+                lk(gemm_h(fty.get(L * 3 + 1), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF), 256, qf2 + 512)
+                lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF)
+                lk(gemm_h(fty.get(L * 3 + 2), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, D), 256, qf2 + 768)
+            }
+            freedom { cuMemcpyDtoD_v2(XC, XCb + (S - 1) * D * 8, D * 8) }
+        }
+        if (PFB == 0 || p >= NP) {
         lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
         for (L in 0..NL - 1) {
             pb<Int> = pbase.get(L)
@@ -599,6 +765,7 @@ main()<Int> -> {
                 if (is_iq(tdn) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
             }
             lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, RK2), 512, pfb + 768)
+        }
         }
         if (p >= NP - 1) {
             lk(hrms, 1, 256, PH)
