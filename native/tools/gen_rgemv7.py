@@ -78,14 +78,15 @@ def kern(name, bs, gb, iq3):
             w(f"{I}ga{k}<UInt32> = ld_shared_v2_u32(ix{k} * 8, 0)")
             w(f"{I}gb{k}<UInt32> = ld_shared_v2_u32(ix{k} * 8, 1)")
         w(f"{I}sg{k}<UInt32> = (({sv}{sh}) & 255) as UInt32")
+        # Sign handling (2026-10-26): the grid bytes are non-negative (< 128), so
+        #   sum s_i g_i x_i = dp4a(g, x) - 2 * dp4a(g, x & m),  m = 0xFF per byte where the sign bit is set.
+        # m from a nibble without per-bit extraction: n * 0x204081 spreads bits 0..3 to bits 0/8/16/24 (the
+        # shifted copies occupy disjoint bit ranges, so no carries), & 0x01010101, * 255. Integer-identical
+        # to the old vsub4(g ^ m, m) form (vsub4 is a 7-op SIMD emulation in PTX on sm_86).
         for h in range(2):
-            terms = []
-            for e in range(4):
-                bit = 4 * h + e
-                t = f"(sg{k} >> {bit}) & (1 as UInt32)" if bit else f"sg{k} & (1 as UInt32)"
-                terms.append(f"((({t}) * ff) << {8*e})" if e else f"(({t}) * ff)")
-            w(f"{I}m{k}_{h}<UInt32> = " + " | ".join(terms))
-        w(f"{I}si{k}<CInt> = dp4a_s32(vsub4(gb{k} ^ m{k}_1, m{k}_1), qx{2*k+1}, dp4a_s32(vsub4(ga{k} ^ m{k}_0, m{k}_0), qx{2*k}, 0))")
+            nib = f"(sg{k} >> {4*h}) & (15 as UInt32)" if h else f"sg{k} & (15 as UInt32)"
+            w(f"{I}m{k}_{h}<UInt32> = ((({nib}) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff")
+        w(f"{I}si{k}<CInt> = dp4a_s32(gb{k}, qx{2*k+1}, dp4a_s32(ga{k}, qx{2*k}, 0)) - 2 * dp4a_s32(gb{k}, qx{2*k+1} & m{k}_1, dp4a_s32(ga{k}, qx{2*k} & m{k}_0, 0))")
     if iq3:
         w(f"{I}db<Float32> = d * (c1 + c2 * (((sc >> (4 * (ib % 2))) & 15) as Float32))")
         w(f"{I}acc = acc + dx * db * ((si0 + si1 + si2 + si3) as Float32)")
