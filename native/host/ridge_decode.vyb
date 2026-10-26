@@ -386,8 +386,11 @@ main()<Int> -> {
         // IQ GEMV variant: VYB_RGPTX (a gen_rgemv2.py / gen_rgemv5.py output) with VYB_RGR rows per warp;
         // default rgemv5 (gen_rgemv5.py 1 rgemv5.vyb 1 1 0 2: 1 row/warp, vector x loads, grid in shared
         // memory, 2-deep super-block prefetch, shuffle reduction; bit-identical to rgemv4, ~1.4x faster).
-        // VYB_RGPTX=native/build/rgemv4.ptx VYB_RGR=4 = previous default.
-        rgp<String> = env_get("VYB_RGPTX") else "native/build/rgemv5.ptx"
+        // VYB_RGPTX=native/build/rgemv4.ptx VYB_RGR=4 = older default.
+        // Default now rgemv8 (gen_rgemv8.py rgemv8.vyb 4 1): same lane map/arithmetic as rgemv5 (bit-identical)
+        // but the IQ2_S row is streamed as coalesced u32 loads (4 super-blocks per chunk, 2 chunks in flight)
+        // and bytes are pulled out with shfl_idx_u32: 162 vs 187 us/call. VYB_RGPTX=native/build/rgemv5.ptx = previous.
+        rgp<String> = env_get("VYB_RGPTX") else "native/build/rgemv8.ptx"
         rgr<String> = env_get("VYB_RGR") else "1"
         RK2 = parse_u(rgr, 0, rgr.len())
         mr4<Int> = load_mod(rgp)
