@@ -6,6 +6,7 @@
 # 32x32 via mma.m16n8k16 (f16 in, f32 accumulate).  Shared: A [64][72] halves @0, B [128][72] @9216.
 # Params: W@0 X@8 Y@16 S@24 N@32 K@40 LDY@48 RS@56 G@64 NMT@72.  Grid = NMT * ceil(N/128), block 256.
 # Compile: vyb --kernel --gpu sm_80 --kernel-shared 27648 (ursela/gpu-features compiler).
+# --bm128 --vdeq --gsh (rpf_gemm128, the default IQ prefill tiles): --kernel-shared 45056 (A+B tiles + 8 KB IQ grid).
 import vmath::{vexp}
 
 gemm_q4k(p<Int>) -> {
