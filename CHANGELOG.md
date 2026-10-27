@@ -6,7 +6,7 @@
 - **27B Ridge (qwen35) all-Vyb decode** (`native/host/ridge_decode.vyb`, `native/kernels/r*.vyb`),
   with `./ridge-chat`: streaming chat, the ChatML template, thinking on or off, and a gold-exact
   `VYB_EXACT=1` path. See `doc/RIDGE-27B.md`.
-- RTX 3090 speed: tg128 34.3 tok/s, pp512 795 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
+- RTX 3090 speed: tg128 34.4 tok/s, pp512 795 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
   - q8_1 + dp4a GEMVs for IQ2_S / IQ3_S / Q4_K / Q5_K / Q8_0
   - batched prefill
   - multi-block exact RMSNorm (`rms_blkg`, 32.4 → 32.7 tok/s)

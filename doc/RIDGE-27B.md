@@ -27,7 +27,7 @@ make -C native ridge-kernels             # builds all PTX the decoder loads into
 | `VYB_THINK` | 0 | 1 turns thinking on |
 | `VYB_EXACT` | 0 | 1 = bit-exact gold path (slower, see below) |
 | `RIDGE_STATS` | 1 | 0 hides the tok/s line |
-| `VYB_MAXS` | 4096 | context length (KV slots) |
+| `VYB_MAXS` | 2048 | context length (KV slots) |
 
 The decoder can also be run directly, which is what the benchmarks do:
 
@@ -57,7 +57,7 @@ RTX 3090 (godzilla, CC 8.6, 24 GB). Vyb main, 2026-10-26:
 
 | Path | tg128 | pp512 |
 |---|---|---|
-| Vyb default | **34.3** | **795** |
+| Vyb default | **34.4** | **795** |
 | Vyb `VYB_EXACT=1` | ~20.8 | ~753 |
 | llama.cpp (CUDA, same GGUF) | 47.35 | 1258.5 |
 
