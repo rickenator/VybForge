@@ -20,7 +20,7 @@ gemv_iq2s_q(p<Int>) -> {
     acc<Float32> = 0.0
     ff<UInt32> = 255 as UInt32
     if (tid + 0 < 512) {
-        st_shared_v4_u32((tid + 0) * 16, ld_v4_u32(G + (tid + 0) * 16, 0), ld_v4_u32(G + (tid + 0) * 16, 1), ld_v4_u32(G + (tid + 0) * 16, 2), ld_v4_u32(G + (tid + 0) * 16, 3))
+        st_shared_v4_u32((tid + 0) * 16, ldg_v4_u32(G + (tid + 0) * 16, 0), ldg_v4_u32(G + (tid + 0) * 16, 1), ldg_v4_u32(G + (tid + 0) * 16, 2), ldg_v4_u32(G + (tid + 0) * 16, 3))
     }
     kernel_barrier()
     ib<Int> = l % 8
@@ -31,14 +31,14 @@ gemv_iq2s_q(p<Int>) -> {
             bb<Int> = rb + sb * 82
             xq<Int> = X + sb * 256 + ib * 32
             dx<Float32> = ld_f32n(X + K + (sb * 8 + ib) * 4)
-            qx0<UInt32> = ld_v4_u32(xq + 0, 0)
-            qx1<UInt32> = ld_v4_u32(xq + 0, 1)
-            qx2<UInt32> = ld_v4_u32(xq + 0, 2)
-            qx3<UInt32> = ld_v4_u32(xq + 0, 3)
-            qx4<UInt32> = ld_v4_u32(xq + 16, 0)
-            qx5<UInt32> = ld_v4_u32(xq + 16, 1)
-            qx6<UInt32> = ld_v4_u32(xq + 16, 2)
-            qx7<UInt32> = ld_v4_u32(xq + 16, 3)
+            qx0<UInt32> = ldg_v4_u32(xq + 0, 0)
+            qx1<UInt32> = ldg_v4_u32(xq + 0, 1)
+            qx2<UInt32> = ldg_v4_u32(xq + 0, 2)
+            qx3<UInt32> = ldg_v4_u32(xq + 0, 3)
+            qx4<UInt32> = ldg_v4_u32(xq + 16, 0)
+            qx5<UInt32> = ldg_v4_u32(xq + 16, 1)
+            qx6<UInt32> = ldg_v4_u32(xq + 16, 2)
+            qx7<UInt32> = ldg_v4_u32(xq + 16, 3)
             d<Float32> = ld_f16(bb)
             q01<Int> = (ld_u16(bb + 2 + 4 * ib) as Int) & 65535
             q23<Int> = (ld_u16(bb + 4 + 4 * ib) as Int) & 65535
@@ -50,30 +50,30 @@ gemv_iq2s_q(p<Int>) -> {
             ga0<UInt32> = ld_shared_v2_u32(ix0 * 8, 0)
             gb0<UInt32> = ld_shared_v2_u32(ix0 * 8, 1)
             sg0<UInt32> = ((s01) & 255) as UInt32
-            m0_0<UInt32> = (((sg0 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m0_1<UInt32> = ((((sg0 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si0<CInt> = dp4a_s32(gb0, qx1, dp4a_s32(ga0, qx0, 0)) - 2 * dp4a_s32(gb0, qx1 & m0_1, dp4a_s32(ga0, qx0 & m0_0, 0))
+            m0_0<UInt32> = bytemask4(sg0)
+            m0_1<UInt32> = bytemask4(sg0 >> 4)
+            si0<CInt> = dp4a_sgn_s32(gb0, qx1, m0_1, dp4a_sgn_s32(ga0, qx0, m0_0, 0))
             ix1<Int> = ((q01 >> 8) & 255) | ((qh << 6) & 768)
             ga1<UInt32> = ld_shared_v2_u32(ix1 * 8, 0)
             gb1<UInt32> = ld_shared_v2_u32(ix1 * 8, 1)
             sg1<UInt32> = ((s01 >> 8) & 255) as UInt32
-            m1_0<UInt32> = (((sg1 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m1_1<UInt32> = ((((sg1 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si1<CInt> = dp4a_s32(gb1, qx3, dp4a_s32(ga1, qx2, 0)) - 2 * dp4a_s32(gb1, qx3 & m1_1, dp4a_s32(ga1, qx2 & m1_0, 0))
+            m1_0<UInt32> = bytemask4(sg1)
+            m1_1<UInt32> = bytemask4(sg1 >> 4)
+            si1<CInt> = dp4a_sgn_s32(gb1, qx3, m1_1, dp4a_sgn_s32(ga1, qx2, m1_0, 0))
             ix2<Int> = ((q23) & 255) | ((qh << 4) & 768)
             ga2<UInt32> = ld_shared_v2_u32(ix2 * 8, 0)
             gb2<UInt32> = ld_shared_v2_u32(ix2 * 8, 1)
             sg2<UInt32> = ((s23) & 255) as UInt32
-            m2_0<UInt32> = (((sg2 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m2_1<UInt32> = ((((sg2 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si2<CInt> = dp4a_s32(gb2, qx5, dp4a_s32(ga2, qx4, 0)) - 2 * dp4a_s32(gb2, qx5 & m2_1, dp4a_s32(ga2, qx4 & m2_0, 0))
+            m2_0<UInt32> = bytemask4(sg2)
+            m2_1<UInt32> = bytemask4(sg2 >> 4)
+            si2<CInt> = dp4a_sgn_s32(gb2, qx5, m2_1, dp4a_sgn_s32(ga2, qx4, m2_0, 0))
             ix3<Int> = ((q23 >> 8) & 255) | ((qh << 2) & 768)
             ga3<UInt32> = ld_shared_v2_u32(ix3 * 8, 0)
             gb3<UInt32> = ld_shared_v2_u32(ix3 * 8, 1)
             sg3<UInt32> = ((s23 >> 8) & 255) as UInt32
-            m3_0<UInt32> = (((sg3 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m3_1<UInt32> = ((((sg3 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si3<CInt> = dp4a_s32(gb3, qx7, dp4a_s32(ga3, qx6, 0)) - 2 * dp4a_s32(gb3, qx7 & m3_1, dp4a_s32(ga3, qx6 & m3_0, 0))
+            m3_0<UInt32> = bytemask4(sg3)
+            m3_1<UInt32> = bytemask4(sg3 >> 4)
+            si3<CInt> = dp4a_sgn_s32(gb3, qx7, m3_1, dp4a_sgn_s32(ga3, qx6, m3_0, 0))
             dlo<Float32> = d * (((sc & 15) as Float32) + ch) * cq
             dhi<Float32> = d * ((((sc >> 4) & 15) as Float32) + ch) * cq
             acc = acc + dx * (dlo * ((si0 + si1) as Float32) + dhi * ((si2 + si3) as Float32))
@@ -114,7 +114,7 @@ gemv_iq3s_q(p<Int>) -> {
     acc<Float32> = 0.0
     ff<UInt32> = 255 as UInt32
     if (tid + 0 < 128) {
-        st_shared_v4_u32((tid + 0) * 16, ld_v4_u32(G + (tid + 0) * 16, 0), ld_v4_u32(G + (tid + 0) * 16, 1), ld_v4_u32(G + (tid + 0) * 16, 2), ld_v4_u32(G + (tid + 0) * 16, 3))
+        st_shared_v4_u32((tid + 0) * 16, ldg_v4_u32(G + (tid + 0) * 16, 0), ldg_v4_u32(G + (tid + 0) * 16, 1), ldg_v4_u32(G + (tid + 0) * 16, 2), ldg_v4_u32(G + (tid + 0) * 16, 3))
     }
     kernel_barrier()
     ib<Int> = l % 8
@@ -125,14 +125,14 @@ gemv_iq3s_q(p<Int>) -> {
             bb<Int> = rb + sb * 110
             xq<Int> = X + sb * 256 + ib * 32
             dx<Float32> = ld_f32n(X + K + (sb * 8 + ib) * 4)
-            qx0<UInt32> = ld_v4_u32(xq + 0, 0)
-            qx1<UInt32> = ld_v4_u32(xq + 0, 1)
-            qx2<UInt32> = ld_v4_u32(xq + 0, 2)
-            qx3<UInt32> = ld_v4_u32(xq + 0, 3)
-            qx4<UInt32> = ld_v4_u32(xq + 16, 0)
-            qx5<UInt32> = ld_v4_u32(xq + 16, 1)
-            qx6<UInt32> = ld_v4_u32(xq + 16, 2)
-            qx7<UInt32> = ld_v4_u32(xq + 16, 3)
+            qx0<UInt32> = ldg_v4_u32(xq + 0, 0)
+            qx1<UInt32> = ldg_v4_u32(xq + 0, 1)
+            qx2<UInt32> = ldg_v4_u32(xq + 0, 2)
+            qx3<UInt32> = ldg_v4_u32(xq + 0, 3)
+            qx4<UInt32> = ldg_v4_u32(xq + 16, 0)
+            qx5<UInt32> = ldg_v4_u32(xq + 16, 1)
+            qx6<UInt32> = ldg_v4_u32(xq + 16, 2)
+            qx7<UInt32> = ldg_v4_u32(xq + 16, 3)
             d<Float32> = ld_f16(bb)
             qw0<Int> = (ld_u16(bb + 2 + 8 * ib + 0) as Int) & 65535
             qw1<Int> = (ld_u16(bb + 2 + 8 * ib + 2) as Int) & 65535
@@ -147,33 +147,33 @@ gemv_iq3s_q(p<Int>) -> {
             ga0<UInt32> = ld_shared_u32(i1_0 * 4)
             gb0<UInt32> = ld_shared_u32(i2_0 * 4)
             sg0<UInt32> = ((s01) & 255) as UInt32
-            m0_0<UInt32> = (((sg0 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m0_1<UInt32> = ((((sg0 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si0<CInt> = dp4a_s32(gb0, qx1, dp4a_s32(ga0, qx0, 0)) - 2 * dp4a_s32(gb0, qx1 & m0_1, dp4a_s32(ga0, qx0 & m0_0, 0))
+            m0_0<UInt32> = bytemask4(sg0)
+            m0_1<UInt32> = bytemask4(sg0 >> 4)
+            si0<CInt> = dp4a_sgn_s32(gb0, qx1, m0_1, dp4a_sgn_s32(ga0, qx0, m0_0, 0))
             i1_1<Int> = (qw1 & 255) | ((qh << 6) & 256)
             i2_1<Int> = (qw1 >> 8) | ((qh << 5) & 256)
             ga1<UInt32> = ld_shared_u32(i1_1 * 4)
             gb1<UInt32> = ld_shared_u32(i2_1 * 4)
             sg1<UInt32> = ((s01 >> 8) & 255) as UInt32
-            m1_0<UInt32> = (((sg1 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m1_1<UInt32> = ((((sg1 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si1<CInt> = dp4a_s32(gb1, qx3, dp4a_s32(ga1, qx2, 0)) - 2 * dp4a_s32(gb1, qx3 & m1_1, dp4a_s32(ga1, qx2 & m1_0, 0))
+            m1_0<UInt32> = bytemask4(sg1)
+            m1_1<UInt32> = bytemask4(sg1 >> 4)
+            si1<CInt> = dp4a_sgn_s32(gb1, qx3, m1_1, dp4a_sgn_s32(ga1, qx2, m1_0, 0))
             i1_2<Int> = (qw2 & 255) | ((qh << 4) & 256)
             i2_2<Int> = (qw2 >> 8) | ((qh << 3) & 256)
             ga2<UInt32> = ld_shared_u32(i1_2 * 4)
             gb2<UInt32> = ld_shared_u32(i2_2 * 4)
             sg2<UInt32> = ((s23) & 255) as UInt32
-            m2_0<UInt32> = (((sg2 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m2_1<UInt32> = ((((sg2 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si2<CInt> = dp4a_s32(gb2, qx5, dp4a_s32(ga2, qx4, 0)) - 2 * dp4a_s32(gb2, qx5 & m2_1, dp4a_s32(ga2, qx4 & m2_0, 0))
+            m2_0<UInt32> = bytemask4(sg2)
+            m2_1<UInt32> = bytemask4(sg2 >> 4)
+            si2<CInt> = dp4a_sgn_s32(gb2, qx5, m2_1, dp4a_sgn_s32(ga2, qx4, m2_0, 0))
             i1_3<Int> = (qw3 & 255) | ((qh << 2) & 256)
             i2_3<Int> = (qw3 >> 8) | ((qh << 1) & 256)
             ga3<UInt32> = ld_shared_u32(i1_3 * 4)
             gb3<UInt32> = ld_shared_u32(i2_3 * 4)
             sg3<UInt32> = ((s23 >> 8) & 255) as UInt32
-            m3_0<UInt32> = (((sg3 & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            m3_1<UInt32> = ((((sg3 >> 4) & (15 as UInt32)) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff
-            si3<CInt> = dp4a_s32(gb3, qx7, dp4a_s32(ga3, qx6, 0)) - 2 * dp4a_s32(gb3, qx7 & m3_1, dp4a_s32(ga3, qx6 & m3_0, 0))
+            m3_0<UInt32> = bytemask4(sg3)
+            m3_1<UInt32> = bytemask4(sg3 >> 4)
+            si3<CInt> = dp4a_sgn_s32(gb3, qx7, m3_1, dp4a_sgn_s32(ga3, qx6, m3_0, 0))
             db<Float32> = d * (c1 + c2 * (((sc >> (4 * (ib % 2))) & 15) as Float32))
             acc = acc + dx * db * ((si0 + si1 + si2 + si3) as Float32)
             sb = sb + 4
@@ -204,11 +204,7 @@ xq8(p<Int>) -> {
     x<Float32> = 0.0 as Float32
     if (i < K) { x = ld_f32n(X + i * 4) }
     a<Float32> = max_f32(x, (0.0 as Float32) - x)
-    a = max_f32(a, shfl_xor_f32(a, 16))
-    a = max_f32(a, shfl_xor_f32(a, 8))
-    a = max_f32(a, shfl_xor_f32(a, 4))
-    a = max_f32(a, shfl_xor_f32(a, 2))
-    a = max_f32(a, shfl_xor_f32(a, 1))
+    a = warp_max_f32(a)
     dd<Float32> = a / (127.0 as Float32)
     iv<Float32> = 0.0 as Float32
     if (a > (0.0 as Float32)) { iv = (127.0 as Float32) / a }

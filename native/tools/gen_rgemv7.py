@@ -35,7 +35,7 @@ def kern(name, bs, gb, iq3):
     ff<UInt32> = 255 as UInt32""")
     for c in range(0, gb // 16, TPB):
         w(f"""    if (tid + {c} < {gb // 16}) {{
-        st_shared_v4_u32((tid + {c}) * 16, ld_v4_u32(G + (tid + {c}) * 16, 0), ld_v4_u32(G + (tid + {c}) * 16, 1), ld_v4_u32(G + (tid + {c}) * 16, 2), ld_v4_u32(G + (tid + {c}) * 16, 3))
+        st_shared_v4_u32((tid + {c}) * 16, ldg_v4_u32(G + (tid + {c}) * 16, 0), ldg_v4_u32(G + (tid + {c}) * 16, 1), ldg_v4_u32(G + (tid + {c}) * 16, 2), ldg_v4_u32(G + (tid + {c}) * 16, 3))
     }}""")
     w("""    kernel_barrier()
     ib<Int> = l % 8
@@ -48,7 +48,7 @@ def kern(name, bs, gb, iq3):
             dx<Float32> = ld_f32n(X + K + (sb * 8 + ib) * 4)""".replace("BS", str(bs)))
     I = "            "
     for c in range(8):
-        w(f"{I}qx{c}<UInt32> = ld_v4_u32(xq + {16 * (c // 4)}, {c % 4})")
+        w(f"{I}qx{c}<UInt32> = ldg_v4_u32(xq + {16 * (c // 4)}, {c % 4})")
     w(f"{I}d<Float32> = ld_f16(bb)")
     if iq3:
         for k in range(4):
@@ -83,10 +83,10 @@ def kern(name, bs, gb, iq3):
         # m from a nibble without per-bit extraction: n * 0x204081 spreads bits 0..3 to bits 0/8/16/24 (the
         # shifted copies occupy disjoint bit ranges, so no carries), & 0x01010101, * 255. Integer-identical
         # to the old vsub4(g ^ m, m) form (vsub4 is a 7-op SIMD emulation in PTX on sm_86).
-        for h in range(2):
-            nib = f"(sg{k} >> {4*h}) & (15 as UInt32)" if h else f"sg{k} & (15 as UInt32)"
-            w(f"{I}m{k}_{h}<UInt32> = ((({nib}) * (2113665 as UInt32)) & (16843009 as UInt32)) * ff")
-        w(f"{I}si{k}<CInt> = dp4a_s32(gb{k}, qx{2*k+1}, dp4a_s32(ga{k}, qx{2*k}, 0)) - 2 * dp4a_s32(gb{k}, qx{2*k+1} & m{k}_1, dp4a_s32(ga{k}, qx{2*k} & m{k}_0, 0))")
+        # (Vyb intrinsics since vyb-wt 2026-10-26: bytemask4 builds m, dp4a_sgn_s32 applies it.)
+        w(f"{I}m{k}_0<UInt32> = bytemask4(sg{k})")
+        w(f"{I}m{k}_1<UInt32> = bytemask4(sg{k} >> 4)")
+        w(f"{I}si{k}<CInt> = dp4a_sgn_s32(gb{k}, qx{2*k+1}, m{k}_1, dp4a_sgn_s32(ga{k}, qx{2*k}, m{k}_0, 0))")
     if iq3:
         w(f"{I}db<Float32> = d * (c1 + c2 * (((sc >> (4 * (ib % 2))) & 15) as Float32))")
         w(f"{I}acc = acc + dx * db * ((si0 + si1 + si2 + si3) as Float32)")
@@ -125,11 +125,7 @@ xq8(p<Int>) -> {
     x<Float32> = 0.0 as Float32
     if (i < K) { x = ld_f32n(X + i * 4) }
     a<Float32> = max_f32(x, (0.0 as Float32) - x)
-    a = max_f32(a, shfl_xor_f32(a, 16))
-    a = max_f32(a, shfl_xor_f32(a, 8))
-    a = max_f32(a, shfl_xor_f32(a, 4))
-    a = max_f32(a, shfl_xor_f32(a, 2))
-    a = max_f32(a, shfl_xor_f32(a, 1))
+    a = warp_max_f32(a)
     dd<Float32> = a / (127.0 as Float32)
     iv<Float32> = 0.0 as Float32
     if (a > (0.0 as Float32)) { iv = (127.0 as Float32) / a }

@@ -29,10 +29,10 @@ gemv_q8_0_sk(p<Int>) -> {
         d<Float32> = ld_f16(bb)
         qb<Int> = bb + 2 + e
         xb<Int> = X + (j * 32 + e) * 4
-        x0<Float32> = ld_v4_f32(xb, 0)
-        x1<Float32> = ld_v4_f32(xb, 1)
-        x2<Float32> = ld_v4_f32(xb, 2)
-        x3<Float32> = ld_v4_f32(xb, 3)
+        x0<Float32> = ldg_v4_f32(xb, 0)
+        x1<Float32> = ldg_v4_f32(xb, 1)
+        x2<Float32> = ldg_v4_f32(xb, 2)
+        x3<Float32> = ldg_v4_f32(xb, 3)
         pq<Float32> = x0 * ((ld_i8(qb + 0) as Int) as Float32)
         pq = pq + x1 * ((ld_i8(qb + 1) as Int) as Float32)
         pq = pq + x2 * ((ld_i8(qb + 2) as Int) as Float32)
@@ -40,11 +40,7 @@ gemv_q8_0_sk(p<Int>) -> {
         acc = acc + d * pq
         j = j + 32
     }
-    acc = acc + shfl_xor_f32(acc, 16)
-    acc = acc + shfl_xor_f32(acc, 8)
-    acc = acc + shfl_xor_f32(acc, 4)
-    acc = acc + shfl_xor_f32(acc, 2)
-    acc = acc + shfl_xor_f32(acc, 1)
+    acc = warp_sum_f32(acc)
     if (t % 32 == 0) { st_shared_f64(t / 32, acc as Float) }
     kernel_barrier()
     if (t == 0) {
