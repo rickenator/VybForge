@@ -621,12 +621,22 @@ main()<Int> -> {
     Q6G<Int> = 32
     // Default now rq6k8.ptx (gen_rq6k8.py rq6k8.vyb 4 1): same lane map/arithmetic (bit-identical) with the row
     // streamed as coalesced u32 loads + shfl_idx extract, 318 vs 385 us/call. VYB_Q6KPTX=native/build/rq6k.ptx = previous.
-    q6p<String> = env_get("VYB_Q6KPTX") else "native/build/rq6k8.ptx"
+    // 2026-10-26: default now rq6kr2.ptx (gen_rq6k.py 2 1): 2 rows per warp share each lane's x loads, same
+    // per-row lane map / arithmetic / reduction -> bit-identical (VYB_LOGDUMP cmp); RTX 3090 tg128 see commit.
+    // The rows-per-warp launch geometry must match the PTX, so VYB_Q6KR defaults to 2 only for rq6kr2.ptx.
+    // On GB10 (cc 12.x) rq6kr2 measured slower (Righty tg64 13.67 vs 13.91), so it stays on rq6k8 there.
+    q6pd<String> = "native/build/rq6kr2.ptx"
+    if (CCMAJ >= 10) { q6pd = "native/build/rq6k8.ptx" }
+    q6p<String> = env_get("VYB_Q6KPTX") else ""
+    if (q6p == "") { q6p = q6pd }
+    q6rd<String> = "1"
+    if (q6p == "native/build/rq6kr2.ptx") { q6rd = "2" }
     if (q6p != "none") {
         mq6v<Int> = load_mod(q6p)
         if (mq6v == 0) { println("ERR load " + q6p) ; return 1 }
         hq6 = get_fn(mq6v, "gemv_q6k_v")
-        q6r<String> = env_get("VYB_Q6KR") else "1"
+        q6r<String> = env_get("VYB_Q6KR") else ""
+        if (q6r == "") { q6r = q6rd }
         Q6G = 16 * parse_u(q6r, 0, q6r.len())
         println("Q6K_GEMV ptx=" + q6p + " rows_per_block=" + Q6G.to_string())
     }
