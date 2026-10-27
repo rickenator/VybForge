@@ -550,6 +550,15 @@ main()<Int> -> {
         hq4q = get_fn(mq4q, "gemv_q4k_q") ; hxq4 = get_fn(m7b, "xq8") ; Q4Q8 = 1
         println("Q4K_GEMV gdn=q8_1 dp4a (rq4kq)")
     }
+    // VYB_Q5Q8 (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): attention q/k/v Q5_K GEMVs on q8_1 + dp4a
+    Q5Q8<Int> = 0 ; hq5q<Int> = 0 ; hxq5<Int> = 0
+    if ((env_get("VYB_Q5Q8") else dfq4) == "1") {
+        mq5q<Int> = load_mod("native/build/rq5kq.ptx")
+        m7c<Int> = load_mod("native/build/rgemv7.ptx")
+        if (mq5q == 0 || m7c == 0) { println("ERR load rq5kq / rgemv7") ; return 1 }
+        hq5q = get_fn(mq5q, "gemv_q5k_q") ; hxq5 = get_fn(m7c, "xq8") ; Q5Q8 = 1
+        println("Q5K_GEMV attn=q8_1 dp4a (rq5kq)")
+    }
     // VYB_Q6KPTX: Q6_K decode GEMV gemv_q6k_v (gen_rq6k.py R D; default rq6k.ptx = gen_rq6k.py 1 2: 1 row/warp,
     // 2-deep prefetch, shuffle reduction; bit-identical to qwen3 gemv_q6k). VYB_Q6KR = rows per warp.
     // VYB_Q6KPTX=none = qwen3.ptx gemv_q6k (32 rows/block).
@@ -845,6 +854,7 @@ main()<Int> -> {
             set_gemv(pb0 + 256, RBA + ofv.get(iq) - RLO, XN32, QG, 2 * NQ, D, 8, 0, 0)
             set_gemv(pb0 + 2 * 256, RBA + ofv.get(ik) - RLO, XN32, KR, NKV, D, 8, 0, 0)
             set_gemv(pb0 + 3 * 256, RBA + ofv.get(iv) - RLO, XN32, VC, NKV, D, 8, 0, 0)   // Y = V cache row p (per token)
+            if (Q5Q8 == 1) { put_i(pb0 + 256, 8, XNQ) ; put_i(pb0 + 2 * 256, 8, XNQ) ; put_i(pb0 + 3 * 256, 8, XNQ) }
             p4a<Int> = pb0 + 4 * 256
             put_i(p4a, 0, QG) ; put_i(p4a, 8, QB) ; put_i(p4a, 16, GT) ; put_i(p4a, 24, 1) ; put_i(p4a, 32, H) ; put_i(p4a, 40, HD)
             p5a<Int> = pb0 + 5 * 256
@@ -1183,9 +1193,16 @@ main()<Int> -> {
                 put_i(pb + 3 * 256, 16, VC2 + p * NKV * 8)
                 put_i(pb + 7 * 256, 24, KC2 + p * NKV * 8) ; put_i(pb + 7 * 256, 72, p)
                 put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
-                lk(hq5, (2 * NQ + 15) / 16, 512, pb + 256)
-                lk(hq5, (NKV + 15) / 16, 512, pb + 2 * 256)
-                lk(hq5, (NKV + 15) / 16, 512, pb + 3 * 256)
+                if (Q5Q8 == 1) {
+                    lk(hxq5, (D + 255) / 256, 256, PXNQ)
+                    lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
+                    lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
+                    lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)
+                } else {
+                    lk(hq5, (2 * NQ + 15) / 16, 512, pb + 256)
+                    lk(hq5, (NKV + 15) / 16, 512, pb + 2 * 256)
+                    lk(hq5, (NKV + 15) / 16, 512, pb + 3 * 256)
+                }
                 lk(hqgs, (NQ + 255) / 256, 256, pb + 4 * 256)
                 lk(hrms, H, 256, pb + 5 * 256)
                 lk(hrms, KVH, 256, pb + 6 * 256)
