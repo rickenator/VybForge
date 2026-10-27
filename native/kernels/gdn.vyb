@@ -326,3 +326,56 @@ conv_shift(p<Int>) -> {
         }
     }
 }
+
+// Decode (T = 1) launch fusion (Ursela, 2026-10-27): sigmoid_k (beta) + alpha_gate in one launch. p is the
+// sigmoid_k block, p + 24 points at the alpha_gate block; same per-element f64 math -> bit-identical.
+sg_ag(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    q<Int> = ld_i64(p + 24)
+    A<Int> = ld_i64(q + 0)
+    DT<Int> = ld_i64(q + 8)
+    SA<Int> = ld_i64(q + 16)
+    OUT<Int> = ld_i64(q + 24)
+    n2<Int> = ld_i64(q + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        v<Float> = ld_f64(X + gid * 8)
+        st_f64(Y + gid * 8, 1.0 / (1.0 + vexp(0.0 - v)))
+    }
+    if (gid < n2) {
+        v2<Float> = ld_f64(A + gid * 8) + ld_f64(DT + gid * 8)
+        st_f64(OUT + gid * 8, vsoftplus(v2) * ld_f64(SA + gid * 8))
+    }
+}
+// Decode (T = 1) conv step: conv_shift + interleave_qkv + conv1d_k + silu_k in one launch, one thread per
+// channel (each of the four is per-channel; the same thread now does them in order, with the same loops and
+// f64 expressions) -> bit-identical. p is the conv1d_k block (S W Y QKV DC T=1) plus Q at p + 48 (the new
+// qkv row) and Z at p + 56 (silu output). Y (the pre-silu conv) is still written.
+conv_step(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    QKV<Int> = ld_i64(p + 24)
+    DC<Int> = ld_i64(p + 32)
+    Q<Int> = ld_i64(p + 48)
+    Z<Int> = ld_i64(p + 56)
+    ncs<Int> = DC
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < QKV) {
+        j<Int> = 0
+        for (j in 0..ncs - 2) {
+            st_f64(S + (ncs * gid + j) * 8, ld_f64(S + (ncs * gid + j + 1) * 8))
+        }
+        st_f64(S + (ncs * gid + DC - 1) * 8, ld_f64(Q + gid * 8))
+        acc<Float> = 0.0
+        j2<Int> = 0
+        for (j2 in 0..DC - 1) {
+            acc = acc + ld_f64(S + (ncs * gid + j2) * 8) * ld_f64(W + (gid * DC + j2) * 8)
+        }
+        st_f64(Y + gid * 8, acc)
+        v<Float> = ld_f64(Y + gid * 8)
+        st_f64(Z + gid * 8, v / (1.0 + vexp(0.0 - v)))
+    }
+}

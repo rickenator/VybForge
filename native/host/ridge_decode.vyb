@@ -488,6 +488,12 @@ main()<Int> -> {
     hl2<Int> = get_fn(mgd, "l2norm") ; hng<Int> = get_fn(mgd, "norm_gated") ; hsg<Int> = get_fn(mgd, "sigmoid_k")
     hag<Int> = get_fn(mgd, "alpha_gate") ; hsv<Int> = get_fn(mgd, "silu_k") ; hcv<Int> = get_fn(mgd, "conv1d_k")
     hil<Int> = get_fn(mgd, "interleave_qkv") ; hsh<Int> = get_fn(mgd, "conv_shift")
+    // VYB_GDNF (default 1): decode GDN launch fusion, sigmoid_k + alpha_gate -> sg_ag and conv_shift +
+    // interleave_qkv + conv1d_k + silu_k -> conv_step (gdn.vyb). Bit-identical; 4 fewer launches per GDN layer.
+    hsga<Int> = get_fn(mgd, "sg_ag") ; hcst<Int> = get_fn(mgd, "conv_step")
+    GDNF<Int> = 1
+    if ((env_get("VYB_GDNF") else "1") == "0" || hsga == 0 || hcst == 0) { GDNF = 0 }
+    if (GDNF == 1) { println("GDN_FUSE sg_ag+conv_step (decode)") }
     hrope<Int> = get_fn(mrp, "rope_nrot") ; hqgs<Int> = get_fn(ma35, "qg_split") ; hgm<Int> = get_fn(ma35, "gate_mul")
     hq6d<Int> = get_fn(mq6, "q6kdeq")
     hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
@@ -824,6 +830,7 @@ main()<Int> -> {
     SCLV<Float> = 1.0 / sqrt(SS as Float)
 
     // per-layer launch plan: kind, and the param-block base of each step (8 blocks per slot)
+    if (D % 32 != 0) { RMQ8 = 0 }
     kind<Vec<Int>> = Vec() ; pbase<Vec<Int>> = Vec() ; aidx<Vec<Int>> = Vec()
     fty<Vec<Int>> = Vec()      // gate, up, down types (3 per layer)
     gdn_bytes<Int> = 0 ; kv_bytes<Int> = 0
@@ -914,6 +921,7 @@ main()<Int> -> {
             put_i(p7, 0, QKVX) ; put_i(p7, 8, CVL) ; put_i(p7, 16, QKV) ; put_i(p7, 24, DC) ; put_i(p7, 32, 1)
             p8<Int> = pb0 + 8 * 256
             put_i(p8, 0, CVL) ; put_i(p8, 8, CW) ; put_i(p8, 16, CRAW) ; put_i(p8, 24, QKV) ; put_i(p8, 32, DC) ; put_i(p8, 40, 1)
+            put_i(p8, 48, QKVX) ; put_i(p8, 56, CONVS) ; put_i(p4, 24, p5)
             p9<Int> = pb0 + 9 * 256
             put_i(p9, 0, CRAW) ; put_i(p9, 8, CONVS) ; put_i(p9, 16, QKV)
             p10<Int> = pb0 + 10 * 256
@@ -1304,12 +1312,17 @@ main()<Int> -> {
                     lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
                     lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
                 }
-                lk(hsg, 1, 64, pb + 4 * 256)
-                lk(hag, 1, 64, pb + 5 * 256)
-                lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
-                lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
-                lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
-                lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                if (GDNF == 1) {
+                    lk(hsga, 1, 64, pb + 4 * 256)
+                    lk(hcst, (QKV + 255) / 256, 256, pb + 8 * 256)
+                } else {
+                    lk(hsg, 1, 64, pb + 4 * 256)
+                    lk(hag, 1, 64, pb + 5 * 256)
+                    lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
+                    lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
+                    lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
+                    lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                }
                 if (RK2 >= 1) {
                     if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
                         lk(hl2b, 2 * HK, SS, pb + 20 * 256)
