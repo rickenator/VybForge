@@ -1190,7 +1190,7 @@ main()<Int> -> {
                 lk(hrms, H, 256, pb + 5 * 256)
                 lk(hrms, KVH, 256, pb + 6 * 256)
                 lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
-                lk(hasc, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256)
+                lk(hasc, (H * (p + 1) + 31) / 32, 32, pb + 8 * 256)
                 if (ACX == 1) {
                     lk4(hrm2, H, 32, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrxe, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)

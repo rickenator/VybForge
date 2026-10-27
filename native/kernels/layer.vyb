@@ -571,10 +571,40 @@ attn_sc(p<Int>) -> {
             kb<Int> = K + (t * KVH * HD + kvh * HD) * 8
             sc<Float> = 0.0
             ia<Int> = 0
-            for (ia in 0..HD - 1) {
+            # 8 independent load pairs in flight per trip (2026-10-26): the old one-pair loop paid a full
+            # uncoalesced load latency per element (~62 us per launch). Same adds in the same order.
+            while (ia + 7 < HD) {
+                q0<Float> = ld_f64(qb + ia * 8)
+                q1<Float> = ld_f64(qb + ia * 8 + 8)
+                q2<Float> = ld_f64(qb + ia * 8 + 16)
+                q3<Float> = ld_f64(qb + ia * 8 + 24)
+                q4<Float> = ld_f64(qb + ia * 8 + 32)
+                q5<Float> = ld_f64(qb + ia * 8 + 40)
+                q6<Float> = ld_f64(qb + ia * 8 + 48)
+                q7<Float> = ld_f64(qb + ia * 8 + 56)
+                k0<Float> = ld_f64(kb + ia * 8)
+                k1<Float> = ld_f64(kb + ia * 8 + 8)
+                k2<Float> = ld_f64(kb + ia * 8 + 16)
+                k3<Float> = ld_f64(kb + ia * 8 + 24)
+                k4<Float> = ld_f64(kb + ia * 8 + 32)
+                k5<Float> = ld_f64(kb + ia * 8 + 40)
+                k6<Float> = ld_f64(kb + ia * 8 + 48)
+                k7<Float> = ld_f64(kb + ia * 8 + 56)
+                sc = sc + q0 * k0
+                sc = sc + q1 * k1
+                sc = sc + q2 * k2
+                sc = sc + q3 * k3
+                sc = sc + q4 * k4
+                sc = sc + q5 * k5
+                sc = sc + q6 * k6
+                sc = sc + q7 * k7
+                ia = ia + 8
+            }
+            while (ia < HD) {
                 qv<Float> = ld_f64(qb + ia * 8)
                 kv<Float> = ld_f64(kb + ia * 8)
                 sc = sc + qv * kv
+                ia = ia + 1
             }
             st_f64(SC + gid * 8, sc * scale)
         }
