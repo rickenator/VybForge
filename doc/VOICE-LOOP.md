@@ -5,6 +5,17 @@ Companion: `native/ROADMAP.md` (substrate phases), `doc/SUBSTRATE-SCOPE.md` (gen
 
 ## Where it stands
 
+> **Update 2026-10-27 — the plan below is complete except L4.** P2's decoder is
+> done (`native/whisper/README.md`): decoder logits within 5.2e-05, 24-token
+> greedy decode matching the reference token for token, and an id→text
+> detokeniser matching character for character. L3 dispatch and its TZif clock
+> are done (`native/voice`). L4 TTS exists as a gated Klatt cascade formant core
+> (`native/tts`), so "no TTS" below no longer holds — what is open is the round
+> trip: `round_trip.sh hello` is labelled non-speech by Whisper, and
+> `native/tts/README.md` argues the oracle, not only the synthesiser, is what
+> needs fixing first. The narrative that follows is the original 2026-10-11
+> mandate, kept for the layer contracts.
+
 **P0 (host audio path) is done and gated** — see `native/audio/README.md`. A Vyb
 program read 64000 frames (4 s @ 16 kHz mono) from the host microphone and wrote a
 valid WAV whose levels agree with two independent measurements; a second Vyb
