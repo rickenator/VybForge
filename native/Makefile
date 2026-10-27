@@ -518,7 +518,14 @@ chat-gen: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/na
 # averaged -> tokens/sec once the model is resident. No re-load per interaction.
 CHAT_GEN ?= 3
 RESIDENT_RUNS ?= 3
+# The gold in verify_resident_bench.py is for this prompt, so the ids are re-encoded HERE every run (same
+# encode probe -> emit_prompt_ids.py path as chat-prompt). resident-bench used to read whatever
+# native/out/prompt_ids.txt held; a stale 16-id file ("Add a package to a QEMU x86_64 boot test.") left by
+# an older checkout made the gate FAIL on a correct build (2026-10-26).
+RESIDENT_PROMPT := The capital of France is
 resident-bench: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(RESIDENT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(RESIDENT_PROMPT)"
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) VYB_RUNS=$(RESIDENT_RUNS) $(VYB) native/host/resident_driver.vyb --module-path native/llm 2>&1 | tee native/out/resident_bench.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_resident_bench.py
 
