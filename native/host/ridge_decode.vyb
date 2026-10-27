@@ -33,6 +33,7 @@ extern "C" {
     cuMemAllocHost_v2(pp<loc<Int>>, bytesize<Int>)<CInt>
     cuMemFreeHost(p<Int>)<CInt>
     cuMemcpy(dst<Int>, src<Int>, ByteCount<Int>)<CInt>
+    cuMemcpyAsync(dst<Int>, src<Int>, ByteCount<Int>, hStream<Int>)<CInt>
     pread(fd<CInt>, buf<Int>, n<Int>, off<Int>)<Int>
     creat(path<CString>, mode<CInt>)<CInt>
     write(fd<CInt>, buf<Int>, n<Int>)<Int>
@@ -152,6 +153,15 @@ dsync() -> {
 }
 put_i(PD<Int>, off<Int>, v<Int>) -> {
     freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+// stream-ordered 8-byte param write: v goes into pinned slot PS, then an async copy on stream 0.
+// No host stall (cuMemcpyHtoD from pageable memory drains the stream). The caller must not reuse
+// PS until the copy has run (the decode step syncs before the next token's writes).
+put_ia(PD<Int>, off<Int>, v<Int>, PS<Int>) -> {
+    freedom {
+        at(from<loc<Int>>(PS)) = v
+        cuMemcpyAsync(PD + off, PS, 8, 0)
+    }
 }
 put_f(PD<Int>, off<Int>, v<Float>) -> {
     freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
@@ -1088,6 +1098,11 @@ main()<Int> -> {
     ldp<String> = env_get("VYB_LOGDUMP") else ""
     LFD<CInt> = -1
     LHB<Int> = 0
+    // VYB_PSA (default 1): attention-layer per-token params via pinned slots + async copies (no drain)
+    PSA<Int> = 0
+    if ((env_get("VYB_PSA") else "1") == "1") {
+        freedom { if (cuMemAllocHost_v2(loc(PSA), 4096) != 0) { PSA = 0 } }
+    }
     if (ldp.len() > 0) {
         freedom {
             LFD = creat(ldp, 420)
@@ -1214,9 +1229,16 @@ main()<Int> -> {
             } else {
                 a<Int> = aidx.get(L)
                 KC2<Int> = KCv.get(a) ; VC2<Int> = VCv.get(a)
-                put_i(pb + 3 * 256, 16, VC2 + p * NKV * 8)
-                put_i(pb + 7 * 256, 24, KC2 + p * NKV * 8) ; put_i(pb + 7 * 256, 72, p)
-                put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
+                if (PSA != 0 && p >= NP - 1) {
+                    ps<Int> = PSA + a * 40
+                    put_ia(pb + 3 * 256, 16, VC2 + p * NKV * 8, ps)
+                    put_ia(pb + 7 * 256, 24, KC2 + p * NKV * 8, ps + 8) ; put_ia(pb + 7 * 256, 72, p, ps + 16)
+                    put_ia(pb + 8 * 256, 224, p, ps + 24) ; put_ia(pb + 8 * 256, 240, p + 1, ps + 32)
+                } else {
+                    put_i(pb + 3 * 256, 16, VC2 + p * NKV * 8)
+                    put_i(pb + 7 * 256, 24, KC2 + p * NKV * 8) ; put_i(pb + 7 * 256, 72, p)
+                    put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
+                }
                 if (Q5Q8 == 1) {
                     lk(hxq5, (D + 255) / 256, 256, PXNQ)
                     lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
