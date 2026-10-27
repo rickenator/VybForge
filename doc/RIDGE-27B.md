@@ -58,7 +58,7 @@ changes since are decode-only):
 
 | Path | tg128 | pp512 |
 |---|---|---|
-| Vyb default | **37.6** | **791** |
+| Vyb default | **39.7** | **791** |
 | Vyb `VYB_EXACT=1` | ~20.8 | ~753 |
 | llama.cpp (CUDA, same GGUF) | 47.35 | 1258.5 |
 
@@ -77,8 +77,9 @@ Peak memory on the 3090 is about 14.2 GB of VRAM.
 - **`VYB_EXACT=1`** keeps the f64 reference math everywhere. Its token stream is bit-identical
   to the gold ids (`GOLD_EXACT`). Every change must keep this.
 - **Default (lossy) path**: q8_1 activations + `dp4a` for the IQ2_S / IQ3_S / Q4_K / Q5_K / Q8_0
-  GEMVs and an f32 conv. On 510 wikitext tokens vs the exact path: mean KLD **0.00407**, p99
-  0.061, top-1 agreement 98.6 %, PPL **3.2568**. The rule for a lossy default is mean KLD ≤ ~0.005
+  GEMVs, an f32 conv and an f32 GDN state (`delta_step_g32`). On 510 wikitext tokens vs the exact
+  path: mean KLD **0.00394**, p99 0.044, top-1 agreement 98.04 %, PPL **3.2448** (before the f32
+  GDN state: 0.00407 / 3.2568). The rule for a lossy default is mean KLD ≤ ~0.005
   and PPL within ~0.01 of exact.
 - **Qwen3-4B resident gate**: `make -C native resident-bench` must PASS (gold stream MATCH).
 
@@ -101,11 +102,13 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `PROMPT`, `PROMPT_IDS`, `FORCE_IDS`, `GEN`, `CHAT`, `CHAT_N`, `CHAT_SYS`, `THINK`, `STREAM`, `TOKTEXT`, `MAXS` | prompt / chat / output control |
 | `MODEL`, `TSV`, `INVFREQ`, `LLM_DIR` | input paths (GGUF, tensor TSV, rope inv-freq, tokenizer dir) |
 | `PFB`, `PFB64`, `PFBM`, `PFG32`, `PFQ4`, `PFQ4H`, `PFQ5H`, `PFXH`, `PFG128PTX` | batched-prefill variants (`PFB=2` is the bench setting) |
+| `GDN32`, `DSG` | f32 GDN recurrent state (`GDN32`) stepped by `delta_step_g32` (`DSG`, `native/tools/gen_rdeltag.py`): state held in registers, 8 warps x 16 rows per 32-column block, one read + one write of the state. Default 1 unless `VYB_EXACT=1`; lossy (KLD above). `GDN32=0` = f64 `DSX`; `DSG=0` = `delta_step_u32` |
+| `Q4KU`, `Q5KU` | Q4_K / Q5_K q8_1 GEMVs with the super-block loop unrolled x4 (`gemv_q4k_qu`, `gemv_q5k_qu`; default 1, bit-identical; 0 = the plain loop) |
 | `DSX` | Tiled f64 GDN state step `delta_step_x` (default 1, bit-identical to `DSU`; `VYB_DSX=0` falls back to `delta_step_u`). `DSXPTX` overrides the module path |
 | `CG` | Decode step (layers + lm_head) replayed as one CUDA graph (default 1, bit-identical). Re-captured when the attention grid bucket (64 positions) grows; 0 = eager launches |
 | `LKD` | Kernels launched by a direct `cuLaunchKernel` Vyb extern on the decode stream (default 1; 0 = the `cuda_launch4i` shim, which also disables `CG`) |
 | `PSA` | Per-token attention params written through pinned slots + `cuMemcpyAsync` (default 1; required by `CG`) |
-| `DSU`, `DSV`, `DSW`, `DST`, `DSC`, `DSF`, `DSP`, `DSPNW`, `DSVJB`, `DSPPTX`, `DSWPTX`, `GDN32`, `ACX` | Gated-DeltaNet state-step / attention kernel variants (experimental) |
+| `DSU`, `DSV`, `DSW`, `DST`, `DSC`, `DSF`, `DSP`, `DSPNW`, `DSVJB`, `DSPPTX`, `DSWPTX`, `ACX` | Gated-DeltaNet state-step / attention kernel variants (experimental) |
 | `RGPTX`, `RG6PTX`, `RG7PTX`, `RG6PERM`, `RG6TPB`, `RG6WPR`, `RGTPB`, `RGR`, `RGFUSE`, `RK1`, `XPERM`, `Q4KPTX`, `Q4KR` | GEMV kernel selection and tuning (experimental) |
 | `DBG`, `LOGDUMP` | debug output / dump logits |
 
@@ -113,5 +116,5 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 
 `make -C native ridge-kernels` runs `native/tools/build_ridge_kernels.sh`. The script holds the
 `--kernel-shared` size for each kernel that needs one. Several kernels are generated:
-`native/tools/gen_rgemv{5,6,7,8}.py`, `gen_rpf*.py` and `gen_rdelta2.py` write the `.vyb`
+`native/tools/gen_rgemv{5,6,7,8}.py`, `gen_rpf*.py`, `gen_rdelta2.py`, `gen_rdelta2x.py` and `gen_rdeltag.py` write the `.vyb`
 source, which is committed.

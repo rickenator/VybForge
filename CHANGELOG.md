@@ -6,7 +6,15 @@
 - **27B Ridge (qwen35) all-Vyb decode** (`native/host/ridge_decode.vyb`, `native/kernels/r*.vyb`),
   with `./ridge-chat`: streaming chat, the ChatML template, thinking on or off, and a gold-exact
   `VYB_EXACT=1` path. See `doc/RIDGE-27B.md`.
-- RTX 3090 speed: tg128 37.6 tok/s, pp512 791 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
+- RTX 3090 speed: tg128 39.7 tok/s, pp512 791 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
+  - f32 GDN recurrent state with a register-resident state step `delta_step_g32`
+    (`native/tools/gen_rdeltag.py`, structure after llama.cpp `gated_delta_net.cu`, MIT): one DRAM
+    read and one write of the state per token instead of the tiled f64 `delta_step_x` (48.6 µs per
+    launch, the largest per-kernel gap in an nsys profile against llama.cpp's 6.5 µs). Default unless
+    `VYB_EXACT=1` (`VYB_GDN32` / `VYB_DSG`); lossy, KLD-checked: mean KLD 0.00394, top-1 98.04 %,
+    PPL 3.2448 vs 0.00407 / 3.2568 for the f64 default. tg128 37.9 → 39.7 tok/s
+  - Q4_K / Q5_K q8_1 GEMVs with the super-block loop unrolled ×4 (`gemv_q4k_qu`, `gemv_q5k_qu`;
+    `VYB_Q4KU`, `VYB_Q5KU`), bit-identical (`VYB_LOGDUMP` cmp), +0.8 % / +0.4 % tg128 interleaved
   - Q6_K decode GEMV `rq6kr2` (2 rows per warp, `native/tools/gen_rq6k.py 2 1`), default on sm_8x;
     GB10 keeps `rq6k8`, which measured faster there. Bit-identical
   - `rms_blkg` writes the q8_1 copy of the attention-norm output itself (`VYB_RMSQ8`), dropping the

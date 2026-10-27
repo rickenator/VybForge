@@ -686,7 +686,11 @@ main()<Int> -> {
         hdst = get_fn(mdt, "delta_step_t") ; htr = get_fn(mdt, "st_tr")
         DST = 1
         println("GDN_STATE column-major delta_step_t")
-        if ((env_get("VYB_GDN32") else "") == "1") {
+        // GDN32 + DSG default 1 unless VYB_EXACT=1 (2026-10-27 RTX 3090: tg128 37.9 -> 39.6; KLD mean 0.00394,
+        // top1 98.04%, ppl 3.2448 on the 510-token gate vs 0.00407 / 3.2568 for the f64 DSX default)
+        dfg<String> = "1"
+        if ((env_get("VYB_EXACT") else "") == "1") { dfg = "0" }
+        if ((env_get("VYB_GDN32") else dfg) == "1") {
             hdst = get_fn(mdt, "delta_step_t32") ; htr = get_fn(mdt, "st_tr32")
             if (hdst == 0 || htr == 0) { println("ERR rdelta f32 kernels") ; return 1 }
             GDN32 = 1
@@ -720,10 +724,10 @@ main()<Int> -> {
             DSP = 1
             println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
         }
-        // VYB_DSG=1 (with VYB_GDN32=1): delta_step_g32 (rdeltag, gen_rdeltag.py): f32 state held in registers,
+        // VYB_DSG (default 1 with GDN32; 0 = delta_step_u32): delta_step_g32 (rdeltag, gen_rdeltag.py): f32 state held in registers,
         // 8 warps x 16 rows per 32-column block, warp partials summed in shared; one read + one write of the state
         // (llama.cpp gated_delta_net structure, MIT). Not bit-exact -> KLD-checked.
-        if (GDN32 == 1 && (env_get("VYB_DSG") else "") == "1" && SS == 128) {
+        if (GDN32 == 1 && DSP == 0 && (env_get("VYB_DSG") else dfg) == "1" && SS == 128) {
             mdg<Int> = load_mod("native/build/rdeltag.ptx")
             if (mdg == 0) { println("ERR load rdeltag.ptx") ; return 1 }
             hdst = get_fn(mdg, "delta_step_g32")
