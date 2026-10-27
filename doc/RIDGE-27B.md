@@ -42,7 +42,7 @@ VYB_STDLIB=$VYBHOME/stdlib VYB_PFB=2 VYB_GEN=128 VYB_PROMPT="The capital of Fran
 
 | File | From |
 |---|---|
-| `native/out/ridge_tensors.tsv` | `python3 native/tools/inventory_to_tsv.py` (from `native/gguf/ridge-3.7bpw-inventory.tsv`) |
+| `native/out/ridge_tensors.tsv` | `make -C native ridge-tensors` (runs `native/tools/inventory_to_tsv.py` on `native/gguf/ridge-3.7bpw-inventory.tsv`) |
 | `native/out/iq2s_grid.bin`, `iq3s_grid.bin` | `python3 native/tools/iq2_s_ref.py`, `iq3_s_ref.py` |
 | `native/out/ridge_invfreq.bin` | `python3 native/tools/gen_invfreq.py <rope_base> <n_rot_dims> native/out/ridge_invfreq.bin` |
 | `native/out/ridge_meta.txt` | `python3 native/gguf/ridge_inventory.py <GGUF> --meta native/out/ridge_meta.txt` |
@@ -53,11 +53,12 @@ Check for this first when a fresh checkout produces nonsense.
 
 ## Performance (tg128 / pp512, tok/s)
 
-RTX 3090 (godzilla, CC 8.6, 24 GB). Vyb main, 2026-10-26:
+RTX 3090 (godzilla, CC 8.6, 24 GB). Vyb main, 2026-10-27 (pp512 last measured 2026-10-26; the
+changes since are decode-only):
 
 | Path | tg128 | pp512 |
 |---|---|---|
-| Vyb default | **35.8** | **791** |
+| Vyb default | **37.6** | **791** |
 | Vyb `VYB_EXACT=1` | ~20.8 | ~753 |
 | llama.cpp (CUDA, same GGUF) | 47.35 | 1258.5 |
 
@@ -92,6 +93,9 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `Q4Q8`, `Q5Q8`, `Q8SK` | Q4_K / Q5_K / Q8_0 GEMVs on q8_1 + dp4a, Q8_0 split-K (default on) |
 | `CONV32` | f32 short conv in the GDN block (default on) |
 | `RMSG` | multi-block RMSNorm `rms_blkg`, exact (default on) |
+| `RMSQ8` | `rms_blkg` also writes the q8_1 copy (int8 + per-32 f32 scale) that the Q4_K / Q5_K GEMVs read, instead of a separate `xq8` launch (default 1, bit-identical; needs `RMSG`; off when the hidden size is not a multiple of 32) |
+| `GDNF` | GDN decode: fused `sg_ag` (sigmoid + alpha gate) and `conv_step` (shift + interleave + conv1d + silu) kernels, 4 fewer launches per GDN layer (default 1, bit-identical; 0 = the separate kernels) |
+| `Q6KPTX`, `Q6KR` | Q6_K decode GEMV module and rows per warp. Default `rq6kr2.ptx` with 2 rows per warp on CC < 10 (bit-identical), `rq6k8.ptx` with 1 on GB10; `Q6KR` must match the module |
 | `PROMPT`, `PROMPT_IDS`, `FORCE_IDS`, `GEN`, `CHAT`, `CHAT_N`, `CHAT_SYS`, `THINK`, `STREAM`, `TOKTEXT`, `MAXS` | prompt / chat / output control |
 | `MODEL`, `TSV`, `INVFREQ`, `LLM_DIR` | input paths (GGUF, tensor TSV, rope inv-freq, tokenizer dir) |
 | `PFB`, `PFB64`, `PFBM`, `PFG32`, `PFQ4`, `PFQ4H`, `PFQ5H`, `PFXH`, `PFG128PTX` | batched-prefill variants (`PFB=2` is the bench setting) |
@@ -100,7 +104,7 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `LKD` | Kernels launched by a direct `cuLaunchKernel` Vyb extern on the decode stream (default 1; 0 = the `cuda_launch4i` shim, which also disables `CG`) |
 | `PSA` | Per-token attention params written through pinned slots + `cuMemcpyAsync` (default 1; required by `CG`) |
 | `DSU`, `DSV`, `DSW`, `DST`, `DSC`, `DSF`, `DSP`, `DSPNW`, `DSVJB`, `DSPPTX`, `DSWPTX`, `GDN32`, `ACX` | Gated-DeltaNet state-step / attention kernel variants (experimental) |
-| `RGPTX`, `RG6PTX`, `RG7PTX`, `RG6PERM`, `RG6TPB`, `RG6WPR`, `RGTPB`, `RGR`, `RGFUSE`, `RK1`, `XPERM`, `Q4KPTX`, `Q4KR`, `Q6KPTX`, `Q6KR` | GEMV kernel selection and tuning (experimental) |
+| `RGPTX`, `RG6PTX`, `RG7PTX`, `RG6PERM`, `RG6TPB`, `RG6WPR`, `RGTPB`, `RGR`, `RGFUSE`, `RK1`, `XPERM`, `Q4KPTX`, `Q4KR` | GEMV kernel selection and tuning (experimental) |
 | `DBG`, `LOGDUMP` | debug output / dump logits |
 
 ## Kernels
