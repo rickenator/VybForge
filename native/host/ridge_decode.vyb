@@ -34,6 +34,15 @@ extern "C" {
     cuMemFreeHost(p<Int>)<CInt>
     cuMemcpy(dst<Int>, src<Int>, ByteCount<Int>)<CInt>
     cuMemcpyAsync(dst<Int>, src<Int>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuLaunchKernel(f<Int>, gx<CUInt>, gy<CUInt>, gz<CUInt>, bx<CUInt>, by<CUInt>, bz<CUInt>,
+                   shm<CUInt>, st<Int>, kp<Int>, ex<Int>)<CInt>
+    cuStreamCreate(ph<loc<Int>>, flags<CUInt>)<CInt>
+    cuStreamBeginCapture_v2(st<Int>, mode<CInt>)<CInt>
+    cuStreamEndCapture(st<Int>, pg<loc<Int>>)<CInt>
+    cuGraphInstantiateWithFlags(pe<loc<Int>>, g<Int>, flags<Int>)<CInt>
+    cuGraphLaunch(e<Int>, st<Int>)<CInt>
+    cuGraphDestroy(g<Int>)<CInt>
+    cuGraphExecDestroy(e<Int>)<CInt>
     pread(fd<CInt>, buf<Int>, n<Int>, off<Int>)<Int>
     creat(path<CString>, mode<CInt>)<CInt>
     write(fd<CInt>, buf<Int>, n<Int>)<Int>
@@ -140,6 +149,11 @@ download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
     }
     return 0
 }
+// launch-state globals: see lk()
+LKC<Int> = 0
+LST<Int> = 0
+LSKIP<Int> = 0
+LDBG<Int> = 0
 dalloc(n<Int>)<Int> -> {
     dp<Int> = 0
     freedom {
@@ -160,7 +174,7 @@ put_i(PD<Int>, off<Int>, v<Int>) -> {
 put_ia(PD<Int>, off<Int>, v<Int>, PS<Int>) -> {
     freedom {
         at(from<loc<Int>>(PS)) = v
-        cuMemcpyAsync(PD + off, PS, 8, 0)
+        if (LSKIP == 0) { cuMemcpyAsync(PD + off, PS, 8, LST) }
     }
 }
 put_f(PD<Int>, off<Int>, v<Float>) -> {
@@ -184,11 +198,25 @@ get_fn(mi<Int>, nm<String>)<Int> -> {
     }
     return 0
 }
+// Launch state (module globals). LKC: pinned 64-byte block, 4 arg cells + the kernelParams array
+// pointing at them, so lk/lk4 call cuLaunchKernel directly (no C shim) on stream LST. LSKIP=1
+// while a captured decode graph is being replayed: the host walk still runs (param slots), launches don't.
 lk(h<Int>, gx<Int>, bx<Int>, p<Int>)<Int> -> {
-    freedom {
-        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, p, 0, 0, 0) != 0) { return 1 }
+    if (LSKIP == 1) { return 0 }
+    if (LKC != 0) {
+        freedom {
+            at(from<loc<Int>>(LKC)) = p
+            at(from<loc<Int>>(LKC + 8)) = 0
+            at(from<loc<Int>>(LKC + 16)) = 0
+            at(from<loc<Int>>(LKC + 24)) = 0
+            if (cuLaunchKernel(h, gx, 1, 1, bx, 1, 1, 0, LST, LKC + 32, 0) != 0) { return 1 }
+        }
+    } else {
+        freedom {
+            if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, p, 0, 0, 0) != 0) { return 1 }
+        }
     }
-    if ((env_get("VYB_DBG") else "").len() > 0) {
+    if (LDBG == 1) {
         t0<Int> = time_mono_millis()
         freedom {
             rc<CInt> = cuCtxSynchronize()
@@ -198,6 +226,17 @@ lk(h<Int>, gx<Int>, bx<Int>, p<Int>)<Int> -> {
     return 0
 }
 lk4(h<Int>, gx<Int>, bx<Int>, a0<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    if (LSKIP == 1) { return 0 }
+    if (LKC != 0) {
+        freedom {
+            at(from<loc<Int>>(LKC)) = a0
+            at(from<loc<Int>>(LKC + 8)) = a1
+            at(from<loc<Int>>(LKC + 16)) = a2
+            at(from<loc<Int>>(LKC + 24)) = a3
+            if (cuLaunchKernel(h, gx, 1, 1, bx, 1, 1, 0, LST, LKC + 32, 0) != 0) { return 1 }
+        }
+        return 0
+    }
     freedom {
         if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, a0, a1, a2, a3) != 0) { return 1 }
         return 0
@@ -1103,6 +1142,32 @@ main()<Int> -> {
     if ((env_get("VYB_PSA") else "1") == "1") {
         freedom { if (cuMemAllocHost_v2(loc(PSA), 4096) != 0) { PSA = 0 } }
     }
+    if ((env_get("VYB_DBG") else "").len() > 0) { LDBG = 1 }
+    // VYB_LKD (default 1): direct cuLaunchKernel from Vyb through the pinned LKC cell block
+    if ((env_get("VYB_LKD") else "1") == "1") {
+        lkc<Int> = 0
+        freedom { if (cuMemAllocHost_v2(loc(lkc), 64) != 0) { lkc = 0 } }
+        if (lkc != 0) {
+            for (i in 0..3) {
+                freedom {
+                    at(from<loc<Int>>(lkc + i * 8)) = 0
+                    at(from<loc<Int>>(lkc + 32 + i * 8)) = lkc + i * 8
+                }
+            }
+            LKC = lkc
+        }
+    }
+    // VYB_CG (default 1; 0 = eager launches): each decode step (layers + lm_head) is one CUDA graph,
+    // captured on a created stream and re-captured only when the attention grid bucket (64 positions) grows.
+    GRA<Int> = 0
+    if ((env_get("VYB_CG") else "1") == "1" && PSA != 0 && LKC != 0) {
+        lst<Int> = 0
+        freedom { if (cuStreamCreate(loc(lst), 0) == 0) { GRA = 1 } }
+        LST = lst
+    }
+    GX<Int> = 0
+    GBK<Int> = -1
+    GCAP<Int> = 0
     if (ldp.len() > 0) {
         freedom {
             LFD = creat(ldp, 420)
@@ -1189,8 +1254,21 @@ main()<Int> -> {
                 }
             }
         }
+        pg<Int> = p + 1
+        gmode<Int> = 0
         if (PFB == 0 || p >= NP) {
         lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
+        if (GRA == 1 && p >= NP) {
+            gmode = 1
+            pg = ((p + 64) / 64) * 64
+            if (pg != GBK) {
+                if (GX != 0) { freedom { cuGraphExecDestroy(GX) } ; GX = 0 }
+                crc<Int> = 0
+                freedom { crc = cuStreamBeginCapture_v2(LST, 2) as Int }
+                if (crc != 0) { println("ERR capture begin " + crc.to_string()) ; return 31 }
+                GCAP = 1
+            } else { LSKIP = 1 }
+        }
         for (L in 0..NL - 1) {
             pb<Int> = pbase.get(L)
             lk(hrmsg, RMSGB, 256, pb)
@@ -1253,12 +1331,12 @@ main()<Int> -> {
                 lk(hrms, H, 256, pb + 5 * 256)
                 lk(hrms, KVH, 256, pb + 6 * 256)
                 lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
-                lk(hasc, (H * (p + 1) + 31) / 32, 32, pb + 8 * 256)
+                lk(hasc, (H * pg + 31) / 32, 32, pb + 8 * 256)
                 if (ACX == 1) {
                     lk4(hrm2, H, 32, pb + 8 * 256, RXM, 0, 0)
-                    lk4(hrxe, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxe, (H * pg + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrs8, 1, 32, pb + 8 * 256, RXM, 0, 0)
-                    lk4(hrxw, (H * (p + 1) + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxw, (H * pg + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrcw, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                 } else { lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256) }
                 lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
@@ -1299,6 +1377,25 @@ main()<Int> -> {
             lk(hq6, (VOCAB + Q6G - 1) / Q6G, 512, PH + 256)
             lk(hamp, (NCH + 255) / 256, 256, PH2)
             lk(hamr, 1, 32, PH3)
+            if (gmode == 1) {
+                grc<Int> = 0
+                if (GCAP == 1) {
+                    gg<Int> = 0
+                    gex<Int> = 0
+                    freedom {
+                        grc = cuStreamEndCapture(LST, loc(gg)) as Int
+                        if (grc == 0) { grc = cuGraphInstantiateWithFlags(loc(gex), gg, 0) as Int }
+                        if (gg != 0) { cuGraphDestroy(gg) }
+                    }
+                    if (grc != 0) { println("ERR graph capture " + grc.to_string() + " at pos " + p.to_string()) ; return 32 }
+                    GX = gex
+                    GBK = pg
+                    GCAP = 0
+                }
+                LSKIP = 0
+                freedom { grc = cuGraphLaunch(GX, LST) as Int }
+                if (grc != 0) { println("ERR graph launch " + grc.to_string()) ; return 33 }
+            }
             nid<Int> = 0
             freedom {
                 rc<CInt> = cuCtxSynchronize()
