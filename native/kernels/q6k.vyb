@@ -45,6 +45,43 @@ q6kdeq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
     }
 }
 
+// Row gather of `q6kdeq` for the decode-step embed inside the CUDA graph: the row index is read
+// from device cell ip (a pinned-slot copy captured in the graph), so a replay needs no new launch
+// args. q = matrix base, n = row length. Same decode arithmetic as q6kdeq with z = 0 (bit-identical).
+q6kdeq_ix(q<Int>, ip<Int>, o<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        row<Int> = ld_i64(ip)
+        block<Int> = gid / 256
+        bb<Int> = q + row * (n / 256) * 210 + block * 210
+        g<Int> = (gid % 256) / 128
+        yl<Int> = gid % 128
+        quad<Int> = yl / 32
+        l<Int> = yl % 32
+        is2<Int> = l / 16
+        sidx<Int> = g * 8 + is2 + quad * 2
+        qlbase<Int> = g * 64
+        qhbase<Int> = g * 32
+        qloff<Int> = qlbase + (quad % 2) * 32 + l
+        d<Float> = ld_f16(bb + 208)
+        sc0<Int> = (ld_i8(bb + 192 + sidx) as Int)
+        qlb<Int> = (ld_i8(bb + 0 + qloff) as Int) & 255
+        qhb<Int> = (ld_i8(bb + 128 + qhbase + l) as Int) & 255
+        nib<Int> = 0
+        if (quad < 2) { nib = qlb & 15 } else { nib = qlb >> 4 }
+        hib<Int> = 0
+        if (quad == 0) { hib = (qhb >> 0) & 3 }
+        if (quad == 1) { hib = (qhb >> 2) & 3 }
+        if (quad == 2) { hib = (qhb >> 4) & 3 }
+        if (quad == 3) { hib = (qhb >> 6) & 3 }
+        qs<Int> = (nib | (hib << 4)) - 32
+        sf<Float> = sc0 as Float
+        qf<Float> = qs as Float
+        val<Float> = d * sf * qf
+        st_f64(o + gid * 8, val)
+    }
+}
+
 // f32 twin of `q6kdeq` (VybForge#23): same decode, both z contracts, 4-byte store.
 q6kdeq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()

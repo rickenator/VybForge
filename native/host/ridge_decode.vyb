@@ -482,7 +482,7 @@ main()<Int> -> {
     if (mrax == 0) { println("ERR load rattn") ; return 1 }
     hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx") ; hrxw<Int> = get_fn(mrax, "rax_w") ; hrm2<Int> = get_fn(mrax, "rax_mx2") ; hrs8<Int> = get_fn(mrax, "rax_sum8") ; hrcw<Int> = get_fn(mrax, "rax_cw")
     RXM<Int> = dalloc(4096)
-    hs32<Int> = get_fn(mlay, "silu32") ; hc32<Int> = get_fn(mlay, "cast32")
+    hs32<Int> = get_fn(mlay, "silu32") ; hsq<Int> = get_fn(mlay, "silu32q") ; hc32<Int> = get_fn(mlay, "cast32")
     hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
     hamp<Int> = get_fn(mq3, "argmax1_p") ; hamr<Int> = get_fn(mq3, "argmax1_r") ; hexp<Int> = get_fn(mq3, "f32expand")
     hl2<Int> = get_fn(mgd, "l2norm") ; hng<Int> = get_fn(mgd, "norm_gated") ; hsg<Int> = get_fn(mgd, "sigmoid_k")
@@ -496,6 +496,7 @@ main()<Int> -> {
     if (GDNF == 1) { println("GDN_FUSE sg_ag+conv_step (decode)") }
     hrope<Int> = get_fn(mrp, "rope_nrot") ; hqgs<Int> = get_fn(ma35, "qg_split") ; hgm<Int> = get_fn(ma35, "gate_mul")
     hq6d<Int> = get_fn(mq6, "q6kdeq")
+    hq6x<Int> = get_fn(mq6, "q6kdeq_ix")
     hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
     hi3<Int> = get_fn(mrg, "gemv_iq3s") ; hds<Int> = get_fn(mrg, "delta_step_b")
     hl2b<Int> = get_fn(mr2, "l2norm_b") ; hngb<Int> = get_fn(mr2, "norm_gated_b") ; hdsc<Int> = get_fn(mr2, "delta_step_c")
@@ -823,10 +824,17 @@ main()<Int> -> {
     XNQ<Int> = dalloc(D * 2) ; H32Q<Int> = dalloc(FF * 2) ; PXNQ<Int> = dalloc(256) ; PXHQ<Int> = dalloc(256)
     put_i(PXNQ, 0, XN32) ; put_i(PXNQ, 8, XNQ) ; put_i(PXNQ, 16, D)
     put_i(PXHQ, 0, H32) ; put_i(PXHQ, 8, H32Q) ; put_i(PXHQ, 16, FF)
+    // VYB_SWQ8 (default 1): decode FFN silu32 also writes H32Q (silu32q), dropping the xq8 launch
+    // before an IQ down GEMV on the q8_1 path. Bit-identical; needs FF % 32 == 0.
+    SWQ<Int> = 0
+    if ((env_get("VYB_SWQ8") else "1") == "1" && RQ8 == 1 && hsq != 0 && FF % 32 == 0) { SWQ = 1 }
+    PSQ<Int> = dalloc(64)
+    put_i(PSQ, 0, GR) ; put_i(PSQ, 8, UP) ; put_i(PSQ, 16, H32) ; put_i(PSQ, 24, FF) ; put_i(PSQ, 32, H32Q)
     EQ<Int> = dalloc(VAL * 2) ; PEQ<Int> = dalloc(256)
     put_i(PEQ, 0, E32) ; put_i(PEQ, 8, EQ) ; put_i(PEQ, 16, VAL)
     LOGB<Int> = dalloc(VOCAB * 8) ; NCH<Int> = (VOCAB + 255) / 256
     PV<Int> = dalloc(NCH * 8) ; PI<Int> = dalloc(NCH * 8) ; OUTI<Int> = dalloc(8)
+    CURD<Int> = dalloc(8)
     SCLV<Float> = 1.0 / sqrt(SS as Float)
 
     // per-layer launch plan: kind, and the param-block base of each step (8 blocks per slot)
@@ -870,6 +878,10 @@ main()<Int> -> {
         // FFN blocks at slots 16..19
         pfn<Int> = pb0 + 16 * 256
         put_i(pfn, 0, XM) ; put_i(pfn, 8, PANW) ; put_i(pfn, 16, XN) ; put_i(pfn, 24, 1) ; put_i(pfn, 32, D) ; put_f(pfn, 40, EPS) ; put_i(pfn, 48, XN32)
+        // VYB_RMSQ8 also covers ffn_norm: rms_blkg writes XNQ for IQ gate/up GEMVs on the q8_1 path
+        if (RMQ8 == 1 && RQ8 == 1) {
+            if (uses_q8(tyv.get(ig), RQ83) + uses_q8(tyv.get(iu), RQ83) > 0) { put_i(pfn, 56, XNQ) }
+        }
         xg<Int> = XN32 ; xu<Int> = XN32 ; xd<Int> = H32
         if (XPM == 1) {
             if (is_iq(tyv.get(ig)) == 1) { xg = XNP }
@@ -1196,6 +1208,9 @@ main()<Int> -> {
         freedom { if (cuStreamCreate(loc(lst), 0) == 0) { GRA = 1 } }
         LST = lst
     }
+    EMBG<Int> = 0
+    if ((env_get("VYB_EMBG") else "1") == "1" && hq6x != 0) { EMBG = 1 }
+    if (GRA == 1 && EMBG == 1) { println("EMBG embed in decode graph") }
     GX<Int> = 0
     GBK<Int> = -1
     GCAP<Int> = 0
@@ -1288,7 +1303,12 @@ main()<Int> -> {
         pg<Int> = p + 1
         gmode<Int> = 0
         if (PFB == 0 || p >= NP) {
-        lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
+        // VYB_EMBG (default 1, needs the decode graph): the token embed runs inside the graph, reading
+        // the token id from CURD (pinned slot PSA+4000, copied by a captured async memcpy), so a replay
+        // launches nothing outside the graph. 0 = eager embed launch before the graph.
+        egm<Int> = 0
+        if (EMBG == 1 && GRA == 1 && p >= NP) { egm = 1 }
+        if (egm == 0) { lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0) }
         if (GRA == 1 && p >= NP) {
             gmode = 1
             pg = ((p + 64) / 64) * 64
@@ -1299,6 +1319,10 @@ main()<Int> -> {
                 if (crc != 0) { println("ERR capture begin " + crc.to_string()) ; return 31 }
                 GCAP = 1
             } else { LSKIP = 1 }
+        }
+        if (egm == 1) {
+            put_ia(CURD, 0, cur, PSA + 4000)
+            lk4(hq6x, (D + 255) / 256, 256, TEMB, CURD, XC, D)
         }
         for (L in 0..NL - 1) {
             pb<Int> = pbase.get(L)
@@ -1386,7 +1410,7 @@ main()<Int> -> {
                 if (perm_x(tg, RQ8, RQ83) + perm_x(tu, RQ8, RQ83) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
             }
             if (RQ8 == 1) {
-                if (uses_q8(tg, RQ83) + uses_q8(tu, RQ83) > 0) { lk(hxq, (D + 255) / 256, 256, PXNQ) }
+                if (RMQ8 == 0 && uses_q8(tg, RQ83) + uses_q8(tu, RQ83) > 0) { lk(hxq, (D + 255) / 256, 256, PXNQ) }
             }
             fgu<Int> = 0
             if (FUS == 1 && tg == tu && is_iq(tg) == 1) { fgu = 1 }
@@ -1398,11 +1422,13 @@ main()<Int> -> {
                 lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF, IRB, Q4G, Q6G), gemv_t(tg, ITH), pfb + 256)
                 lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, IRB, Q4G, Q6G), gemv_t(tu, ITH), pfb + 512)
             }
-            lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF)
+            swq<Int> = 0
+            if (SWQ == 1 && uses_q8(tdn, RQ83) == 1) { swq = 1 }
+            if (swq == 1) { lk(hsq, (FF + 255) / 256, 256, PSQ) } else { lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF) }
             if (XPM == 1) {
                 if (perm_x(tdn, RQ8, RQ83) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
             }
-            if (RQ8 == 1) {
+            if (RQ8 == 1 && swq == 0) {
                 if (uses_q8(tdn, RQ83) == 1) { lk(hxq, (FF + 255) / 256, 256, PXHQ) }
             }
             lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, IRB, Q4G, Q6G), gemv_t(tdn, ITH), pfb + 768)
