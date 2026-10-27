@@ -32,7 +32,7 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
+.PHONY: ridge-tensors ridge-tensors-check all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
 
 all: verify
 
@@ -534,6 +534,19 @@ RIDGE_GGUF ?= $(HOME)/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf
 ridge-inventory:
 	cd $(ROOT) && .venv/bin/python native/gguf/ridge_inventory.py "$(RIDGE_GGUF)" \
 	  --tsv native/gguf/ridge-3.7bpw-inventory.tsv --meta native/out/ridge_meta.txt
+
+# The engine's tensor index (name, dims, type, absolute offset) for ridge_decode.vyb, projected from the
+# tracked inventory; native/out/ is not tracked, so a fresh checkout (e.g. a Spark) needs this once.
+# ridge-tensors-check: ridge_decode.vyb must refuse a missing index with a named ERR, not "alloc region".
+ridge-tensors:
+	cd $(ROOT) && env -u PYTHONPATH python3 native/tools/inventory_to_tsv.py \
+	  --inventory native/gguf/ridge-3.7bpw-inventory.tsv --out native/out/ridge_tensors.tsv
+
+ridge-tensors-check:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_TSV=/nonexistent/ridge_tensors.tsv VYB_GEN=1 $(VYB) native/host/ridge_decode.vyb \
+	  --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype \
+	  --module-path native/llm 2>&1 | grep -q "ERR tensor index /nonexistent/ridge_tensors.tsv is missing or empty" \
+	  && echo "ridge-tensors-check: ok" || { echo "ridge-tensors-check: FAIL"; exit 1; }
 
 # ── S0.2e capability / layer descriptor gate (VybForge#10 phase 2) ───────────────
 # model_caps.vyb answers "what does this model REQUIRE of the engine" (layer kinds and their

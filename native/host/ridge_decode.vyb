@@ -426,6 +426,11 @@ main()<Int> -> {
             st = i + 1
         }
     }
+    // A missing or empty tensor index used to surface much later as "ERR alloc region" (RBYTES = 0).
+    if (nmv.len() == 0) {
+        println("ERR tensor index " + TSV + " is missing or empty: generate it with `make -f native/Makefile ridge-tensors` (or set VYB_TSV)")
+        return 21
+    }
     RLO<Int> = ofv.get(0) ; RHI<Int> = 0
     for (i in 0..nmv.len() - 1) {
         if (ofv.get(i) < RLO) { RLO = ofv.get(i) }
