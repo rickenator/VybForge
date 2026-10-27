@@ -640,6 +640,7 @@ main()<Int> -> {
     }
     // VYB_Q5Q8 (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): attention q/k/v Q5_K GEMVs on q8_1 + dp4a
     Q5Q8<Int> = 0 ; hq5q<Int> = 0 ; hxq5<Int> = 0
+    Q5KM<Int> = 0
     if ((env_get("VYB_Q5Q8") else dfq4) == "1") {
         mq5q<Int> = load_mod("native/build/rq5kq.ptx")
         m7c<Int> = load_mod("native/build/rgemv7.ptx")
@@ -650,6 +651,11 @@ main()<Int> -> {
         if ((env_get("VYB_Q5KU") else "1") == "1") {
             hq5u<Int> = get_fn(mq5q, "gemv_q5k_qu")
             if (hq5u != 0) { hq5q = hq5u ; println("Q5KU gemv_q5k_qu unroll4") }
+        }
+        // VYB_Q5KM=1: gemv_q5k_m, llama.cpp mmvq layout (one row per 128-thread block); KLD-checked
+        if ((env_get("VYB_Q5KM") else "0") == "1") {
+            hq5m<Int> = get_fn(mq5q, "gemv_q5k_m")
+            if (hq5m != 0) { hq5q = hq5m ; Q5KM = 1 ; println("Q5KM gemv_q5k_m mmvq 128/row") }
         }
     }
     // VYB_Q6KPTX: Q6_K decode GEMV gemv_q6k_v (gen_rq6k.py R D; default rq6k.ptx = gen_rq6k.py 1 2: 1 row/warp,
@@ -1416,9 +1422,15 @@ main()<Int> -> {
                 }
                 if (Q5Q8 == 1) {
                     if (RMQ8 == 0) { lk(hxq5, (D + 255) / 256, 256, PXNQ) }
-                    lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
-                    lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
-                    lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)
+                    if (Q5KM == 1) {
+                        lk(hq5q, 2 * NQ, 128, pb + 256)
+                        lk(hq5q, NKV, 128, pb + 2 * 256)
+                        lk(hq5q, NKV, 128, pb + 3 * 256)
+                    } else {
+                        lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
+                        lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
+                        lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)
+                    }
                 } else {
                     lk(hq5, (2 * NQ + 15) / 16, 512, pb + 256)
                     lk(hq5, (NKV + 15) / 16, 512, pb + 2 * 256)
