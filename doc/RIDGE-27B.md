@@ -58,7 +58,7 @@ changes since are decode-only):
 
 | Path | tg128 | pp512 |
 |---|---|---|
-| Vyb default | **39.7** | **791** |
+| Vyb default | **40.1** | **791** |
 | Vyb `VYB_EXACT=1` | ~20.8 | ~753 |
 | llama.cpp (CUDA, same GGUF) | 47.35 | 1258.5 |
 

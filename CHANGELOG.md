@@ -6,7 +6,7 @@
 - **27B Ridge (qwen35) all-Vyb decode** (`native/host/ridge_decode.vyb`, `native/kernels/r*.vyb`),
   with `./ridge-chat`: streaming chat, the ChatML template, thinking on or off, and a gold-exact
   `VYB_EXACT=1` path. See `doc/RIDGE-27B.md`.
-- RTX 3090 speed: tg128 39.7 tok/s, pp512 791 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
+- RTX 3090 speed: tg128 40.1 tok/s, pp512 791 tok/s (llama.cpp: 47.35 / 1258.5). Recent steps:
   - f32 GDN recurrent state with a register-resident state step `delta_step_g32`
     (`native/tools/gen_rdeltag.py`, structure after llama.cpp `gated_delta_net.cu`, MIT): one DRAM
     read and one write of the state per token instead of the tiled f64 `delta_step_x` (48.6 µs per
