@@ -2,7 +2,7 @@
 // output lane (attn_cx recomputes max/sum/exp for each of the HD lanes). Same expressions, same
 // summation order as attn_cx -> bit-identical. Params block is attn_cx's (V@96 Ctx@104 S@184 HD@200
 // H@208 KVH@216 P0@224 SC@232 T@240); M = rows*2 f64 scratch (mx, ssum). SC is overwritten with exp.
-import vmath::{vexp}
+import vmath::{vexp, vsqrt}
 
 rax_mx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     S<Int> = ld_i64(p + 184)
@@ -211,5 +211,239 @@ rax_cx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
             acc = acc + w * vv
         }
         st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
+
+// rax_fs / rax_fc: split-over-positions flash-decode attention (S = 1), f32 compute, LOSSY (VYB_AFS; off under VYB_EXACT=1).
+// rax_fs: grid H*NS (NS = ceil(n/32) chunks of 32 positions), 256 threads. Warp per position: lane-strided coalesced
+// q.k dot over HD in f32 + xor-shuffle reduce; chunk scores -> shared; chunk max m, l = sum exp(s-m) and the partial
+// context O[h][c][ii] = sum_t exp(s_t-m) V[t][kvh][ii] (f32 accumulate) -> OB (f64), m and l -> ML (f64 pairs).
+// rax_fc: grid H, 256 threads. M = max_c m_c, L = sum_c l_c exp(m_c-M), Ctx[h][ii] = sum_c O_c exp(m_c-M) / L (f64 out).
+// Params block is attn_sc's (Q@80 K@88 V@96 Ctx@104 HD@200 H@208 KVH@216 P0@224).
+rax_fs(p<Int>, OB<Int>, NS<Int>, ML<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    sc64<Float> = 0.08838834764831845
+    if (HD != 128) { sc64 = 1.0 / vsqrt(HD as Float, 16) }
+    scl<Float32> = (sc64 as Float32)
+    l2e<Float32> = (1.4426950408889634 as Float32)
+    hkv<Int> = H / KVH
+    b<Int> = blk_x()
+    h<Int> = b / NS
+    c<Int> = b % NS
+    tid<Int> = tid_x()
+    nt<Int> = dim_x()
+    lane<Int> = tid % 32
+    nw<Int> = nt / 32
+    kvh<Int> = h / hkv
+    n<Int> = P0 + 1
+    t0<Int> = c * 32
+    nc<Int> = n - t0
+    if (nc > 32) { nc = 32 }
+    qb<Int> = Q + h * HD * 8
+    j<Int> = tid / 32
+    while (j < nc) {
+        kb<Int> = K + ((t0 + j) * KVH * HD + kvh * HD) * 8
+        d<Float32> = (0.0 as Float32)
+        ia<Int> = lane
+        while (ia < HD) {
+            d = d + (ld_f64(qb + ia * 8) as Float32) * (ld_f64(kb + ia * 8) as Float32)
+            ia = ia + 32
+        }
+        d = d + shfl_xor_f32(d, 16)
+        d = d + shfl_xor_f32(d, 8)
+        d = d + shfl_xor_f32(d, 4)
+        d = d + shfl_xor_f32(d, 2)
+        d = d + shfl_xor_f32(d, 1)
+        if (lane == 0) { st_shared_f64(j, ((d * scl) as Float)) }
+        j = j + nw
+    }
+    kernel_barrier()
+    m<Float32> = (-1000000000000000000000000000000.0 as Float32)
+    j = 0
+    while (j < nc) {
+        s<Float32> = (ld_shared_f64(j) as Float32)
+        if (s > m) { m = s }
+        j = j + 1
+    }
+    ob<Int> = h * NS + c
+    ii<Int> = tid
+    while (ii < HD) {
+        acc<Float32> = (0.0 as Float32)
+        ls<Float32> = (0.0 as Float32)
+        vb<Int> = V + (t0 * KVH * HD + kvh * HD + ii) * 8
+        j = 0
+        while (j < nc) {
+            e<Float32> = ex2_f32(((ld_shared_f64(j) as Float32) - m) * l2e)
+            ls = ls + e
+            acc = acc + e * (ld_f64(vb + j * KVH * HD * 8) as Float32)
+            j = j + 1
+        }
+        st_f64(OB + (ob * HD + ii) * 8, (acc as Float))
+        if (ii == 0) {
+            st_f64(ML + ob * 16, (m as Float))
+            st_f64(ML + ob * 16 + 8, (ls as Float))
+        }
+        ii = ii + nt
+    }
+}
+
+rax_fc(p<Int>, OB<Int>, NS<Int>, ML<Int>) -> {
+    Ctx<Int> = ld_i64(p + 104)
+    HD<Int> = ld_i64(p + 200)
+    l2e<Float32> = (1.4426950408889634 as Float32)
+    h<Int> = blk_x()
+    tid<Int> = tid_x()
+    nt<Int> = dim_x()
+    mx<Float32> = (-1000000000000000000000000000000.0 as Float32)
+    c<Int> = 0
+    while (c < NS) {
+        mc<Float32> = (ld_f64(ML + (h * NS + c) * 16) as Float32)
+        if (mc > mx) { mx = mc }
+        c = c + 1
+    }
+    ii<Int> = tid
+    while (ii < HD) {
+        acc<Float32> = (0.0 as Float32)
+        L<Float32> = (0.0 as Float32)
+        c = 0
+        while (c < NS) {
+            a<Int> = ML + (h * NS + c) * 16
+            wc<Float32> = ex2_f32(((ld_f64(a) as Float32) - mx) * l2e)
+            L = L + (ld_f64(a + 8) as Float32) * wc
+            acc = acc + (ld_f64(OB + ((h * NS + c) * HD + ii) * 8) as Float32) * wc
+            c = c + 1
+        }
+        st_f64(Ctx + (h * HD + ii) * 8, ((acc / L) as Float))
+        ii = ii + nt
+    }
+}
+
+// rax_fs64 / rax_fc64: the same split with f64 compute; each exp is computed ONCE (per position in rax_fs64, per chunk in
+// rax_fc64) into shared, so the cost is the dot/accumulate only. Not bit-identical to the 6-launch chain (summation order
+// over positions is chunked), so it is treated as lossy too (VYB_AFS=1 default variant; VYB_AFS32=1 picks the f32 kernels).
+rax_fs64(p<Int>, OB<Int>, NS<Int>, ML<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    scl<Float> = 0.08838834764831845
+    if (HD != 128) { scl = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    b<Int> = blk_x()
+    h<Int> = b / NS
+    c<Int> = b % NS
+    tid<Int> = tid_x()
+    nt<Int> = dim_x()
+    lane<Int> = tid % 32
+    nw<Int> = nt / 32
+    kvh<Int> = h / hkv
+    n<Int> = P0 + 1
+    t0<Int> = c * 32
+    nc<Int> = n - t0
+    if (nc > 32) { nc = 32 }
+    qb<Int> = Q + h * HD * 8
+    j<Int> = tid / 32
+    while (j < nc) {
+        kb<Int> = K + ((t0 + j) * KVH * HD + kvh * HD) * 8
+        d<Float> = 0.0
+        ia<Int> = lane
+        while (ia < HD) {
+            d = d + ld_f64(qb + ia * 8) * ld_f64(kb + ia * 8)
+            ia = ia + 32
+        }
+        d = d + shfl_xor_f64(d, 16)
+        d = d + shfl_xor_f64(d, 8)
+        d = d + shfl_xor_f64(d, 4)
+        d = d + shfl_xor_f64(d, 2)
+        d = d + shfl_xor_f64(d, 1)
+        if (lane == 0) { st_shared_f64(j, d * scl) }
+        j = j + nw
+    }
+    kernel_barrier()
+    m<Float> = -1000000000000000000000000000000.0
+    j = 0
+    while (j < nc) {
+        s<Float> = ld_shared_f64(j)
+        if (s > m) { m = s }
+        j = j + 1
+    }
+    if (tid < nc) { st_shared_f64(32 + tid, vexp(ld_shared_f64(tid) - m)) }
+    kernel_barrier()
+    ob<Int> = h * NS + c
+    ii<Int> = tid
+    while (ii < HD) {
+        acc<Float> = 0.0
+        vb<Int> = V + (t0 * KVH * HD + kvh * HD + ii) * 8
+        j = 0
+        while (j < nc) {
+            acc = acc + ld_shared_f64(32 + j) * ld_f64(vb + j * KVH * HD * 8)
+            j = j + 1
+        }
+        st_f64(OB + (ob * HD + ii) * 8, acc)
+        ii = ii + nt
+    }
+    if (tid == 0) {
+        ls<Float> = 0.0
+        j = 0
+        while (j < nc) {
+            ls = ls + ld_shared_f64(32 + j)
+            j = j + 1
+        }
+        st_f64(ML + ob * 16, m)
+        st_f64(ML + ob * 16 + 8, ls)
+    }
+}
+
+// shared: w_c at 0..NS-1 (NS <= 128 -> --kernel-shared >= 1040), L at 128
+rax_fc64(p<Int>, OB<Int>, NS<Int>, ML<Int>) -> {
+    Ctx<Int> = ld_i64(p + 104)
+    HD<Int> = ld_i64(p + 200)
+    h<Int> = blk_x()
+    tid<Int> = tid_x()
+    nt<Int> = dim_x()
+    mx<Float> = -1000000000000000000000000000000.0
+    c<Int> = 0
+    while (c < NS) {
+        mc<Float> = ld_f64(ML + (h * NS + c) * 16)
+        if (mc > mx) { mx = mc }
+        c = c + 1
+    }
+    c = tid
+    while (c < NS) {
+        st_shared_f64(c, vexp(ld_f64(ML + (h * NS + c) * 16) - mx))
+        c = c + nt
+    }
+    kernel_barrier()
+    if (tid == 0) {
+        L<Float> = 0.0
+        c = 0
+        while (c < NS) {
+            L = L + ld_f64(ML + (h * NS + c) * 16 + 8) * ld_shared_f64(c)
+            c = c + 1
+        }
+        st_shared_f64(128, L)
+    }
+    kernel_barrier()
+    Lt<Float> = ld_shared_f64(128)
+    ii<Int> = tid
+    while (ii < HD) {
+        acc<Float> = 0.0
+        c = 0
+        while (c < NS) {
+            acc = acc + ld_f64(OB + ((h * NS + c) * HD + ii) * 8) * ld_shared_f64(c)
+            c = c + 1
+        }
+        st_f64(Ctx + (h * HD + ii) * 8, acc / Lt)
+        ii = ii + nt
     }
 }
