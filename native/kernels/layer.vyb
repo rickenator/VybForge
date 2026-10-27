@@ -942,10 +942,9 @@ rms_blk(p<Int>) -> {
         sq<Float> = 0.0
         if (x > 0.000000001) {
             if (x < 1000000000.0) {
-                st_f64(Y + row * N * 8, x)
-                bits<Int> = ld_i64(Y + row * N * 8)
-                st_i64(Y + row * N * 8, 6910469410427058089 - bits / 2)
-                y<Float> = x * ld_f64(Y + row * N * 8)
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
                 y = 0.5 * (y + x / y)
                 y = 0.5 * (y + x / y)
                 y = 0.5 * (y + x / y)
@@ -1506,10 +1505,9 @@ qknrope(p<Int>) -> {
         sq<Float> = 0.0
         if (x > 0.000000001) {
             if (x < 1000000000.0) {
-                st_f64(xn, x)
-                bits<Int> = ld_i64(xn)
-                st_i64(xn, 6910469410427058089 - bits / 2)
-                y<Float> = x * ld_f64(xn)
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
                 y = 0.5 * (y + x / y)
                 y = 0.5 * (y + x / y)
                 y = 0.5 * (y + x / y)
