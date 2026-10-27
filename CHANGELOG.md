@@ -17,6 +17,11 @@
     `VYB_Q4KU`, `VYB_Q5KU`), bit-identical (`VYB_LOGDUMP` cmp), +0.8 % / +0.4 % tg128 interleaved
   - Q6_K decode GEMV `rq6kr2` (2 rows per warp, `native/tools/gen_rq6k.py 2 1`), default on sm_8x;
     GB10 keeps `rq6k8`, which measured faster there. Bit-identical
+  - Q4_K GDN GEMVs (qkv+gate, ssm_out) in llama.cpp's mmvq layout: `gemv_q4k_m` in `rq4kq.vyb`
+    (128 threads per row, vdr=2, 8 super-blocks in flight, structure after `mmvq.cu` /
+    `vecdotq.cuh`, MIT; see THIRD-PARTY.md), with rq4kq built with a 256 B static shared buffer.
+    Default wherever `VYB_Q4Q8` is on (`VYB_Q4KM=0` reverts). KLD-checked: mean 0.00402, top-1
+    98.63 %, PPL 3.2491. 3090 tg128 39.69 → 40.16 tok/s; GB10 with `VYB_Q4Q8=1` 14.54 → 14.68
   - GB10 (DGX Spark): `VYB_Q8SK` (Q8_0 split-K GEMV) now defaults on for CC >= 10 as well (off under
     `VYB_EXACT=1`); with DSG, tg128 14.55 → 14.76 tok/s; token stream unchanged vs `VYB_Q8SK=0`.
     GB10 `VYB_EXACT=1` checked gold-exact

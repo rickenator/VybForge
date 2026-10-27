@@ -630,8 +630,10 @@ main()<Int> -> {
             hq4u<Int> = get_fn(mq4q, "gemv_q4k_qu")
             if (hq4u != 0) { hq4q = hq4u ; println("Q4KU gemv_q4k_qu unroll4") }
         }
-        // VYB_Q4KM=1: gemv_q4k_m, llama.cpp mmvq layout (one row per 128-thread block); KLD-checked
-        if ((env_get("VYB_Q4KM") else "0") == "1") {
+        // VYB_Q4KM (default 1 wherever Q4Q8 is on): gemv_q4k_m, llama.cpp mmvq layout (one row per
+        // 128-thread block). Not bit-identical to gemv_q4k_qu (f64 partials per warp); KLD 0.00402,
+        // ppl 3.2491, top-1 98.63 %; 3090 tg128 39.69 -> 40.16, GB10 (VYB_Q4Q8=1) 14.54 -> 14.68.
+        if ((env_get("VYB_Q4KM") else "1") == "1") {
             hq4m<Int> = get_fn(mq4q, "gemv_q4k_m")
             if (hq4m != 0) { hq4q = hq4m ; Q4KM = 1 ; println("Q4KM gemv_q4k_m mmvq 128/row") }
         }
