@@ -621,6 +621,11 @@ main()<Int> -> {
         if (mq4q == 0 || m7b == 0) { println("ERR load rq4kq / rgemv7") ; return 1 }
         hq4q = get_fn(mq4q, "gemv_q4k_q") ; hxq4 = get_fn(m7b, "xq8") ; Q4Q8 = 1
         println("Q4K_GEMV gdn=q8_1 dp4a (rq4kq)")
+        // VYB_Q4KU (default 1): gemv_q4k_qu, the same math with the super-block loop unrolled x4 (bit-identical)
+        if ((env_get("VYB_Q4KU") else "1") == "1") {
+            hq4u<Int> = get_fn(mq4q, "gemv_q4k_qu")
+            if (hq4u != 0) { hq4q = hq4u ; println("Q4KU gemv_q4k_qu unroll4") }
+        }
     }
     // VYB_Q5Q8 (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): attention q/k/v Q5_K GEMVs on q8_1 + dp4a
     Q5Q8<Int> = 0 ; hq5q<Int> = 0 ; hxq5<Int> = 0
