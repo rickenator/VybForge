@@ -22,6 +22,10 @@
     `vecdotq.cuh`, MIT; see THIRD-PARTY.md), with rq4kq built with a 256 B static shared buffer.
     Default wherever `VYB_Q4Q8` is on (`VYB_Q4KM=0` reverts). KLD-checked: mean 0.00402, top-1
     98.63 %, PPL 3.2491. 3090 tg128 39.69 → 40.16 tok/s; GB10 with `VYB_Q4Q8=1` 14.54 → 14.68
+  - Q5_K attention q/k/v GEMVs in the same mmvq layout: `gemv_q5k_m` in `rq5kq.vyb` (high bits from
+    `qh` per 4-byte group, rq5kq built with a 256 B static shared buffer; llama.cpp MIT, see
+    THIRD-PARTY.md). Default on sm_8x (`VYB_Q5KM=0` reverts); opt-in on GB10, where it measured
+    no gain. KLD mean 0.00384 (lowest so far), top-1 98.63 %, PPL 3.2336. 3090 tg128 40.25 → 40.45
   - GB10 (DGX Spark): `VYB_Q8SK` (Q8_0 split-K GEMV) now defaults on for CC >= 10 as well (off under
     `VYB_EXACT=1`); with DSG, tg128 14.55 → 14.76 tok/s; token stream unchanged vs `VYB_Q8SK=0`.
     GB10 `VYB_EXACT=1` checked gold-exact

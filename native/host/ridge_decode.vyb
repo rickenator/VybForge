@@ -652,8 +652,12 @@ main()<Int> -> {
             hq5u<Int> = get_fn(mq5q, "gemv_q5k_qu")
             if (hq5u != 0) { hq5q = hq5u ; println("Q5KU gemv_q5k_qu unroll4") }
         }
-        // VYB_Q5KM=1: gemv_q5k_m, llama.cpp mmvq layout (one row per 128-thread block); KLD-checked
-        if ((env_get("VYB_Q5KM") else "0") == "1") {
+        // VYB_Q5KM (default 1 on sm_8x, where Q5Q8 is on): gemv_q5k_m, llama.cpp mmvq layout (one row per
+        // 128-thread block). KLD mean 0.00384, top-1 98.63 %, PPL 3.2336; 3090 tg128 40.25 -> 40.45.
+        // GB10 measured no gain (14.94 vs 14.95), so it stays opt-in there.
+        dfq5m<String> = "0"
+        if (CCMAJ == 8) { dfq5m = "1" }
+        if ((env_get("VYB_Q5KM") else dfq5m) == "1") {
             hq5m<Int> = get_fn(mq5q, "gemv_q5k_m")
             if (hq5m != 0) { hq5q = hq5m ; Q5KM = 1 ; println("Q5KM gemv_q5k_m mmvq 128/row") }
         }

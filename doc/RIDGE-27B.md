@@ -93,6 +93,7 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `RGMAP`, `RGQ8`, `RGQ8_IQ3` | IQ2_S / IQ3_S GEMV: mapped grid, q8_1 activations + dp4a (default on) |
 | `Q4Q8`, `Q5Q8`, `Q8SK` | Q4_K / Q5_K / Q8_0 GEMVs on q8_1 + dp4a, Q8_0 split-K (default on for sm_8x; `Q8SK` also on for CC >= 10 / GB10 unless `VYB_EXACT=1`) |
 | `Q4KM` | Q4_K q8_1 GEMV `gemv_q4k_m` in llama.cpp's mmvq layout (128 threads per row); default on wherever `Q4Q8` is on, `=0` falls back to `gemv_q4k_qu`. Lossy vs `qu` only by summation order (KLD 0.00402) |
+| `Q5KM` | Q5_K q8_1 GEMV `gemv_q5k_m` (attention q/k/v) in llama.cpp's mmvq layout (128 threads per row); default on for sm_8x, opt-in elsewhere (no gain on GB10); `=0` falls back to `gemv_q5k_qu`. Lossy vs `qu` only by summation order (KLD 0.00384, PPL 3.2336) |
 | `CONV32` | f32 short conv in the GDN block (default on) |
 | `RMSG` | multi-block RMSNorm `rms_blkg`, exact (default on) |
 | `RMSQ8` | `rms_blkg` also writes the q8_1 copy (int8 + per-32 f32 scale) that the Q4_K / Q5_K GEMVs read, instead of a separate `xq8` launch, for the attention norm and (when gate/up use the q8_1 path) the FFN norm (default 1, bit-identical; needs `RMSG`; off when the hidden size is not a multiple of 32) |
