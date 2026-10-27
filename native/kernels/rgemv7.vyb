@@ -28,9 +28,9 @@ gemv_iq2s_q(p<Int>) -> {
         rb<Int> = W + n0 * (nsb * 82)
         sb<Int> = l / 8
         while (sb < nsb) {
-            bb<Int> = rb + sb * 82
-            xq<Int> = X + sb * 256 + ib * 32
-            dx<Float32> = ld_f32n(X + K + (sb * 8 + ib) * 4)
+            bb<Int> = rb + (sb) * 82
+            xq<Int> = X + (sb) * 256 + ib * 32
+            dx<Float32> = ld_f32n(X + K + ((sb) * 8 + ib) * 4)
             qx0<UInt32> = ldg_v4_u32(xq + 0, 0)
             qx1<UInt32> = ldg_v4_u32(xq + 0, 1)
             qx2<UInt32> = ldg_v4_u32(xq + 0, 2)
@@ -122,9 +122,9 @@ gemv_iq3s_q(p<Int>) -> {
         rb<Int> = W + n0 * (nsb * 110)
         sb<Int> = l / 8
         while (sb < nsb) {
-            bb<Int> = rb + sb * 110
-            xq<Int> = X + sb * 256 + ib * 32
-            dx<Float32> = ld_f32n(X + K + (sb * 8 + ib) * 4)
+            bb<Int> = rb + (sb) * 110
+            xq<Int> = X + (sb) * 256 + ib * 32
+            dx<Float32> = ld_f32n(X + K + ((sb) * 8 + ib) * 4)
             qx0<UInt32> = ldg_v4_u32(xq + 0, 0)
             qx1<UInt32> = ldg_v4_u32(xq + 0, 1)
             qx2<UInt32> = ldg_v4_u32(xq + 0, 2)
