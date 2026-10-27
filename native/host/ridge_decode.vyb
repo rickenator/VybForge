@@ -470,6 +470,10 @@ main()<Int> -> {
     if (RMSG == 0) { hrmsg = hrms }
     RMSGB<Int> = 5
     if (RMSG == 0) { RMSGB = 1 }
+    // VYB_RMSQ8 (default 1; needs VYB_RMSG): the decode attn_norm rms_blkg also writes the q8_1 copy
+    // (p + 56) for the Q4Q8 / Q5Q8 GEMVs, replacing the xq8 launch after it (64/step). Bit-identical.
+    RMQ8<Int> = 1
+    if ((env_get("VYB_RMSQ8") else "1") == "0" || RMSG == 0) { RMQ8 = 0 }
     hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
     // decode attention context: softmax once per head row (rattn.vyb), bit-identical to attn_cx. VYB_ACX=0 off.
     ACX<Int> = 1
@@ -852,6 +856,10 @@ main()<Int> -> {
         // block 0: attn_norm (rms_blk XC -> XN, XN32)
         p0<Int> = pb0
         put_i(p0, 0, XC) ; put_i(p0, 8, ANW) ; put_i(p0, 16, XN) ; put_i(p0, 24, 1) ; put_i(p0, 32, D) ; put_f(p0, 40, EPS) ; put_i(p0, 48, XN32)
+        if (RMQ8 == 1) {
+            if (isg == 1 && Q4Q8 == 1) { put_i(p0, 56, XNQ) }
+            if (isg == 0 && Q5Q8 == 1) { put_i(p0, 56, XNQ) }
+        }
         // FFN blocks at slots 16..19
         pfn<Int> = pb0 + 16 * 256
         put_i(pfn, 0, XM) ; put_i(pfn, 8, PANW) ; put_i(pfn, 16, XN) ; put_i(pfn, 24, 1) ; put_i(pfn, 32, D) ; put_f(pfn, 40, EPS) ; put_i(pfn, 48, XN32)
@@ -1289,7 +1297,7 @@ main()<Int> -> {
             lk(hrmsg, RMSGB, 256, pb)
             if (kind.get(L) == 1) {
                 if (Q4Q8 == 1) {
-                    lk(hxq4, (D + 255) / 256, 256, PXNQ)
+                    if (RMQ8 == 0) { lk(hxq4, (D + 255) / 256, 256, PXNQ) }
                     lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256)
                 } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
                 if (Q8SK == 1) { lk(hq8s, 2 * HV, 256, pb + 2 * 256) } else {
@@ -1333,7 +1341,7 @@ main()<Int> -> {
                     put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
                 }
                 if (Q5Q8 == 1) {
-                    lk(hxq5, (D + 255) / 256, 256, PXNQ)
+                    if (RMQ8 == 0) { lk(hxq5, (D + 255) / 256, 256, PXNQ) }
                     lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
                     lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
                     lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)
