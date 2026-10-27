@@ -603,6 +603,7 @@ main()<Int> -> {
     // xq8 from rgemv7). NOT bit-identical; validated by KLD.
     // 2026-10-26 RTX 3090: default on CC major 8 (tg128 26.9 -> 28.4, KLD 0.00394, ppl 3.2437); =0 or VYB_EXACT=1 off.
     Q4Q8<Int> = 0 ; hq4q<Int> = 0 ; hxq4<Int> = 0
+    Q4KM<Int> = 0
     dfq4<String> = "0"
     if (CCMAJ == 8) { dfq4 = "1" }
     if ((env_get("VYB_EXACT") else "") == "1") { dfq4 = "0" }
@@ -628,6 +629,11 @@ main()<Int> -> {
         if ((env_get("VYB_Q4KU") else "1") == "1") {
             hq4u<Int> = get_fn(mq4q, "gemv_q4k_qu")
             if (hq4u != 0) { hq4q = hq4u ; println("Q4KU gemv_q4k_qu unroll4") }
+        }
+        // VYB_Q4KM=1: gemv_q4k_m, llama.cpp mmvq layout (one row per 128-thread block); KLD-checked
+        if ((env_get("VYB_Q4KM") else "0") == "1") {
+            hq4m<Int> = get_fn(mq4q, "gemv_q4k_m")
+            if (hq4m != 0) { hq4q = hq4m ; Q4KM = 1 ; println("Q4KM gemv_q4k_m mmvq 128/row") }
         }
     }
     // VYB_Q5Q8 (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): attention q/k/v Q5_K GEMVs on q8_1 + dp4a
@@ -1359,7 +1365,7 @@ main()<Int> -> {
             if (kind.get(L) == 1) {
                 if (Q4Q8 == 1) {
                     if (RMQ8 == 0) { lk(hxq4, (D + 255) / 256, 256, PXNQ) }
-                    lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256)
+                    if (Q4KM == 1) { lk(hq4q, QKV + VAL, 128, pb + 256) } else { lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256) }
                 } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
                 if (Q8SK == 1) { lk(hq8s, 2 * HV, 256, pb + 2 * 256) } else {
                     lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
@@ -1391,7 +1397,7 @@ main()<Int> -> {
                 lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
                 if (Q4Q8 == 1) {
                     lk(hxq4, (VAL + 255) / 256, 256, PEQ)
-                    lk(hq4q, (D + 15) / 16, 512, pb + 15 * 256)
+                    if (Q4KM == 1) { lk(hq4q, D, 128, pb + 15 * 256) } else { lk(hq4q, (D + 15) / 16, 512, pb + 15 * 256) }
                 } else { lk(hq4, (D + Q4G - 1) / Q4G, 512, pb + 15 * 256) }
             } else {
                 a<Int> = aidx.get(L)

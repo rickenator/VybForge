@@ -272,3 +272,102 @@ gemv_q4k_qu(p<Int>) -> {
         }
     }
 }
+
+// gemv_q4k_m: Q4_K x q8_1 in llama.cpp's mmvq layout (ggml-cuda/mmvq.cu mul_mat_vec_q + vecdotq.cuh
+// vec_dot_q4_K_q8_1, MIT, see THIRD-PARTY.md): one row per 128-thread block (4 warps), 16 threads per
+// super-block so 8 super-blocks are in flight per row, vdr=2: thread i (i16 = i % 16, j = i16 / 4) owns the
+// two qs words at bytes 32j + 4(i16 % 4) and +16 (8 values of sub-block 2j in the low nibbles, 8 of 2j+1 in
+// the high) and the matching four xq8 words. f64 warp + cross-warp reduction. Not bit-identical to
+// gemv_q4k_q (different sum order) -> KLD-checked. VYB_Q4KM=1, launch grid = rows, block = 128.
+gemv_q4k_m(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    YE<Int> = ld_i64(p + 48)
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    w<Int> = tid / 32
+    n0<Int> = blk_x()
+    NS2<Int> = ld_i64(p + 64)
+    RS<Int> = ld_i64(p + 120)
+    NS3<Int> = ld_i64(p + 96)
+    if (n0 >= N) {
+        if (n0 < N + NS2) {
+            n0 = n0 - N
+            W = ld_i64(p + 56)
+            Y = ld_i64(p + 72)
+            YE = ld_i64(p + 80)
+            N = NS2
+        } else {
+            n0 = n0 - N - NS2
+            W = ld_i64(p + 88)
+            Y = ld_i64(p + 104)
+            YE = ld_i64(p + 112)
+            N = NS3
+        }
+    }
+    nsb<Int> = K / 256
+    i16<Int> = tid % 16
+    j<Int> = i16 / 4
+    q4o<Int> = 16 + 32 * j + 4 * (i16 % 4)
+    xo<Int> = 64 * j + 4 * (i16 % 4)
+    sh<UInt32> = ((j % 2) * 16) as UInt32
+    mk<UInt32> = (0 as UInt32) - ((j / 2) as UInt32)
+    nmk<UInt32> = (0 as UInt32) - ((1 - j / 2) as UInt32)
+    one4<UInt32> = 16843009 as UInt32
+    m4<UInt32> = 252645135 as UInt32
+    acc0<Float32> = 0.0
+    if (n0 < N) {
+        rb0<Int> = W + n0 * nsb * 144
+        xs<Int> = X + K + (2 * j) * 4
+        sb<Int> = tid / 16
+        while (sb < nsb) {
+            bb<Int> = rb0 + sb * 144
+            df0<Float32> = ld_f16(bb)
+            mnf0<Float32> = ld_f16(bb + 2)
+            ba0<UInt32> = ld_u32(bb + 4)
+            bc0<UInt32> = ld_u32(bb + 8)
+            be0<UInt32> = ld_u32(bb + 12)
+            v0<UInt32> = ld_u32(bb + q4o)
+            v1<UInt32> = ld_u32(bb + q4o + 16)
+            xb<Int> = X + sb * 256 + xo
+            u0<UInt32> = ld_u32(xb)
+            u1<UInt32> = ld_u32(xb + 16)
+            u2<UInt32> = ld_u32(xb + 32)
+            u3<UInt32> = ld_u32(xb + 48)
+            dxl<Float32> = ld_f32(xs + sb * 32)
+            dxh<Float32> = ld_f32(xs + sb * 32 + 4)
+            b00<UInt32> = ba0 >> sh
+            b10<UInt32> = bc0 >> sh
+            b20<UInt32> = be0 >> sh
+            sc00<UInt32> = ((b00 & 63) & nmk) | (((b20 & 15) | (((b00 >> 6) & 3) << 4)) & mk)
+            m00<UInt32> = ((b10 & 63) & nmk) | ((((b20 >> 4) & 15) | (((b10 >> 6) & 3) << 4)) & mk)
+            sc10<UInt32> = (((b00 >> 8) & 63) & nmk) | ((((b20 >> 8) & 15) | (((b00 >> 14) & 3) << 4)) & mk)
+            m10<UInt32> = (((b10 >> 8) & 63) & nmk) | ((((b20 >> 12) & 15) | (((b10 >> 14) & 3) << 4)) & mk)
+            dl<CInt> = dp4a_s32(v1 & m4, u1, dp4a_s32(v0 & m4, u0, 0))
+            dh<CInt> = dp4a_s32((v1 >> 4) & m4, u3, dp4a_s32((v0 >> 4) & m4, u2, 0))
+            sl<CInt> = dp4a_s32(one4, u1, dp4a_s32(one4, u0, 0))
+            shh<CInt> = dp4a_s32(one4, u3, dp4a_s32(one4, u2, 0))
+            acc0 = acc0 + dxl * (df0 * (sc00 as Float32) * (dl as Float32) - mnf0 * (m00 as Float32) * (sl as Float32))
+            acc0 = acc0 + dxh * (df0 * (sc10 as Float32) * (dh as Float32) - mnf0 * (m10 as Float32) * (shh as Float32))
+            sb = sb + 8
+        }
+    }
+    s0<Float> = acc0 as Float
+    s0 = s0 + shfl_down_f64(s0, 16)
+    s0 = s0 + shfl_down_f64(s0, 8)
+    s0 = s0 + shfl_down_f64(s0, 4)
+    s0 = s0 + shfl_down_f64(s0, 2)
+    s0 = s0 + shfl_down_f64(s0, 1)
+    if (l == 0) { st_shared_f64(w, s0) }
+    kernel_barrier()
+    if (tid == 0 && n0 < N) {
+        s0 = ld_shared_f64(0) + ld_shared_f64(1) + ld_shared_f64(2) + ld_shared_f64(3)
+        if (YE == 4) { st_f32(Y + n0 * 4, s0 as Float32) } else {
+            if (RS != 0) { s0 = ld_f64(RS + n0 * 8) + s0 }
+            st_f64(Y + n0 * 8, s0)
+        }
+    }
+}
