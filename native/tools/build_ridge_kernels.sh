@@ -8,7 +8,7 @@ cd "$(dirname "$(readlink -f "$0")")/../build" 2>/dev/null || { mkdir -p "$(dirn
 VYB_BIN=${VYB_BIN:-$HOME/Projects/Vyb/build/vyb}
 export VYB_STDLIB=${VYB_STDLIB:-$(dirname "$(dirname "$(readlink -f "$VYB_BIN")")")/stdlib}
 # name[:shared-bytes]
-K="attn35 gdn layer q4k q5k q6k qwen3 iq2s iq3s q8_0 rope rattn rconv32 rdelta:8192 rdelta2:12288
+K="attn35 gdn layer q4k q5k q6k qwen3 iq2s iq3s q8_0 rope rattn:512 rconv32 rdelta:8192 rdelta2:12288
    rdelta2w:40960 rdelta2x:33040 rdeltag rgemv rgemv2 rgemv4 rgemv5:8192 rgemv6:8192 rgemv7:8192 rgemv8:8192 rpf:20480 rpf32
    rpf_gemm:27648 rpf_gemm128:45056 rpf_gemm128h:45056 rq4k rq4kq:256 rq5kq:256 rq6k rq6k8 rq6kr2 rq80s"
 fail=0

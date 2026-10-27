@@ -482,6 +482,13 @@ main()<Int> -> {
     if (mrax == 0) { println("ERR load rattn") ; return 1 }
     hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx") ; hrxw<Int> = get_fn(mrax, "rax_w") ; hrm2<Int> = get_fn(mrax, "rax_mx2") ; hrs8<Int> = get_fn(mrax, "rax_sum8") ; hrcw<Int> = get_fn(mrax, "rax_cw")
     RXM<Int> = dalloc(4096)
+    // VYB_AFD=1 (opt-in, with VYB_ACX; measured no gain on the 3090 yet): rax_fd, flash-decode style fused decode attention, one block
+    // per head: attn_sc + rax_mx2 + rax_e + rax_sum8 + rax_w + rax_cw in one launch. Bit-identical.
+    AFD<Int> = 0
+    AFDS<Int> = 1
+    if ((env_get("VYB_AFDS") else "1") == "0") { AFDS = 0 }
+    hrfd<Int> = get_fn(mrax, "rax_fd")
+    if ((env_get("VYB_AFD") else "0") == "1" && ACX == 1 && hrfd != 0) { AFD = 1 ; println("ATTN_FD rax_fd fused decode attention") }
     hs32<Int> = get_fn(mlay, "silu32") ; hsq<Int> = get_fn(mlay, "silu32q") ; hc32<Int> = get_fn(mlay, "cast32")
     hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
     hamp<Int> = get_fn(mq3, "argmax1_p") ; hamr<Int> = get_fn(mq3, "argmax1_r") ; hexp<Int> = get_fn(mq3, "f32expand")
@@ -1444,6 +1451,10 @@ main()<Int> -> {
                 lk(hrms, H, 256, pb + 5 * 256)
                 lk(hrms, KVH, 256, pb + 6 * 256)
                 lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
+                if (AFD == 1) {
+                    if (AFDS == 1) { lk(hasc, (H * pg + 31) / 32, 32, pb + 8 * 256) }
+                    lk4(hrfd, H, 256, pb + 8 * 256, RXM, AFDS, 0)
+                } else {
                 lk(hasc, (H * pg + 31) / 32, 32, pb + 8 * 256)
                 if (ACX == 1) {
                     lk4(hrm2, H, 32, pb + 8 * 256, RXM, 0, 0)
@@ -1452,6 +1463,7 @@ main()<Int> -> {
                     lk4(hrxw, (H * pg + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                     lk4(hrcw, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
                 } else { lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256) }
+                }
                 lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
                 lk(hc32, (NQ + 255) / 256, 256, pb + 10 * 256)
                 lk(hq6, (D + Q6G - 1) / Q6G, 512, pb + 11 * 256)

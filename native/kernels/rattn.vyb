@@ -2,7 +2,7 @@
 // output lane (attn_cx recomputes max/sum/exp for each of the HD lanes). Same expressions, same
 // summation order as attn_cx -> bit-identical. Params block is attn_cx's (V@96 Ctx@104 S@184 HD@200
 // H@208 KVH@216 P0@224 SC@232 T@240); M = rows*2 f64 scratch (mx, ssum). SC is overwritten with exp.
-import vmath::{vexp}
+import vmath::{vexp, vsqrt}
 
 rax_mx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
     S<Int> = ld_i64(p + 184)
@@ -211,5 +211,144 @@ rax_cx(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
             acc = acc + w * vv
         }
         st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
+// rax_fd: flash-decode style fused decode attention (S = 1), one block per head (grid H, 256 threads):
+// scores (attn_sc), row max (rax_mx2), exp (rax_e), row sum (rax_sum8), w (rax_w) and context (rax_cw)
+// in ONE launch instead of six (z0 = 1: five, attn_sc stays its own wide launch). Same expressions, same summation order (dot over HD in ia order, sum
+// and context over t in order; max is order-free) -> bit-identical. SC ends holding w, as before.
+// Params block is attn_sc/attn_cx's (Q@80 K@88 V@96 Ctx@104 HD@200 H@208 KVH@216 P0@224 SC@232 T@240).
+rax_fd(p<Int>, M<Int>, z0<Int>, z1<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    h<Int> = blk_x()
+    tid<Int> = tid_x()
+    nt<Int> = dim_x()
+    kvh<Int> = h / hkv
+    n<Int> = P0 + 1
+    sb<Int> = SC + h * T * 8
+    qb<Int> = Q + h * HD * 8
+    t<Int> = tid
+    // z0 = 1: scores already in SC (attn_sc launched separately, 32-thread blocks over all SMs)
+    if (z0 == 1) { t = n }
+    while (t < n) {
+        kb<Int> = K + (t * KVH * HD + kvh * HD) * 8
+        sc<Float> = 0.0
+        ia<Int> = 0
+        while (ia + 7 < HD) {
+            q0<Float> = ld_f64(qb + ia * 8)
+            q1<Float> = ld_f64(qb + ia * 8 + 8)
+            q2<Float> = ld_f64(qb + ia * 8 + 16)
+            q3<Float> = ld_f64(qb + ia * 8 + 24)
+            q4<Float> = ld_f64(qb + ia * 8 + 32)
+            q5<Float> = ld_f64(qb + ia * 8 + 40)
+            q6<Float> = ld_f64(qb + ia * 8 + 48)
+            q7<Float> = ld_f64(qb + ia * 8 + 56)
+            k0<Float> = ld_f64(kb + ia * 8)
+            k1<Float> = ld_f64(kb + ia * 8 + 8)
+            k2<Float> = ld_f64(kb + ia * 8 + 16)
+            k3<Float> = ld_f64(kb + ia * 8 + 24)
+            k4<Float> = ld_f64(kb + ia * 8 + 32)
+            k5<Float> = ld_f64(kb + ia * 8 + 40)
+            k6<Float> = ld_f64(kb + ia * 8 + 48)
+            k7<Float> = ld_f64(kb + ia * 8 + 56)
+            sc = sc + q0 * k0
+            sc = sc + q1 * k1
+            sc = sc + q2 * k2
+            sc = sc + q3 * k3
+            sc = sc + q4 * k4
+            sc = sc + q5 * k5
+            sc = sc + q6 * k6
+            sc = sc + q7 * k7
+            ia = ia + 8
+        }
+        while (ia < HD) {
+            qv<Float> = ld_f64(qb + ia * 8)
+            kv<Float> = ld_f64(kb + ia * 8)
+            sc = sc + qv * kv
+            ia = ia + 1
+        }
+        st_f64(sb + t * 8, sc * scale)
+        t = t + nt
+    }
+    kernel_barrier()
+    mx<Float> = -1000000000000000000000000000000.0
+    t = tid
+    while (t < n) {
+        s1<Float> = ld_f64(sb + t * 8)
+        if (s1 > mx) { mx = s1 }
+        t = t + nt
+    }
+    o<Float> = shfl_down_f64(mx, 16)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 8)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 4)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 2)
+    if (o > mx) { mx = o }
+    o = shfl_down_f64(mx, 1)
+    if (o > mx) { mx = o }
+    if (tid % 32 == 0) { st_shared_f64(tid / 32, mx) }
+    kernel_barrier()
+    if (tid == 0) {
+        m<Float> = ld_shared_f64(0)
+        wi<Int> = 1
+        while (wi < nt / 32) {
+            o2<Float> = ld_shared_f64(wi)
+            if (o2 > m) { m = o2 }
+            wi = wi + 1
+        }
+        st_shared_f64(32, m)
+    }
+    kernel_barrier()
+    mx = ld_shared_f64(32)
+    t = tid
+    while (t < n) {
+        a<Int> = sb + t * 8
+        st_f64(a, vexp(ld_f64(a) - mx))
+        t = t + nt
+    }
+    kernel_barrier()
+    if (tid == 0) {
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        while (tb < n) {
+            ssum = ssum + ld_f64(sb + tb * 8)
+            tb = tb + 1
+        }
+        st_shared_f64(33, ssum)
+    }
+    kernel_barrier()
+    sm<Float> = ld_shared_f64(33)
+    t = tid
+    while (t < n) {
+        a2<Int> = sb + t * 8
+        st_f64(a2, ld_f64(a2) / sm)
+        t = t + nt
+    }
+    kernel_barrier()
+    ii<Int> = tid
+    while (ii < HD) {
+        acc<Float> = 0.0
+        tc<Int> = 0
+        while (tc < n) {
+            acc = acc + ld_f64(sb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            tc = tc + 1
+        }
+        st_f64(Ctx + (h * HD + ii) * 8, acc)
+        ii = ii + nt
     }
 }
