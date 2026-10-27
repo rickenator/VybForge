@@ -93,8 +93,10 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `Q4Q8`, `Q5Q8`, `Q8SK` | Q4_K / Q5_K / Q8_0 GEMVs on q8_1 + dp4a, Q8_0 split-K (default on) |
 | `CONV32` | f32 short conv in the GDN block (default on) |
 | `RMSG` | multi-block RMSNorm `rms_blkg`, exact (default on) |
-| `RMSQ8` | `rms_blkg` also writes the q8_1 copy (int8 + per-32 f32 scale) that the Q4_K / Q5_K GEMVs read, instead of a separate `xq8` launch (default 1, bit-identical; needs `RMSG`; off when the hidden size is not a multiple of 32) |
+| `RMSQ8` | `rms_blkg` also writes the q8_1 copy (int8 + per-32 f32 scale) that the Q4_K / Q5_K GEMVs read, instead of a separate `xq8` launch, for the attention norm and (when gate/up use the q8_1 path) the FFN norm (default 1, bit-identical; needs `RMSG`; off when the hidden size is not a multiple of 32) |
 | `GDNF` | GDN decode: fused `sg_ag` (sigmoid + alpha gate) and `conv_step` (shift + interleave + conv1d + silu) kernels, 4 fewer launches per GDN layer (default 1, bit-identical; 0 = the separate kernels) |
+| `SWQ8` | FFN: `silu32q` fuses SwiGLU with the q8_1 quant of its output for the `ffn_down` GEMV, one launch instead of `silu32` + `xq8` per layer (default 1, bit-identical; needs the q8_1 path and FF a multiple of 32). `VYB_DBG=1` prints `SWQ_LAYER_STEPS` |
+| `EMBG` | Decode token embedding (`q6kdeq_ix`, reads the token id from device memory) runs inside the decode CUDA graph instead of as an eager launch (default 1 when the graph is on, bit-identical) |
 | `Q6KPTX`, `Q6KR` | Q6_K decode GEMV module and rows per warp. Default `rq6kr2.ptx` with 2 rows per warp on CC < 10 (bit-identical), `rq6k8.ptx` with 1 on GB10; `Q6KR` must match the module |
 | `PROMPT`, `PROMPT_IDS`, `FORCE_IDS`, `GEN`, `CHAT`, `CHAT_N`, `CHAT_SYS`, `THINK`, `STREAM`, `TOKTEXT`, `MAXS` | prompt / chat / output control |
 | `MODEL`, `TSV`, `INVFREQ`, `LLM_DIR` | input paths (GGUF, tensor TSV, rope inv-freq, tokenizer dir) |

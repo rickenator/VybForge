@@ -13,6 +13,10 @@
     separate `xq8` launch per layer; GDN decode small kernels fused into `sg_ag` (sigmoid + alpha
     gate) and `conv_step` (shift + interleave + conv1d + silu) (`VYB_GDNF`). Both bit-identical
     (`VYB_LOGDUMP` cmp); with `rq6kr2`, tg128 35.8 → 37.6 tok/s
+  - FFN decode fusions: `silu32q` (SwiGLU + q8_1 quant for `ffn_down`, `VYB_SWQ8`), the `ffn_norm`
+    q8_1 copy from `rms_blkg` (now part of `VYB_RMSQ8`), and the token embedding inside the decode
+    graph (`q6kdeq_ix`, `VYB_EMBG`). About 128 fewer launches per step, bit-identical; about +0.3%
+    tg128 measured interleaved, within the 37.6 headline
   - decode step as one CUDA graph (`VYB_CG`), launched by a direct `cuLaunchKernel` Vyb extern; 34.7 → 35.8 tok/s, bit-identical
   - q8_1 + dp4a GEMVs for IQ2_S / IQ3_S / Q4_K / Q5_K / Q8_0
   - batched prefill
