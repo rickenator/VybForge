@@ -986,6 +986,99 @@ rms_blk(p<Int>) -> {
     }
 }
 
+// ---- rms_blkg (Ursela, 2026-10-26): single-row rms_blk spread over 5 blocks. rms_blk runs on ONE SM,
+// where f64 math is 2 FMA/clk: the x*r*w scale pass alone is ~3 us of the ~13 us. Every block repeats the
+// identical sum / tree / seeded-Newton (same bits of r), then scales only the 256-element chunks j with
+// j % 5 == blk_x(). Same y = x * r * w per element -> bit-identical to rms_blk. X must not alias Y
+// (blocks read all of X while others write Y); decode's three hidden-size norms are XC/XM -> XN.
+rms_blkg(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    Y32<Int> = ld_i64(p + 48)
+    row<Int> = 0
+    g<Int> = blk_x()
+    t<Int> = tid_x()
+    xb<Int> = X + row * N * 8
+    ss<Float> = 0.0
+    d<Int> = t
+    # 4 loads in flight per trip (Ursela): same elements, same summation order -> bit-identical
+    while (d + 768 < N) {
+        a0<Float> = ld_f64(xb + d * 8)
+        a1<Float> = ld_f64(xb + (d + 256) * 8)
+        a2<Float> = ld_f64(xb + (d + 512) * 8)
+        a3<Float> = ld_f64(xb + (d + 768) * 8)
+        ss = ss + a0 * a0
+        ss = ss + a1 * a1
+        ss = ss + a2 * a2
+        ss = ss + a3 * a3
+        d = d + 1024
+    }
+    while (d < N) {
+        v<Float> = ld_f64(xb + d * 8)
+        ss = ss + v * v
+        d = d + 256
+    }
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 128
+    # strides 128/64/32 through shared, 16..1 by warp shuffle: lane t adds lane t+st exactly as the
+    # shared tree did (same pairs, same order) -> bit-identical, 5 fewer block barriers (2026-10-26).
+    while (st2 > 16) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t < 32) {
+        sw<Float> = ld_shared_f64(t)
+        sw = sw + shfl_down_f64(sw, 16)
+        sw = sw + shfl_down_f64(sw, 8)
+        sw = sw + shfl_down_f64(sw, 4)
+        sw = sw + shfl_down_f64(sw, 2)
+        sw = sw + shfl_down_f64(sw, 1)
+        if (t == 0) { st_shared_f64(0, sw) }
+    }
+    if (t == 0) {
+        # Seeded Newton (Ursela): vsqrt(x, 24) from y0=x is 24 dependent f64 divides on one thread
+        # (~6 us on the 3090, half of this kernel). Seed with the classic rsqrt bit trick instead and
+        # take 6 steps: identical result for x in [1e-9, 1e9] (checked against the 24-step loop on
+        # 300k random x, where both have converged to the same fixed point); outside that range the
+        # old loop runs unchanged, so the result is bit-identical everywhere.
+        x<Float> = ld_shared_f64(0) / (N as Float) + eps
+        sq<Float> = 0.0
+        if (x > 0.000000001) {
+            if (x < 1000000000.0) {
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                sq = y
+            }
+        }
+        if (sq == 0.0) { sq = vsqrt(x, 24) }
+        st_shared_f64(256, 1.0 / sq)
+    }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    yb<Int> = Y + row * N * 8
+    d2<Int> = t + 256 * g
+    while (d2 < N) {
+        xv<Float> = ld_f64(xb + d2 * 8)
+        wv<Float> = ld_f64(W + d2 * 8)
+        y<Float> = xv * r * wv
+        st_f64(yb + d2 * 8, y)
+        if (Y32 != 0) { st_f32(Y32 + (row * N + d2) * 4, y) }
+        d2 = d2 + 1280
+    }
+}
+
 // ---- Parallel KV attention (Ursela, queue item 22). The attn_mx/attn_sum pair ran ONE thread per
 // (row, head) -- 32 threads on the whole GPU at decode -- looping serially over all T positions, and
 // attn_cxw one thread per (row, head, dim) looping over T; attn_sc read each K row with one thread

@@ -409,7 +409,14 @@ main()<Int> -> {
     RK2<Int> = 1
     if ((env_get("VYB_RK1") else "").len() > 0) { RK2 = 0 }
     if (mr2 == 0 || mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
-    hrms<Int> = get_fn(mlay, "rms_blk") ; hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
+    hrms<Int> = get_fn(mlay, "rms_blk") ; hrmsg<Int> = get_fn(mlay, "rms_blkg")
+    // VYB_RMSG (default 1): decode hidden-size norms on 5 blocks (rms_blkg, bit-identical)
+    RMSG<Int> = 1
+    if ((env_get("VYB_RMSG") else "1") == "0") { RMSG = 0 }
+    if (RMSG == 0) { hrmsg = hrms }
+    RMSGB<Int> = 5
+    if (RMSG == 0) { RMSGB = 1 }
+    hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
     // decode attention context: softmax once per head row (rattn.vyb), bit-identical to attn_cx. VYB_ACX=0 off.
     ACX<Int> = 1
     if ((env_get("VYB_ACX") else "") == "0") { ACX = 0 }
@@ -1154,7 +1161,7 @@ main()<Int> -> {
         lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0)
         for (L in 0..NL - 1) {
             pb<Int> = pbase.get(L)
-            lk(hrms, 1, 256, pb)
+            lk(hrmsg, RMSGB, 256, pb)
             if (kind.get(L) == 1) {
                 if (Q4Q8 == 1) {
                     lk(hxq4, (D + 255) / 256, 256, PXNQ)
@@ -1221,7 +1228,7 @@ main()<Int> -> {
             }
             pfb<Int> = pb + 16 * 256
             tg<Int> = fty.get(L * 3) ; tu<Int> = fty.get(L * 3 + 1) ; tdn<Int> = fty.get(L * 3 + 2)
-            lk(hrms, 1, 256, pfb)
+            lk(hrmsg, RMSGB, 256, pfb)
             if (XPM == 1) {
                 if (perm_x(tg, RQ8, RQ83) + perm_x(tu, RQ8, RQ83) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
             }
@@ -1249,7 +1256,7 @@ main()<Int> -> {
         }
         }
         if (p >= NP - 1) {
-            lk(hrms, 1, 256, PH)
+            lk(hrmsg, RMSGB, 256, PH)
             lk(hq6, (VOCAB + Q6G - 1) / Q6G, 512, PH + 256)
             lk(hamp, (NCH + 255) / 256, 256, PH2)
             lk(hamr, 1, 32, PH3)
