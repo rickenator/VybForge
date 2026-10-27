@@ -22,10 +22,10 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 # state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
 # unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
 # an explicit `make q8_0` but a fresh `make verify` did not build it.
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
+.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
 
 all: verify
 
@@ -329,9 +329,13 @@ kvresp-train-kv: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/kvresp_train_kv.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
 
-decode: $(ROOT)/native/build/layer.ptx
+# decode_driver.vyb is the real Qwen3-4B greedy decode now (the toy wte/lmh fixture
+# verify_decode.py expected is gone), so decode and verify check its token stream against
+# decode_ref.py's (generated once, ~90 s/step; `make decode-real` regenerates it).
+decode: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && test -f native/out/decode_ids_ref.txt || .venv/bin/python native/gguf/decode_ref.py
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
-	cd $(ROOT) && python3 native/tools/verify_decode.py
+	cd $(ROOT) && python3 native/tools/verify_decode_real.py
 
 # Real Qwen3-4B greedy decode: token stream == numpy decode_ref.py (decode_ids_ref.txt)
 decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
@@ -396,8 +400,9 @@ verify: $(PTX) $(ROOT)/native/gguf/test.gguf
 	@echo "== TENSOR:: WRAPPER (gemm + rmsnorm via module + cuLaunchKernel) =="
 	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
 	@echo "== GREEDY AUTOREGRESSIVE DECODE (numpy reference) =="
+	cd $(ROOT) && test -f native/out/decode_ids_ref.txt || .venv/bin/python native/gguf/decode_ref.py
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
-	cd $(ROOT) && python3 native/tools/verify_decode.py
+	cd $(ROOT) && python3 native/tools/verify_decode_real.py
 	@echo "== STOCHASTIC SAMPLER (temp + top_k + top_p + LCG) =="
 	cd $(ROOT) && $(VYB) native/sampler/test_sampler.vyb --module-path native/sampler
 	cd $(ROOT) && python3 native/sampler/verify_sampler.py
@@ -413,6 +418,10 @@ verify: $(PTX) $(ROOT)/native/gguf/test.gguf
 	@echo "== G-DECODE: agent-response CONTRACT EMISSION (jsonschema) =="
 	cd $(ROOT) && $(VYB) native/gdecode/test_contract.vyb --module-path native/gdecode
 	cd $(ROOT) && python3 native/gdecode/verify_contract.py
+
+# All PTX the 27B Ridge decoder loads (per-kernel --kernel-shared sizes live in the script).
+ridge-kernels:
+	VYB_BIN=$(VYB) VYB_STDLIB=$(VYBDIR)/stdlib $(ROOT)/native/tools/build_ridge_kernels.sh
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out

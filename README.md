@@ -88,6 +88,13 @@ buffers/kernels, not to a specific vendor as a product — a future sponsor can
 change the backend without renaming the shop. Real base-model weights are kept
 central (never committed): see `MODELS.md`.
 
+### Ridge 27B chat (`./ridge-chat`)
+
+`./ridge-chat` chats with the 27B Ridge (qwen35) model. The engine is all Vyb (`native/host/ridge_decode.vyb`).
+On an RTX 3090 it runs at 34.3 tok/s decode and 795 tok/s prefill; llama.cpp does 47.4 / 1258.
+Setup, the flags, the perf tables for the 3090 and DGX Spark, and the exactness/KLD gates are in
+[`doc/RIDGE-27B.md`](doc/RIDGE-27B.md). Build the kernels with `make -C native ridge-kernels`.
+
 ## Configuration
 
 Env vars are `VYBFORGE_*`.
