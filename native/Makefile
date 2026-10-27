@@ -8,6 +8,13 @@
 VYBHOME ?= $(HOME)/Projects/Vyb
 VYBDIR  ?= $(VYBHOME)
 VYB     ?= $(VYBDIR)/build/vyb
+# VYB_BIN is the name the kernel build scripts read, but make itself only honours VYB/VYBHOME:
+# say so instead of silently building with a different compiler than the one asked for.
+ifneq ($(origin VYB_BIN),undefined)
+ifneq ($(VYB_BIN),$(VYB))
+$(warning VYB_BIN=$(VYB_BIN) is ignored here; set VYB= or VYBHOME= instead (using VYB=$(VYB)))
+endif
+endif
 ROOT    := $(shell git -C "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))/.." rev-parse --show-toplevel 2>/dev/null || echo "$(abspath $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/..)")
 KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
