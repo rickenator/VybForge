@@ -609,7 +609,10 @@ main()<Int> -> {
     // VYB_Q8SK (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): GDN alpha+beta Q8_0 GEMVs as ONE split-K
     // launch (rq80s.vyb gemv_q8_0_sk; one block per row). NOT bit-identical; validated by KLD.
     Q8SK<Int> = 0 ; hq8s<Int> = 0
-    if ((env_get("VYB_Q8SK") else dfq4) == "1") {
+    // Q8SK also defaults on for CC >= 10 (GB10: +1.2% alone, DSG+Q8SK 14.76 vs DSG 14.55)
+    dfq8s<String> = dfq4
+    if (CCMAJ >= 10 && (env_get("VYB_EXACT") else "") != "1") { dfq8s = "1" }
+    if ((env_get("VYB_Q8SK") else dfq8s) == "1") {
         mq8s<Int> = load_mod("native/build/rq80s.ptx")
         if (mq8s == 0) { println("ERR load rq80s") ; return 1 }
         hq8s = get_fn(mq8s, "gemv_q8_0_sk") ; Q8SK = 1
