@@ -17,6 +17,9 @@
     `VYB_Q4KU`, `VYB_Q5KU`), bit-identical (`VYB_LOGDUMP` cmp), +0.8 % / +0.4 % tg128 interleaved
   - Q6_K decode GEMV `rq6kr2` (2 rows per warp, `native/tools/gen_rq6k.py 2 1`), default on sm_8x;
     GB10 keeps `rq6k8`, which measured faster there. Bit-identical
+  - GB10 (DGX Spark): `VYB_Q8SK` (Q8_0 split-K GEMV) now defaults on for CC >= 10 as well (off under
+    `VYB_EXACT=1`); with DSG, tg128 14.55 → 14.76 tok/s; token stream unchanged vs `VYB_Q8SK=0`.
+    GB10 `VYB_EXACT=1` checked gold-exact
   - `rms_blkg` writes the q8_1 copy of the attention-norm output itself (`VYB_RMSQ8`), dropping the
     separate `xq8` launch per layer; GDN decode small kernels fused into `sg_ag` (sigmoid + alpha
     gate) and `conv_step` (shift + interleave + conv1d + silu) (`VYB_GDNF`). Both bit-identical
