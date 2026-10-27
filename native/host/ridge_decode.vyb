@@ -465,6 +465,10 @@ main()<Int> -> {
     if (RMSG == 0) { hrmsg = hrms }
     RMSGB<Int> = 5
     if (RMSG == 0) { RMSGB = 1 }
+    // VYB_RMSQ8 (default 1; needs VYB_RMSG): the decode attn_norm rms_blkg also writes the q8_1 copy
+    // (p + 56) for the Q4Q8 / Q5Q8 GEMVs, replacing the xq8 launch after it (64/step). Bit-identical.
+    RMQ8<Int> = 1
+    if ((env_get("VYB_RMSQ8") else "1") == "0" || RMSG == 0) { RMQ8 = 0 }
     hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
     // decode attention context: softmax once per head row (rattn.vyb), bit-identical to attn_cx. VYB_ACX=0 off.
     ACX<Int> = 1
@@ -479,6 +483,12 @@ main()<Int> -> {
     hl2<Int> = get_fn(mgd, "l2norm") ; hng<Int> = get_fn(mgd, "norm_gated") ; hsg<Int> = get_fn(mgd, "sigmoid_k")
     hag<Int> = get_fn(mgd, "alpha_gate") ; hsv<Int> = get_fn(mgd, "silu_k") ; hcv<Int> = get_fn(mgd, "conv1d_k")
     hil<Int> = get_fn(mgd, "interleave_qkv") ; hsh<Int> = get_fn(mgd, "conv_shift")
+    // VYB_GDNF (default 1): decode GDN launch fusion, sigmoid_k + alpha_gate -> sg_ag and conv_shift +
+    // interleave_qkv + conv1d_k + silu_k -> conv_step (gdn.vyb). Bit-identical; 4 fewer launches per GDN layer.
+    hsga<Int> = get_fn(mgd, "sg_ag") ; hcst<Int> = get_fn(mgd, "conv_step")
+    GDNF<Int> = 1
+    if ((env_get("VYB_GDNF") else "1") == "0" || hsga == 0 || hcst == 0) { GDNF = 0 }
+    if (GDNF == 1) { println("GDN_FUSE sg_ag+conv_step (decode)") }
     hrope<Int> = get_fn(mrp, "rope_nrot") ; hqgs<Int> = get_fn(ma35, "qg_split") ; hgm<Int> = get_fn(ma35, "gate_mul")
     hq6d<Int> = get_fn(mq6, "q6kdeq")
     hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
@@ -805,6 +815,7 @@ main()<Int> -> {
     SCLV<Float> = 1.0 / sqrt(SS as Float)
 
     // per-layer launch plan: kind, and the param-block base of each step (8 blocks per slot)
+    if (D % 32 != 0) { RMQ8 = 0 }
     kind<Vec<Int>> = Vec() ; pbase<Vec<Int>> = Vec() ; aidx<Vec<Int>> = Vec()
     fty<Vec<Int>> = Vec()      // gate, up, down types (3 per layer)
     gdn_bytes<Int> = 0 ; kv_bytes<Int> = 0
@@ -837,6 +848,10 @@ main()<Int> -> {
         // block 0: attn_norm (rms_blk XC -> XN, XN32)
         p0<Int> = pb0
         put_i(p0, 0, XC) ; put_i(p0, 8, ANW) ; put_i(p0, 16, XN) ; put_i(p0, 24, 1) ; put_i(p0, 32, D) ; put_f(p0, 40, EPS) ; put_i(p0, 48, XN32)
+        if (RMQ8 == 1) {
+            if (isg == 1 && Q4Q8 == 1) { put_i(p0, 56, XNQ) }
+            if (isg == 0 && Q5Q8 == 1) { put_i(p0, 56, XNQ) }
+        }
         // FFN blocks at slots 16..19
         pfn<Int> = pb0 + 16 * 256
         put_i(pfn, 0, XM) ; put_i(pfn, 8, PANW) ; put_i(pfn, 16, XN) ; put_i(pfn, 24, 1) ; put_i(pfn, 32, D) ; put_f(pfn, 40, EPS) ; put_i(pfn, 48, XN32)
@@ -891,6 +906,7 @@ main()<Int> -> {
             put_i(p7, 0, QKVX) ; put_i(p7, 8, CVL) ; put_i(p7, 16, QKV) ; put_i(p7, 24, DC) ; put_i(p7, 32, 1)
             p8<Int> = pb0 + 8 * 256
             put_i(p8, 0, CVL) ; put_i(p8, 8, CW) ; put_i(p8, 16, CRAW) ; put_i(p8, 24, QKV) ; put_i(p8, 32, DC) ; put_i(p8, 40, 1)
+            put_i(p8, 48, QKVX) ; put_i(p8, 56, CONVS) ; put_i(p4, 24, p5)
             p9<Int> = pb0 + 9 * 256
             put_i(p9, 0, CRAW) ; put_i(p9, 8, CONVS) ; put_i(p9, 16, QKV)
             p10<Int> = pb0 + 10 * 256
@@ -1274,19 +1290,24 @@ main()<Int> -> {
             lk(hrmsg, RMSGB, 256, pb)
             if (kind.get(L) == 1) {
                 if (Q4Q8 == 1) {
-                    lk(hxq4, (D + 255) / 256, 256, PXNQ)
+                    if (RMQ8 == 0) { lk(hxq4, (D + 255) / 256, 256, PXNQ) }
                     lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256)
                 } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
                 if (Q8SK == 1) { lk(hq8s, 2 * HV, 256, pb + 2 * 256) } else {
                     lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
                     lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
                 }
-                lk(hsg, 1, 64, pb + 4 * 256)
-                lk(hag, 1, 64, pb + 5 * 256)
-                lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
-                lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
-                lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
-                lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                if (GDNF == 1) {
+                    lk(hsga, 1, 64, pb + 4 * 256)
+                    lk(hcst, (QKV + 255) / 256, 256, pb + 8 * 256)
+                } else {
+                    lk(hsg, 1, 64, pb + 4 * 256)
+                    lk(hag, 1, 64, pb + 5 * 256)
+                    lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
+                    lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
+                    lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
+                    lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                }
                 if (RK2 >= 1) {
                     if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
                         lk(hl2b, 2 * HK, SS, pb + 20 * 256)
@@ -1318,7 +1339,7 @@ main()<Int> -> {
                     put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
                 }
                 if (Q5Q8 == 1) {
-                    lk(hxq5, (D + 255) / 256, 256, PXNQ)
+                    if (RMQ8 == 0) { lk(hxq5, (D + 255) / 256, 256, PXNQ) }
                     lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
                     lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
                     lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)

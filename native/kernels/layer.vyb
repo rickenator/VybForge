@@ -998,6 +998,12 @@ rms_blkg(p<Int>) -> {
     N<Int> = ld_i64(p + 32)
     eps<Float> = ld_f64(p + 40)
     Y32<Int> = ld_i64(p + 48)
+    # Y8 (p + 56, 0 = off): also write the q8_1 copy of Y32 that xq8 (rgemv7.vyb) would make from it
+    # -- N int8 then N/32 f32 scales -- so the Q4Q8/Q5Q8 GEMVs skip the separate xq8 launch. Each warp
+    # holds 32 consecutive aligned elements (256 * g + 32 * w + lane + 1280 k), the same groups xq8's
+    # warps quantise, and x is the same f32 rounding of y -> bit-identical to rms_blkg + xq8. Host
+    # turns it on only when N % 32 == 0 (no partial warp).
+    Y8<Int> = ld_i64(p + 56)
     row<Int> = 0
     g<Int> = blk_x()
     t<Int> = tid_x()
@@ -1075,6 +1081,16 @@ rms_blkg(p<Int>) -> {
         y<Float> = xv * r * wv
         st_f64(yb + d2 * 8, y)
         if (Y32 != 0) { st_f32(Y32 + (row * N + d2) * 4, y) }
+        if (Y8 != 0) {
+            x8<Float32> = y as Float32
+            a8<Float32> = max_f32(x8, (0.0 as Float32) - x8)
+            a8 = warp_max_f32(a8)
+            dd8<Float32> = a8 / (127.0 as Float32)
+            iv8<Float32> = 0.0 as Float32
+            if (a8 > (0.0 as Float32)) { iv8 = (127.0 as Float32) / a8 }
+            st_i8(Y8 + d2, sat_s8(rni_f32(x8 * iv8)))
+            if (d2 % 32 == 0) { st_f32(Y8 + N + (d2 / 32) * 4, dd8) }
+        }
         d2 = d2 + 1280
     }
 }
