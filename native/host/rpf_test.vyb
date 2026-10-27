@@ -1,0 +1,308 @@
+import io::{open_read, read_at, read_all, close}
+import llm::{llm_load, llm_decode, llm_encode}
+import vllm::{Model}
+import env::{env_get}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
+    cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) {
+        if ((s.char_at(i) as Int) == nd) { return i }
+    }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+parse_ids(s<String>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec()
+    n<Int> = s.len()
+    cur<Int> = -1
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) {
+                if (cur < 0) { cur = 0 }
+                cur = cur * 10 + (c - 48)
+            }
+        } else {
+            if (cur >= 0) { v.push(cur) ; cur = -1 }
+        }
+    }
+    if (cur >= 0) { v.push(cur) }
+    return v
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1
+    seg<Int> = frm
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        if ((s.char_at(i) as Int) == 120) {
+            n = n * parse_u(s, seg, i)
+            seg = i + 1
+        }
+    }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 13) { return numel * 176 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    if (ty == 22) { return numel * 82 / 256 }
+    if (ty == 21) { return numel * 110 / 256 }
+    if (ty == 8) { return numel * 34 / 32 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (nmv.get(i) == nm) { return i }
+    }
+    return -1
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
+        return 0
+    }
+    return 0
+}
+dalloc(n<Int>)<Int> -> {
+    dp<Int> = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(dp), n) != 0) { return 0 }
+        cuMemsetD8_v2(dp, 0, n)
+    }
+    return dp
+}
+dsync() -> {
+    freedom { cuCtxSynchronize() }
+}
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+load_mod(path<String>)<Int> -> {
+    img<String> = read_bin(path)
+    if (img.len() < 16) { return 0 }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), img) != 0) { return 0 }
+        return addr(m)
+    }
+    return 0
+}
+get_fn(mi<Int>, nm<String>)<Int> -> {
+    freedom {
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), from<loc<CVoid>>(mi), nm) != 0) { println("NO_KERNEL " + nm); return 0 }
+        return addr(f)
+    }
+    return 0
+}
+lk(h<Int>, gx<Int>, bx<Int>, p<Int>)<Int> -> {
+    freedom {
+        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, p, 0, 0, 0) != 0) { return 1 }
+    }
+    if ((env_get("VYB_DBG") else "").len() > 0) {
+        t0<Int> = time_mono_millis()
+        freedom {
+            rc<CInt> = cuCtxSynchronize()
+            println("DBG h=" + h.to_string() + " p=" + p.to_string() + " grid=" + gx.to_string() + " rc=" + (rc as Int).to_string() + " ms=" + (time_mono_millis() - t0).to_string())
+        }
+    }
+    return 0
+}
+lk4(h<Int>, gx<Int>, bx<Int>, a0<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    freedom {
+        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, a0, a1, a2, a3) != 0) { return 1 }
+        return 0
+    }
+    return 0
+}
+
+set_gemv(pb<Int>, W<Int>, X<Int>, Y<Int>, N<Int>, K<Int>, YE<Int>, RS<Int>, G<Int>) -> {
+    put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, 1)
+    put_i(pb, 32, N) ; put_i(pb, 40, K) ; put_i(pb, 48, YE)
+    put_i(pb, 56, 0) ; put_i(pb, 64, 0) ; put_i(pb, 72, 0) ; put_i(pb, 80, 8)
+    put_i(pb, 88, 0) ; put_i(pb, 96, 0) ; put_i(pb, 104, 0) ; put_i(pb, 112, 8)
+    put_i(pb, 120, RS) ; put_i(pb, 128, G)
+}
+
+// GEMM-vs-GEMV check + timing for one packed tensor (Ridge batched prefill, gen_rpf.py kernels).
+// Env: VYB_TN tensor name, VYB_S rows (tokens), VYB_REP timing reps, VYB_MODEL, VYB_TSV.
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "/home/rick"
+    MODEL<String> = env_get("VYB_MODEL") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
+    TSV<String> = env_get("VYB_TSV") else "native/out/ridge_tensors.tsv"
+    TN<String> = env_get("VYB_TN") else "blk.0.attn_qkv.weight"
+    S<Int> = parse_u(env_get("VYB_S") else "100", 0, (env_get("VYB_S") else "100").len())
+    REP<Int> = parse_u(env_get("VYB_REP") else "5", 0, (env_get("VYB_REP") else "5").len())
+    bff<String> = read_bin(TSV)
+    ln<Int> = bff.len() ; st<Int> = 0 ; i<Int> = 0
+    K<Int> = 0 ; N<Int> = 0 ; TY<Int> = -1 ; OFF<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                if (bff.substring(st, t1) == TN) {
+                    t2<Int> = strchr(bff, 9, t1 + 1)
+                    t3<Int> = strchr(bff, 9, t2 + 1)
+                    t4<Int> = strchr(bff, 9, t3 + 1)
+                    if (t4 < 0) { t4 = i }
+                    xp<Int> = strchr(bff, 120, t1 + 1)
+                    K = parse_u(bff, t1 + 1, xp)
+                    N = parse_u(bff, xp + 1, t2)
+                    TY = parse_u(bff, t2 + 1, t3)
+                    OFF = parse_u(bff, t3 + 1, t4)
+                }
+            }
+            st = i + 1
+        }
+    }
+    if (TY < 0) { println("ERR no tensor " + TN) ; return 2 }
+    NB<Int> = packed_bytes(K * N, TY)
+    println("TENSOR " + TN + " K=" + K.to_string() + " N=" + N.to_string() + " type=" + TY.to_string() + " bytes=" + NB.to_string() + " S=" + S.to_string())
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    // VYB_BM=128: the 128-token tile GEMMs (gen_rpf.py --bm128 -> rpf_gemm128)
+    BMt<Int> = 64
+    if ((env_get("VYB_BM") else "") == "128") { BMt = 128 }
+    gpx<String> = "native/build/rpf_gemm.ptx"
+    if (BMt == 128) { gpx = "native/build/rpf_gemm128.ptx" }
+    mg<Int> = load_mod(gpx)
+    mp<Int> = load_mod("native/build/rpf.ptx")
+    mq3<Int> = load_mod("native/build/qwen3.ptx")
+    mrg<Int> = load_mod("native/build/rgemv.ptx")
+    if (mg == 0 || mp == 0 || mq3 == 0 || mrg == 0) { println("MODLOAD_FAIL") ; return 10 }
+    gn<String> = "gemm_q4k" ; vn<String> = "gemv_q4k" ; vm<Int> = mq3 ; vg<Int> = (N + 31) / 32
+    if (TY == 13) { gn = "gemm_q5k" ; vn = "gemv_q5k" ; vm = mrg ; vg = (N + 15) / 16 }
+    if (TY == 14) { gn = "gemm_q6k" ; vn = "gemv_q6k" }
+    if (TY == 8) { gn = "gemm_q80" ; vn = "gemv_q8_0" ; vm = mrg ; vg = (N + 15) / 16 }
+    if (TY == 22) { gn = "gemm_iq2s" ; vn = "gemv_iq2s" ; vm = mrg ; vg = (N + 15) / 16 }
+    if (TY == 21) { gn = "gemm_iq3s" ; vn = "gemv_iq3s" ; vm = mrg ; vg = (N + 15) / 16 }
+    hg<Int> = get_fn(mg, gn) ; hv<Int> = get_fn(vm, vn) ; hf<Int> = get_fn(mp, "fill_rand") ; hc<Int> = get_fn(mp, "cmp_k")
+    if (hg == 0 || hv == 0 || hf == 0 || hc == 0) { return 11 }
+    WB<Int> = dalloc(NB)
+    data<String> = read_model(MODEL, OFF, NB)
+    if (data.len() < NB) { println("ERR short read") ; return 21 }
+    download(data, WB, NB)
+    g2s<String> = read_bin("native/out/iq2s_grid.bin")
+    g3s<String> = read_bin("native/out/iq3s_grid.bin")
+    G2<Int> = dalloc(8192) ; G3<Int> = dalloc(2048)
+    download(g2s, G2, 8192) ; download(g3s, G3, 2048)
+    GR<Int> = 0
+    if (TY == 22) { GR = G2 }
+    if (TY == 21) { GR = G3 }
+    X<Int> = dalloc(S * K * 4) ; Y1<Int> = dalloc(S * N * 8) ; Y2<Int> = dalloc(S * N * 8) ; RS<Int> = dalloc(S * N * 8)
+    PB<Int> = dalloc(4096) ; OUT<Int> = dalloc(64)
+    put_i(PB, 0, X) ; put_i(PB, 8, S * K) ; put_i(PB, 16, 7) ; put_f(PB, 24, 1.0)
+    lk(hf, (S * K + 255) / 256, 256, PB)
+    NMT<Int> = (S + BMt - 1) / BMt
+    PG<Int> = PB + 256
+    put_i(PG, 0, WB) ; put_i(PG, 8, X) ; put_i(PG, 16, Y1) ; put_i(PG, 24, S) ; put_i(PG, 32, N) ; put_i(PG, 40, K)
+    put_i(PG, 48, N) ; put_i(PG, 56, 0) ; put_i(PG, 64, GR) ; put_i(PG, 72, NMT)
+    GG<Int> = NMT * ((N + 127) / 128)
+    dsync()
+    lk(hg, GG, 256, PG)
+    freedom {
+        rc<CInt> = cuCtxSynchronize()
+        if (rc != 0) { println("ERR gemm cuda " + (rc as Int).to_string()) ; return 30 }
+    }
+    m<Int> = 0
+    for (m in 0..S - 1) {
+        pv<Int> = PB + 512 + (m % 8) * 256
+        set_gemv(pv, WB, X + m * K * 4, Y2 + m * N * 8, N, K, 8, 0, GR)
+        lk(hv, vg, 512, pv)
+        if (m % 8 == 7) { dsync() }
+    }
+    dsync()
+    PC<Int> = PB + 3072
+    put_i(PC, 0, Y2) ; put_i(PC, 8, Y1) ; put_i(PC, 16, S * N) ; put_i(PC, 24, OUT)
+    lk(hc, 1, 256, PC)
+    dsync()
+    mx<Float> = 0.0 ; sa<Float> = 0.0 ; sd<Float> = 0.0
+    freedom {
+        cuMemcpyDtoH_v2(loc(mx), OUT, 8)
+        cuMemcpyDtoH_v2(loc(sa), OUT + 8, 8)
+        cuMemcpyDtoH_v2(loc(sd), OUT + 16, 8)
+    }
+    rel<Float> = 0.0
+    if (sa > 0.0) { rel = sqrt(sd / sa) }
+    println("CMP max_abs=" + mx.to_string() + " ref_rms=" + sqrt(sa / ((S * N) as Float)).to_string() + " rel_l2=" + rel.to_string())
+    // RS path: Y1 = Y2 + W x  -> Y1 - Y2 must equal the plain GEMM (checked via sum only)
+    t0<Int> = time_mono_millis()
+    r<Int> = 0
+    for (r in 0..REP - 1) { lk(hg, GG, 256, PG) }
+    dsync()
+    t1<Int> = time_mono_millis()
+    ms<Float> = ((t1 - t0) as Float) / (REP as Float)
+    fl<Float> = 2.0 * (S as Float) * (N as Float) * (K as Float)
+    println("TIME gemm_ms=" + ms.to_string() + " TFLOPS=" + (fl / (ms * 1000000000.0)).to_string() + " weight_GBps=" + ((NB as Float) / (ms * 1000000.0)).to_string())
+    t2<Int> = time_mono_millis()
+    for (r in 0..REP - 1) { lk(hv, vg, 512, PB + 512) }
+    dsync()
+    t3<Int> = time_mono_millis()
+    println("TIME gemv1_ms=" + (((t3 - t2) as Float) / (REP as Float)).to_string())
+    println("TEST_DONE")
+    return 0
+}

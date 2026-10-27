@@ -8,6 +8,13 @@
 VYBHOME ?= $(HOME)/Projects/Vyb
 VYBDIR  ?= $(VYBHOME)
 VYB     ?= $(VYBDIR)/build/vyb
+# VYB_BIN is the name the kernel build scripts read, but make itself only honours VYB/VYBHOME:
+# say so instead of silently building with a different compiler than the one asked for.
+ifneq ($(origin VYB_BIN),undefined)
+ifneq ($(VYB_BIN),$(VYB))
+$(warning VYB_BIN=$(VYB_BIN) is ignored here; set VYB= or VYBHOME= instead (using VYB=$(VYB)))
+endif
+endif
 ROOT    := $(shell git -C "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))/.." rev-parse --show-toplevel 2>/dev/null || echo "$(abspath $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/..)")
 KSRC    := $(ROOT)/native/kernels/%.vyb
 KPTX    := $(ROOT)/native/build/%.ptx
@@ -22,10 +29,10 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 # state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
 # unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
 # an explicit `make q8_0` but a fresh `make verify` did not build it.
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode clean
+.PHONY: ridge-tensors ridge-tensors-check all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
 
 all: verify
 
@@ -329,9 +336,13 @@ kvresp-train-kv: $(ROOT)/native/build/train.ptx
 	cd $(ROOT) && $(VYB) native/train/kvresp_train_kv.vyb
 	cd $(ROOT) && .venv/bin/python native/train/verify_kvresp_train.py
 
-decode: $(ROOT)/native/build/layer.ptx
+# decode_driver.vyb is the real Qwen3-4B greedy decode now (the toy wte/lmh fixture
+# verify_decode.py expected is gone), so decode and verify check its token stream against
+# decode_ref.py's (generated once, ~90 s/step; `make decode-real` regenerates it).
+decode: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && test -f native/out/decode_ids_ref.txt || .venv/bin/python native/gguf/decode_ref.py
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
-	cd $(ROOT) && python3 native/tools/verify_decode.py
+	cd $(ROOT) && python3 native/tools/verify_decode_real.py
 
 # Real Qwen3-4B greedy decode: token stream == numpy decode_ref.py (decode_ids_ref.txt)
 decode-real: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
@@ -396,8 +407,9 @@ verify: $(PTX) $(ROOT)/native/gguf/test.gguf
 	@echo "== TENSOR:: WRAPPER (gemm + rmsnorm via module + cuLaunchKernel) =="
 	cd $(ROOT) && $(VYB) native/tensor/test_tensor.vyb --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda
 	@echo "== GREEDY AUTOREGRESSIVE DECODE (numpy reference) =="
+	cd $(ROOT) && test -f native/out/decode_ids_ref.txt || .venv/bin/python native/gguf/decode_ref.py
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) native/host/decode_driver.vyb --module-path native/llm
-	cd $(ROOT) && python3 native/tools/verify_decode.py
+	cd $(ROOT) && python3 native/tools/verify_decode_real.py
 	@echo "== STOCHASTIC SAMPLER (temp + top_k + top_p + LCG) =="
 	cd $(ROOT) && $(VYB) native/sampler/test_sampler.vyb --module-path native/sampler
 	cd $(ROOT) && python3 native/sampler/verify_sampler.py
@@ -413,6 +425,10 @@ verify: $(PTX) $(ROOT)/native/gguf/test.gguf
 	@echo "== G-DECODE: agent-response CONTRACT EMISSION (jsonschema) =="
 	cd $(ROOT) && $(VYB) native/gdecode/test_contract.vyb --module-path native/gdecode
 	cd $(ROOT) && python3 native/gdecode/verify_contract.py
+
+# All PTX the 27B Ridge decoder loads (per-kernel --kernel-shared sizes live in the script).
+ridge-kernels:
+	VYB_BIN=$(VYB) VYB_STDLIB=$(VYBDIR)/stdlib $(ROOT)/native/tools/build_ridge_kernels.sh
 
 clean:
 	rm -rf $(ROOT)/native/build $(ROOT)/native/out
@@ -502,7 +518,14 @@ chat-gen: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/na
 # averaged -> tokens/sec once the model is resident. No re-load per interaction.
 CHAT_GEN ?= 3
 RESIDENT_RUNS ?= 3
+# The gold in verify_resident_bench.py is for this prompt, so the ids are re-encoded HERE every run (same
+# encode probe -> emit_prompt_ids.py path as chat-prompt). resident-bench used to read whatever
+# native/out/prompt_ids.txt held; a stale 16-id file ("Add a package to a QEMU x86_64 boot test.") left by
+# an older checkout made the gate FAIL on a correct build (2026-10-26).
+RESIDENT_PROMPT := The capital of France is
 resident-bench: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(RESIDENT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(RESIDENT_PROMPT)"
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) VYB_RUNS=$(RESIDENT_RUNS) $(VYB) native/host/resident_driver.vyb --module-path native/llm 2>&1 | tee native/out/resident_bench.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_resident_bench.py
 
@@ -518,6 +541,19 @@ RIDGE_GGUF ?= $(HOME)/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf
 ridge-inventory:
 	cd $(ROOT) && .venv/bin/python native/gguf/ridge_inventory.py "$(RIDGE_GGUF)" \
 	  --tsv native/gguf/ridge-3.7bpw-inventory.tsv --meta native/out/ridge_meta.txt
+
+# The engine's tensor index (name, dims, type, absolute offset) for ridge_decode.vyb, projected from the
+# tracked inventory; native/out/ is not tracked, so a fresh checkout (e.g. a Spark) needs this once.
+# ridge-tensors-check: ridge_decode.vyb must refuse a missing index with a named ERR, not "alloc region".
+ridge-tensors:
+	cd $(ROOT) && env -u PYTHONPATH python3 native/tools/inventory_to_tsv.py \
+	  --inventory native/gguf/ridge-3.7bpw-inventory.tsv --out native/out/ridge_tensors.tsv
+
+ridge-tensors-check:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_TSV=/nonexistent/ridge_tensors.tsv VYB_GEN=1 $(VYB) native/host/ridge_decode.vyb \
+	  --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype \
+	  --module-path native/llm 2>&1 | grep -q "ERR tensor index /nonexistent/ridge_tensors.tsv is missing or empty" \
+	  && echo "ridge-tensors-check: ok" || { echo "ridge-tensors-check: FAIL"; exit 1; }
 
 # ── S0.2e capability / layer descriptor gate (VybForge#10 phase 2) ───────────────
 # model_caps.vyb answers "what does this model REQUIRE of the engine" (layer kinds and their

@@ -1,0 +1,1577 @@
+// Ridge (qwen35 27B) RESIDENT greedy decode, Vyb-native: GDN + gated attention + IQ2_S/IQ3_S FFN.
+// The GGUF's tensor region is uploaded ONCE, packed, into one device buffer (12.6 GB); every
+// projection is a fused dequant GEMV that reads the packed bytes in place (qwen3.vyb gemv_q4k /
+// gemv_q6k, rgemv.vyb gemv_q5k / gemv_q8_0 / gemv_iq2s / gemv_iq3s). Activations stay f64 as in
+// the verified prefill driver (model_driver.vyb); GEMV inputs are f32 copies (rms_blk's Y32 /
+// cast32 / silu32) and outputs f64. KV cache f64 [MAXS, NKV] per attention layer, delta-net
+// state f64 [Hv, S, S] per GDN layer updated in place (delta_step_b), conv window per GDN layer.
+// The prompt is fed token by token through the same decode step (no batched prefill yet).
+// Env: VYB_MODEL, VYB_TSV, VYB_INVFREQ, VYB_LLM_DIR, VYB_PROMPT, VYB_PROMPT_IDS, VYB_GEN (16),
+//      VYB_MAXS (2048).
+import io::{open_read, read_at, read_all, close}
+import llm::{llm_load, llm_decode, llm_encode}
+import vllm::{Model, build_revvocab_from, lead_width, glyph2byte}
+import collections
+import env::{env_get}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuDeviceGetAttribute(pi<loc<CInt>>, attrib<CInt>, dev<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
+    cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuMemAllocHost_v2(pp<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemFreeHost(p<Int>)<CInt>
+    cuMemcpy(dst<Int>, src<Int>, ByteCount<Int>)<CInt>
+    cuMemcpyAsync(dst<Int>, src<Int>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuLaunchKernel(f<Int>, gx<CUInt>, gy<CUInt>, gz<CUInt>, bx<CUInt>, by<CUInt>, bz<CUInt>,
+                   shm<CUInt>, st<Int>, kp<Int>, ex<Int>)<CInt>
+    cuStreamCreate(ph<loc<Int>>, flags<CUInt>)<CInt>
+    cuStreamBeginCapture_v2(st<Int>, mode<CInt>)<CInt>
+    cuStreamEndCapture(st<Int>, pg<loc<Int>>)<CInt>
+    cuGraphInstantiateWithFlags(pe<loc<Int>>, g<Int>, flags<Int>)<CInt>
+    cuGraphLaunch(e<Int>, st<Int>)<CInt>
+    cuGraphDestroy(g<Int>)<CInt>
+    cuGraphExecDestroy(e<Int>)<CInt>
+    pread(fd<CInt>, buf<Int>, n<Int>, off<Int>)<Int>
+    creat(path<CString>, mode<CInt>)<CInt>
+    write(fd<CInt>, buf<Int>, n<Int>)<Int>
+    cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+strchr(s<String>, nd<Int>, st<Int>)<Int> -> {
+    i<Int> = st
+    for (i in st..s.len() - 1) {
+        if ((s.char_at(i) as Int) == nd) { return i }
+    }
+    return -1
+}
+parse_u(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    a<Int> = 0
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) { a = a * 10 + (c - 48) }
+        }
+    }
+    return a
+}
+parse_ids(s<String>)<Vec<Int>> -> {
+    v<Vec<Int>> = Vec()
+    n<Int> = s.len()
+    cur<Int> = -1
+    i<Int> = 0
+    for (i in 0..n - 1) {
+        c<Int> = (s.char_at(i) as Int)
+        if (c >= 48) {
+            if (c <= 57) {
+                if (cur < 0) { cur = 0 }
+                cur = cur * 10 + (c - 48)
+            }
+        } else {
+            if (cur >= 0) { v.push(cur) ; cur = -1 }
+        }
+    }
+    if (cur >= 0) { v.push(cur) }
+    return v
+}
+parse_numel(s<String>, frm<Int>, endp<Int>)<Int> -> {
+    n<Int> = 1
+    seg<Int> = frm
+    i<Int> = frm
+    for (i in frm..endp - 1) {
+        if ((s.char_at(i) as Int) == 120) {
+            n = n * parse_u(s, seg, i)
+            seg = i + 1
+        }
+    }
+    n = n * parse_u(s, seg, endp)
+    return n
+}
+packed_bytes(numel<Int>, ty<Int>)<Int> -> {
+    if (ty == 12) { return numel * 144 / 256 }
+    if (ty == 13) { return numel * 176 / 256 }
+    if (ty == 14) { return numel * 210 / 256 }
+    if (ty == 22) { return numel * 82 / 256 }
+    if (ty == 21) { return numel * 110 / 256 }
+    if (ty == 8) { return numel * 34 / 32 }
+    return numel * 4
+}
+find_nm(nmv<Vec<String>>, nm<String>)<Int> -> {
+    i<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (nmv.get(i) == nm) { return i }
+    }
+    return -1
+}
+read_model(path<String>, off<Int>, nbytes<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, nbytes)) { s -> { r = s } ? -> { r = "" } }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) { s -> { r = s } ? -> { println("WARN read_bin: read failed: " + path) ; r = "" } }
+            close(f)
+        }
+        ? -> { println("WARN read_bin: cannot open " + path) ; r = "" }
+    }
+    if (r.len() == 0) { println("WARN read_bin: empty file " + path) }
+    return r
+}
+download(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoDAsync_v2(dst, data, nbytes, 0) != 0) { return 15 }
+        cuCtxSynchronize()
+        return 0
+    }
+    return 0
+}
+// launch-state globals: see lk()
+LKC<Int> = 0
+LST<Int> = 0
+LSKIP<Int> = 0
+LDBG<Int> = 0
+dalloc(n<Int>)<Int> -> {
+    dp<Int> = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(dp), n) != 0) { return 0 }
+        cuMemsetD8_v2(dp, 0, n)
+    }
+    return dp
+}
+dsync() -> {
+    freedom { cuCtxSynchronize() }
+}
+put_i(PD<Int>, off<Int>, v<Int>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+// stream-ordered 8-byte param write: v goes into pinned slot PS, then an async copy on stream 0.
+// No host stall (cuMemcpyHtoD from pageable memory drains the stream). The caller must not reuse
+// PS until the copy has run (the decode step syncs before the next token's writes).
+put_ia(PD<Int>, off<Int>, v<Int>, PS<Int>) -> {
+    freedom {
+        at(from<loc<Int>>(PS)) = v
+        if (LSKIP == 0) { cuMemcpyAsync(PD + off, PS, 8, LST) }
+    }
+}
+put_f(PD<Int>, off<Int>, v<Float>) -> {
+    freedom { cuMemcpyHtoD_v2(PD + off, loc(v), 8) }
+}
+load_mod(path<String>)<Int> -> {
+    img<String> = read_bin(path)
+    if (img.len() < 16) { return 0 }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), img) != 0) { return 0 }
+        return addr(m)
+    }
+    return 0
+}
+get_fn(mi<Int>, nm<String>)<Int> -> {
+    freedom {
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), from<loc<CVoid>>(mi), nm) != 0) { println("NO_KERNEL " + nm); return 0 }
+        return addr(f)
+    }
+    return 0
+}
+// Launch state (module globals). LKC: pinned 64-byte block, 4 arg cells + the kernelParams array
+// pointing at them, so lk/lk4 call cuLaunchKernel directly (no C shim) on stream LST. LSKIP=1
+// while a captured decode graph is being replayed: the host walk still runs (param slots), launches don't.
+lk(h<Int>, gx<Int>, bx<Int>, p<Int>)<Int> -> {
+    if (LSKIP == 1) { return 0 }
+    if (LKC != 0) {
+        freedom {
+            at(from<loc<Int>>(LKC)) = p
+            at(from<loc<Int>>(LKC + 8)) = 0
+            at(from<loc<Int>>(LKC + 16)) = 0
+            at(from<loc<Int>>(LKC + 24)) = 0
+            if (cuLaunchKernel(h, gx, 1, 1, bx, 1, 1, 0, LST, LKC + 32, 0) != 0) { return 1 }
+        }
+    } else {
+        freedom {
+            if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, p, 0, 0, 0) != 0) { return 1 }
+        }
+    }
+    if (LDBG == 1) {
+        t0<Int> = time_mono_millis()
+        freedom {
+            rc<CInt> = cuCtxSynchronize()
+            println("DBG h=" + h.to_string() + " p=" + p.to_string() + " grid=" + gx.to_string() + " rc=" + (rc as Int).to_string() + " ms=" + (time_mono_millis() - t0).to_string())
+        }
+    }
+    return 0
+}
+lk4(h<Int>, gx<Int>, bx<Int>, a0<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    if (LSKIP == 1) { return 0 }
+    if (LKC != 0) {
+        freedom {
+            at(from<loc<Int>>(LKC)) = a0
+            at(from<loc<Int>>(LKC + 8)) = a1
+            at(from<loc<Int>>(LKC + 16)) = a2
+            at(from<loc<Int>>(LKC + 24)) = a3
+            if (cuLaunchKernel(h, gx, 1, 1, bx, 1, 1, 0, LST, LKC + 32, 0) != 0) { return 1 }
+        }
+        return 0
+    }
+    freedom {
+        if (cuda_launch4i(from<loc<CVoid>>(h), gx, 1, 1, bx, 1, 1, a0, a1, a2, a3) != 0) { return 1 }
+        return 0
+    }
+    return 0
+}
+is_iq(ty<Int>)<Int> -> {
+    if (ty == 21) { return 1 }
+    if (ty == 22) { return 1 }
+    return 0
+}
+// VYB_RGQ8: does a tensor of type ty read q8_1 activations (IQ2_S always, IQ3_S only with VYB_RGQ8_IQ3)?
+uses_q8(ty<Int>, q3<Int>)<Int> -> {
+    if (ty == 22) { return 1 }
+    if (ty == 21 && q3 == 1) { return 1 }
+    return 0
+}
+// does it read the xperm6-permuted f32 copy (an IQ type not on the q8_1 path)?
+perm_x(ty<Int>, q8<Int>, q3<Int>)<Int> -> {
+    if (is_iq(ty) == 0) { return 0 }
+    if (q8 == 1 && uses_q8(ty, q3) == 1) { return 0 }
+    return 1
+}
+// one GEMV param block (gemv_q4k layout + GRID@128), single segment
+set_gemv(pb<Int>, W<Int>, X<Int>, Y<Int>, N<Int>, K<Int>, YE<Int>, RS<Int>, G<Int>) -> {
+    put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, 1)
+    put_i(pb, 32, N) ; put_i(pb, 40, K) ; put_i(pb, 48, YE)
+    put_i(pb, 56, 0) ; put_i(pb, 64, 0) ; put_i(pb, 72, 0) ; put_i(pb, 80, 8)
+    put_i(pb, 88, 0) ; put_i(pb, 96, 0) ; put_i(pb, 104, 0) ; put_i(pb, 112, 8)
+    put_i(pb, 120, RS) ; put_i(pb, 128, G)
+}
+// one batched-prefill GEMM param block (gen_rpf.py layout): Y[s, n] (+= RS) = sum_k W[n, k] X[s, k]
+set_gemm(pb<Int>, W<Int>, X<Int>, Y<Int>, S<Int>, N<Int>, K<Int>, LDY<Int>, RS<Int>, G<Int>, BM<Int>) -> {
+    put_i(pb, 0, W) ; put_i(pb, 8, X) ; put_i(pb, 16, Y) ; put_i(pb, 24, S) ; put_i(pb, 32, N)
+    put_i(pb, 40, K) ; put_i(pb, 48, LDY) ; put_i(pb, 56, RS) ; put_i(pb, 64, G) ; put_i(pb, 72, (S + BM - 1) / BM)
+}
+gemm_grid(S<Int>, N<Int>, BM<Int>)<Int> -> {
+    return ((S + BM - 1) / BM) * ((N + 127) / 128)
+}
+// token-tile height of the prefill GEMM for a weight type: the dequant-heavy q6k / iq2s / iq3s use
+// the 128-token tile (rpf_gemm128) when BIG == 128, the cheap-dequant types the 64-token one
+bm_of(ty<Int>, BIG<Int>)<Int> -> {
+    if (ty == 14 || ty == 21 || ty == 22) { return BIG }
+    return 64
+}
+// f16 activation buffer for the 128-token GEMMs under VYB_PFXH (x16 == x32 otherwise)
+q4x(f<Int>, a<Int>, b<Int>)<Int> -> {
+    if (f == 1) { return b }
+    return a
+}
+
+xsel(bm<Int>, x32<Int>, x16<Int>)<Int> -> {
+    if (bm == 128) { return x16 }
+    return x32
+}
+gemm_h(ty<Int>, g4<Int>, g6<Int>, g5<Int>, g8<Int>, gi2<Int>, gi3<Int>)<Int> -> {
+    if (ty == 12) { return g4 }
+    if (ty == 14) { return g6 }
+    if (ty == 13) { return g5 }
+    if (ty == 8) { return g8 }
+    if (ty == 22) { return gi2 }
+    if (ty == 21) { return gi3 }
+    return 0
+}
+// kernel handle / grid for a weight type (packed GEMV): q4k/q6k take 2 rows per warp
+gemv_h(ty<Int>, hq4<Int>, hq6<Int>, hq5<Int>, hq8<Int>, hi2<Int>, hi3<Int>)<Int> -> {
+    if (ty == 12) { return hq4 }
+    if (ty == 14) { return hq6 }
+    if (ty == 13) { return hq5 }
+    if (ty == 8) { return hq8 }
+    if (ty == 22) { return hi2 }
+    if (ty == 21) { return hi3 }
+    return 0
+}
+// threads per block of the packed GEMV for a weight type (IQ: VYB_RGTPB, default 512)
+gemv_t(ty<Int>, ith<Int>)<Int> -> {
+    if (ty == 21 || ty == 22) { return ith }
+    return 512
+}
+// rk2 = IQ rows per block (0 = old rgemv path), q4g = Q4_K rows per block
+gemv_g(ty<Int>, N<Int>, rk2<Int>, q4g<Int>, q6g<Int>)<Int> -> {
+    if (ty == 12) { return (N + q4g - 1) / q4g }
+    if (ty == 14) { return (N + q6g - 1) / q6g }
+    if (rk2 >= 1) {
+        if (ty == 22) { return (N + rk2 - 1) / rk2 }
+        if (ty == 21) { return (N + rk2 - 1) / rk2 }
+    }
+    return (N + 15) / 16
+}
+grid_of(ty<Int>, g2<Int>, g3<Int>)<Int> -> {
+    if (ty == 22) { return g2 }
+    if (ty == 21) { return g3 }
+    return 0
+}
+
+// ---- chat mode (VYB_CHAT=1) ----
+// enc_ids: " id id ..." for a text segment (empty for "").
+enc_ids(tok<Model>, s<String>)<String> -> {
+    out<String> = ""
+    if (s.len() == 0) { return out }
+    e<Vec<Int>> = llm_encode(tok, s)
+    j<Int> = 0
+    for (j in 0..e.len() - 1) { out = out + " " + e.get(j).to_string() }
+    return out
+}
+// Qwen3.x ChatML prompt (GGUF tokenizer.chat_template): optional VYB_CHAT_SYS, VYB_CHAT_N prior turns
+// (VYB_CHAT_U<i> / VYB_CHAT_A<i>), then msg and the generation prompt. Thinking off unless VYB_THINK=1.
+// Special ids from the Ridge GGUF vocab: 248045 <|im_start|>, 248046 <|im_end|>, 248068 <think>, 248069 </think>.
+chat_ids(tok<Model>, msg<String>)<String> -> {
+    S<String> = " 248045"
+    E<String> = " 248046"
+    NL<String> = enc_ids(tok, "\n")
+    r<String> = ""
+    sys<String> = env_get("VYB_CHAT_SYS") else ""
+    if (sys.len() > 0) { r = r + S + enc_ids(tok, "system\n" + sys) + E + NL }
+    ns<String> = env_get("VYB_CHAT_N") else "0"
+    n<Int> = parse_u(ns, 0, ns.len())
+    i<Int> = 0
+    if (n > 0) {
+        for (i in 0..n - 1) {
+            u<String> = env_get("VYB_CHAT_U" + i.to_string()) else ""
+            a<String> = env_get("VYB_CHAT_A" + i.to_string()) else ""
+            r = r + S + enc_ids(tok, "user\n" + u) + E + NL
+            r = r + S + enc_ids(tok, "assistant\n" + a) + E + NL
+        }
+    }
+    r = r + S + enc_ids(tok, "user\n" + msg) + E + NL
+    r = r + S + enc_ids(tok, "assistant\n") + " 248068"
+    if ((env_get("VYB_THINK") else "") == "1") { r = r + NL } else { r = r + enc_ids(tok, "\n\n") + " 248069" + enc_ids(tok, "\n\n") }
+    return r
+}
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "/home/rick"
+    MODEL<String> = env_get("VYB_MODEL") else hm + "/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf"
+    TSV<String> = env_get("VYB_TSV") else "native/out/ridge_tensors.tsv"
+    FIP<String> = env_get("VYB_INVFREQ") else "native/out/ridge_invfreq.bin"
+    TOKDIR<String> = env_get("VYB_LLM_DIR") else "artifacts/ridge-tokenizer"
+    GEN<Int> = parse_u(env_get("VYB_GEN") else "16", 0, (env_get("VYB_GEN") else "16").len())
+    MAXS<Int> = parse_u(env_get("VYB_MAXS") else "2048", 0, (env_get("VYB_MAXS") else "2048").len())
+    D<Int> = 5120 ; H<Int> = 24 ; KVH<Int> = 4 ; HD<Int> = 256 ; FF<Int> = 17408
+    NQ<Int> = 6144 ; NKV<Int> = 1024 ; VOCAB<Int> = 248320 ; NL<Int> = 64
+    EPS<Float> = 0.000001
+    SS<Int> = 128 ; HK<Int> = 16 ; HV<Int> = 48 ; DC<Int> = 4 ; QKV<Int> = 10240 ; GKEY<Int> = 2048 ; VAL<Int> = 6144
+
+    tok<Model> = llm_load("qwen3", TOKDIR)
+    prids<Vec<Int>> = Vec()
+    pids<String> = env_get("VYB_PROMPT_IDS") else ""
+    pstr<String> = env_get("VYB_PROMPT") else "The capital of France is"
+    CHAT<Int> = 0
+    if ((env_get("VYB_CHAT") else "") == "1") { CHAT = 1 }
+    // VYB_STREAM=1 (default in chat mode): print each generated token's text as it lands, stop at <|im_end|>
+    // / <|endoftext|>; text sits between STREAM_BEGIN and STREAM_END lines.
+    STRM<Int> = CHAT
+    if ((env_get("VYB_STREAM") else "") == "1") { STRM = 1 }
+    if ((env_get("VYB_STREAM") else "") == "0") { STRM = 0 }
+    STOPD<Int> = 0
+    // reverse vocab built ONCE (llm_decode rebuilds it from vocab.json per call, ~2 s)
+    rvm<HashMap<Int, String>> = HashMap<Int, String>()
+    if (STRM == 1) { rvm = build_revvocab_from(TOKDIR) }
+    if (pids.len() > 0) { prids = parse_ids(pids) } else {
+        if (CHAT == 1) { prids = parse_ids(chat_ids(tok, pstr)) } else { prids = llm_encode(tok, pstr) }
+    }
+    NP<Int> = prids.len()
+    pl<String> = ""
+    pi<Int> = 0
+    for (pi in 0..NP - 1) { pl = pl + " " + prids.get(pi).to_string() }
+    println("PROMPT_SRC=<" + pstr + "> PROMPT_N=" + NP.to_string() + " PROMPT_IDS=" + pl)
+    if (NP + GEN > MAXS) { println("ERR prompt+gen exceeds VYB_MAXS"); return 2 }
+
+    // ---- tensor index ----
+    nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
+    bff<String> = read_bin(TSV)
+    ln<Int> = bff.len(); st<Int> = 0; i<Int> = 0
+    for (i in 0..ln - 1) {
+        if ((bff.char_at(i) as Int) == 10) {
+            t1<Int> = strchr(bff, 9, st)
+            if (t1 >= st) {
+                t2<Int> = strchr(bff, 9, t1 + 1)
+                t3<Int> = strchr(bff, 9, t2 + 1)
+                t4<Int> = strchr(bff, 9, t3 + 1)
+                if (t4 < 0) { t4 = i }
+                nmv.push(bff.substring(st, t1))
+                tyv.push(parse_u(bff, t2 + 1, t3))
+                nlv.push(parse_numel(bff, t1 + 1, t2))
+                ofv.push(parse_u(bff, t3 + 1, t4))
+            }
+            st = i + 1
+        }
+    }
+    // A missing or empty tensor index used to surface much later as "ERR alloc region" (RBYTES = 0).
+    if (nmv.len() == 0) {
+        println("ERR tensor index " + TSV + " is missing or empty: generate it with `make -f native/Makefile ridge-tensors` (or set VYB_TSV)")
+        return 21
+    }
+    RLO<Int> = ofv.get(0) ; RHI<Int> = 0
+    for (i in 0..nmv.len() - 1) {
+        if (ofv.get(i) < RLO) { RLO = ofv.get(i) }
+        en<Int> = ofv.get(i) + packed_bytes(nlv.get(i), tyv.get(i))
+        if (en > RHI) { RHI = en }
+    }
+    RBYTES<Int> = RHI - RLO
+    println("TSV tensors=" + nmv.len().to_string() + " region=[" + RLO.to_string() + "," + RHI.to_string() + ") bytes=" + RBYTES.to_string())
+
+    CCMAJ<Int> = 0
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        var<CInt> ccmaj = 0
+        cuDeviceGetAttribute(loc(ccmaj), 75, dev)
+        CCMAJ = (ccmaj as Int)
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+    mlay<Int> = load_mod("native/build/layer.ptx")
+    mq3<Int> = load_mod("native/build/qwen3.ptx")
+    mgd<Int> = load_mod("native/build/gdn.ptx")
+    mrp<Int> = load_mod("native/build/rope.ptx")
+    ma35<Int> = load_mod("native/build/attn35.ptx")
+    mq6<Int> = load_mod("native/build/q6k.ptx")
+    mrg<Int> = load_mod("native/build/rgemv.ptx")
+    mr2<Int> = load_mod("native/build/rgemv2.ptx")
+    // VYB_RK1=1: first-generation kernels (1 row/warp grid GEMVs, gdn.vyb l2norm/norm_gated, delta_step_b)
+    RK2<Int> = 1
+    if ((env_get("VYB_RK1") else "").len() > 0) { RK2 = 0 }
+    if (mr2 == 0 || mlay == 0 || mq3 == 0 || mgd == 0 || mrp == 0 || ma35 == 0 || mq6 == 0 || mrg == 0) { println("MODLOAD_FAIL"); return 10 }
+    hrms<Int> = get_fn(mlay, "rms_blk") ; hrmsg<Int> = get_fn(mlay, "rms_blkg")
+    // VYB_RMSG (default 1): decode hidden-size norms on 5 blocks (rms_blkg, bit-identical)
+    RMSG<Int> = 1
+    if ((env_get("VYB_RMSG") else "1") == "0") { RMSG = 0 }
+    if (RMSG == 0) { hrmsg = hrms }
+    RMSGB<Int> = 5
+    if (RMSG == 0) { RMSGB = 1 }
+    // VYB_RMSQ8 (default 1; needs VYB_RMSG): the decode attn_norm rms_blkg also writes the q8_1 copy
+    // (p + 56) for the Q4Q8 / Q5Q8 GEMVs, replacing the xq8 launch after it (64/step). Bit-identical.
+    RMQ8<Int> = 1
+    if ((env_get("VYB_RMSQ8") else "1") == "0" || RMSG == 0) { RMQ8 = 0 }
+    hasc<Int> = get_fn(mlay, "attn_sc") ; hacx<Int> = get_fn(mlay, "attn_cx")
+    // decode attention context: softmax once per head row (rattn.vyb), bit-identical to attn_cx. VYB_ACX=0 off.
+    ACX<Int> = 1
+    if ((env_get("VYB_ACX") else "") == "0") { ACX = 0 }
+    mrax<Int> = load_mod("native/build/rattn.ptx")
+    if (mrax == 0) { println("ERR load rattn") ; return 1 }
+    hrxm<Int> = get_fn(mrax, "rax_mx") ; hrxe<Int> = get_fn(mrax, "rax_e") ; hrxs<Int> = get_fn(mrax, "rax_sum") ; hrxc<Int> = get_fn(mrax, "rax_cx") ; hrxw<Int> = get_fn(mrax, "rax_w") ; hrm2<Int> = get_fn(mrax, "rax_mx2") ; hrs8<Int> = get_fn(mrax, "rax_sum8") ; hrcw<Int> = get_fn(mrax, "rax_cw")
+    RXM<Int> = dalloc(4096)
+    hs32<Int> = get_fn(mlay, "silu32") ; hsq<Int> = get_fn(mlay, "silu32q") ; hc32<Int> = get_fn(mlay, "cast32")
+    hq4<Int> = get_fn(mq3, "gemv_q4k") ; hq6<Int> = get_fn(mq3, "gemv_q6k")
+    hamp<Int> = get_fn(mq3, "argmax1_p") ; hamr<Int> = get_fn(mq3, "argmax1_r") ; hexp<Int> = get_fn(mq3, "f32expand")
+    hl2<Int> = get_fn(mgd, "l2norm") ; hng<Int> = get_fn(mgd, "norm_gated") ; hsg<Int> = get_fn(mgd, "sigmoid_k")
+    hag<Int> = get_fn(mgd, "alpha_gate") ; hsv<Int> = get_fn(mgd, "silu_k") ; hcv<Int> = get_fn(mgd, "conv1d_k")
+    hil<Int> = get_fn(mgd, "interleave_qkv") ; hsh<Int> = get_fn(mgd, "conv_shift")
+    // VYB_GDNF (default 1): decode GDN launch fusion, sigmoid_k + alpha_gate -> sg_ag and conv_shift +
+    // interleave_qkv + conv1d_k + silu_k -> conv_step (gdn.vyb). Bit-identical; 4 fewer launches per GDN layer.
+    hsga<Int> = get_fn(mgd, "sg_ag") ; hcst<Int> = get_fn(mgd, "conv_step")
+    GDNF<Int> = 1
+    if ((env_get("VYB_GDNF") else "1") == "0" || hsga == 0 || hcst == 0) { GDNF = 0 }
+    if (GDNF == 1) { println("GDN_FUSE sg_ag+conv_step (decode)") }
+    hrope<Int> = get_fn(mrp, "rope_nrot") ; hqgs<Int> = get_fn(ma35, "qg_split") ; hgm<Int> = get_fn(ma35, "gate_mul")
+    hq6d<Int> = get_fn(mq6, "q6kdeq")
+    hq6x<Int> = get_fn(mq6, "q6kdeq_ix")
+    hq5<Int> = get_fn(mrg, "gemv_q5k") ; hq8<Int> = get_fn(mrg, "gemv_q8_0") ; hi2<Int> = get_fn(mrg, "gemv_iq2s")
+    hi3<Int> = get_fn(mrg, "gemv_iq3s") ; hds<Int> = get_fn(mrg, "delta_step_b")
+    hl2b<Int> = get_fn(mr2, "l2norm_b") ; hngb<Int> = get_fn(mr2, "norm_gated_b") ; hdsc<Int> = get_fn(mr2, "delta_step_c")
+    // VYB_XPERM=1 (with an xperm-capable VYB_RGPTX, gen_rgemv2.py ... 1 1): IQ GEMVs read a permuted
+    // copy of x so every x load is a coalesced 128 B line.
+    XPM<Int> = 0
+    RQ8<Int> = 0 ; RQ83<Int> = 0 ; hxq<Int> = 0
+    hxp<Int> = 0
+    ITH<Int> = 512
+    IRB<Int> = 16 * RK2
+    FUS<Int> = 0
+    hi2f<Int> = 0
+    hi3f<Int> = 0
+    if (RK2 == 1) {
+        // IQ GEMV variant: VYB_RGPTX (a gen_rgemv2.py / gen_rgemv5.py output) with VYB_RGR rows per warp;
+        // default rgemv5 (gen_rgemv5.py 1 rgemv5.vyb 1 1 0 2: 1 row/warp, vector x loads, grid in shared
+        // memory, 2-deep super-block prefetch, shuffle reduction; bit-identical to rgemv4, ~1.4x faster).
+        // VYB_RGPTX=native/build/rgemv4.ptx VYB_RGR=4 = older default.
+        // Default now rgemv8 (gen_rgemv8.py rgemv8.vyb 4 1 4): same lane map/arithmetic as rgemv5 (bit-identical)
+        // but the IQ2_S row is streamed as coalesced u32 loads (4 super-blocks per chunk, 2 chunks in flight)
+        // and bytes are pulled out with shfl_idx_u32: IQ2_S 162 vs 187, IQ3_S 193 vs 229 us/call. VYB_RGPTX=native/build/rgemv5.ptx = previous.
+        rgp<String> = env_get("VYB_RGPTX") else "native/build/rgemv8.ptx"
+        rgr<String> = env_get("VYB_RGR") else "1"
+        RK2 = parse_u(rgr, 0, rgr.len())
+        mr4<Int> = load_mod(rgp)
+        if (mr4 == 0) { println("ERR load " + rgp) ; return 1 }
+        hi2 = get_fn(mr4, "gemv_iq2s_r")
+        hi3 = get_fn(mr4, "gemv_iq3s_r")
+        if ((env_get("VYB_XPERM") else "").len() > 0) {
+            XPM = 1
+            hxp = get_fn(mr4, "xperm")
+        }
+        // VYB_RGTPB: IQ GEMV threads per block (must match the ptx: gen_rgemv5.py ... TPB)
+        rgt<String> = env_get("VYB_RGTPB") else "512"
+        ITH = parse_u(rgt, 0, rgt.len())
+        IRB = RK2 * (ITH / 32)
+        // VYB_RGFUSE=1: ffn gate+up in one launch (gemv_iq2s_f / gemv_iq3s_f, gen_rgemv5.py ... FUSE=1)
+        // when both are the same IQ type; per-row arithmetic unchanged, so bit-identical
+        if ((env_get("VYB_RGFUSE") else "").len() > 0) {
+            hi2f = get_fn(mr4, "gemv_iq2s_f")
+            hi3f = get_fn(mr4, "gemv_iq3s_f")
+            if (hi2f != 0 && hi3f != 0) { FUS = 1 }
+        }
+        // VYB_RGMAP=1: llama.cpp-style lane map (gen_rgemv6.py: one ib32 per lane, 4 super-blocks per warp
+        // trip, 16-bit raw loads). NOT bit-identical to the default; validated by greedy match + KLD.
+        // Opt-in (VYB_RGMAP=1 [+VYB_RGQ8=1]). Measured 2026-10-26 after rgemv8/rq6k8: RGMAP+RGQ8 tg128 13.40 vs
+        // exact rgemv8 default 13.44, so the lossy map buys nothing now and stays off; VYB_EXACT=1 forces it off.
+        // 2026-10-26 RTX 3090 (sm_86, 936 GB/s): the exact rgemv8 IQ2_S kernel is ALU/latency-bound there
+        // (~244 GB/s); RGMAP+RGQ8(+IQ3 dp4a) gives tg128 26.9 vs 20.8, KLD 0.00380, ppl 3.2404 -> default on
+        // CC major 8 (Ampere). GB10 (CC 12) keeps the exact map. VYB_EXACT=1 still forces all off.
+        dfrg<String> = "0"
+        if (CCMAJ == 8) { dfrg = "1" }
+        if ((env_get("VYB_EXACT") else "") == "1") { dfrg = "0" }
+        if ((env_get("VYB_RGMAP") else dfrg) == "1") {
+            m6<Int> = load_mod(env_get("VYB_RG6PTX") else "native/build/rgemv6.ptx")
+            if (m6 == 0) { println("ERR load rgemv6") ; return 1 }
+            hi2 = get_fn(m6, "gemv_iq2s_m")
+            hi3 = get_fn(m6, "gemv_iq3s_m")
+            rg6t<String> = env_get("VYB_RG6TPB") else "512"
+            ITH = parse_u(rg6t, 0, rg6t.len())
+            RK2 = 1
+            rg6w<String> = env_get("VYB_RG6WPR") else "1"
+            IRB = ITH / 32 / parse_u(rg6w, 0, rg6w.len())
+            FUS = 0
+            rgp = "rgemv6(map)"
+            if ((env_get("VYB_RG6PERM") else "1") == "1") {
+                hxp = get_fn(m6, "xperm6")
+                if (hxp != 0) { XPM = 1 ; rgp = "rgemv6(map,perm)" }
+            }
+            // VYB_RGQ8=1: q8_1 activations + dp4a (gen_rgemv7.py) for IQ2_S; IQ3_S stays on rgemv6 (its
+            // dp4a variant is slower, 243 vs 227 us) unless VYB_RGQ8_IQ3=1. xq8 writes XNQ/H32Q (K int8 then
+            // K/32 f32 scales). NOT bit-identical; validated by KLD.
+            if ((env_get("VYB_RGQ8") else dfrg) == "1") {
+                m7<Int> = load_mod(env_get("VYB_RG7PTX") else "native/build/rgemv7.ptx")
+                if (m7 == 0) { println("ERR load rgemv7") ; return 1 }
+                hi2 = get_fn(m7, "gemv_iq2s_q")
+                hxq = get_fn(m7, "xq8")
+                IRB = ITH / 32
+                RQ8 = 1
+                rgp = rgp + "+rgemv7(q8_1,dp4a iq2s)"
+                if ((env_get("VYB_RGQ8_IQ3") else dfrg) == "1") {
+                    hi3 = get_fn(m7, "gemv_iq3s_q")
+                    RQ83 = 1
+                    rgp = rgp + "+iq3s"
+                }
+            }
+        }
+        println("IQ_GEMV ptx=" + rgp + " rows_per_warp=" + RK2.to_string() + " tpb=" + ITH.to_string() + " fuse=" + FUS.to_string() + " cc_major=" + CCMAJ.to_string())
+    }
+    // VYB_Q4KPTX=native/build/rq4k.ptx (gen_rq4k.py R D): decode Q4_K GEMV gemv_q4k_v (M=1, vector x
+    // loads, R rows/warp, D-deep prefetch, shuffle reduction; same arithmetic as qwen3 gemv_q4k, bit-exact).
+    // Default rq4k.ptx = gen_rq4k.py 1 3 (~7% faster in situ). VYB_Q4KPTX=none = qwen3.ptx gemv_q4k.
+    Q4G<Int> = 32
+    q4p<String> = env_get("VYB_Q4KPTX") else "native/build/rq4k.ptx"
+    if (q4p != "none") {
+        mq4v<Int> = load_mod(q4p)
+        if (mq4v == 0) { println("ERR load " + q4p) ; return 1 }
+        hq4 = get_fn(mq4v, "gemv_q4k_v")
+        q4r<String> = env_get("VYB_Q4KR") else "1"
+        Q4G = 16 * parse_u(q4r, 0, q4r.len())
+        println("Q4K_GEMV ptx=" + q4p + " rows_per_block=" + Q4G.to_string())
+    }
+    // VYB_Q4Q8=1: the GDN Q4_K decode GEMVs (qkv+gate, ssm_out) on q8_1 activations + dp4a (rq4kq.vyb,
+    // xq8 from rgemv7). NOT bit-identical; validated by KLD.
+    // 2026-10-26 RTX 3090: default on CC major 8 (tg128 26.9 -> 28.4, KLD 0.00394, ppl 3.2437); =0 or VYB_EXACT=1 off.
+    Q4Q8<Int> = 0 ; hq4q<Int> = 0 ; hxq4<Int> = 0
+    Q4KM<Int> = 0
+    dfq4<String> = "0"
+    if (CCMAJ == 8) { dfq4 = "1" }
+    if ((env_get("VYB_EXACT") else "") == "1") { dfq4 = "0" }
+    // VYB_Q8SK (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): GDN alpha+beta Q8_0 GEMVs as ONE split-K
+    // launch (rq80s.vyb gemv_q8_0_sk; one block per row). NOT bit-identical; validated by KLD.
+    Q8SK<Int> = 0 ; hq8s<Int> = 0
+    // Q8SK also defaults on for CC >= 10 (GB10: +1.2% alone, DSG+Q8SK 14.76 vs DSG 14.55)
+    dfq8s<String> = dfq4
+    if (CCMAJ >= 10 && (env_get("VYB_EXACT") else "") != "1") { dfq8s = "1" }
+    if ((env_get("VYB_Q8SK") else dfq8s) == "1") {
+        mq8s<Int> = load_mod("native/build/rq80s.ptx")
+        if (mq8s == 0) { println("ERR load rq80s") ; return 1 }
+        hq8s = get_fn(mq8s, "gemv_q8_0_sk") ; Q8SK = 1
+        println("Q8_0_GEMV gdn alpha+beta split-K (rq80s)")
+    }
+    if ((env_get("VYB_Q4Q8") else dfq4) == "1") {
+        mq4q<Int> = load_mod("native/build/rq4kq.ptx")
+        m7b<Int> = load_mod("native/build/rgemv7.ptx")
+        if (mq4q == 0 || m7b == 0) { println("ERR load rq4kq / rgemv7") ; return 1 }
+        hq4q = get_fn(mq4q, "gemv_q4k_q") ; hxq4 = get_fn(m7b, "xq8") ; Q4Q8 = 1
+        println("Q4K_GEMV gdn=q8_1 dp4a (rq4kq)")
+        // VYB_Q4KU (default 1): gemv_q4k_qu, the same math with the super-block loop unrolled x4 (bit-identical)
+        if ((env_get("VYB_Q4KU") else "1") == "1") {
+            hq4u<Int> = get_fn(mq4q, "gemv_q4k_qu")
+            if (hq4u != 0) { hq4q = hq4u ; println("Q4KU gemv_q4k_qu unroll4") }
+        }
+        // VYB_Q4KM (default 1 wherever Q4Q8 is on): gemv_q4k_m, llama.cpp mmvq layout (one row per
+        // 128-thread block). Not bit-identical to gemv_q4k_qu (f64 partials per warp); KLD 0.00402,
+        // ppl 3.2491, top-1 98.63 %; 3090 tg128 39.69 -> 40.16, GB10 (VYB_Q4Q8=1) 14.54 -> 14.68.
+        if ((env_get("VYB_Q4KM") else "1") == "1") {
+            hq4m<Int> = get_fn(mq4q, "gemv_q4k_m")
+            if (hq4m != 0) { hq4q = hq4m ; Q4KM = 1 ; println("Q4KM gemv_q4k_m mmvq 128/row") }
+        }
+    }
+    // VYB_Q5Q8 (default on CC 8 like Q4Q8; =0 or VYB_EXACT=1 off): attention q/k/v Q5_K GEMVs on q8_1 + dp4a
+    Q5Q8<Int> = 0 ; hq5q<Int> = 0 ; hxq5<Int> = 0
+    Q5KM<Int> = 0
+    if ((env_get("VYB_Q5Q8") else dfq4) == "1") {
+        mq5q<Int> = load_mod("native/build/rq5kq.ptx")
+        m7c<Int> = load_mod("native/build/rgemv7.ptx")
+        if (mq5q == 0 || m7c == 0) { println("ERR load rq5kq / rgemv7") ; return 1 }
+        hq5q = get_fn(mq5q, "gemv_q5k_q") ; hxq5 = get_fn(m7c, "xq8") ; Q5Q8 = 1
+        println("Q5K_GEMV attn=q8_1 dp4a (rq5kq)")
+        // VYB_Q5KU (default 1): gemv_q5k_qu, the same math with the super-block loop unrolled x4 (bit-identical)
+        if ((env_get("VYB_Q5KU") else "1") == "1") {
+            hq5u<Int> = get_fn(mq5q, "gemv_q5k_qu")
+            if (hq5u != 0) { hq5q = hq5u ; println("Q5KU gemv_q5k_qu unroll4") }
+        }
+        // VYB_Q5KM (default 1 on sm_8x, where Q5Q8 is on): gemv_q5k_m, llama.cpp mmvq layout (one row per
+        // 128-thread block). KLD mean 0.00384, top-1 98.63 %, PPL 3.2336; 3090 tg128 40.25 -> 40.45.
+        // GB10 measured no gain (14.94 vs 14.95), so it stays opt-in there.
+        dfq5m<String> = "0"
+        if (CCMAJ == 8) { dfq5m = "1" }
+        if ((env_get("VYB_Q5KM") else dfq5m) == "1") {
+            hq5m<Int> = get_fn(mq5q, "gemv_q5k_m")
+            if (hq5m != 0) { hq5q = hq5m ; Q5KM = 1 ; println("Q5KM gemv_q5k_m mmvq 128/row") }
+        }
+    }
+    // VYB_Q6KPTX: Q6_K decode GEMV gemv_q6k_v (gen_rq6k.py R D; default rq6k.ptx = gen_rq6k.py 1 2: 1 row/warp,
+    // 2-deep prefetch, shuffle reduction; bit-identical to qwen3 gemv_q6k). VYB_Q6KR = rows per warp.
+    // VYB_Q6KPTX=none = qwen3.ptx gemv_q6k (32 rows/block).
+    Q6G<Int> = 32
+    // Default now rq6k8.ptx (gen_rq6k8.py rq6k8.vyb 4 1): same lane map/arithmetic (bit-identical) with the row
+    // streamed as coalesced u32 loads + shfl_idx extract, 318 vs 385 us/call. VYB_Q6KPTX=native/build/rq6k.ptx = previous.
+    // 2026-10-26: default now rq6kr2.ptx (gen_rq6k.py 2 1): 2 rows per warp share each lane's x loads, same
+    // per-row lane map / arithmetic / reduction -> bit-identical (VYB_LOGDUMP cmp); RTX 3090 tg128 see commit.
+    // The rows-per-warp launch geometry must match the PTX, so VYB_Q6KR defaults to 2 only for rq6kr2.ptx.
+    // On GB10 (cc 12.x) rq6kr2 measured slower (Righty tg64 13.67 vs 13.91), so it stays on rq6k8 there.
+    q6pd<String> = "native/build/rq6kr2.ptx"
+    if (CCMAJ >= 10) { q6pd = "native/build/rq6k8.ptx" }
+    q6p<String> = env_get("VYB_Q6KPTX") else ""
+    if (q6p == "") { q6p = q6pd }
+    q6rd<String> = "1"
+    if (q6p == "native/build/rq6kr2.ptx") { q6rd = "2" }
+    if (q6p != "none") {
+        mq6v<Int> = load_mod(q6p)
+        if (mq6v == 0) { println("ERR load " + q6p) ; return 1 }
+        hq6 = get_fn(mq6v, "gemv_q6k_v")
+        q6r<String> = env_get("VYB_Q6KR") else ""
+        if (q6r == "") { q6r = q6rd }
+        Q6G = 16 * parse_u(q6r, 0, q6r.len())
+        println("Q6K_GEMV ptx=" + q6p + " rows_per_block=" + Q6G.to_string())
+    }
+    // VYB_DSC=1: delta_step_c (4 threads per state row); default delta_step_b (measured faster)
+    DSC<Int> = 0
+    // VYB_DSF (default 1): fused l2norm_b + delta_step_b + norm_gated_b (rdelta.vyb delta_step_f,
+    // same arithmetic and reduction trees, bit-identical; 2 fewer launches per GDN layer). 0 = 3 kernels,
+    // 8 = delta_step_f8 (state-row loops unrolled 8-wide).
+    DSF<Int> = 0
+    hdsf<Int> = 0
+    // VYB_DST (default 1): column-major GDN state + delta_step_t (coalesced state loads; bit-identical). Uses the
+    // 3-kernel GDN path; a batched prefill's state is transposed once (st_tr) before decode. 0 = row-major.
+    DST<Int> = 0
+    hdst<Int> = 0
+    htr<Int> = 0
+    GDN32<Int> = 0
+    DSP<Int> = 0 ; DSPT<Int> = 256 ; DSPG<Int> = 32
+    if ((env_get("VYB_DST") else "1") != "0") {
+        mdt<Int> = load_mod("native/build/rdelta.ptx")
+        if (mdt == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
+        hdst = get_fn(mdt, "delta_step_t") ; htr = get_fn(mdt, "st_tr")
+        DST = 1
+        println("GDN_STATE column-major delta_step_t")
+        // GDN32 + DSG default 1 unless VYB_EXACT=1 (2026-10-27 RTX 3090: tg128 37.9 -> 39.6; KLD mean 0.00394,
+        // top1 98.04%, ppl 3.2448 on the 510-token gate vs 0.00407 / 3.2568 for the f64 DSX default)
+        dfg<String> = "1"
+        if ((env_get("VYB_EXACT") else "") == "1") { dfg = "0" }
+        if ((env_get("VYB_GDN32") else dfg) == "1") {
+            hdst = get_fn(mdt, "delta_step_t32") ; htr = get_fn(mdt, "st_tr32")
+            if (hdst == 0 || htr == 0) { println("ERR rdelta f32 kernels") ; return 1 }
+            GDN32 = 1
+            println("GDN_STATE f32 (VYB_GDN32)")
+        }
+        if ((env_get("VYB_DSP") else "") == "1") {
+            // parallel state update (rdelta2, gen_rdelta2.py): Hv*S/32 blocks, NW warps split the i loop; not bit-exact
+            mdp<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdp == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdp, "delta_step_p32") } else { hdst = get_fn(mdp, "delta_step_p") }
+            dpw<String> = env_get("VYB_DSPNW") else "8"
+            DSPT = 32 * parse_u(dpw, 0, dpw.len())
+            DSP = 1
+            println("GDN_STEP delta_step_p tpb=" + DSPT.to_string())
+        }
+        if ((env_get("VYB_DSV") else "") == "1") {
+            // delta_step_u work split JB columns per block (grid Hv*S/JB); bit-identical in f64
+            mdv<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdv == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdv, "delta_step_v32") } else { hdst = get_fn(mdv, "delta_step_v") }
+            if ((env_get("VYB_DSW") else "") == "1") {
+                // delta_step_w needs 40 KB static shared, so it lives in its own module (gen_rdelta2.py ... 1)
+                mdw<Int> = load_mod(env_get("VYB_DSWPTX") else "native/build/rdelta2w.ptx")
+                if (mdw == 0) { println("ERR load rdelta2w") ; return 1 }
+                if (GDN32 == 1) { hdst = get_fn(mdw, "delta_step_w32") } else { hdst = get_fn(mdw, "delta_step_w") }
+            }
+            if (hdst == 0) { println("ERR delta_step_v") ; return 1 }
+            djb<String> = env_get("VYB_DSVJB") else "32"
+            DSPG = parse_u(djb, 0, djb.len())
+            DSPT = DSPG
+            DSP = 1
+            println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
+        }
+        // VYB_DSG (default 1 with GDN32; 0 = delta_step_u32): delta_step_g32 (rdeltag, gen_rdeltag.py): f32 state held in registers,
+        // 8 warps x 16 rows per 32-column block, warp partials summed in shared; one read + one write of the state
+        // (llama.cpp gated_delta_net structure, MIT). Not bit-exact -> KLD-checked.
+        if (GDN32 == 1 && DSP == 0 && (env_get("VYB_DSG") else dfg) == "1" && SS == 128) {
+            mdg<Int> = load_mod("native/build/rdeltag.ptx")
+            if (mdg == 0) { println("ERR load rdeltag.ptx") ; return 1 }
+            hdst = get_fn(mdg, "delta_step_g32")
+            if (hdst == 0) { println("ERR delta_step_g32") ; return 1 }
+            DSPG = 32 ; DSPT = 256 ; DSP = 1
+            println("GDN_STEP delta_step_g32")
+        }
+        // VYB_DSX (default 1; VYB_DSX=0 = delta_step_u): delta_step_x (rdelta2x, gen_rdelta2x.py): state tile
+        // staged in shared by 8 warps, one DRAM read + one write of the state, warp 0 runs delta_step_u's
+        // recurrence verbatim; bit-identical in f64 (56 -> 47.7 us on RTX 3090). Falls back to DSU if the
+        // module is missing.
+        if ((env_get("VYB_DSX") else "1") == "1" && GDN32 == 0 && DSP == 0) {
+            mdx<Int> = load_mod(env_get("VYB_DSXPTX") else "native/build/rdelta2x.ptx")
+            if (mdx != 0) {
+                hdst = get_fn(mdx, "delta_step_x")
+                if (hdst == 0) { println("ERR delta_step_x") ; return 1 }
+                DSPG = 32
+                DSPT = 256
+                DSP = 1
+                println("GDN_STEP delta_step_x")
+            } else {
+                println("WARN rdelta2x.ptx missing, using delta_step_u (make ridge-kernels)")
+            }
+        }
+        // VYB_DSU (default 1 unless VYB_DSP/VYB_DSV/VYB_DSX picked a kernel): delta_step_t with batched state loads
+        // (rdelta2 delta_step_u, 62 vs 71 us; bit-identical in f64). VYB_DSU=0 = plain delta_step_t.
+        if ((env_get("VYB_DSU") else "1") == "1" && DSP == 0) {
+            mdu<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")
+            if (mdu == 0) { println("ERR load rdelta2") ; return 1 }
+            if (GDN32 == 1) { hdst = get_fn(mdu, "delta_step_u32") } else { hdst = get_fn(mdu, "delta_step_u") }
+            if (hdst == 0) { println("ERR delta_step_u") ; return 1 }
+            println("GDN_STEP delta_step_u")
+        }
+    }
+    dsfs<String> = env_get("VYB_DSF") else "1"
+    if (DST == 1) { dsfs = "0" }
+    if (dsfs == "1" || dsfs == "8") {
+        mdf<Int> = load_mod("native/build/rdelta.ptx")
+        if (mdf == 0) { println("ERR load native/build/rdelta.ptx") ; return 1 }
+        dsfn<String> = "delta_step_f"
+        if (dsfs == "8") { dsfn = "delta_step_f8" }
+        hdsf = get_fn(mdf, dsfn)
+        DSF = 1
+        println("GDN_FUSED " + dsfn)
+    }
+    if ((env_get("VYB_DSC") else "").len() > 0) { DSC = 1 }
+    println("KERNELS rk2=" + RK2.to_string())
+    if (hds == 0 || hi3 == 0 || hrope == 0 || hq4 == 0) { return 10 }
+
+    // ---- resident weights: the whole tensor region, once ----
+    tw0<Int> = time_mono_millis()
+    RBA<Int> = dalloc(RBYTES)
+    if (RBA == 0) { println("ERR alloc region"); return 20 }
+    CHK<Int> = 268435456
+    pos<Int> = 0
+    // One pinned 256 MB host buffer, reused for every chunk: pread straight into it, then
+    // cuMemcpy to the region. (Each read_model String chunk was never freed: ~12.5 GB of host RSS.)
+    HB<Int> = 0
+    hrc<Int> = 0
+    freedom { hrc = cuMemAllocHost_v2(loc(HB), CHK) as Int }
+    if (hrc != 0 || HB == 0) { println("ERR pinned alloc " + hrc.to_string()); return 20 }
+    urc<Int> = 0
+    match (open_read(MODEL)) {
+        mf -> {
+            while (pos < RBYTES && urc == 0) {
+                len<Int> = CHK
+                if (pos + len > RBYTES) { len = RBYTES - pos }
+                got<Int> = 0
+                while (got < len && urc == 0) {
+                    n<Int> = 0
+                    freedom { n = pread(mf.fd, HB + got, len - got, RLO + pos + got) }
+                    if (n <= 0) { println("ERR short read at " + (pos + got).to_string()); urc = 21 }
+                    got = got + n
+                }
+                if (urc == 0) {
+                    c<Int> = 0
+                    freedom { c = cuMemcpy(RBA + pos, HB, len) as Int }
+                    if (c != 0) { urc = 22 }
+                }
+                pos = pos + len
+            }
+            close(mf)
+        }
+        ? -> { urc = 21 }
+    }
+    freedom { cuMemFreeHost(HB) }
+    if (urc != 0) { return urc }
+    tw1<Int> = time_mono_millis()
+    println("RESIDENT_WEIGHTS bytes=" + RBYTES.to_string() + " upload_ms=" + (tw1 - tw0).to_string())
+    g2s<String> = read_bin("native/out/iq2s_grid.bin")
+    g3s<String> = read_bin("native/out/iq3s_grid.bin")
+    // A missing grid file used to read as "" and silently produce garbage tokens (3090 bring-up).
+    if (g2s.len() != 8192 || g3s.len() != 2048) { println("ERR iq2s/iq3s grid files missing or wrong size (native/out/iq2s_grid.bin, iq3s_grid.bin)") ; return 3 }
+    G2<Int> = dalloc(8192) ; G3<Int> = dalloc(2048)
+    download(g2s, G2, 8192) ; download(g3s, G3, 2048)
+    fb<String> = read_bin(FIP)
+    NROT<Int> = (fb.len() / 8) * 2
+    FR<Int> = dalloc(1024)
+    download(fb, FR, fb.len())
+    println("ROPE_TABLE entries=" + (fb.len() / 8).to_string() + " NROT=" + NROT.to_string())
+
+    PA<Int> = dalloc(256 * 4096)
+    np<Int> = 0
+    // f32 -> f64 copies of the small F32 tensors
+    tidx<Vec<Int>> = Vec()
+    // activations
+    XC<Int> = dalloc(D * 8) ; XM<Int> = dalloc(D * 8) ; XN<Int> = dalloc(D * 8) ; XN32<Int> = dalloc(D * 4)
+    QKVX<Int> = dalloc(QKV * 8) ; ZB<Int> = dalloc(VAL * 8) ; BRAW<Int> = dalloc(HV * 8) ; ARAW<Int> = dalloc(HV * 8)
+    BETA<Int> = dalloc(HV * 8) ; GATE<Int> = dalloc(HV * 8) ; CRAW<Int> = dalloc(QKV * 8) ; CONVS<Int> = dalloc(QKV * 8)
+    QN<Int> = dalloc(GKEY * 8) ; KN<Int> = dalloc(GKEY * 8) ; GOUT<Int> = dalloc(VAL * 8) ; EPI<Int> = dalloc(VAL * 8)
+    E32<Int> = dalloc(VAL * 4)
+    QG<Int> = dalloc(2 * NQ * 8) ; QB<Int> = dalloc(NQ * 8) ; GT<Int> = dalloc(NQ * 8) ; KR<Int> = dalloc(NKV * 8)
+    QNM<Int> = dalloc(NQ * 8) ; KNM<Int> = dalloc(NKV * 8) ; QR<Int> = dalloc(NQ * 8) ; CTX<Int> = dalloc(NQ * 8)
+    GD<Int> = dalloc(NQ * 8) ; SCR<Int> = dalloc(H * MAXS * 8)
+    GR<Int> = dalloc(FF * 8) ; UP<Int> = dalloc(FF * 8) ; H32<Int> = dalloc(FF * 4)
+    XNP<Int> = dalloc(D * 4) ; H32P<Int> = dalloc(FF * 4) ; PXN<Int> = dalloc(256) ; PXH<Int> = dalloc(256)
+    put_i(PXN, 0, XN32) ; put_i(PXN, 8, XNP) ; put_i(PXN, 16, D)
+    put_i(PXH, 0, H32) ; put_i(PXH, 8, H32P) ; put_i(PXH, 16, FF)
+    XNQ<Int> = dalloc(D * 2) ; H32Q<Int> = dalloc(FF * 2) ; PXNQ<Int> = dalloc(256) ; PXHQ<Int> = dalloc(256)
+    put_i(PXNQ, 0, XN32) ; put_i(PXNQ, 8, XNQ) ; put_i(PXNQ, 16, D)
+    put_i(PXHQ, 0, H32) ; put_i(PXHQ, 8, H32Q) ; put_i(PXHQ, 16, FF)
+    // VYB_SWQ8 (default 1): decode FFN silu32 also writes H32Q (silu32q), dropping the xq8 launch
+    // before an IQ down GEMV on the q8_1 path. Bit-identical; needs FF % 32 == 0.
+    SWQ<Int> = 0
+    SWQN<Int> = 0
+    if ((env_get("VYB_SWQ8") else "1") == "1" && RQ8 == 1 && hsq != 0 && FF % 32 == 0) { SWQ = 1 }
+    PSQ<Int> = dalloc(64)
+    put_i(PSQ, 0, GR) ; put_i(PSQ, 8, UP) ; put_i(PSQ, 16, H32) ; put_i(PSQ, 24, FF) ; put_i(PSQ, 32, H32Q)
+    EQ<Int> = dalloc(VAL * 2) ; PEQ<Int> = dalloc(256)
+    put_i(PEQ, 0, E32) ; put_i(PEQ, 8, EQ) ; put_i(PEQ, 16, VAL)
+    LOGB<Int> = dalloc(VOCAB * 8) ; NCH<Int> = (VOCAB + 255) / 256
+    PV<Int> = dalloc(NCH * 8) ; PI<Int> = dalloc(NCH * 8) ; OUTI<Int> = dalloc(8)
+    CURD<Int> = dalloc(8)
+    SCLV<Float> = 1.0 / sqrt(SS as Float)
+
+    // per-layer launch plan: kind, and the param-block base of each step (8 blocks per slot)
+    if (D % 32 != 0) { RMQ8 = 0 }
+    kind<Vec<Int>> = Vec() ; pbase<Vec<Int>> = Vec() ; aidx<Vec<Int>> = Vec()
+    fty<Vec<Int>> = Vec()      // gate, up, down types (3 per layer)
+    gdn_bytes<Int> = 0 ; kv_bytes<Int> = 0
+    KCv<Vec<Int>> = Vec() ; VCv<Vec<Int>> = Vec()
+    anwv<Vec<Int>> = Vec() ; panwv<Vec<Int>> = Vec() ; l1v<Vec<Int>> = Vec() ; l2v<Vec<Int>> = Vec() ; l3v<Vec<Int>> = Vec()
+    l4v<Vec<Int>> = Vec() ; l5v<Vec<Int>> = Vec() ; l6v<Vec<Int>> = Vec()
+    na<Int> = 0
+    L<Int> = 0
+    for (L in 0..NL - 1) {
+        pf<String> = "blk." + L.to_string() + "."
+        isg<Int> = 0
+        if (find_nm(nmv, pf + "attn_qkv.weight") >= 0) { isg = 1 }
+        kind.push(isg)
+        pb0<Int> = PA + np * 256
+        pbase.push(pb0)
+        // F32 small tensors -> f64
+        an<Int> = find_nm(nmv, pf + "attn_norm.weight")
+        pan<Int> = find_nm(nmv, pf + "post_attention_norm.weight")
+        ANW<Int> = dalloc(D * 8) ; PANW<Int> = dalloc(D * 8)
+        put_i(PA, 255 * 256 * 16 + 0, 0)
+        // a scratch param block at the arena's end for the expand launches
+        XP<Int> = PA + 4095 * 256
+        put_i(XP, 0, RBA + ofv.get(an) - RLO) ; put_i(XP, 8, ANW) ; put_i(XP, 16, D)
+        lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
+        put_i(XP, 0, RBA + ofv.get(pan) - RLO) ; put_i(XP, 8, PANW) ; put_i(XP, 16, D)
+        lk(hexp, (D + 255) / 256, 256, XP) ; dsync()
+        anwv.push(ANW) ; panwv.push(PANW)
+        ig<Int> = find_nm(nmv, pf + "ffn_gate.weight") ; iu<Int> = find_nm(nmv, pf + "ffn_up.weight") ; idn<Int> = find_nm(nmv, pf + "ffn_down.weight")
+        fty.push(tyv.get(ig)) ; fty.push(tyv.get(iu)) ; fty.push(tyv.get(idn))
+        // block 0: attn_norm (rms_blk XC -> XN, XN32)
+        p0<Int> = pb0
+        put_i(p0, 0, XC) ; put_i(p0, 8, ANW) ; put_i(p0, 16, XN) ; put_i(p0, 24, 1) ; put_i(p0, 32, D) ; put_f(p0, 40, EPS) ; put_i(p0, 48, XN32)
+        if (RMQ8 == 1) {
+            if (isg == 1 && Q4Q8 == 1) { put_i(p0, 56, XNQ) }
+            if (isg == 0 && Q5Q8 == 1) { put_i(p0, 56, XNQ) }
+        }
+        // FFN blocks at slots 16..19
+        pfn<Int> = pb0 + 16 * 256
+        put_i(pfn, 0, XM) ; put_i(pfn, 8, PANW) ; put_i(pfn, 16, XN) ; put_i(pfn, 24, 1) ; put_i(pfn, 32, D) ; put_f(pfn, 40, EPS) ; put_i(pfn, 48, XN32)
+        // VYB_RMSQ8 also covers ffn_norm: rms_blkg writes XNQ for IQ gate/up GEMVs on the q8_1 path
+        if (RMQ8 == 1 && RQ8 == 1) {
+            if (uses_q8(tyv.get(ig), RQ83) + uses_q8(tyv.get(iu), RQ83) > 0) { put_i(pfn, 56, XNQ) }
+        }
+        xg<Int> = XN32 ; xu<Int> = XN32 ; xd<Int> = H32
+        if (XPM == 1) {
+            if (is_iq(tyv.get(ig)) == 1) { xg = XNP }
+            if (is_iq(tyv.get(iu)) == 1) { xu = XNP }
+            if (is_iq(tyv.get(idn)) == 1) { xd = H32P }
+        }
+        if (RQ8 == 1) {
+            if (uses_q8(tyv.get(ig), RQ83) == 1) { xg = XNQ }
+            if (uses_q8(tyv.get(iu), RQ83) == 1) { xu = XNQ }
+            if (uses_q8(tyv.get(idn), RQ83) == 1) { xd = H32Q }
+        }
+        set_gemv(pfn + 256, RBA + ofv.get(ig) - RLO, xg, GR, FF, D, 8, 0, grid_of(tyv.get(ig), G2, G3))
+        set_gemv(pfn + 512, RBA + ofv.get(iu) - RLO, xu, UP, FF, D, 8, 0, grid_of(tyv.get(iu), G2, G3))
+        set_gemv(pfn + 768, RBA + ofv.get(idn) - RLO, xd, XC, D, FF, 8, XM, grid_of(tyv.get(idn), G2, G3))
+        if (isg == 1) {
+            aidx.push(-1)
+            iqkv<Int> = find_nm(nmv, pf + "attn_qkv.weight") ; iga<Int> = find_nm(nmv, pf + "attn_gate.weight")
+            ibe<Int> = find_nm(nmv, pf + "ssm_beta.weight") ; ial<Int> = find_nm(nmv, pf + "ssm_alpha.weight")
+            iou<Int> = find_nm(nmv, pf + "ssm_out.weight") ; icw<Int> = find_nm(nmv, pf + "ssm_conv1d.weight")
+            isn<Int> = find_nm(nmv, pf + "ssm_norm.weight") ; idt<Int> = find_nm(nmv, pf + "ssm_dt.bias")
+            iaa<Int> = find_nm(nmv, pf + "ssm_a")
+            CW<Int> = dalloc(QKV * DC * 8) ; SNW<Int> = dalloc(SS * 8) ; DTW<Int> = dalloc(HV * 8) ; SAW<Int> = dalloc(HV * 8)
+            put_i(XP, 0, RBA + ofv.get(icw) - RLO) ; put_i(XP, 8, CW) ; put_i(XP, 16, QKV * DC)
+            lk(hexp, (QKV * DC + 255) / 256, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(isn) - RLO) ; put_i(XP, 8, SNW) ; put_i(XP, 16, SS)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(idt) - RLO) ; put_i(XP, 8, DTW) ; put_i(XP, 16, HV)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(iaa) - RLO) ; put_i(XP, 8, SAW) ; put_i(XP, 16, HV)
+            lk(hexp, 1, 256, XP) ; dsync()
+            STL<Int> = dalloc(HV * SS * SS * 8) ; CVL<Int> = dalloc(QKV * DC * 8)
+            gdn_bytes = gdn_bytes + HV * SS * SS * 8 + QKV * DC * 8
+            if (STL == 0 || CVL == 0) { println("ERR alloc gdn state"); return 23 }
+            l1v.push(CW) ; l2v.push(SNW) ; l3v.push(DTW) ; l4v.push(SAW) ; l5v.push(STL) ; l6v.push(CVL)
+            // 1: qkv + gate (2 segments)
+            p1<Int> = pb0 + 256
+            set_gemv(p1, RBA + ofv.get(iqkv) - RLO, XN32, QKVX, QKV, D, 8, 0, 0)
+            if (Q4Q8 == 1) { put_i(p1, 8, XNQ) }
+            put_i(p1, 56, RBA + ofv.get(iga) - RLO) ; put_i(p1, 64, VAL) ; put_i(p1, 72, ZB) ; put_i(p1, 80, 8)
+            set_gemv(pb0 + 2 * 256, RBA + ofv.get(ibe) - RLO, XN32, BRAW, HV, D, 8, 0, 0)
+            set_gemv(pb0 + 3 * 256, RBA + ofv.get(ial) - RLO, XN32, ARAW, HV, D, 8, 0, 0)
+            p4<Int> = pb0 + 4 * 256
+            put_i(p4, 0, BRAW) ; put_i(p4, 8, BETA) ; put_i(p4, 16, HV)
+            p5<Int> = pb0 + 5 * 256
+            put_i(p5, 0, ARAW) ; put_i(p5, 8, DTW) ; put_i(p5, 16, SAW) ; put_i(p5, 24, GATE) ; put_i(p5, 32, HV)
+            p6<Int> = pb0 + 6 * 256
+            put_i(p6, 0, CVL) ; put_i(p6, 8, QKV) ; put_i(p6, 16, DC)
+            p7<Int> = pb0 + 7 * 256
+            put_i(p7, 0, QKVX) ; put_i(p7, 8, CVL) ; put_i(p7, 16, QKV) ; put_i(p7, 24, DC) ; put_i(p7, 32, 1)
+            p8<Int> = pb0 + 8 * 256
+            put_i(p8, 0, CVL) ; put_i(p8, 8, CW) ; put_i(p8, 16, CRAW) ; put_i(p8, 24, QKV) ; put_i(p8, 32, DC) ; put_i(p8, 40, 1)
+            put_i(p8, 48, QKVX) ; put_i(p8, 56, CONVS) ; put_i(p4, 24, p5)
+            p9<Int> = pb0 + 9 * 256
+            put_i(p9, 0, CRAW) ; put_i(p9, 8, CONVS) ; put_i(p9, 16, QKV)
+            p10<Int> = pb0 + 10 * 256
+            put_i(p10, 0, CONVS) ; put_i(p10, 8, QN) ; put_i(p10, 16, HK) ; put_i(p10, 24, SS) ; put_f(p10, 32, EPS)
+            p11<Int> = pb0 + 11 * 256
+            put_i(p11, 0, CONVS + GKEY * 8) ; put_i(p11, 8, KN) ; put_i(p11, 16, HK) ; put_i(p11, 24, SS) ; put_f(p11, 32, EPS)
+            p20<Int> = pb0 + 20 * 256
+            put_i(p20, 0, CONVS) ; put_i(p20, 8, QN) ; put_i(p20, 16, CONVS + GKEY * 8) ; put_i(p20, 24, KN)
+            put_i(p20, 32, HK) ; put_i(p20, 40, SS) ; put_f(p20, 48, EPS)
+            p12<Int> = pb0 + 12 * 256
+            put_i(p12, 0, QN) ; put_i(p12, 8, KN) ; put_i(p12, 16, CONVS + 2 * GKEY * 8) ; put_i(p12, 24, GATE)
+            put_i(p12, 32, BETA) ; put_i(p12, 40, STL) ; put_i(p12, 48, STL) ; put_i(p12, 56, GOUT) ; put_i(p12, 64, 0)
+            put_i(p12, 72, SS) ; put_i(p12, 80, HK) ; put_i(p12, 88, HV) ; put_f(p12, 96, SCLV)
+            p13<Int> = pb0 + 13 * 256
+            put_i(p13, 0, GOUT) ; put_i(p13, 8, ZB) ; put_i(p13, 16, SNW) ; put_i(p13, 24, EPI) ; put_i(p13, 32, HV) ; put_i(p13, 40, SS) ; put_f(p13, 48, EPS)
+            p14<Int> = pb0 + 14 * 256
+            put_i(p14, 0, EPI) ; put_i(p14, 8, E32) ; put_i(p14, 16, VAL)
+            set_gemv(pb0 + 15 * 256, RBA + ofv.get(iou) - RLO, E32, XM, D, VAL, 8, XC, 0)
+            if (Q4Q8 == 1) { put_i(pb0 + 15 * 256, 8, EQ) }
+        } else {
+            aidx.push(na)
+            iq<Int> = find_nm(nmv, pf + "attn_q.weight") ; ik<Int> = find_nm(nmv, pf + "attn_k.weight") ; iv<Int> = find_nm(nmv, pf + "attn_v.weight")
+            io<Int> = find_nm(nmv, pf + "attn_output.weight") ; iqn<Int> = find_nm(nmv, pf + "attn_q_norm.weight") ; ikn<Int> = find_nm(nmv, pf + "attn_k_norm.weight")
+            QNW<Int> = dalloc(HD * 8) ; KNW<Int> = dalloc(HD * 8)
+            put_i(XP, 0, RBA + ofv.get(iqn) - RLO) ; put_i(XP, 8, QNW) ; put_i(XP, 16, HD)
+            lk(hexp, 1, 256, XP) ; dsync()
+            put_i(XP, 0, RBA + ofv.get(ikn) - RLO) ; put_i(XP, 8, KNW) ; put_i(XP, 16, HD)
+            lk(hexp, 1, 256, XP) ; dsync()
+            KC<Int> = dalloc(MAXS * NKV * 8) ; VC<Int> = dalloc(MAXS * NKV * 8)
+            if (KC == 0 || VC == 0) { println("ERR alloc kv"); return 24 }
+            kv_bytes = kv_bytes + 2 * MAXS * NKV * 8
+            KCv.push(KC) ; VCv.push(VC)
+            l1v.push(QNW) ; l2v.push(KNW) ; l3v.push(0) ; l4v.push(0) ; l5v.push(0) ; l6v.push(0)
+            set_gemv(pb0 + 256, RBA + ofv.get(iq) - RLO, XN32, QG, 2 * NQ, D, 8, 0, 0)
+            set_gemv(pb0 + 2 * 256, RBA + ofv.get(ik) - RLO, XN32, KR, NKV, D, 8, 0, 0)
+            set_gemv(pb0 + 3 * 256, RBA + ofv.get(iv) - RLO, XN32, VC, NKV, D, 8, 0, 0)   // Y = V cache row p (per token)
+            if (Q5Q8 == 1) { put_i(pb0 + 256, 8, XNQ) ; put_i(pb0 + 2 * 256, 8, XNQ) ; put_i(pb0 + 3 * 256, 8, XNQ) }
+            p4a<Int> = pb0 + 4 * 256
+            put_i(p4a, 0, QG) ; put_i(p4a, 8, QB) ; put_i(p4a, 16, GT) ; put_i(p4a, 24, 1) ; put_i(p4a, 32, H) ; put_i(p4a, 40, HD)
+            p5a<Int> = pb0 + 5 * 256
+            put_i(p5a, 0, QB) ; put_i(p5a, 8, QNW) ; put_i(p5a, 16, QNM) ; put_i(p5a, 24, H) ; put_i(p5a, 32, HD) ; put_f(p5a, 40, EPS) ; put_i(p5a, 48, 0)
+            p6a<Int> = pb0 + 6 * 256
+            put_i(p6a, 0, KR) ; put_i(p6a, 8, KNW) ; put_i(p6a, 16, KNM) ; put_i(p6a, 24, KVH) ; put_i(p6a, 32, HD) ; put_f(p6a, 40, EPS) ; put_i(p6a, 48, 0)
+            p7a<Int> = pb0 + 7 * 256
+            put_i(p7a, 0, QNM) ; put_i(p7a, 8, KNM) ; put_i(p7a, 16, QR) ; put_i(p7a, 24, KC) ; put_i(p7a, 32, FR)
+            put_i(p7a, 40, 1) ; put_i(p7a, 48, HD) ; put_i(p7a, 56, H) ; put_i(p7a, 64, KVH) ; put_i(p7a, 72, 0) ; put_i(p7a, 80, NROT)
+            p8a<Int> = pb0 + 8 * 256
+            put_i(p8a, 80, QR) ; put_i(p8a, 88, KC) ; put_i(p8a, 96, VC) ; put_i(p8a, 104, CTX) ; put_i(p8a, 184, 1)
+            put_i(p8a, 200, HD) ; put_i(p8a, 208, H) ; put_i(p8a, 216, KVH) ; put_i(p8a, 224, 0) ; put_i(p8a, 232, SCR) ; put_i(p8a, 240, 1)
+            p9a<Int> = pb0 + 9 * 256
+            put_i(p9a, 0, CTX) ; put_i(p9a, 8, GT) ; put_i(p9a, 16, GD) ; put_i(p9a, 24, NQ)
+            p10a<Int> = pb0 + 10 * 256
+            put_i(p10a, 0, GD) ; put_i(p10a, 8, E32) ; put_i(p10a, 16, NQ)
+            set_gemv(pb0 + 11 * 256, RBA + ofv.get(io) - RLO, E32, XM, D, NQ, 8, XC, 0)
+            na = na + 1
+        }
+        np = np + 24
+    }
+    // head
+    ion<Int> = find_nm(nmv, "output_norm.weight") ; iow<Int> = find_nm(nmv, "output.weight") ; iem<Int> = find_nm(nmv, "token_embd.weight")
+    ONW<Int> = dalloc(D * 8)
+    XP2<Int> = PA + 4095 * 256
+    put_i(XP2, 0, RBA + ofv.get(ion) - RLO) ; put_i(XP2, 8, ONW) ; put_i(XP2, 16, D)
+    lk(hexp, (D + 255) / 256, 256, XP2) ; dsync()
+    PH<Int> = PA + np * 256
+    put_i(PH, 0, XC) ; put_i(PH, 8, ONW) ; put_i(PH, 16, XN) ; put_i(PH, 24, 1) ; put_i(PH, 32, D) ; put_f(PH, 40, EPS) ; put_i(PH, 48, XN32)
+    set_gemv(PH + 256, RBA + ofv.get(iow) - RLO, XN32, LOGB, VOCAB, D, 8, 0, 0)
+    PH2<Int> = PH + 512
+    put_i(PH2, 0, LOGB) ; put_i(PH2, 8, PV) ; put_i(PH2, 16, PI) ; put_i(PH2, 24, VOCAB) ; put_i(PH2, 32, 256)
+    PH3<Int> = PH + 768
+    put_i(PH3, 0, PV) ; put_i(PH3, 8, PI) ; put_i(PH3, 16, OUTI) ; put_i(PH3, 24, NCH)
+    TEMB<Int> = RBA + ofv.get(iem) - RLO
+    dsync()
+    mfree<Int> = 0 ; mtot<Int> = 0
+    freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+    println("MEM weights=" + RBYTES.to_string() + " gdn_state=" + gdn_bytes.to_string() + " kv=" + kv_bytes.to_string()
+            + " dev_used=" + (mtot - mfree).to_string() + " dev_total=" + mtot.to_string())
+    println("PLAN layers=" + NL.to_string() + " attn=" + na.to_string() + " param_blocks=" + np.to_string())
+
+    // ---- batched prefill (VYB_PFB=<min prompt tokens>; off by default so gold stays on the token path) ----
+    // The whole prompt goes through each layer at once: tensor-core GEMMs straight on the packed weights
+    // (rpf_gemm.vyb, f16 activations / f32 accumulate), chunk kernels for conv / l2norm / causal attention
+    // (rpf.vyb), delta_seq for the GDN recurrence, then the decode state (GDN state, conv window, KV rows
+    // 0..NP-1) is exactly where the token path would have left it. One chunk: NP <= 2048.
+    PFB<Int> = 0
+    pfbs<String> = env_get("VYB_PFB") else ""
+    if (pfbs.len() > 0) {
+        if (NP >= parse_u(pfbs, 0, pfbs.len()) && NP <= 2048 && NP > 1) { PFB = 1 }
+    }
+    PB2<Int> = 0 ; XCb<Int> = 0 ; S<Int> = NP
+    hpg4<Int> = 0 ; hpg5<Int> = 0 ; hpg6<Int> = 0 ; hpg8<Int> = 0 ; hpgi2<Int> = 0 ; hpgi3<Int> = 0
+    hpds<Int> = 0 ; hpag<Int> = 0 ; hpcv<Int> = 0 ; hpcs<Int> = 0 ; hpl2<Int> = 0 ; hpat<Int> = 0
+    // f32-compute chunk kernels (rpf32.vyb; GB10 f64 is slow): default with VYB_PFB, VYB_PFB64=1 = the f64 ones
+    P32<Int> = 1
+    if ((env_get("VYB_PFB64") else "").len() > 0) { P32 = 0 }
+    // gate/up GEMMs write f32 (LDY<0) for silu_f32: bit-identical (silu_b32 casts the f64 to f32); VYB_PFG32=0 off
+    GLDY<Int> = 0 - FF
+    if ((env_get("VYB_PFG32") else "") == "0" || P32 == 0) { GLDY = FF }
+    hsf32<Int> = 0
+    hng32<Int> = 0 ; hsl32<Int> = 0
+    // VYB_PFBM=64: every prefill GEMM on the 64-token tile (default: q6k/iq2s/iq3s on the 128 one)
+    BIG<Int> = 128
+    if ((env_get("VYB_PFBM") else "") == "64") { BIG = 64 }
+    // the GDN q4k projections follow BIG (VYB_PFQ4=64: keep them on the 64-token tile)
+    PQB<Int> = BIG
+    if ((env_get("VYB_PFQ4") else "") == "64") { PQB = 64 }
+    // default (VYB_PFXH=0 to disable): the 128-token GEMMs read f16 activations converted once per producer (rpf_gemm128h)
+    XHM<Int> = 0
+    if (BIG == 128) { XHM = 1 ; PQB = 64 }
+    if ((env_get("VYB_PFXH") else "") == "0") { XHM = 0 ; PQB = BIG }
+    // GDN q4k projections on the 128 f16 tile (XN16b / E16b converted per layer); default with XHM, VYB_PFQ4H=0 off
+    Q4H<Int> = 0
+    if (XHM == 1 && (env_get("VYB_PFQ4H") else "") != "0") { Q4H = 1 ; PQB = 128 }
+    // attention q/k/v q5k GEMMs on the 128 f16 tile (XN16b); default with XHM, VYB_PFQ5H=0 off
+    Q5H<Int> = 0 ; P5B<Int> = 64
+    if (XHM == 1 && (env_get("VYB_PFQ5H") else "") != "0") { Q5H = 1 ; P5B = 128 }
+    hpg5h<Int> = 0
+    hcvh<Int> = 0
+    XN32b<Int> = 0 ; GRb<Int> = 0 ; UPb<Int> = 0 ; H32b<Int> = 0
+    XN16b<Int> = 0 ; E16b<Int> = 0 ; H16b<Int> = 0 ; E32o<Int> = 0
+    if (PFB == 1) {
+        mpg<Int> = load_mod("native/build/rpf_gemm.ptx")
+        mpk<Int> = load_mod("native/build/rpf.ptx")
+        if (mpg == 0 || mpk == 0) { println("ERR load rpf ptx") ; return 10 }
+        hpg4 = get_fn(mpg, "gemm_q4k") ; hpg5 = get_fn(mpg, "gemm_q5k") ; hpg6 = get_fn(mpg, "gemm_q6k")
+        hpg8 = get_fn(mpg, "gemm_q80") ; hpgi2 = get_fn(mpg, "gemm_iq2s") ; hpgi3 = get_fn(mpg, "gemm_iq3s")
+        hpds = get_fn(mpg, "delta_seq")
+        if (BIG == 128) {
+            p128<String> = "native/build/rpf_gemm128.ptx"
+            if (XHM == 1) { p128 = "native/build/rpf_gemm128h.ptx" }
+            mpg2<Int> = load_mod(env_get("VYB_PFG128PTX") else p128)
+            if (mpg2 == 0) { println("ERR load rpf_gemm128 ptx") ; return 10 }
+            if (PQB == 128) { hpg4 = get_fn(mpg2, "gemm_q4k") }
+            if (XHM == 1) { hcvh = get_fn(mpg2, "cvt_h") }
+            if (Q5H == 1) { hpg5h = get_fn(mpg2, "gemm_q5k") }
+            hpg6 = get_fn(mpg2, "gemm_q6k") ; hpgi2 = get_fn(mpg2, "gemm_iq2s") ; hpgi3 = get_fn(mpg2, "gemm_iq3s")
+        }
+        hpag = get_fn(mpk, "ag_b") ; hpcv = get_fn(mpk, "conv_b") ; hpcs = get_fn(mpk, "conv_save")
+        // VYB_CONV32 (DEFAULT on; =0 or VYB_EXACT=1 for exact; NOT bit-identical): GDN short conv with the SiLU in f32 (rconv32.vyb conv_b32;
+        // 4-tap dot still f64). conv_b is FP64-bound on the f64 vexp + div.
+        dfcv<String> = "1"
+        if ((env_get("VYB_EXACT") else "") == "1") { dfcv = "0" }
+        if ((env_get("VYB_CONV32") else dfcv) == "1") {
+            mcv32<Int> = load_mod("native/build/rconv32.ptx")
+            if (mcv32 == 0) { println("ERR load rconv32.ptx") ; return 10 }
+            hpcv = get_fn(mcv32, "conv_b32")
+            println("CONV32 conv_b32 (f32 silu)")
+        }
+        hpl2 = get_fn(mpk, "l2n_bs") ; hpat = get_fn(mpk, "attn_pf")
+        if (P32 == 1) {
+            mp32<Int> = load_mod("native/build/rpf32.ptx")
+            if (mp32 == 0) { println("ERR load rpf32 ptx") ; return 10 }
+            hpds = get_fn(mp32, "delta_seq32") ; hpl2 = get_fn(mp32, "l2n_b32") ; hpat = get_fn(mp32, "attn_pf2")
+            hng32 = get_fn(mp32, "ng_b32") ; hsl32 = get_fn(mp32, "silu_b32") ; hsf32 = get_fn(mp32, "silu_f32")
+            if (hng32 == 0 || hsl32 == 0) { return 10 }
+        }
+        if (hpg4 == 0 || hpgi3 == 0 || hpds == 0 || hpat == 0 || hpl2 == 0) { return 10 }
+        XCb = dalloc(S * D * 8) ; XMb<Int> = dalloc(S * D * 8) ; XNb<Int> = dalloc(S * D * 8) ; XN32b = dalloc(S * D * 4)
+        QKVXb<Int> = dalloc(S * QKV * 8) ; ZBb<Int> = dalloc(S * VAL * 8) ; BRAWb<Int> = dalloc(S * HV * 8) ; ARAWb<Int> = dalloc(S * HV * 8)
+        BETAb<Int> = dalloc(S * HV * 8) ; GATEb<Int> = dalloc(S * HV * 8) ; CONVSb<Int> = dalloc(S * QKV * 8)
+        QNb<Int> = dalloc(S * GKEY * 8) ; KNb<Int> = dalloc(S * GKEY * 8) ; GOUTb<Int> = dalloc(S * VAL * 8) ; EPIb<Int> = dalloc(S * VAL * 8)
+        E32b<Int> = dalloc(S * NQ * 4)
+        QGb<Int> = dalloc(S * 2 * NQ * 8) ; QBb<Int> = dalloc(S * NQ * 8) ; GTb<Int> = dalloc(S * NQ * 8) ; KRb<Int> = dalloc(S * NKV * 8)
+        QNMb<Int> = dalloc(S * NQ * 8) ; KNMb<Int> = dalloc(S * NKV * 8) ; QRb<Int> = dalloc(S * NQ * 8) ; CTXb<Int> = dalloc(S * NQ * 8)
+        GDb<Int> = dalloc(S * NQ * 8)
+        GUB<Int> = 8
+        if (GLDY < 0) { GUB = 4 }
+        GRb = dalloc(S * FF * GUB) ; UPb = dalloc(S * FF * GUB) ; H32b = dalloc(S * FF * 4)
+        XN16b = XN32b ; E16b = E32b ; H16b = H32b ; E32o = E32b
+        if (XHM == 1) { XN16b = dalloc(S * D * 2) ; E16b = dalloc(S * NQ * 2) ; H16b = dalloc(S * FF * 2) }
+        if (H32b == 0 || GRb == 0 || UPb == 0) { println("ERR alloc prefill buffers") ; return 25 }
+        PB2 = dalloc(NL * 32 * 256)
+        for (L in 0..NL - 1) {
+            pf2<String> = "blk." + L.to_string() + "."
+            qb<Int> = PB2 + L * 32 * 256
+            put_i(qb, 0, XCb) ; put_i(qb, 8, anwv.get(L)) ; put_i(qb, 16, XNb) ; put_i(qb, 24, S) ; put_i(qb, 32, D) ; put_f(qb, 40, EPS) ; put_i(qb, 48, XN32b)
+            if (kind.get(L) == 1) {
+                CWl<Int> = l1v.get(L) ; SNWl<Int> = l2v.get(L) ; DTWl<Int> = l3v.get(L) ; SAWl<Int> = l4v.get(L) ; STLl<Int> = l5v.get(L) ; CVLl<Int> = l6v.get(L)
+                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_qkv.weight")) - RLO, q4x(Q4H, XN32b, XN16b), QKVXb, S, QKV, D, QKV, 0, 0, PQB)
+                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_gate.weight")) - RLO, q4x(Q4H, XN32b, XN16b), ZBb, S, VAL, D, VAL, 0, 0, PQB)
+                set_gemm(qb + 3 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_beta.weight")) - RLO, XN32b, BRAWb, S, HV, D, HV, 0, 0, 64)
+                set_gemm(qb + 4 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_alpha.weight")) - RLO, XN32b, ARAWb, S, HV, D, HV, 0, 0, 64)
+                q5<Int> = qb + 5 * 256
+                put_i(q5, 0, BRAWb) ; put_i(q5, 8, BETAb) ; put_i(q5, 16, S * HV)
+                q6<Int> = qb + 6 * 256
+                put_i(q6, 0, ARAWb) ; put_i(q6, 8, DTWl) ; put_i(q6, 16, SAWl) ; put_i(q6, 24, GATEb) ; put_i(q6, 32, S * HV) ; put_i(q6, 40, HV)
+                q7<Int> = qb + 7 * 256
+                put_i(q7, 0, QKVXb) ; put_i(q7, 8, CVLl) ; put_i(q7, 16, CWl) ; put_i(q7, 24, CONVSb) ; put_i(q7, 32, S) ; put_i(q7, 40, QKV)
+                q8<Int> = qb + 8 * 256
+                put_i(q8, 0, CVLl) ; put_i(q8, 8, QKVXb) ; put_i(q8, 16, S) ; put_i(q8, 24, QKV)
+                q9<Int> = qb + 9 * 256
+                put_i(q9, 0, CONVSb) ; put_i(q9, 8, QNb) ; put_i(q9, 16, KNb) ; put_i(q9, 24, HK) ; put_i(q9, 32, SS)
+                put_i(q9, 40, QKV) ; put_i(q9, 48, GKEY) ; put_f(q9, 56, EPS) ; put_i(q9, 64, S * 2 * HK)
+                q10<Int> = qb + 10 * 256
+                put_i(q10, 0, QNb) ; put_i(q10, 8, KNb) ; put_i(q10, 16, CONVSb + 2 * GKEY * 8) ; put_i(q10, 24, GATEb)
+                put_i(q10, 32, BETAb) ; put_i(q10, 40, STLl) ; put_i(q10, 48, GOUTb) ; put_i(q10, 56, S) ; put_i(q10, 64, SS)
+                put_i(q10, 72, HK) ; put_i(q10, 80, HV) ; put_f(q10, 88, SCLV) ; put_i(q10, 96, QKV) ; put_i(q10, 104, GKEY)
+                q11<Int> = qb + 11 * 256
+                put_i(q11, 0, GOUTb) ; put_i(q11, 8, ZBb) ; put_i(q11, 16, SNWl) ; put_i(q11, 24, EPIb) ; put_i(q11, 32, S * HV) ; put_i(q11, 40, SS) ; put_f(q11, 48, EPS)
+                if (P32 == 1) { put_i(q11, 24, E32b) }
+                q12<Int> = qb + 12 * 256
+                put_i(q12, 0, EPIb) ; put_i(q12, 8, E32b) ; put_i(q12, 16, S * VAL)
+                set_gemm(qb + 13 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "ssm_out.weight")) - RLO, q4x(Q4H, E32b, E16b), XMb, S, D, VAL, D, XCb, 0, PQB)
+            } else {
+                a2<Int> = aidx.get(L)
+                KCl<Int> = KCv.get(a2) ; VCl<Int> = VCv.get(a2)
+                set_gemm(qb + 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_q.weight")) - RLO, q4x(Q5H, XN32b, XN16b), QGb, S, 2 * NQ, D, 2 * NQ, 0, 0, P5B)
+                set_gemm(qb + 2 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_k.weight")) - RLO, q4x(Q5H, XN32b, XN16b), KRb, S, NKV, D, NKV, 0, 0, P5B)
+                set_gemm(qb + 3 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_v.weight")) - RLO, q4x(Q5H, XN32b, XN16b), VCl, S, NKV, D, NKV, 0, 0, P5B)
+                r4<Int> = qb + 4 * 256
+                put_i(r4, 0, QGb) ; put_i(r4, 8, QBb) ; put_i(r4, 16, GTb) ; put_i(r4, 24, S) ; put_i(r4, 32, H) ; put_i(r4, 40, HD)
+                r5<Int> = qb + 5 * 256
+                put_i(r5, 0, QBb) ; put_i(r5, 8, l1v.get(L)) ; put_i(r5, 16, QNMb) ; put_i(r5, 24, S * H) ; put_i(r5, 32, HD) ; put_f(r5, 40, EPS) ; put_i(r5, 48, 0)
+                r6<Int> = qb + 6 * 256
+                put_i(r6, 0, KRb) ; put_i(r6, 8, l2v.get(L)) ; put_i(r6, 16, KNMb) ; put_i(r6, 24, S * KVH) ; put_i(r6, 32, HD) ; put_f(r6, 40, EPS) ; put_i(r6, 48, 0)
+                r7<Int> = qb + 7 * 256
+                put_i(r7, 0, QNMb) ; put_i(r7, 8, KNMb) ; put_i(r7, 16, QRb) ; put_i(r7, 24, KCl) ; put_i(r7, 32, FR)
+                put_i(r7, 40, S) ; put_i(r7, 48, HD) ; put_i(r7, 56, H) ; put_i(r7, 64, KVH) ; put_i(r7, 72, 0) ; put_i(r7, 80, NROT)
+                r8<Int> = qb + 8 * 256
+                put_i(r8, 0, QRb) ; put_i(r8, 8, KCl) ; put_i(r8, 16, VCl) ; put_i(r8, 24, CTXb) ; put_i(r8, 32, H) ; put_i(r8, 40, KVH) ; put_i(r8, 48, HD) ; put_i(r8, 56, 0) ; put_i(r8, 64, S)
+                r9<Int> = qb + 9 * 256
+                put_i(r9, 0, CTXb) ; put_i(r9, 8, GTb) ; put_i(r9, 16, GDb) ; put_i(r9, 24, S * NQ)
+                r10<Int> = qb + 10 * 256
+                put_i(r10, 0, GDb) ; put_i(r10, 8, E32b) ; put_i(r10, 16, S * NQ)
+                set_gemm(qb + 11 * 256, RBA + ofv.get(find_nm(nmv, pf2 + "attn_output.weight")) - RLO, E16b, XMb, S, D, NQ, D, XCb, 0, BIG)
+            }
+            qf<Int> = qb + 16 * 256
+            put_i(qf, 0, XMb) ; put_i(qf, 8, panwv.get(L)) ; put_i(qf, 16, XNb) ; put_i(qf, 24, S) ; put_i(qf, 32, D) ; put_f(qf, 40, EPS) ; put_i(qf, 48, XN32b)
+            tg2<Int> = fty.get(L * 3) ; tu2<Int> = fty.get(L * 3 + 1) ; td2<Int> = fty.get(L * 3 + 2)
+            set_gemm(qf + 256, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_gate.weight")) - RLO, xsel(bm_of(tg2, BIG), XN32b, XN16b), GRb, S, FF, D, GLDY, 0, grid_of(tg2, G2, G3), bm_of(tg2, BIG))
+            set_gemm(qf + 512, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_up.weight")) - RLO, xsel(bm_of(tu2, BIG), XN32b, XN16b), UPb, S, FF, D, GLDY, 0, grid_of(tu2, G2, G3), bm_of(tu2, BIG))
+            set_gemm(qf + 768, RBA + ofv.get(find_nm(nmv, pf2 + "ffn_down.weight")) - RLO, xsel(bm_of(td2, BIG), H32b, H16b), XCb, S, D, FF, D, XMb, grid_of(td2, G2, G3), bm_of(td2, BIG))
+        }
+        dsync()
+        freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+        println("PFB batched prefill S=" + S.to_string() + " dev_used=" + (mtot - mfree).to_string())
+    }
+
+    // ---- the token loop ----
+    // Reference checks (KLD vs llama.cpp): VYB_FORCE_IDS feeds these ids instead of the argmax (teacher forcing);
+    // VYB_LOGDUMP=path writes the f64 logits of every emitted position (VOCAB floats each).
+    fstr<String> = env_get("VYB_FORCE_IDS") else ""
+    fv<Vec<Int>> = parse_ids(fstr)
+    ldp<String> = env_get("VYB_LOGDUMP") else ""
+    LFD<CInt> = -1
+    LHB<Int> = 0
+    // VYB_PSA (default 1): attention-layer per-token params via pinned slots + async copies (no drain)
+    PSA<Int> = 0
+    if ((env_get("VYB_PSA") else "1") == "1") {
+        freedom { if (cuMemAllocHost_v2(loc(PSA), 4096) != 0) { PSA = 0 } }
+    }
+    if ((env_get("VYB_DBG") else "").len() > 0) { LDBG = 1 }
+    // VYB_LKD (default 1): direct cuLaunchKernel from Vyb through the pinned LKC cell block
+    if ((env_get("VYB_LKD") else "1") == "1") {
+        lkc<Int> = 0
+        freedom { if (cuMemAllocHost_v2(loc(lkc), 64) != 0) { lkc = 0 } }
+        if (lkc != 0) {
+            for (i in 0..3) {
+                freedom {
+                    at(from<loc<Int>>(lkc + i * 8)) = 0
+                    at(from<loc<Int>>(lkc + 32 + i * 8)) = lkc + i * 8
+                }
+            }
+            LKC = lkc
+        }
+    }
+    // VYB_CG (default 1; 0 = eager launches): each decode step (layers + lm_head) is one CUDA graph,
+    // captured on a created stream and re-captured only when the attention grid bucket (64 positions) grows.
+    GRA<Int> = 0
+    if ((env_get("VYB_CG") else "1") == "1" && PSA != 0 && LKC != 0) {
+        lst<Int> = 0
+        freedom { if (cuStreamCreate(loc(lst), 0) == 0) { GRA = 1 } }
+        LST = lst
+    }
+    EMBG<Int> = 0
+    if ((env_get("VYB_EMBG") else "1") == "1" && hq6x != 0) { EMBG = 1 }
+    if (GRA == 1 && EMBG == 1) { println("EMBG embed in decode graph") }
+    GX<Int> = 0
+    GBK<Int> = -1
+    GCAP<Int> = 0
+    if (ldp.len() > 0) {
+        freedom {
+            LFD = creat(ldp, 420)
+            cuMemAllocHost_v2(loc(LHB), VOCAB * 8)
+        }
+        if (LFD < 0) { println("ERR open logdump") ; return 1 }
+    }
+    gen<Vec<Int>> = Vec()
+    cur<Int> = prids.get(0)
+    TOTAL<Int> = NP + GEN - 1
+    tpf0<Int> = time_mono_millis() ; tpf1<Int> = 0 ; tfirst<Int> = 0
+    if (STRM == 1) { println("STREAM_BEGIN") }
+    p<Int> = 0
+    for (p in 0..TOTAL - 1) {
+        if (p < NP) { cur = prids.get(p) }
+        if (PFB == 1 && p == 0) {
+            s2<Int> = 0
+            for (s2 in 0..S - 1) { lk4(hq6d, (D + 255) / 256, 256, TEMB + prids.get(s2) * (D / 256) * 210, XCb + s2 * D * 8, D, 0) }
+            for (L in 0..NL - 1) {
+                qb2<Int> = PB2 + L * 32 * 256
+                lk(hrms, S, 256, qb2)
+                if (kind.get(L) == 1) {
+                    if (Q4H == 1) { lk4(hcvh, (S * D + 255) / 256, 256, XN32b, XN16b, S * D, 0) }
+                    lk(hpg4, gemm_grid(S, QKV, PQB), 256, qb2 + 256)
+                    lk(hpg4, gemm_grid(S, VAL, PQB), 256, qb2 + 2 * 256)
+                    lk(hpg8, gemm_grid(S, HV, 64), 256, qb2 + 3 * 256)
+                    lk(hpg8, gemm_grid(S, HV, 64), 256, qb2 + 4 * 256)
+                    lk(hsg, (S * HV + 255) / 256, 256, qb2 + 5 * 256)
+                    lk(hpag, (S * HV + 255) / 256, 256, qb2 + 6 * 256)
+                    lk(hpcv, (S * QKV + 255) / 256, 256, qb2 + 7 * 256)
+                    lk(hpcs, (QKV + 255) / 256, 256, qb2 + 8 * 256)
+                    if (P32 == 1) {
+                        lk(hpl2, (S * 2 * HK + 7) / 8, 256, qb2 + 9 * 256)
+                        lk(hpds, HV * 4, 128, qb2 + 10 * 256)
+                        lk(hng32, (S * HV + 7) / 8, 256, qb2 + 11 * 256)
+                    } else {
+                        lk(hpl2, S * 2 * HK, SS, qb2 + 9 * 256)
+                        lk(hpds, HV * 4, 128, qb2 + 10 * 256)
+                        lk(hngb, S * HV, SS, qb2 + 11 * 256)
+                        lk(hc32, (S * VAL + 255) / 256, 256, qb2 + 12 * 256)
+                    }
+                    if (Q4H == 1) { lk4(hcvh, (S * VAL + 255) / 256, 256, E32o, E16b, S * VAL, 0) }
+                    lk(hpg4, gemm_grid(S, D, PQB), 256, qb2 + 13 * 256)
+                } else {
+                    if (Q5H == 1) {
+                        lk4(hcvh, (S * D + 255) / 256, 256, XN32b, XN16b, S * D, 0)
+                        lk(hpg5h, gemm_grid(S, 2 * NQ, 128), 256, qb2 + 256)
+                        lk(hpg5h, gemm_grid(S, NKV, 128), 256, qb2 + 2 * 256)
+                        lk(hpg5h, gemm_grid(S, NKV, 128), 256, qb2 + 3 * 256)
+                    } else {
+                        lk(hpg5, gemm_grid(S, 2 * NQ, 64), 256, qb2 + 256)
+                        lk(hpg5, gemm_grid(S, NKV, 64), 256, qb2 + 2 * 256)
+                        lk(hpg5, gemm_grid(S, NKV, 64), 256, qb2 + 3 * 256)
+                    }
+                    lk(hqgs, (S * NQ + 255) / 256, 256, qb2 + 4 * 256)
+                    lk(hrms, S * H, 256, qb2 + 5 * 256)
+                    lk(hrms, S * KVH, 256, qb2 + 6 * 256)
+                    lk(hrope, (S * (NQ + NKV) + 255) / 256, 256, qb2 + 7 * 256)
+                    if (P32 == 1) { lk(hpat, ((S + 7) / 8) * KVH, 256, qb2 + 8 * 256) } else { lk(hpat, S * H, 256, qb2 + 8 * 256) }
+                    lk(hgm, (S * NQ + 255) / 256, 256, qb2 + 9 * 256)
+                    lk(hc32, (S * NQ + 255) / 256, 256, qb2 + 10 * 256)
+                    if (XHM == 1) { lk4(hcvh, (S * NQ + 255) / 256, 256, E32o, E16b, S * NQ, 0) }
+                    lk(hpg6, gemm_grid(S, D, BIG), 256, qb2 + 11 * 256)
+                }
+                qf2<Int> = qb2 + 16 * 256
+                lk(hrms, S, 256, qf2)
+                if (XHM == 1) { lk4(hcvh, (S * D + 255) / 256, 256, XN32b, XN16b, S * D, 0) }
+                lk(gemm_h(fty.get(L * 3), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF, bm_of(fty.get(L * 3), BIG)), 256, qf2 + 256)
+                lk(gemm_h(fty.get(L * 3 + 1), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, FF, bm_of(fty.get(L * 3 + 1), BIG)), 256, qf2 + 512)
+                if (P32 == 1 && GLDY < 0) { lk4(hsf32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { if (P32 == 1) { lk4(hsl32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } else { lk4(hs32, (S * FF + 255) / 256, 256, GRb, UPb, H32b, S * FF) } }
+                if (XHM == 1) { lk4(hcvh, (S * FF + 255) / 256, 256, H32b, H16b, S * FF, 0) }
+                lk(gemm_h(fty.get(L * 3 + 2), hpg4, hpg6, hpg5, hpg8, hpgi2, hpgi3), gemm_grid(S, D, bm_of(fty.get(L * 3 + 2), BIG)), 256, qf2 + 768)
+            }
+            freedom { cuMemcpyDtoD_v2(XC, XCb + (S - 1) * D * 8, D * 8) }
+            if (DST == 1) {
+                NST<Int> = HV * SS * SS
+                TSCR<Int> = dalloc(NST * 8)
+                if (TSCR == 0) { println("ERR alloc st_tr scratch") ; return 23 }
+                for (L in 0..NL - 1) {
+                    if (kind.get(L) == 1) {
+                        lk4(htr, (NST + 255) / 256, 256, l5v.get(L), TSCR, SS, NST)
+                        freedom { cuMemcpyDtoD_v2(l5v.get(L), TSCR, NST * (8 - 4 * GDN32)) }
+                    }
+                }
+            }
+        }
+        pg<Int> = p + 1
+        gmode<Int> = 0
+        if (PFB == 0 || p >= NP) {
+        // VYB_EMBG (default 1, needs the decode graph): the token embed runs inside the graph, reading
+        // the token id from CURD (pinned slot PSA+4000, copied by a captured async memcpy), so a replay
+        // launches nothing outside the graph. 0 = eager embed launch before the graph.
+        egm<Int> = 0
+        if (EMBG == 1 && GRA == 1 && p >= NP) { egm = 1 }
+        if (egm == 0) { lk4(hq6d, (D + 255) / 256, 256, TEMB + cur * (D / 256) * 210, XC, D, 0) }
+        if (GRA == 1 && p >= NP) {
+            gmode = 1
+            pg = ((p + 64) / 64) * 64
+            if (pg != GBK) {
+                if (GX != 0) { freedom { cuGraphExecDestroy(GX) } ; GX = 0 }
+                crc<Int> = 0
+                freedom { crc = cuStreamBeginCapture_v2(LST, 2) as Int }
+                if (crc != 0) { println("ERR capture begin " + crc.to_string()) ; return 31 }
+                GCAP = 1
+            } else { LSKIP = 1 }
+        }
+        if (egm == 1) {
+            put_ia(CURD, 0, cur, PSA + 4000)
+            lk4(hq6x, (D + 255) / 256, 256, TEMB, CURD, XC, D)
+        }
+        for (L in 0..NL - 1) {
+            pb<Int> = pbase.get(L)
+            lk(hrmsg, RMSGB, 256, pb)
+            if (kind.get(L) == 1) {
+                if (Q4Q8 == 1) {
+                    if (RMQ8 == 0) { lk(hxq4, (D + 255) / 256, 256, PXNQ) }
+                    if (Q4KM == 1) { lk(hq4q, QKV + VAL, 128, pb + 256) } else { lk(hq4q, (QKV + VAL + 15) / 16, 512, pb + 256) }
+                } else { lk(hq4, (QKV + VAL + Q4G - 1) / Q4G, 512, pb + 256) }
+                if (Q8SK == 1) { lk(hq8s, 2 * HV, 256, pb + 2 * 256) } else {
+                    lk(hq8, (HV + 15) / 16, 512, pb + 2 * 256)
+                    lk(hq8, (HV + 15) / 16, 512, pb + 3 * 256)
+                }
+                if (GDNF == 1) {
+                    lk(hsga, 1, 64, pb + 4 * 256)
+                    lk(hcst, (QKV + 255) / 256, 256, pb + 8 * 256)
+                } else {
+                    lk(hsg, 1, 64, pb + 4 * 256)
+                    lk(hag, 1, 64, pb + 5 * 256)
+                    lk(hsh, (QKV + 255) / 256, 256, pb + 6 * 256)
+                    lk(hil, (QKV + 255) / 256, 256, pb + 7 * 256)
+                    lk(hcv, (QKV + 255) / 256, 256, pb + 8 * 256)
+                    lk(hsv, (QKV + 255) / 256, 256, pb + 9 * 256)
+                }
+                if (RK2 >= 1) {
+                    if (DSF == 1 && DSC == 0) { lk(hdsf, HV, SS, pb + 12 * 256) } else {
+                        lk(hl2b, 2 * HK, SS, pb + 20 * 256)
+                        if (DST == 1) { if (DSP == 1) { lk(hdst, HV * SS / DSPG, DSPT, pb + 12 * 256) } else { lk(hdst, HV, SS, pb + 12 * 256) } } else { if (DSC == 1) { lk(hdsc, HV * SS / 32, 128, pb + 12 * 256) } else { lk(hds, HV, SS, pb + 12 * 256) } }
+                        lk(hngb, HV, SS, pb + 13 * 256)
+                    }
+                } else {
+                    lk(hl2, (GKEY + 255) / 256, 256, pb + 10 * 256)
+                    lk(hl2, (GKEY + 255) / 256, 256, pb + 11 * 256)
+                    lk(hds, HV, SS, pb + 12 * 256)
+                    lk(hng, (VAL + 255) / 256, 256, pb + 13 * 256)
+                }
+                lk(hc32, (VAL + 255) / 256, 256, pb + 14 * 256)
+                if (Q4Q8 == 1) {
+                    lk(hxq4, (VAL + 255) / 256, 256, PEQ)
+                    if (Q4KM == 1) { lk(hq4q, D, 128, pb + 15 * 256) } else { lk(hq4q, (D + 15) / 16, 512, pb + 15 * 256) }
+                } else { lk(hq4, (D + Q4G - 1) / Q4G, 512, pb + 15 * 256) }
+            } else {
+                a<Int> = aidx.get(L)
+                KC2<Int> = KCv.get(a) ; VC2<Int> = VCv.get(a)
+                if (PSA != 0 && p >= NP - 1) {
+                    ps<Int> = PSA + a * 40
+                    put_ia(pb + 3 * 256, 16, VC2 + p * NKV * 8, ps)
+                    put_ia(pb + 7 * 256, 24, KC2 + p * NKV * 8, ps + 8) ; put_ia(pb + 7 * 256, 72, p, ps + 16)
+                    put_ia(pb + 8 * 256, 224, p, ps + 24) ; put_ia(pb + 8 * 256, 240, p + 1, ps + 32)
+                } else {
+                    put_i(pb + 3 * 256, 16, VC2 + p * NKV * 8)
+                    put_i(pb + 7 * 256, 24, KC2 + p * NKV * 8) ; put_i(pb + 7 * 256, 72, p)
+                    put_i(pb + 8 * 256, 224, p) ; put_i(pb + 8 * 256, 240, p + 1)
+                }
+                if (Q5Q8 == 1) {
+                    if (RMQ8 == 0) { lk(hxq5, (D + 255) / 256, 256, PXNQ) }
+                    if (Q5KM == 1) {
+                        lk(hq5q, 2 * NQ, 128, pb + 256)
+                        lk(hq5q, NKV, 128, pb + 2 * 256)
+                        lk(hq5q, NKV, 128, pb + 3 * 256)
+                    } else {
+                        lk(hq5q, (2 * NQ + 15) / 16, 512, pb + 256)
+                        lk(hq5q, (NKV + 15) / 16, 512, pb + 2 * 256)
+                        lk(hq5q, (NKV + 15) / 16, 512, pb + 3 * 256)
+                    }
+                } else {
+                    lk(hq5, (2 * NQ + 15) / 16, 512, pb + 256)
+                    lk(hq5, (NKV + 15) / 16, 512, pb + 2 * 256)
+                    lk(hq5, (NKV + 15) / 16, 512, pb + 3 * 256)
+                }
+                lk(hqgs, (NQ + 255) / 256, 256, pb + 4 * 256)
+                lk(hrms, H, 256, pb + 5 * 256)
+                lk(hrms, KVH, 256, pb + 6 * 256)
+                lk(hrope, (NQ + NKV + 255) / 256, 256, pb + 7 * 256)
+                lk(hasc, (H * pg + 31) / 32, 32, pb + 8 * 256)
+                if (ACX == 1) {
+                    lk4(hrm2, H, 32, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxe, (H * pg + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrs8, 1, 32, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrxw, (H * pg + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                    lk4(hrcw, (NQ + 255) / 256, 256, pb + 8 * 256, RXM, 0, 0)
+                } else { lk(hacx, (NQ + 255) / 256, 256, pb + 8 * 256) }
+                lk(hgm, (NQ + 255) / 256, 256, pb + 9 * 256)
+                lk(hc32, (NQ + 255) / 256, 256, pb + 10 * 256)
+                lk(hq6, (D + Q6G - 1) / Q6G, 512, pb + 11 * 256)
+            }
+            pfb<Int> = pb + 16 * 256
+            tg<Int> = fty.get(L * 3) ; tu<Int> = fty.get(L * 3 + 1) ; tdn<Int> = fty.get(L * 3 + 2)
+            lk(hrmsg, RMSGB, 256, pfb)
+            if (XPM == 1) {
+                if (perm_x(tg, RQ8, RQ83) + perm_x(tu, RQ8, RQ83) > 0) { lk(hxp, (D + 255) / 256, 256, PXN) }
+            }
+            if (RQ8 == 1) {
+                if (RMQ8 == 0 && uses_q8(tg, RQ83) + uses_q8(tu, RQ83) > 0) { lk(hxq, (D + 255) / 256, 256, PXNQ) }
+            }
+            fgu<Int> = 0
+            if (FUS == 1 && tg == tu && is_iq(tg) == 1) { fgu = 1 }
+            if (fgu == 1) {
+                hf<Int> = hi3f
+                if (tg == 22) { hf = hi2f }
+                lk(hf, 2 * gemv_g(tg, FF, IRB, Q4G, Q6G), ITH, pfb + 256)
+            } else {
+                lk(gemv_h(tg, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tg, FF, IRB, Q4G, Q6G), gemv_t(tg, ITH), pfb + 256)
+                lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, IRB, Q4G, Q6G), gemv_t(tu, ITH), pfb + 512)
+            }
+            swq<Int> = 0
+            if (SWQ == 1 && uses_q8(tdn, RQ83) == 1) { swq = 1 ; SWQN = SWQN + 1 }
+            if (swq == 1) { lk(hsq, (FF + 255) / 256, 256, PSQ) } else { lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF) }
+            if (XPM == 1) {
+                if (perm_x(tdn, RQ8, RQ83) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
+            }
+            if (RQ8 == 1 && swq == 0) {
+                if (uses_q8(tdn, RQ83) == 1) { lk(hxq, (FF + 255) / 256, 256, PXHQ) }
+            }
+            lk(gemv_h(tdn, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tdn, D, IRB, Q4G, Q6G), gemv_t(tdn, ITH), pfb + 768)
+        }
+        }
+        if (p >= NP - 1) {
+            lk(hrmsg, RMSGB, 256, PH)
+            lk(hq6, (VOCAB + Q6G - 1) / Q6G, 512, PH + 256)
+            lk(hamp, (NCH + 255) / 256, 256, PH2)
+            lk(hamr, 1, 32, PH3)
+            if (gmode == 1) {
+                grc<Int> = 0
+                if (GCAP == 1) {
+                    gg<Int> = 0
+                    gex<Int> = 0
+                    freedom {
+                        grc = cuStreamEndCapture(LST, loc(gg)) as Int
+                        if (grc == 0) { grc = cuGraphInstantiateWithFlags(loc(gex), gg, 0) as Int }
+                        if (gg != 0) { cuGraphDestroy(gg) }
+                    }
+                    if (grc != 0) { println("ERR graph capture " + grc.to_string() + " at pos " + p.to_string()) ; return 32 }
+                    GX = gex
+                    GBK = pg
+                    GCAP = 0
+                }
+                LSKIP = 0
+                freedom { grc = cuGraphLaunch(GX, LST) as Int }
+                if (grc != 0) { println("ERR graph launch " + grc.to_string()) ; return 33 }
+            }
+            nid<Int> = 0
+            freedom {
+                rc<CInt> = cuCtxSynchronize()
+                if (rc != 0) { println("ERR cuda " + (rc as Int).to_string() + " at pos " + p.to_string()); return 30 }
+                cuMemcpyDtoH_v2(loc(nid), OUTI, 8)
+            }
+            gen.push(nid)
+            cur = nid
+            if (gen.len() <= fv.len()) { cur = fv.get(gen.len() - 1) }
+            if (LFD >= 0) {
+                wn<Int> = 0
+                freedom {
+                    cuMemcpy(LHB, LOGB, VOCAB * 8)
+                    wn = write(LFD, LHB, VOCAB * 8)
+                }
+                if (wn != VOCAB * 8) { println("ERR logdump write") ; return 1 }
+            }
+            if (STRM == 1) {
+                if (nid == 248046 || nid == 248044) { STOPD = 1 } else {
+                    stk<String> = rvm.get(nid) else ""
+                    sout<String> = ""
+                    sn<Int> = stk.len()
+                    si<Int> = 0
+                    while (si < sn) {
+                        slw<Int> = lead_width((stk.char_at(si) as Int) & 255)
+                        sout = sout.concat(String::from_byte(glyph2byte(stk.substring(si, si + slw))))
+                        si = si + slw
+                    }
+                    print(sout)
+                }
+            }
+            if (p == NP - 1) { tpf1 = time_mono_millis() }
+            if (p == NP) { tfirst = time_mono_millis() }
+            if ((env_get("VYB_TOKTEXT") else "").len() > 0) {
+                sofar<Vec<Int>> = Vec()
+                sofar.push(nid)
+                println("TOK " + (p + 1).to_string() + " id=" + nid.to_string() + " <" + llm_decode(tok, sofar) + ">")
+            }
+        }
+        if (STOPD == 1) { break }
+    }
+    if (STRM == 1) { println("") ; println("STREAM_END") }
+    freedom { cuCtxSynchronize() }
+    if (LFD >= 0) { freedom { cuMemFreeHost(LHB) } }
+    tend<Int> = time_mono_millis()
+    freedom { cuMemGetInfo_v2(loc(mfree), loc(mtot)) }
+    resp<String> = llm_decode(tok, gen)
+    gl<String> = ""
+    gi<Int> = 0
+    for (gi in 0..gen.len() - 1) { gl = gl + " " + gen.get(gi).to_string() }
+    println("GEN_IDS=" + gl)
+    println("GEN_TEXT=<" + resp + ">")
+    pfms<Int> = tpf1 - tpf0
+    dms<Int> = tend - tpf1
+    ndec<Int> = gen.len() - 1
+    println("TIMING prefill_tokens=" + NP.to_string() + " prefill_ms=" + pfms.to_string()
+            + " decode_tokens=" + ndec.to_string() + " decode_ms=" + dms.to_string())
+    if (pfms > 0) { println("PREFILL_TOK_S=" + ((NP as Float) * 1000.0 / (pfms as Float)).to_string()) }
+    if (LDBG == 1) { println("SWQ_LAYER_STEPS=" + SWQN.to_string()) }
+    if (dms > 0) { println("DECODE_TOK_S=" + ((ndec as Float) * 1000.0 / (dms as Float)).to_string()) }
+    println("MEM_END dev_used=" + (mtot - mfree).to_string())
+    println("DECODE_DONE")
+    return 0
+}

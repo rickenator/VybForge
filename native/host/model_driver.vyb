@@ -11,6 +11,7 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import llm::{llm_load, llm_decode, llm_encode}
 import vllm::{Model}
 import env::{env_get}
+import time::{time_mono_millis}
 // S0.2: dimensions come from the model's own config, and buffer sizes from the tensor core.
 // Both are PURE (no CUDA, no allocation) — a module that pulls in cuda_binding cannot be
 // imported by a file declaring its own extern "C" (Vyb#442).
@@ -31,6 +32,7 @@ extern "C" {
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
     cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
     cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
+    cuMemcpyAsync(dst<Int>, src<loc<CVoid>>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemFree_v2(dptr<Int>)<CInt>
     cuMemsetD8_v2(dstDevice<Int>, uc<CUInt>, N<Int>)<CInt>
@@ -164,7 +166,57 @@ read_bin(path<String>)<String> -> {
 // in-dim (the kernel's `z` arg): >0 transposes the whole-matrix write. GGUF stores 2D weights
 // out-major, so every real weight matrix needs its own in-dim here (Wq/Wk/Wv→D, Wo→NQ,
 // Wg/Wu→D, Wd→FF); 1D norms take the load_norm path and need nothing.
+// ───────── residency slice (perf): one contiguous run of the model's OWN bytes ─────────
+// The whole forward re-reads and re-uploads every weight tensor from the GGUF on every token
+// through read_model -> String -> cuMemcpyHtoD; that PLUMBING, not I/O, is the measured
+// bottleneck (12.6 GB / 9.29 s = 1.36 GB/s out of a page-cached file). A GGUF stores one
+// block's tensors contiguously, so a whole layer IS a single byte run: upload it ONCE into one
+// device buffer and let the existing staging code index into it instead of reading the file
+// again. RLO/RHI are the run's absolute file offsets, RBA its device base; RHIT counts the
+// staging calls that actually took the resident path, so a "resident" run cannot silently
+// stream instead. Off by default (RHI == RLO), and then every loader is byte-for-byte the
+// streaming path it was.
+RLO<Int> = 0
+RHI<Int> = 0
+RBA<Int> = 0
+RHIT<Int> = 0
+
+# Phase accounting (measurement mode, VYB_PHASE=1): STGMS accumulates the milliseconds each layer
+# spends INSIDE its weight staging (file read + HtoD + dequant-drain, i.e. exactly what residency
+# is meant to remove), so the split against PREFILL_TIMING prices the target before any kernel work.
+# Off by default: the sync it needs to attribute dequant time honestly would change the pipeline.
+PHASE<Int> = 0
+STGMS<Int> = 0
+
+// Device address of `off` inside the resident run, or -1 when it is not resident. One range
+// answers for every tensor of the run, which is why this needs no table and why it extends to
+// N layers by widening the run (blk.0..blk.N is contiguous in the file).
+res_addr(off<Int>)<Int> -> {
+    if (off >= RLO) { if (off < RHI) { return RBA + (off - RLO) } }
+    return -1
+}
+
+// prefix test (the loader-side helpers here predate String.slice and use char_at)
+has_pref(s<String>, p<String>)<Bool> -> {
+    np<Int> = p.len()
+    if (s.len() < np) { return false }
+    i<Int> = 0
+    for (i in 0..np - 1) {
+        if ((s.char_at(i) as Int) != (p.char_at(i) as Int)) { return false }
+    }
+    return true
+}
+
 load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
+    rp<Int> = res_addr(off)
+    if (rp >= 0) {
+        RHIT = RHIT + 1
+        freedom {
+            rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), (numel + 255) / 256, 1, 1, 256, 1, 1, rp, dout, numel, inz)
+            if (rc != 0) { return 33 }
+            return 0
+        }
+    }
     data<String> = read_model(path, off, nb)
     if (data.len() < nb) { return 32 }
     freedom {
@@ -177,6 +229,18 @@ load_quant(path<String>, dpack<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, h
     return 0
 }
 load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
+    rp<Int> = res_addr(off)
+    if (rp >= 0) {
+        RHIT = RHIT + 1
+        freedom {
+            put_i(pf, 0, rp)
+            cuMemcpyHtoD_v2(pf + 8, loc(dout), 8)
+            cuMemcpyHtoD_v2(pf + 16, loc(numel), 8)
+            rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)), (numel + 255) / 256, 1, 1, 256, 1, 1, pf, 0, 0, 0)
+            if (rc != 0) { return 33 }
+            return 0
+        }
+    }
     data<String> = read_model(path, off, numel * 4)
     if (data.len() < numel * 4) { return 32 }
     freedom {
@@ -227,6 +291,23 @@ emb_row(path<String>, off<Int>, tid<Int>, D<Int>, ty<Int>, dpk<Int>, q6fn<loc<CV
 // Everything else — read the raw bytes out of the GGUF, stage them, the transposing write — is the
 // same as `load_quant`; `inz` is the tensor's IN dim exactly as there (gate/up: D, down: FF).
 load_quant_grid(path<String>, dpk<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>, fh<Int>, gridDev<Int>, inz<Int>)<Int> -> {
+    rp<Int> = res_addr(off)
+    if (rp >= 0) {
+        RHIT = RHIT + 1
+        freedom {
+            gv<Int> = gridDev; qv<Int> = rp; ov<Int> = dout; nv<Int> = numel; zv<Int> = inz
+            params<[Int; 5]> = [0, 0, 0, 0, 0]
+            params[0] = addr(gv)
+            params[1] = addr(qv)
+            params[2] = addr(ov)
+            params[3] = addr(nv)
+            params[4] = addr(zv)
+            fnv<loc<CVoid>> = from<loc<CVoid>>(fh)
+            rc<CInt> = cuda_launch_n(from<loc<CVoid>>(addr(fnv)), (numel + 255) / 256, 1, 1, 256, 1, 1, addr(params), 5)
+            if (rc != 0) { return 33 }
+            return 0
+        }
+    }
     data<String> = read_model(path, off, nb)
     if (data.len() < nb) { return 32 }
     freedom {
@@ -256,6 +337,57 @@ load_quant_grid(path<String>, dpk<Int>, dout<Int>, off<Int>, nb<Int>, numel<Int>
 // signature stops being readable. `f*` are function handles (Int, converted at launch), `g*` the
 // device tables.
 struct GridK { f2<Int>, g2<Int>, f3<Int>, g3<Int> }
+
+# ───── f32/f16 compute path: the 4B's VybForge#23 configuration, ported to Ridge ─────
+# The 27B stages every weight tensor PER TOKEN and dequantizes it to f64: measured (VYB_PHASE) that
+# staging work is ~3.2x the layer math, and the f64 MACs run at 1/64 rate. So the FFN weights are
+# dequantized ONCE into f16 slabs and the GEMMs read those directly. Every kernel here already
+# exists in layer.ptx and is gated by the 4B driver — no new kernel is needed:
+#   cast32    f64 -> f32 elementwise (A-operand copies; also the first half of the one-time narrow)
+#   cast16    f32 -> f16 elementwise (the second half of the one-time narrow)
+#   gemm16_p  split-K GEMM, A f32, B f16, 2 columns x 4 rows per thread -> f32 partials
+#   gemm32_r  reduce of the partials, storing f64 — so every caller keeps the dtype it already had
+# Param blocks go as STRUCTS via cuMemcpyAsync: the 4B measured the synchronous cuMemcpyHtoD from
+# pageable memory performing a STREAM SYNC per field, which drains the queue and serializes host
+# against device (its run_ffn writes 24 fields per layer).
+struct GP16 { a<Int>, b<Int>, sk<Int>, m<Int>, n<Int>, k<Int>, nblk<Int>, ksp<Int> }
+struct GP16R { sk<Int>, scr<Int>, m<Int>, n<Int>, p1<Int>, p2<Int>, ksp<Int> }
+struct GP3C { src<Int>, dst<Int>, n<Int> }
+
+# elementwise cast, 24-byte block (same shape as the 4B's cast1)
+cast_elem(cfn<loc<CVoid>>, pb<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
+    b3<GP3C> = GP3C { src = src, dst = dst, n = n }
+    freedom {
+        if (cuMemcpyAsync(pb, loc(b3), 24, 0) != 0) { return 1 }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, pb, 0, 0, 0)
+        if (rc != 0) { return 77 }
+        return 0
+    }
+    return 0
+}
+
+# split-K GEMM, two passes (the 4B's gemm2). `ksp` carries the pass-1 column factor in its high bits:
+# ksp = split + 65536 * (cf - 1). gemm16_p is the 2-column kernel, so callers pass split + 65536.
+gemm_split(cfn<loc<CVoid>>, grn<loc<CVoid>>, pb<Int>, skb<Int>, ksp<Int>,
+           a<Int>, b<Int>, c<Int>, m<Int>, n<Int>, k<Int>)<Int> -> {
+    freedom {
+        cf<Int> = ksp / 65536 + 1
+        kq<Int> = ksp % 65536
+        nblk<Int> = ((m + 3) / 4 * (n / cf) + 255) / 256
+        b1<GP16> = GP16 { a = a, b = b, sk = skb, m = m, n = n, k = k, nblk = nblk, ksp = kq }
+        if (cuMemcpyAsync(pb, loc(b1), 64, 0) != 0) { return 1 }
+        rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), nblk * kq, 1, 1, 256, 1, 1, pb, 0, 0, 0)
+        if (rc1 != 0) { println("GEMM16_P_ERR rc=" + (rc1 as Int).to_string()); return 73 }
+        # pass 2 reads its params from pb + 64, NOT from pb: the 4B measured that launching it with the
+        # base pointer feeds it pointer values as M/N and makes it fault (illegal address 700).
+        b2<GP16R> = GP16R { sk = skb, scr = c, m = m, n = n, p1 = 0, p2 = 0, ksp = kq }
+        if (cuMemcpyAsync(pb + 64, loc(b2), 56, 0) != 0) { return 1 }
+        rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(grn)), (m * n + 255) / 256, 1, 1, 256, 1, 1, pb + 64, 0, 0, 0)
+        if (rc2 != 0) { println("GEMM16_R_ERR rc=" + (rc2 as Int).to_string()); return 74 }
+        return 0
+    }
+    return 0
+}
 
 // ───────── unit 9c: the recurrent block, on the engine's own weight path ─────────
 // put_*/dump_* are the small device-side helpers the Gated DeltaNet branch needs. `dump_section`
@@ -520,6 +652,46 @@ run_ffn(S<Int>, D<Int>, FF<Int>, gfn<loc<CVoid>>, rfn<loc<CVoid>>, sfn<loc<CVoid
         cuda_launch4i(from<loc<CVoid>>(addr(gfn)), (gM * gN + 255) / 256, 1, 1, 256, 1, 1, GM, 0, 0, 0)
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
         return 0
+    }
+    return 0
+}
+
+# ───── the f16 FFN: same stages, same order, weights read from the resident f16 slabs ─────
+# run_ffn's twin for VYB_FFN16=1. Three differences and no others: both A operands are cast to f32
+# first (gemm16_p reads A with ld_f32), the weights come from the slab built ONCE per block, and each
+# GEMM is the split-K pair (gemm16_p + gemm32_r) instead of the f64 element-per-thread `gemm`. The
+# rmsnorm / silu / residual stages are byte-for-byte the same calls, and gemm32_r stores f64 — so
+# every buffer, dtype and summation order downstream is unchanged. KSP is passed as KSP + 65536
+# because gemm16_p is the 2-column kernel (see gemm_split).
+run_ffn16(S<Int>, D<Int>, FF<Int>, g16p<loc<CVoid>>, g3r<loc<CVoid>>, c32n<loc<CVoid>>,
+          rfn<loc<CVoid>>, sfn<loc<CVoid>>, refn<loc<CVoid>>,
+          GM<Int>, RN<Int>, EPS<Float>, X1<Int>, N2<Int>, WGA<Int>, WUA<Int>, WDA<Int>, Lb<Int>,
+          X32<Int>, H32<Int>, SKX<Int>, PB<Int>, KSP<Int>,
+          X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>, XO<Int>)<Int> -> {
+    rA<Int> = X1; rB<Int> = N2; rC<Int> = X1N
+    freedom {
+        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
+        cuMemcpyHtoD_v2(RN + 24, loc(S), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
+        rn1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        if (rn1 != 0) { return 93 }
+    }
+    f1<Int> = cast_elem(c32n, PB, X1N, X32, S * D)
+    if (f1 != 0) { println("FFN16_ERR cast X"); return 94 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, X32, WGA + Lb * D * FF * 2, Gr, S, FF, D)
+    if (f1 != 0) { println("FFN16_ERR gate"); return 95 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, X32, WUA + Lb * D * FF * 2, Up, S, FF, D)
+    if (f1 != 0) { println("FFN16_ERR up"); return 96 }
+    freedom {
+        sl1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
+        if (sl1 != 0) { return 97 }
+    }
+    f1 = cast_elem(c32n, PB, Hu, H32, S * FF)
+    if (f1 != 0) { println("FFN16_ERR cast H"); return 94 }
+    f1 = gemm_split(g16p, g3r, PB, SKX, KSP + 65536, H32, WDA + Lb * D * FF * 2, M, S, D, FF)
+    if (f1 != 0) { println("FFN16_ERR down"); return 98 }
+    freedom {
+        rf1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
+        if (rf1 != 0) { return 99 }
     }
     return 0
 }
@@ -982,6 +1154,16 @@ main()<Int> -> {
         f3l<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(f2l), mi2, "iq2sdeq") != 0) { return 10 }
         if (cuModuleGetFunction(loc(f3l), mi3, "iq3sdeq") != 0) { return 10 }
+        # f32/f16 path (the Ridge port of VybForge#23): all four kernels ship in layer.ptx, which this
+        # config already builds. Loaded here so a missing one fails loudly at module-load, not at the
+        # first layer. Inert until VYB_FFN16=1 wires them.
+        g16p<loc<CVoid>> = from<loc<CVoid>>(0); g3r<loc<CVoid>> = from<loc<CVoid>>(0)
+        c32n<loc<CVoid>> = from<loc<CVoid>>(0); c16n<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16p), ml, "gemm16_p") != 0) { println("MODLOAD_FAIL gemm16_p"); return 10 }
+        if (cuModuleGetFunction(loc(g3r), ml, "gemm32_r") != 0) { println("MODLOAD_FAIL gemm32_r"); return 10 }
+        if (cuModuleGetFunction(loc(c32n), ml, "cast32") != 0) { println("MODLOAD_FAIL cast32"); return 10 }
+        if (cuModuleGetFunction(loc(c16n), ml, "cast16") != 0) { println("MODLOAD_FAIL cast16"); return 10 }
+        println("F16_PATH kernels gemm16_p/gemm32_r/cast32/cast16 loaded from layer.ptx")
         # Length-checked, never trusted: a short read here is a grid the kernels would index past.
         g2img<String> = read_bin("native/out/iq2s_grid.bin")
         g3img<String> = read_bin("native/out/iq3s_grid.bin")
@@ -1056,6 +1238,9 @@ main()<Int> -> {
         # once: 16384 x 5120 x 8 = 671 MB, which fits beside the layer weights on a 24 GB card).
         DCH<Int> = 0; DCL<Int> = 0; DBV<Int> = 0; DAO<Int> = 0
         CH<Int> = 16384
+        t_pf0<Int> = 0
+t_pf1<Int> = 0
+        t_ls<Int> = 0
         DPK<Int> = 0; GM<Int> = 0; RN<Int> = 0; ATT<Int> = 0; ROP<Int> = 0; PF<Int> = 0; T4<Int> = 0; A4<Int> = 0; IDS<Int> = 0; EP<Int> = 0
         # unit 10 step 5: the Ridge attention branch's buffers (allocated only when JQG == 1)
         DQG<Int> = 0; DGT<Int> = 0; DGD<Int> = 0; AP1<Int> = 0
@@ -1128,6 +1313,32 @@ main()<Int> -> {
         if (pk_max <= 0) { println("PK_FAIL no tensor to size the staging buffer from"); return 11 }
         println("PK_STAGE bytes=" + pk_max.to_string() + " (the largest tensor staged whole)")
         if (cuMemAlloc_v2(loc(DPK), pk_max) != 0) { return 11 }
+
+        # ---- VYB_FFN16: the FFN's weights dequantized ONCE into resident f16 slabs ----
+        # The measured target: per-token staging (read + HtoD + dequant) is ~3.2x the layer math, and
+        # the read/HtoD half of it is not the cost (546d8d6). So the three FFN matrices — the largest
+        # tensors in the file — are staged once, narrowed to f16, and the GEMMs read the slabs. f16
+        # was cleared numerically first: rounding these tensors costs rel_l2 1-3e-4 and cos
+        # >= 0.99999994 per block against a gate bar of 0.99.
+        fn16s<String> = env_get("VYB_FFN16") else ""
+        FN16<Int> = 0
+        if (fn16s == "1") { FN16 = 1 }
+        WGA<Int> = 0; WUA<Int> = 0; WDA<Int> = 0
+        T32<Int> = 0; X32<Int> = 0; H32<Int> = 0; SKX<Int> = 0; F16PB<Int> = 0
+        FKSP<Int> = 16
+        if (FN16 == 1) {
+            if (cuMemAlloc_v2(loc(WGA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(WUA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(WDA), D * FF * 2 * NTL) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(T32), D * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(X32), S * D * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(H32), S * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SKX), FKSP * S * FF * 4) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(F16PB), 128) != 0) { return 11 }
+            println("FFN16_ALLOC slabs=" + (((D * FF * 2 * NTL) / 1048576) * 3).to_string()
+                    + " MB (3 x f16), scratch T32=" + ((D * FF * 4) / 1048576).to_string()
+                    + " MB, split-K KSP=" + FKSP.to_string())
+        }
 
         # ---- unit 10 step 5: the Ridge attention branch's own buffers ----
         # DQG holds the JOINT q+gate projection (S x 2*NQ), which nothing else allocates; DGT the
@@ -1285,6 +1496,7 @@ main()<Int> -> {
                 if (e != 0) { println("EMBED_ERR row " + ir.to_string() + " token " + dr.to_string() + " e=" + e.to_string()); return 91 }
             }
             println("EMBED_ROWS tokens=" + S.to_string() + " (the prompt's rows only; no table materialised)")
+            t_pf0 = time_mono_millis()
             if (LTR == 1) {
                 # The untied embed is NEW code (W2) and nothing else checks it: dump the first three
                 # components of each prompt row so a python Q6_K dequant of the same table rows can
@@ -1421,6 +1633,117 @@ main()<Int> -> {
                     + " chain=" + MCHN.to_string())
         }
 
+        # ---- residency slice (perf): keep the first VYB_RES_N blocks' bytes ON the GPU ----
+        # A GGUF stores one block's tensors contiguously, so blocks 0..N-1 are a SINGLE byte run:
+        # one cuMemAlloc, one read, one HtoD — and from then on every staging call for those
+        # blocks indexes RBA through res_addr() instead of returning to the file. VYB_RES_N = how
+        # blocks stay resident (0 = off by default, which is the untouched streaming path
+        # everywhere; set VYB_RES_N=N to keep the first N blocks on the GPU). RHIT counts the
+        # staging calls that actually took the device path, so a
+        # "resident" run cannot silently stream, and a run matching no tensor is REPORTED rather
+        # than assumed — this slice exists to measure the plumbing it removes.
+        phases<String> = env_get("VYB_PHASE") else ""
+        if (phases == "1") { PHASE = 1 }
+        resns<String> = env_get("VYB_RES_N") else "0"
+        RESC<Int> = parse_u(resns, 0, resns.len())
+        if (RESC > 0) {
+            rlo<Int> = 0 ; rhi<Int> = 0 ; rcnt<Int> = 0
+            rk<Int> = 0
+            for (rk in 0..RESC - 1) {
+                rpre<String> = "blk." + rk.to_string() + "."
+                rjx<Int> = 0
+                for (rjx in 0..nmv.len() - 1) {
+                    if (has_pref(nmv.get(rjx), rpre)) {
+                        ro<Int> = ofv.get(rjx)
+                        rnb<Int> = packed_bytes(nlv.get(rjx), tyv.get(rjx))
+                        if (rcnt == 0) { rlo = ro ; rhi = ro + rnb }
+                        if (ro < rlo) { rlo = ro }
+                        if (ro + rnb > rhi) { rhi = ro + rnb }
+                        rcnt = rcnt + 1
+                    }
+                }
+            }
+            if (rcnt > 0) {
+                # the pointer comes back through a LOCAL: cuMemAlloc's out-param does not land in a
+                # file-scope global (measured — it returns 0 with the global still holding 0, and
+                # the HtoD then fails with rc 1 into address 0).
+                rbp<Int> = 0
+                racc<CInt> = cuMemAlloc_v2(loc(rbp), rhi - rlo)
+                if (racc != 0) { println("RESIDENT_SLICE alloc failed rc=" + (racc as Int).to_string()); return 11 }
+                RBA = rbp
+                # Chunked: a single read_at above ~1 GB comes back SHORT ("read short", measured at
+                # N=16 — 2.8 GB — while N=4's 698 MB was fine), so the run is read and copied in
+                # 256 MB pieces. The copy is a plain HtoD into RBA+offset, one piece at a time.
+                rdone<Int> = 0
+                rchunk<Int> = 268435456
+                rc2<CInt> = 0
+                while (rdone < rhi - rlo) {
+                    rn<Int> = rchunk
+                    if (rhi - rlo - rdone < rchunk) { rn = rhi - rlo - rdone }
+                    rpiece<String> = read_model(MODEL, rlo + rdone, rn)
+                    if (rpiece.len() < rn) {
+                        println("RESIDENT_SLICE read short at +" + rdone.to_string() + " (wanted " + rn.to_string() + ")")
+                        return 66
+                    }
+                    rc2 = 0
+                    freedom { rc2 = cuMemcpyHtoDAsync_v2(RBA + rdone, rpiece, rn, 0) }
+                    if (rc2 != 0) {
+                        println("RESIDENT_SLICE upload failed rc=" + (rc2 as Int).to_string()
+                                + " at +" + rdone.to_string())
+                        return 66
+                    }
+                    rdone = rdone + rn
+                }
+                cuCtxSynchronize()
+                RLO = rlo ; RHI = rhi
+                println("RESIDENT_SLICE blocks=" + RESC.to_string() + " of " + NTL.to_string()
+                        + " tensors=" + rcnt.to_string() + " lo=" + rlo.to_string()
+                        + " hi=" + rhi.to_string() + " bytes=" + (rhi - rlo).to_string()
+                        + " (" + ((rhi - rlo) / 1048576).to_string() + " MB, one upload)")
+            } else {
+                println("RESIDENT_SLICE blocks=" + RESC.to_string() + " matched no tensor in the index")
+            }
+        } else {
+            println("RESIDENT_SLICE off: every tensor streams from the file")
+        }
+
+        # ---- FFN16: build the three f16 slabs, ONCE for the whole model ----
+        # One pass over the blocks: stage each FFN matrix through the engine's own staging path (the
+        # dequant stays the verified one), narrow it f64 -> f32 -> f16 with the two cast kernels, and
+        # write it into the slab. This is the same staging work the loop used to do PER TOKEN, paid
+        # once per process — which is the whole point of the port.
+        if (FN16 == 1) {
+            println("FFN16_BUILD " + NTL.to_string() + " blocks x 3 matrices, one-time")
+            t_bs<Int> = time_mono_millis()
+            L16<Int> = 0
+            e16<Int> = 0
+            for (L16 in 0..NTL - 1) {
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK)
+                if (e16 != 0) { println("FFN16_ERR stage gate L=" + L16.to_string()); return 74 }
+                e16 = cast_elem(c32n, F16PB, DWg, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast gate"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WGA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow gate"); return 70 }
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK)
+                if (e16 != 0) { println("FFN16_ERR stage up L=" + L16.to_string()); return 75 }
+                e16 = cast_elem(c32n, F16PB, DWu, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast up"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WUA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow up"); return 70 }
+                e16 = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L16.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK)
+                if (e16 != 0) { println("FFN16_ERR stage down L=" + L16.to_string()); return 76 }
+                e16 = cast_elem(c32n, F16PB, DWd, T32, D * FF)
+                if (e16 != 0) { println("FFN16_ERR cast down"); return 70 }
+                e16 = cast_elem(c16n, F16PB, T32, WDA + L16 * D * FF * 2, D * FF)
+                if (e16 != 0) { println("FFN16_ERR narrow down"); return 70 }
+                if (L16 % 8 == 0) { println("FFN16_BUILD " + L16.to_string() + "/" + NTL.to_string()) }
+            }
+            cuCtxSynchronize()
+            t_be<Int> = time_mono_millis()
+            println("FFN16_READY slabs built (f16, " + (((D * FF * 2 * NTL) / 1048576) * 3).to_string() + " MB)"
+                    + " build_ms=" + (t_be - t_bs).to_string())
+        }
+
         LST<Int> = 0 ; LEP<Int> = NTL
         if (MTPM == 1) { LST = NTL ; LEP = NTL + 1 }
         # ---- W4b: the CHAINED draft's step loop (VYB_MTP_CHAIN=<N>, default off) ----
@@ -1525,6 +1848,7 @@ main()<Int> -> {
                 return 0
             }
             if (lkc == 2) {
+                if (PHASE == 1) { freedom { cuCtxSynchronize() } ; t_ls = time_mono_millis() }
                 # ---- the recurrent block: mixer (per token, state carried) then the shared FFN ----
                 l_an<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_norm.weight")
                 l_qk<Int> = find_nm(nmv, "blk." + L.to_string() + ".attn_qkv.weight")
@@ -1571,9 +1895,16 @@ main()<Int> -> {
                 if (l_fn < 0) { println("GDN_ERR blk." + L.to_string() + " has no FFN pre-norm tensor"); return 7 }
                 e = load_norm(MODEL, PF, DPK, N2, ofv.get(l_fn), nlv.get(l_fn), efn)
                 if (e != 0) { println("GDN_ERR stage ffn pre-norm"); return 80 }
+                if (FN16 == 0) {
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 74 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 75 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { return 76 }
+                }
+                if (PHASE == 1) {
+                    freedom { cuCtxSynchronize() }
+                    t_lx<Int> = time_mono_millis()
+                    STGMS = STGMS + (t_lx - t_ls)
+                }
                 if (PR >= 0) {
                     println("GDN_GEOM blk." + L.to_string() + ".NE=" + GNE.to_string() + " S=" + GSS.to_string()
                             + " Hk=" + GHK.to_string() + " Hv=" + GHV.to_string() + " d_conv=" + GDC.to_string()
@@ -1696,6 +2027,7 @@ main()<Int> -> {
                 }
             } else {
             if (JQG == 1) {
+                if (PHASE == 1) { freedom { cuCtxSynchronize() } ; t_ls = time_mono_millis() }
                 # ---- Ridge's ATTENTION block, on the engine's own weight path (unit 10 step 5) ----
                 # `attn_q` is a JOINT q+gate projection, so the block is: attn_norm -> qg -> SPLIT
                 # (qg_split) -> the two per-head RMS norms -> rope_nrot over the first NROT dims ->
@@ -1734,6 +2066,11 @@ main()<Int> -> {
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { println("ATTN_ERR stage ffn_gate"); return 74 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { println("ATTN_ERR stage ffn_up"); return 75 }
                 e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { println("ATTN_ERR stage ffn_down"); return 76 }
+                if (PHASE == 1) {
+                    freedom { cuCtxSynchronize() }
+                    t_lz<Int> = time_mono_millis()
+                    STGMS = STGMS + (t_lz - t_ls)
+                }
                 if (APR >= 0) {
                     println("ATTN_GEOM blk." + L.to_string() + " D=" + D.to_string() + " H=" + H.to_string()
                             + " KVH=" + KVH.to_string() + " HD=" + HD.to_string() + " NQ=" + NQ.to_string()
@@ -1837,9 +2174,11 @@ main()<Int> -> {
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k.weight", DPK, PF, DWk, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 71 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_v.weight", DPK, PF, DWv, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 72 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_output.weight", DPK, PF, DWo, q4fn, q5fn, q6fn, efn, NQ, GK); if (e != 0) { return 73 }
+            if (FN16 == 0) {
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_gate.weight", DPK, PF, DWg, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 74 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_up.weight", DPK, PF, DWu, q4fn, q5fn, q6fn, efn, D, GK); if (e != 0) { return 75 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".ffn_down.weight", DPK, PF, DWd, q4fn, q5fn, q6fn, efn, FF, GK); if (e != 0) { return 76 }
+            }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_norm.weight", DPK, PF, N1, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 77 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_q_norm.weight", DPK, PF, Nq, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 78 }
             e = stage_one(MODEL, nmv, ofv, nlv, tyv, "blk." + L.to_string() + ".attn_k_norm.weight", DPK, PF, Nk, q4fn, q5fn, q6fn, efn, 0, GK); if (e != 0) { return 79 }
@@ -1852,9 +2191,16 @@ main()<Int> -> {
             if (e != 0) { return 81 }
             }
             }
+            if (FN16 == 1) {
+                e = run_ffn16(S, D, FF, g16p, g3r, c32n, rfn, sfn, refn, GM, RN, EPS,
+                              X1, N2, WGA, WUA, WDA, L, X32, H32, SKX, F16PB, FKSP,
+                              X1N, Gr, Up, Hu, M, XO)
+                if (e != 0) { println("FFN16_ERR run_ffn16 L=" + L.to_string()); return 82 }
+            } else {
             e = run_ffn(S, D, FF, gfn, rfn, sfn, refn, GM, RN, EPS,
                         X1, N2, DWg, DWu, DWd, X1N, Gr, Up, Hu, M, XO)
             if (e != 0) { return 82 }
+            }
             if (LTR == 1) {
                 match (open_write("native/out/ridge_trace_L" + L.to_string() + ".txt")) {
                     tw -> {
@@ -1943,6 +2289,16 @@ main()<Int> -> {
             ? -> { return 17 }
         }
         println("PREFILL_HIDDEN_DONE (layers=" + MAXL.to_string() + ")")
+        t_pf1 = time_mono_millis()
+        println("PREFILL_TIMING S=" + S.to_string() + " ms=" + (t_pf1 - t_pf0).to_string() + " us_per_token=" + (((t_pf1 - t_pf0) * 1000) / S).to_string())
+        # the residency slice's own evidence: how many staging calls read RBA instead of the file
+        if (RESC > 0) {
+            println("RESIDENT_SLICE_HITS blocks=" + RESC.to_string() + " staged_from_device=" + RHIT.to_string())
+        }
+        if (PHASE == 1) {
+            println("PHASE_SPLIT staging_ms=" + STGMS.to_string() + " total_ms=" + (t_pf1 - t_pf0).to_string()
+                    + " staging_pct=" + ((STGMS * 100) / ((t_pf1 - t_pf0) + 1)).to_string())
+        }
 
         if (DOLM == 1) {
             i0 = find_nm(nmv, "output_norm.weight")

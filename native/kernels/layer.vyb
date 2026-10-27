@@ -260,7 +260,10 @@ attn(p<Int>) -> {
     HD<Int> = ld_i64(p + 200)
     H<Int> = ld_i64(p + 208)
     KVH<Int> = ld_i64(p + 216)
-    scale<Float> = 1.0 / vsqrt(HD as Float, 16)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
     hkv<Int> = H / KVH
     total<Int> = S * H * HD
     gid<Int> = blk_x() * dim_x() + tid_x()
@@ -450,5 +453,3370 @@ widen32(p<Int>) -> {
     if (gid < N) {
         w<Float32> = ld_f32(SRC + gid * 4)
         st_f64(DST + gid * 8, w)
+    }
+}
+
+// KV-cached causal attention (Ursela, VybForge#23 follow-up). Same math, loops and per-element summation
+// order as `attn`, but the S query rows sit at ABSOLUTE positions P0..P0+S-1 and K/V are the per-layer
+// CACHE ([MAXS, KVH*HD], rows 0..P0+S-1 already written). Query row s attends to cache rows 0..P0+s, so
+// with P0 = 0 and S = full length this is exactly `attn`; with S = 1 it is the decode step. Bit-identical
+// to the uncached path because every product and sum happens in the same order.
+// PD offsets: as attn (+80 Q, +88 K, +96 V, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH) plus +224 P0.
+attn_kv(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    total<Int> = S * H * HD
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        kb<Int> = K + kvh * HD * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = 0.0
+            ia<Int> = 0
+            for (ia in 0..HD - 1) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(kb + (ta * KVH * HD + ia) * 8)
+                sc = sc + qv * kv
+            }
+            sc = sc * scale
+            if (sc > mx) { mx = sc }
+        }
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            sc2<Float> = 0.0
+            ib<Int> = 0
+            for (ib in 0..HD - 1) {
+                qv2<Float> = ld_f64(qb + ib * 8)
+                kv2<Float> = ld_f64(kb + (tb * KVH * HD + ib) * 8)
+                sc2 = sc2 + qv2 * kv2
+            }
+            sc2 = sc2 * scale
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            sc3<Float> = 0.0
+            jj<Int> = 0
+            for (jj in 0..HD - 1) {
+                qv3<Float> = ld_f64(qb + jj * 8)
+                kv3<Float> = ld_f64(kb + (tc * KVH * HD + jj) * 8)
+                sc3 = sc3 + qv3 * kv3
+            }
+            sc3 = sc3 * scale
+            e<Float> = vexp(sc3 - mx)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
+// Two-kernel KV attention (Ursela, VybForge#23 follow-up). attn/attn_kv give each of the HD threads of a
+// (row, head) its OWN copy of every score: 3 passes x (P0+s+1) positions x HD MACs per thread, all f64 --
+// HD-fold redundant, and it made a 128-token generation 4x slower per token than a 3-token one. Here the
+// score is computed ONCE per (row, head, position) into scratch SC, and the context kernel only reads it.
+// Every score is the same sequential HD dot product times scale, and the context thread runs the same
+// max / sum-of-exp / weighted-sum loops in the same order over the same values, so the output is
+// BIT-IDENTICAL to attn_kv (and attn).
+// Params: the ATT block (+80 Q, +88 K cache, +96 V cache, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH,
+// +224 P0) plus +232 SC (scratch, [S, H, T] f64) and +240 T = P0 + S (cache rows valid).
+// attn_sc: one thread per (s, h, t), t < T; positions t > P0 + s are causal-masked and never read.
+attn_sc(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    # 1/sqrt(HD): 16 dependent f64 divides PER THREAD before (Ursela). For HD=128 use the value that
+    # exact loop produces (0.08838834764831845, computed by the same IEEE ops on the host).
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        gsh<Int> = gid / T
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        if (t <= P0 + s) {
+            kvh<Int> = h / hkv
+            qb<Int> = Q + (s * H * HD + h * HD) * 8
+            kb<Int> = K + (t * KVH * HD + kvh * HD) * 8
+            sc<Float> = 0.0
+            ia<Int> = 0
+            # 8 independent load pairs in flight per trip (2026-10-26): the old one-pair loop paid a full
+            # uncoalesced load latency per element (~62 us per launch). Same adds in the same order.
+            while (ia + 7 < HD) {
+                q0<Float> = ld_f64(qb + ia * 8)
+                q1<Float> = ld_f64(qb + ia * 8 + 8)
+                q2<Float> = ld_f64(qb + ia * 8 + 16)
+                q3<Float> = ld_f64(qb + ia * 8 + 24)
+                q4<Float> = ld_f64(qb + ia * 8 + 32)
+                q5<Float> = ld_f64(qb + ia * 8 + 40)
+                q6<Float> = ld_f64(qb + ia * 8 + 48)
+                q7<Float> = ld_f64(qb + ia * 8 + 56)
+                k0<Float> = ld_f64(kb + ia * 8)
+                k1<Float> = ld_f64(kb + ia * 8 + 8)
+                k2<Float> = ld_f64(kb + ia * 8 + 16)
+                k3<Float> = ld_f64(kb + ia * 8 + 24)
+                k4<Float> = ld_f64(kb + ia * 8 + 32)
+                k5<Float> = ld_f64(kb + ia * 8 + 40)
+                k6<Float> = ld_f64(kb + ia * 8 + 48)
+                k7<Float> = ld_f64(kb + ia * 8 + 56)
+                sc = sc + q0 * k0
+                sc = sc + q1 * k1
+                sc = sc + q2 * k2
+                sc = sc + q3 * k3
+                sc = sc + q4 * k4
+                sc = sc + q5 * k5
+                sc = sc + q6 * k6
+                sc = sc + q7 * k7
+                ia = ia + 8
+            }
+            while (ia < HD) {
+                qv<Float> = ld_f64(qb + ia * 8)
+                kv<Float> = ld_f64(kb + ia * 8)
+                sc = sc + qv * kv
+                ia = ia + 1
+            }
+            st_f64(SC + gid * 8, sc * scale)
+        }
+    }
+}
+
+// attn_cx: one thread per (s, h, ii) -- the context element -- reading the precomputed scores.
+attn_cx(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        sb<Int> = SC + (s * H + h) * T * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = ld_f64(sb + ta * 8)
+            if (sc > mx) { mx = sc }
+        }
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            sc2<Float> = ld_f64(sb + tb * 8)
+            ssum = ssum + vexp(sc2 - mx)
+        }
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            sc3<Float> = ld_f64(sb + tc * 8)
+            e<Float> = vexp(sc3 - mx)
+            w<Float> = e / ssum
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
+// f16 weights (Ursela, VybForge#23 follow-up). gemm32_p already streams its f32 weights at ~85% of DRAM
+// peak at M=1 (3090 ~800 GB/s, GB10 ~240 GB/s in a standalone harness), so the f32 path is at its floor:
+// 14.5 GB read per token. Halving the bytes is the remaining lever short of reading Q4_K directly.
+// gemm16_p is gemm32_p with B stored as IEEE half (2 bytes): the half is widened and bound to a <Float32>
+// local, so the MACs stay native f32 exactly as in gemm32_p (same params, same split-K, same gemm32_r).
+// The half copy rounds each dequantized weight to 11 significant bits; the gold stream is the gate.
+// 2 COLUMNS x 4 rows per thread (Ursela): each thread now loads 2 adjacent halves per k step and keeps
+// 8 accumulators. Swept in a standalone harness (1/2/4 columns x KSP 8..128) on both GPUs at M=1:
+// 2 columns wins on every Qwen3-4B shape, e.g. ffn_down (N=2560, K=9728) GB10 0.286 -> 0.183 ms and
+// q (N=4096) 3090 0.047 -> 0.035 ms at KSP=32. N must be even (all Qwen3 shapes are). The driver's
+// grid uses NBLK = ceil(MB * N/2 / 256), matching what the kernel derives here.
+gemm16_p(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    SK<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    MB<Int> = (M + 3) / 4
+    NC<Int> = N / 2
+    NBLK<Int> = (MB * NC + 255) / 256
+    KSP<Int> = ld_i64(p + 56)
+    bx<Int> = blk_x()
+    ks<Int> = bx / NBLK
+    nb<Int> = bx % NBLK
+    gid<Int> = nb * dim_x() + tid_x()
+    total<Int> = M * N
+    if (gid < MB * NC) {
+        mb<Int> = gid / NC
+        nn<Int> = (gid % NC) * 2
+        mm0<Int> = mb * 4
+        kl<Int> = (K + KSP - 1) / KSP
+        k0<Int> = ks * kl
+        k1<Int> = k0 + kl
+        if (k1 > K) { k1 = K }
+        a0_0<Float32> = 0.0
+        a0_1<Float32> = 0.0
+        a1_0<Float32> = 0.0
+        a1_1<Float32> = 0.0
+        a2_0<Float32> = 0.0
+        a2_1<Float32> = 0.0
+        a3_0<Float32> = 0.0
+        a3_1<Float32> = 0.0
+        pa0<Int> = A + (mm0 * K + k0) * 4
+        pa1<Int> = pa0 + K * 4
+        pa2<Int> = pa0 + K * 8
+        pa3<Int> = pa0 + K * 12
+        pb<Int> = B + (k0 * N + nn) * 2
+        pbx<Int> = N * 2
+        kk<Int> = k0
+        for (kk in k0..k1 - 1) {
+            bv0<Float32> = ld_f16(pb + 0)
+            bv1<Float32> = ld_f16(pb + 2)
+            av0<Float32> = ld_f32(pa0)
+            av1<Float32> = ld_f32(pa1)
+            av2<Float32> = ld_f32(pa2)
+            av3<Float32> = ld_f32(pa3)
+            a0_0 = a0_0 + av0 * bv0
+            a0_1 = a0_1 + av0 * bv1
+            a1_0 = a1_0 + av1 * bv0
+            a1_1 = a1_1 + av1 * bv1
+            a2_0 = a2_0 + av2 * bv0
+            a2_1 = a2_1 + av2 * bv1
+            a3_0 = a3_0 + av3 * bv0
+            a3_1 = a3_1 + av3 * bv1
+            pa0 = pa0 + 4
+            pa1 = pa1 + 4
+            pa2 = pa2 + 4
+            pa3 = pa3 + 4
+            pb = pb + pbx
+        }
+        { st_f32(SK + (ks * total + (mm0 + 0) * N + nn + 0) * 4, a0_0) }
+        { st_f32(SK + (ks * total + (mm0 + 0) * N + nn + 1) * 4, a0_1) }
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn + 0) * 4, a1_0) }
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn + 1) * 4, a1_1) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn + 0) * 4, a2_0) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn + 1) * 4, a2_1) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn + 0) * 4, a3_0) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn + 1) * 4, a3_1) }
+    }
+}
+
+// f32 -> f16 elementwise (load-time expansion of the weights). Params: +0 src (f32), +8 dst (f16), +16 n.
+cast16(p<Int>) -> {
+    SRC<Int> = ld_i64(p + 0)
+    DST<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        v<Float32> = ld_f32(SRC + gid * 4)
+        st_f16(DST + gid * 2, v)
+    }
+}
+
+// Softmax split out of attn_cx (Ursela). attn_cx made each of the HD threads of a (row, head) evaluate
+// 2 x (P0+s+1) f64 vexp and a f64 divide per position -- HD-fold redundant transcendental work at the
+// 1/64 f64 rate of sm_86 (nsys, 3090, GEN=64: attn_cx 31% of GPU time, ~10 ms/token). The softmax is
+// now its own short pipeline, each step once per (row, head[, position]), with the SAME expressions in
+// the SAME order, so the weights -- and the context -- are bit-identical to attn_cx:
+//   attn_mx   (s,h):   mx = max_t SC                      -> MS[2*sh]
+//   attn_ex   (s,h,t): E = vexp(SC - mx)                  -> EW
+//   attn_sum  (s,h):   ssum = sum_t E (t ascending)       -> MS[2*sh+1]
+//   attn_nrm  (s,h,t): W = E / ssum                       -> EW (in place)
+//   attn_cxw  (s,h,ii): acc = sum_t W * V (t ascending)   -> Ctx
+// Params: the ATT block (+96 V cache, +104 Ctx, +184 S, +200 HD, +208 H, +216 KVH, +224 P0, +232 SC,
+// +240 T) plus +248 EW ([S, H, T] f64) and +256 MS ([S, H, 2] f64).
+attn_mx(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H) {
+        s<Int> = gid / H
+        sa<Int> = P0 + s
+        sb<Int> = SC + gid * T * 8
+        mx<Float> = -1000000000000000000000000000000.0
+        ta<Int> = 0
+        for (ta in 0..sa) {
+            sc<Float> = ld_f64(sb + ta * 8)
+            if (sc > mx) { mx = sc }
+        }
+        st_f64(MS + gid * 16, mx)
+    }
+}
+attn_ex(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        sh<Int> = gid / T
+        s<Int> = sh / H
+        if (t <= P0 + s) {
+            mx<Float> = ld_f64(MS + sh * 16)
+            sc<Float> = ld_f64(SC + gid * 8)
+            st_f64(EW + gid * 8, vexp(sc - mx))
+        }
+    }
+}
+attn_sum(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H) {
+        s<Int> = gid / H
+        sa<Int> = P0 + s
+        eb<Int> = EW + gid * T * 8
+        ssum<Float> = 0.0
+        tb<Int> = 0
+        for (tb in 0..sa) {
+            ssum = ssum + ld_f64(eb + tb * 8)
+        }
+        st_f64(MS + gid * 16 + 8, ssum)
+    }
+}
+attn_nrm(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    MS<Int> = ld_i64(p + 256)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * T) {
+        t<Int> = gid % T
+        sh<Int> = gid / T
+        s<Int> = sh / H
+        if (t <= P0 + s) {
+            ssum<Float> = ld_f64(MS + sh * 16 + 8)
+            e<Float> = ld_f64(EW + gid * 8)
+            st_f64(EW + gid * 8, e / ssum)
+        }
+    }
+}
+attn_cxw(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    hkv<Int> = H / KVH
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        ii<Int> = gid % HD
+        gsh<Int> = gid / HD
+        h<Int> = gsh % H
+        s<Int> = gsh / H
+        sa<Int> = P0 + s
+        kvh<Int> = h / hkv
+        wb<Int> = EW + gsh * T * 8
+        acc<Float> = 0.0
+        tc<Int> = 0
+        for (tc in 0..sa) {
+            w<Float> = ld_f64(wb + tc * 8)
+            vv<Float> = ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            acc = acc + w * vv
+        }
+        st_f64(Ctx + (s * H * HD + h * HD + ii) * 8, acc)
+    }
+}
+
+// Block-per-row RMSNorm with a shared-memory reduction (Ursela). nsys, 3090, GEN=64, after 7f6dfdd: the
+// norms were 26% of GPU time (rmsnorm 15%, rms_apply 6%, rms_ss 5%). rmsnorm has every thread re-sum
+// the whole row and every thread runs vsqrt(.., 24) -- a 24-step f64 software sqrt at the 1/64 f64
+// rate; the two-pass pair still runs the sqrt per element. Here ONE block (256 threads) owns a row:
+// strided coalesced sum of squares, a shared-memory tree reduce, ONE sqrt per row by thread 0, then
+// each thread scales its elements. Optional fused f32 copy of the output (Y32 != 0) feeds the f32/f16
+// gemm directly and removes the separate cast32 launch. Summation order differs from rmsnorm (strided
+// partials + tree), so outputs differ at f64 rounding (~1e-16 relative); the gold stream is the gate.
+// Params: +0 X, +8 W, +16 Y, +24 M (rows), +32 N (row length), +40 eps, +48 Y32 (0 = none).
+// Grid = M blocks of 256 threads. Shared slots 0..255 partials, 256 the row's 1/rms.
+rms_blk(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    Y32<Int> = ld_i64(p + 48)
+    row<Int> = blk_x()
+    t<Int> = tid_x()
+    xb<Int> = X + row * N * 8
+    ss<Float> = 0.0
+    d<Int> = t
+    # 4 loads in flight per trip (Ursela): same elements, same summation order -> bit-identical
+    while (d + 768 < N) {
+        a0<Float> = ld_f64(xb + d * 8)
+        a1<Float> = ld_f64(xb + (d + 256) * 8)
+        a2<Float> = ld_f64(xb + (d + 512) * 8)
+        a3<Float> = ld_f64(xb + (d + 768) * 8)
+        ss = ss + a0 * a0
+        ss = ss + a1 * a1
+        ss = ss + a2 * a2
+        ss = ss + a3 * a3
+        d = d + 1024
+    }
+    while (d < N) {
+        v<Float> = ld_f64(xb + d * 8)
+        ss = ss + v * v
+        d = d + 256
+    }
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 128
+    # strides 128/64/32 through shared, 16..1 by warp shuffle: lane t adds lane t+st exactly as the
+    # shared tree did (same pairs, same order) -> bit-identical, 5 fewer block barriers (2026-10-26).
+    while (st2 > 16) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t < 32) {
+        sw<Float> = ld_shared_f64(t)
+        sw = sw + shfl_down_f64(sw, 16)
+        sw = sw + shfl_down_f64(sw, 8)
+        sw = sw + shfl_down_f64(sw, 4)
+        sw = sw + shfl_down_f64(sw, 2)
+        sw = sw + shfl_down_f64(sw, 1)
+        if (t == 0) { st_shared_f64(0, sw) }
+    }
+    if (t == 0) {
+        # Seeded Newton (Ursela): vsqrt(x, 24) from y0=x is 24 dependent f64 divides on one thread
+        # (~6 us on the 3090, half of this kernel). Seed with the classic rsqrt bit trick instead and
+        # take 6 steps: identical result for x in [1e-9, 1e9] (checked against the 24-step loop on
+        # 300k random x, where both have converged to the same fixed point); outside that range the
+        # old loop runs unchanged, so the result is bit-identical everywhere.
+        x<Float> = ld_shared_f64(0) / (N as Float) + eps
+        sq<Float> = 0.0
+        if (x > 0.000000001) {
+            if (x < 1000000000.0) {
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                sq = y
+            }
+        }
+        if (sq == 0.0) { sq = vsqrt(x, 24) }
+        st_shared_f64(256, 1.0 / sq)
+    }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    yb<Int> = Y + row * N * 8
+    d2<Int> = t
+    while (d2 + 256 < N) {
+        xa<Float> = ld_f64(xb + d2 * 8)
+        xc<Float> = ld_f64(xb + (d2 + 256) * 8)
+        wa<Float> = ld_f64(W + d2 * 8)
+        wc<Float> = ld_f64(W + (d2 + 256) * 8)
+        ya<Float> = xa * r * wa
+        yc<Float> = xc * r * wc
+        st_f64(yb + d2 * 8, ya)
+        st_f64(yb + (d2 + 256) * 8, yc)
+        if (Y32 != 0) {
+            st_f32(Y32 + (row * N + d2) * 4, ya)
+            st_f32(Y32 + (row * N + d2 + 256) * 4, yc)
+        }
+        d2 = d2 + 512
+    }
+    while (d2 < N) {
+        xv<Float> = ld_f64(xb + d2 * 8)
+        wv<Float> = ld_f64(W + d2 * 8)
+        y<Float> = xv * r * wv
+        st_f64(yb + d2 * 8, y)
+        if (Y32 != 0) { st_f32(Y32 + (row * N + d2) * 4, y) }
+        d2 = d2 + 256
+    }
+}
+
+// ---- rms_blkg (Ursela, 2026-10-26): single-row rms_blk spread over 5 blocks. rms_blk runs on ONE SM,
+// where f64 math is 2 FMA/clk: the x*r*w scale pass alone is ~3 us of the ~13 us. Every block repeats the
+// identical sum / tree / seeded-Newton (same bits of r), then scales only the 256-element chunks j with
+// j % 5 == blk_x(). Same y = x * r * w per element -> bit-identical to rms_blk. X must not alias Y
+// (blocks read all of X while others write Y); decode's three hidden-size norms are XC/XM -> XN.
+rms_blkg(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 32)
+    eps<Float> = ld_f64(p + 40)
+    Y32<Int> = ld_i64(p + 48)
+    # Y8 (p + 56, 0 = off): also write the q8_1 copy of Y32 that xq8 (rgemv7.vyb) would make from it
+    # -- N int8 then N/32 f32 scales -- so the Q4Q8/Q5Q8 GEMVs skip the separate xq8 launch. Each warp
+    # holds 32 consecutive aligned elements (256 * g + 32 * w + lane + 1280 k), the same groups xq8's
+    # warps quantise, and x is the same f32 rounding of y -> bit-identical to rms_blkg + xq8. Host
+    # turns it on only when N % 32 == 0 (no partial warp).
+    Y8<Int> = ld_i64(p + 56)
+    row<Int> = 0
+    g<Int> = blk_x()
+    t<Int> = tid_x()
+    xb<Int> = X + row * N * 8
+    ss<Float> = 0.0
+    d<Int> = t
+    # 4 loads in flight per trip (Ursela): same elements, same summation order -> bit-identical
+    while (d + 768 < N) {
+        a0<Float> = ld_f64(xb + d * 8)
+        a1<Float> = ld_f64(xb + (d + 256) * 8)
+        a2<Float> = ld_f64(xb + (d + 512) * 8)
+        a3<Float> = ld_f64(xb + (d + 768) * 8)
+        ss = ss + a0 * a0
+        ss = ss + a1 * a1
+        ss = ss + a2 * a2
+        ss = ss + a3 * a3
+        d = d + 1024
+    }
+    while (d < N) {
+        v<Float> = ld_f64(xb + d * 8)
+        ss = ss + v * v
+        d = d + 256
+    }
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 128
+    # strides 128/64/32 through shared, 16..1 by warp shuffle: lane t adds lane t+st exactly as the
+    # shared tree did (same pairs, same order) -> bit-identical, 5 fewer block barriers (2026-10-26).
+    while (st2 > 16) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t < 32) {
+        sw<Float> = ld_shared_f64(t)
+        sw = sw + shfl_down_f64(sw, 16)
+        sw = sw + shfl_down_f64(sw, 8)
+        sw = sw + shfl_down_f64(sw, 4)
+        sw = sw + shfl_down_f64(sw, 2)
+        sw = sw + shfl_down_f64(sw, 1)
+        if (t == 0) { st_shared_f64(0, sw) }
+    }
+    if (t == 0) {
+        # Seeded Newton (Ursela): vsqrt(x, 24) from y0=x is 24 dependent f64 divides on one thread
+        # (~6 us on the 3090, half of this kernel). Seed with the classic rsqrt bit trick instead and
+        # take 6 steps: identical result for x in [1e-9, 1e9] (checked against the 24-step loop on
+        # 300k random x, where both have converged to the same fixed point); outside that range the
+        # old loop runs unchanged, so the result is bit-identical everywhere.
+        x<Float> = ld_shared_f64(0) / (N as Float) + eps
+        sq<Float> = 0.0
+        if (x > 0.000000001) {
+            if (x < 1000000000.0) {
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                sq = y
+            }
+        }
+        if (sq == 0.0) { sq = vsqrt(x, 24) }
+        st_shared_f64(256, 1.0 / sq)
+    }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    yb<Int> = Y + row * N * 8
+    d2<Int> = t + 256 * g
+    while (d2 < N) {
+        xv<Float> = ld_f64(xb + d2 * 8)
+        wv<Float> = ld_f64(W + d2 * 8)
+        y<Float> = xv * r * wv
+        st_f64(yb + d2 * 8, y)
+        if (Y32 != 0) { st_f32(Y32 + (row * N + d2) * 4, y) }
+        if (Y8 != 0) {
+            x8<Float32> = y as Float32
+            a8<Float32> = max_f32(x8, (0.0 as Float32) - x8)
+            a8 = warp_max_f32(a8)
+            dd8<Float32> = a8 / (127.0 as Float32)
+            iv8<Float32> = 0.0 as Float32
+            if (a8 > (0.0 as Float32)) { iv8 = (127.0 as Float32) / a8 }
+            st_i8(Y8 + d2, sat_s8(rni_f32(x8 * iv8)))
+            if (d2 % 32 == 0) { st_f32(Y8 + N + (d2 / 32) * 4, dd8) }
+        }
+        d2 = d2 + 1280
+    }
+}
+
+// ---- Parallel KV attention (Ursela, queue item 22). The attn_mx/attn_sum pair ran ONE thread per
+// (row, head) -- 32 threads on the whole GPU at decode -- looping serially over all T positions, and
+// attn_cxw one thread per (row, head, dim) looping over T; attn_sc read each K row with one thread
+// (8-byte loads 8 KB apart across a warp, 25% sector use). Cost grew linearly with position at very
+// low parallelism. Same math, still f64 throughout, only reduction ORDER changes (tree / chunked):
+// attn_sc2  block = 8 warps = 8 positions of one (row, head); lane l takes dims l, l+32, l+64, l+96
+//           (coalesced K reads), 32-lane tree in shared memory.        grid S*H*ceil(T/8) x 256
+// attn_smx  block per (row, head): tree max (exact), vexp as attn_ex, tree sum, normalize -- the four
+//           mx/ex/sum/nrm launches in one.                              grid S*H x 256
+// attn_cx2  block per (row, head, chunk of positions), thread per dim: serial f64 sum over its
+//           chunk into PC.                                              grid S*H*CS x HD
+// attn_cxr  Ctx = sum of the CS chunk partials in chunk order.          grid ceil(S*H*HD/256) x 256
+// Params as attn_sc/attn_cxw, plus PC (chunk partials) @264; CS is fixed at 8.
+attn_sc2(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    KE<Int> = ld_i64(p + 272)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    hkv<Int> = H / KVH
+    TB<Int> = (T + 7) / 8
+    gsh<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gsh / H
+    h<Int> = gsh % H
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    t<Int> = tb * 8 + tid / 32
+    ok<Int> = 0
+    if (t < T) { if (t <= P0 + s) { ok = 1 } }
+    part<Float> = 0.0
+    if (ok == 1) {
+        qb<Int> = Q + (s * H * HD + h * HD) * 8
+        ia<Int> = l
+        if (KE == 4) {
+            # f32 K cache (VYB_KV32): widen each element, the dot stays f64
+            kb4<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 4
+            while (ia < HD) {
+                kv4<Float32> = ld_f32(kb4 + ia * 4)
+                part = part + ld_f64(qb + ia * 8) * (kv4 as Float)
+                ia = ia + 32
+            }
+        } else {
+            kb<Int> = K + (t * KVH * HD + (h / hkv) * HD) * 8
+            while (ia < HD) {
+                part = part + ld_f64(qb + ia * 8) * ld_f64(kb + ia * 8)
+                ia = ia + 32
+            }
+        }
+    }
+    st_shared_f64(tid, part)
+    kernel_barrier()
+    st2<Int> = 16
+    while (st2 > 0) {
+        if (l < st2) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (l == 0) { if (ok == 1) { st_f64(SC + (gsh * T + t) * 8, ld_shared_f64(tid) * scale) } }
+}
+attn_smx(p<Int>) -> {
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    gsh<Int> = blk_x()
+    s<Int> = gsh / H
+    n<Int> = P0 + s + 1
+    tid<Int> = tid_x()
+    sb<Int> = SC + gsh * T * 8
+    eb<Int> = EW + gsh * T * 8
+    mx<Float> = -1000000000000000000000000000000.0
+    t<Int> = tid
+    while (t < n) {
+        v<Float> = ld_f64(sb + t * 8)
+        if (v > mx) { mx = v }
+        t = t + 256
+    }
+    st_shared_f64(tid, mx)
+    kernel_barrier()
+    st2<Int> = 128
+    while (st2 > 0) {
+        if (tid < st2) {
+            a<Float> = ld_shared_f64(tid)
+            b<Float> = ld_shared_f64(tid + st2)
+            if (b > a) { st_shared_f64(tid, b) }
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    gm<Float> = ld_shared_f64(0)
+    kernel_barrier()
+    ss<Float> = 0.0
+    t2<Int> = tid
+    while (t2 < n) {
+        e<Float> = vexp(ld_f64(sb + t2 * 8) - gm)
+        st_f64(eb + t2 * 8, e)
+        ss = ss + e
+        t2 = t2 + 256
+    }
+    st_shared_f64(tid, ss)
+    kernel_barrier()
+    st3<Int> = 128
+    while (st3 > 0) {
+        if (tid < st3) { st_shared_f64(tid, ld_shared_f64(tid) + ld_shared_f64(tid + st3)) }
+        kernel_barrier()
+        st3 = st3 / 2
+    }
+    tot<Float> = ld_shared_f64(0)
+    E32<Int> = ld_i64(p + 280)
+    t3<Int> = tid
+    if (E32 != 0) {
+        e3<Int> = E32 + gsh * T * 4
+        while (t3 < n) {
+            st_f32(e3 + t3 * 4, (ld_f64(eb + t3 * 8) / tot) as Float32)
+            t3 = t3 + 256
+        }
+    } else {
+        while (t3 < n) {
+            st_f64(eb + t3 * 8, ld_f64(eb + t3 * 8) / tot)
+            t3 = t3 + 256
+        }
+    }
+}
+attn_cx2(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    PC<Int> = ld_i64(p + 264)
+    KE<Int> = ld_i64(p + 272)
+    gsh<Int> = blk_x() / 8
+    c<Int> = blk_x() % 8
+    s<Int> = gsh / H
+    h<Int> = gsh % H
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 7) / 8
+    t0<Int> = c * cl
+    t1<Int> = t0 + cl
+    if (t1 > n) { t1 = n }
+    kvh<Int> = h / (H / KVH)
+    wb<Int> = EW + gsh * T * 8
+    acc<Float> = 0.0
+    tc<Int> = t0
+    if (KE == 4) {
+        while (tc < t1) {
+            vv4<Float32> = ld_f32(V + (tc * KVH * HD + kvh * HD + ii) * 4)
+            acc = acc + ld_f64(wb + tc * 8) * (vv4 as Float)
+            tc = tc + 1
+        }
+    } else {
+        while (tc < t1) {
+            acc = acc + ld_f64(wb + tc * 8) * ld_f64(V + (tc * KVH * HD + kvh * HD + ii) * 8)
+            tc = tc + 1
+        }
+    }
+    st_f64(PC + ((gsh * 8 + c) * HD + ii) * 8, acc)
+}
+attn_cxr(p<Int>) -> {
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    PC<Int> = ld_i64(p + 264)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        gsh<Int> = gid / HD
+        ii<Int> = gid % HD
+        acc<Float> = 0.0
+        c<Int> = 0
+        for (c in 0..7) { acc = acc + ld_f64(PC + ((gsh * 8 + c) * HD + ii) * 8) }
+        st_f64(Ctx + gid * 8, acc)
+    }
+}
+
+// GQA-grouped twins (Ursela): the H/KVH = 4 query heads of a KV group share each K/V row, so one warp
+// reads K row t ONCE and forms all 4 head dots (4 partials per lane, one tree for the 4), and one
+// thread per dim reads V[t] once into 4 head accumulators. Positions are chunked CS = 32 ways for V.
+// attn_sc3 grid S*KVH*ceil(T/8) x 256 (warp = position);  attn_cx3 grid S*KVH*32 x HD;
+// attn_cxr3 grid ceil(S*H*HD/256) x 256 (sums the 32 chunk partials in order). Requires H/KVH == 4.
+attn_sc3(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    KE<Int> = ld_i64(p + 272)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    TB<Int> = (T + 7) / 8
+    gk<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    tid<Int> = tid_x()
+    l<Int> = tid % 32
+    t<Int> = tb * 8 + tid / 32
+    ok<Int> = 0
+    if (t < T) { if (t <= P0 + s) { ok = 1 } }
+    p0<Float> = 0.0
+    p1<Float> = 0.0
+    p2<Float> = 0.0
+    p3<Float> = 0.0
+    if (ok == 1) {
+        qb<Int> = Q + (s * H * HD + g * 4 * HD) * 8
+        kb<Int> = K + (t * KVH * HD + g * HD) * KE
+        ia<Int> = l
+        while (ia < HD) {
+            kv<Float> = 0.0
+            if (KE == 4) {
+                k4<Float32> = ld_f32(kb + ia * 4)
+                kv = k4 as Float
+            } else { kv = ld_f64(kb + ia * 8) }
+            p0 = p0 + ld_f64(qb + ia * 8) * kv
+            p1 = p1 + ld_f64(qb + (HD + ia) * 8) * kv
+            p2 = p2 + ld_f64(qb + (2 * HD + ia) * 8) * kv
+            p3 = p3 + ld_f64(qb + (3 * HD + ia) * 8) * kv
+            ia = ia + 32
+        }
+    }
+    st_shared_f64(tid * 4, p0)
+    st_shared_f64(tid * 4 + 1, p1)
+    st_shared_f64(tid * 4 + 2, p2)
+    st_shared_f64(tid * 4 + 3, p3)
+    kernel_barrier()
+    st2<Int> = 16
+    while (st2 > 0) {
+        if (l < st2) {
+            j<Int> = 0
+            for (j in 0..3) { st_shared_f64(tid * 4 + j, ld_shared_f64(tid * 4 + j) + ld_shared_f64((tid + st2) * 4 + j)) }
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (l < 4) {
+        if (ok == 1) {
+            hh<Int> = g * 4 + l
+            st_f64(SC + ((s * H + hh) * T + t) * 8, ld_shared_f64((tid - l) * 4 + l) * scale)
+        }
+    }
+}
+attn_cx3(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    EW<Int> = ld_i64(p + 248)
+    PC<Int> = ld_i64(p + 264)
+    KE<Int> = ld_i64(p + 272)
+    gk<Int> = blk_x() / 32
+    c<Int> = blk_x() % 32
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 31) / 32
+    t0<Int> = c * cl
+    t1<Int> = t0 + cl
+    if (t1 > n) { t1 = n }
+    w0<Int> = EW + (s * H + g * 4) * T * 8
+    a0<Float> = 0.0
+    a1<Float> = 0.0
+    a2<Float> = 0.0
+    a3<Float> = 0.0
+    tc<Int> = t0
+    while (tc < t1) {
+        vv<Float> = 0.0
+        if (KE == 4) {
+            v4<Float32> = ld_f32(V + (tc * KVH * HD + g * HD + ii) * 4)
+            vv = v4 as Float
+        } else { vv = ld_f64(V + (tc * KVH * HD + g * HD + ii) * 8) }
+        a0 = a0 + ld_f64(w0 + tc * 8) * vv
+        a1 = a1 + ld_f64(w0 + (T + tc) * 8) * vv
+        a2 = a2 + ld_f64(w0 + (2 * T + tc) * 8) * vv
+        a3 = a3 + ld_f64(w0 + (3 * T + tc) * 8) * vv
+        tc = tc + 1
+    }
+    hb<Int> = s * H + g * 4
+    st_f64(PC + (((hb + 0) * 32 + c) * HD + ii) * 8, a0)
+    st_f64(PC + (((hb + 1) * 32 + c) * HD + ii) * 8, a1)
+    st_f64(PC + (((hb + 2) * 32 + c) * HD + ii) * 8, a2)
+    st_f64(PC + (((hb + 3) * 32 + c) * HD + ii) * 8, a3)
+}
+attn_cxr3(p<Int>) -> {
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    PC<Int> = ld_i64(p + 264)
+    C32<Int> = ld_i64(p + 192)   # optional f32 copy of the context (replaces the cast32 launch)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * H * HD) {
+        gsh<Int> = gid / HD
+        ii<Int> = gid % HD
+        acc<Float> = 0.0
+        c<Int> = 0
+        for (c in 0..31) { acc = acc + ld_f64(PC + ((gsh * 32 + c) * HD + ii) * 8) }
+        st_f64(Ctx + gid * 8, acc)
+        if (C32 != 0) { st_f32(C32 + gid * 4, acc) }
+    }
+}
+
+// f32-math attention (Ursela, item 22, VYB_ATTN=4; needs the f32 K/V cache). GB10 runs f64 at a small
+// fraction of f32, and at T ~ 1k the f64 FMAs of the score dots and the weighted V sum were the cost
+// (KV bytes were not: halving them changed nothing). Scores: Q narrowed to f32 per lane, f32 dots, then
+// the tree on the widened partials (Vyb has no f32 shared-memory ops), stored f64 for the (unchanged, f64) softmax; the softmax also writes f32
+// weights (EW32) that attn_cx4 consumes with f32 V into f32 accumulators; chunk partials are stored f64
+// and attn_cxr3 sums them as before. Same grids as attn_sc3 / attn_cx3.
+attn_sc4(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    TB<Int> = (T + 7) / 8
+    gk<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    # causal early exit (Ursela, prefill): a block whose first position is past every query row it serves
+    # has nothing to store; it now skips the dot products and the shared tree (block-uniform branch)
+    if (tb * 8 <= P0 + s) {
+        tid<Int> = tid_x()
+        l<Int> = tid % 32
+        t<Int> = tb * 8 + tid / 32
+        ok<Int> = 0
+        if (t < T) { if (t <= P0 + s) { ok = 1 } }
+        z<Float32> = 0.0 as Float32
+        p0<Float32> = z
+        p1<Float32> = z
+        p2<Float32> = z
+        p3<Float32> = z
+        if (ok == 1) {
+            qb<Int> = Q + (s * H * HD + g * 4 * HD) * 8
+            kb<Int> = K + (t * KVH * HD + g * HD) * 4
+            ia<Int> = l
+            while (ia < HD) {
+                kv<Float32> = ld_f32(kb + ia * 4)
+                q0<Float32> = ld_f64(qb + ia * 8) as Float32
+                q1<Float32> = ld_f64(qb + (HD + ia) * 8) as Float32
+                q2<Float32> = ld_f64(qb + (2 * HD + ia) * 8) as Float32
+                q3<Float32> = ld_f64(qb + (3 * HD + ia) * 8) as Float32
+                p0 = p0 + q0 * kv
+                p1 = p1 + q1 * kv
+                p2 = p2 + q2 * kv
+                p3 = p3 + q3 * kv
+                ia = ia + 32
+            }
+        }
+        // no f32 shared-memory intrinsics in Vyb (only ld/st_shared_f64): the tree runs on the widened partials
+        st_shared_f64(tid * 4, p0 as Float)
+        st_shared_f64(tid * 4 + 1, p1 as Float)
+        st_shared_f64(tid * 4 + 2, p2 as Float)
+        st_shared_f64(tid * 4 + 3, p3 as Float)
+        kernel_barrier()
+        # packed tree (Ursela): the 4 values' active pairs share the 32 lanes (2+1+1+1+1 warp steps instead of
+        # 5 x 4 serial f64 adds); same pairs, same order -> bit-identical
+        wb<Int> = (tid - l) * 4
+        st2<Int> = 16
+        while (st2 > 0) {
+            pc<Int> = l
+            while (pc < 4 * st2) {
+                jv<Int> = pc / st2
+                li<Int> = pc % st2
+                st_shared_f64(wb + li * 4 + jv, ld_shared_f64(wb + li * 4 + jv) + ld_shared_f64(wb + (li + st2) * 4 + jv))
+                pc = pc + 32
+            }
+            kernel_barrier()
+            st2 = st2 / 2
+        }
+        if (l < 4) {
+            if (ok == 1) {
+                hh<Int> = g * 4 + l
+                st_f64(SC + ((s * H + hh) * T + t) * 8, ld_shared_f64((tid - l) * 4 + l) * scale)
+            }
+        }
+    }
+}
+attn_cx4(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    PC<Int> = ld_i64(p + 264)
+    E32<Int> = ld_i64(p + 280)
+    gk<Int> = blk_x() / 32
+    c<Int> = blk_x() % 32
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 31) / 32
+    t0<Int> = c * cl
+    t1<Int> = t0 + cl
+    if (t1 > n) { t1 = n }
+    w0<Int> = E32 + (s * H + g * 4) * T * 4
+    z<Float32> = 0.0 as Float32
+    a0<Float32> = z
+    a1<Float32> = z
+    a2<Float32> = z
+    a3<Float32> = z
+    tc<Int> = t0
+    while (tc < t1) {
+        vv<Float32> = ld_f32(V + (tc * KVH * HD + g * HD + ii) * 4)
+        e0<Float32> = ld_f32(w0 + tc * 4)
+        e1<Float32> = ld_f32(w0 + (T + tc) * 4)
+        e2<Float32> = ld_f32(w0 + (2 * T + tc) * 4)
+        e3<Float32> = ld_f32(w0 + (3 * T + tc) * 4)
+        a0 = a0 + e0 * vv
+        a1 = a1 + e1 * vv
+        a2 = a2 + e2 * vv
+        a3 = a3 + e3 * vv
+        tc = tc + 1
+    }
+    hb<Int> = s * H + g * 4
+    st_f64(PC + (((hb + 0) * 32 + c) * HD + ii) * 8, a0 as Float)
+    st_f64(PC + (((hb + 1) * 32 + c) * HD + ii) * 8, a1 as Float)
+    st_f64(PC + (((hb + 2) * 32 + c) * HD + ii) * 8, a2 as Float)
+    st_f64(PC + (((hb + 3) * 32 + c) * HD + ii) * 8, a3 as Float)
+}
+
+// silu with the f32 store (Ursela, launch fusion): the same f64 silu value, narrowed like cast32 does, so
+// the down-projection input is bit-identical and the separate cast32 launch disappears.
+silu32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        hv<Float> = gv * sg * uv
+        st_f32(h + gid * 4, hv)
+    }
+}
+
+// silu32 + xq8 (rgemv7.vyb) in one launch for the decode FFN: H = silu(G) * U as f32, plus the q8_1
+// copy (n int8 then n/32 f32 scales) the IQ down GEMV reads. Params at p: G U H n Y8. Same element per
+// thread as both kernels (256-thread blocks), the quantised value is the same f32 rounding of hv that
+// st_f32 stores and xq8 reloads, and each warp holds the same 32 aligned elements -> bit-identical.
+// Host uses it only when n % 32 == 0. Out-of-range lanes take x = 0, as in xq8.
+silu32q(p<Int>) -> {
+    g<Int> = ld_i64(p + 0)
+    u<Int> = ld_i64(p + 8)
+    h<Int> = ld_i64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    Y8<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    x8<Float32> = 0.0 as Float32
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        hv<Float> = gv * sg * uv
+        st_f32(h + gid * 4, hv)
+        x8 = hv as Float32
+    }
+    a8<Float32> = max_f32(x8, (0.0 as Float32) - x8)
+    a8 = warp_max_f32(a8)
+    dd8<Float32> = a8 / (127.0 as Float32)
+    iv8<Float32> = 0.0 as Float32
+    if (a8 > (0.0 as Float32)) { iv8 = (127.0 as Float32) / a8 }
+    if (gid < n) {
+        st_i8(Y8 + gid, sat_s8(rni_f32(x8 * iv8)))
+        if (gid % 32 == 0) { st_f32(Y8 + n + (gid / 32) * 4, dd8) }
+    }
+}
+
+// q-norm + k-norm + RoPE in ONE launch (Ursela, launch fusion; was rms_blk x2 + qwen3rope). One block of
+// HD = 128 threads per (row, head) over the S*H q heads then the S*KVH k heads. Same f64 math as
+// rms_blk (its 256-thread tree's first step only adds the +0.0 partials of idle threads, exact) and
+// as qwen3rope's table path (TB != 0), so the rotated q/k are bit-identical. RoPE params at ROP+80
+// (RPB) plus z2 = q src, z3 = k src, z4 = q-norm weight, z5 = k-norm weight, z6 = a rms_blk param
+// block (eps at +40). q/k-norm outputs (xn rows) double as the rsqrt bit-trick scratch, as in rms_blk.
+qknrope(p<Int>) -> {
+    XQ<Int> = ld_i64(p + 80)
+    XK<Int> = ld_i64(p + 88)
+    Qd<Int> = ld_i64(p + 96)
+    Kd<Int> = ld_i64(p + 104)
+    TB<Int> = ld_i64(p + 112)
+    KE4<Int> = ld_i64(p + 120)
+    SQ<Int> = ld_i64(p + 128)
+    SK<Int> = ld_i64(p + 136)
+    WQ<Int> = ld_i64(p + 144)
+    WK<Int> = ld_i64(p + 152)
+    eps<Float> = ld_f64(ld_i64(p + 160) + 40)
+    S<Int> = ld_i64(p + 184)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    POS<Int> = ld_i64(p + 224)
+    half<Int> = HD / 2
+    b<Int> = blk_x()
+    t<Int> = tid_x()
+    isq<Int> = 1
+    rb<Int> = b
+    if (b >= S * H) { isq = 0; rb = b - S * H }
+    src<Int> = SQ + rb * HD * 8
+    wt<Int> = WQ
+    xn<Int> = XQ + rb * HD * 8
+    s<Int> = rb / H
+    if (isq == 0) {
+        src = SK + rb * HD * 8
+        wt = WK
+        xn = XK + rb * HD * 8
+        s = rb / KVH
+    }
+    v<Float> = ld_f64(src + t * 8)
+    ss<Float> = 0.0
+    ss = ss + v * v
+    st_shared_f64(t, ss)
+    kernel_barrier()
+    st2<Int> = 64
+    while (st2 > 0) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t == 0) {
+        x<Float> = ld_shared_f64(0) / (HD as Float) + eps
+        sq<Float> = 0.0
+        if (x > 0.000000001) {
+            if (x < 1000000000.0) {
+                # f64_bits / f64_from_bits (Vyb kernel intrinsics, 2026-10-26): register bit casts; was a
+                # st_f64 / ld_i64 / st_i64 / ld_f64 round trip through global memory (same bits).
+                y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                y = 0.5 * (y + x / y)
+                sq = y
+            }
+        }
+        if (sq == 0.0) { sq = vsqrt(x, 24) }
+        st_shared_f64(256, 1.0 / sq)
+    }
+    kernel_barrier()
+    r<Float> = ld_shared_f64(256)
+    xv<Float> = ld_f64(src + t * 8)
+    wv<Float> = ld_f64(wt + t * 8)
+    yn<Float> = xv * r * wv
+    st_shared_f64(t, yn)
+    kernel_barrier()
+    tix<Int> = TB + ((POS + s) * half + t % half) * 16
+    c<Float> = ld_f64(tix)
+    sn<Float> = ld_f64(tix + 8)
+    o<Float> = 0.0
+    if (t < half) {
+        v1<Float> = ld_shared_f64(t + half)
+        o = yn * c - v1 * sn
+    } else {
+        v1b<Float> = ld_shared_f64(t - half)
+        o = yn * c + v1b * sn
+    }
+    if (isq == 1) {
+        st_f64(Qd + (rb * HD + t) * 8, o)
+    } else {
+        if (KE4 == 4) { st_f32(Kd + (rb * HD + t) * 4, o as Float32) } else { st_f64(Kd + (rb * HD + t) * 8, o) }
+    }
+}
+
+// Register-tiled prefill GEMM pass 1 (Ursela, long-prompt prefill): drop-in for gemm16_p (same params,
+// same split-K ranges, same SK partial layout -> gemm32_r unchanged). One warp computes 8 rows x 256
+// columns: lane l owns columns c0 + l + 32 j (j < 8), so every f16 B load is one coalesced 64-byte line
+// and every A load is a warp broadcast; 64 accumulators per thread. Each output still accumulates
+// a*b over k = k0..k1-1 in order with the same f32 expressions -> bit-identical to gemm16_p.
+// Needs N % 256 == 0 (all Qwen3-4B shapes: 1024, 2560, 4096, 9728).
+gemm16_t(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    SK<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    KSP<Int> = ld_i64(p + 56)
+    MB8<Int> = (M + 7) / 8
+    NG<Int> = N / 256
+    items<Int> = MB8 * NG
+    NBLK<Int> = (items + 7) / 8
+    bx<Int> = blk_x()
+    ks<Int> = bx / NBLK
+    nb<Int> = bx % NBLK
+    w<Int> = nb * 8 + tid_x() / 32
+    lane<Int> = tid_x() % 32
+    total<Int> = M * N
+    if (w < items) {
+        mb<Int> = w / NG
+        cg<Int> = w % NG
+        mm0<Int> = mb * 8
+        c0<Int> = cg * 256 + lane
+        kl<Int> = (K + KSP - 1) / KSP
+        k0<Int> = ks * kl
+        k1<Int> = k0 + kl
+        if (k1 > K) { k1 = K }
+        a0_0<Float32> = 0.0
+        a0_1<Float32> = 0.0
+        a0_2<Float32> = 0.0
+        a0_3<Float32> = 0.0
+        a0_4<Float32> = 0.0
+        a0_5<Float32> = 0.0
+        a0_6<Float32> = 0.0
+        a0_7<Float32> = 0.0
+        a1_0<Float32> = 0.0
+        a1_1<Float32> = 0.0
+        a1_2<Float32> = 0.0
+        a1_3<Float32> = 0.0
+        a1_4<Float32> = 0.0
+        a1_5<Float32> = 0.0
+        a1_6<Float32> = 0.0
+        a1_7<Float32> = 0.0
+        a2_0<Float32> = 0.0
+        a2_1<Float32> = 0.0
+        a2_2<Float32> = 0.0
+        a2_3<Float32> = 0.0
+        a2_4<Float32> = 0.0
+        a2_5<Float32> = 0.0
+        a2_6<Float32> = 0.0
+        a2_7<Float32> = 0.0
+        a3_0<Float32> = 0.0
+        a3_1<Float32> = 0.0
+        a3_2<Float32> = 0.0
+        a3_3<Float32> = 0.0
+        a3_4<Float32> = 0.0
+        a3_5<Float32> = 0.0
+        a3_6<Float32> = 0.0
+        a3_7<Float32> = 0.0
+        a4_0<Float32> = 0.0
+        a4_1<Float32> = 0.0
+        a4_2<Float32> = 0.0
+        a4_3<Float32> = 0.0
+        a4_4<Float32> = 0.0
+        a4_5<Float32> = 0.0
+        a4_6<Float32> = 0.0
+        a4_7<Float32> = 0.0
+        a5_0<Float32> = 0.0
+        a5_1<Float32> = 0.0
+        a5_2<Float32> = 0.0
+        a5_3<Float32> = 0.0
+        a5_4<Float32> = 0.0
+        a5_5<Float32> = 0.0
+        a5_6<Float32> = 0.0
+        a5_7<Float32> = 0.0
+        a6_0<Float32> = 0.0
+        a6_1<Float32> = 0.0
+        a6_2<Float32> = 0.0
+        a6_3<Float32> = 0.0
+        a6_4<Float32> = 0.0
+        a6_5<Float32> = 0.0
+        a6_6<Float32> = 0.0
+        a6_7<Float32> = 0.0
+        a7_0<Float32> = 0.0
+        a7_1<Float32> = 0.0
+        a7_2<Float32> = 0.0
+        a7_3<Float32> = 0.0
+        a7_4<Float32> = 0.0
+        a7_5<Float32> = 0.0
+        a7_6<Float32> = 0.0
+        a7_7<Float32> = 0.0
+        # A arrives packed by apack as [M/8][K][8] f32: the 8 row values of step k are one 32-byte packet
+        pa<Int> = A + (mb * K + k0) * 32
+        pb<Int> = B + (k0 * N + c0) * 2
+        pbx<Int> = N * 2
+        np<Int> = (k1 - k0) / 2
+        pb1<Int> = pb + pbx * 1
+        pbxu<Int> = pbx * 2
+        kk<Int> = 0
+        while (kk < np) {
+            b0v0<Float32> = ld_f16(pb + 0)
+            b0v1<Float32> = ld_f16(pb + 64)
+            b0v2<Float32> = ld_f16(pb + 128)
+            b0v3<Float32> = ld_f16(pb + 192)
+            b0v4<Float32> = ld_f16(pb + 256)
+            b0v5<Float32> = ld_f16(pb + 320)
+            b0v6<Float32> = ld_f16(pb + 384)
+            b0v7<Float32> = ld_f16(pb + 448)
+            a0v0<Float32> = ld_f32(pa + 0)
+            a0v1<Float32> = ld_f32(pa + 4)
+            a0v2<Float32> = ld_f32(pa + 8)
+            a0v3<Float32> = ld_f32(pa + 12)
+            a0v4<Float32> = ld_f32(pa + 16)
+            a0v5<Float32> = ld_f32(pa + 20)
+            a0v6<Float32> = ld_f32(pa + 24)
+            a0v7<Float32> = ld_f32(pa + 28)
+            a0_0 = a0_0 + a0v0 * b0v0
+            a0_1 = a0_1 + a0v0 * b0v1
+            a0_2 = a0_2 + a0v0 * b0v2
+            a0_3 = a0_3 + a0v0 * b0v3
+            a0_4 = a0_4 + a0v0 * b0v4
+            a0_5 = a0_5 + a0v0 * b0v5
+            a0_6 = a0_6 + a0v0 * b0v6
+            a0_7 = a0_7 + a0v0 * b0v7
+            a1_0 = a1_0 + a0v1 * b0v0
+            a1_1 = a1_1 + a0v1 * b0v1
+            a1_2 = a1_2 + a0v1 * b0v2
+            a1_3 = a1_3 + a0v1 * b0v3
+            a1_4 = a1_4 + a0v1 * b0v4
+            a1_5 = a1_5 + a0v1 * b0v5
+            a1_6 = a1_6 + a0v1 * b0v6
+            a1_7 = a1_7 + a0v1 * b0v7
+            a2_0 = a2_0 + a0v2 * b0v0
+            a2_1 = a2_1 + a0v2 * b0v1
+            a2_2 = a2_2 + a0v2 * b0v2
+            a2_3 = a2_3 + a0v2 * b0v3
+            a2_4 = a2_4 + a0v2 * b0v4
+            a2_5 = a2_5 + a0v2 * b0v5
+            a2_6 = a2_6 + a0v2 * b0v6
+            a2_7 = a2_7 + a0v2 * b0v7
+            a3_0 = a3_0 + a0v3 * b0v0
+            a3_1 = a3_1 + a0v3 * b0v1
+            a3_2 = a3_2 + a0v3 * b0v2
+            a3_3 = a3_3 + a0v3 * b0v3
+            a3_4 = a3_4 + a0v3 * b0v4
+            a3_5 = a3_5 + a0v3 * b0v5
+            a3_6 = a3_6 + a0v3 * b0v6
+            a3_7 = a3_7 + a0v3 * b0v7
+            a4_0 = a4_0 + a0v4 * b0v0
+            a4_1 = a4_1 + a0v4 * b0v1
+            a4_2 = a4_2 + a0v4 * b0v2
+            a4_3 = a4_3 + a0v4 * b0v3
+            a4_4 = a4_4 + a0v4 * b0v4
+            a4_5 = a4_5 + a0v4 * b0v5
+            a4_6 = a4_6 + a0v4 * b0v6
+            a4_7 = a4_7 + a0v4 * b0v7
+            a5_0 = a5_0 + a0v5 * b0v0
+            a5_1 = a5_1 + a0v5 * b0v1
+            a5_2 = a5_2 + a0v5 * b0v2
+            a5_3 = a5_3 + a0v5 * b0v3
+            a5_4 = a5_4 + a0v5 * b0v4
+            a5_5 = a5_5 + a0v5 * b0v5
+            a5_6 = a5_6 + a0v5 * b0v6
+            a5_7 = a5_7 + a0v5 * b0v7
+            a6_0 = a6_0 + a0v6 * b0v0
+            a6_1 = a6_1 + a0v6 * b0v1
+            a6_2 = a6_2 + a0v6 * b0v2
+            a6_3 = a6_3 + a0v6 * b0v3
+            a6_4 = a6_4 + a0v6 * b0v4
+            a6_5 = a6_5 + a0v6 * b0v5
+            a6_6 = a6_6 + a0v6 * b0v6
+            a6_7 = a6_7 + a0v6 * b0v7
+            a7_0 = a7_0 + a0v7 * b0v0
+            a7_1 = a7_1 + a0v7 * b0v1
+            a7_2 = a7_2 + a0v7 * b0v2
+            a7_3 = a7_3 + a0v7 * b0v3
+            a7_4 = a7_4 + a0v7 * b0v4
+            a7_5 = a7_5 + a0v7 * b0v5
+            a7_6 = a7_6 + a0v7 * b0v6
+            a7_7 = a7_7 + a0v7 * b0v7
+            b1v0<Float32> = ld_f16(pb1 + 0)
+            b1v1<Float32> = ld_f16(pb1 + 64)
+            b1v2<Float32> = ld_f16(pb1 + 128)
+            b1v3<Float32> = ld_f16(pb1 + 192)
+            b1v4<Float32> = ld_f16(pb1 + 256)
+            b1v5<Float32> = ld_f16(pb1 + 320)
+            b1v6<Float32> = ld_f16(pb1 + 384)
+            b1v7<Float32> = ld_f16(pb1 + 448)
+            a1v0<Float32> = ld_f32(pa + 32)
+            a1v1<Float32> = ld_f32(pa + 36)
+            a1v2<Float32> = ld_f32(pa + 40)
+            a1v3<Float32> = ld_f32(pa + 44)
+            a1v4<Float32> = ld_f32(pa + 48)
+            a1v5<Float32> = ld_f32(pa + 52)
+            a1v6<Float32> = ld_f32(pa + 56)
+            a1v7<Float32> = ld_f32(pa + 60)
+            a0_0 = a0_0 + a1v0 * b1v0
+            a0_1 = a0_1 + a1v0 * b1v1
+            a0_2 = a0_2 + a1v0 * b1v2
+            a0_3 = a0_3 + a1v0 * b1v3
+            a0_4 = a0_4 + a1v0 * b1v4
+            a0_5 = a0_5 + a1v0 * b1v5
+            a0_6 = a0_6 + a1v0 * b1v6
+            a0_7 = a0_7 + a1v0 * b1v7
+            a1_0 = a1_0 + a1v1 * b1v0
+            a1_1 = a1_1 + a1v1 * b1v1
+            a1_2 = a1_2 + a1v1 * b1v2
+            a1_3 = a1_3 + a1v1 * b1v3
+            a1_4 = a1_4 + a1v1 * b1v4
+            a1_5 = a1_5 + a1v1 * b1v5
+            a1_6 = a1_6 + a1v1 * b1v6
+            a1_7 = a1_7 + a1v1 * b1v7
+            a2_0 = a2_0 + a1v2 * b1v0
+            a2_1 = a2_1 + a1v2 * b1v1
+            a2_2 = a2_2 + a1v2 * b1v2
+            a2_3 = a2_3 + a1v2 * b1v3
+            a2_4 = a2_4 + a1v2 * b1v4
+            a2_5 = a2_5 + a1v2 * b1v5
+            a2_6 = a2_6 + a1v2 * b1v6
+            a2_7 = a2_7 + a1v2 * b1v7
+            a3_0 = a3_0 + a1v3 * b1v0
+            a3_1 = a3_1 + a1v3 * b1v1
+            a3_2 = a3_2 + a1v3 * b1v2
+            a3_3 = a3_3 + a1v3 * b1v3
+            a3_4 = a3_4 + a1v3 * b1v4
+            a3_5 = a3_5 + a1v3 * b1v5
+            a3_6 = a3_6 + a1v3 * b1v6
+            a3_7 = a3_7 + a1v3 * b1v7
+            a4_0 = a4_0 + a1v4 * b1v0
+            a4_1 = a4_1 + a1v4 * b1v1
+            a4_2 = a4_2 + a1v4 * b1v2
+            a4_3 = a4_3 + a1v4 * b1v3
+            a4_4 = a4_4 + a1v4 * b1v4
+            a4_5 = a4_5 + a1v4 * b1v5
+            a4_6 = a4_6 + a1v4 * b1v6
+            a4_7 = a4_7 + a1v4 * b1v7
+            a5_0 = a5_0 + a1v5 * b1v0
+            a5_1 = a5_1 + a1v5 * b1v1
+            a5_2 = a5_2 + a1v5 * b1v2
+            a5_3 = a5_3 + a1v5 * b1v3
+            a5_4 = a5_4 + a1v5 * b1v4
+            a5_5 = a5_5 + a1v5 * b1v5
+            a5_6 = a5_6 + a1v5 * b1v6
+            a5_7 = a5_7 + a1v5 * b1v7
+            a6_0 = a6_0 + a1v6 * b1v0
+            a6_1 = a6_1 + a1v6 * b1v1
+            a6_2 = a6_2 + a1v6 * b1v2
+            a6_3 = a6_3 + a1v6 * b1v3
+            a6_4 = a6_4 + a1v6 * b1v4
+            a6_5 = a6_5 + a1v6 * b1v5
+            a6_6 = a6_6 + a1v6 * b1v6
+            a6_7 = a6_7 + a1v6 * b1v7
+            a7_0 = a7_0 + a1v7 * b1v0
+            a7_1 = a7_1 + a1v7 * b1v1
+            a7_2 = a7_2 + a1v7 * b1v2
+            a7_3 = a7_3 + a1v7 * b1v3
+            a7_4 = a7_4 + a1v7 * b1v4
+            a7_5 = a7_5 + a1v7 * b1v5
+            a7_6 = a7_6 + a1v7 * b1v6
+            a7_7 = a7_7 + a1v7 * b1v7
+            pa = pa + 64
+            pb = pb + pbxu
+            pb1 = pb1 + pbxu
+            kk = kk + 1
+        }
+        nr<Int> = (k1 - k0) % 2
+        if (nr > 0) {
+            r0b0<Float32> = ld_f16(pb + 0)
+            r0b1<Float32> = ld_f16(pb + 64)
+            r0b2<Float32> = ld_f16(pb + 128)
+            r0b3<Float32> = ld_f16(pb + 192)
+            r0b4<Float32> = ld_f16(pb + 256)
+            r0b5<Float32> = ld_f16(pb + 320)
+            r0b6<Float32> = ld_f16(pb + 384)
+            r0b7<Float32> = ld_f16(pb + 448)
+            r0a0<Float32> = ld_f32(pa + 0)
+            r0a1<Float32> = ld_f32(pa + 4)
+            r0a2<Float32> = ld_f32(pa + 8)
+            r0a3<Float32> = ld_f32(pa + 12)
+            r0a4<Float32> = ld_f32(pa + 16)
+            r0a5<Float32> = ld_f32(pa + 20)
+            r0a6<Float32> = ld_f32(pa + 24)
+            r0a7<Float32> = ld_f32(pa + 28)
+            a0_0 = a0_0 + r0a0 * r0b0
+            a0_1 = a0_1 + r0a0 * r0b1
+            a0_2 = a0_2 + r0a0 * r0b2
+            a0_3 = a0_3 + r0a0 * r0b3
+            a0_4 = a0_4 + r0a0 * r0b4
+            a0_5 = a0_5 + r0a0 * r0b5
+            a0_6 = a0_6 + r0a0 * r0b6
+            a0_7 = a0_7 + r0a0 * r0b7
+            a1_0 = a1_0 + r0a1 * r0b0
+            a1_1 = a1_1 + r0a1 * r0b1
+            a1_2 = a1_2 + r0a1 * r0b2
+            a1_3 = a1_3 + r0a1 * r0b3
+            a1_4 = a1_4 + r0a1 * r0b4
+            a1_5 = a1_5 + r0a1 * r0b5
+            a1_6 = a1_6 + r0a1 * r0b6
+            a1_7 = a1_7 + r0a1 * r0b7
+            a2_0 = a2_0 + r0a2 * r0b0
+            a2_1 = a2_1 + r0a2 * r0b1
+            a2_2 = a2_2 + r0a2 * r0b2
+            a2_3 = a2_3 + r0a2 * r0b3
+            a2_4 = a2_4 + r0a2 * r0b4
+            a2_5 = a2_5 + r0a2 * r0b5
+            a2_6 = a2_6 + r0a2 * r0b6
+            a2_7 = a2_7 + r0a2 * r0b7
+            a3_0 = a3_0 + r0a3 * r0b0
+            a3_1 = a3_1 + r0a3 * r0b1
+            a3_2 = a3_2 + r0a3 * r0b2
+            a3_3 = a3_3 + r0a3 * r0b3
+            a3_4 = a3_4 + r0a3 * r0b4
+            a3_5 = a3_5 + r0a3 * r0b5
+            a3_6 = a3_6 + r0a3 * r0b6
+            a3_7 = a3_7 + r0a3 * r0b7
+            a4_0 = a4_0 + r0a4 * r0b0
+            a4_1 = a4_1 + r0a4 * r0b1
+            a4_2 = a4_2 + r0a4 * r0b2
+            a4_3 = a4_3 + r0a4 * r0b3
+            a4_4 = a4_4 + r0a4 * r0b4
+            a4_5 = a4_5 + r0a4 * r0b5
+            a4_6 = a4_6 + r0a4 * r0b6
+            a4_7 = a4_7 + r0a4 * r0b7
+            a5_0 = a5_0 + r0a5 * r0b0
+            a5_1 = a5_1 + r0a5 * r0b1
+            a5_2 = a5_2 + r0a5 * r0b2
+            a5_3 = a5_3 + r0a5 * r0b3
+            a5_4 = a5_4 + r0a5 * r0b4
+            a5_5 = a5_5 + r0a5 * r0b5
+            a5_6 = a5_6 + r0a5 * r0b6
+            a5_7 = a5_7 + r0a5 * r0b7
+            a6_0 = a6_0 + r0a6 * r0b0
+            a6_1 = a6_1 + r0a6 * r0b1
+            a6_2 = a6_2 + r0a6 * r0b2
+            a6_3 = a6_3 + r0a6 * r0b3
+            a6_4 = a6_4 + r0a6 * r0b4
+            a6_5 = a6_5 + r0a6 * r0b5
+            a6_6 = a6_6 + r0a6 * r0b6
+            a6_7 = a6_7 + r0a6 * r0b7
+            a7_0 = a7_0 + r0a7 * r0b0
+            a7_1 = a7_1 + r0a7 * r0b1
+            a7_2 = a7_2 + r0a7 * r0b2
+            a7_3 = a7_3 + r0a7 * r0b3
+            a7_4 = a7_4 + r0a7 * r0b4
+            a7_5 = a7_5 + r0a7 * r0b5
+            a7_6 = a7_6 + r0a7 * r0b6
+            a7_7 = a7_7 + r0a7 * r0b7
+        }
+        if (mm0 + 0 < M) {
+            ob0<Int> = SK + (ks * total + (mm0 + 0) * N + c0) * 4
+            st_f32(ob0 + 0, a0_0)
+            st_f32(ob0 + 128, a0_1)
+            st_f32(ob0 + 256, a0_2)
+            st_f32(ob0 + 384, a0_3)
+            st_f32(ob0 + 512, a0_4)
+            st_f32(ob0 + 640, a0_5)
+            st_f32(ob0 + 768, a0_6)
+            st_f32(ob0 + 896, a0_7)
+        }
+        if (mm0 + 1 < M) {
+            ob1<Int> = SK + (ks * total + (mm0 + 1) * N + c0) * 4
+            st_f32(ob1 + 0, a1_0)
+            st_f32(ob1 + 128, a1_1)
+            st_f32(ob1 + 256, a1_2)
+            st_f32(ob1 + 384, a1_3)
+            st_f32(ob1 + 512, a1_4)
+            st_f32(ob1 + 640, a1_5)
+            st_f32(ob1 + 768, a1_6)
+            st_f32(ob1 + 896, a1_7)
+        }
+        if (mm0 + 2 < M) {
+            ob2<Int> = SK + (ks * total + (mm0 + 2) * N + c0) * 4
+            st_f32(ob2 + 0, a2_0)
+            st_f32(ob2 + 128, a2_1)
+            st_f32(ob2 + 256, a2_2)
+            st_f32(ob2 + 384, a2_3)
+            st_f32(ob2 + 512, a2_4)
+            st_f32(ob2 + 640, a2_5)
+            st_f32(ob2 + 768, a2_6)
+            st_f32(ob2 + 896, a2_7)
+        }
+        if (mm0 + 3 < M) {
+            ob3<Int> = SK + (ks * total + (mm0 + 3) * N + c0) * 4
+            st_f32(ob3 + 0, a3_0)
+            st_f32(ob3 + 128, a3_1)
+            st_f32(ob3 + 256, a3_2)
+            st_f32(ob3 + 384, a3_3)
+            st_f32(ob3 + 512, a3_4)
+            st_f32(ob3 + 640, a3_5)
+            st_f32(ob3 + 768, a3_6)
+            st_f32(ob3 + 896, a3_7)
+        }
+        if (mm0 + 4 < M) {
+            ob4<Int> = SK + (ks * total + (mm0 + 4) * N + c0) * 4
+            st_f32(ob4 + 0, a4_0)
+            st_f32(ob4 + 128, a4_1)
+            st_f32(ob4 + 256, a4_2)
+            st_f32(ob4 + 384, a4_3)
+            st_f32(ob4 + 512, a4_4)
+            st_f32(ob4 + 640, a4_5)
+            st_f32(ob4 + 768, a4_6)
+            st_f32(ob4 + 896, a4_7)
+        }
+        if (mm0 + 5 < M) {
+            ob5<Int> = SK + (ks * total + (mm0 + 5) * N + c0) * 4
+            st_f32(ob5 + 0, a5_0)
+            st_f32(ob5 + 128, a5_1)
+            st_f32(ob5 + 256, a5_2)
+            st_f32(ob5 + 384, a5_3)
+            st_f32(ob5 + 512, a5_4)
+            st_f32(ob5 + 640, a5_5)
+            st_f32(ob5 + 768, a5_6)
+            st_f32(ob5 + 896, a5_7)
+        }
+        if (mm0 + 6 < M) {
+            ob6<Int> = SK + (ks * total + (mm0 + 6) * N + c0) * 4
+            st_f32(ob6 + 0, a6_0)
+            st_f32(ob6 + 128, a6_1)
+            st_f32(ob6 + 256, a6_2)
+            st_f32(ob6 + 384, a6_3)
+            st_f32(ob6 + 512, a6_4)
+            st_f32(ob6 + 640, a6_5)
+            st_f32(ob6 + 768, a6_6)
+            st_f32(ob6 + 896, a6_7)
+        }
+        if (mm0 + 7 < M) {
+            ob7<Int> = SK + (ks * total + (mm0 + 7) * N + c0) * 4
+            st_f32(ob7 + 0, a7_0)
+            st_f32(ob7 + 128, a7_1)
+            st_f32(ob7 + 256, a7_2)
+            st_f32(ob7 + 384, a7_3)
+            st_f32(ob7 + 512, a7_4)
+            st_f32(ob7 + 640, a7_5)
+            st_f32(ob7 + 768, a7_6)
+            st_f32(ob7 + 896, a7_7)
+        }
+    }
+}
+
+// apack (Ursela): A [M][K] f32 -> [ceil(M/8)][K][8] f32 packets for gemm16_t (rows >= M repeat row M-1).
+// Params: +0 src, +8 dst, +16 M, +24 K.
+apack(p<Int>) -> {
+    SRC<Int> = ld_i64(p + 0)
+    DST<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 16)
+    K<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < (M + 7) / 8 * K * 8) {
+        i<Int> = gid % 8
+        kk<Int> = (gid / 8) % K
+        mb<Int> = gid / (8 * K)
+        row<Int> = mb * 8 + i
+        if (row > M - 1) { row = M - 1 }
+        v<Float32> = ld_f32(SRC + (row * K + kk) * 4)
+        st_f32(DST + gid * 4, v)
+    }
+}
+
+
+
+
+
+
+
+
+
+
+// Prefill attention (Ursela). attn_sc4 spends a warp, 5 block barriers and a shared f64 tree per score; at
+// S=512 that is ~190 ms/forward on GB10. attn_sc5 gives each (row s, kv group g, position t) ONE thread
+// that rebuilds attn_sc4's arithmetic exactly: lane partial l = sum over ia = l, l+32, l+64, l+96 (f32,
+// same order), then the same f64 pairwise tree (16, 8, 4, 2, 1) -> bit-identical scores. HD == 128 only.
+// Grid: S * KVH * ceil(T / 128) blocks of 128 threads (consecutive t -> broadcast Q, coalesced stores).
+attn_sc5(p<Int>) -> {
+    Q<Int> = ld_i64(p + 80)
+    K<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 184)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    SC<Int> = ld_i64(p + 232)
+    T<Int> = ld_i64(p + 240)
+    PC<Int> = ld_i64(p + 264)
+    scale<Float> = 0.08838834764831845
+    TB<Int> = (T + 127) / 128
+    gk<Int> = blk_x() / TB
+    tb<Int> = blk_x() % TB
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    t<Int> = tb * 128 + tid_x()
+    if (t < T) { if (t <= P0 + s) {
+        # K transposed by attn_kt into the (here unused) chunk-partial buffer PC: [g][ia][T] f32 -> coalesced
+        T4<Int> = T * 4
+        Q32<Int> = PC + ((T * KVH * 512 + 255) / 256) * 256   # f32 copy of Q written by attn_kt
+        hj<Int> = 0
+        # all 4 heads of the group in one pass over K (each K element loaded once, not 4 times)
+        qb<Int> = Q32 + (s * H * 128 + g * 4 * 128) * 4
+        kp<Int> = PC + (g * 128 * T + t) * 4
+        p0_0<Float32> = 0.0 as Float32
+        p0_1<Float32> = 0.0 as Float32
+        p0_2<Float32> = 0.0 as Float32
+        p0_3<Float32> = 0.0 as Float32
+        p0_4<Float32> = 0.0 as Float32
+        p0_5<Float32> = 0.0 as Float32
+        p0_6<Float32> = 0.0 as Float32
+        p0_7<Float32> = 0.0 as Float32
+        p0_8<Float32> = 0.0 as Float32
+        p0_9<Float32> = 0.0 as Float32
+        p0_10<Float32> = 0.0 as Float32
+        p0_11<Float32> = 0.0 as Float32
+        p0_12<Float32> = 0.0 as Float32
+        p0_13<Float32> = 0.0 as Float32
+        p0_14<Float32> = 0.0 as Float32
+        p0_15<Float32> = 0.0 as Float32
+        p0_16<Float32> = 0.0 as Float32
+        p0_17<Float32> = 0.0 as Float32
+        p0_18<Float32> = 0.0 as Float32
+        p0_19<Float32> = 0.0 as Float32
+        p0_20<Float32> = 0.0 as Float32
+        p0_21<Float32> = 0.0 as Float32
+        p0_22<Float32> = 0.0 as Float32
+        p0_23<Float32> = 0.0 as Float32
+        p0_24<Float32> = 0.0 as Float32
+        p0_25<Float32> = 0.0 as Float32
+        p0_26<Float32> = 0.0 as Float32
+        p0_27<Float32> = 0.0 as Float32
+        p0_28<Float32> = 0.0 as Float32
+        p0_29<Float32> = 0.0 as Float32
+        p0_30<Float32> = 0.0 as Float32
+        p0_31<Float32> = 0.0 as Float32
+        p1_0<Float32> = 0.0 as Float32
+        p1_1<Float32> = 0.0 as Float32
+        p1_2<Float32> = 0.0 as Float32
+        p1_3<Float32> = 0.0 as Float32
+        p1_4<Float32> = 0.0 as Float32
+        p1_5<Float32> = 0.0 as Float32
+        p1_6<Float32> = 0.0 as Float32
+        p1_7<Float32> = 0.0 as Float32
+        p1_8<Float32> = 0.0 as Float32
+        p1_9<Float32> = 0.0 as Float32
+        p1_10<Float32> = 0.0 as Float32
+        p1_11<Float32> = 0.0 as Float32
+        p1_12<Float32> = 0.0 as Float32
+        p1_13<Float32> = 0.0 as Float32
+        p1_14<Float32> = 0.0 as Float32
+        p1_15<Float32> = 0.0 as Float32
+        p1_16<Float32> = 0.0 as Float32
+        p1_17<Float32> = 0.0 as Float32
+        p1_18<Float32> = 0.0 as Float32
+        p1_19<Float32> = 0.0 as Float32
+        p1_20<Float32> = 0.0 as Float32
+        p1_21<Float32> = 0.0 as Float32
+        p1_22<Float32> = 0.0 as Float32
+        p1_23<Float32> = 0.0 as Float32
+        p1_24<Float32> = 0.0 as Float32
+        p1_25<Float32> = 0.0 as Float32
+        p1_26<Float32> = 0.0 as Float32
+        p1_27<Float32> = 0.0 as Float32
+        p1_28<Float32> = 0.0 as Float32
+        p1_29<Float32> = 0.0 as Float32
+        p1_30<Float32> = 0.0 as Float32
+        p1_31<Float32> = 0.0 as Float32
+        p2_0<Float32> = 0.0 as Float32
+        p2_1<Float32> = 0.0 as Float32
+        p2_2<Float32> = 0.0 as Float32
+        p2_3<Float32> = 0.0 as Float32
+        p2_4<Float32> = 0.0 as Float32
+        p2_5<Float32> = 0.0 as Float32
+        p2_6<Float32> = 0.0 as Float32
+        p2_7<Float32> = 0.0 as Float32
+        p2_8<Float32> = 0.0 as Float32
+        p2_9<Float32> = 0.0 as Float32
+        p2_10<Float32> = 0.0 as Float32
+        p2_11<Float32> = 0.0 as Float32
+        p2_12<Float32> = 0.0 as Float32
+        p2_13<Float32> = 0.0 as Float32
+        p2_14<Float32> = 0.0 as Float32
+        p2_15<Float32> = 0.0 as Float32
+        p2_16<Float32> = 0.0 as Float32
+        p2_17<Float32> = 0.0 as Float32
+        p2_18<Float32> = 0.0 as Float32
+        p2_19<Float32> = 0.0 as Float32
+        p2_20<Float32> = 0.0 as Float32
+        p2_21<Float32> = 0.0 as Float32
+        p2_22<Float32> = 0.0 as Float32
+        p2_23<Float32> = 0.0 as Float32
+        p2_24<Float32> = 0.0 as Float32
+        p2_25<Float32> = 0.0 as Float32
+        p2_26<Float32> = 0.0 as Float32
+        p2_27<Float32> = 0.0 as Float32
+        p2_28<Float32> = 0.0 as Float32
+        p2_29<Float32> = 0.0 as Float32
+        p2_30<Float32> = 0.0 as Float32
+        p2_31<Float32> = 0.0 as Float32
+        p3_0<Float32> = 0.0 as Float32
+        p3_1<Float32> = 0.0 as Float32
+        p3_2<Float32> = 0.0 as Float32
+        p3_3<Float32> = 0.0 as Float32
+        p3_4<Float32> = 0.0 as Float32
+        p3_5<Float32> = 0.0 as Float32
+        p3_6<Float32> = 0.0 as Float32
+        p3_7<Float32> = 0.0 as Float32
+        p3_8<Float32> = 0.0 as Float32
+        p3_9<Float32> = 0.0 as Float32
+        p3_10<Float32> = 0.0 as Float32
+        p3_11<Float32> = 0.0 as Float32
+        p3_12<Float32> = 0.0 as Float32
+        p3_13<Float32> = 0.0 as Float32
+        p3_14<Float32> = 0.0 as Float32
+        p3_15<Float32> = 0.0 as Float32
+        p3_16<Float32> = 0.0 as Float32
+        p3_17<Float32> = 0.0 as Float32
+        p3_18<Float32> = 0.0 as Float32
+        p3_19<Float32> = 0.0 as Float32
+        p3_20<Float32> = 0.0 as Float32
+        p3_21<Float32> = 0.0 as Float32
+        p3_22<Float32> = 0.0 as Float32
+        p3_23<Float32> = 0.0 as Float32
+        p3_24<Float32> = 0.0 as Float32
+        p3_25<Float32> = 0.0 as Float32
+        p3_26<Float32> = 0.0 as Float32
+        p3_27<Float32> = 0.0 as Float32
+        p3_28<Float32> = 0.0 as Float32
+        p3_29<Float32> = 0.0 as Float32
+        p3_30<Float32> = 0.0 as Float32
+        p3_31<Float32> = 0.0 as Float32
+        k0<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_0<Float32> = ld_f32(qb + 0)
+        p0_0 = p0_0 + q0_0 * k0
+        q1_0<Float32> = ld_f32(qb + 512)
+        p1_0 = p1_0 + q1_0 * k0
+        q2_0<Float32> = ld_f32(qb + 1024)
+        p2_0 = p2_0 + q2_0 * k0
+        q3_0<Float32> = ld_f32(qb + 1536)
+        p3_0 = p3_0 + q3_0 * k0
+        k1<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_1<Float32> = ld_f32(qb + 4)
+        p0_1 = p0_1 + q0_1 * k1
+        q1_1<Float32> = ld_f32(qb + 516)
+        p1_1 = p1_1 + q1_1 * k1
+        q2_1<Float32> = ld_f32(qb + 1028)
+        p2_1 = p2_1 + q2_1 * k1
+        q3_1<Float32> = ld_f32(qb + 1540)
+        p3_1 = p3_1 + q3_1 * k1
+        k2<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_2<Float32> = ld_f32(qb + 8)
+        p0_2 = p0_2 + q0_2 * k2
+        q1_2<Float32> = ld_f32(qb + 520)
+        p1_2 = p1_2 + q1_2 * k2
+        q2_2<Float32> = ld_f32(qb + 1032)
+        p2_2 = p2_2 + q2_2 * k2
+        q3_2<Float32> = ld_f32(qb + 1544)
+        p3_2 = p3_2 + q3_2 * k2
+        k3<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_3<Float32> = ld_f32(qb + 12)
+        p0_3 = p0_3 + q0_3 * k3
+        q1_3<Float32> = ld_f32(qb + 524)
+        p1_3 = p1_3 + q1_3 * k3
+        q2_3<Float32> = ld_f32(qb + 1036)
+        p2_3 = p2_3 + q2_3 * k3
+        q3_3<Float32> = ld_f32(qb + 1548)
+        p3_3 = p3_3 + q3_3 * k3
+        k4<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_4<Float32> = ld_f32(qb + 16)
+        p0_4 = p0_4 + q0_4 * k4
+        q1_4<Float32> = ld_f32(qb + 528)
+        p1_4 = p1_4 + q1_4 * k4
+        q2_4<Float32> = ld_f32(qb + 1040)
+        p2_4 = p2_4 + q2_4 * k4
+        q3_4<Float32> = ld_f32(qb + 1552)
+        p3_4 = p3_4 + q3_4 * k4
+        k5<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_5<Float32> = ld_f32(qb + 20)
+        p0_5 = p0_5 + q0_5 * k5
+        q1_5<Float32> = ld_f32(qb + 532)
+        p1_5 = p1_5 + q1_5 * k5
+        q2_5<Float32> = ld_f32(qb + 1044)
+        p2_5 = p2_5 + q2_5 * k5
+        q3_5<Float32> = ld_f32(qb + 1556)
+        p3_5 = p3_5 + q3_5 * k5
+        k6<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_6<Float32> = ld_f32(qb + 24)
+        p0_6 = p0_6 + q0_6 * k6
+        q1_6<Float32> = ld_f32(qb + 536)
+        p1_6 = p1_6 + q1_6 * k6
+        q2_6<Float32> = ld_f32(qb + 1048)
+        p2_6 = p2_6 + q2_6 * k6
+        q3_6<Float32> = ld_f32(qb + 1560)
+        p3_6 = p3_6 + q3_6 * k6
+        k7<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_7<Float32> = ld_f32(qb + 28)
+        p0_7 = p0_7 + q0_7 * k7
+        q1_7<Float32> = ld_f32(qb + 540)
+        p1_7 = p1_7 + q1_7 * k7
+        q2_7<Float32> = ld_f32(qb + 1052)
+        p2_7 = p2_7 + q2_7 * k7
+        q3_7<Float32> = ld_f32(qb + 1564)
+        p3_7 = p3_7 + q3_7 * k7
+        k8<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_8<Float32> = ld_f32(qb + 32)
+        p0_8 = p0_8 + q0_8 * k8
+        q1_8<Float32> = ld_f32(qb + 544)
+        p1_8 = p1_8 + q1_8 * k8
+        q2_8<Float32> = ld_f32(qb + 1056)
+        p2_8 = p2_8 + q2_8 * k8
+        q3_8<Float32> = ld_f32(qb + 1568)
+        p3_8 = p3_8 + q3_8 * k8
+        k9<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_9<Float32> = ld_f32(qb + 36)
+        p0_9 = p0_9 + q0_9 * k9
+        q1_9<Float32> = ld_f32(qb + 548)
+        p1_9 = p1_9 + q1_9 * k9
+        q2_9<Float32> = ld_f32(qb + 1060)
+        p2_9 = p2_9 + q2_9 * k9
+        q3_9<Float32> = ld_f32(qb + 1572)
+        p3_9 = p3_9 + q3_9 * k9
+        k10<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_10<Float32> = ld_f32(qb + 40)
+        p0_10 = p0_10 + q0_10 * k10
+        q1_10<Float32> = ld_f32(qb + 552)
+        p1_10 = p1_10 + q1_10 * k10
+        q2_10<Float32> = ld_f32(qb + 1064)
+        p2_10 = p2_10 + q2_10 * k10
+        q3_10<Float32> = ld_f32(qb + 1576)
+        p3_10 = p3_10 + q3_10 * k10
+        k11<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_11<Float32> = ld_f32(qb + 44)
+        p0_11 = p0_11 + q0_11 * k11
+        q1_11<Float32> = ld_f32(qb + 556)
+        p1_11 = p1_11 + q1_11 * k11
+        q2_11<Float32> = ld_f32(qb + 1068)
+        p2_11 = p2_11 + q2_11 * k11
+        q3_11<Float32> = ld_f32(qb + 1580)
+        p3_11 = p3_11 + q3_11 * k11
+        k12<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_12<Float32> = ld_f32(qb + 48)
+        p0_12 = p0_12 + q0_12 * k12
+        q1_12<Float32> = ld_f32(qb + 560)
+        p1_12 = p1_12 + q1_12 * k12
+        q2_12<Float32> = ld_f32(qb + 1072)
+        p2_12 = p2_12 + q2_12 * k12
+        q3_12<Float32> = ld_f32(qb + 1584)
+        p3_12 = p3_12 + q3_12 * k12
+        k13<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_13<Float32> = ld_f32(qb + 52)
+        p0_13 = p0_13 + q0_13 * k13
+        q1_13<Float32> = ld_f32(qb + 564)
+        p1_13 = p1_13 + q1_13 * k13
+        q2_13<Float32> = ld_f32(qb + 1076)
+        p2_13 = p2_13 + q2_13 * k13
+        q3_13<Float32> = ld_f32(qb + 1588)
+        p3_13 = p3_13 + q3_13 * k13
+        k14<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_14<Float32> = ld_f32(qb + 56)
+        p0_14 = p0_14 + q0_14 * k14
+        q1_14<Float32> = ld_f32(qb + 568)
+        p1_14 = p1_14 + q1_14 * k14
+        q2_14<Float32> = ld_f32(qb + 1080)
+        p2_14 = p2_14 + q2_14 * k14
+        q3_14<Float32> = ld_f32(qb + 1592)
+        p3_14 = p3_14 + q3_14 * k14
+        k15<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_15<Float32> = ld_f32(qb + 60)
+        p0_15 = p0_15 + q0_15 * k15
+        q1_15<Float32> = ld_f32(qb + 572)
+        p1_15 = p1_15 + q1_15 * k15
+        q2_15<Float32> = ld_f32(qb + 1084)
+        p2_15 = p2_15 + q2_15 * k15
+        q3_15<Float32> = ld_f32(qb + 1596)
+        p3_15 = p3_15 + q3_15 * k15
+        k16<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_16<Float32> = ld_f32(qb + 64)
+        p0_16 = p0_16 + q0_16 * k16
+        q1_16<Float32> = ld_f32(qb + 576)
+        p1_16 = p1_16 + q1_16 * k16
+        q2_16<Float32> = ld_f32(qb + 1088)
+        p2_16 = p2_16 + q2_16 * k16
+        q3_16<Float32> = ld_f32(qb + 1600)
+        p3_16 = p3_16 + q3_16 * k16
+        k17<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_17<Float32> = ld_f32(qb + 68)
+        p0_17 = p0_17 + q0_17 * k17
+        q1_17<Float32> = ld_f32(qb + 580)
+        p1_17 = p1_17 + q1_17 * k17
+        q2_17<Float32> = ld_f32(qb + 1092)
+        p2_17 = p2_17 + q2_17 * k17
+        q3_17<Float32> = ld_f32(qb + 1604)
+        p3_17 = p3_17 + q3_17 * k17
+        k18<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_18<Float32> = ld_f32(qb + 72)
+        p0_18 = p0_18 + q0_18 * k18
+        q1_18<Float32> = ld_f32(qb + 584)
+        p1_18 = p1_18 + q1_18 * k18
+        q2_18<Float32> = ld_f32(qb + 1096)
+        p2_18 = p2_18 + q2_18 * k18
+        q3_18<Float32> = ld_f32(qb + 1608)
+        p3_18 = p3_18 + q3_18 * k18
+        k19<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_19<Float32> = ld_f32(qb + 76)
+        p0_19 = p0_19 + q0_19 * k19
+        q1_19<Float32> = ld_f32(qb + 588)
+        p1_19 = p1_19 + q1_19 * k19
+        q2_19<Float32> = ld_f32(qb + 1100)
+        p2_19 = p2_19 + q2_19 * k19
+        q3_19<Float32> = ld_f32(qb + 1612)
+        p3_19 = p3_19 + q3_19 * k19
+        k20<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_20<Float32> = ld_f32(qb + 80)
+        p0_20 = p0_20 + q0_20 * k20
+        q1_20<Float32> = ld_f32(qb + 592)
+        p1_20 = p1_20 + q1_20 * k20
+        q2_20<Float32> = ld_f32(qb + 1104)
+        p2_20 = p2_20 + q2_20 * k20
+        q3_20<Float32> = ld_f32(qb + 1616)
+        p3_20 = p3_20 + q3_20 * k20
+        k21<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_21<Float32> = ld_f32(qb + 84)
+        p0_21 = p0_21 + q0_21 * k21
+        q1_21<Float32> = ld_f32(qb + 596)
+        p1_21 = p1_21 + q1_21 * k21
+        q2_21<Float32> = ld_f32(qb + 1108)
+        p2_21 = p2_21 + q2_21 * k21
+        q3_21<Float32> = ld_f32(qb + 1620)
+        p3_21 = p3_21 + q3_21 * k21
+        k22<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_22<Float32> = ld_f32(qb + 88)
+        p0_22 = p0_22 + q0_22 * k22
+        q1_22<Float32> = ld_f32(qb + 600)
+        p1_22 = p1_22 + q1_22 * k22
+        q2_22<Float32> = ld_f32(qb + 1112)
+        p2_22 = p2_22 + q2_22 * k22
+        q3_22<Float32> = ld_f32(qb + 1624)
+        p3_22 = p3_22 + q3_22 * k22
+        k23<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_23<Float32> = ld_f32(qb + 92)
+        p0_23 = p0_23 + q0_23 * k23
+        q1_23<Float32> = ld_f32(qb + 604)
+        p1_23 = p1_23 + q1_23 * k23
+        q2_23<Float32> = ld_f32(qb + 1116)
+        p2_23 = p2_23 + q2_23 * k23
+        q3_23<Float32> = ld_f32(qb + 1628)
+        p3_23 = p3_23 + q3_23 * k23
+        k24<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_24<Float32> = ld_f32(qb + 96)
+        p0_24 = p0_24 + q0_24 * k24
+        q1_24<Float32> = ld_f32(qb + 608)
+        p1_24 = p1_24 + q1_24 * k24
+        q2_24<Float32> = ld_f32(qb + 1120)
+        p2_24 = p2_24 + q2_24 * k24
+        q3_24<Float32> = ld_f32(qb + 1632)
+        p3_24 = p3_24 + q3_24 * k24
+        k25<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_25<Float32> = ld_f32(qb + 100)
+        p0_25 = p0_25 + q0_25 * k25
+        q1_25<Float32> = ld_f32(qb + 612)
+        p1_25 = p1_25 + q1_25 * k25
+        q2_25<Float32> = ld_f32(qb + 1124)
+        p2_25 = p2_25 + q2_25 * k25
+        q3_25<Float32> = ld_f32(qb + 1636)
+        p3_25 = p3_25 + q3_25 * k25
+        k26<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_26<Float32> = ld_f32(qb + 104)
+        p0_26 = p0_26 + q0_26 * k26
+        q1_26<Float32> = ld_f32(qb + 616)
+        p1_26 = p1_26 + q1_26 * k26
+        q2_26<Float32> = ld_f32(qb + 1128)
+        p2_26 = p2_26 + q2_26 * k26
+        q3_26<Float32> = ld_f32(qb + 1640)
+        p3_26 = p3_26 + q3_26 * k26
+        k27<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_27<Float32> = ld_f32(qb + 108)
+        p0_27 = p0_27 + q0_27 * k27
+        q1_27<Float32> = ld_f32(qb + 620)
+        p1_27 = p1_27 + q1_27 * k27
+        q2_27<Float32> = ld_f32(qb + 1132)
+        p2_27 = p2_27 + q2_27 * k27
+        q3_27<Float32> = ld_f32(qb + 1644)
+        p3_27 = p3_27 + q3_27 * k27
+        k28<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_28<Float32> = ld_f32(qb + 112)
+        p0_28 = p0_28 + q0_28 * k28
+        q1_28<Float32> = ld_f32(qb + 624)
+        p1_28 = p1_28 + q1_28 * k28
+        q2_28<Float32> = ld_f32(qb + 1136)
+        p2_28 = p2_28 + q2_28 * k28
+        q3_28<Float32> = ld_f32(qb + 1648)
+        p3_28 = p3_28 + q3_28 * k28
+        k29<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_29<Float32> = ld_f32(qb + 116)
+        p0_29 = p0_29 + q0_29 * k29
+        q1_29<Float32> = ld_f32(qb + 628)
+        p1_29 = p1_29 + q1_29 * k29
+        q2_29<Float32> = ld_f32(qb + 1140)
+        p2_29 = p2_29 + q2_29 * k29
+        q3_29<Float32> = ld_f32(qb + 1652)
+        p3_29 = p3_29 + q3_29 * k29
+        k30<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_30<Float32> = ld_f32(qb + 120)
+        p0_30 = p0_30 + q0_30 * k30
+        q1_30<Float32> = ld_f32(qb + 632)
+        p1_30 = p1_30 + q1_30 * k30
+        q2_30<Float32> = ld_f32(qb + 1144)
+        p2_30 = p2_30 + q2_30 * k30
+        q3_30<Float32> = ld_f32(qb + 1656)
+        p3_30 = p3_30 + q3_30 * k30
+        k31<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_31<Float32> = ld_f32(qb + 124)
+        p0_31 = p0_31 + q0_31 * k31
+        q1_31<Float32> = ld_f32(qb + 636)
+        p1_31 = p1_31 + q1_31 * k31
+        q2_31<Float32> = ld_f32(qb + 1148)
+        p2_31 = p2_31 + q2_31 * k31
+        q3_31<Float32> = ld_f32(qb + 1660)
+        p3_31 = p3_31 + q3_31 * k31
+        k32<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_32<Float32> = ld_f32(qb + 128)
+        p0_0 = p0_0 + q0_32 * k32
+        q1_32<Float32> = ld_f32(qb + 640)
+        p1_0 = p1_0 + q1_32 * k32
+        q2_32<Float32> = ld_f32(qb + 1152)
+        p2_0 = p2_0 + q2_32 * k32
+        q3_32<Float32> = ld_f32(qb + 1664)
+        p3_0 = p3_0 + q3_32 * k32
+        k33<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_33<Float32> = ld_f32(qb + 132)
+        p0_1 = p0_1 + q0_33 * k33
+        q1_33<Float32> = ld_f32(qb + 644)
+        p1_1 = p1_1 + q1_33 * k33
+        q2_33<Float32> = ld_f32(qb + 1156)
+        p2_1 = p2_1 + q2_33 * k33
+        q3_33<Float32> = ld_f32(qb + 1668)
+        p3_1 = p3_1 + q3_33 * k33
+        k34<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_34<Float32> = ld_f32(qb + 136)
+        p0_2 = p0_2 + q0_34 * k34
+        q1_34<Float32> = ld_f32(qb + 648)
+        p1_2 = p1_2 + q1_34 * k34
+        q2_34<Float32> = ld_f32(qb + 1160)
+        p2_2 = p2_2 + q2_34 * k34
+        q3_34<Float32> = ld_f32(qb + 1672)
+        p3_2 = p3_2 + q3_34 * k34
+        k35<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_35<Float32> = ld_f32(qb + 140)
+        p0_3 = p0_3 + q0_35 * k35
+        q1_35<Float32> = ld_f32(qb + 652)
+        p1_3 = p1_3 + q1_35 * k35
+        q2_35<Float32> = ld_f32(qb + 1164)
+        p2_3 = p2_3 + q2_35 * k35
+        q3_35<Float32> = ld_f32(qb + 1676)
+        p3_3 = p3_3 + q3_35 * k35
+        k36<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_36<Float32> = ld_f32(qb + 144)
+        p0_4 = p0_4 + q0_36 * k36
+        q1_36<Float32> = ld_f32(qb + 656)
+        p1_4 = p1_4 + q1_36 * k36
+        q2_36<Float32> = ld_f32(qb + 1168)
+        p2_4 = p2_4 + q2_36 * k36
+        q3_36<Float32> = ld_f32(qb + 1680)
+        p3_4 = p3_4 + q3_36 * k36
+        k37<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_37<Float32> = ld_f32(qb + 148)
+        p0_5 = p0_5 + q0_37 * k37
+        q1_37<Float32> = ld_f32(qb + 660)
+        p1_5 = p1_5 + q1_37 * k37
+        q2_37<Float32> = ld_f32(qb + 1172)
+        p2_5 = p2_5 + q2_37 * k37
+        q3_37<Float32> = ld_f32(qb + 1684)
+        p3_5 = p3_5 + q3_37 * k37
+        k38<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_38<Float32> = ld_f32(qb + 152)
+        p0_6 = p0_6 + q0_38 * k38
+        q1_38<Float32> = ld_f32(qb + 664)
+        p1_6 = p1_6 + q1_38 * k38
+        q2_38<Float32> = ld_f32(qb + 1176)
+        p2_6 = p2_6 + q2_38 * k38
+        q3_38<Float32> = ld_f32(qb + 1688)
+        p3_6 = p3_6 + q3_38 * k38
+        k39<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_39<Float32> = ld_f32(qb + 156)
+        p0_7 = p0_7 + q0_39 * k39
+        q1_39<Float32> = ld_f32(qb + 668)
+        p1_7 = p1_7 + q1_39 * k39
+        q2_39<Float32> = ld_f32(qb + 1180)
+        p2_7 = p2_7 + q2_39 * k39
+        q3_39<Float32> = ld_f32(qb + 1692)
+        p3_7 = p3_7 + q3_39 * k39
+        k40<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_40<Float32> = ld_f32(qb + 160)
+        p0_8 = p0_8 + q0_40 * k40
+        q1_40<Float32> = ld_f32(qb + 672)
+        p1_8 = p1_8 + q1_40 * k40
+        q2_40<Float32> = ld_f32(qb + 1184)
+        p2_8 = p2_8 + q2_40 * k40
+        q3_40<Float32> = ld_f32(qb + 1696)
+        p3_8 = p3_8 + q3_40 * k40
+        k41<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_41<Float32> = ld_f32(qb + 164)
+        p0_9 = p0_9 + q0_41 * k41
+        q1_41<Float32> = ld_f32(qb + 676)
+        p1_9 = p1_9 + q1_41 * k41
+        q2_41<Float32> = ld_f32(qb + 1188)
+        p2_9 = p2_9 + q2_41 * k41
+        q3_41<Float32> = ld_f32(qb + 1700)
+        p3_9 = p3_9 + q3_41 * k41
+        k42<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_42<Float32> = ld_f32(qb + 168)
+        p0_10 = p0_10 + q0_42 * k42
+        q1_42<Float32> = ld_f32(qb + 680)
+        p1_10 = p1_10 + q1_42 * k42
+        q2_42<Float32> = ld_f32(qb + 1192)
+        p2_10 = p2_10 + q2_42 * k42
+        q3_42<Float32> = ld_f32(qb + 1704)
+        p3_10 = p3_10 + q3_42 * k42
+        k43<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_43<Float32> = ld_f32(qb + 172)
+        p0_11 = p0_11 + q0_43 * k43
+        q1_43<Float32> = ld_f32(qb + 684)
+        p1_11 = p1_11 + q1_43 * k43
+        q2_43<Float32> = ld_f32(qb + 1196)
+        p2_11 = p2_11 + q2_43 * k43
+        q3_43<Float32> = ld_f32(qb + 1708)
+        p3_11 = p3_11 + q3_43 * k43
+        k44<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_44<Float32> = ld_f32(qb + 176)
+        p0_12 = p0_12 + q0_44 * k44
+        q1_44<Float32> = ld_f32(qb + 688)
+        p1_12 = p1_12 + q1_44 * k44
+        q2_44<Float32> = ld_f32(qb + 1200)
+        p2_12 = p2_12 + q2_44 * k44
+        q3_44<Float32> = ld_f32(qb + 1712)
+        p3_12 = p3_12 + q3_44 * k44
+        k45<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_45<Float32> = ld_f32(qb + 180)
+        p0_13 = p0_13 + q0_45 * k45
+        q1_45<Float32> = ld_f32(qb + 692)
+        p1_13 = p1_13 + q1_45 * k45
+        q2_45<Float32> = ld_f32(qb + 1204)
+        p2_13 = p2_13 + q2_45 * k45
+        q3_45<Float32> = ld_f32(qb + 1716)
+        p3_13 = p3_13 + q3_45 * k45
+        k46<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_46<Float32> = ld_f32(qb + 184)
+        p0_14 = p0_14 + q0_46 * k46
+        q1_46<Float32> = ld_f32(qb + 696)
+        p1_14 = p1_14 + q1_46 * k46
+        q2_46<Float32> = ld_f32(qb + 1208)
+        p2_14 = p2_14 + q2_46 * k46
+        q3_46<Float32> = ld_f32(qb + 1720)
+        p3_14 = p3_14 + q3_46 * k46
+        k47<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_47<Float32> = ld_f32(qb + 188)
+        p0_15 = p0_15 + q0_47 * k47
+        q1_47<Float32> = ld_f32(qb + 700)
+        p1_15 = p1_15 + q1_47 * k47
+        q2_47<Float32> = ld_f32(qb + 1212)
+        p2_15 = p2_15 + q2_47 * k47
+        q3_47<Float32> = ld_f32(qb + 1724)
+        p3_15 = p3_15 + q3_47 * k47
+        k48<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_48<Float32> = ld_f32(qb + 192)
+        p0_16 = p0_16 + q0_48 * k48
+        q1_48<Float32> = ld_f32(qb + 704)
+        p1_16 = p1_16 + q1_48 * k48
+        q2_48<Float32> = ld_f32(qb + 1216)
+        p2_16 = p2_16 + q2_48 * k48
+        q3_48<Float32> = ld_f32(qb + 1728)
+        p3_16 = p3_16 + q3_48 * k48
+        k49<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_49<Float32> = ld_f32(qb + 196)
+        p0_17 = p0_17 + q0_49 * k49
+        q1_49<Float32> = ld_f32(qb + 708)
+        p1_17 = p1_17 + q1_49 * k49
+        q2_49<Float32> = ld_f32(qb + 1220)
+        p2_17 = p2_17 + q2_49 * k49
+        q3_49<Float32> = ld_f32(qb + 1732)
+        p3_17 = p3_17 + q3_49 * k49
+        k50<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_50<Float32> = ld_f32(qb + 200)
+        p0_18 = p0_18 + q0_50 * k50
+        q1_50<Float32> = ld_f32(qb + 712)
+        p1_18 = p1_18 + q1_50 * k50
+        q2_50<Float32> = ld_f32(qb + 1224)
+        p2_18 = p2_18 + q2_50 * k50
+        q3_50<Float32> = ld_f32(qb + 1736)
+        p3_18 = p3_18 + q3_50 * k50
+        k51<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_51<Float32> = ld_f32(qb + 204)
+        p0_19 = p0_19 + q0_51 * k51
+        q1_51<Float32> = ld_f32(qb + 716)
+        p1_19 = p1_19 + q1_51 * k51
+        q2_51<Float32> = ld_f32(qb + 1228)
+        p2_19 = p2_19 + q2_51 * k51
+        q3_51<Float32> = ld_f32(qb + 1740)
+        p3_19 = p3_19 + q3_51 * k51
+        k52<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_52<Float32> = ld_f32(qb + 208)
+        p0_20 = p0_20 + q0_52 * k52
+        q1_52<Float32> = ld_f32(qb + 720)
+        p1_20 = p1_20 + q1_52 * k52
+        q2_52<Float32> = ld_f32(qb + 1232)
+        p2_20 = p2_20 + q2_52 * k52
+        q3_52<Float32> = ld_f32(qb + 1744)
+        p3_20 = p3_20 + q3_52 * k52
+        k53<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_53<Float32> = ld_f32(qb + 212)
+        p0_21 = p0_21 + q0_53 * k53
+        q1_53<Float32> = ld_f32(qb + 724)
+        p1_21 = p1_21 + q1_53 * k53
+        q2_53<Float32> = ld_f32(qb + 1236)
+        p2_21 = p2_21 + q2_53 * k53
+        q3_53<Float32> = ld_f32(qb + 1748)
+        p3_21 = p3_21 + q3_53 * k53
+        k54<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_54<Float32> = ld_f32(qb + 216)
+        p0_22 = p0_22 + q0_54 * k54
+        q1_54<Float32> = ld_f32(qb + 728)
+        p1_22 = p1_22 + q1_54 * k54
+        q2_54<Float32> = ld_f32(qb + 1240)
+        p2_22 = p2_22 + q2_54 * k54
+        q3_54<Float32> = ld_f32(qb + 1752)
+        p3_22 = p3_22 + q3_54 * k54
+        k55<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_55<Float32> = ld_f32(qb + 220)
+        p0_23 = p0_23 + q0_55 * k55
+        q1_55<Float32> = ld_f32(qb + 732)
+        p1_23 = p1_23 + q1_55 * k55
+        q2_55<Float32> = ld_f32(qb + 1244)
+        p2_23 = p2_23 + q2_55 * k55
+        q3_55<Float32> = ld_f32(qb + 1756)
+        p3_23 = p3_23 + q3_55 * k55
+        k56<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_56<Float32> = ld_f32(qb + 224)
+        p0_24 = p0_24 + q0_56 * k56
+        q1_56<Float32> = ld_f32(qb + 736)
+        p1_24 = p1_24 + q1_56 * k56
+        q2_56<Float32> = ld_f32(qb + 1248)
+        p2_24 = p2_24 + q2_56 * k56
+        q3_56<Float32> = ld_f32(qb + 1760)
+        p3_24 = p3_24 + q3_56 * k56
+        k57<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_57<Float32> = ld_f32(qb + 228)
+        p0_25 = p0_25 + q0_57 * k57
+        q1_57<Float32> = ld_f32(qb + 740)
+        p1_25 = p1_25 + q1_57 * k57
+        q2_57<Float32> = ld_f32(qb + 1252)
+        p2_25 = p2_25 + q2_57 * k57
+        q3_57<Float32> = ld_f32(qb + 1764)
+        p3_25 = p3_25 + q3_57 * k57
+        k58<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_58<Float32> = ld_f32(qb + 232)
+        p0_26 = p0_26 + q0_58 * k58
+        q1_58<Float32> = ld_f32(qb + 744)
+        p1_26 = p1_26 + q1_58 * k58
+        q2_58<Float32> = ld_f32(qb + 1256)
+        p2_26 = p2_26 + q2_58 * k58
+        q3_58<Float32> = ld_f32(qb + 1768)
+        p3_26 = p3_26 + q3_58 * k58
+        k59<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_59<Float32> = ld_f32(qb + 236)
+        p0_27 = p0_27 + q0_59 * k59
+        q1_59<Float32> = ld_f32(qb + 748)
+        p1_27 = p1_27 + q1_59 * k59
+        q2_59<Float32> = ld_f32(qb + 1260)
+        p2_27 = p2_27 + q2_59 * k59
+        q3_59<Float32> = ld_f32(qb + 1772)
+        p3_27 = p3_27 + q3_59 * k59
+        k60<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_60<Float32> = ld_f32(qb + 240)
+        p0_28 = p0_28 + q0_60 * k60
+        q1_60<Float32> = ld_f32(qb + 752)
+        p1_28 = p1_28 + q1_60 * k60
+        q2_60<Float32> = ld_f32(qb + 1264)
+        p2_28 = p2_28 + q2_60 * k60
+        q3_60<Float32> = ld_f32(qb + 1776)
+        p3_28 = p3_28 + q3_60 * k60
+        k61<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_61<Float32> = ld_f32(qb + 244)
+        p0_29 = p0_29 + q0_61 * k61
+        q1_61<Float32> = ld_f32(qb + 756)
+        p1_29 = p1_29 + q1_61 * k61
+        q2_61<Float32> = ld_f32(qb + 1268)
+        p2_29 = p2_29 + q2_61 * k61
+        q3_61<Float32> = ld_f32(qb + 1780)
+        p3_29 = p3_29 + q3_61 * k61
+        k62<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_62<Float32> = ld_f32(qb + 248)
+        p0_30 = p0_30 + q0_62 * k62
+        q1_62<Float32> = ld_f32(qb + 760)
+        p1_30 = p1_30 + q1_62 * k62
+        q2_62<Float32> = ld_f32(qb + 1272)
+        p2_30 = p2_30 + q2_62 * k62
+        q3_62<Float32> = ld_f32(qb + 1784)
+        p3_30 = p3_30 + q3_62 * k62
+        k63<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_63<Float32> = ld_f32(qb + 252)
+        p0_31 = p0_31 + q0_63 * k63
+        q1_63<Float32> = ld_f32(qb + 764)
+        p1_31 = p1_31 + q1_63 * k63
+        q2_63<Float32> = ld_f32(qb + 1276)
+        p2_31 = p2_31 + q2_63 * k63
+        q3_63<Float32> = ld_f32(qb + 1788)
+        p3_31 = p3_31 + q3_63 * k63
+        k64<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_64<Float32> = ld_f32(qb + 256)
+        p0_0 = p0_0 + q0_64 * k64
+        q1_64<Float32> = ld_f32(qb + 768)
+        p1_0 = p1_0 + q1_64 * k64
+        q2_64<Float32> = ld_f32(qb + 1280)
+        p2_0 = p2_0 + q2_64 * k64
+        q3_64<Float32> = ld_f32(qb + 1792)
+        p3_0 = p3_0 + q3_64 * k64
+        k65<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_65<Float32> = ld_f32(qb + 260)
+        p0_1 = p0_1 + q0_65 * k65
+        q1_65<Float32> = ld_f32(qb + 772)
+        p1_1 = p1_1 + q1_65 * k65
+        q2_65<Float32> = ld_f32(qb + 1284)
+        p2_1 = p2_1 + q2_65 * k65
+        q3_65<Float32> = ld_f32(qb + 1796)
+        p3_1 = p3_1 + q3_65 * k65
+        k66<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_66<Float32> = ld_f32(qb + 264)
+        p0_2 = p0_2 + q0_66 * k66
+        q1_66<Float32> = ld_f32(qb + 776)
+        p1_2 = p1_2 + q1_66 * k66
+        q2_66<Float32> = ld_f32(qb + 1288)
+        p2_2 = p2_2 + q2_66 * k66
+        q3_66<Float32> = ld_f32(qb + 1800)
+        p3_2 = p3_2 + q3_66 * k66
+        k67<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_67<Float32> = ld_f32(qb + 268)
+        p0_3 = p0_3 + q0_67 * k67
+        q1_67<Float32> = ld_f32(qb + 780)
+        p1_3 = p1_3 + q1_67 * k67
+        q2_67<Float32> = ld_f32(qb + 1292)
+        p2_3 = p2_3 + q2_67 * k67
+        q3_67<Float32> = ld_f32(qb + 1804)
+        p3_3 = p3_3 + q3_67 * k67
+        k68<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_68<Float32> = ld_f32(qb + 272)
+        p0_4 = p0_4 + q0_68 * k68
+        q1_68<Float32> = ld_f32(qb + 784)
+        p1_4 = p1_4 + q1_68 * k68
+        q2_68<Float32> = ld_f32(qb + 1296)
+        p2_4 = p2_4 + q2_68 * k68
+        q3_68<Float32> = ld_f32(qb + 1808)
+        p3_4 = p3_4 + q3_68 * k68
+        k69<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_69<Float32> = ld_f32(qb + 276)
+        p0_5 = p0_5 + q0_69 * k69
+        q1_69<Float32> = ld_f32(qb + 788)
+        p1_5 = p1_5 + q1_69 * k69
+        q2_69<Float32> = ld_f32(qb + 1300)
+        p2_5 = p2_5 + q2_69 * k69
+        q3_69<Float32> = ld_f32(qb + 1812)
+        p3_5 = p3_5 + q3_69 * k69
+        k70<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_70<Float32> = ld_f32(qb + 280)
+        p0_6 = p0_6 + q0_70 * k70
+        q1_70<Float32> = ld_f32(qb + 792)
+        p1_6 = p1_6 + q1_70 * k70
+        q2_70<Float32> = ld_f32(qb + 1304)
+        p2_6 = p2_6 + q2_70 * k70
+        q3_70<Float32> = ld_f32(qb + 1816)
+        p3_6 = p3_6 + q3_70 * k70
+        k71<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_71<Float32> = ld_f32(qb + 284)
+        p0_7 = p0_7 + q0_71 * k71
+        q1_71<Float32> = ld_f32(qb + 796)
+        p1_7 = p1_7 + q1_71 * k71
+        q2_71<Float32> = ld_f32(qb + 1308)
+        p2_7 = p2_7 + q2_71 * k71
+        q3_71<Float32> = ld_f32(qb + 1820)
+        p3_7 = p3_7 + q3_71 * k71
+        k72<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_72<Float32> = ld_f32(qb + 288)
+        p0_8 = p0_8 + q0_72 * k72
+        q1_72<Float32> = ld_f32(qb + 800)
+        p1_8 = p1_8 + q1_72 * k72
+        q2_72<Float32> = ld_f32(qb + 1312)
+        p2_8 = p2_8 + q2_72 * k72
+        q3_72<Float32> = ld_f32(qb + 1824)
+        p3_8 = p3_8 + q3_72 * k72
+        k73<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_73<Float32> = ld_f32(qb + 292)
+        p0_9 = p0_9 + q0_73 * k73
+        q1_73<Float32> = ld_f32(qb + 804)
+        p1_9 = p1_9 + q1_73 * k73
+        q2_73<Float32> = ld_f32(qb + 1316)
+        p2_9 = p2_9 + q2_73 * k73
+        q3_73<Float32> = ld_f32(qb + 1828)
+        p3_9 = p3_9 + q3_73 * k73
+        k74<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_74<Float32> = ld_f32(qb + 296)
+        p0_10 = p0_10 + q0_74 * k74
+        q1_74<Float32> = ld_f32(qb + 808)
+        p1_10 = p1_10 + q1_74 * k74
+        q2_74<Float32> = ld_f32(qb + 1320)
+        p2_10 = p2_10 + q2_74 * k74
+        q3_74<Float32> = ld_f32(qb + 1832)
+        p3_10 = p3_10 + q3_74 * k74
+        k75<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_75<Float32> = ld_f32(qb + 300)
+        p0_11 = p0_11 + q0_75 * k75
+        q1_75<Float32> = ld_f32(qb + 812)
+        p1_11 = p1_11 + q1_75 * k75
+        q2_75<Float32> = ld_f32(qb + 1324)
+        p2_11 = p2_11 + q2_75 * k75
+        q3_75<Float32> = ld_f32(qb + 1836)
+        p3_11 = p3_11 + q3_75 * k75
+        k76<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_76<Float32> = ld_f32(qb + 304)
+        p0_12 = p0_12 + q0_76 * k76
+        q1_76<Float32> = ld_f32(qb + 816)
+        p1_12 = p1_12 + q1_76 * k76
+        q2_76<Float32> = ld_f32(qb + 1328)
+        p2_12 = p2_12 + q2_76 * k76
+        q3_76<Float32> = ld_f32(qb + 1840)
+        p3_12 = p3_12 + q3_76 * k76
+        k77<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_77<Float32> = ld_f32(qb + 308)
+        p0_13 = p0_13 + q0_77 * k77
+        q1_77<Float32> = ld_f32(qb + 820)
+        p1_13 = p1_13 + q1_77 * k77
+        q2_77<Float32> = ld_f32(qb + 1332)
+        p2_13 = p2_13 + q2_77 * k77
+        q3_77<Float32> = ld_f32(qb + 1844)
+        p3_13 = p3_13 + q3_77 * k77
+        k78<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_78<Float32> = ld_f32(qb + 312)
+        p0_14 = p0_14 + q0_78 * k78
+        q1_78<Float32> = ld_f32(qb + 824)
+        p1_14 = p1_14 + q1_78 * k78
+        q2_78<Float32> = ld_f32(qb + 1336)
+        p2_14 = p2_14 + q2_78 * k78
+        q3_78<Float32> = ld_f32(qb + 1848)
+        p3_14 = p3_14 + q3_78 * k78
+        k79<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_79<Float32> = ld_f32(qb + 316)
+        p0_15 = p0_15 + q0_79 * k79
+        q1_79<Float32> = ld_f32(qb + 828)
+        p1_15 = p1_15 + q1_79 * k79
+        q2_79<Float32> = ld_f32(qb + 1340)
+        p2_15 = p2_15 + q2_79 * k79
+        q3_79<Float32> = ld_f32(qb + 1852)
+        p3_15 = p3_15 + q3_79 * k79
+        k80<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_80<Float32> = ld_f32(qb + 320)
+        p0_16 = p0_16 + q0_80 * k80
+        q1_80<Float32> = ld_f32(qb + 832)
+        p1_16 = p1_16 + q1_80 * k80
+        q2_80<Float32> = ld_f32(qb + 1344)
+        p2_16 = p2_16 + q2_80 * k80
+        q3_80<Float32> = ld_f32(qb + 1856)
+        p3_16 = p3_16 + q3_80 * k80
+        k81<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_81<Float32> = ld_f32(qb + 324)
+        p0_17 = p0_17 + q0_81 * k81
+        q1_81<Float32> = ld_f32(qb + 836)
+        p1_17 = p1_17 + q1_81 * k81
+        q2_81<Float32> = ld_f32(qb + 1348)
+        p2_17 = p2_17 + q2_81 * k81
+        q3_81<Float32> = ld_f32(qb + 1860)
+        p3_17 = p3_17 + q3_81 * k81
+        k82<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_82<Float32> = ld_f32(qb + 328)
+        p0_18 = p0_18 + q0_82 * k82
+        q1_82<Float32> = ld_f32(qb + 840)
+        p1_18 = p1_18 + q1_82 * k82
+        q2_82<Float32> = ld_f32(qb + 1352)
+        p2_18 = p2_18 + q2_82 * k82
+        q3_82<Float32> = ld_f32(qb + 1864)
+        p3_18 = p3_18 + q3_82 * k82
+        k83<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_83<Float32> = ld_f32(qb + 332)
+        p0_19 = p0_19 + q0_83 * k83
+        q1_83<Float32> = ld_f32(qb + 844)
+        p1_19 = p1_19 + q1_83 * k83
+        q2_83<Float32> = ld_f32(qb + 1356)
+        p2_19 = p2_19 + q2_83 * k83
+        q3_83<Float32> = ld_f32(qb + 1868)
+        p3_19 = p3_19 + q3_83 * k83
+        k84<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_84<Float32> = ld_f32(qb + 336)
+        p0_20 = p0_20 + q0_84 * k84
+        q1_84<Float32> = ld_f32(qb + 848)
+        p1_20 = p1_20 + q1_84 * k84
+        q2_84<Float32> = ld_f32(qb + 1360)
+        p2_20 = p2_20 + q2_84 * k84
+        q3_84<Float32> = ld_f32(qb + 1872)
+        p3_20 = p3_20 + q3_84 * k84
+        k85<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_85<Float32> = ld_f32(qb + 340)
+        p0_21 = p0_21 + q0_85 * k85
+        q1_85<Float32> = ld_f32(qb + 852)
+        p1_21 = p1_21 + q1_85 * k85
+        q2_85<Float32> = ld_f32(qb + 1364)
+        p2_21 = p2_21 + q2_85 * k85
+        q3_85<Float32> = ld_f32(qb + 1876)
+        p3_21 = p3_21 + q3_85 * k85
+        k86<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_86<Float32> = ld_f32(qb + 344)
+        p0_22 = p0_22 + q0_86 * k86
+        q1_86<Float32> = ld_f32(qb + 856)
+        p1_22 = p1_22 + q1_86 * k86
+        q2_86<Float32> = ld_f32(qb + 1368)
+        p2_22 = p2_22 + q2_86 * k86
+        q3_86<Float32> = ld_f32(qb + 1880)
+        p3_22 = p3_22 + q3_86 * k86
+        k87<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_87<Float32> = ld_f32(qb + 348)
+        p0_23 = p0_23 + q0_87 * k87
+        q1_87<Float32> = ld_f32(qb + 860)
+        p1_23 = p1_23 + q1_87 * k87
+        q2_87<Float32> = ld_f32(qb + 1372)
+        p2_23 = p2_23 + q2_87 * k87
+        q3_87<Float32> = ld_f32(qb + 1884)
+        p3_23 = p3_23 + q3_87 * k87
+        k88<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_88<Float32> = ld_f32(qb + 352)
+        p0_24 = p0_24 + q0_88 * k88
+        q1_88<Float32> = ld_f32(qb + 864)
+        p1_24 = p1_24 + q1_88 * k88
+        q2_88<Float32> = ld_f32(qb + 1376)
+        p2_24 = p2_24 + q2_88 * k88
+        q3_88<Float32> = ld_f32(qb + 1888)
+        p3_24 = p3_24 + q3_88 * k88
+        k89<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_89<Float32> = ld_f32(qb + 356)
+        p0_25 = p0_25 + q0_89 * k89
+        q1_89<Float32> = ld_f32(qb + 868)
+        p1_25 = p1_25 + q1_89 * k89
+        q2_89<Float32> = ld_f32(qb + 1380)
+        p2_25 = p2_25 + q2_89 * k89
+        q3_89<Float32> = ld_f32(qb + 1892)
+        p3_25 = p3_25 + q3_89 * k89
+        k90<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_90<Float32> = ld_f32(qb + 360)
+        p0_26 = p0_26 + q0_90 * k90
+        q1_90<Float32> = ld_f32(qb + 872)
+        p1_26 = p1_26 + q1_90 * k90
+        q2_90<Float32> = ld_f32(qb + 1384)
+        p2_26 = p2_26 + q2_90 * k90
+        q3_90<Float32> = ld_f32(qb + 1896)
+        p3_26 = p3_26 + q3_90 * k90
+        k91<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_91<Float32> = ld_f32(qb + 364)
+        p0_27 = p0_27 + q0_91 * k91
+        q1_91<Float32> = ld_f32(qb + 876)
+        p1_27 = p1_27 + q1_91 * k91
+        q2_91<Float32> = ld_f32(qb + 1388)
+        p2_27 = p2_27 + q2_91 * k91
+        q3_91<Float32> = ld_f32(qb + 1900)
+        p3_27 = p3_27 + q3_91 * k91
+        k92<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_92<Float32> = ld_f32(qb + 368)
+        p0_28 = p0_28 + q0_92 * k92
+        q1_92<Float32> = ld_f32(qb + 880)
+        p1_28 = p1_28 + q1_92 * k92
+        q2_92<Float32> = ld_f32(qb + 1392)
+        p2_28 = p2_28 + q2_92 * k92
+        q3_92<Float32> = ld_f32(qb + 1904)
+        p3_28 = p3_28 + q3_92 * k92
+        k93<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_93<Float32> = ld_f32(qb + 372)
+        p0_29 = p0_29 + q0_93 * k93
+        q1_93<Float32> = ld_f32(qb + 884)
+        p1_29 = p1_29 + q1_93 * k93
+        q2_93<Float32> = ld_f32(qb + 1396)
+        p2_29 = p2_29 + q2_93 * k93
+        q3_93<Float32> = ld_f32(qb + 1908)
+        p3_29 = p3_29 + q3_93 * k93
+        k94<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_94<Float32> = ld_f32(qb + 376)
+        p0_30 = p0_30 + q0_94 * k94
+        q1_94<Float32> = ld_f32(qb + 888)
+        p1_30 = p1_30 + q1_94 * k94
+        q2_94<Float32> = ld_f32(qb + 1400)
+        p2_30 = p2_30 + q2_94 * k94
+        q3_94<Float32> = ld_f32(qb + 1912)
+        p3_30 = p3_30 + q3_94 * k94
+        k95<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_95<Float32> = ld_f32(qb + 380)
+        p0_31 = p0_31 + q0_95 * k95
+        q1_95<Float32> = ld_f32(qb + 892)
+        p1_31 = p1_31 + q1_95 * k95
+        q2_95<Float32> = ld_f32(qb + 1404)
+        p2_31 = p2_31 + q2_95 * k95
+        q3_95<Float32> = ld_f32(qb + 1916)
+        p3_31 = p3_31 + q3_95 * k95
+        k96<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_96<Float32> = ld_f32(qb + 384)
+        p0_0 = p0_0 + q0_96 * k96
+        q1_96<Float32> = ld_f32(qb + 896)
+        p1_0 = p1_0 + q1_96 * k96
+        q2_96<Float32> = ld_f32(qb + 1408)
+        p2_0 = p2_0 + q2_96 * k96
+        q3_96<Float32> = ld_f32(qb + 1920)
+        p3_0 = p3_0 + q3_96 * k96
+        k97<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_97<Float32> = ld_f32(qb + 388)
+        p0_1 = p0_1 + q0_97 * k97
+        q1_97<Float32> = ld_f32(qb + 900)
+        p1_1 = p1_1 + q1_97 * k97
+        q2_97<Float32> = ld_f32(qb + 1412)
+        p2_1 = p2_1 + q2_97 * k97
+        q3_97<Float32> = ld_f32(qb + 1924)
+        p3_1 = p3_1 + q3_97 * k97
+        k98<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_98<Float32> = ld_f32(qb + 392)
+        p0_2 = p0_2 + q0_98 * k98
+        q1_98<Float32> = ld_f32(qb + 904)
+        p1_2 = p1_2 + q1_98 * k98
+        q2_98<Float32> = ld_f32(qb + 1416)
+        p2_2 = p2_2 + q2_98 * k98
+        q3_98<Float32> = ld_f32(qb + 1928)
+        p3_2 = p3_2 + q3_98 * k98
+        k99<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_99<Float32> = ld_f32(qb + 396)
+        p0_3 = p0_3 + q0_99 * k99
+        q1_99<Float32> = ld_f32(qb + 908)
+        p1_3 = p1_3 + q1_99 * k99
+        q2_99<Float32> = ld_f32(qb + 1420)
+        p2_3 = p2_3 + q2_99 * k99
+        q3_99<Float32> = ld_f32(qb + 1932)
+        p3_3 = p3_3 + q3_99 * k99
+        k100<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_100<Float32> = ld_f32(qb + 400)
+        p0_4 = p0_4 + q0_100 * k100
+        q1_100<Float32> = ld_f32(qb + 912)
+        p1_4 = p1_4 + q1_100 * k100
+        q2_100<Float32> = ld_f32(qb + 1424)
+        p2_4 = p2_4 + q2_100 * k100
+        q3_100<Float32> = ld_f32(qb + 1936)
+        p3_4 = p3_4 + q3_100 * k100
+        k101<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_101<Float32> = ld_f32(qb + 404)
+        p0_5 = p0_5 + q0_101 * k101
+        q1_101<Float32> = ld_f32(qb + 916)
+        p1_5 = p1_5 + q1_101 * k101
+        q2_101<Float32> = ld_f32(qb + 1428)
+        p2_5 = p2_5 + q2_101 * k101
+        q3_101<Float32> = ld_f32(qb + 1940)
+        p3_5 = p3_5 + q3_101 * k101
+        k102<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_102<Float32> = ld_f32(qb + 408)
+        p0_6 = p0_6 + q0_102 * k102
+        q1_102<Float32> = ld_f32(qb + 920)
+        p1_6 = p1_6 + q1_102 * k102
+        q2_102<Float32> = ld_f32(qb + 1432)
+        p2_6 = p2_6 + q2_102 * k102
+        q3_102<Float32> = ld_f32(qb + 1944)
+        p3_6 = p3_6 + q3_102 * k102
+        k103<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_103<Float32> = ld_f32(qb + 412)
+        p0_7 = p0_7 + q0_103 * k103
+        q1_103<Float32> = ld_f32(qb + 924)
+        p1_7 = p1_7 + q1_103 * k103
+        q2_103<Float32> = ld_f32(qb + 1436)
+        p2_7 = p2_7 + q2_103 * k103
+        q3_103<Float32> = ld_f32(qb + 1948)
+        p3_7 = p3_7 + q3_103 * k103
+        k104<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_104<Float32> = ld_f32(qb + 416)
+        p0_8 = p0_8 + q0_104 * k104
+        q1_104<Float32> = ld_f32(qb + 928)
+        p1_8 = p1_8 + q1_104 * k104
+        q2_104<Float32> = ld_f32(qb + 1440)
+        p2_8 = p2_8 + q2_104 * k104
+        q3_104<Float32> = ld_f32(qb + 1952)
+        p3_8 = p3_8 + q3_104 * k104
+        k105<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_105<Float32> = ld_f32(qb + 420)
+        p0_9 = p0_9 + q0_105 * k105
+        q1_105<Float32> = ld_f32(qb + 932)
+        p1_9 = p1_9 + q1_105 * k105
+        q2_105<Float32> = ld_f32(qb + 1444)
+        p2_9 = p2_9 + q2_105 * k105
+        q3_105<Float32> = ld_f32(qb + 1956)
+        p3_9 = p3_9 + q3_105 * k105
+        k106<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_106<Float32> = ld_f32(qb + 424)
+        p0_10 = p0_10 + q0_106 * k106
+        q1_106<Float32> = ld_f32(qb + 936)
+        p1_10 = p1_10 + q1_106 * k106
+        q2_106<Float32> = ld_f32(qb + 1448)
+        p2_10 = p2_10 + q2_106 * k106
+        q3_106<Float32> = ld_f32(qb + 1960)
+        p3_10 = p3_10 + q3_106 * k106
+        k107<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_107<Float32> = ld_f32(qb + 428)
+        p0_11 = p0_11 + q0_107 * k107
+        q1_107<Float32> = ld_f32(qb + 940)
+        p1_11 = p1_11 + q1_107 * k107
+        q2_107<Float32> = ld_f32(qb + 1452)
+        p2_11 = p2_11 + q2_107 * k107
+        q3_107<Float32> = ld_f32(qb + 1964)
+        p3_11 = p3_11 + q3_107 * k107
+        k108<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_108<Float32> = ld_f32(qb + 432)
+        p0_12 = p0_12 + q0_108 * k108
+        q1_108<Float32> = ld_f32(qb + 944)
+        p1_12 = p1_12 + q1_108 * k108
+        q2_108<Float32> = ld_f32(qb + 1456)
+        p2_12 = p2_12 + q2_108 * k108
+        q3_108<Float32> = ld_f32(qb + 1968)
+        p3_12 = p3_12 + q3_108 * k108
+        k109<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_109<Float32> = ld_f32(qb + 436)
+        p0_13 = p0_13 + q0_109 * k109
+        q1_109<Float32> = ld_f32(qb + 948)
+        p1_13 = p1_13 + q1_109 * k109
+        q2_109<Float32> = ld_f32(qb + 1460)
+        p2_13 = p2_13 + q2_109 * k109
+        q3_109<Float32> = ld_f32(qb + 1972)
+        p3_13 = p3_13 + q3_109 * k109
+        k110<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_110<Float32> = ld_f32(qb + 440)
+        p0_14 = p0_14 + q0_110 * k110
+        q1_110<Float32> = ld_f32(qb + 952)
+        p1_14 = p1_14 + q1_110 * k110
+        q2_110<Float32> = ld_f32(qb + 1464)
+        p2_14 = p2_14 + q2_110 * k110
+        q3_110<Float32> = ld_f32(qb + 1976)
+        p3_14 = p3_14 + q3_110 * k110
+        k111<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_111<Float32> = ld_f32(qb + 444)
+        p0_15 = p0_15 + q0_111 * k111
+        q1_111<Float32> = ld_f32(qb + 956)
+        p1_15 = p1_15 + q1_111 * k111
+        q2_111<Float32> = ld_f32(qb + 1468)
+        p2_15 = p2_15 + q2_111 * k111
+        q3_111<Float32> = ld_f32(qb + 1980)
+        p3_15 = p3_15 + q3_111 * k111
+        k112<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_112<Float32> = ld_f32(qb + 448)
+        p0_16 = p0_16 + q0_112 * k112
+        q1_112<Float32> = ld_f32(qb + 960)
+        p1_16 = p1_16 + q1_112 * k112
+        q2_112<Float32> = ld_f32(qb + 1472)
+        p2_16 = p2_16 + q2_112 * k112
+        q3_112<Float32> = ld_f32(qb + 1984)
+        p3_16 = p3_16 + q3_112 * k112
+        k113<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_113<Float32> = ld_f32(qb + 452)
+        p0_17 = p0_17 + q0_113 * k113
+        q1_113<Float32> = ld_f32(qb + 964)
+        p1_17 = p1_17 + q1_113 * k113
+        q2_113<Float32> = ld_f32(qb + 1476)
+        p2_17 = p2_17 + q2_113 * k113
+        q3_113<Float32> = ld_f32(qb + 1988)
+        p3_17 = p3_17 + q3_113 * k113
+        k114<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_114<Float32> = ld_f32(qb + 456)
+        p0_18 = p0_18 + q0_114 * k114
+        q1_114<Float32> = ld_f32(qb + 968)
+        p1_18 = p1_18 + q1_114 * k114
+        q2_114<Float32> = ld_f32(qb + 1480)
+        p2_18 = p2_18 + q2_114 * k114
+        q3_114<Float32> = ld_f32(qb + 1992)
+        p3_18 = p3_18 + q3_114 * k114
+        k115<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_115<Float32> = ld_f32(qb + 460)
+        p0_19 = p0_19 + q0_115 * k115
+        q1_115<Float32> = ld_f32(qb + 972)
+        p1_19 = p1_19 + q1_115 * k115
+        q2_115<Float32> = ld_f32(qb + 1484)
+        p2_19 = p2_19 + q2_115 * k115
+        q3_115<Float32> = ld_f32(qb + 1996)
+        p3_19 = p3_19 + q3_115 * k115
+        k116<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_116<Float32> = ld_f32(qb + 464)
+        p0_20 = p0_20 + q0_116 * k116
+        q1_116<Float32> = ld_f32(qb + 976)
+        p1_20 = p1_20 + q1_116 * k116
+        q2_116<Float32> = ld_f32(qb + 1488)
+        p2_20 = p2_20 + q2_116 * k116
+        q3_116<Float32> = ld_f32(qb + 2000)
+        p3_20 = p3_20 + q3_116 * k116
+        k117<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_117<Float32> = ld_f32(qb + 468)
+        p0_21 = p0_21 + q0_117 * k117
+        q1_117<Float32> = ld_f32(qb + 980)
+        p1_21 = p1_21 + q1_117 * k117
+        q2_117<Float32> = ld_f32(qb + 1492)
+        p2_21 = p2_21 + q2_117 * k117
+        q3_117<Float32> = ld_f32(qb + 2004)
+        p3_21 = p3_21 + q3_117 * k117
+        k118<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_118<Float32> = ld_f32(qb + 472)
+        p0_22 = p0_22 + q0_118 * k118
+        q1_118<Float32> = ld_f32(qb + 984)
+        p1_22 = p1_22 + q1_118 * k118
+        q2_118<Float32> = ld_f32(qb + 1496)
+        p2_22 = p2_22 + q2_118 * k118
+        q3_118<Float32> = ld_f32(qb + 2008)
+        p3_22 = p3_22 + q3_118 * k118
+        k119<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_119<Float32> = ld_f32(qb + 476)
+        p0_23 = p0_23 + q0_119 * k119
+        q1_119<Float32> = ld_f32(qb + 988)
+        p1_23 = p1_23 + q1_119 * k119
+        q2_119<Float32> = ld_f32(qb + 1500)
+        p2_23 = p2_23 + q2_119 * k119
+        q3_119<Float32> = ld_f32(qb + 2012)
+        p3_23 = p3_23 + q3_119 * k119
+        k120<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_120<Float32> = ld_f32(qb + 480)
+        p0_24 = p0_24 + q0_120 * k120
+        q1_120<Float32> = ld_f32(qb + 992)
+        p1_24 = p1_24 + q1_120 * k120
+        q2_120<Float32> = ld_f32(qb + 1504)
+        p2_24 = p2_24 + q2_120 * k120
+        q3_120<Float32> = ld_f32(qb + 2016)
+        p3_24 = p3_24 + q3_120 * k120
+        k121<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_121<Float32> = ld_f32(qb + 484)
+        p0_25 = p0_25 + q0_121 * k121
+        q1_121<Float32> = ld_f32(qb + 996)
+        p1_25 = p1_25 + q1_121 * k121
+        q2_121<Float32> = ld_f32(qb + 1508)
+        p2_25 = p2_25 + q2_121 * k121
+        q3_121<Float32> = ld_f32(qb + 2020)
+        p3_25 = p3_25 + q3_121 * k121
+        k122<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_122<Float32> = ld_f32(qb + 488)
+        p0_26 = p0_26 + q0_122 * k122
+        q1_122<Float32> = ld_f32(qb + 1000)
+        p1_26 = p1_26 + q1_122 * k122
+        q2_122<Float32> = ld_f32(qb + 1512)
+        p2_26 = p2_26 + q2_122 * k122
+        q3_122<Float32> = ld_f32(qb + 2024)
+        p3_26 = p3_26 + q3_122 * k122
+        k123<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_123<Float32> = ld_f32(qb + 492)
+        p0_27 = p0_27 + q0_123 * k123
+        q1_123<Float32> = ld_f32(qb + 1004)
+        p1_27 = p1_27 + q1_123 * k123
+        q2_123<Float32> = ld_f32(qb + 1516)
+        p2_27 = p2_27 + q2_123 * k123
+        q3_123<Float32> = ld_f32(qb + 2028)
+        p3_27 = p3_27 + q3_123 * k123
+        k124<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_124<Float32> = ld_f32(qb + 496)
+        p0_28 = p0_28 + q0_124 * k124
+        q1_124<Float32> = ld_f32(qb + 1008)
+        p1_28 = p1_28 + q1_124 * k124
+        q2_124<Float32> = ld_f32(qb + 1520)
+        p2_28 = p2_28 + q2_124 * k124
+        q3_124<Float32> = ld_f32(qb + 2032)
+        p3_28 = p3_28 + q3_124 * k124
+        k125<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_125<Float32> = ld_f32(qb + 500)
+        p0_29 = p0_29 + q0_125 * k125
+        q1_125<Float32> = ld_f32(qb + 1012)
+        p1_29 = p1_29 + q1_125 * k125
+        q2_125<Float32> = ld_f32(qb + 1524)
+        p2_29 = p2_29 + q2_125 * k125
+        q3_125<Float32> = ld_f32(qb + 2036)
+        p3_29 = p3_29 + q3_125 * k125
+        k126<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_126<Float32> = ld_f32(qb + 504)
+        p0_30 = p0_30 + q0_126 * k126
+        q1_126<Float32> = ld_f32(qb + 1016)
+        p1_30 = p1_30 + q1_126 * k126
+        q2_126<Float32> = ld_f32(qb + 1528)
+        p2_30 = p2_30 + q2_126 * k126
+        q3_126<Float32> = ld_f32(qb + 2040)
+        p3_30 = p3_30 + q3_126 * k126
+        k127<Float32> = ld_f32(kp)
+        kp = kp + T4
+        q0_127<Float32> = ld_f32(qb + 508)
+        p0_31 = p0_31 + q0_127 * k127
+        q1_127<Float32> = ld_f32(qb + 1020)
+        p1_31 = p1_31 + q1_127 * k127
+        q2_127<Float32> = ld_f32(qb + 1532)
+        p2_31 = p2_31 + q2_127 * k127
+        q3_127<Float32> = ld_f32(qb + 2044)
+        p3_31 = p3_31 + q3_127 * k127
+        v0_0<Float> = (p0_0 as Float) + (p0_16 as Float)
+        v0_1<Float> = (p0_1 as Float) + (p0_17 as Float)
+        v0_2<Float> = (p0_2 as Float) + (p0_18 as Float)
+        v0_3<Float> = (p0_3 as Float) + (p0_19 as Float)
+        v0_4<Float> = (p0_4 as Float) + (p0_20 as Float)
+        v0_5<Float> = (p0_5 as Float) + (p0_21 as Float)
+        v0_6<Float> = (p0_6 as Float) + (p0_22 as Float)
+        v0_7<Float> = (p0_7 as Float) + (p0_23 as Float)
+        v0_8<Float> = (p0_8 as Float) + (p0_24 as Float)
+        v0_9<Float> = (p0_9 as Float) + (p0_25 as Float)
+        v0_10<Float> = (p0_10 as Float) + (p0_26 as Float)
+        v0_11<Float> = (p0_11 as Float) + (p0_27 as Float)
+        v0_12<Float> = (p0_12 as Float) + (p0_28 as Float)
+        v0_13<Float> = (p0_13 as Float) + (p0_29 as Float)
+        v0_14<Float> = (p0_14 as Float) + (p0_30 as Float)
+        v0_15<Float> = (p0_15 as Float) + (p0_31 as Float)
+        v0_0 = v0_0 + v0_8
+        v0_1 = v0_1 + v0_9
+        v0_2 = v0_2 + v0_10
+        v0_3 = v0_3 + v0_11
+        v0_4 = v0_4 + v0_12
+        v0_5 = v0_5 + v0_13
+        v0_6 = v0_6 + v0_14
+        v0_7 = v0_7 + v0_15
+        v0_0 = v0_0 + v0_4
+        v0_1 = v0_1 + v0_5
+        v0_2 = v0_2 + v0_6
+        v0_3 = v0_3 + v0_7
+        v0_0 = v0_0 + v0_2
+        v0_1 = v0_1 + v0_3
+        v0_0 = v0_0 + v0_1
+        st_f64(SC + ((s * H + g * 4 + 0) * T + t) * 8, v0_0 * scale)
+        v1_0<Float> = (p1_0 as Float) + (p1_16 as Float)
+        v1_1<Float> = (p1_1 as Float) + (p1_17 as Float)
+        v1_2<Float> = (p1_2 as Float) + (p1_18 as Float)
+        v1_3<Float> = (p1_3 as Float) + (p1_19 as Float)
+        v1_4<Float> = (p1_4 as Float) + (p1_20 as Float)
+        v1_5<Float> = (p1_5 as Float) + (p1_21 as Float)
+        v1_6<Float> = (p1_6 as Float) + (p1_22 as Float)
+        v1_7<Float> = (p1_7 as Float) + (p1_23 as Float)
+        v1_8<Float> = (p1_8 as Float) + (p1_24 as Float)
+        v1_9<Float> = (p1_9 as Float) + (p1_25 as Float)
+        v1_10<Float> = (p1_10 as Float) + (p1_26 as Float)
+        v1_11<Float> = (p1_11 as Float) + (p1_27 as Float)
+        v1_12<Float> = (p1_12 as Float) + (p1_28 as Float)
+        v1_13<Float> = (p1_13 as Float) + (p1_29 as Float)
+        v1_14<Float> = (p1_14 as Float) + (p1_30 as Float)
+        v1_15<Float> = (p1_15 as Float) + (p1_31 as Float)
+        v1_0 = v1_0 + v1_8
+        v1_1 = v1_1 + v1_9
+        v1_2 = v1_2 + v1_10
+        v1_3 = v1_3 + v1_11
+        v1_4 = v1_4 + v1_12
+        v1_5 = v1_5 + v1_13
+        v1_6 = v1_6 + v1_14
+        v1_7 = v1_7 + v1_15
+        v1_0 = v1_0 + v1_4
+        v1_1 = v1_1 + v1_5
+        v1_2 = v1_2 + v1_6
+        v1_3 = v1_3 + v1_7
+        v1_0 = v1_0 + v1_2
+        v1_1 = v1_1 + v1_3
+        v1_0 = v1_0 + v1_1
+        st_f64(SC + ((s * H + g * 4 + 1) * T + t) * 8, v1_0 * scale)
+        v2_0<Float> = (p2_0 as Float) + (p2_16 as Float)
+        v2_1<Float> = (p2_1 as Float) + (p2_17 as Float)
+        v2_2<Float> = (p2_2 as Float) + (p2_18 as Float)
+        v2_3<Float> = (p2_3 as Float) + (p2_19 as Float)
+        v2_4<Float> = (p2_4 as Float) + (p2_20 as Float)
+        v2_5<Float> = (p2_5 as Float) + (p2_21 as Float)
+        v2_6<Float> = (p2_6 as Float) + (p2_22 as Float)
+        v2_7<Float> = (p2_7 as Float) + (p2_23 as Float)
+        v2_8<Float> = (p2_8 as Float) + (p2_24 as Float)
+        v2_9<Float> = (p2_9 as Float) + (p2_25 as Float)
+        v2_10<Float> = (p2_10 as Float) + (p2_26 as Float)
+        v2_11<Float> = (p2_11 as Float) + (p2_27 as Float)
+        v2_12<Float> = (p2_12 as Float) + (p2_28 as Float)
+        v2_13<Float> = (p2_13 as Float) + (p2_29 as Float)
+        v2_14<Float> = (p2_14 as Float) + (p2_30 as Float)
+        v2_15<Float> = (p2_15 as Float) + (p2_31 as Float)
+        v2_0 = v2_0 + v2_8
+        v2_1 = v2_1 + v2_9
+        v2_2 = v2_2 + v2_10
+        v2_3 = v2_3 + v2_11
+        v2_4 = v2_4 + v2_12
+        v2_5 = v2_5 + v2_13
+        v2_6 = v2_6 + v2_14
+        v2_7 = v2_7 + v2_15
+        v2_0 = v2_0 + v2_4
+        v2_1 = v2_1 + v2_5
+        v2_2 = v2_2 + v2_6
+        v2_3 = v2_3 + v2_7
+        v2_0 = v2_0 + v2_2
+        v2_1 = v2_1 + v2_3
+        v2_0 = v2_0 + v2_1
+        st_f64(SC + ((s * H + g * 4 + 2) * T + t) * 8, v2_0 * scale)
+        v3_0<Float> = (p3_0 as Float) + (p3_16 as Float)
+        v3_1<Float> = (p3_1 as Float) + (p3_17 as Float)
+        v3_2<Float> = (p3_2 as Float) + (p3_18 as Float)
+        v3_3<Float> = (p3_3 as Float) + (p3_19 as Float)
+        v3_4<Float> = (p3_4 as Float) + (p3_20 as Float)
+        v3_5<Float> = (p3_5 as Float) + (p3_21 as Float)
+        v3_6<Float> = (p3_6 as Float) + (p3_22 as Float)
+        v3_7<Float> = (p3_7 as Float) + (p3_23 as Float)
+        v3_8<Float> = (p3_8 as Float) + (p3_24 as Float)
+        v3_9<Float> = (p3_9 as Float) + (p3_25 as Float)
+        v3_10<Float> = (p3_10 as Float) + (p3_26 as Float)
+        v3_11<Float> = (p3_11 as Float) + (p3_27 as Float)
+        v3_12<Float> = (p3_12 as Float) + (p3_28 as Float)
+        v3_13<Float> = (p3_13 as Float) + (p3_29 as Float)
+        v3_14<Float> = (p3_14 as Float) + (p3_30 as Float)
+        v3_15<Float> = (p3_15 as Float) + (p3_31 as Float)
+        v3_0 = v3_0 + v3_8
+        v3_1 = v3_1 + v3_9
+        v3_2 = v3_2 + v3_10
+        v3_3 = v3_3 + v3_11
+        v3_4 = v3_4 + v3_12
+        v3_5 = v3_5 + v3_13
+        v3_6 = v3_6 + v3_14
+        v3_7 = v3_7 + v3_15
+        v3_0 = v3_0 + v3_4
+        v3_1 = v3_1 + v3_5
+        v3_2 = v3_2 + v3_6
+        v3_3 = v3_3 + v3_7
+        v3_0 = v3_0 + v3_2
+        v3_1 = v3_1 + v3_3
+        v3_0 = v3_0 + v3_1
+        st_f64(SC + ((s * H + g * 4 + 3) * T + t) * 8, v3_0 * scale)
+    } }
+}
+
+// attn_kt (Ursela): K cache rows [t][g][128] f32 -> PC as [g][128][T] f32 for attn_sc5. Grid over T*KVH*128.
+attn_kt(p<Int>) -> {
+    K<Int> = ld_i64(p + 88)
+    KVH<Int> = ld_i64(p + 216)
+    T<Int> = ld_i64(p + 240)
+    PC<Int> = ld_i64(p + 264)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    NK<Int> = T * KVH * 128
+    if (gid < NK) {
+        t<Int> = gid % T
+        r<Int> = gid / T
+        v<Float32> = ld_f32(K + (t * KVH * 128 + r) * 4)
+        st_f32(PC + gid * 4, v)
+    } else {
+        # then Q (f64, [S][H][128]) -> f32 right after it (same value attn_sc4 rounds to)
+        Q<Int> = ld_i64(p + 80)
+        S<Int> = ld_i64(p + 184)
+        H<Int> = ld_i64(p + 208)
+        qi<Int> = gid - NK
+        if (qi < S * H * 128) {
+            qv<Float32> = ld_f64(Q + qi * 8) as Float32
+            st_f32(PC + ((NK * 4 + 255) / 256) * 256 + qi * 4, qv)
+        }
+    }
+}
+
+// attn_cx5 (Ursela): attn_cx4 + attn_cxr3 in one pass with no [S, H, 32, HD] f64 partial buffer (537 MB
+// at S=512). Thread (s, g, ii) walks attn_cx4's 32 position chunks in order, sums each in f32 exactly as
+// attn_cx4 did, and adds the chunk sums in f64 in chunk order as attn_cxr3 did -> bit-identical context.
+// Grid: S * KVH blocks of HD threads.
+attn_cx5(p<Int>) -> {
+    V<Int> = ld_i64(p + 96)
+    Ctx<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 184)
+    C32<Int> = ld_i64(p + 192)
+    HD<Int> = ld_i64(p + 200)
+    H<Int> = ld_i64(p + 208)
+    KVH<Int> = ld_i64(p + 216)
+    P0<Int> = ld_i64(p + 224)
+    T<Int> = ld_i64(p + 240)
+    E32<Int> = ld_i64(p + 280)
+    gk<Int> = blk_x()
+    s<Int> = gk / KVH
+    g<Int> = gk % KVH
+    ii<Int> = tid_x()
+    n<Int> = P0 + s + 1
+    cl<Int> = (n + 31) / 32
+    w0<Int> = E32 + (s * H + g * 4) * T * 4
+    z<Float32> = 0.0 as Float32
+    c0<Float> = 0.0
+    c1<Float> = 0.0
+    c2<Float> = 0.0
+    c3<Float> = 0.0
+    c<Int> = 0
+    for (c in 0..31) {
+        t0<Int> = c * cl
+        t1<Int> = t0 + cl
+        if (t1 > n) { t1 = n }
+        a0<Float32> = z
+        a1<Float32> = z
+        a2<Float32> = z
+        a3<Float32> = z
+        tc<Int> = t0
+        while (tc < t1) {
+            vv<Float32> = ld_f32(V + (tc * KVH * HD + g * HD + ii) * 4)
+            e0<Float32> = ld_f32(w0 + tc * 4)
+            e1<Float32> = ld_f32(w0 + (T + tc) * 4)
+            e2<Float32> = ld_f32(w0 + (2 * T + tc) * 4)
+            e3<Float32> = ld_f32(w0 + (3 * T + tc) * 4)
+            a0 = a0 + e0 * vv
+            a1 = a1 + e1 * vv
+            a2 = a2 + e2 * vv
+            a3 = a3 + e3 * vv
+            tc = tc + 1
+        }
+        c0 = c0 + (a0 as Float)
+        c1 = c1 + (a1 as Float)
+        c2 = c2 + (a2 as Float)
+        c3 = c3 + (a3 as Float)
+    }
+    hb<Int> = s * H + g * 4
+    st_f64(Ctx + ((hb + 0) * HD + ii) * 8, c0)
+    st_f64(Ctx + ((hb + 1) * HD + ii) * 8, c1)
+    st_f64(Ctx + ((hb + 2) * HD + ii) * 8, c2)
+    st_f64(Ctx + ((hb + 3) * HD + ii) * 8, c3)
+    if (C32 != 0) {
+        st_f32(C32 + ((hb + 0) * HD + ii) * 4, c0)
+        st_f32(C32 + ((hb + 1) * HD + ii) * 4, c1)
+        st_f32(C32 + ((hb + 2) * HD + ii) * 4, c2)
+        st_f32(C32 + ((hb + 3) * HD + ii) * 4, c3)
     }
 }

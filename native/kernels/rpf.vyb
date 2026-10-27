@@ -1,0 +1,292 @@
+// Ridge batched prefill: the non-GEMM kernels that see a whole chunk of S prompt tokens at once
+// (rows [S][dim], token-major), plus test helpers. GEMMs and delta_seq are generated
+// (native/tools/gen_rpf.py -> rpf_gemm.vyb). Compile: vyb --kernel --gpu sm_80 --kernel-shared 20480
+// (attn_pf keeps up to 2048 scores + a 256-entry reduction scratch in shared memory).
+import vmath::{vexp, vsqrt}
+
+// natural log (the gdn.vyb vlog, used by alpha_gate)
+vlog(x<Float>)<Float> -> {
+    m<Float> = x
+    k<Int> = 0
+    i<Int> = 0
+    for (i in 0..63) {
+        if (m >= 2.0) { m = m * 0.5 ; k = k + 1 }
+    }
+    for (i in 0..63) {
+        if (m < 1.0) { m = m * 2.0 ; k = k - 1 }
+    }
+    z<Float> = (m - 1.0) / (m + 1.0)
+    z2<Float> = z * z
+    s<Float> = 1.0
+    p<Float> = z2
+    j<Int> = 0
+    for (j in 1..12) {
+        s = s + p / (2.0 * (j as Float) + 1.0)
+        p = p * z2
+    }
+    return (k as Float) * 0.6931471805599453 + 2.0 * z * s
+}
+
+
+softplus_b(x<Float>)<Float> -> {
+    if (x > 20.0) { return x }
+    return vlog(1.0 + vexp(x))
+}
+
+// alpha gate, batched: OUT[s,h] = softplus(A[s,h] + DT[h]) * SA[h]. Params A@0 DT@8 SA@16 OUT@24 n@32 HV@40
+ag_b(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    DT<Int> = ld_i64(p + 8)
+    SA<Int> = ld_i64(p + 16)
+    OUT<Int> = ld_i64(p + 24)
+    n<Int> = ld_i64(p + 32)
+    HV<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        hh<Int> = gid % HV
+        v<Float> = ld_f64(A + gid * 8) + ld_f64(DT + hh * 8)
+        st_f64(OUT + gid * 8, softplus_b(v) * ld_f64(SA + hh * 8))
+    }
+}
+
+// causal depthwise conv (DC = 4) + SiLU over the chunk. x(s) = X[s, ch] for s >= 0, the carried window
+// CV[ch*4 + 4 + s] for s < 0 (frame 3 = previous token). Y[s, ch] = silu(sum_j x(s-3+j) W[ch*4+j]),
+// summed j = 0..3 as conv1d_k does. Params X@0 CV@8 W@16 Y@24 S@32 QKV@40
+conv_b(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    CV<Int> = ld_i64(p + 8)
+    W<Int> = ld_i64(p + 16)
+    Y<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 32)
+    QKV<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * QKV) {
+        ch<Int> = gid % QKV
+        s<Int> = gid / QKV
+        acc<Float> = 0.0
+        j<Int> = 0
+        while (j < 4) {
+            u<Int> = s - 3 + j
+            xv<Float> = 0.0
+            if (u >= 0) { xv = ld_f64(X + (u * QKV + ch) * 8) } else { xv = ld_f64(CV + (ch * 4 + 4 + u) * 8) }
+            acc = acc + xv * ld_f64(W + (ch * 4 + j) * 8)
+            j = j + 1
+        }
+        st_f64(Y + gid * 8, acc / (1.0 + vexp(0.0 - acc)))
+    }
+}
+
+// carry the conv window past the chunk: frame f = x(S-4+f). Params CV@0 X@8 S@16 QKV@24
+conv_save(p<Int>) -> {
+    CV<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    S<Int> = ld_i64(p + 16)
+    QKV<Int> = ld_i64(p + 24)
+    ch<Int> = blk_x() * dim_x() + tid_x()
+    if (ch < QKV) {
+        f0<Float> = 0.0
+        f1<Float> = 0.0
+        f2<Float> = 0.0
+        f3<Float> = 0.0
+        u<Int> = S - 4
+        if (u >= 0) { f0 = ld_f64(X + (u * QKV + ch) * 8) } else { f0 = ld_f64(CV + (ch * 4 + 4 + u) * 8) }
+        u = S - 3
+        if (u >= 0) { f1 = ld_f64(X + (u * QKV + ch) * 8) } else { f1 = ld_f64(CV + (ch * 4 + 4 + u) * 8) }
+        u = S - 2
+        if (u >= 0) { f2 = ld_f64(X + (u * QKV + ch) * 8) } else { f2 = ld_f64(CV + (ch * 4 + 4 + u) * 8) }
+        f3 = ld_f64(X + ((S - 1) * QKV + ch) * 8)
+        st_f64(CV + (ch * 4) * 8, f0)
+        st_f64(CV + (ch * 4 + 1) * 8, f1)
+        st_f64(CV + (ch * 4 + 2) * 8, f2)
+        st_f64(CV + (ch * 4 + 3) * 8, f3)
+    }
+}
+
+// l2norm of the q and k heads of every token (l2norm_b maths), reading the strided conv output.
+// Grid S*2*HK, block SSd. Params X@0 ([S][QKS], q at 0, k at GK) QN@8 KN@16 ([S][GK]) HK@24 SSd@32
+// QKS@40 GK@48 eps@56
+l2n_bs(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    QN<Int> = ld_i64(p + 8)
+    KN<Int> = ld_i64(p + 16)
+    HK<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    QKS<Int> = ld_i64(p + 40)
+    GK<Int> = ld_i64(p + 48)
+    eps<Float> = ld_f64(p + 56)
+    b<Int> = blk_x()
+    t<Int> = tid_x()
+    s<Int> = b / (2 * HK)
+    r<Int> = b % (2 * HK)
+    src<Int> = X + (s * QKS + r * D) * 8
+    dst<Int> = QN + (s * GK + r * D) * 8
+    if (r >= HK) { dst = KN + (s * GK + (r - HK) * D) * 8 }
+    v<Float> = ld_f64(src + t * 8)
+    st_shared_f64(t, v * v)
+    kernel_barrier()
+    st2<Int> = D / 2
+    while (st2 > 0) {
+        if (t < st2) { st_shared_f64(t, ld_shared_f64(t) + ld_shared_f64(t + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    sq<Float> = vsqrt(ld_shared_f64(0), 40)
+    if (sq < eps) { sq = eps }
+    st_f64(dst + t * 8, v / sq)
+}
+
+// causal attention for a chunk of queries against the KV cache rows [0, P0+s]: block (s, h), 256
+// threads (HD = 256), scores in shared f64 [0, 2048), reduction scratch [2048, 2304).
+// Params Q@0 ([S][H*HD], roped) KC@8 VC@16 ([pos][KVH*HD]) CTX@24 ([S][H*HD]) H@32 KVH@40 HD@48 P0@56
+attn_pf(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    KC<Int> = ld_i64(p + 8)
+    VC<Int> = ld_i64(p + 16)
+    CTX<Int> = ld_i64(p + 24)
+    H<Int> = ld_i64(p + 32)
+    KVH<Int> = ld_i64(p + 40)
+    HD<Int> = ld_i64(p + 48)
+    P0<Int> = ld_i64(p + 56)
+    scale<Float> = 0.08838834764831845
+    if (HD != 128) { scale = 1.0 / vsqrt(HD as Float, 16) }
+    b<Int> = blk_x()
+    s<Int> = b / H
+    h<Int> = b % H
+    kvh<Int> = h / (H / KVH)
+    tid<Int> = tid_x()
+    lane<Int> = tid % 32
+    wp<Int> = tid / 32
+    T<Int> = P0 + s + 1
+    NKV<Int> = KVH * HD
+    qb<Int> = Q + (s * H * HD + h * HD) * 8
+    q0<Float> = ld_f64(qb + lane * 8)
+    q1<Float> = ld_f64(qb + (lane + 32) * 8)
+    q2<Float> = ld_f64(qb + (lane + 64) * 8)
+    q3<Float> = ld_f64(qb + (lane + 96) * 8)
+    q4<Float> = ld_f64(qb + (lane + 128) * 8)
+    q5<Float> = ld_f64(qb + (lane + 160) * 8)
+    q6<Float> = ld_f64(qb + (lane + 192) * 8)
+    q7<Float> = ld_f64(qb + (lane + 224) * 8)
+    t<Int> = wp
+    while (t < T) {
+        kb<Int> = KC + (t * NKV + kvh * HD + lane) * 8
+        d<Float> = q0 * ld_f64(kb)
+        d = d + q1 * ld_f64(kb + 256)
+        d = d + q2 * ld_f64(kb + 512)
+        d = d + q3 * ld_f64(kb + 768)
+        d = d + q4 * ld_f64(kb + 1024)
+        d = d + q5 * ld_f64(kb + 1280)
+        d = d + q6 * ld_f64(kb + 1536)
+        d = d + q7 * ld_f64(kb + 1792)
+        d = d + shfl_xor_f64(d, 16)
+        d = d + shfl_xor_f64(d, 8)
+        d = d + shfl_xor_f64(d, 4)
+        d = d + shfl_xor_f64(d, 2)
+        d = d + shfl_xor_f64(d, 1)
+        if (lane == 0) { st_shared_f64(t, d * scale) }
+        t = t + 8
+    }
+    kernel_barrier()
+    mx<Float> = -1000000000000000000000000000000.0
+    t = tid
+    while (t < T) {
+        v<Float> = ld_shared_f64(t)
+        if (v > mx) { mx = v }
+        t = t + 256
+    }
+    st_shared_f64(2048 + tid, mx)
+    kernel_barrier()
+    st2<Int> = 128
+    while (st2 > 0) {
+        if (tid < st2) {
+            o<Float> = ld_shared_f64(2048 + tid + st2)
+            if (o > ld_shared_f64(2048 + tid)) { st_shared_f64(2048 + tid, o) }
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    mx = ld_shared_f64(2048)
+    kernel_barrier()
+    ss<Float> = 0.0
+    t = tid
+    while (t < T) {
+        e<Float> = vexp(ld_shared_f64(t) - mx)
+        st_shared_f64(t, e)
+        ss = ss + e
+        t = t + 256
+    }
+    st_shared_f64(2048 + tid, ss)
+    kernel_barrier()
+    st2 = 128
+    while (st2 > 0) {
+        if (tid < st2) { st_shared_f64(2048 + tid, ld_shared_f64(2048 + tid) + ld_shared_f64(2048 + tid + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    ssum<Float> = ld_shared_f64(2048)
+    acc<Float> = 0.0
+    vb<Int> = VC + (kvh * HD + tid) * 8
+    t = 0
+    while (t < T) {
+        acc = acc + (ld_shared_f64(t) / ssum) * ld_f64(vb + t * NKV * 8)
+        t = t + 1
+    }
+    st_f64(CTX + (s * H * HD + h * HD + tid) * 8, acc)
+}
+
+// test helper: Y[i] = f32 pseudo-random in [-scale, scale). Params Y@0 n@8 seed@16 scale@24
+fill_rand(p<Int>) -> {
+    Y<Int> = ld_i64(p + 0)
+    n<Int> = ld_i64(p + 8)
+    seed<Int> = ld_i64(p + 16)
+    scl<Float> = ld_f64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        a<Int> = (gid * 1103515245 + 12345 + seed) % 2147483648
+        a = (a * 1103515245 + 12345) % 2147483648
+        a = (a * 1103515245 + 12345) % 2147483648
+        v<Float> = ((((a / 65536) % 32768) as Float) / 16384.0 - 1.0) * scl
+        st_f32(Y + gid * 4, v)
+    }
+}
+
+// test helper: OUT = [max |A-B|, sum A^2, sum (A-B)^2] over n f64. One block of 256.
+cmp_k(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    OUT<Int> = ld_i64(p + 24)
+    t<Int> = tid_x()
+    mx<Float> = 0.0
+    sa<Float> = 0.0
+    sd<Float> = 0.0
+    i<Int> = t
+    while (i < n) {
+        a<Float> = ld_f64(A + i * 8)
+        dd<Float> = a - ld_f64(B + i * 8)
+        if (dd < 0.0) { dd = 0.0 - dd }
+        if (dd > mx) { mx = dd }
+        sa = sa + a * a
+        sd = sd + dd * dd
+        i = i + 256
+    }
+    st_shared_f64(t, mx)
+    st_shared_f64(256 + t, sa)
+    st_shared_f64(512 + t, sd)
+    kernel_barrier()
+    st2<Int> = 128
+    while (st2 > 0) {
+        if (t < st2) {
+            if (ld_shared_f64(t + st2) > ld_shared_f64(t)) { st_shared_f64(t, ld_shared_f64(t + st2)) }
+            st_shared_f64(256 + t, ld_shared_f64(256 + t) + ld_shared_f64(256 + t + st2))
+            st_shared_f64(512 + t, ld_shared_f64(512 + t) + ld_shared_f64(512 + t + st2))
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    if (t == 0) {
+        st_f64(OUT, ld_shared_f64(0))
+        st_f64(OUT + 8, ld_shared_f64(256))
+        st_f64(OUT + 16, ld_shared_f64(512))
+    }
+}

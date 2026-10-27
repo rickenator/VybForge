@@ -1,0 +1,369 @@
+// Ridge decode: fused GDN step for one value head per block (grid Hv x S threads, S = head dim).
+// delta_step_f(p): p = delta_step_b params (pb + 12*256); the l2norm_b params are at p + 8*256
+// (pb + 20*256) and the norm_gated_b params at p + 256 (pb + 13*256). Does l2norm_b (row h % Hk of q = X1 -> Y1 and
+// k = X2 -> Y2) + delta_step_b + norm_gated_b in one launch with the same per-thread arithmetic
+// and the same shared-memory reduction trees, so the outputs are bit-identical to the 3-kernel path.
+import vmath::{vexp, vsqrt}
+
+delta_step_f(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    pl<Int> = p + 2048
+    X1<Int> = ld_i64(pl + 0)
+    Y1<Int> = ld_i64(pl + 8)
+    X2<Int> = ld_i64(pl + 16)
+    Y2<Int> = ld_i64(pl + 24)
+    DL<Int> = ld_i64(pl + 40)
+    epsl<Float> = ld_f64(pl + 48)
+    pg<Int> = p + 256
+    GZ<Int> = ld_i64(pg + 8)
+    GW<Int> = ld_i64(pg + 16)
+    GY<Int> = ld_i64(pg + 24)
+    DG<Int> = ld_i64(pg + 40)
+    epsg<Float> = ld_f64(pg + 48)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    // l2norm_b of row hk of X1 and of X2 (trees at shared 512.. and 768..)
+    v1<Float> = ld_f64(X1 + (hk * DL + j) * 8)
+    v2<Float> = ld_f64(X2 + (hk * DL + j) * 8)
+    st_shared_f64(512 + j, v1 * v1)
+    st_shared_f64(768 + j, v2 * v2)
+    kernel_barrier()
+    st2<Int> = DL / 2
+    while (st2 > 0) {
+        if (j < st2) {
+            st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2))
+            st_shared_f64(768 + j, ld_shared_f64(768 + j) + ld_shared_f64(768 + j + st2))
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    n1<Float> = vsqrt(ld_shared_f64(512), 40)
+    if (n1 < epsl) { n1 = epsl }
+    n2<Float> = vsqrt(ld_shared_f64(768), 40)
+    if (n2 < epsl) { n2 = epsl }
+    y1<Float> = v1 / n1
+    y2<Float> = v2 / n2
+    if (h == hk) {
+        st_f64(Y1 + (hk * DL + j) * 8, y1)
+        st_f64(Y2 + (hk * DL + j) * 8, y2)
+    }
+    kv<Float> = y2
+    qv<Float> = y1
+    st_shared_f64(j, kv)
+    st_shared_f64(256 + j, qv)
+    kernel_barrier()
+    gexp<Float> = vexp(ld_f64(G + h * 8))
+    be<Float> = ld_f64(BE + h * 8)
+    kq<Float> = 0.0
+    i<Int> = 0
+    for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+    rw<Int> = SIN + (S * S * h + j * S) * 8
+    acc<Float> = 0.0
+    acq<Float> = 0.0
+    i = 0
+    for (i in 0..S - 1) {
+        sv<Float> = ld_f64(rw + i * 8)
+        acc = acc + sv * ld_shared_f64(i)
+        acq = acq + sv * ld_shared_f64(256 + i)
+    }
+    del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+    ov<Float> = sc * (gexp * acq + del * kq)
+    st_f64(OUT + (j + S * h) * 8, ov)
+    ww<Int> = SOUT + (S * S * h + j * S) * 8
+    i = 0
+    for (i in 0..S - 1) {
+        sv3<Float> = ld_f64(rw + i * 8)
+        st_f64(ww + i * 8, gexp * sv3 + del * ld_shared_f64(i))
+    }
+    // norm_gated_b of row h (tree at shared 512..)
+    st_shared_f64(512 + j, ov * ov)
+    kernel_barrier()
+    st2 = DG / 2
+    while (st2 > 0) {
+        if (j < st2) { st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    rinv<Float> = 1.0 / vsqrt(ld_shared_f64(512) / (DG as Float) + epsg, 40)
+    wv<Float> = ld_f64(GW + j * 8)
+    zv<Float> = ld_f64(GZ + (h * DG + j) * 8)
+    sg<Float> = 1.0 + vexp(0.0 - zv)
+    st_f64(GY + (h * DG + j) * 8, ov * rinv * wv * (zv / sg))
+}
+
+// delta_step_f8: delta_step_f with the state-row loops unrolled 8-wide (8 independent loads in
+// flight per thread; same accumulation order, bit-identical). Needs S % 8 == 0.
+delta_step_f8(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    pl<Int> = p + 2048
+    X1<Int> = ld_i64(pl + 0)
+    Y1<Int> = ld_i64(pl + 8)
+    X2<Int> = ld_i64(pl + 16)
+    Y2<Int> = ld_i64(pl + 24)
+    DL<Int> = ld_i64(pl + 40)
+    epsl<Float> = ld_f64(pl + 48)
+    pg<Int> = p + 256
+    GZ<Int> = ld_i64(pg + 8)
+    GW<Int> = ld_i64(pg + 16)
+    GY<Int> = ld_i64(pg + 24)
+    DG<Int> = ld_i64(pg + 40)
+    epsg<Float> = ld_f64(pg + 48)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    // l2norm_b of row hk of X1 and of X2 (trees at shared 512.. and 768..)
+    v1<Float> = ld_f64(X1 + (hk * DL + j) * 8)
+    v2<Float> = ld_f64(X2 + (hk * DL + j) * 8)
+    st_shared_f64(512 + j, v1 * v1)
+    st_shared_f64(768 + j, v2 * v2)
+    kernel_barrier()
+    st2<Int> = DL / 2
+    while (st2 > 0) {
+        if (j < st2) {
+            st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2))
+            st_shared_f64(768 + j, ld_shared_f64(768 + j) + ld_shared_f64(768 + j + st2))
+        }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    n1<Float> = vsqrt(ld_shared_f64(512), 40)
+    if (n1 < epsl) { n1 = epsl }
+    n2<Float> = vsqrt(ld_shared_f64(768), 40)
+    if (n2 < epsl) { n2 = epsl }
+    y1<Float> = v1 / n1
+    y2<Float> = v2 / n2
+    if (h == hk) {
+        st_f64(Y1 + (hk * DL + j) * 8, y1)
+        st_f64(Y2 + (hk * DL + j) * 8, y2)
+    }
+    kv<Float> = y2
+    qv<Float> = y1
+    st_shared_f64(j, kv)
+    st_shared_f64(256 + j, qv)
+    kernel_barrier()
+    gexp<Float> = vexp(ld_f64(G + h * 8))
+    be<Float> = ld_f64(BE + h * 8)
+    kq<Float> = 0.0
+    i<Int> = 0
+    for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+    rw<Int> = SIN + (S * S * h + j * S) * 8
+    acc<Float> = 0.0
+    acq<Float> = 0.0
+    ii<Int> = 0
+    for (ii in 0..S / 8 - 1) {
+        ib<Int> = ii * 8
+        ra<Int> = rw + ib * 8
+        s0<Float> = ld_f64(ra + 0)
+        s1<Float> = ld_f64(ra + 8)
+        s2<Float> = ld_f64(ra + 16)
+        s3<Float> = ld_f64(ra + 24)
+        s4<Float> = ld_f64(ra + 32)
+        s5<Float> = ld_f64(ra + 40)
+        s6<Float> = ld_f64(ra + 48)
+        s7<Float> = ld_f64(ra + 56)
+        acc = acc + s0 * ld_shared_f64(ib + 0)
+        acq = acq + s0 * ld_shared_f64(256 + ib + 0)
+        acc = acc + s1 * ld_shared_f64(ib + 1)
+        acq = acq + s1 * ld_shared_f64(256 + ib + 1)
+        acc = acc + s2 * ld_shared_f64(ib + 2)
+        acq = acq + s2 * ld_shared_f64(256 + ib + 2)
+        acc = acc + s3 * ld_shared_f64(ib + 3)
+        acq = acq + s3 * ld_shared_f64(256 + ib + 3)
+        acc = acc + s4 * ld_shared_f64(ib + 4)
+        acq = acq + s4 * ld_shared_f64(256 + ib + 4)
+        acc = acc + s5 * ld_shared_f64(ib + 5)
+        acq = acq + s5 * ld_shared_f64(256 + ib + 5)
+        acc = acc + s6 * ld_shared_f64(ib + 6)
+        acq = acq + s6 * ld_shared_f64(256 + ib + 6)
+        acc = acc + s7 * ld_shared_f64(ib + 7)
+        acq = acq + s7 * ld_shared_f64(256 + ib + 7)
+    }
+    del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+    ov<Float> = sc * (gexp * acq + del * kq)
+    st_f64(OUT + (j + S * h) * 8, ov)
+    ww<Int> = SOUT + (S * S * h + j * S) * 8
+    ii = 0
+    for (ii in 0..S / 8 - 1) {
+        jb<Int> = ii * 8
+        rb<Int> = rw + jb * 8
+        wb<Int> = ww + jb * 8
+        t0<Float> = ld_f64(rb + 0)
+        t1<Float> = ld_f64(rb + 8)
+        t2<Float> = ld_f64(rb + 16)
+        t3<Float> = ld_f64(rb + 24)
+        t4<Float> = ld_f64(rb + 32)
+        t5<Float> = ld_f64(rb + 40)
+        t6<Float> = ld_f64(rb + 48)
+        t7<Float> = ld_f64(rb + 56)
+        st_f64(wb + 0, gexp * t0 + del * ld_shared_f64(jb + 0))
+        st_f64(wb + 8, gexp * t1 + del * ld_shared_f64(jb + 1))
+        st_f64(wb + 16, gexp * t2 + del * ld_shared_f64(jb + 2))
+        st_f64(wb + 24, gexp * t3 + del * ld_shared_f64(jb + 3))
+        st_f64(wb + 32, gexp * t4 + del * ld_shared_f64(jb + 4))
+        st_f64(wb + 40, gexp * t5 + del * ld_shared_f64(jb + 5))
+        st_f64(wb + 48, gexp * t6 + del * ld_shared_f64(jb + 6))
+        st_f64(wb + 56, gexp * t7 + del * ld_shared_f64(jb + 7))
+    }
+    // norm_gated_b of row h (tree at shared 512..)
+    st_shared_f64(512 + j, ov * ov)
+    kernel_barrier()
+    st2 = DG / 2
+    while (st2 > 0) {
+        if (j < st2) { st_shared_f64(512 + j, ld_shared_f64(512 + j) + ld_shared_f64(512 + j + st2)) }
+        kernel_barrier()
+        st2 = st2 / 2
+    }
+    rinv<Float> = 1.0 / vsqrt(ld_shared_f64(512) / (DG as Float) + epsg, 40)
+    wv<Float> = ld_f64(GW + j * 8)
+    zv<Float> = ld_f64(GZ + (h * DG + j) * 8)
+    sg<Float> = 1.0 + vexp(0.0 - zv)
+    st_f64(GY + (h * DG + j) * 8, ov * rinv * wv * (zv / sg))
+}
+
+// delta_step_t: delta_step_b on a column-major GDN state (element (j, i) of head h at
+// S*S*h + i*S + j), so a warp's loads at fixed i are 32 consecutive f64 (coalesced) instead of 32
+// rows 1 KB apart. Same per-thread arithmetic and order as delta_step_b: bit-identical results.
+// Same params as delta_step_b; grid Hv x S. In-place safe (each element read then written by its thread).
+delta_step_t(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    if (j < S) {
+        st_shared_f64(j, ld_f64(Kp + (j + S * hk) * 8))
+        st_shared_f64(256 + j, ld_f64(Q + (j + S * hk) * 8))
+    }
+    kernel_barrier()
+    if (j < S) {
+        gexp<Float> = vexp(ld_f64(G + h * 8))
+        be<Float> = ld_f64(BE + h * 8)
+        kq<Float> = 0.0
+        i<Int> = 0
+        for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+        rw<Int> = SIN + (S * S * h + j) * 8
+        st8<Int> = S * 8
+        acc<Float> = 0.0
+        acq<Float> = 0.0
+        i = 0
+        for (i in 0..S - 1) {
+            sv<Float> = ld_f64(rw + i * st8)
+            acc = acc + sv * ld_shared_f64(i)
+            acq = acq + sv * ld_shared_f64(256 + i)
+        }
+        del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+        st_f64(OUT + (j + S * h) * 8, sc * (gexp * acq + del * kq))
+        ww<Int> = SOUT + (S * S * h + j) * 8
+        i = 0
+        for (i in 0..S - 1) {
+            sv3<Float> = ld_f64(rw + i * st8)
+            st_f64(ww + i * st8, gexp * sv3 + del * ld_shared_f64(i))
+        }
+    }
+}
+
+// st_tr(src, dst, S, n): dst = per-head transpose of src (n = Hv*S*S f64; element h*S*S + j*S + i
+// goes to h*S*S + i*S + j). Grid ceil(n/256) x 256.
+st_tr(src<Int>, dst<Int>, S<Int>, n<Int>) -> {
+    e<Int> = blk_x() * dim_x() + tid_x()
+    if (e < n) {
+        ss<Int> = S * S
+        hh<Int> = e / ss
+        r<Int> = e % ss
+        jj<Int> = r / S
+        ii<Int> = r % S
+        st_f64(dst + (hh * ss + ii * S + jj) * 8, ld_f64(src + e * 8))
+    }
+}
+
+// delta_step_t32: delta_step_t with the column-major GDN state stored as f32 (VYB_GDN32=1). Same f64
+// arithmetic and order; only the state loads/stores round to f32, so the state traffic per token halves.
+delta_step_t32(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    Kp<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    G<Int> = ld_i64(p + 24)
+    BE<Int> = ld_i64(p + 32)
+    SIN<Int> = ld_i64(p + 40)
+    SOUT<Int> = ld_i64(p + 48)
+    OUT<Int> = ld_i64(p + 56)
+    S<Int> = ld_i64(p + 72)
+    Hk<Int> = ld_i64(p + 80)
+    sc<Float> = ld_f64(p + 96)
+    h<Int> = blk_x()
+    j<Int> = tid_x()
+    hk<Int> = h % Hk
+    if (j < S) {
+        st_shared_f64(j, ld_f64(Kp + (j + S * hk) * 8))
+        st_shared_f64(256 + j, ld_f64(Q + (j + S * hk) * 8))
+    }
+    kernel_barrier()
+    if (j < S) {
+        gexp<Float> = vexp(ld_f64(G + h * 8))
+        be<Float> = ld_f64(BE + h * 8)
+        kq<Float> = 0.0
+        i<Int> = 0
+        for (i in 0..S - 1) { kq = kq + ld_shared_f64(i) * ld_shared_f64(256 + i) }
+        rw<Int> = SIN + (S * S * h + j) * 4
+        st4<Int> = S * 4
+        acc<Float> = 0.0
+        acq<Float> = 0.0
+        i = 0
+        for (i in 0..S - 1) {
+            sv<Float> = (ld_f32(rw + i * st4) as Float)
+            acc = acc + sv * ld_shared_f64(i)
+            acq = acq + sv * ld_shared_f64(256 + i)
+        }
+        del<Float> = (ld_f64(V + (j + S * h) * 8) - gexp * acc) * be
+        st_f64(OUT + (j + S * h) * 8, sc * (gexp * acq + del * kq))
+        ww<Int> = SOUT + (S * S * h + j) * 4
+        i = 0
+        for (i in 0..S - 1) {
+            sv3<Float> = (ld_f32(rw + i * st4) as Float)
+            st_f32(ww + i * st4, ((gexp * sv3 + del * ld_shared_f64(i)) as Float32))
+        }
+    }
+}
+
+// st_tr32: st_tr writing an f32 destination (n f64 in, n f32 out).
+st_tr32(src<Int>, dst<Int>, S<Int>, n<Int>) -> {
+    e<Int> = blk_x() * dim_x() + tid_x()
+    if (e < n) {
+        ss<Int> = S * S
+        hh<Int> = e / ss
+        r<Int> = e % ss
+        jj<Int> = r / S
+        ii<Int> = r % S
+        st_f32(dst + (hh * ss + ii * S + jj) * 4, (ld_f64(src + e * 8) as Float32))
+    }
+}

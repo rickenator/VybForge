@@ -1,0 +1,32 @@
+// Ridge batched-prefill GDN short conv + SiLU with the SiLU in f32 (opt-in VYB_CONV32=1, NOT bit-identical).
+// Same inputs/outputs as rpf.vyb conv_b: X [S][QKV] f64, CV conv state [QKV][4] f64 (frame 4+u for u<0),
+// W [QKV][4] f64, Y [S][QKV] f64. The 4-tap dot stays f64 (exact vs conv_b); only silu(a) = a / (1 + 2^(-a*log2 e))
+// runs in f32 (ex2.approx + f32 div) instead of the f64 polynomial vexp + f64 div that made conv_b FP64-bound.
+// Compile: vyb --kernel --gpu sm_80.
+conv_b32(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    CV<Int> = ld_i64(p + 8)
+    W<Int> = ld_i64(p + 16)
+    Y<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 32)
+    QKV<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S * QKV) {
+        ch<Int> = gid % QKV
+        s<Int> = gid / QKV
+        acc<Float> = 0.0
+        j<Int> = 0
+        while (j < 4) {
+            u<Int> = s - 3 + j
+            xv<Float> = 0.0
+            if (u >= 0) { xv = ld_f64(X + (u * QKV + ch) * 8) } else { xv = ld_f64(CV + (ch * 4 + 4 + u) * 8) }
+            acc = acc + xv * ld_f64(W + (ch * 4 + j) * 8)
+            j = j + 1
+        }
+        a<Float32> = acc as Float32
+        nl2e<Float32> = -1.4426950408889634 as Float32
+        one<Float32> = 1.0 as Float32
+        y<Float32> = a / (one + ex2_f32(a * nl2e))
+        st_f64(Y + gid * 8, y as Float)
+    }
+}

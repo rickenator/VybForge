@@ -14,11 +14,14 @@ extern "C" {
     cuInit(flags<CUInt>)<CInt>
     cuDeviceGetCount(count<loc<CInt>>)<CInt>
     cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuDeviceGetAttribute(pi<loc<CInt>>, attrib<CInt>, dev<CInt>)<CInt>
     cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
     cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    # Generic UVA copy, used ASYNC on the null stream for the small launch-parameter blocks (see h2d).
+    cuMemcpyAsync(dst<Int>, src<loc<CVoid>>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyHtoDAsync_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>, hStream<Int>)<CInt>
     cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
     cuMemcpyDtoD_v2(dstDevice<Int>, srcDevice<Int>, ByteCount<Int>)<CInt>
@@ -102,15 +105,25 @@ dequant_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)
     }
     return 0
 }
+deqT_gpu(pkb<Int>, off<Int>, dout<Int>, numel<Int>, hq<loc<CVoid>>, inz<Int>)<Int> -> {
+    if ((numel / inz) % 16 != 0) { return 34 }
+    if (inz % 256 != 0) { return 34 }
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hq)), numel / 4096, 1, 1, 256, 1, 1, pkb + off, dout, numel, inz)
+        if (rc != 0) { return 33 }
+        return 0
+    }
+    return 0
+}
 load_norm(path<String>, pf<Int>, dpack<Int>, dout<Int>, off<Int>, numel<Int>, he<loc<CVoid>>)<Int> -> {
     data<String> = read_model(path, off, numel * 4)
     if (data.len() < numel * 4) { return 32 }
     freedom {
         e<Int> = download(data, dpack, numel * 4)
         if (e != 0) { return e }
-        cuMemcpyHtoD_v2(pf + 0, loc(dpack), 8)
-        cuMemcpyHtoD_v2(pf + 8, loc(dout), 8)
-        cuMemcpyHtoD_v2(pf + 16, loc(numel), 8)
+        cuMemcpyAsync(pf + 0, loc(dpack), 8, 0)
+        cuMemcpyAsync(pf + 8, loc(dout), 8, 0)
+        cuMemcpyAsync(pf + 16, loc(numel), 8, 0)
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(he)), (numel + 255) / 256, 1, 1, 256, 1, 1, pf, 0, 0, 0)
         if (rc != 0) { return 33 }
         return 0
@@ -138,6 +151,32 @@ emb_dequant(path<String>, off<Int>, total<Int>, dpk<Int>, q6fn<loc<CVoid>>, de<I
             }
         }
         if (estr != 0) { return estr }
+    }
+    return 0
+}
+# Item 21: the token-embedding table stays PACKED (Q6_K, 0.32 GB) on the GPU; a prompt/generated row is
+# decoded straight into EMB with the same f64 q6kdeq the old 3.1 GB f64 table was built with.
+emb_upload(path<String>, off<Int>, total<Int>, tep<Int>)<Int> -> {
+    CH<Int> = 65536 * 64
+    nb<Int> = total / 256 * 210
+    pos<Int> = 0
+    estr<Int> = 0
+    while (pos < nb) {
+        len<Int> = CH / 256 * 210
+        if (pos + len > nb) { len = nb - pos }
+        data<String> = read_model(path, off + pos, len)
+        if (data.len() < len) { return 61 }
+        freedom { e<Int> = download(data, tep + pos, len); if (e != 0) { estr = e } }
+        if (estr != 0) { return estr }
+        pos = pos + len
+    }
+    return 0
+}
+emb_row(q6fn<loc<CVoid>>, tep<Int>, tokenId<Int>, D<Int>, dst<Int>)<Int> -> {
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(q6fn)), (D + 255) / 256, 1, 1, 256, 1, 1, tep + tokenId * (D / 256) * 210, dst, D, 0)
+        if (rc != 0) { return 15 }
+        return 0
     }
     return 0
 }
@@ -179,20 +218,82 @@ parse_pids(s<String>)<Vec<Int>> -> {
 //   pass 1 (gemm32_p): A, B, SK, M, N, K, NBLK, KSP       +0..+56
 //   pass 2 (gemm32_r): SK, SCR, M, N, alpha, beta, KSP    +0..+48 (alpha/beta are not read)
 //   cast32 / widen32:  src, dst, n                        +0..+16
+// Launch-parameter writes are cuMemcpyAsync on the null stream (Ursela): the synchronous cuMemcpyHtoD
+// from pageable memory performs a STREAM SYNC before every copy, so each of the ~2,900 parameter writes
+// per token drained the GPU queue and serialized host and device. The async form from pageable memory
+// stages the bytes immediately (the host local can be reused at once) and stays ordered with the
+// launches on the same null stream, so the semantics are unchanged and the pipeline is not drained.
 struct GP1 { a<Int>, b<Int>, sk<Int>, m<Int>, n<Int>, k<Int>, nblk<Int>, ksp<Int> }
 struct GP2 { sk<Int>, scr<Int>, m<Int>, n<Int>, pad1<Int>, pad2<Int>, ksp<Int> }
 struct GP3 { src<Int>, dst<Int>, n<Int> }
+struct AP1 { s<Int>, d<Int>, m<Int>, k<Int> }
+// More parameter blocks as structs (Ursela): one cuMemcpyAsync per block instead of one per 8-byte field.
+// Field order == kernel offsets. Padding fields cover the unused slots of the big PD-layout blocks.
+//   rms_ss: X, SS, S, D, CH (+0..+32)      rms_apply: X, W, Y, SS, S, D, eps, NCH (+0..+56)
+//   rmsnorm: X, W, Y, M, N, eps (+0..+40)
+//   qwen3rope from +80: Q, K, Qd, Kd, [112..168 pad], FREQ@176, S@184, [192], HD@200, H@208, KVH@216, POS@224
+//   attention from +80: Q, K, V, Ctx, [112..176 pad], S@184, [192], HD@200, H@208, KVH@216, P0@224,
+//                       SC@232, T@240, EW@248, MS@256
+struct NP1 { x<Int>, ss<Int>, s<Int>, d<Int>, ch<Int> }
+struct NP2 { x<Int>, w<Int>, y<Int>, ss<Int>, s<Int>, d<Int>, ep<Float>, nch<Int> }
+struct RNB { x<Int>, w<Int>, y<Int>, m<Int>, n<Int>, ep<Float> }
+struct RBB { x<Int>, w<Int>, y<Int>, m<Int>, n<Int>, ep<Float>, y32<Int> }   // rms_blk
+struct RPB { q<Int>, k<Int>, qd<Int>, kd<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>,
+             fr<Int>, s<Int>, z8<Int>, hd<Int>, h<Int>, kvh<Int>, pos<Int> }
+struct ATB { q<Int>, k<Int>, v<Int>, ctx<Int>, z0<Int>, z1<Int>, z2<Int>, z3<Int>, z4<Int>, z5<Int>, z6<Int>, z7<Int>, z8<Int>,
+             s<Int>, z9<Int>, hd<Int>, h<Int>, kvh<Int>, p0<Int>, sc<Int>, t<Int>, ew<Int>, ms<Int>, pc<Int>, ke<Int>, e32<Int> }
 
+gemm2t(gpn<loc<CVoid>>, gtn<loc<CVoid>>, gan<loc<CVoid>>, TL<Int>, TK<Int>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
+      A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
+    # TL = 1: pass 1 is the register-tiled gemm16_t (M >= 8, N % 256 == 0, f16 B); else gemm2
+    ok<Int> = 0
+    if (TL == 1) { if (M >= 8) { if (N % 256 == 0) { ok = 1 } } }
+    if (ok == 0) { return gemm2(gpn, grn, GPB, SKB, KSP, A, B, C, M, N, K, al, be) }
+    freedom {
+        KSP = KSP % 65536   # the column-factor bits only matter to gemm16_p
+        # TK = 1 (VYB_GTK=1): split-K only as deep as parallelism needs (>= 1536 warps), not the decode-tuned
+        # KSP (32/64): at M = 512 the 32-deep partials were 637 MB written + read per ffn GEMM. Changes the
+        # f32 summation grouping (not bit-identical to gemm16_p) -> gated on tokens.
+        TKW<Int> = TK
+        if (TK > 0) {
+            itm<Int> = (M + 7) / 8 * (N / 256)
+            kt<Int> = (TKW + itm - 1) / itm
+            if (kt < KSP) { KSP = kt }
+            if (KSP < 1) { KSP = 1 }
+        }
+        NBLK<Int> = ((M + 7) / 8 * (N / 256) + 7) / 8
+        # packed A lives in the split-K scratch past the KSP partial slices (SKB holds 32 x MAXS x FF x 8 bytes)
+        APK<Int> = SKB + ((KSP * M * N * 4 + 255) / 256) * 256
+        apb<Int> = APK + ((M + 7) / 8 * K * 32 + 255) / 256 * 256
+        ab<AP1> = AP1 { s = A, d = APK, m = M, k = K }
+        if (cuMemcpyAsync(apb, loc(ab), 32, 0) != 0) { return 1 }
+        rca<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gan)), ((M + 7) / 8 * K * 8 + 255) / 256, 1, 1, 256, 1, 1, apb, 0, 0, 0)
+        if (rca != 0) { println("APACK_ERR rc=" + rca.to_string()); return 73 }
+        b1<GP1> = GP1 { a = APK, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
+        if (cuMemcpyAsync(GPB, loc(b1), 64, 0) != 0) { return 1 }
+        rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gtn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
+        if (rc1 != 0) { println("GEMM2T_ERR rc=" + rc1.to_string()); return 73 }
+        b2<GP2> = GP2 { sk = SKB, scr = C, m = M, n = N, pad1 = 0, pad2 = 0, ksp = KSP }
+        if (cuMemcpyAsync(GPB + 64, loc(b2), 56, 0) != 0) { return 1 }
+        rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(grn)), (M * N + 255) / 256, 1, 1, 256, 1, 1, GPB + 64, 0, 0, 0)
+        if (rc2 != 0) { return 74 }
+        return 0
+    }
+    return 0
+}
 gemm2(gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
       A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, al<Float>, be<Float>)<Int> -> {
     freedom {
-        NBLK<Int> = ((M + 3) / 4 * N + 255) / 256
+        # KSP carries the pass-1 column factor in its high bits: KSP = ksp + 65536 * (cf - 1).
+        CF<Int> = KSP / 65536 + 1
+        KSP = KSP % 65536
+        NBLK<Int> = ((M + 3) / 4 * (N / CF) + 255) / 256
         b1<GP1> = GP1 { a = A, b = B, sk = SKB, m = M, n = N, k = K, nblk = NBLK, ksp = KSP }
-        if (cuMemcpyHtoD_v2(GPB, loc(b1), 64) != 0) { return 1 }
+        if (cuMemcpyAsync(GPB, loc(b1), 64, 0) != 0) { return 1 }
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(gpn)), NBLK * KSP, 1, 1, 256, 1, 1, GPB, 0, 0, 0)
         if (rc1 != 0) { println("GEMM2_P_ERR rc=" + rc1.to_string() + " grid=" + (NBLK * KSP).to_string() + " M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string()); return 73 }
         b2<GP2> = GP2 { sk = SKB, scr = C, m = M, n = N, pad1 = 0, pad2 = 0, ksp = KSP }
-        if (cuMemcpyHtoD_v2(GPB + 64, loc(b2), 56) != 0) { return 1 }
+        if (cuMemcpyAsync(GPB + 64, loc(b2), 56, 0) != 0) { return 1 }
         # pass 2 reads its params from GPB + 64, NOT from GPB: launching it with the base pointer fed it
         # pointer values as M/N and made it write through the weights buffer (illegal address 700).
         rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(grn)), (M * N + 255) / 256, 1, 1, 256, 1, 1, GPB + 64, 0, 0, 0)
@@ -208,23 +309,87 @@ norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
       X<Int>, W<Int>, Y<Int>, S<Int>, D<Int>, ep<Float>, CH<Int>)<Int> -> {
     freedom {
         NCH<Int> = (D + CH - 1) / CH
-        cuMemcpyHtoD_v2(RSPB + 0, loc(X), 8)
-        cuMemcpyHtoD_v2(RSPB + 8, loc(SNB), 8)
-        cuMemcpyHtoD_v2(RSPB + 16, loc(S), 8)
-        cuMemcpyHtoD_v2(RSPB + 24, loc(D), 8)
-        cuMemcpyHtoD_v2(RSPB + 32, loc(CH), 8)
+        n1b<NP1> = NP1 { x = X, ss = SNB, s = S, d = D, ch = CH }
+        cuMemcpyAsync(RSPB, loc(n1b), 40, 0)
         rc1<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rsnp)), (S * NCH + 255) / 256, 1, 1, 256, 1, 1, RSPB, 0, 0, 0)
         if (rc1 != 0) { println("NORM2_SS_ERR rc=" + rc1.to_string()); return 75 }
-        cuMemcpyHtoD_v2(RSB + 0, loc(X), 8)
-        cuMemcpyHtoD_v2(RSB + 8, loc(W), 8)
-        cuMemcpyHtoD_v2(RSB + 16, loc(Y), 8)
-        cuMemcpyHtoD_v2(RSB + 24, loc(SNB), 8)
-        cuMemcpyHtoD_v2(RSB + 32, loc(S), 8)
-        cuMemcpyHtoD_v2(RSB + 40, loc(D), 8)
-        cuMemcpyHtoD_v2(RSB + 48, loc(ep), 8)
-        cuMemcpyHtoD_v2(RSB + 56, loc(NCH), 8)
+        n2b<NP2> = NP2 { x = X, w = W, y = Y, ss = SNB, s = S, d = D, ep = ep, nch = NCH }
+        cuMemcpyAsync(RSB, loc(n2b), 64, 0)
         rc2<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(ranp)), (S * D + 255) / 256, 1, 1, 256, 1, 1, RSB, 0, 0, 0)
         if (rc2 != 0) { println("NORM2_AP_ERR rc=" + rc2.to_string()); return 76 }
+        return 0
+    }
+    return 0
+}
+
+// Block-per-row RMSNorm (rms_blk): one launch, grid = rows, 256 threads; Y32 != 0 also writes an f32 copy.
+normb(rbf<loc<CVoid>>, PB<Int>, X<Int>, W<Int>, Y<Int>, M<Int>, N<Int>, ep<Float>, Y32<Int>)<Int> -> {
+    rb<RBB> = RBB { x = X, w = W, y = Y, m = M, n = N, ep = ep, y32 = Y32 }
+    freedom {
+        cuMemcpyAsync(PB, loc(rb), 56, 0)
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(rbf)), M, 1, 1, 256, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("RMS_BLK_ERR rc=" + rc.to_string()); return 78 }
+        return 0
+    }
+    return 0
+}
+
+// Fused quantized GEMV launch (Ursela): Y[M,N] (f64) = X[M,K] (f32) . W^T, W = resident Q4_K (ty 12)
+// or Q6_K (ty 14) rows. 48-byte param block {W, X, Y, M, N, K}; ceil(N/16) blocks x 512 threads.
+struct QGB { w<Int>, x<Int>, y<Int>, m<Int>, n<Int>, k<Int>, ye<Int>, w2<Int>, n2<Int>, y2<Int>, ye2<Int>, w3<Int>, n3<Int>, y3<Int>, ye3<Int>, rs<Int> }
+# Fused M=1 launch of up to three GEMVs over the same x (item: fewer launches). Same kernels, same
+# per-row math -> bit-identical to separate gemvq calls. Only for GR 2 (Ampere R=2) / 3 (p2).
+gemvq3(q4f<loc<CVoid>>, q6f<loc<CVoid>>, GR<Int>, ty<Int>, PB<Int>, X<Int>, K<Int>, RS<Int>, W1<Int>, Y1<Int>, N1<Int>, E1<Int>, W2<Int>, Y2<Int>, N2<Int>, E2<Int>, W3<Int>, Y3<Int>, N3<Int>, E3<Int>)<Int> -> {
+    qb<QGB> = QGB { w = W1, x = X, y = Y1, m = 1, n = N1, k = K, ye = E1, w2 = W2, n2 = N2, y2 = Y2, ye2 = E2, w3 = W3, n3 = N3, y3 = Y3, ye3 = E3, rs = RS }
+    freedom {
+        cuMemcpyAsync(PB, loc(qb), 128, 0)
+        NT<Int> = N1 + N2 + N3
+        qfn<loc<CVoid>> = q4f
+        if (ty == 14) { qfn = q6f }
+        gx<Int> = (NT + 7) / 8
+        bx<Int> = 256
+        if (GR == 2) { gx = (NT + 31) / 32; bx = 512 }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(qfn)), gx, 1, 1, bx, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("GEMVQ3_ERR rc=" + rc.to_string()); return 79 }
+        return 0
+    }
+    return 0
+}
+gemvq(q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, GR<Int>, ty<Int>, PB<Int>, W<Int>, X<Int>, Y<Int>, M<Int>, N<Int>, K<Int>, YE<Int>, MR<Int>)<Int> -> {
+    qb<QGB> = QGB { w = W, x = X, y = Y, m = M, n = N, k = K, ye = YE, w2 = 0, n2 = 0, y2 = 0, ye2 = 0, w3 = 0, n3 = 0, y3 = 0, ye3 = 0, rs = 0 }
+    freedom {
+        cuMemcpyAsync(PB, loc(qb), 128, 0)
+        # M > 1 (prefill): the 8-row twins reuse each decoded weight for 8 activation rows.
+        gx<Int> = (N + 15) / 16
+        bx<Int> = 512
+        qfn<loc<CVoid>> = q4f
+        if (ty == 14) { qfn = q6f }
+        if (M > 1) {
+            qfn = q4m
+            if (ty == 14) { qfn = q6m }
+        }
+        # gemv_q4k_m8 runs 8-warp blocks (80 registers; item 18)
+        if (M > 1) { if (ty == 12) { gx = (N + 7) / 8; bx = 256 } }
+        # exact-M R=2 twins: 8 warps x 2 rows per block (both types)
+        if (M > 1) { if (MR == 1) { gx = (N + 15) / 16; bx = 256 } }
+        if (M == 1) { if (GR == 3) { if (N > 0) {
+            if ((K / 256) % 2 != 0) { println("GEMVQ_ERR p2 needs K/256 even"); return 78 }
+            gx = (N + 7) / 8
+            bx = 256
+        } } }
+        # M = 1: 2 rows per warp (item 19); 16-warp blocks, or 4-warp blocks for N <= 1024
+        if (M == 1) { if (GR == 2) {
+            if (N % 2 != 0) { println("GEMVQ_ERR odd N"); return 78 }
+            gx = (N + 31) / 32
+            if (N <= 1024) {
+                qfn = q4s
+                if (ty == 14) { qfn = q6s }
+                gx = (N + 7) / 8
+                bx = 128
+            }
+        } }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(qfn)), gx, 1, 1, bx, 1, 1, PB, 0, 0, 0)
+        if (rc != 0) { println("GEMVQ_ERR rc=" + rc.to_string()); return 79 }
         return 0
     }
     return 0
@@ -235,7 +400,7 @@ norm2(rsnp<loc<CVoid>>, ranp<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>,
 cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
     b3<GP3> = GP3 { src = src, dst = dst, n = n }
     freedom {
-        if (cuMemcpyHtoD_v2(PB, loc(b3), 24) != 0) { return 1 }
+        if (cuMemcpyAsync(PB, loc(b3), 24, 0) != 0) { return 1 }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("CAST32_ERR rc=" + rc.to_string()); return 77 }
         return 0
@@ -250,7 +415,7 @@ cast1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
 widen1(cfn<loc<CVoid>>, PB<Int>, src<Int>, dst<Int>, n<Int>)<Int> -> {
     b3<GP3> = GP3 { src = src, dst = dst, n = n }
     freedom {
-        if (cuMemcpyHtoD_v2(PB, loc(b3), 24) != 0) { return 1 }
+        if (cuMemcpyAsync(PB, loc(b3), 24, 0) != 0) { return 1 }
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(cfn)), (n + 255) / 256, 1, 1, 256, 1, 1, PB, 0, 0, 0)
         if (rc != 0) { println("WIDEN1_ERR rc=" + rc.to_string()); return 80 }
         return 0
@@ -269,67 +434,212 @@ run_layer(S<Int>, D<Int>, H<Int>, KVH<Int>, HD<Int>, FF<Int>, NQ<Int>, NKV<Int>,
           XN<Int>, DQ<Int>, DK<Int>, DV<Int>, DQN<Int>, DKN<Int>, DQr<Int>, DKr<Int>,
           DCtx<Int>, DO<Int>, X1<Int>, X1N<Int>, Gr<Int>, Up<Int>, Hu<Int>, M<Int>,
           gpn<loc<CVoid>>, grn<loc<CVoid>>, GPB<Int>, SKB<Int>, KSP<Int>,
-          rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>)<Int> -> {
+          rsn<loc<CVoid>>, ran<loc<CVoid>>, RSPB<Int>, RSB<Int>, SNB<Int>, CHN<Int>,
+          P0<Int>, KC<Int>, VC<Int>, akfn<loc<CVoid>>, QV<Int>,
+          ascf<loc<CVoid>>, acxf<loc<CVoid>>, SCB<Int>,
+          amxf<loc<CVoid>>, aexf<loc<CVoid>>, asmf<loc<CVoid>>, anrf<loc<CVoid>>, EWB<Int>, MSB<Int>,
+          rbf<loc<CVoid>>, RBP<Int>, RBQ<Int>, W16C<Int>,
+          AT2<Int>, KV32<Int>, as4f<loc<CVoid>>, ac4f<loc<CVoid>>, EW32<Int>, as3f<loc<CVoid>>, ac3f<loc<CVoid>>, acr3f<loc<CVoid>>, as2f<loc<CVoid>>, asxf<loc<CVoid>>, ac2f<loc<CVoid>>, acrf<loc<CVoid>>, PCB<Int>,
+          QG<Int>, GR<Int>, q4s<loc<CVoid>>, q6s<loc<CVoid>>, q4f<loc<CVoid>>, q6f<loc<CVoid>>, q4m<loc<CVoid>>, q6m<loc<CVoid>>, QPB<Int>,
+          Pq<Int>, Pk<Int>, Pv<Int>, Po<Int>, Pg<Int>, Pu<Int>, Pd<Int>, Tq<Int>, Tk<Int>, Tv<Int>, To<Int>, Tg<Int>, Tu<Int>, Td<Int>, FZ<Int>, s32f<loc<CVoid>>, qknf<loc<CVoid>>, MRr<Int>, g3t<loc<CVoid>>, TLy<Int>, TKy<Int>, g3a<loc<CVoid>>, as5f<loc<CVoid>>, ac5f<loc<CVoid>>, APFy<Int>, aktf<loc<CVoid>>)<Int> -> {
     freedom {
         AF<Float> = 1.0; BF<Float> = 0.0
+        # gemm16_p covers 2 columns per thread; gemm32_p 1. Encoded into the KSP argument (see gemm2).
+        KSPG<Int> = KSP
+        if (W16C == 2) { KSPG = KSP + 65536 }
+        # Per-shape split-K (harness sweep, d0419ba): the narrow-N gemms (attn_k/v N=1024, ffn_down N=2560
+        # over K=9728) want twice the slices to fill the card; the wide ones stay at KSP.
+        KSPW<Int> = KSPG + KSP
         zro<Int> = 0
         rA<Int> = XI; rB<Int> = N1; rC<Int> = XN
-        if (norm2(rsn, ran, RSPB, RSB, SNB, XI, N1, XN, S, D, EPS, CHN) != 0) { return 75 }
-
-        if (cast1(c32n, CPB, XN, XN32, S * D) != 0) { return 77 }
+        # attn_norm + the f32 copy for the gemms in ONE launch (rms_blk), was norm2 (2) + cast1 (1)
+        if (normb(rbf, RBP, XI, N1, XN, S, D, EPS, XN32) != 0) { return 75 }
+        # KV cache (KC != 0): V rows land directly in this layer's V cache at row P0.
+        vdst<Int> = DV
+        # VYB_KV32 (KV32 == 1): the cache rows are f32; V/K land in the f64 scratch first and are
+        # narrowed into row P0 of the cache (cast32) -- the attention widens them back per element.
+        KEL<Int> = 8
+        if (KV32 == 1) { if (KC != 0) { if (AT2 >= 1) { KEL = 4 } } }
+        # decode GEMV writes V straight into the f32 cache row; the f16/f32 gemm path writes f64 scratch
+        VYE<Int> = 8
+        if (KC != 0) { if (KEL == 8) { vdst = VC + P0 * NKV * 8 } }
+        if (KEL == 4) { if (QG == 1) { vdst = VC + P0 * NKV * 4; VYE = 4 } }
         gA<Int> = XN; gB<Int> = DWq32; gC<Int> = DQ; gM<Int> = S; gN<Int> = NQ; gK<Int> = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
-        gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
-        gA = XN; gB = DWv32; gC = DV; gM = S; gN = NKV; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, XN32, DWv32, DV, S, NKV, D, AF, BF) != 0) { return 73 }
+        # Fused decode launches (FZ, default on; VYB_FUSE=0 off): q|k|v (or q|k) in one GEMV launch.
+        fz3<Int> = 0
+        if (FZ == 1) { if (QG == 1) { if (S == 1) { if (GR >= 2) { if (Tq == Tk) { fz3 = 1 } } } } }
+        if (fz3 == 1) { if (Tv == Tq) { fz3 = 2 } }
+        if (fz3 == 2) {
+            if (gemvq3(q4f, q6f, GR, Tq, QPB, XN32, D, 0, Pq, DQ, NQ, 8, Pk, DK, NKV, 8, Pv, vdst, NKV, VYE) != 0) { return 79 }
+        }
+        if (fz3 == 1) {
+            if (gemvq3(q4f, q6f, GR, Tq, QPB, XN32, D, 0, Pq, DQ, NQ, 8, Pk, DK, NKV, 8, 0, 0, 0, 8) != 0) { return 79 }
+        }
+        if (fz3 == 0) {
+            if (QG == 1) {
+                if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tq, QPB, Pq, XN32, DQ, S, NQ, D, 8, MRr) != 0) { return 79 }
+            } else {
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, XN32, DWq32, DQ, S, NQ, D, AF, BF) != 0) { return 73 }
+            }
+            gA = XN; gB = DWk32; gC = DK; gM = S; gN = NKV; gK = D
+            if (QG == 1) {
+                if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tk, QPB, Pk, XN32, DK, S, NKV, D, 8, MRr) != 0) { return 79 }
+            } else {
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWk32, DK, S, NKV, D, AF, BF) != 0) { return 73 }
+            }
+        }
+        if (fz3 < 2) {
+            gA = XN; gB = DWv32; gC = vdst; gM = S; gN = NKV; gK = D
+            if (QG == 1) {
+                if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tv, QPB, Pv, XN32, vdst, S, NKV, D, VYE, MRr) != 0) { return 79 }
+            } else {
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, XN32, DWv32, vdst, S, NKV, D, AF, BF) != 0) { return 73 }
+            }
+        }
 
-        rA = DQ; rB = Nq; rC = DQN; gM = S * H; gN = HD
-        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-        println("RLR qkvok")
-        cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-        rA = DK; rB = Nk; rC = DKN; gM = S * KVH; gN = HD
-        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-        cuMemcpyHtoD_v2(RN + 24, loc(gM), 8); cuMemcpyHtoD_v2(RN + 32, loc(gN), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (S * KVH * HD + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
+        if (QV == 0) { println("RLR qkvok") }
+        # q/k norms: rows of HD, one block per (row, head); separate param blocks so the two stay in flight
+        fzn<Int> = 0
+        if (FZ == 1) { if (HD == 128) { fzn = 1 } }
+        if (fzn == 0) {
+        if (normb(rbf, RBP + 64, DQ, Nq, DQN, S * H, HD, EPS, 0) != 0) { return 75 }
+        if (normb(rbf, RBQ, DK, Nk, DKN, S * KVH, HD, EPS, 0) != 0) { return 75 }
+        }
 
-        cuMemcpyHtoD_v2(ROP + 80, loc(DQN), 8); cuMemcpyHtoD_v2(ROP + 88, loc(DKN), 8)
-        cuMemcpyHtoD_v2(ROP + 96, loc(DQr), 8); cuMemcpyHtoD_v2(ROP + 104, loc(DKr), 8)
-        cuMemcpyHtoD_v2(ROP + 176, loc(DF), 8); cuMemcpyHtoD_v2(ROP + 184, loc(S), 8)
-        cuMemcpyHtoD_v2(ROP + 200, loc(HD), 8); cuMemcpyHtoD_v2(ROP + 208, loc(H), 8); cuMemcpyHtoD_v2(ROP + 216, loc(KVH), 8)
-        cuMemcpyHtoD_v2(ROP + 224, loc(zro), 8)   # POS offset = 0 (full-sequence rope; qwen3rope +224)
+        # KV cache: rotated K rows land directly in this layer's K cache at row P0, rope at POS = P0.
+        kdst<Int> = DKr
+        if (KC != 0) { kdst = KC + P0 * NKV * KEL }
+        rtb<Int> = 0
+        if (HD == 128) { rtb = DF + 512 }
+        rpb<RPB> = RPB { q = DQN, k = DKN, qd = DQr, kd = kdst, z0 = rtb, z1 = KEL, z2 = DQ, z3 = DK, z4 = Nq, z5 = Nk, z6 = RBP, z7 = 0,
+                         fr = DF, s = S, z8 = 0, hd = HD, h = H, kvh = KVH, pos = P0 }
+        cuMemcpyAsync(ROP + 80, loc(rpb), 152, 0)
         rope_total<Int> = S * H * HD + S * KVH * HD
-        cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
-        println("RLR ropeok")
+        if (fzn == 1) {
+            cuda_launch4i(from<loc<CVoid>>(addr(qknf)), S * (H + KVH), 1, 1, 128, 1, 1, ROP, 0, 0, 0)
+        } else {
+            cuda_launch4i(from<loc<CVoid>>(addr(rpfn)), (rope_total + 255) / 256, 1, 1, 256, 1, 1, ROP, 0, 0, 0)
+        }
+        if (QV == 0) { println("RLR ropeok") }
+        if (KEL == 4) { if (VYE == 8) {
+            if (cast1(c32n, CPB, DV, VC + P0 * NKV * 4, S * NKV) != 0) { return 77 }
+        } }
 
-        cuMemcpyHtoD_v2(ATT + 80, loc(DQr), 8); cuMemcpyHtoD_v2(ATT + 88, loc(DKr), 8)
-        cuMemcpyHtoD_v2(ATT + 96, loc(DV), 8); cuMemcpyHtoD_v2(ATT + 104, loc(DCtx), 8)
-        cuMemcpyHtoD_v2(ATT + 184, loc(S), 8); cuMemcpyHtoD_v2(ATT + 200, loc(HD), 8)
-        cuMemcpyHtoD_v2(ATT + 208, loc(H), 8); cuMemcpyHtoD_v2(ATT + 216, loc(KVH), 8)
-        cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
-        println("RLR attnok")
+        TT<Int> = P0 + S
+        E32U<Int> = 0
+        # fused-mode: attn_cxr3 also writes the f32 context (no cast32 launch)
+        c32d<Int> = 0
+        if (FZ == 1) { if (KC != 0) { if (AT2 >= 3) { c32d = DC32 } } }
+        if (AT2 == 4) { if (KEL == 4) { E32U = EW32 } }
+        akp<Int> = DKr; avp<Int> = DV
+        if (KC != 0) { akp = KC; avp = VC }
+        atb<ATB> = ATB { q = DQr, k = akp, v = avp, ctx = DCtx, z0 = 0, z1 = 0, z2 = 0, z3 = 0, z4 = 0, z5 = 0, z6 = 0, z7 = 0, z8 = 0,
+                         s = S, z9 = c32d, hd = HD, h = H, kvh = KVH, p0 = P0, sc = SCB, t = TT, ew = EWB, ms = MSB, pc = PCB, ke = KEL, e32 = E32U }
+        cuMemcpyAsync(ATT + 80, loc(atb), 208, 0)
+        if (KC != 0) {
+            # scores once per (row, head, position); softmax once per (row, head[, position]); then the
+            # weighted V sum -- bit-identical to attn_kv / attn.
+            if (AT2 == 4) { if (KEL == 4) {
+                # f32-math attention (VYB_ATTN=4 with VYB_KV32=1)
+                # prefill (S >= APF, HD == 128): thread-per-score attn_sc5 + chunk-fused attn_cx5 (bit-identical)
+                apv<Int> = 0
+                if (S >= APFy) { if (HD == 128) { apv = 1 } }
+                if (apv == 1) {
+                    cuda_launch4i(from<loc<CVoid>>(addr(aktf)), (TT * KVH * 128 + S * H * 128 + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(as5f)), S * KVH * ((TT + 127) / 128), 1, 1, 128, 1, 1, ATT, 0, 0, 0)
+                } else {
+                    cuda_launch4i(from<loc<CVoid>>(addr(as4f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                }
+                cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                if (apv == 1) {
+                    cuda_launch4i(from<loc<CVoid>>(addr(ac5f)), S * KVH, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                } else {
+                    cuda_launch4i(from<loc<CVoid>>(addr(ac4f)), S * KVH * 32, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                    cuda_launch4i(from<loc<CVoid>>(addr(acr3f)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                }
+            } else { return 81 } }
+            if (AT2 == 3) {
+                # GQA-grouped parallel attention (Ursela, item 22)
+                cuda_launch4i(from<loc<CVoid>>(addr(as3f)), S * KVH * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(ac3f)), S * KVH * 32, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(acr3f)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            }
+            if (AT2 == 1) {
+                # parallel attention (Ursela, item 22): 4 launches, f64, tree/chunked reductions
+                cuda_launch4i(from<loc<CVoid>>(addr(as2f)), S * H * ((TT + 7) / 8), 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(asxf)), S * H, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(ac2f)), S * H * 8, 1, 1, HD, 1, 1, ATT, 0, 0, 0)
+                cuda_launch4i(from<loc<CVoid>>(addr(acrf)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            }
+            if (AT2 == 0) {
+            cuda_launch4i(from<loc<CVoid>>(addr(ascf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(amxf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(aexf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(asmf)), (S * H + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(anrf)), (S * H * TT + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            cuda_launch4i(from<loc<CVoid>>(addr(acxf)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+            }
+        } else {
+            cuda_launch4i(from<loc<CVoid>>(addr(afn)), (S * H * HD + 255) / 256, 1, 1, 256, 1, 1, ATT, 0, 0, 0)
+        }
+        if (QV == 0) { println("RLR attnok") }
 
-        if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 }
+        if (c32d == 0) { if (cast1(c32n, CPB, DCtx, DC32, S * NQ) != 0) { return 77 } }
         gA = DCtx; gB = DWo32; gC = DO; gM = S; gN = D; gK = NQ
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        fzr<Int> = 0
+        if (FZ == 1) { if (QG == 1) { if (S == 1) { if (GR >= 2) { fzr = 1 } } } }
+        if (fzr == 1) {
+            # o-projection with the residual in its epilogue: X1 = XI + Wo ctx (was gemv + resid)
+            if (gemvq3(q4f, q6f, GR, To, QPB, DC32, NQ, XI, Po, X1, D, 8, 0, 0, 0, 8, 0, 0, 0, 8) != 0) { return 79 }
+        } else {
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, To, QPB, Po, DC32, DO, S, D, NQ, 8, MRr) != 0) { return 79 }
+        } else {
+            if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, DC32, DWo32, DO, S, D, NQ, AF, BF) != 0) { return 73 }
+        }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, XI, DO, X1, S * D)
+        }
 
         rA = X1; rB = N2; rC = X1N
-        if (norm2(rsn, ran, RSPB, RSB, SNB, X1, N2, X1N, S, D, EPS, CHN) != 0) { return 75 }
-
-        if (cast1(c32n, CPB, X1N, X132, S * D) != 0) { return 77 }
-        gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
-        gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
-        cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
-
-        if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
+        if (normb(rbf, RBP, X1, N2, X1N, S, D, EPS, X132) != 0) { return 75 }
+        fz2<Int> = 0
+        if (FZ == 1) { if (QG == 1) { if (S == 1) { if (GR >= 2) { if (Tg == Tu) { fz2 = 1 } } } } }
+        if (fz2 == 1) {
+            if (gemvq3(q4f, q6f, GR, Tg, QPB, X132, D, 0, Pg, Gr, FF, 8, Pu, Up, FF, 8, 0, 0, 0, 8) != 0) { return 79 }
+        } else {
+            gA = X1N; gB = DWg32; gC = Gr; gM = S; gN = FF; gK = D
+            if (QG == 1) {
+                if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tg, QPB, Pg, X132, Gr, S, FF, D, 8, MRr) != 0) { return 79 }
+            } else {
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWg32, Gr, S, FF, D, AF, BF) != 0) { return 73 }
+            }
+            gA = X1N; gB = DWu32; gC = Up; gM = S; gN = FF; gK = D
+            if (QG == 1) {
+                if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Tu, QPB, Pu, X132, Up, S, FF, D, 8, MRr) != 0) { return 79 }
+            } else {
+                if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPG, X132, DWu32, Up, S, FF, D, AF, BF) != 0) { return 73 }
+            }
+        }
+        if (FZ == 1) {
+            cuda_launch4i(from<loc<CVoid>>(addr(s32f)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, HU32, S * FF)
+        } else {
+            cuda_launch4i(from<loc<CVoid>>(addr(sfn)), (S * FF + 255) / 256, 1, 1, 256, 1, 1, Gr, Up, Hu, S * FF)
+            if (cast1(c32n, CPB, Hu, HU32, S * FF) != 0) { return 77 }
+        }
         gA = Hu; gB = DWd32; gC = M; gM = S; gN = D; gK = FF
-        if (gemm2(g3p, g3r, GPB, SKB, KSP, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        if (fzr == 1) {
+            # down-projection with the residual in its epilogue: XO = X1 + Wd h
+            if (gemvq3(q4f, q6f, GR, Td, QPB, HU32, FF, X1, Pd, XO, D, 8, 0, 0, 0, 8, 0, 0, 0, 8) != 0) { return 79 }
+        } else {
+        if (QG == 1) {
+            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, Td, QPB, Pd, HU32, M, S, D, FF, 8, MRr) != 0) { return 79 }
+        } else {
+            if (gemm2t(g3p, g3t, g3a, TLy, TKy, g3r, GPB, SKB, KSPW, HU32, DWd32, M, S, D, FF, AF, BF) != 0) { return 73 }
+        }
         cuda_launch4i(from<loc<CVoid>>(addr(refn)), (S * D + 255) / 256, 1, 1, 256, 1, 1, X1, M, XO, S * D)
-        println("RLR endok")
+        }
+        if (QV == 0) { println("RLR endok") }
         return 0
     }
     return 0
@@ -365,10 +675,77 @@ main()<Int> -> {
     qs<String> = env_get("VYB_QUIET") else ""
     if (qs.len() > 0) { QV = 1 }
     MAXS<Int> = SEEDLEN + GEN
+    # KV cache (default ON): prefill the prompt once, then run ONE row per generated token against the
+    # per-layer K/V cache. VYB_NOKV=1 restores the recompute-the-whole-prefix loop for A/B checks; the two
+    # paths are bit-identical (same per-row arithmetic in the same order), so the token streams must match.
+    KVON<Int> = 1
+    nkv_s<String> = env_get("VYB_NOKV") else ""
+    if (nkv_s.len() > 0) { KVON = 0 }
+    # Resident weight precision: VYB_W32=1 keeps the f32 copy (14.5 GB); default is f16 (7.3 GB), which
+    # halves the bytes every token streams. W16 = 1 -> f16 path.
+    W16<Int> = 1
+    w32_s<String> = env_get("VYB_W32") else ""
+    if (w32_s.len() > 0) { W16 = 0 }
+    # Head table precision: f16 by default (0.78 GB streamed per token); VYB_HEAD32=1 keeps f32 (1.55 GB).
+    # Fused quantized GEMV for decode steps (S == 1) straight from the resident Q4_K/Q6_K blocks
+    # (Ursela, queue item 16). VYB_GEMV16=1 falls back to the expanded f16/f32 weights for every step.
+    # Parallel f64 attention (item 22); VYB_ATTN1=1 keeps the serial-per-head kernels (bit-exact old order).
+    # VYB_KV32=1: f32 K/V cache (half the per-token cache bytes); needs the parallel attention.
+    KV32ON<Int> = 0
+    kv32_s<String> = env_get("VYB_KV32") else ""
+    if (kv32_s.len() > 0) { KV32ON = 1 }
+    AT2ON<Int> = 1
+    at1_s<String> = env_get("VYB_ATTN1") else ""
+    if (at1_s.len() > 0) { AT2ON = 0 }
+    # Default (item 22): AT2ON = 4 = f32-math GQA-grouped attention over an f32 K/V cache (token streams
+    # identical to the serial f64 kernels through GEN=1024 on 5 prompts, both GPUs). VYB_ATTN=3: same grid,
+    # f64 math (f32 cache only with VYB_KV32=1); VYB_ATTN=2: per-head parallel f64; VYB_ATTN1=1: the old
+    # serial-per-head f64 kernels (exact old reduction order). 3/4 need H/KVH == 4.
+    at_s<String> = env_get("VYB_ATTN") else ""
+    if (AT2ON == 1) { AT2ON = 4; KV32ON = 1 }
+    if (at_s == "3") { AT2ON = 3; KV32ON = 0; if (kv32_s.len() > 0) { KV32ON = 1 } }
+    if (at_s == "2") { AT2ON = 1; KV32ON = 0; if (kv32_s.len() > 0) { KV32ON = 1 } }
+    if (AT2ON == 0) { KV32ON = 0 }
+    if (H != KVH * 4) { if (AT2ON >= 3) { AT2ON = 1 } }
+    QGON<Int> = 1
+    qg_s<String> = env_get("VYB_GEMV16") else ""
+    if (qg_s.len() > 0) { QGON = 0 }
+    # QONLY (default, item 18): no expanded weight copy at all (saves the 7.3 GB f16 block + 0.4 GB f32
+    # scratch and the load-time expansion). Decode runs the fused Q4_K/Q6_K GEMV; short prefills the
+    # 8-row twins, long prefills (>= QPF rows) the f16 gemm over a one-layer f16 scratch. VYB_QONLY=0
+    # (or VYB_W32=1 / VYB_GEMV16=1, which need the expanded copy) restores the resident f16/f32 block.
+    QONLY<Int> = 1
+    qo_s<String> = env_get("VYB_QONLY") else ""
+    if (qo_s == "0") { QONLY = 0 }
+    if (W16 == 0) { QONLY = 0 }
+    if (QGON == 0) { QONLY = 0 }
+    if (QONLY == 1) { QGON = 1 }
+    # QONLY prefill of >= QPF rows (item 18): expand ONE layer at a time to f16 in a 0.2 GB scratch and
+    # run the f16 gemm (same f16 weights as the default path, so the same numbers); fewer rows use the
+    # 8-row fused twins. VYB_QPF=0 disables the scratch path.
+    # Default crossover (measured, 2-token gen after an N-row prompt): 3090 m8 vs scratch ~24 rows,
+    # GB10 ~48 rows; set after the device query below.
+    QPF<Int> = 0 - 1
+    # Head (item 20, default): the tied head runs the fused Q6_K GEMV over the packed token_embd
+    # (0.32 GB per token instead of the 0.78 GB f16 table; no f16 table at all). f32 x and f32
+    # accumulation, so logits differ from the f16-table head in the last bits; token streams were
+    # identical on 5 prompts through GEN=512 (p0 through 1024) on the 3090 and the GB10.
+    # VYB_HEADQ=0 restores the f16-table head (VYB_HEAD32=1: the f32 table).
+    HQ<Int> = 1
+    hq_s<String> = env_get("VYB_HEADQ") else ""
+    if (hq_s == "0") { HQ = 0 }
+    qpf_s<String> = env_get("VYB_QPF") else ""
+    if (qpf_s.len() > 0) { QPF = parse_u(qpf_s, 0, qpf_s.len()) }
+    if (QPF == 0) { QPF = 1000000000 }
+    H16<Int> = 1
+    h32_s<String> = env_get("VYB_HEAD32") else ""
+    if (h32_s.len() > 0) { H16 = 0 }
+    if (H16 == 0) { HQ = 0 }
     EPS<Float> = 0.000001
     hm<String> = env_get("HOME") else "."
     MODEL<String> = env_get("VYBFORGE_QWEN3_GGUF") else hm + "/Models/qwen3/Qwen3-4B-Q4_K_M.gguf"
-    TSV<String> = "native/out/qwen3_4b_tensors.tsv"
+    # VYBFORGE_QWEN3_TSV: tensor inventory matching VYBFORGE_QWEN3_GGUF (quant-mix files)
+    TSV<String> = env_get("VYBFORGE_QWEN3_TSV") else "native/out/qwen3_4b_tensors.tsv"
 
     nmv<Vec<String>> = Vec(); tyv<Vec<Int>> = Vec(); nlv<Vec<Int>> = Vec(); ofv<Vec<Int>> = Vec()
     bff<String> = read_bin(TSV)
@@ -407,6 +784,38 @@ main()<Int> -> {
     K5<Int> = packed_bytes(nlv.get(find_nm(nmv, "blk.0.ffn_up.weight")), tyv.get(find_nm(nmv, "blk.0.ffn_up.weight")))
     K6<Int> = packed_bytes(nlv.get(find_nm(nmv, "blk.0.ffn_down.weight")), tyv.get(find_nm(nmv, "blk.0.ffn_down.weight")))
 
+    GR<Int> = 1
+    # GP = 1: R=1 GEMV is the software-pipelined twin (gemv_q*k_p2, 8 warps); VYB_GEMVP=0 keeps gemv_q*k_r1.
+    GP<Int> = 1
+    FZON<Int> = 1
+    MBX<Int> = 1
+    # GTILE = 1: f16 prefill gemm pass 1 is the register-tiled gemm16_t (VYB_GTILE=0: gemm16_p)
+    GTILE<Int> = 1
+    # APF: rows from which the f32 attention uses the prefill kernels attn_sc5/attn_cx5 (VYB_APF=0 off)
+    APF<Int> = 16
+    apf_s<String> = env_get("VYB_APF") else ""
+    if (apf_s == "0") { APF = 1000000000 }
+    # GTK = 1 (default; VYB_GTK=0 off): adaptive split-K depth for the tiled prefill GEMM. Gated: 9 prompts of
+    # 24..512 tokens x GEN=256 tokens identical to GTK=0 on GB10 and the 3090 (18/18).
+    GTK<Int> = 1
+    gtk_s<String> = env_get("VYB_GTK") else ""
+    if (gtk_s == "0") { GTK = 0 }
+    # GTKW: warp target of the adaptive split-K (VYB_GTKW, default 1536); passed to gemm2t as TK
+    GTKW<Int> = 3072   # GB10 512-token sweep: 768 536, 1536 514, 3072 474, 6144 463 ms (+75 ms reduce)
+    gtw_s<String> = env_get("VYB_GTKW") else ""
+    if (gtw_s.len() > 0) { GTKW = parse_u(gtw_s, 0, gtw_s.len()) }
+    gt_s<String> = env_get("VYB_GTILE") else ""
+    if (gt_s == "0") { GTILE = 0 }
+    # MR2 = 1: the exact-M twins run 2 weight rows per warp (VYB_MR2=0: 1 row)
+    MR2<Int> = 1
+    mr2_s<String> = env_get("VYB_MR2") else ""
+    if (mr2_s == "0") { MR2 = 0 }
+    mbx_s<String> = env_get("VYB_MBX") else ""
+    if (mbx_s == "0") { MBX = 0 }
+    fz_s<String> = env_get("VYB_FUSE") else ""
+    if (fz_s == "0") { FZON = 0 }
+    gp_s<String> = env_get("VYB_GEMVP") else ""
+    if (gp_s == "0") { GP = 0 }
     freedom {
         if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
         var<CInt> ndev = 0
@@ -415,6 +824,20 @@ main()<Int> -> {
         if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
         ctx<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+        var<CInt> ccmaj = 0
+        if (cuDeviceGetAttribute(loc(ccmaj), 75, dev) != 0) { ccmaj = 0 }
+        # M = 1 GEMV flavour (item 19): R = 2 packed-convert on Ampere (cc 8.x), R = 1 elsewhere
+        GR = 1
+        if (ccmaj == 8) { GR = 2 }
+        # GB10 crossover re-swept after the tiled prefill GEMM: scratch path wins from ~32 rows (32: 176 vs 176 ms, 40: 197 vs 220); QPF=32 vs 48 gated identical on 6 prompts of 32..47 tokens x GEN=256
+        # 3090 re-swept at 7c7c459: scratch path wins from ~17 rows (16: 75 vs 71 ms, 20: 82 vs 98); QPF=18 vs 24 gated
+        # identical on 18..23-token prompts x GEN=256. GB10 QPF=26 was tried and DIVERGED (30-token prompt, generated
+        # token 110: the two prefill paths round differently) -> GB10 stays 32.
+        if (QPF < 0) { QPF = 32; if (ccmaj == 8) { QPF = 18 } }
+        if (GR == 1) { if (GP == 1) { GR = 3 } }
+        gr_s<String> = env_get("VYB_GEMVR") else ""
+        if (gr_s == "1") { GR = 1 }
+        if (gr_s == "2") { GR = 2 }
     }
 
     freedom {
@@ -437,8 +860,47 @@ main()<Int> -> {
         gfn<loc<CVoid>> = from<loc<CVoid>>(0); rfn<loc<CVoid>> = from<loc<CVoid>>(0); afn<loc<CVoid>> = from<loc<CVoid>>(0); sfn<loc<CVoid>> = from<loc<CVoid>>(0); refn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gfn), ml, "gemm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(rfn), ml, "rmsnorm") != 0) { return 10 }
+        rbf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(rbf), ml, "rms_blk") != 0) { return 10 }
         if (cuModuleGetFunction(loc(afn), ml, "attn") != 0) { return 10 }
+        akfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(akfn), ml, "attn_kv") != 0) { return 10 }
+        ascf<loc<CVoid>> = from<loc<CVoid>>(0); acxf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(ascf), ml, "attn_sc") != 0) { return 10 }
+        as2f<loc<CVoid>> = from<loc<CVoid>>(0); asxf<loc<CVoid>> = from<loc<CVoid>>(0); ac2f<loc<CVoid>> = from<loc<CVoid>>(0); acrf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as2f), ml, "attn_sc2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(asxf), ml, "attn_smx") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(ac2f), ml, "attn_cx2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acrf), ml, "attn_cxr") != 0) { return 10 }
+        as3f<loc<CVoid>> = from<loc<CVoid>>(0); ac3f<loc<CVoid>> = from<loc<CVoid>>(0); acr3f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as3f), ml, "attn_sc3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(ac3f), ml, "attn_cx3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acr3f), ml, "attn_cxr3") != 0) { return 10 }
+        as4f<loc<CVoid>> = from<loc<CVoid>>(0); ac4f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as4f), ml, "attn_sc4") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(ac4f), ml, "attn_cx4") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(acxf), ml, "attn_cxw") != 0) { return 10 }
+        amxf<loc<CVoid>> = from<loc<CVoid>>(0); aexf<loc<CVoid>> = from<loc<CVoid>>(0)
+        asmf<loc<CVoid>> = from<loc<CVoid>>(0); anrf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(amxf), ml, "attn_mx") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(aexf), ml, "attn_ex") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(asmf), ml, "attn_sum") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(anrf), ml, "attn_nrm") != 0) { return 10 }
         if (cuModuleGetFunction(loc(sfn), ml, "silu") != 0) { return 10 }
+        s32f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(s32f), ml, "silu32") != 0) { return 10 }
+        qknf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(qknf), ml, "qknrope") != 0) { return 10 }
+        g16t<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16t), ml, "gemm16_t") != 0) { return 10 }
+        g16a<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16a), ml, "apack") != 0) { return 10 }
+        as5h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(as5h), ml, "attn_sc5") != 0) { return 10 }
+        ac5h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(ac5h), ml, "attn_cx5") != 0) { return 10 }
+        akth<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(akth), ml, "attn_kt") != 0) { return 10 }
         if (cuModuleGetFunction(loc(refn), ml, "resid") != 0) { return 10 }
         gpn<loc<CVoid>> = from<loc<CVoid>>(0); grn<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(gpn), ml, "gemm_p") != 0) { return 10 }
@@ -447,11 +909,24 @@ main()<Int> -> {
         # split-K triple -- pass 1 (f32 MACs), pass 2 (f32 reduce), pass 3 (widen to the f64 C).
         q432<loc<CVoid>> = from<loc<CVoid>>(0); q632<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(q432), m4, "q4kdeq32") != 0) { return 10 }
+        q416<loc<CVoid>> = from<loc<CVoid>>(0); q616<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q416), m4, "q4kdeqT") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q616), m6, "q6kdeqT") != 0) { return 10 }
+        q6h<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q6h), m6, "q6kdeq16") != 0) { return 10 }
         if (cuModuleGetFunction(loc(q632), m6, "q6kdeq32") != 0) { return 10 }
         c32n<loc<CVoid>> = from<loc<CVoid>>(0); g3p<loc<CVoid>> = from<loc<CVoid>>(0)
         g3r<loc<CVoid>> = from<loc<CVoid>>(0); w3n<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(c32n), ml, "cast32") != 0) { return 10 }
         if (cuModuleGetFunction(loc(g3p), ml, "gemm32_p") != 0) { return 10 }
+        g16p<loc<CVoid>> = from<loc<CVoid>>(0); c16n<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(g16p), ml, "gemm16_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(c16n), ml, "cast16") != 0) { return 10 }
+        # gemm pass 1 used by the layers: f16 weights unless VYB_W32=1
+        gwp<loc<CVoid>> = g3p
+        if (W16 == 1) { gwp = g16p }
+        TLx<Int> = 0
+        if (W16 == 1) { TLx = GTILE }
         if (cuModuleGetFunction(loc(g3r), ml, "gemm32_r") != 0) { return 10 }
         if (cuModuleGetFunction(loc(w3n), ml, "widen32") != 0) { return 10 }
         rsn<loc<CVoid>> = from<loc<CVoid>>(0); ran<loc<CVoid>> = from<loc<CVoid>>(0)
@@ -461,6 +936,66 @@ main()<Int> -> {
         if (cuModuleGetFunction(loc(rpfn), mw, "qwen3rope") != 0) { return 10 }
         if (cuModuleGetFunction(loc(efn), mw, "f32expand") != 0) { return 10 }
         if (cuModuleGetFunction(loc(lsfn), mw, "logits_slice") != 0) { return 10 }
+        l32p<loc<CVoid>> = from<loc<CVoid>>(0); l32r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(l32p), mw, "logits32_p") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(l32r), mw, "logits32_r") != 0) { return 10 }
+        q4f<loc<CVoid>> = from<loc<CVoid>>(0); q6f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (GR == 2) {
+            if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k") != 0) { return 10 }
+            if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k") != 0) { return 10 }
+        } else {
+            if (GP == 1) {
+                if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_p2") != 0) { return 10 }
+                if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_p2") != 0) { return 10 }
+            } else {
+                if (cuModuleGetFunction(loc(q4f), mw, "gemv_q4k_r1") != 0) { return 10 }
+                if (cuModuleGetFunction(loc(q6f), mw, "gemv_q6k_r1") != 0) { return 10 }
+            }
+        }
+        q4s<loc<CVoid>> = from<loc<CVoid>>(0); q6s<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4s), mw, "gemv_q4k_s") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6s), mw, "gemv_q6k_s") != 0) { return 10 }
+        q4m<loc<CVoid>> = from<loc<CVoid>>(0); q6m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m), mw, "gemv_q4k_m8") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m), mw, "gemv_q6k_m8") != 0) { return 10 }
+        q4m2<loc<CVoid>> = from<loc<CVoid>>(0); q6m2<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m2), mw, "gemv_q4k_m2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m2), mw, "gemv_q6k_m2") != 0) { return 10 }
+        q4m3<loc<CVoid>> = from<loc<CVoid>>(0); q6m3<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m3), mw, "gemv_q4k_m3") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m3), mw, "gemv_q6k_m3") != 0) { return 10 }
+        q4m4<loc<CVoid>> = from<loc<CVoid>>(0); q6m4<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m4), mw, "gemv_q4k_m4") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m4), mw, "gemv_q6k_m4") != 0) { return 10 }
+        q4m5<loc<CVoid>> = from<loc<CVoid>>(0); q6m5<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m5), mw, "gemv_q4k_m5") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m5), mw, "gemv_q6k_m5") != 0) { return 10 }
+        q4m6<loc<CVoid>> = from<loc<CVoid>>(0); q6m6<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m6), mw, "gemv_q4k_m6") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m6), mw, "gemv_q6k_m6") != 0) { return 10 }
+        q4m7<loc<CVoid>> = from<loc<CVoid>>(0); q6m7<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m7), mw, "gemv_q4k_m7") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m7), mw, "gemv_q6k_m7") != 0) { return 10 }
+        q4m2r<loc<CVoid>> = from<loc<CVoid>>(0); q6m2r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m2r), mw, "gemv_q4k_m2r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m2r), mw, "gemv_q6k_m2r2") != 0) { return 10 }
+        q4m3r<loc<CVoid>> = from<loc<CVoid>>(0); q6m3r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m3r), mw, "gemv_q4k_m3r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m3r), mw, "gemv_q6k_m3r2") != 0) { return 10 }
+        q4m4r<loc<CVoid>> = from<loc<CVoid>>(0); q6m4r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m4r), mw, "gemv_q4k_m4r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m4r), mw, "gemv_q6k_m4r2") != 0) { return 10 }
+        q4m5r<loc<CVoid>> = from<loc<CVoid>>(0); q6m5r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m5r), mw, "gemv_q4k_m5r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m5r), mw, "gemv_q6k_m5r2") != 0) { return 10 }
+        q4m6r<loc<CVoid>> = from<loc<CVoid>>(0); q6m6r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m6r), mw, "gemv_q4k_m6r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m6r), mw, "gemv_q6k_m6r2") != 0) { return 10 }
+        q4m7r<loc<CVoid>> = from<loc<CVoid>>(0); q6m7r<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(q4m7r), mw, "gemv_q4k_m7r2") != 0) { return 10 }
+        if (cuModuleGetFunction(loc(q6m7r), mw, "gemv_q6k_m7r2") != 0) { return 10 }
+        l16p<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(l16p), mw, "logits16_p") != 0) { return 10 }
         if (cuModuleGetFunction(loc(arfn), mw, "argmax_row") != 0) { return 10 }
         a1p<loc<CVoid>> = from<loc<CVoid>>(0); a1r<loc<CVoid>> = from<loc<CVoid>>(0)
         if (cuModuleGetFunction(loc(a1p), mw, "argmax1_p") != 0) { return 10 }
@@ -486,34 +1021,58 @@ main()<Int> -> {
         ii0 = find_nm(nmv, "blk.0.ffn_norm.weight"); n2n<Int> = nlv.get(ii0)
         nstride<Int> = n1n + nqn + nkn + n2n
 
-        # Qwen3-4B-Q4_K_M MIXES quantization per layer: attn_v and ffn_down are
-        # Q6_K (ty 14, numel*210/256) on some layers, Q4_K (ty 12, numel*144/256)
-        # on others (verified in the TSV), so their PACKED SIZE varies per layer.
-        # The other 5 tensor kinds are uniformly Q4_K. Build per-layer cumulative
-        # packed byte offsets + sizes for the two variable kinds.
-        ov2<Vec<Int>> = Vec(); os2<Vec<Int>> = Vec()
-        ov6<Vec<Int>> = Vec(); os6<Vec<Int>> = Vec()
-        run2<Int> = 0; run6<Int> = 0
+        # Per-layer quant type of EVERY weight kind (item 23): Qwen3-4B-Q4_K_M already mixes Q6_K/Q4_K
+        # per layer for attn_v and ffn_down, and quality recipes (see the log) put Q6_K on any of the
+        # seven kinds. Each kind gets per-layer packed byte offsets, sizes and types; Q4_K (12) and
+        # Q6_K (14) are supported (fused GEMV, M-blocked prefill, f32/f16 expansion).
+        ovq<Vec<Int>> = Vec(); osq<Vec<Int>> = Vec(); ltq<Vec<Int>> = Vec(); runq<Int> = 0
+        ovk<Vec<Int>> = Vec(); osk<Vec<Int>> = Vec(); ltk<Vec<Int>> = Vec(); runk<Int> = 0
+        ovv<Vec<Int>> = Vec(); osv<Vec<Int>> = Vec(); ltv<Vec<Int>> = Vec(); runv<Int> = 0
+        ovo<Vec<Int>> = Vec(); oso<Vec<Int>> = Vec(); lto<Vec<Int>> = Vec(); runo<Int> = 0
+        ovg<Vec<Int>> = Vec(); osg<Vec<Int>> = Vec(); ltg<Vec<Int>> = Vec(); rung<Int> = 0
+        ovu<Vec<Int>> = Vec(); osu<Vec<Int>> = Vec(); ltu<Vec<Int>> = Vec(); runu<Int> = 0
+        ovd<Vec<Int>> = Vec(); osd<Vec<Int>> = Vec(); ltd<Vec<Int>> = Vec(); rund<Int> = 0
         Lx<Int> = 0
         for (Lx in 0..NLAYER - 1) {
-            t2<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_v.weight"))
-            sz2<Int> = 0
-            if (t2 == 12) { sz2 = wv_nl * 144 / 256 } else { sz2 = wv_nl * 210 / 256 }
-            ov2.push(run2); os2.push(sz2); run2 = run2 + sz2
-            t6<Int> = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_down.weight"))
-            sz6<Int> = 0
-            if (t6 == 12) { sz6 = wd_nl * 144 / 256 } else { sz6 = wd_nl * 210 / 256 }
-            ov6.push(run6); os6.push(sz6); run6 = run6 + sz6
+            tx<Int> = 0; sx<Int> = 0
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_q.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_q L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wq_nl, tx)
+            ovq.push(runq); osq.push(sx); ltq.push(tx); runq = runq + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_k.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_k L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wk_nl, tx)
+            ovk.push(runk); osk.push(sx); ltk.push(tx); runk = runk + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_v.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_v L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wv_nl, tx)
+            ovv.push(runv); osv.push(sx); ltv.push(tx); runv = runv + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".attn_output.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE attn_output L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wo_nl, tx)
+            ovo.push(runo); oso.push(sx); lto.push(tx); runo = runo + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_gate.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_gate L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wg_nl, tx)
+            ovg.push(rung); osg.push(sx); ltg.push(tx); rung = rung + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_up.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_up L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wu_nl, tx)
+            ovu.push(runu); osu.push(sx); ltu.push(tx); runu = runu + sx
+            tx = tyv.get(find_nm(nmv, "blk." + Lx.to_string() + ".ffn_down.weight"))
+            if (tx != 12) { if (tx != 14) { println("UNSUPPORTED_QTYPE ffn_down L=" + Lx.to_string() + " ty=" + tx.to_string()); return 67 } }
+            sx = packed_bytes(wd_nl, tx)
+            ovd.push(rund); osd.push(sx); ltd.push(tx); rund = rund + sx
         }
 
         PK0<Int> = 0; PK1<Int> = 0; PK2<Int> = 0; PK3<Int> = 0; PK4<Int> = 0; PK5<Int> = 0; PK6<Int> = 0
-        if (cuMemAlloc_v2(loc(PK0), K0 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK1), K1 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK2), run2) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK3), K3 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK4), K4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK5), K5 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(PK6), run6) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK0), runq) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK1), runk) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK2), runv) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK3), runo) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK4), rung) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK5), runu) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(PK6), rund) != 0) { return 11 }
         Wq<Int> = 0; Wk<Int> = 0; Wv<Int> = 0; Wo<Int> = 0; Wg<Int> = 0; Wu<Int> = 0; Wd<Int> = 0
         N1<Int> = 0; Nq<Int> = 0; Nk<Int> = 0; N2<Int> = 0; ON<Int> = 0
         DE<Int> = 0; EMB<Int> = 0; HA<Int> = 0; HB<Int> = 0; DH<Int> = 0
@@ -528,22 +1087,15 @@ main()<Int> -> {
         WqA<Int> = 0; WkA<Int> = 0; WvA<Int> = 0; WoA<Int> = 0; WgA<Int> = 0; WuA<Int> = 0; WdA<Int> = 0
         XN32<Int> = 0; DC32<Int> = 0; X132<Int> = 0; HU32<Int> = 0; SK32<Int> = 0; SCR32<Int> = 0
         CPB<Int> = 0; WPB<Int> = 0; RDB<Int> = 0
-        if (cuMemAlloc_v2(loc(Wq), wq_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wk), wk_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wv), wv_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wo), wo_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wg), wg_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wu), wu_nl * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wd), wd_nl * 8) != 0) { return 11 }
         # f32 path (VybForge#23): weights as f32, the four gemm A-operands as f32 copies, the f32
         # partial scratch and reduce output, and two 24-byte param blocks + a 64-byte readback block.
-        if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wk32), wk_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wv32), wv_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wo32), wo_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wq32), wq_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wk32), wk_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wv32), wv_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wo32), wo_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wg32), wg_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wu32), wu_nl * 4) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(Wd32), wd_nl * 4) != 0) { return 11 } }
         # (MAXS + 4) rows: gemm32_p covers 4 rows per thread and READS the padding (never stores it).
         if (cuMemAlloc_v2(loc(XN32), (MAXS + 4) * D * 4) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DC32), (MAXS + 4) * NQ * 4) != 0) { return 11 }
@@ -560,19 +1112,45 @@ main()<Int> -> {
         # does. This deletes the per-token dequant entirely. The per-layer SHAPES are uniform, so
         # each tensor is one base pointer plus L * (numel * 4): the per-layer quant-type variation
         # (attn_v, ffn_down) changes the packed size, never the element count.
-        if (cuMemAlloc_v2(loc(WqA), wq_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WkA), wk_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WvA), wv_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WoA), wo_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WgA), wg_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WuA), wu_nl * 4 * NLAYER) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(WdA), wd_nl * 4 * NLAYER) != 0) { return 11 }
-        println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * 4 * NLAYER).to_string() + " bytes")
+        WES<Int> = 4
+        if (W16 == 1) { WES = 2 }   # bytes per resident weight element
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WqA), wq_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WkA), wk_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WvA), wv_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WoA), wo_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WgA), wg_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WuA), wu_nl * WES * NLAYER) != 0) { return 11 } }
+        if (QONLY == 0) { if (cuMemAlloc_v2(loc(WdA), wd_nl * WES * NLAYER) != 0) { return 11 } }
+        SLq<Int> = 0; SLk<Int> = 0; SLv<Int> = 0; SLo<Int> = 0; SLg<Int> = 0; SLu<Int> = 0; SLd<Int> = 0; ST32<Int> = 0
+        if (QONLY == 1) { if (W16 == 1) { if (QPF > 0) {
+            mxn<Int> = wq_nl
+            if (wg_nl > mxn) { mxn = wg_nl }
+            if (wu_nl > mxn) { mxn = wu_nl }
+            if (wd_nl > mxn) { mxn = wd_nl }
+            if (wo_nl > mxn) { mxn = wo_nl }
+            if (cuMemAlloc_v2(loc(ST32), 256) != 0) { return 11 }   # enable flag (f16 deq writes the scratch directly)
+            if (cuMemAlloc_v2(loc(SLq), wq_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLk), wk_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLv), wv_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLo), wo_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLg), wg_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLu), wu_nl * 2) != 0) { return 11 }
+            if (cuMemAlloc_v2(loc(SLd), wd_nl * 2) != 0) { return 11 }
+        } } }
+        println("ALL_WEIGHT_BUFFERS alloc'ed: total " + ((wq_nl + wk_nl + wv_nl + wo_nl + wg_nl + wu_nl + wd_nl) * WES * NLAYER).to_string() + " bytes (" + WES.to_string() + " B/elem)")
         # The per-layer norms all live in ONE resident block (one slot per layer, four kinds each);
         # the gen loop indexes into it instead of re-loading the four tensors per layer per token.
         if (cuMemAlloc_v2(loc(NB), NLAYER * nstride * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(ON), 2560 * 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DE), te_nl * 8) != 0) { return 11 }
+        TEP<Int> = 0
+        if (cuMemAlloc_v2(loc(TEP), te_nl / 256 * 210) != 0) { return 11 }
+        # f32 copy of the tied embedding for the head (1.55 GB) + the 32-lane partials (VOCAB x 32 f32).
+        DE32<Int> = 0; LPART<Int> = 0; LPB<Int> = 0
+        if (H16 == 0) { if (cuMemAlloc_v2(loc(DE32), te_nl * 4) != 0) { return 11 } }
+        if (cuMemAlloc_v2(loc(LPART), VOCAB * 32 * 4) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(LPB), 64) != 0) { return 11 }
+        QPB<Int> = 0
+        if (cuMemAlloc_v2(loc(QPB), 128) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(EMB), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HA), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(HB), MAXS * D * 8) != 0) { return 11 }
@@ -595,18 +1173,53 @@ main()<Int> -> {
         if (cuMemAlloc_v2(loc(M), MAXS * D * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DL), MAXS * VOCAB * 8) != 0) { return 11 }   # [MAXS, V] rows for per-step logits
         if (cuMemAlloc_v2(loc(AO), 8) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(DF), 64 * 8) != 0) { return 11 }
+        # Per-layer K (post-norm, post-rope) and V caches: NLAYER x [MAXS, NKV] f64 each.
+        # attention scratch rows: with the KV cache only the prompt (prefill) or 1 row is live at once,
+        # so [rows, H, MAXS] needs SEEDLEN + 1 rows, not MAXS (was O(MAXS^2): 0.8 GB at 1k tokens, 13 GB at 4k)
+        ATR<Int> = MAXS
+        if (KVON == 1) { ATR = SEEDLEN + 1 }
+        # K/V cache element size: f32 when the f32 cache is in use
+        KVES<Int> = 8
+        if (KV32ON == 1) { KVES = 4 }
+        KCA<Int> = 0; VCA<Int> = 0
+        if (cuMemAlloc_v2(loc(KCA), NLAYER * MAXS * NKV * KVES) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(VCA), NLAYER * MAXS * NKV * KVES) != 0) { return 11 }
+        # attention score scratch [S <= MAXS, H, T <= MAXS] f64 (shared by all layers; ~MAXS^2 * H * 8 bytes)
+        SCB<Int> = 0
+        if (cuMemAlloc_v2(loc(SCB), ATR * H * MAXS * 8) != 0) { return 11 }
+        EWB<Int> = 0; MSB<Int> = 0
+        if (cuMemAlloc_v2(loc(EWB), ATR * H * MAXS * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(MSB), MAXS * H * 16) != 0) { return 11 }
+        # attn_cx2 chunk partials: rows x H x 8 chunks x HD f64 (rows = the prompt at prefill, 1 at decode)
+        EW32<Int> = 0
+        if (cuMemAlloc_v2(loc(EW32), ATR * H * MAXS * 4) != 0) { return 11 }
+        PCB<Int> = 0
+        if (cuMemAlloc_v2(loc(PCB), (SEEDLEN + 1) * H * 32 * HD * 8) != 0) { return 11 }
+        # inv_freq[64] then the rotary cos/sin table (MAXS x 64 x {cos,sin}) at DF + 512.
+        if (cuMemAlloc_v2(loc(DF), 64 * 8 + MAXS * 64 * 16) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(DPK), 60000) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(GM), 64) != 0) { return 11 }
         # Split-K gemm scratch (VybForge#23): KSP slices of the largest gemm (M <= MAXS, N <= FF).
         if (cuMemAlloc_v2(loc(GPB), 128) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(SKB), KSP * MAXS * FF * 8) != 0) { return 11 }
+        # With the tiled f16 prefill GEMM + adaptive split-K the scratch only needs: decode / M < 8 slices
+        # (2 KSP x 8 rows x FF, 8-byte slots as before), the prefill partials (adaptive depth x M x N <= 1536 x 2048
+        # + M x N floats) and the packed A copy (ceil(M/8) x 8 x K floats): ~94 MB at a 512-token prompt instead of
+        # KSP x MAXS x FF x 8 (1.9 GB at 512 + 256). VYB_GTILE=0 / VYB_GTK=0 / f32 weights keep the old size.
+        SKBSZ<Int> = KSP * MAXS * FF * 8
+        if (TLx == 1) { if (GTK == 1) {
+            SKBSZ = 2 * KSP * 8 * FF * 8 + 4 * (GTKW * 2048 + SEEDLEN * FF) + 4096 + (SEEDLEN + 8) * FF * 4 + 1048576
+            if (SKBSZ > KSP * MAXS * FF * 8) { SKBSZ = KSP * MAXS * FF * 8 }
+        } }
+        if (cuMemAlloc_v2(loc(SKB), SKBSZ) != 0) { return 11 }
         # Two-pass norm: params buffers + the per-chunk sum-of-squares scratch (NCH <= 64 covers D=2560).
         if (cuMemAlloc_v2(loc(RSPB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RSB), 64) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(SNB), MAXS * 64 * 8) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(RN), 48) != 0) { return 11 }
-        if (cuMemAlloc_v2(loc(ATT), 224) != 0) { return 11 }
+        RBP<Int> = 0; RBQ<Int> = 0
+        if (cuMemAlloc_v2(loc(RBP), 192) != 0) { return 11 }   # rms_blk blocks: +0 layer norms, +64 q norm, +128 head
+        if (cuMemAlloc_v2(loc(RBQ), 64) != 0) { return 11 }    # k norm
+        if (cuMemAlloc_v2(loc(ATT), 288) != 0) { return 11 }   # +224 P0, +232 SC, +240 T, +248 EW, +256 MS for the KV attention
         if (cuMemAlloc_v2(loc(ROP), 232) != 0) { return 11 }   # +224 POS base for qwen3rope
         if (cuMemAlloc_v2(loc(PF), 24) != 0) { return 11 }
         if (cuMemAlloc_v2(loc(LSP), 64) != 0) { return 11 }
@@ -625,40 +1238,40 @@ main()<Int> -> {
         L<Int> = 0
         e<Int> = 0
         for (L in 0..NLAYER - 1) {
-            # attn_q (uniform Q4_K)
-            pd<String> = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_q.weight")), K0)
-            if (pd.len() < K0) { println("SHORTED pk attn_q L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK0 + K0 * L, K0) }
+            # attn_q (per-layer type ltq)
+            pd<String> = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_q.weight")), osq.get(L))
+            if (pd.len() < osq.get(L)) { println("SHORTED pk attn_q L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK0 + ovq.get(L), osq.get(L)) }
             if (e != 0) { return 66 }
-            # attn_k (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_k.weight")), K1)
-            if (pd.len() < K1) { println("SHORTED pk attn_k L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK1 + K1 * L, K1) }
+            # attn_k (per-layer type ltk)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_k.weight")), osk.get(L))
+            if (pd.len() < osk.get(L)) { println("SHORTED pk attn_k L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK1 + ovk.get(L), osk.get(L)) }
             if (e != 0) { return 66 }
-            # attn_v (MIXED Q6_K/Q4_K per layer -> per-layer offset os2/ov2)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")), os2.get(L))
-            if (pd.len() < os2.get(L)) { println("SHORTED pk attn_v L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK2 + ov2.get(L), os2.get(L)) }
+            # attn_v (per-layer type ltv)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight")), osv.get(L))
+            if (pd.len() < osv.get(L)) { println("SHORTED pk attn_v L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK2 + ovv.get(L), osv.get(L)) }
             if (e != 0) { return 66 }
-            # attn_output (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_output.weight")), K3)
-            if (pd.len() < K3) { println("SHORTED pk attn_output L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK3 + K3 * L, K3) }
+            # attn_output (per-layer type lto)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_output.weight")), oso.get(L))
+            if (pd.len() < oso.get(L)) { println("SHORTED pk attn_output L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK3 + ovo.get(L), oso.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_gate (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_gate.weight")), K4)
-            if (pd.len() < K4) { println("SHORTED pk ffn_gate L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK4 + K4 * L, K4) }
+            # ffn_gate (per-layer type ltg)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_gate.weight")), osg.get(L))
+            if (pd.len() < osg.get(L)) { println("SHORTED pk ffn_gate L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK4 + ovg.get(L), osg.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_up (uniform Q4_K)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_up.weight")), K5)
-            if (pd.len() < K5) { println("SHORTED pk ffn_up L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK5 + K5 * L, K5) }
+            # ffn_up (per-layer type ltu)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_up.weight")), osu.get(L))
+            if (pd.len() < osu.get(L)) { println("SHORTED pk ffn_up L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK5 + ovu.get(L), osu.get(L)) }
             if (e != 0) { return 66 }
-            # ffn_down (MIXED Q6_K/Q4_K per layer -> per-layer offset os6/ov6)
-            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")), os6.get(L))
-            if (pd.len() < os6.get(L)) { println("SHORTED pk ffn_down L=" + L.to_string()); return 66 }
-            freedom { e = download(pd, PK6 + ov6.get(L), os6.get(L)) }
+            # ffn_down (per-layer type ltd)
+            pd = read_model(MODEL, ofv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight")), osd.get(L))
+            if (pd.len() < osd.get(L)) { println("SHORTED pk ffn_down L=" + L.to_string()); return 66 }
+            freedom { e = download(pd, PK6 + ovd.get(L), osd.get(L)) }
             if (e != 0) { return 66 }
             if (L % 6 == 0) { println("PACKED_UPLOADED layer " + L.to_string() + "/36") }
         }
@@ -668,20 +1281,47 @@ main()<Int> -> {
         # The per-token dequant recomputed weights that never change between tokens. With f32 (half
         # the f64 footprint) the whole expansion fits in the card, so it happens once here and the
         # token loop does no dequantizing at all.
-        for (L in 0..NLAYER - 1) {
-            avtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".attn_v.weight"))
-            avqA<loc<CVoid>> = q432
-            if (avtA == 14) { avqA = q632 }
-            fdtA<Int> = tyv.get(find_nm(nmv, "blk." + L.to_string() + ".ffn_down.weight"))
-            fdqA<loc<CVoid>> = q432
-            if (fdtA == 14) { fdqA = q632 }
-            e = dequant_gpu(PK0, K0 * L, WqA + L * wq_nl * 4, wq_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK1, K1 * L, WkA + L * wk_nl * 4, wk_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK2, ov2.get(L), WvA + L * wv_nl * 4, wv_nl, avqA, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK3, K3 * L, WoA + L * wo_nl * 4, wo_nl, q432, NQ); if (e != 0) { return 70 }
-            e = dequant_gpu(PK4, K4 * L, WgA + L * wg_nl * 4, wg_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK5, K5 * L, WuA + L * wu_nl * 4, wu_nl, q432, D); if (e != 0) { return 70 }
-            e = dequant_gpu(PK6, ov6.get(L), WdA + L * wd_nl * 4, wd_nl, fdqA, FF); if (e != 0) { return 70 }
+        if (QONLY == 1) { println("QONLY: no expanded weights (decode + prefill read the packed Q4_K/Q6_K blocks)") }
+        for (L in 0..(NLAYER * (1 - QONLY)) - 1) {
+            dqq<loc<CVoid>> = q432
+            if (ltq.get(L) == 14) { dqq = q632 }
+            dqk<loc<CVoid>> = q432
+            if (ltk.get(L) == 14) { dqk = q632 }
+            dqv<loc<CVoid>> = q432
+            if (ltv.get(L) == 14) { dqv = q632 }
+            dqo<loc<CVoid>> = q432
+            if (lto.get(L) == 14) { dqo = q632 }
+            dqg<loc<CVoid>> = q432
+            if (ltg.get(L) == 14) { dqg = q632 }
+            dqu<loc<CVoid>> = q432
+            if (ltu.get(L) == 14) { dqu = q632 }
+            dqd<loc<CVoid>> = q432
+            if (ltd.get(L) == 14) { dqd = q632 }
+            if (W16 == 1) {
+                # f32 into the per-layer scratch (Wq32..Wd32), then narrowed to f16 in the resident block.
+                e = dequant_gpu(PK0, ovq.get(L), Wq32, wq_nl, dqq, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, ovk.get(L), Wk32, wk_nl, dqk, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ovv.get(L), Wv32, wv_nl, dqv, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, ovo.get(L), Wo32, wo_nl, dqo, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, ovg.get(L), Wg32, wg_nl, dqg, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, ovu.get(L), Wu32, wu_nl, dqu, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ovd.get(L), Wd32, wd_nl, dqd, FF); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wq32, WqA + L * wq_nl * 2, wq_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wk32, WkA + L * wk_nl * 2, wk_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wv32, WvA + L * wv_nl * 2, wv_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wo32, WoA + L * wo_nl * 2, wo_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wg32, WgA + L * wg_nl * 2, wg_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wu32, WuA + L * wu_nl * 2, wu_nl); if (e != 0) { return 70 }
+                e = cast1(c16n, CPB, Wd32, WdA + L * wd_nl * 2, wd_nl); if (e != 0) { return 70 }
+            } else {
+                e = dequant_gpu(PK0, ovq.get(L), WqA + L * wq_nl * 4, wq_nl, dqq, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK1, ovk.get(L), WkA + L * wk_nl * 4, wk_nl, dqk, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK2, ovv.get(L), WvA + L * wv_nl * 4, wv_nl, dqv, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK3, ovo.get(L), WoA + L * wo_nl * 4, wo_nl, dqo, NQ); if (e != 0) { return 70 }
+                e = dequant_gpu(PK4, ovg.get(L), WgA + L * wg_nl * 4, wg_nl, dqg, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK5, ovu.get(L), WuA + L * wu_nl * 4, wu_nl, dqu, D); if (e != 0) { return 70 }
+                e = dequant_gpu(PK6, ovd.get(L), WdA + L * wd_nl * 4, wd_nl, dqd, FF); if (e != 0) { return 70 }
+            }
             if (L % 6 == 0) { println("WEIGHTS_EXPANDED layer " + L.to_string() + "/36") }
         }
         println("ALL_WEIGHTS_EXPANDED")
@@ -700,8 +1340,28 @@ main()<Int> -> {
         }
         println("ALL_NORMS_RESIDENT")
 
-        e = emb_dequant(MODEL, te_off0, te_nl, DPK, q6fn, DE); if (e != 0) { return 91 }
-        println("EMB_DEQUANT_DONE")
+        if (tyv.get(find_nm(nmv, "token_embd.weight")) != 14) { println("UNSUPPORTED_QTYPE token_embd (need Q6_K)"); return 67 }
+        e = emb_upload(MODEL, te_off0, te_nl, TEP); if (e != 0) { return 91 }
+        println("EMB_PACKED_RESIDENT")
+        # f32 head table straight from the packed rows: q6kdeq32's f32 d*sc*q rounds once, at the last
+        # multiply (d*sc is exact), which is the same single rounding the old f64-then-cast took.
+        if (H16 == 0) { e = dequant_gpu(TEP, 0, DE32, te_nl, q632, 0); if (e != 0) { return 91 } }
+        rtfn<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(rtfn), mw, "rope_tab") != 0) { return 10 }
+        e = cast1(rtfn, CPB, DF, DF + 512, MAXS * 64); if (e != 0) { return 91 }
+        # f16 head table: narrow the f32 copy, then release the f32 one (the head reads only DEH).
+        DEH<Int> = DE32
+        lhp<loc<CVoid>> = l32p
+        if (H16 == 1) {
+            # straight to f16 (q6kdeq16 = q6kdeq32's value rounded once more: what the f32 copy + cast16 gave),
+            # so the 1.55 GB f32 table never exists
+            if (HQ == 0) {
+                if (cuMemAlloc_v2(loc(DEH), te_nl * 2) != 0) { return 11 }
+                e = dequant_gpu(TEP, 0, DEH, te_nl, q6h, 0); if (e != 0) { return 91 }
+            }
+            lhp = l16p
+            println("EMB_F16_HEAD_DONE")
+        }
 
         # NOTE: the 4 per-layer RMSNorm weights (attn_norm/attn_q_norm/attn_k_norm/
         # ffn_norm) DIFFER per layer and are loaded per-layer inside the gen loop
@@ -735,7 +1395,7 @@ main()<Int> -> {
             # seed EMB with the prompt rows (or [0,1])
             si<Int> = 0
             for (si in 0..SEEDLEN - 1) {
-                if (copy_row(DE, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
+                if (emb_row(q6fn, TEP, pids.get(si), D, EMB + si * D * 8) != 0) { return 15 }
             }
 
             # Prompt mode writes the FULL sequence (prompt ids + generated) to
@@ -757,7 +1417,33 @@ main()<Int> -> {
                     for (g in 0..GEN - 1) {
                         Scur = SEEDLEN + g
                         cur<Int> = EMB
+                        # Rows this step pushes through the layers: the whole prefix without the cache;
+                        # with it, the prompt on step 0 and then only the newest token at position P0.
+                        Srows<Int> = Scur
+                        P0<Int> = 0
+                        if (KVON == 1) {
+                            if (g > 0) { Srows = 1; P0 = Scur - 1; cur = EMB + P0 * D * 8 }
+                        }
                         if (QV == 0) { println("DECG step " + g.to_string() + " Scur=" + Scur.to_string()) }
+                        # exact-M prefill twin for 2..7 rows (VYB_MBX=0: always the 8-row kernel)
+                        q4mx<loc<CVoid>> = q4m; q6mx<loc<CVoid>> = q6m
+                        if (MBX == 1) {
+                            if (Srows == 2) { q4mx = q4m2; q6mx = q6m2 }
+                            if (Srows == 3) { q4mx = q4m3; q6mx = q6m3 }
+                            if (Srows == 4) { q4mx = q4m4; q6mx = q6m4 }
+                            if (Srows == 5) { q4mx = q4m5; q6mx = q6m5 }
+                            if (Srows == 6) { q4mx = q4m6; q6mx = q6m6 }
+                            if (Srows == 7) { q4mx = q4m7; q6mx = q6m7 }
+                        }
+                        MRx<Int> = 0
+                        if (MBX == 1) { if (MR2 == 1) {
+                            if (Srows == 2) { q4mx = q4m2r; q6mx = q6m2r; MRx = 1 }
+                            if (Srows == 3) { q4mx = q4m3r; q6mx = q6m3r; MRx = 1 }
+                            if (Srows == 4) { q4mx = q4m4r; q6mx = q6m4r; MRx = 1 }
+                            if (Srows == 5) { q4mx = q4m5r; q6mx = q6m5r; MRx = 1 }
+                            if (Srows == 6) { q4mx = q4m6r; q6mx = q6m6r; MRx = 1 }
+                            if (Srows == 7) { q4mx = q4m7r; q6mx = q6m7r; MRx = 1 }
+                        } }
                         L<Int> = 0
                         for (L in 0..NLAYER - 1) {
                             if (QV == 0) { println("DECG L" + L.to_string() + " deqstart") }
@@ -779,14 +1465,51 @@ main()<Int> -> {
                             phC<Int> = time_mono_millis()
                             tgt<Int> = HA
                             if ((L % 2) == 1) { tgt = HB }
-                            e = run_layer(Scur, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
+                            KCl<Int> = 0; VCl<Int> = 0
+                            if (KVON == 1) { KCl = KCA + L * MAXS * NKV * KVES; VCl = VCA + L * MAXS * NKV * KVES }
+                            QGL<Int> = 0
+                            if (QGON == 1) { if (Srows == 1) { QGL = 1 } }
+                            if (QONLY == 1) { QGL = 1 }
+                            pwq<Int> = WqA + L * wq_nl * WES; pwk<Int> = WkA + L * wk_nl * WES; pwv<Int> = WvA + L * wv_nl * WES
+                            pwo<Int> = WoA + L * wo_nl * WES; pwg<Int> = WgA + L * wg_nl * WES; pwu<Int> = WuA + L * wu_nl * WES
+                            pwd<Int> = WdA + L * wd_nl * WES
+                            if (ST32 != 0) { if (Srows >= QPF) { if (Srows > 1) {
+                                # long QONLY prefill: this layer's f16 weights into the one-layer scratch
+                                QGL = 0
+                                pwq = SLq; pwk = SLk; pwv = SLv; pwo = SLo; pwg = SLg; pwu = SLu; pwd = SLd
+                                dz<loc<CVoid>> = q416
+                                dz = q416; if (ltq.get(L) == 14) { dz = q616 }
+                                e = deqT_gpu(PK0, ovq.get(L), SLq, wq_nl, dz, D)
+                                dz = q416; if (ltk.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK1, ovk.get(L), SLk, wk_nl, dz, D) }
+                                dz = q416; if (ltv.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK2, ovv.get(L), SLv, wv_nl, dz, D) }
+                                dz = q416; if (lto.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK3, ovo.get(L), SLo, wo_nl, dz, NQ) }
+                                dz = q416; if (ltg.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK4, ovg.get(L), SLg, wg_nl, dz, D) }
+                                dz = q416; if (ltu.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK5, ovu.get(L), SLu, wu_nl, dz, D) }
+                                dz = q416; if (ltd.get(L) == 14) { dz = q616 }
+                                if (e == 0) { e = deqT_gpu(PK6, ovd.get(L), SLd, wd_nl, dz, FF) }
+                                if (e != 0) { println("QPF_EXPAND_ERR L=" + L.to_string()); return 72 }
+                            } } }
+                            e = run_layer(Srows, D, H, KVH, HD, FF, NQ, NKV, EPS, cur, tgt,
                                           gfn, rfn, rpfn, afn, sfn, refn, GM, RN, ATT, ROP,
-                                          N1, WqA + L * wq_nl * 4, WkA + L * wk_nl * 4, WvA + L * wv_nl * 4,
-                                          Nq, Nk, DF, WoA + L * wo_nl * 4, N2,
-                                          WgA + L * wg_nl * 4, WuA + L * wu_nl * 4, WdA + L * wd_nl * 4,
-                                          XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, g3p, g3r, w3n,
+                                          N1, pwq, pwk, pwv,
+                                          Nq, Nk, DF, pwo, N2,
+                                          pwg, pwu, pwd,
+                                          XN32, DC32, X132, HU32, SK32, SCR32, CPB, WPB, RDB, c32n, gwp, g3r, w3n,
                                           XN, DQ, DK, DV, DQN, DKN, DQr, DKr, DCtx, DO, X1, X1N, Gr, Up, Hu, M,
-                                          gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN)
+                                          gpn, grn, GPB, SKB, KSP, rsn, ran, RSPB, RSB, SNB, CHN,
+                                          P0, KCl, VCl, akfn, QV, ascf, acxf, SCB,
+                                          amxf, aexf, asmf, anrf, EWB, MSB,
+                                          rbf, RBP, RBQ, W16 * 2,
+                                          AT2ON, KV32ON, as4f, ac4f, EW32, as3f, ac3f, acr3f, as2f, asxf, ac2f, acrf, PCB,
+                                          QGL, GR, q4s, q6s, q4f, q6f, q4mx, q6mx, QPB,
+                                          PK0 + ovq.get(L), PK1 + ovk.get(L), PK2 + ovv.get(L), PK3 + ovo.get(L),
+                                          PK4 + ovg.get(L), PK5 + ovu.get(L), PK6 + ovd.get(L),
+                                          ltq.get(L), ltk.get(L), ltv.get(L), lto.get(L), ltg.get(L), ltu.get(L), ltd.get(L), FZON, s32f, qknf, MRx, g16t, TLx, GTK * GTKW, g16a, as5h, ac5h, APF, akth)
                             if (e != 0) { println("RUN_LAYER_ERR L=" + L.to_string() + " code=" + e.to_string()); return 71 }
                             lyT = lyT + (time_mono_millis() - phC)
                             cur = tgt
@@ -795,42 +1518,42 @@ main()<Int> -> {
                         if (QV == 0) { println("DECG forward done") }
                         phD<Int> = time_mono_millis()
                         rA = cur; rB = ON; rC = DH
-                        cuMemcpyHtoD_v2(RN + 0, loc(rA), 8); cuMemcpyHtoD_v2(RN + 8, loc(rB), 8); cuMemcpyHtoD_v2(RN + 16, loc(rC), 8)
-                        cuMemcpyHtoD_v2(RN + 24, loc(Scur), 8); cuMemcpyHtoD_v2(RN + 32, loc(D), 8); cuMemcpyHtoD_v2(RN + 40, loc(EPS), 8)
-                        cuda_launch4i(from<loc<CVoid>>(addr(rfn)), (Scur * D + 255) / 256, 1, 1, 256, 1, 1, RN, 0, 0, 0)
-                        LCH<Int> = 16384
-                        s7<Int> = Scur - 1
-                        vs2<Int> = 0
-                        ve2<Int> = 0
-                        rc_sl<CInt> = 0
-                        while (vs2 < VOCAB) {
-                            ve2 = vs2 + LCH
-                            if (ve2 > VOCAB) { ve2 = VOCAB }
-                            cuMemcpyHtoD_v2(LSP + 0, loc(DH), 8); cuMemcpyHtoD_v2(LSP + 8, loc(DE), 8); cuMemcpyHtoD_v2(LSP + 16, loc(DL), 8)
-                            cuMemcpyHtoD_v2(LSP + 24, loc(s7), 8); cuMemcpyHtoD_v2(LSP + 32, loc(D), 8)
-                            cuMemcpyHtoD_v2(LSP + 40, loc(vs2), 8); cuMemcpyHtoD_v2(LSP + 48, loc(ve2), 8); cuMemcpyHtoD_v2(LSP + 56, loc(VOCAB), 8)
-                            rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(lsfn)), (ve2 - vs2 + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
-                            if (rc_sl != 0) { return 92 }
-                            vs2 = ve2
+                        e = normb(rbf, RBP + 128, cur, ON, DH, Srows, D, EPS, 0)
+                        if (e != 0) { return 78 }
+                        s7<Int> = Srows - 1
+                        if (HQ == 1) {
+                            e = cast1(c32n, CPB, DH + s7 * D * 8, XN32, D); if (e != 0) { return 92 }
+                            if (gemvq(q4f, q6f, q4m, q6m, q4s, q6s, GR, 14, QPB, TEP, XN32, DL + s7 * VOCAB * 8, 1, VOCAB, D, 8, 0) != 0) { return 92 }
+                        } else {
+                        # Coalesced tied head: 32 lanes per vocab row over the f32 table, then a lane reduce.
+                        lpb1<GP3> = GP3 { src = DH, dst = DEH, n = LPART }
+                        cuMemcpyAsync(LPB + 0, loc(lpb1), 24, 0)
+                        cuMemcpyAsync(LPB + 24, loc(s7), 8, 0); cuMemcpyAsync(LPB + 32, loc(D), 8, 0); cuMemcpyAsync(LPB + 40, loc(VOCAB), 8, 0)
+                        rc_sl<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(lhp)), (VOCAB * 32 + 255) / 256, 1, 1, 256, 1, 1, LPB, 0, 0, 0)
+                        if (rc_sl != 0) { println("LOGITS32_P_ERR rc=" + rc_sl.to_string()); return 92 }
+                        cuMemcpyAsync(LSP + 0, loc(LPART), 8, 0); cuMemcpyAsync(LSP + 8, loc(DL), 8, 0)
+                        cuMemcpyAsync(LSP + 16, loc(s7), 8, 0); cuMemcpyAsync(LSP + 24, loc(VOCAB), 8, 0)
+                        rc_sl = cuda_launch4i(from<loc<CVoid>>(addr(l32r)), (VOCAB + 255) / 256, 1, 1, 256, 1, 1, LSP, 0, 0, 0)
+                        if (rc_sl != 0) { println("LOGITS32_R_ERR rc=" + rc_sl.to_string()); return 92 }
                         }
                         # Two-pass argmax (VybForge#23): `argmax_row` scans VOCAB with ONE thread
                         # (14.4 ms per launch, measured); this splits the row into VOCAB/CHA chunks,
                         # one thread each, then reduces ~594 partials in a single thread.
                         nchA<Int> = (VOCAB + CHA - 1) / CHA
-                        cuMemcpyHtoD_v2(A5 + 0, loc(DL + s7 * VOCAB * 8), 8); cuMemcpyHtoD_v2(A5 + 8, loc(PVA), 8)
-                        cuMemcpyHtoD_v2(A5 + 16, loc(PIA), 8); cuMemcpyHtoD_v2(A5 + 24, loc(VOCAB), 8)
-                        cuMemcpyHtoD_v2(A5 + 32, loc(CHA), 8)
+                        cuMemcpyAsync(A5 + 0, loc(DL + s7 * VOCAB * 8), 8, 0); cuMemcpyAsync(A5 + 8, loc(PVA), 8, 0)
+                        cuMemcpyAsync(A5 + 16, loc(PIA), 8, 0); cuMemcpyAsync(A5 + 24, loc(VOCAB), 8, 0)
+                        cuMemcpyAsync(A5 + 32, loc(CHA), 8, 0)
                         rc_am<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(a1p)), (nchA + 255) / 256, 1, 1, 256, 1, 1, A5, 0, 0, 0)
                         if (rc_am != 0) { println("ARGMAX1_P_ERR rc=" + rc_am.to_string()); return 93 }
-                        cuMemcpyHtoD_v2(A6 + 0, loc(PVA), 8); cuMemcpyHtoD_v2(A6 + 8, loc(PIA), 8)
-                        cuMemcpyHtoD_v2(A6 + 16, loc(AO), 8); cuMemcpyHtoD_v2(A6 + 24, loc(nchA), 8)
+                        cuMemcpyAsync(A6 + 0, loc(PVA), 8, 0); cuMemcpyAsync(A6 + 8, loc(PIA), 8, 0)
+                        cuMemcpyAsync(A6 + 16, loc(AO), 8, 0); cuMemcpyAsync(A6 + 24, loc(nchA), 8, 0)
                         rc_am = cuda_launch4i(from<loc<CVoid>>(addr(a1r)), 1, 1, 1, 256, 1, 1, A6, 0, 0, 0)
                         if (rc_am != 0) { println("ARGMAX1_R_ERR rc=" + rc_am.to_string()); return 94 }
                         cuCtxSynchronize()
                         nxt = 0
                         cuMemcpyDtoH_v2(loc(nxt), AO, 8)
                         match (write_str(w, nxt.to_string() + "\n")) { q -> { } ? -> { return 17 } }
-                        copy_row(DE, nxt, D, EMB + Scur * D * 8)
+                        emb_row(q6fn, TEP, nxt, D, EMB + Scur * D * 8)
                         hdT = hdT + (time_mono_millis() - phD)
                         if (QV == 0) { println("GEN step " + g.to_string() + " token=" + nxt.to_string()) }
                     }

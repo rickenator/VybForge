@@ -38,6 +38,7 @@ Usage: ridge_forward_verify.py [fixture-name ...]
 import glob
 import hashlib
 import os
+import re
 import subprocess
 import sys
 
@@ -102,6 +103,25 @@ def oracle_version():
     except Exception as e:                                                # noqa: BLE001
         return "unknown (%s)" % e.__class__.__name__
 
+
+def oracle_key(ver):
+    # (base, build, commit) out of `version: X (build N, commit H)`.
+    m = re.search(r"^version:\s*([^()]+?)\s*\(build\s+(\d+),\s*commit\s+([0-9a-f]+)\)", ver or "")
+    if not m:
+        return None
+    return (m.group(1).strip(), int(m.group(2)), m.group(3))
+
+
+def same_oracle(want, live):
+    # Compare the oracle SEMANTICALLY, not verbatim. git abbreviates the commit to a length that
+    # depends on the repo and the tool build (7 chars in the captured fixture, 9 in a fresh build),
+    # so a verbatim compare is UNPASSABLE for anyone who rebuilds the oracle at the same commit: it
+    # reported "the oracle moved" while both the gguf hash AND the commit agreed. Commit is compared
+    # by PREFIX, build number exactly, base version exactly; anything unparseable falls back to exact.
+    a, b = oracle_key(want), oracle_key(live)
+    if a is None or b is None:
+        return want == live
+    return a[0] == b[0] and a[1] == b[1] and (a[2].startswith(b[2][:7]) or b[2].startswith(a[2][:7]))
 
 def read_floats(path):
     vals = []
@@ -184,7 +204,7 @@ def verify_fixture(fx, ids_k=None):
     # ── provenance FIRST: a mismatch means the oracle moved, not that we are wrong ────────────────
     want_ver, want_gid = field(fx, "llama_version"), field(fx, "gguf_id")
     live_ver, live_gid = oracle_version(), gguf_id(MODEL)
-    if want_ver != live_ver or want_gid != live_gid:
+    if not same_oracle(want_ver, live_ver) or want_gid != live_gid:
         print("RIDGE_FORWARD_VERIFY_FAIL the oracle moved: llama-server %r vs fixture %r, gguf %s vs %s "
               "— recapture required (native/tools/ridge_oracle_capture.py)"
               % (live_ver, want_ver, live_gid, want_gid))
