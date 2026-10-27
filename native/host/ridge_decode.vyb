@@ -827,6 +827,7 @@ main()<Int> -> {
     // VYB_SWQ8 (default 1): decode FFN silu32 also writes H32Q (silu32q), dropping the xq8 launch
     // before an IQ down GEMV on the q8_1 path. Bit-identical; needs FF % 32 == 0.
     SWQ<Int> = 0
+    SWQN<Int> = 0
     if ((env_get("VYB_SWQ8") else "1") == "1" && RQ8 == 1 && hsq != 0 && FF % 32 == 0) { SWQ = 1 }
     PSQ<Int> = dalloc(64)
     put_i(PSQ, 0, GR) ; put_i(PSQ, 8, UP) ; put_i(PSQ, 16, H32) ; put_i(PSQ, 24, FF) ; put_i(PSQ, 32, H32Q)
@@ -1423,7 +1424,7 @@ main()<Int> -> {
                 lk(gemv_h(tu, hq4, hq6, hq5, hq8, hi2, hi3), gemv_g(tu, FF, IRB, Q4G, Q6G), gemv_t(tu, ITH), pfb + 512)
             }
             swq<Int> = 0
-            if (SWQ == 1 && uses_q8(tdn, RQ83) == 1) { swq = 1 }
+            if (SWQ == 1 && uses_q8(tdn, RQ83) == 1) { swq = 1 ; SWQN = SWQN + 1 }
             if (swq == 1) { lk(hsq, (FF + 255) / 256, 256, PSQ) } else { lk4(hs32, (FF + 255) / 256, 256, GR, UP, H32, FF) }
             if (XPM == 1) {
                 if (perm_x(tdn, RQ8, RQ83) == 1) { lk(hxp, (FF + 255) / 256, 256, PXH) }
@@ -1516,6 +1517,7 @@ main()<Int> -> {
     println("TIMING prefill_tokens=" + NP.to_string() + " prefill_ms=" + pfms.to_string()
             + " decode_tokens=" + ndec.to_string() + " decode_ms=" + dms.to_string())
     if (pfms > 0) { println("PREFILL_TOK_S=" + ((NP as Float) * 1000.0 / (pfms as Float)).to_string()) }
+    if (LDBG == 1) { println("SWQ_LAYER_STEPS=" + SWQN.to_string()) }
     if (dms > 0) { println("DECODE_TOK_S=" + ((ndec as Float) * 1000.0 / (dms as Float)).to_string()) }
     println("MEM_END dev_used=" + (mtot - mfree).to_string())
     println("DECODE_DONE")
