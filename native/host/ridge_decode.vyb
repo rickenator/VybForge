@@ -635,6 +635,11 @@ main()<Int> -> {
         if (mq5q == 0 || m7c == 0) { println("ERR load rq5kq / rgemv7") ; return 1 }
         hq5q = get_fn(mq5q, "gemv_q5k_q") ; hxq5 = get_fn(m7c, "xq8") ; Q5Q8 = 1
         println("Q5K_GEMV attn=q8_1 dp4a (rq5kq)")
+        // VYB_Q5KU (default 1): gemv_q5k_qu, the same math with the super-block loop unrolled x4 (bit-identical)
+        if ((env_get("VYB_Q5KU") else "1") == "1") {
+            hq5u<Int> = get_fn(mq5q, "gemv_q5k_qu")
+            if (hq5u != 0) { hq5q = hq5u ; println("Q5KU gemv_q5k_qu unroll4") }
+        }
     }
     // VYB_Q6KPTX: Q6_K decode GEMV gemv_q6k_v (gen_rq6k.py R D; default rq6k.ptx = gen_rq6k.py 1 2: 1 row/warp,
     // 2-deep prefetch, shuffle reduction; bit-identical to qwen3 gemv_q6k). VYB_Q6KR = rows per warp.
@@ -714,6 +719,17 @@ main()<Int> -> {
             DSPT = DSPG
             DSP = 1
             println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
+        }
+        // VYB_DSG=1 (with VYB_GDN32=1): delta_step_g32 (rdeltag, gen_rdeltag.py): f32 state held in registers,
+        // 8 warps x 16 rows per 32-column block, warp partials summed in shared; one read + one write of the state
+        // (llama.cpp gated_delta_net structure, MIT). Not bit-exact -> KLD-checked.
+        if (GDN32 == 1 && (env_get("VYB_DSG") else "") == "1" && SS == 128) {
+            mdg<Int> = load_mod("native/build/rdeltag.ptx")
+            if (mdg == 0) { println("ERR load rdeltag.ptx") ; return 1 }
+            hdst = get_fn(mdg, "delta_step_g32")
+            if (hdst == 0) { println("ERR delta_step_g32") ; return 1 }
+            DSPG = 32 ; DSPT = 256 ; DSP = 1
+            println("GDN_STEP delta_step_g32")
         }
         // VYB_DSX (default 1; VYB_DSX=0 = delta_step_u): delta_step_x (rdelta2x, gen_rdelta2x.py): state tile
         // staged in shared by 8 warps, one DRAM read + one write of the state, warp 0 runs delta_step_u's
