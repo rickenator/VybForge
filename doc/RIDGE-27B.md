@@ -57,7 +57,7 @@ RTX 3090 (godzilla, CC 8.6, 24 GB). Vyb main, 2026-10-26:
 
 | Path | tg128 | pp512 |
 |---|---|---|
-| Vyb default | **34.4** | **795** |
+| Vyb default | **35.8** | **791** |
 | Vyb `VYB_EXACT=1` | ~20.8 | ~753 |
 | llama.cpp (CUDA, same GGUF) | 47.35 | 1258.5 |
 
@@ -96,6 +96,9 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `MODEL`, `TSV`, `INVFREQ`, `LLM_DIR` | input paths (GGUF, tensor TSV, rope inv-freq, tokenizer dir) |
 | `PFB`, `PFB64`, `PFBM`, `PFG32`, `PFQ4`, `PFQ4H`, `PFQ5H`, `PFXH`, `PFG128PTX` | batched-prefill variants (`PFB=2` is the bench setting) |
 | `DSX` | Tiled f64 GDN state step `delta_step_x` (default 1, bit-identical to `DSU`; `VYB_DSX=0` falls back to `delta_step_u`). `DSXPTX` overrides the module path |
+| `CG` | Decode step (layers + lm_head) replayed as one CUDA graph (default 1, bit-identical). Re-captured when the attention grid bucket (64 positions) grows; 0 = eager launches |
+| `LKD` | Kernels launched by a direct `cuLaunchKernel` Vyb extern on the decode stream (default 1; 0 = the `cuda_launch4i` shim, which also disables `CG`) |
+| `PSA` | Per-token attention params written through pinned slots + `cuMemcpyAsync` (default 1; required by `CG`) |
 | `DSU`, `DSV`, `DSW`, `DST`, `DSC`, `DSF`, `DSP`, `DSPNW`, `DSVJB`, `DSPPTX`, `DSWPTX`, `GDN32`, `ACX` | Gated-DeltaNet state-step / attention kernel variants (experimental) |
 | `RGPTX`, `RG6PTX`, `RG7PTX`, `RG6PERM`, `RG6TPB`, `RG6WPR`, `RGTPB`, `RGR`, `RGFUSE`, `RK1`, `XPERM`, `Q4KPTX`, `Q4KR`, `Q6KPTX`, `Q6KR` | GEMV kernel selection and tuning (experimental) |
 | `DBG`, `LOGDUMP` | debug output / dump logits |
