@@ -11,6 +11,26 @@
 
 import vmath::{vexp, vsqrt}
 
+// vsqrt40s (Ursela, 2026-10-26): vsqrt(x, 40) is 40 dependent f64 divides on EVERY thread of l2norm_b /
+// norm_gated_b. Seed with the rsqrt bit trick (f64_bits / f64_from_bits) and take 6 Newton steps: identical
+// to vsqrt(x, 40) on 300k log-uniform x in [1e-9, 1e9] (tools/check_vsqrt_seed.py, 0 mismatches); outside that range
+// the 40-step loop runs unchanged -> bit-identical.
+share(all) vsqrt40s(x<Float>)<Float> -> {
+    if (x > 0.000000001) {
+        if (x < 1000000000.0) {
+            y<Float> = x * f64_from_bits(6910469410427058089 - f64_bits(x) / 2)
+            y = 0.5 * (y + x / y)
+            y = 0.5 * (y + x / y)
+            y = 0.5 * (y + x / y)
+            y = 0.5 * (y + x / y)
+            y = 0.5 * (y + x / y)
+            y = 0.5 * (y + x / y)
+            return y
+        }
+    }
+    return vsqrt(x, 40)
+}
+
 gemv_iq2s_r(p<Int>) -> {
     W<Int> = ld_i64(p + 0)
     X<Int> = ld_i64(p + 8)
@@ -308,7 +328,7 @@ l2norm_b(p<Int>) -> {
         kernel_barrier()
         st2 = st2 / 2
     }
-    s<Float> = vsqrt(ld_shared_f64(0), 40)
+    s<Float> = vsqrt40s(ld_shared_f64(0))
     if (s < eps) { s = eps }
     st_f64(Y + (rr * D + t) * 8, v / s)
 }
@@ -332,7 +352,7 @@ norm_gated_b(p<Int>) -> {
         kernel_barrier()
         st2 = st2 / 2
     }
-    rinv<Float> = 1.0 / vsqrt(ld_shared_f64(0) / (D as Float) + eps, 40)
+    rinv<Float> = 1.0 / vsqrt40s(ld_shared_f64(0) / (D as Float) + eps)
     wv<Float> = ld_f64(W + t * 8)
     zv<Float> = ld_f64(Z + (r * D + t) * 8)
     sg<Float> = 1.0 + vexp(0.0 - zv)
