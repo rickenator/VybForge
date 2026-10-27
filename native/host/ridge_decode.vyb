@@ -635,19 +635,24 @@ main()<Int> -> {
             DSP = 1
             println("GDN_STEP delta_step_v jb=" + DSPG.to_string())
         }
-        // VYB_DSX=1: delta_step_x (rdelta2x, gen_rdelta2x.py): state tile staged in shared by 8 warps, one
-        // DRAM read + one write of the state, warp 0 runs delta_step_u's recurrence verbatim; bit-identical in f64.
-        if ((env_get("VYB_DSX") else "") == "1" && GDN32 == 0 && DSP == 0) {
+        // VYB_DSX (default 1; VYB_DSX=0 = delta_step_u): delta_step_x (rdelta2x, gen_rdelta2x.py): state tile
+        // staged in shared by 8 warps, one DRAM read + one write of the state, warp 0 runs delta_step_u's
+        // recurrence verbatim; bit-identical in f64 (56 -> 47.7 us on RTX 3090). Falls back to DSU if the
+        // module is missing.
+        if ((env_get("VYB_DSX") else "1") == "1" && GDN32 == 0 && DSP == 0) {
             mdx<Int> = load_mod(env_get("VYB_DSXPTX") else "native/build/rdelta2x.ptx")
-            if (mdx == 0) { println("ERR load rdelta2x") ; return 1 }
-            hdst = get_fn(mdx, "delta_step_x")
-            if (hdst == 0) { println("ERR delta_step_x") ; return 1 }
-            DSPG = 32
-            DSPT = 256
-            DSP = 1
-            println("GDN_STEP delta_step_x")
+            if (mdx != 0) {
+                hdst = get_fn(mdx, "delta_step_x")
+                if (hdst == 0) { println("ERR delta_step_x") ; return 1 }
+                DSPG = 32
+                DSPT = 256
+                DSP = 1
+                println("GDN_STEP delta_step_x")
+            } else {
+                println("WARN rdelta2x.ptx missing, using delta_step_u (make ridge-kernels)")
+            }
         }
-        // VYB_DSU (default 1 unless VYB_DSP/VYB_DSV picked a kernel): delta_step_t with batched state loads
+        // VYB_DSU (default 1 unless VYB_DSP/VYB_DSV/VYB_DSX picked a kernel): delta_step_t with batched state loads
         // (rdelta2 delta_step_u, 62 vs 71 us; bit-identical in f64). VYB_DSU=0 = plain delta_step_t.
         if ((env_get("VYB_DSU") else "1") == "1" && DSP == 0) {
             mdu<Int> = load_mod(env_get("VYB_DSPPTX") else "native/build/rdelta2.ptx")

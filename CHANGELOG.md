@@ -12,6 +12,9 @@
   - multi-block exact RMSNorm (`rms_blkg`, 32.4 → 32.7 tok/s)
   - seeded 6-step Newton sqrt in `l2norm_b` / `norm_gated_b`. It is bit-identical, checked by
     `native/tools/check_vsqrt_seed.py`, and took decode from 32.7 to 34.2 tok/s.
+- Tiled f64 GDN state step `delta_step_x` (`native/tools/gen_rdelta2x.py`), now the default
+  (`VYB_DSX=0` restores `delta_step_u`). Bit-identical f64 logits; 56 → 47.7 µs per launch,
+  tg128 33.9 → 34.3 tok/s.
 - `make -C native ridge-kernels` (`native/tools/build_ridge_kernels.sh`): builds every PTX the
   decoder loads, each at its own `--kernel-shared` size.
 

@@ -95,6 +95,7 @@ Flags marked "default on" are enabled on CC ≥ 8 unless `VYB_EXACT=1`. Set one 
 | `PROMPT`, `PROMPT_IDS`, `FORCE_IDS`, `GEN`, `CHAT`, `CHAT_N`, `CHAT_SYS`, `THINK`, `STREAM`, `TOKTEXT`, `MAXS` | prompt / chat / output control |
 | `MODEL`, `TSV`, `INVFREQ`, `LLM_DIR` | input paths (GGUF, tensor TSV, rope inv-freq, tokenizer dir) |
 | `PFB`, `PFB64`, `PFBM`, `PFG32`, `PFQ4`, `PFQ4H`, `PFQ5H`, `PFXH`, `PFG128PTX` | batched-prefill variants (`PFB=2` is the bench setting) |
+| `DSX` | Tiled f64 GDN state step `delta_step_x` (default 1, bit-identical to `DSU`; `VYB_DSX=0` falls back to `delta_step_u`). `DSXPTX` overrides the module path |
 | `DSU`, `DSV`, `DSW`, `DST`, `DSC`, `DSF`, `DSP`, `DSPNW`, `DSVJB`, `DSPPTX`, `DSWPTX`, `GDN32`, `ACX` | Gated-DeltaNet state-step / attention kernel variants (experimental) |
 | `RGPTX`, `RG6PTX`, `RG7PTX`, `RG6PERM`, `RG6TPB`, `RG6WPR`, `RGTPB`, `RGR`, `RGFUSE`, `RK1`, `XPERM`, `Q4KPTX`, `Q4KR`, `Q6KPTX`, `Q6KR` | GEMV kernel selection and tuning (experimental) |
 | `DBG`, `LOGDUMP` | debug output / dump logits |
