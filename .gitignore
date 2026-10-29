@@ -24,3 +24,4 @@ native/gguf/qwen3-4b-head.bin
 
 # generated legitimization receipts
 native/legit/receipts/
+native/glm53/layer0/*.bin
