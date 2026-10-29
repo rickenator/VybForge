@@ -135,6 +135,10 @@ nothing in `~/.hermes/config.yaml` changes.
   then bandwidth. Gate: `TP2_VYB_MATCH` vs single-layer P4 output.
 - **P7 — optional**: MTP drafter (needs P6 to be worth it), vision tower.
 - **P8 — cutover.** Vyb server binds `:8000` behind the same contract as TensorFold
+  (`2026-10-29 user decision`: **Spark maintenance windows are fine before cutover** —
+  Hermes falls back to `deepseek-flash` (`fallback_providers[0]`) while the rig is down,
+  so the Sparks can be borrowed for VybFly 100× runs or TP=2 testing without waiting for
+  P8; stop/start is proven (~240 s reload + smoke test).
   (model id `GLM-5.3-Flash`, thinking flag, vision off acceptable), A/B: fixed-prompt
   logprob parity + tok/s vs the recorded TensorFold numbers, both nodes' containers up.
   Only then `~/.hermes/config.yaml` moves (via `hermes config set`, never hand-edited).
