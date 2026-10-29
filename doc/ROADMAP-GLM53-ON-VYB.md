@@ -80,6 +80,12 @@ nothing in `~/.hermes/config.yaml` changes.
   `native/exl3/tile_slot_composition.json` (see `native/exl3/README.md` for the
   format, the oracle setup and its gotchas). Remaining: the Vyb kernel port
   (`deq_exl3`) gated as `EXL3_VYB_MATCH`.
+  **DONE 2026-10-28**: `EXL3_VYB_MATCH: OK` — `native/kernels/exl3.vyb` +
+  `native/host/exl3_driver.vyb` (`make exl3`) on the real fixture: rotated basis
+  max abs 9.8e-4 / rel 4.9e-4 (the reference's own fp16 intermediate rounding),
+  full pipeline max abs 6.1e-5 on W, 0/8.4M over 3e-3. P1 complete; the
+  per-128-block Hadamard + suh/svh stage currently runs in numpy on the kernel's
+  output and moves on-GPU with the serving integration (P5+/fused path).
 - **P2 — MoE block.** Reference (numpy): router fp32 sigmoid → noaux_tc top-8 → renorm →
   ×2.5, shared expert + clamped SwiGLU experts, weighted sum. Vyb: grouped GEMM +
   dispatch kernels. Fixture: real bf16 router/shared weights + dequant'd experts from P1

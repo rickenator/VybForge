@@ -1,0 +1,182 @@
+// EXL3 P1 gate driver: run the exl3deq kernel over the real down_proj fixture
+// (native/exl3/fixture/layers_3_mlp_experts_0_down_proj_trellis.bin, expert 0 of
+// layer 3 of GLM-5.3-Flash, bytes pulled from lefty:/srv/models/hf) and dump the
+// full rotated-basis [in, out] f64 matrix as text for verify_exl3_vyb.py.
+// Pattern follows q4k_load_driver.vyb (io::read_at, chunked H2D, one-retry module
+// load, per-element DtoH). The map (map.bin) is generated from the oracle-probed
+// tile_slot_composition.json by gen_map_bin.py; its header carries cw + ntiles.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "."
+    fx<String> = env_get("VYBFORGE_EXL3_FIXTURE") else "native/exl3/fixture"
+
+    # --- map.bin (16-byte header + 256 x 16-byte slot entries) ---
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> {
+            match (read_all(f)) {
+                g -> { mapd = g }
+                ? -> { return 12 }
+            }
+            close(f)
+        }
+        ? -> { println("NO_MAP native/exl3/map.bin (make exl3 generates it)"); return 12 }
+    }
+    if (mapd.len() < 16 + 256 * 16) { println("SHORT_MAP"); return 22 }
+    cw<Int> = 0
+    ntiles<Int> = 0
+    # header: two little-endian i64 — decode via char_at (avoid endianness doubt)
+    hb<Int> = 0
+    while (hb < 8) {
+        cw = cw | (((mapd.char_at(hb) as Int) & 255) << (hb * 8))
+        ntiles = ntiles | (((mapd.char_at(8 + hb) as Int) & 255) << (hb * 8))
+        hb = hb + 1
+    }
+    if (cw <= 0 || ntiles <= 0) { println("BAD_MAP_HEADER cw=" + cw.to_string()); return 22 }
+
+    # --- trellis.bin: ntiles x 128 bytes ---
+    tre<String> = ""
+    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_trellis.bin")) {
+        f -> {
+            match (read_all(f)) {
+                g -> { tre = g }
+                ? -> { return 12 }
+            }
+            close(f)
+        }
+        ? -> { println("NO_TRELLIS"); return 12 }
+    }
+    tb<Int> = tre.len()
+    if (tb < ntiles * 128) { println("SHORT_TRELLIS got=" + tb.to_string()); return 22 }
+    kn<Int> = (ntiles / (cw / 16)) * 16 * cw     # k * n elements
+
+    println("EXL3_DRIVER cw=" + cw.to_string() + " ntiles=" + ntiles.to_string() +
+            " trellis_bytes=" + tb.to_string() + " elements=" + kn.to_string())
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/exl3.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { println("NO_PTX native/build/exl3.ptx (make exl3 builds it)"); return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/exl3.ptx")) {
+                f -> {
+                    match (read_all(f)) {
+                        g -> { ptx2 = g }
+                        ? -> { return 20 }
+                    }
+                    close(f)
+                }
+                ? -> { return 20 }
+            }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "exl3deq") != 0) { return 10 }
+
+        qd<Int> = 0
+        td<Int> = 0
+        od<Int> = 0
+        mb<Int> = mapd.len()
+        ob<Int> = kn * 8
+        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(od), ob) != 0) { return 11 }
+
+        # chunked H2D (8 bytes per call, little-endian Int = bytes) — q4k pattern
+        up<Int> = 0
+        while (up < mb) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                if (up + bj < mb) {
+                    ch = ch | ((((mapd.char_at(up + bj) as Int) & 255)) << (bj * 8))
+                }
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(td + up, loc(ch), 8) != 0) { return 15 }
+            up = up + 8
+        }
+        npb<Int> = tb - (tb % 8)
+        ci<Int> = 0
+        while (ci < npb / 8) {
+            o8<Int> = ci * 8
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                ch = ch | ((((tre.char_at(o8 + bj) as Int) & 255)) << (bj * 8))
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(qd + o8, loc(ch), 8) != 0) { return 15 }
+            ci = ci + 1
+        }
+        tj<Int> = npb
+        while (tj < tb) {
+            by<Int> = (tre.char_at(tj) as Int) & 255
+            if (cuMemcpyHtoD_v2(qd + tj, loc(by), 1) != 0) { return 15 }
+            tj = tj + 1
+        }
+
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), ntiles, 1, 1, 256, 1, 1,
+                                 qd, td, od, 0)
+        if (rc != 0) { println("launch rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        match (open_write("native/out/exl3_rotated.txt")) {
+            w -> {
+                i2<Int> = 0
+                while (i2 < kn) {
+                    rv<Float> = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv), od + i2 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    i2 = i2 + 1
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+
+        cuMemFree_v2(qd)
+        cuMemFree_v2(td)
+        cuMemFree_v2(od)
+
+        println("EXL3_DEQ_DONE elements=" + kn.to_string())
+        return 0
+    }
+}

@@ -29,7 +29,7 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 # state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
 # unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
 # an explicit `make q8_0` but a fresh `make verify` did not build it.
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s exl3
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: ridge-tensors ridge-tensors-check all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
@@ -150,6 +150,14 @@ gguf-real:
 q4k: $(ROOT)/native/build/q4k.ptx
 	cd $(ROOT) && $(VYB) native/host/q4k_driver.vyb
 	cd $(ROOT) && python3 native/gguf/q4k_verify.py
+
+# EXL3 4bpw (GLM-5.3 routed experts, P1 in doc/ROADMAP-GLM53-ON-VYB.md): generate the
+# slot map from the oracle-verified composition, run the exl3deq kernel on the real
+# fixture, gate the rotated basis + full pipeline against the numpy reference.
+exl3: $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT)/native/exl3 && python3 gen_map_bin.py
+	cd $(ROOT) && $(VYB) native/host/exl3_driver.vyb
+	cd $(ROOT) && python3 native/exl3/verify_exl3_vyb.py
 
 # Phase-3 swap-in (issue #5 storage boundary): stream real Q4_K weights via
 # read_at + bulk q4k dequant to f32, packed stays canonical, memory reported

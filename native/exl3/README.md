@@ -12,8 +12,12 @@ is bf16 safetensors.
   serves GLM-5.3-Flash with) on REAL expert weights: max abs diff 1.2e-4 on
   values with std 0.0117 (pure fp16-butterfly rounding from the oracle's column
   transform; the rotated-basis compare in `bisect2.py` is bit-exact, 0.0).
-- Remaining for P1: the Vyb port (`native/kernels/deq_exl3.vyb` + driver),
-  gated against this reference (`EXL3_VYB_MATCH`).
+- **`EXL3_VYB_MATCH: OK`** — the Vyb kernel is ported and gated
+  (`native/kernels/exl3.vyb` + `native/host/exl3_driver.vyb`, `make exl3`):
+  rotated basis max abs 9.8e-4 / rel 4.9e-4 (exactly the reference's fp16
+  intermediate rounding — Vyb sums the codebook halves in f64), full pipeline
+  (numpy Hadamard+scales on the Vyb output) max abs 6.1e-5 on W, 0 of 8,388,608
+  elements over 3e-3. P1 is complete.
 
 ## Format (pinned from exllamav3 source + oracle probes)
 
@@ -57,16 +61,35 @@ fallbacks — no .cpp file actually calls them (verified by grep).
 Gotcha 3: the build takes ~10 min; run it via `systemd-run --user` so nothing
 reaps it (see `~/.cache/exl3-build/import.log`).
 
+## Vyb port gotchas (learned the hard way)
+
+- **Never hand-convert the hex constants.** The three decode constants must be
+  used as computed decimals: 0xCBAC1FED=3417055213, 0x8FFF8FFF=2415890431,
+  0x3B603B60=996162400. Eyeballed values decode every window wrong while still
+  producing plausible-looking norms.
+- **st_i64 → ld_f16 load-after-store is unreliable** under -O2 (stale/reordered
+  reads gave NaN on 8 slots × every tile plus sporadic garbage). Convert the fp16
+  halves arithmetically (`fp16_to_f64`, sign/exp/mantissa with halving loops).
+- **`&&` in a `while` condition fails to parse** in host code (and kernels): use a
+  nested `if` inside the loop.
+- **A `match` with a nested `match` on one line fails to parse**: put the inner
+  match on its own lines and `close(f)` on its own line (q4k driver shape).
+- `ld_u16`/`ld_i8` do not implicitly convert to Int: cast (`as Int`) and mask
+  (`& 255` for bytes).
+
 ## Files
 
   exl3_ref.py           reference dequant + mcg decode + Hadamard (verification-only Python)
   verify_ref.py         EXL3_REF_VERIFY gate: reference vs oracle on the real fixture
+  verify_exl3_vyb.py    EXL3_VYB_MATCH gate: Vyb kernel output vs reference (both stages)
+  gen_map_bin.py        tile_slot_composition.json -> map.bin for the Vyb kernel
   build_map.py          empirical slot-composition extraction (256 single-nibble probes)
   finalize_map.py       merge b/s compositions, verify on random probes, save the map
   probe_swindows.py     the probe run that exposed the s-window structure
   bisect2.py            rotated-basis bit-exactness check (0.0 diff)
   probe_hadamard.py     Hadamard-ordering hypothesis test
   tile_slot_composition.json   THE verified map (committed)
+  map.bin               kernel-side form of the same map (16-byte header + 256x16B)
   fixture/              real tensor bytes from lefty:/srv/models/hf (NOT committed)
 
 Regenerate the fixture: `ssh lefty python3 /tmp/extract_exl3_fixture.py

@@ -1,0 +1,112 @@
+// EXL3 4bpw dequant kernel — the routed experts of GLM-5.3-Flash (the only EXL3
+// tensors in the checkpoint: quantization_config.scope = glm53_routed_experts_only,
+// bits=4, codebook mcg). Emits the ROTATED-basis tile values What; the per-128-block
+// Hadamard + suh/svh scales are a separate generic stage (see native/exl3/README.md).
+//
+// Format per weight matrix [in, out] (all pinned against the exllamav3 oracle,
+// native/exl3/README.md):
+//   trellis  i16 [in/16, out/16, 64]   64 u16 = 1024 bits = 256 nibbles / 16x16 tile
+//   one 16-bit window per output value: window j covers nibbles j..j+3 of the
+//   tile's nibble stream (LSB-first in each u16), BUT the placement of window
+//   value -> tile (row, col) is a fixed pipeline quirk, not a clean formula —
+//   it is pinned empirically and passed in as the `tab` map (one 16-byte entry
+//   per slot: 4x u16 nibble index, 4x u8 bit position, u16 row, u16 col).
+//   Map header: [0..7] cw (i64, out columns), [8..15] ntiles (i64).
+// Value decode (codebook.cuh decode_3inst, cb=1 "mcg"), bit-exact vs oracle:
+//   prod = (w16 * 0xCBAC1FED) mod 2^32
+//   y    = (prod & 0x8fff8fff) ^ 0x3b603b60
+//   val  = f16(y & 0xffff) + f16(y >> 16)
+// The fp16 halves are converted arithmetically (sign/exp/mantissa, subnormals
+// included) — an earlier st_i64+ld_f16 bitcast through a scratch buffer read
+// stale/reordered memory under -O2 and is not trustworthy for load-after-store.
+//
+// Thread = one (tile, slot) output value (f64 store, q4kdeq convention; the
+// DtoH gate reads exact f64).
+// fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
+// Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
+// Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the
+// verified fixture — the numpy reference has no non-finite values — and is
+// clamped to the fp16 max as a stand-in so a surprise shows up as a finite
+// mismatch in the gate rather than poisoning the whole tile.
+share(all) fp16_to_f64(b<Int>)<Float> -> {
+    sb<Int> = (b >> 15) & 1
+    eb<Int> = (b >> 10) & 31
+    mb<Int> = b & 1023
+    v<Float> = 0.0
+    if (eb == 0) {
+        v = mb as Float
+        k<Int> = 0
+        while (k < 24) {
+            v = v * 0.5
+            k = k + 1
+        }
+    } else {
+        if (eb == 31) {
+            v = 65504.0
+        } else {
+            v = (1024 + mb) as Float
+            sh<Int> = eb - 25
+            while (sh > 0) {
+                v = v * 2.0
+                sh = sh - 1
+            }
+            while (sh < 0) {
+                v = v * 0.5
+                sh = sh + 1
+            }
+        }
+    }
+    if (sb == 1) {
+        v = 0.0 - v
+    }
+    return v
+}
+
+exl3deq(q<Int>, tab<Int>, o<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    ntiles<Int> = ld_i64(tab + 8)
+    total<Int> = ntiles * 256
+    if (gid < total) {
+        tile<Int> = gid / 256
+        slot<Int> = gid - tile * 256
+        base<Int> = tab + 16 + slot * 16
+        # compose this slot's 16-bit window from its 4 (nibble, bitpos) pairs
+        w16<Int> = 0
+        i<Int> = 0
+        while (i < 4) {
+            nidx<Int> = ld_u16(base + i * 2) as Int
+            p<Int> = (ld_i8(base + 8 + i) as Int) & 255
+            # nibble nidx of this tile: u16 word nidx/4, nib-in-word nidx%4 ->
+            # byte (nidx/4)*2 + (nidx%4)/2, low/high nibble by (nidx%4)%2
+            wb<Int> = q + tile * 128 + (nidx / 4) * 2 + (nidx % 4) / 2
+            by<Int> = (ld_i8(wb) as Int) & 255
+            sh<Int> = ((nidx % 4) % 2) * 4
+            nib<Int> = (by >> sh) & 15
+            w16 = w16 | (nib << (p * 4))
+            i = i + 1
+        }
+        # mcg decode; constants are the DECIMAL forms of 0xCBAC1FED / 0x8FFF8FFF /
+        # 0x3B603B60 (computed, not eyeballed — a hand conversion here silently
+        # decodes every window wrong). All positive so Int (64-bit) arithmetic
+        # never goes negative: w16 <= 65535, product <= 2.24e14 < 2^63, mask = mod 2^32
+        prod<Int> = (w16 * 3417055213) & 4294967295
+        y<Int> = (prod & 2415890431) ^ 996162400
+        # fp16 halves -> f64 arithmetically (sign/exp/mantissa, subnormals by
+        # halving; exp==31 cannot occur on the verified fixture — reference has
+        # no inf/nan — and is clamped to a huge finite so the gate stays honest)
+        lo<Float> = fp16_to_f64(y & 65535)
+        hi<Float> = fp16_to_f64((y >> 16) & 65535)
+        val<Float> = lo + hi
+        # place: tile (kb, nb) covers rows 16kb+r, cols 16*nb+c; nbc = cw/16
+        cw<Int> = ld_i64(tab + 0)
+        nbc<Int> = cw / 16
+        r<Int> = ld_u16(base + 12) as Int
+        c<Int> = ld_u16(base + 14) as Int
+        kbv<Int> = tile / nbc
+        nbv<Int> = tile - kbv * nbc
+        row<Int> = kbv * 16 + r
+        col<Int> = nbv * 16 + c
+        vv<Float> = val as Float
+        st_f64(o + (row * cw + col) * 8, vv)
+    }
+}
