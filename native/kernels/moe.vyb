@@ -1,0 +1,170 @@
+// GLM-5.3 MoE block kernels (P2 in doc/ROADMAP-GLM53-ON-VYB.md), matching the
+// reference in native/glm53/moe_ref.py (itself gated against exllamav3's shipped
+// routing reference — MOE_ROUTE_VERIFY: OK).
+//
+// Fixture-shaped: HIDDEN=4096, INTER=2048, N_EXPERTS=288, TOPK=8, and the expert
+// weights are the P1-dequantised expert 0 on every lane (only expert 0 is in the
+// fixture; the per-expert pointer table arrives with the loader, P4). The shared
+// expert rides as lane 8 with weight 1.
+//
+// Semantics (sigmoid / noaux_tc / n_group=1):
+//   logits = y @ gateW^T ; score = sigmoid(logits) ; choice = score + bias
+//   idx = top8(choice) ; w = score[idx] / sum * routed_scaling_factor (2.5)
+//   act = silu(min(min(g,10),...)) * clamp(u, +-10) ; out = sum w_i (act_i @ Wd_i)
+//
+// All params come from one p-buffer of i64 slots (qwen3rope idiom):
+//   +0 y(f32) +8 gateW(f32 [288,4096]) +16 bias(f32) +24 logits scratch(f32 [S,288])
+//   +32 idx out(f32 [S,8]) +40 w out(f32 [S,8]) +48 act out(f32 [S*9,2048])
+//   +56 wg_e +64 wu_e +72 wd_e +80 wg_s +88 wu_s +96 wd_s +104 out(f32 [S,4096])
+//   +112 S
+import vmath::{vexp}
+
+share(all) ldf(a<Int>)<Float> -> {
+    v<Float32> = ld_f32(a)
+    return v as Float
+}
+
+share(all) sigm(x<Float>)<Float> -> {
+    return 1.0 / (1.0 + vexp(0.0 - x))
+}
+
+// one thread per token: logits, top-8 selection, renorm x2.5
+moe_route(p<Int>) -> {
+    Y<Int> = ld_i64(p + 0)
+    GW<Int> = ld_i64(p + 8)
+    BI<Int> = ld_i64(p + 16)
+    LG<Int> = ld_i64(p + 24)
+    IX<Int> = ld_i64(p + 32)
+    WT<Int> = ld_i64(p + 40)
+    S<Int> = ld_i64(p + 112)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < S) {
+        e<Int> = 0
+        while (e < 288) {
+            acc<Float> = 0.0
+            h<Int> = 0
+            while (h < 4096) {
+                acc = acc + ldf(Y + (gid * 4096 + h) * 4) * ldf(GW + (e * 4096 + h) * 4)
+                h = h + 1
+            }
+            st_f32(LG + (gid * 288 + e) * 4, acc as Float32)
+            e = e + 1
+        }
+        # top-8 over choice = sigmoid(logit) + bias, skipping already-picked
+        lane<Int> = 0
+        while (lane < 8) {
+            best<Float> = -1000000000.0
+            besti<Int> = 0
+            e = 0
+            while (e < 288) {
+                used<Int> = 0
+                q<Int> = 0
+                while (q < lane) {
+                    pi<Int> = ld_f32(IX + (gid * 8 + q) * 4) as Int
+                    if (pi == e) { used = 1 }
+                    q = q + 1
+                }
+                if (used == 0) {
+                    sc<Float> = sigm(ldf(LG + (gid * 288 + e) * 4)) + ldf(BI + e * 4)
+                    if (sc > best) {
+                        best = sc
+                        besti = e
+                    }
+                }
+                e = e + 1
+            }
+            st_f32(IX + (gid * 8 + lane) * 4, besti as Float32)
+            lane = lane + 1
+        }
+        # weights: raw scores over the selected set, normalised, x2.5
+        tot<Float> = 0.0
+        lane = 0
+        while (lane < 8) {
+            pi<Int> = ld_f32(IX + (gid * 8 + lane) * 4) as Int
+            tot = tot + sigm(ldf(LG + (gid * 288 + pi) * 4))
+            lane = lane + 1
+        }
+        lane = 0
+        while (lane < 8) {
+            pi<Int> = ld_f32(IX + (gid * 8 + lane) * 4) as Int
+            wv<Float> = sigm(ldf(LG + (gid * 288 + pi) * 4)) / (tot + 0.00000000000000000001)
+            st_f32(WT + (gid * 8 + lane) * 4, (wv * 2.5) as Float32)
+            lane = lane + 1
+        }
+    }
+}
+
+// one thread per (token, lane, i) with lane 8 = shared expert: clamped SwiGLU halves
+moe_act(p<Int>) -> {
+    Y<Int> = ld_i64(p + 0)
+    AC<Int> = ld_i64(p + 48)
+    WG<Int> = ld_i64(p + 56)
+    WU<Int> = ld_i64(p + 64)
+    WSG<Int> = ld_i64(p + 80)
+    WSU<Int> = ld_i64(p + 88)
+    S<Int> = ld_i64(p + 112)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    total<Int> = S * 9 * 2048
+    if (gid < total) {
+        s<Int> = gid / 18432
+        lane<Int> = (gid % 18432) / 2048
+        i<Int> = gid % 2048
+        gsrc<Int> = WG
+        usrc<Int> = WU
+        if (lane == 8) {
+            gsrc = WSG
+            usrc = WSU
+        }
+        g<Float> = 0.0
+        u<Float> = 0.0
+        h<Int> = 0
+        while (h < 4096) {
+            yv<Float> = ldf(Y + (s * 4096 + h) * 4)
+            g = g + yv * ldf(gsrc + (h * 2048 + i) * 4)
+            u = u + yv * ldf(usrc + (h * 2048 + i) * 4)
+            h = h + 1
+        }
+        # swiglu_limit = 10.0
+        if (g > 10.0) { g = 10.0 }
+        if (u > 10.0) { u = 10.0 }
+        if (u < -10.0) { u = -10.0 }
+        act<Float> = (g * sigm(g)) * u
+        st_f32(AC + (s * 9 * 2048 + lane * 2048 + i) * 4, act as Float32)
+    }
+}
+
+// one thread per (token, out): weighted expert sum + shared expert
+moe_down(p<Int>) -> {
+    AC<Int> = ld_i64(p + 48)
+    WT<Int> = ld_i64(p + 40)
+    WD<Int> = ld_i64(p + 72)
+    WSD<Int> = ld_i64(p + 96)
+    O<Int> = ld_i64(p + 104)
+    S<Int> = ld_i64(p + 112)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    total<Int> = S * 4096
+    if (gid < total) {
+        s<Int> = gid / 4096
+        i<Int> = gid % 4096
+        acc<Float> = 0.0
+        lane<Int> = 0
+        while (lane < 8) {
+            wv<Float> = ldf(WT + (s * 8 + lane) * 4)
+            part<Float> = 0.0
+            j<Int> = 0
+            while (j < 2048) {
+                part = part + ldf(AC + (s * 9 * 2048 + lane * 2048 + j) * 4) * ldf(WD + (j * 4096 + i) * 4)
+                j = j + 1
+            }
+            acc = acc + wv * part
+            lane = lane + 1
+        }
+        part2<Float> = 0.0
+        js<Int> = 0
+        while (js < 2048) {
+            part2 = part2 + ldf(AC + (s * 9 * 2048 + 8 * 2048 + js) * 4) * ldf(WSD + (js * 4096 + i) * 4)
+            js = js + 1
+        }
+        st_f32(O + gid * 4, (acc + part2) as Float32)
+    }
+}

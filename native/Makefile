@@ -29,7 +29,7 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 # state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
 # unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
 # an explicit `make q8_0` but a fresh `make verify` did not build it.
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s exl3
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s exl3 moe
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
 .PHONY: ridge-tensors ridge-tensors-check all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
@@ -158,6 +158,13 @@ exl3: $(ROOT)/native/build/exl3.ptx
 	cd $(ROOT)/native/exl3 && python3 gen_map_bin.py
 	cd $(ROOT) && $(VYB) native/host/exl3_driver.vyb
 	cd $(ROOT) && python3 native/exl3/verify_exl3_vyb.py
+
+# P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
+# against exllamav3's own routing reference in verify_moe.py).
+moe: $(ROOT)/native/build/moe.ptx
+	cd $(ROOT) && python3 native/glm53/prepare_moe_fixture.py
+	cd $(ROOT) && $(VYB) native/host/moe_driver.vyb
+	cd $(ROOT) && python3 native/glm53/verify_moe_vyb.py
 
 # Phase-3 swap-in (issue #5 storage boundary): stream real Q4_K weights via
 # read_at + bulk q4k dequant to f32, packed stays canonical, memory reported

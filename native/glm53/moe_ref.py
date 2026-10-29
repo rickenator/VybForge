@@ -40,9 +40,10 @@ def _load(name, dtype, shape):
 
 
 def load_router():
+    """Returns (gate W as f32 [N_EXPERTS, HIDDEN], bias f32 [N_EXPERTS])."""
     w = _load("layers_3_mlp_gate_weight.bin", "<u2", (N_EXPERTS, HIDDEN))
     bias = _load("layers_3_mlp_gate_e_score_correction_bias.bin", "<f4", (N_EXPERTS,))
-    return w, bias
+    return bf16_to_f32(w).astype(np.float32), bias.astype(np.float32)
 
 
 def bf16_to_f32(u16: np.ndarray) -> np.ndarray:
@@ -65,8 +66,9 @@ def sigmoid(x):
 
 
 def route(y, gate_w, bias, topk: int = TOPK):
-    """y: [S, HIDDEN] float32/64 -> (idx [S,topk], weights [S,topk])."""
-    logits = y.astype(np.float64) @ bf16_to_f32(gate_w).astype(np.float64).T
+    """y: [S, HIDDEN] float32/64; gate_w f32 [N_EXPERTS, HIDDEN].
+    -> (idx [S,topk], weights [S,topk])."""
+    logits = y.astype(np.float64) @ gate_w.astype(np.float64).T
     scores = sigmoid(logits)
     choice = scores + bias.astype(np.float64)[None, :]
     idx = np.argsort(-choice, axis=-1)[:, :topk]
@@ -88,14 +90,23 @@ def ffn(x, wg, wu, wd):
 
 
 def moe_block(y, gate_w, bias, expert_w, shared_w, topk: int = TOPK):
-    """y: [S, HIDDEN]. expert_w: dict index -> (wg, wu, wd) in (in,out) layout."""
+    """y: [S, HIDDEN]. expert_w: dict index -> (wg, wu, wd) in (in,out) layout.
+
+    The expert FFN is computed once per DISTINCT weight set (cached by the tuple's
+    identity): in the current fixture every lane maps to expert 0's weights, and in
+    general a lane's FFN depends only on the weights it is given.
+    """
     idx, w = route(y, gate_w, bias, topk)
     S = y.shape[0]
     out = np.zeros((S, HIDDEN), dtype=np.float64)
     for s in range(S):
+        cache = {}
         for lane in range(topk):
             e = int(idx[s, lane])
             wg, wu, wd = expert_w[e]
-            out[s] += w[s, lane] * ffn(y[s:s + 1], wg, wu, wd)[0]
+            key = (id(wg), id(wu), id(wd))
+            if key not in cache:
+                cache[key] = ffn(y[s:s + 1], wg, wu, wd)[0]
+            out[s] += w[s, lane] * cache[key]
     out += ffn(y, *shared_w)
     return out, idx, w

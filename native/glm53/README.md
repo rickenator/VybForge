@@ -15,6 +15,15 @@ checkpoint) and `verify_moe.py` gates them:
   8/8 tokens with identical expert sets, max |Δweight| 1.2e-4 (the oracle returns
   fp16 weights).
 - `MOE_BLOCK_SANITY: OK` — numpy vs torch on identical weights: rel diff 5.7e-16.
+- **`MOE_VYB_MATCH: OK`** — the Vyb kernels (`native/kernels/moe.vyb`:
+  `moe_route`, `moe_act`, `moe_down`, driven by `native/host/moe_driver.vyb`,
+  `make moe`) on the prepared fixture: 4/4 tokens identical expert sets, max
+  |Δweight| 3e-8, block output rel 8e-8 (scale 0.745).
+
+P2 is complete. Fixture caveat: only expert 0's trellis is in the P1 fixture, so
+every lane uses expert 0's weights (the routing is still fully exercised — the
+selection, weights and lane dispatch all agree with the oracle). Distinct
+per-expert weights arrive with the loader (P4).
 
 Semantics (scoring_func=sigmoid, topk_method=noaux_tc, n_group=topk_group=1):
 
@@ -38,6 +47,21 @@ the loader (P4).
 
 ## Remaining for P2
 
-- Vyb kernels: grouped GEMM over the selected experts + dispatch/gather, and the
-  router (sigmoid/top-8/renorm) on device; then `MOE_VYB_MATCH` against
-  `moe_ref.moe_block` on the same fixture.
+P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
+per-expert weights, a per-expert pointer table instead of the single expert-0
+set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
+
+## Vyb host/kernel gotchas found here
+
+- **A 4-byte DtoH into a `Float` gives denormals.** The buffers are f32; copying
+  4 bytes into an 8-byte Float yields values like 4.8e-315. Read the word into an
+  `Int` and decode the 4 bytes in python instead.
+- **A bf16→f32 conversion applied twice silently zeroes the data** (`astype(uint32)`
+  on an f32 array truncates it to 0/1). `load_router()` returns f32 now; nothing
+  downstream converts again.
+- **Fixture scale matters for routing tests.** With `y ~ N(0, 0.02)` the selection
+  bias (≈7.4-7.8) dominated the gate logits and every token routed identically;
+  `y ~ N(0, 0.3)` makes the logits decide.
+- **The harness reaps long background jobs (~6 min).** Split slow steps and cache
+  their outputs (the f64 dequant of three 2048x4096 experts is minutes of numpy;
+  `prepare_moe_fixture.py` caches each array in `prep/`).

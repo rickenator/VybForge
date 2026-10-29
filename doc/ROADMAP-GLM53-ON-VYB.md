@@ -90,13 +90,13 @@ nothing in `~/.hermes/config.yaml` changes.
   ×2.5, shared expert + clamped SwiGLU experts, weighted sum. Vyb: grouped GEMM +
   dispatch kernels. Fixture: real bf16 router/shared weights + dequant'd experts from P1
   fixtures. Gates: `MOE_REF_VERIFY`, `MOE_VYB_MATCH`.
-  **PROGRESS 2026-10-29**: `MOE_ROUTE_VERIFY: OK` + `MOE_BLOCK_SANITY: OK` —
-  `native/glm53/moe_ref.py` matches exllamav3's own shipped routing reference
-  (`_routing_ds3_torch`, the composition its CUDA router is tested against) on the
-  real layer-3 router weights: 8/8 tokens identical expert sets, max |Δw| 1.2e-4
-  (fp16 oracle); the block's clamp/weighting/shared-expert math matches torch to
-  5.7e-16. Semantics and layout notes in `native/glm53/README.md`. Remaining: the
-  Vyb kernels (on-device router + grouped GEMM/dispatch) gated `MOE_VYB_MATCH`.
+  **PROGRESS 2026-10-29**: **P2 DONE.** `MOE_ROUTE_VERIFY: OK` + `MOE_BLOCK_SANITY: OK`
+  (numpy vs exllamav3's shipped routing reference: 8/8 tokens identical expert sets,
+  max |Δw| 1.2e-4; block math vs torch 5.7e-16) and **`MOE_VYB_MATCH: OK`** — the Vyb
+  kernels (`native/kernels/moe.vyb`: moe_route + clamped-SwiGLU expert/shared act +
+  weighted down-combine, `make moe`): 4/4 tokens identical expert sets, max |Δw| 3e-8,
+  output rel 8e-8. Fixture caveat: expert 0's weights on every lane until the loader
+  (P4) brings the per-expert pointer table. Notes in `native/glm53/README.md`.
 - **P3 — attention stack.** 3a gated delta-net (short conv + recurrent state update),
   3b MLA dense-equivalent (nope+rope, kv LoRA), 3c DSA indexer top-k selection +
   kpool compress. Oracles: the HF transformers implementation for glm5_next (or

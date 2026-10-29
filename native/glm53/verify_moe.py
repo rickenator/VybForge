@@ -39,7 +39,7 @@ class Stub:
     pass
 
 cfg = Stub()
-cfg.gate_tensor = torch.from_numpy(moe_ref.bf16_to_f32(gw).astype(np.float32).T.copy()).half()
+cfg.gate_tensor = torch.from_numpy(gw.astype(np.float32).T.copy()).half()
 cfg.num_experts = moe_ref.N_EXPERTS
 cfg.num_experts_per_tok = moe_ref.TOPK
 cfg.e_score_correction_bias = torch.from_numpy(bias.copy())
