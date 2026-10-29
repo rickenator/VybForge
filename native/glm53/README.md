@@ -51,6 +51,36 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## Hyper-connections (mHC) — P3, gated
+
+The body carries `hc_mult = 4` parallel fp32 residual streams per token. Every
+sublayer site has its own mixer: `hc_attn` and `hc_ffn` per layer, tensors
+`model.language_model.layers.N.hc_{attn,ffn}_{fn,base,scale}`:
+`fn` bf16 [24, 16384] (rows = `(2+H)*H`: pre 4, post 4, comb 16), `base` f32 [24],
+`scale` f32 **[3 scalars]** (pre/post/comb scales, not a matrix).
+
+    flat = rms_norm_unweighted(streams.reshape(R, 4*4096))   # fp32 streams
+    mix  = flat @ fnᵀ                    # pre(4) | post(4) | comb(4x4)
+    pre  = sigmoid(pre_w*pre_s + pre_b) + hc_eps        # hc_eps = 1e-6
+    post = 2 * sigmoid(post_w*post_s + post_b)
+    comb = softmax(comb_w*comb_s + comb_b, -1) + hc_eps
+    comb = comb / (colsum + hc_eps); then 5 x {rowsum, colsum} normalise (sinkhorn)
+    collapsed = Σ_h pre_h * stream_h                    # what the sublayer consumes
+    x ← post ⊗ y + combᵀ x                              # apply_ residual update
+
+`native/glm53/hc_ref.py` (numpy) + `verify_hc.py`: **HC_REF_VERIFY: OK** against
+exllamav3's shipped path (`HyperConnection._mix_unfused` / `apply_`, which dispatches
+to the fused `ext.hc_mix` CUDA kernel on a GPU) on the real layer-3 weights:
+post |Δ| 7e-8, comb |Δ| 1e-7, residual update 1e-7, collapsed bit-exact at fp16
+(the fused path stores `collapsed` as half; 1 of 12288 elements differs, a rounding
+boundary). Observed on real weights: `pre` spans 0.0002-0.54 — some streams are
+nearly switched off — and comb columns sum to exactly 1.0 after sinkhorn.
+
+## Remaining for P3
+
+gated delta-net (34 layers) and MLA + DSA indexer (11 layers) still to pin against
+their torch paths; then the per-layer composition (P4) can be assembled.
+
 ## Vyb host/kernel gotchas found here
 
 - **A 4-byte DtoH into a `Float` gives denormals.** The buffers are f32; copying

@@ -100,6 +100,14 @@ nothing in `~/.hermes/config.yaml` changes.
 - **P3 — attention stack.** 3a gated delta-net (short conv + recurrent state update),
   3b MLA dense-equivalent (nope+rope, kv LoRA), 3c DSA indexer top-k selection +
   kpool compress. Oracles: the HF transformers implementation for glm5_next (or
+  **PROGRESS 2026-10-29**: hyper-connections (mHC) done — `native/glm53/hc_ref.py`
+  + `verify_hc.py`, **HC_REF_VERIFY: OK** vs exllamav3's shipped path (fused
+  `ext.hc_mix` on GPU) with the real layer-3 `hc_attn`/`hc_ffn` weights: post/comb/
+  residual update each ~1e-7, collapsed bit-exact at fp16. Pinned on the way: `fn`
+  is bf16 [24, 16384] = (2+H)·H rows over H·hidden cols, `scale` is **3 scalars**,
+  sinkhorn = softmax(-1) then col-normalise then 5×(row,col). Remaining in P3:
+  gated delta-net (34 layers) and MLA + DSA indexer (11 layers). Oracles: the HF
+  transformers implementation for glm5_next (or
   Qwen3-Next for the delta-net pieces). Gates: `LA_VYB_MATCH`, `MLA_VYB_MATCH`,
   `DSA_VYB_MATCH`. This is the highest-risk phase; budget it as such.
 - **P4 — hyper-connections + one real GLM layer end-to-end.** bf16 body weights
