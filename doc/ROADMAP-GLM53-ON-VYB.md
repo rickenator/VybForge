@@ -100,6 +100,14 @@ nothing in `~/.hermes/config.yaml` changes.
 - **P3 — attention stack.** 3a gated delta-net (short conv + recurrent state update),
   3b MLA dense-equivalent (nope+rope, kv LoRA), 3c DSA indexer top-k selection +
   kpool compress. Oracles: the HF transformers implementation for glm5_next (or
+  **PROGRESS 2026-10-29 (3)**: **P3 spec complete.** MLA + DSA indexer added —
+  `native/glm53/mla_ref.py` + `verify_mla.py`: **DSA_SELECT_VERIFY: OK** (numpy
+  selection vs the shipped `QSAIndexer.select_indices_ref`: 0 differing entries out of
+  99,840) and **MLA_ABSORB_VERIFY: OK** (absorbed vs explicit form 1.4e-15). Config
+  pinned: q_lora 1536 / kv_lora 512, 64 heads x 256 nope, **rope dim 0**, indexer
+  32x128 with topk 2048 = 512 blocks x kpool 4 + always-select-tail, all layers "full".
+  Remaining: P4 — assemble a real layer from checkpoint weights (this is also where
+  the indexer/MLA projections get gated, not just their algebra).
   **PROGRESS 2026-10-29 (2)**: KDA linear attention gated — `native/glm53/gdn_ref.py`
   + `verify_gdn.py`, **GDN_RULE_VERIFY: OK**: delta rule vs the module's own labelled
   reference (99.991% of 98,304 outputs bf16-identical at 64x128, 12 steps), conv+silu

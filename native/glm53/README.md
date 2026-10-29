@@ -51,6 +51,38 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## MLA + DSA indexer — P3, gated (selection)
+
+Config: `q_lora_rank 1536`, `kv_lora_rank 512`, 64 q-heads, `qk_nope_head_dim 256`,
+**`qk_rope_head_dim 0`** (no rope anywhere in the main attention), `v_head_dim 256`;
+indexer `index_n_heads 32`, `index_head_dim 128`, `index_topk 2048`,
+`index_kpool 4` (compress ratio), `kpool_compress` on, `always_select_tail` on, and
+all 45 layers are `"full"` indexers.
+
+    q   = q_b(q_a_layernorm(q_a(x)))            # [.., 64, 256]
+    ckv = kv_a_layernorm(kv_a_proj(x)[..., :512])
+    k[h] = ckv @ W_UK[h] ; v[h] = ckv @ W_UV[h]        # from kv_b_proj
+    o[h] = softmax(q[h]·k[h]/sqrt(256) + causal) @ v[h]
+    out  = o_proj(o.reshape(.., 64*256))
+
+    indexer: qk = index_qk_proj(x) -> q[32*128] + raw_k[128]
+             q = q_layernorm(q) then rope ; pooled = mean over cr=4 blocks, k_layernorm, rope@block start
+             score = relu(q·pooled).sum(heads) * 1/sqrt(128)
+             blocks visible iff block < (pos+1)//cr ; top-k blocks -> cr tokens each ; plus the
+             tail block's tokens ; drop tokens past pos ; pad -1 to a multiple of 32
+
+`native/glm53/mla_ref.py` + `verify_mla.py`:
+- **DSA_SELECT_VERIFY: OK** — numpy selection vs the shipped
+  `QSAIndexer.select_indices_ref` at real indexer shape (32x128, kpool 4,
+  block_topk 512, 2 seqs x 24 queries over 64 tokens of history): **0 differing
+  entries out of 99,840**, i.e. identical token sets, order and -1 padding.
+- **MLA_ABSORB_VERIFY: OK** — the absorbed-query form (what decode runs) vs the
+  explicit `ckv·W_UK` / `ckv·W_UV` form: rel 1.4e-15.
+
+Not yet gated (needs real weights, P4): the indexer's projection/norm/rope path and
+the MLA q_a/q_b/kv_a latent projections — the gates above cover the selection
+geometry and the attention algebra, not the checkpoint weights feeding them.
+
 ## Linear attention (KDA) — P3, gated
 
 Config: `linear_attn_config = {num_heads 64, head_dim 128, short_conv_kernel_size 4,
