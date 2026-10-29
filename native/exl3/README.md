@@ -12,12 +12,14 @@ is bf16 safetensors.
   serves GLM-5.3-Flash with) on REAL expert weights: max abs diff 1.2e-4 on
   values with std 0.0117 (pure fp16-butterfly rounding from the oracle's column
   transform; the rotated-basis compare in `bisect2.py` is bit-exact, 0.0).
-- **`EXL3_VYB_MATCH: OK`** — the Vyb kernel is ported and gated
+- **`EXL3_VYB_MATCH: OK`** — the whole path is ported and gated
   (`native/kernels/exl3.vyb` + `native/host/exl3_driver.vyb`, `make exl3`):
-  rotated basis max abs 9.8e-4 / rel 4.9e-4 (exactly the reference's fp16
-  intermediate rounding — Vyb sums the codebook halves in f64), full pipeline
-  (numpy Hadamard+scales on the Vyb output) max abs 6.1e-5 on W, 0 of 8,388,608
-  elements over 3e-3. P1 is complete.
+  `exl3deq` (trellis -> rotated basis), `exl3hgen` (H/sqrt(128) on device),
+  `exl3had1`/`exl3had2` (per-128-block Hadamard + suh/svh), so nothing but the
+  kernel's own output is numpy. Rotated basis max abs 9.8e-4 / rel 4.9e-4
+  (exactly the reference's fp16 intermediate rounding — Vyb sums the codebook
+  halves in f64), full W max abs 4.4e-5, 0 of 8,388,608 elements over 3e-3.
+  P1 is complete.
 
 ## Format (pinned from exllamav3 source + oracle probes)
 
@@ -76,6 +78,17 @@ reaps it (see `~/.cache/exl3-build/import.log`).
   match on its own lines and `close(f)` on its own line (q4k driver shape).
 - `ld_u16`/`ld_i8` do not implicitly convert to Int: cast (`as Int`) and mask
   (`& 255` for bytes).
+- **The 128-wide Hadamard stage needs `nbc = n/128`, not `n/16`.** `cw/16` is the
+  number of 16-wide dequant subtiles and silently gives every Hadamard block a
+  bogus `(kb, nb)`: the symptom is an output where only the first column-block
+  rows are non-zero and everything else is exactly 0.0.
+- `.len()` on an outer String does not resolve inside a `freedom` block — hoist
+  the length into an Int first.
+- String locals declared inside `freedom { }` are not visible to the analyzer;
+  declare them at main scope (the map/trellis loads do this).
+- `cuCtxSynchronize()` between stages when the params buffer is rewritten per
+  launch: launches are async, so the next stage's kernel can otherwise read the
+  params of the one after it.
 
 ## Files
 

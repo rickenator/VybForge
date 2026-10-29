@@ -56,16 +56,13 @@ rel = np.abs(vyb - what_ref) / np.maximum(np.abs(what_ref), 1.0)
 print(f"A. rotated basis: max abs {diff.max():.3e}  max rel {rel.max():.3e}")
 gate_a = rel.max() <= 1.5e-3
 
-# --- B. full pipeline (numpy Hadamard + scales on the VYB dequant) ---
-H = hadamard128()
-Hs = (H * R_SCALE).astype(np.float32)
-t2 = vyb.astype(np.float32).reshape(k // 128, 128, n // 128, 128)
-t2 = np.einsum("ab,ibjc,cd->ijad", Hs, t2, Hs).transpose(0, 2, 1, 3).reshape(k, n)
-w_vyb = (t2 * d["suh"].astype(np.float32)[:, None] * d["svh"].astype(np.float32)[None, :]).astype(np.float16)
-
+# --- B. full pipeline, entirely on the GPU (Hadamard + suh/svh in Vyb) ---
+w_txt = open(vyb_txt.replace("exl3_rotated", "exl3_w")).read()
+w_vyb = np.array(w_txt.split(), dtype=np.float64).reshape(k, n)
+del w_txt
 w_ref_full = dequant_exl3(trellis, d["suh"], d["svh"]).astype(np.float32)
-diff_b = np.abs(w_vyb.astype(np.float32) - w_ref_full)
-print(f"B. full W:        max abs {diff_b.max():.3e}  |diff|>3e-3: {int((diff_b > 3e-3).sum())}")
+diff_b = np.abs(w_vyb - w_ref_full)
+print(f"B. full W (GPU):  max abs {diff_b.max():.3e}  |diff|>3e-3: {int((diff_b > 3e-3).sum())}")
 gate_b = bool((diff_b > 3e-3).sum() == 0)
 
 ok = gate_a and gate_b

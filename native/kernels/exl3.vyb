@@ -22,6 +22,100 @@
 //
 // Thread = one (tile, slot) output value (f64 store, q4kdeq convention; the
 // DtoH gate reads exact f64).
+// Per-128-block Hadamard + scale stages — the halves of reconstruction that follow
+// exl3deq:  W = diag(suh) . (H/8) What (H/8) . diag(svh), H = natural-order
+// Sylvester Hadamard-128, 1/8 = 1/sqrt(128). Stages:
+//   exl3hgen  builds H/8 on the device (sign = parity of popcount(i & j))
+//   exl3had1  tmp[b,d] = sum_c What[b,c] * Hs[c,d]      (column transform)
+//   exl3had2  out[a,d] = suh[row]*svh[col]* sum_b Hs[a,b] * tmp[b,d]  (row + scales)
+// Params are passed in a p-buffer (qwen3rope idiom): all entries are i64.
+// Thread mapping is one output element per thread; no shared memory, so the
+// transform is a plain 128-tap loop per element (2 x 128 f64 ops per output).
+
+// p: +0 H, and the scale constant is baked in.
+exl3hgen(p<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < 16384) {
+        i<Int> = gid / 128
+        j<Int> = gid - i * 128
+        t<Int> = i & j
+        acc<Int> = 0
+        k<Int> = 0
+        while (k < 7) {
+            acc = acc + ((t >> k) & 1)
+            k = k + 1
+        }
+        v<Float> = 0.08838834764831845
+        if ((acc % 2) == 1) {
+            v = 0.0 - v
+        }
+        H<Int> = ld_i64(p + 0)
+        st_f64(H + gid * 8, v)
+    }
+}
+
+// p: +0 what, +8 tmp, +16 H, +24 cw, +32 nbc, +40 nblocks
+exl3had1(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    T<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    cw<Int> = ld_i64(p + 24)
+    nbc<Int> = ld_i64(p + 32)
+    nblocks<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < nblocks * 16384) {
+        # block = 128x128 tile index; nbc (blocks per row) MUST be n/128, not the
+        # n/16 subtile count — the wrong constant gave every block a bogus (kb, nb)
+        # and collapsed the output onto the first column blocks.
+        block<Int> = gid / 16384
+        b<Int> = (gid % 16384) / 128
+        d<Int> = gid % 128
+        kbv<Int> = block / nbc
+        nbv<Int> = block - kbv * nbc
+        row<Int> = kbv * 128 + b
+        colbase<Int> = nbv * 128
+        acc<Float> = 0.0
+        c<Int> = 0
+        while (c < 128) {
+            acc = acc + ld_f64(W + (row * cw + colbase + c) * 8) * ld_f64(H + (c * 128 + d) * 8)
+            c = c + 1
+        }
+        st_f64(T + (block * 16384 + b * 128 + d) * 8, acc)
+    }
+}
+
+// p: +0 tmp, +8 out, +16 H, +24 suh, +32 svh, +40 cw, +48 nbc, +56 nblocks
+exl3had2(p<Int>) -> {
+    T<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    SU<Int> = ld_i64(p + 24)
+    SV<Int> = ld_i64(p + 32)
+    cw<Int> = ld_i64(p + 40)
+    nbc<Int> = ld_i64(p + 48)
+    nblocks<Int> = ld_i64(p + 56)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < nblocks * 16384) {
+        # see exl3had1: nbc must be the 128-wide block count (n/128)
+        block<Int> = gid / 16384
+        a<Int> = (gid % 16384) / 128
+        d<Int> = gid % 128
+        acc<Float> = 0.0
+        b<Int> = 0
+        while (b < 128) {
+            acc = acc + ld_f64(H + (a * 128 + b) * 8) * ld_f64(T + (block * 16384 + b * 128 + d) * 8)
+            b = b + 1
+        }
+        kbv<Int> = block / nbc
+        nbv<Int> = block - kbv * nbc
+        row<Int> = kbv * 128 + a
+        col<Int> = nbv * 128 + d
+        su<Float> = ld_f16(SU + row * 2)
+        sv<Float> = ld_f16(SV + col * 2)
+        st_f64(O + (row * cw + col) * 8, acc * su * sv)
+    }
+}
+
 // fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
 // Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
 // Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the

@@ -68,6 +68,36 @@ main()<Int> -> {
     tb<Int> = tre.len()
     if (tb < ntiles * 128) { println("SHORT_TRELLIS got=" + tb.to_string()); return 22 }
     kn<Int> = (ntiles / (cw / 16)) * 16 * cw     # k * n elements
+    # suh (k, fp16) + svh (n, fp16) for the scale stage
+    suhraw<String> = ""
+    svhraw<String> = ""
+    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_suh.bin")) {
+        f -> {
+            match (read_all(f)) {
+                g -> { suhraw = g }
+                ? -> { return 12 }
+            }
+            close(f)
+        }
+        ? -> { println("NO_SUH"); return 12 }
+    }
+    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_svh.bin")) {
+        f -> {
+            match (read_all(f)) {
+                g -> { svhraw = g }
+                ? -> { return 12 }
+            }
+            close(f)
+        }
+        ? -> { println("NO_SVH"); return 12 }
+    }
+    krows<Int> = kn / cw
+    sub<Int> = suhraw.len()
+    svb<Int> = svhraw.len()
+    if (suhraw.len() < krows * 2) { println("SHORT_SUH"); return 22 }
+    if (svhraw.len() < cw * 2) { println("SHORT_SVH"); return 22 }
+    if ((sub % 8) != 0) { println("SUH_NOT_8_ALIGNED len=" + sub.to_string()); return 23 }
+    if ((svb % 8) != 0) { println("SVH_NOT_8_ALIGNED len=" + svb.to_string()); return 23 }
 
     println("EXL3_DRIVER cw=" + cw.to_string() + " ntiles=" + ntiles.to_string() +
             " trellis_bytes=" + tb.to_string() + " elements=" + kn.to_string())
@@ -158,6 +188,113 @@ main()<Int> -> {
         if (rc != 0) { println("launch rc"); println_int(rc); return 12 }
         cuCtxSynchronize()
 
+        # ---- Hadamard + scales on GPU: H, tmp = What.Hs, out = suh.svh.(Hs.tmp) ----
+        hd<Int> = 0
+        td2<Int> = 0
+        fd<Int> = 0
+        pd<Int> = 0
+        sud<Int> = 0
+        svd<Int> = 0
+        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 11 }
+        # Hadamard stage tiles are 128x128: blocks per row = n/128 (NOT cw/16, which
+        # is the count of 16-wide dequant subtiles — using it gave every block a
+        # wrong (kb, nb) and collapsed the output onto the first column blocks).
+        nbc<Int> = cw / 128
+        nblocks<Int> = (kn / cw / 128) * nbc
+
+        uq<Int> = 0
+        while (uq < sub) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                ch = ch | ((((suhraw.char_at(uq + bj) as Int) & 255)) << (bj * 8))
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(sud + uq, loc(ch), 8) != 0) { return 41 }
+            uq = uq + 8
+        }
+        uq = 0
+        while (uq < svb) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                ch = ch | ((((svhraw.char_at(uq + bj) as Int) & 255)) << (bj * 8))
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(svd + uq, loc(ch), 8) != 0) { return 42 }
+            uq = uq + 8
+        }
+
+        # params buffer for the three stages (i64 entries, qwen3rope idiom)
+        pv<Int> = 0
+        while (pv < 8) {
+            chp<Int> = 0
+            if (pv == 0) { chp = pd }
+            if (pv == 1) { chp = hd }
+            if (pv == 2) { chp = td2 }
+            if (pv == 3) { chp = fd }
+            if (pv == 4) { chp = cw }
+            if (pv == 5) { chp = nbc }
+            if (pv == 6) { chp = nblocks }
+            if (pv == 7) { chp = 0 }
+            if (cuMemcpyHtoD_v2(pd + pv * 8, loc(chp), 8) != 0) { return 43 }
+            pv = pv + 1
+        }
+
+        hfH<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hfH), hmod, "exl3hgen") != 0) { return 10 }
+        hf1<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf1), hmod, "exl3had1") != 0) { return 10 }
+        hf2<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf2), hmod, "exl3had2") != 0) { return 10 }
+
+        # hgen: H at pd+0 = hd
+        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 44 }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfH)), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch hgen rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # had1: params what=od, tmp=td2, H=hd, cw, nbc, nblocks at +0..+40
+        hq<Int> = 0
+        while (hq < 6) {
+            chq<Int> = 0
+            if (hq == 0) { chq = od }
+            if (hq == 1) { chq = td2 }
+            if (hq == 2) { chq = hd }
+            if (hq == 3) { chq = cw }
+            if (hq == 4) { chq = nbc }
+            if (hq == 5) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + hq * 8, loc(chq), 8) != 0) { return 45 }
+            hq = hq + 1
+        }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hf1)), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch had1 rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # had2: params tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks at +0..+56
+        hq = 0
+        while (hq < 8) {
+            chq<Int> = 0
+            if (hq == 0) { chq = td2 }
+            if (hq == 1) { chq = fd }
+            if (hq == 2) { chq = hd }
+            if (hq == 3) { chq = sud }
+            if (hq == 4) { chq = svd }
+            if (hq == 5) { chq = cw }
+            if (hq == 6) { chq = nbc }
+            if (hq == 7) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + hq * 8, loc(chq), 8) != 0) { return 45 }
+            hq = hq + 1
+        }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hf2)), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch had2 rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
         match (open_write("native/out/exl3_rotated.txt")) {
             w -> {
                 i2<Int> = 0
@@ -172,11 +309,32 @@ main()<Int> -> {
             ? -> { return 17 }
         }
 
+        # final W (Hadamard + scales applied on the GPU)
+        match (open_write("native/out/exl3_w.txt")) {
+            w -> {
+                i3<Int> = 0
+                while (i3 < kn) {
+                    rv2<Float> = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv2), fd + i3 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv2.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    i3 = i3 + 1
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+
         cuMemFree_v2(qd)
         cuMemFree_v2(td)
         cuMemFree_v2(od)
+        cuMemFree_v2(hd)
+        cuMemFree_v2(td2)
+        cuMemFree_v2(fd)
+        cuMemFree_v2(pd)
+        cuMemFree_v2(sud)
+        cuMemFree_v2(svd)
 
-        println("EXL3_DEQ_DONE elements=" + kn.to_string())
+        println("EXL3_DEQ_DONE elements=" + kn.to_string() + " nblocks=" + nblocks.to_string())
         return 0
     }
 }
