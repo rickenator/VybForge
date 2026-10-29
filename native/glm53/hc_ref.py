@@ -21,7 +21,7 @@ import numpy as np
 H = 4                 # hc_mult
 HIDDEN = 4096
 Hc_EPS = 0.000001     # hc_eps (config hc_eps)
-SINKHORN_ITERS = 6
+SINKHORN_ITERS = 20      # config: hc_sinkhorn_iters = 20
 
 
 def rms_norm_unweighted(x, eps):

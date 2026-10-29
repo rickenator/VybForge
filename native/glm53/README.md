@@ -51,6 +51,36 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## Linear attention (KDA) — P3, gated
+
+Config: `linear_attn_config = {num_heads 64, head_dim 128, short_conv_kernel_size 4,
+gate_lower_bound -5.0}`, and `kda_layers` covers **all 34** linear layers, so every
+linear layer is the KDA (per-channel forget gate) variant. Layer schedule is
+`GGGAGGGAGGGAG...` (34 linear / 11 `deepseek_sparse_attention`).
+
+    qkv   = qkv_proj(x)                     # q|k|v, 3 x 64 x 128
+    conv  = silu(causal depthwise conv k=4) over q|k|v   (weight [C,4], w[...,3] = current token)
+    z     = g_b_proj(g_a_proj(x))           # low-rank SIGMOID output gate
+    beta  = sigmoid(b_proj(x)) * beta_scale
+    f     = f_b_proj(f_a_proj(x))           # low-rank forget gate
+    g     = -5 * sigmoid((f + dt_bias) * exp(a_log))     # per-k-channel log decay
+    q̂ = l2norm(q)·dk^-0.5 ; k̂ = l2norm(k)              # eps 1e-6
+    per step: state *= exp(g_i) ; kv = (state*k̂_i).sum(-2)
+              state += k̂_i ⊗ ((v_i - kv)*beta_i) ; o_i = (state*q̂_i).sum(-2)
+    out = gated_rmsnorm(o, z)               # KDA: sigmoid gate AFTER the weighted norm
+    → o_proj → hyper-connection apply
+
+`native/glm53/gdn_ref.py` + `verify_gdn.py` → **GDN_RULE_VERIFY: OK**:
+- delta rule vs the module's own labelled reference (`torch_recurrent_kda`,
+  "mirroring the GLM5.3/Kimi reference") at 64 heads x 128, 12 steps: **99.991% of
+  98,304 outputs round to the identical bf16 value** (the reference returns bf16;
+  the rest are last-bit ties).
+- short conv + silu vs `causal_conv1d_update_function_torch`: rel 9.2e-8.
+- gated RMSNorm vs `GatedRMSNorm.forward` (sigmoid form): rel 1.3e-7.
+
+Still open in P3: MLA + DSA indexer (11 layers), then the GDN layer assembled from
+real weights (projections are EXL3 trellis → the P1 dequant path).
+
 ## Hyper-connections (mHC) — P3, gated
 
 The body carries `hc_mult = 4` parallel fp32 residual streams per token. Every
