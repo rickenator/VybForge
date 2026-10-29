@@ -163,25 +163,9 @@ main()<Int> -> {
             if (cuMemcpyHtoD_v2(td + up, loc(ch), 8) != 0) { return 15 }
             up = up + 8
         }
-        npb<Int> = tb - (tb % 8)
-        ci<Int> = 0
-        while (ci < npb / 8) {
-            o8<Int> = ci * 8
-            ch<Int> = 0
-            bj<Int> = 0
-            while (bj < 8) {
-                ch = ch | ((((tre.char_at(o8 + bj) as Int) & 255)) << (bj * 8))
-                bj = bj + 1
-            }
-            if (cuMemcpyHtoD_v2(qd + o8, loc(ch), 8) != 0) { return 15 }
-            ci = ci + 1
-        }
-        tj<Int> = npb
-        while (tj < tb) {
-            by<Int> = (tre.char_at(tj) as Int) & 255
-            if (cuMemcpyHtoD_v2(qd + tj, loc(by), 1) != 0) { return 15 }
-            tj = tj + 1
-        }
+        # bulk H2D straight from the String (the same conversion cuModuleLoadData
+        # uses for the PTX text) — one call instead of one per 8 bytes
+        if (cuMemcpyHtoD_v2(qd, tre, tb) != 0) { return 15 }
 
         rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), ntiles, 1, 1, 256, 1, 1,
                                  qd, td, od, 0)
