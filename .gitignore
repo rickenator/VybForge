@@ -16,6 +16,7 @@ native/build/
 native/out/
 native/exl3/fixture/
 native/exl3/*.npy
+native/glm53/fixture/
 native/gguf/*.gguf
 native/gguf/parsed.txt
 
