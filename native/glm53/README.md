@@ -51,6 +51,19 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## Tokenizer (P5) — contract pinned
+
+`tokenizer.json` (20 MB) extracted from the checkpoint into `fixture/`. Facts:
+HF `TokenizersBackend`, `vocab_size` 154,820 (`len(t)` 154,856), **eos = pad =
+154820, no BOS**, byte-level pretokenization (BPE over bytes, so any unicode
+string round-trips exactly). `native/glm53/verify_tokenizer.py` →
+**TOKENIZER_REF: OK** — encodes a 10-string corpus (code, unicode, chat
+template, whitespace runs, 300-char repeat) with all round-trips exact and
+writes `native/out/tokenizer_ref_ids.txt`, the golden ids a Vyb-side
+implementation must reproduce byte for byte. 1 M-context cache math is
+straightforward at these dims: 11 DSA layers x 1 M tokens x 512 latent x 2 B
+= ~11 GB KV + 45 x 1 M x 128 x 2 B indexer keys = ~11.5 GB.
+
 ## MLA + DSA indexer — P3, gated (selection)
 
 Config: `q_lora_rank 1536`, `kv_lora_rank 512`, 64 q-heads, `qk_nope_head_dim 256`,
