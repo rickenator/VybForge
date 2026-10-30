@@ -37,36 +37,39 @@ checkpoint) is why every gate run calls GLM53Loader.tree_status() first: it
 reports the .COMPLETE marker and refuses to count shards that fail the check.
 
 ===========================================================================
-MEMORY ACCOUNTING (measured from the checkpoint, 83 shards)
+MEMORY ACCOUNTING (measured, full 83-shard tree + index, .COMPLETE)
 ===========================================================================
-Storage on disk (index total, ~183 GB — NOT ~90 GB):
-  embed_tokens + lm_head      2 x 154,880 x 4,096 x 2 B      ~2.54 GB
-  dense layers 0-2            ~0.58 GB each (KDA + dense MLP) ~1.74 GB
-  DSA layers (11)             ~0.21 GB each                   ~2.3  GB
-  MoE layers (42) non-expert  ~0.58 GB each                   ~24.3 GB
-  MoE experts, EXL3 4bpw      42 x 288 x 3 x 4.2 MB           ~152  GB
-  MTP layer + vision tower    remainder                       ~2-4  GB
-The routed experts alone (152 GB) exceed one 121 GB Spark, which is why the
-loader dequantizes on demand and keeps only the routed-in experts resident.
+Storage on disk — 163.56 GiB total (trees manifest: 163.58 GiB):
+  routed experts, EXL3 4bpw   43 layers x 288 experts x 3 x 4.21 MB  145.55 GiB
+                              (42 body MoE layers + the MTP draft layer 45)
+  non-expert bf16 body                                         18.01 GiB
+    embed_tokens 1.18 + lm_head 1.18 + 45 body layers ~14.6 + vision 1.05
+The routed experts alone (145.6 GiB) exceed one 121 GB Spark, which is why
+the loader dequantizes on demand and keeps only the routed-in experts
+resident; the trellis stays on disk (mmap, OS-paged), never fully resident.
 
-Resident plan, ONE 121 GB Spark, full 45-layer model:
-  bf16 body (embed, lm_head, all non-expert layer weights)   ~31.1 GB
-  expert LRU 16 experts x 3 matrices, fp16 [2048, 4096]       ~0.80 GB
-  KV latent, 11 DSA layers x 1 M x 512 bf16                  ~11.0 GB
-  indexer keys, 45 layers x 1 M x 128 bf16                   ~11.3 GB
-  KDA recurrent state, 34 x 64x128x128 bf16 (+ conv)        ~0.07 GB
-  activations/scratch (4-stream mHC, 64 KB/token working set) ~1-2 GB
-  ---------------------------------------------------------------
-  worst case @1 M context                                    ~56-58 GB   fits
-  @32 K context                                              ~34-36 GB
+Resident on ONE 121 GB Spark, full 45-layer model (bf16 cache):
+  bf16 body (embed, lm_head, all non-expert weights)          18.0 GiB
+  expert LRU, 16 experts x 3 matrices fp16 [2048, 4096]       0.75 GiB
+    (top-8 experts of one token in flight: 0.38 GiB)
+  KV latent, 11 DSA layers x 1 M x 512 bf16                  11.0 GiB
+  indexer keys, 45 layers x 1 M x 128 bf16                   11.25 GiB
+  KDA recurrent state 68 MiB + conv 4.8 MiB                   0.07 GiB
+  --------------------------------------------------------------- 
+  total @1 M context bf16                                    41.1 GiB  (2.9x headroom)
+  total @1 M context fp8 latent+keys                         30.0 GiB
+  total @32 K context bf16                                   19.5 GiB
+  optional: MTP draft layer 45 needs its own 1 M latent+indexer  +1.25 GiB
+  (vision tower 1.05 GiB loads only for image input)
 
 TP=2 split (two Sparks, layer-sharded — the default; see kv_cache.tp2_plan):
-  rank 0: layers 0-22  (5 DSA, 18 KDA)   rank 1: layers 23-44 (6 DSA, 16 KDA)
-  bf16 body ~15.6 GB / ~15.4 GB; expert LRU same 0.80 GB per rank;
-  KV latent 5.1 / 6.1 GB, indexer keys 5.9 / 5.6 GB @1 M;
-  embed_tokens + lm_head + final norm replicated (or lm_head sharded on vocab);
-  KDA state is per-sequence O(1) — 2 MiB/layer bf16, so 36/32 MiB per rank,
-  amortized 0.068 B/token at 1 M — flat in context length.
+  rank 0: layers 0-22 (5 DSA, 18 KDA)   rank 1: layers 23-45 (6 DSA, 16 KDA)
+  resident @1 M bf16: rank 0 = 8.82 body + 10.75 KV + 0.75 LRU = 20.3 GiB
+                      rank 1 = 8.14 body + 11.50 KV + 0.75 LRU = 20.4 GiB
+  embed_tokens replicated on rank 0 only, lm_head + final norm on rank 1;
+  boundary traffic 8 KiB/token (4096 x bf16 hidden). The MTP draft layer and
+  its extra 1.25 GiB of KV sit with rank 1 (next to lm_head). KDA state is
+  per-sequence O(1) — 36/32 MiB per rank, amortized 0.068 B/token at 1 M.
 ===========================================================================
 """
 
@@ -115,11 +118,13 @@ def dequant_exl3_fast(trellis: np.ndarray, suh: np.ndarray, svh: np.ndarray) -> 
     Byte-for-byte the same decode and scale pipeline as
     exl3.exl3_ref.dequant_exl3 (which is oracle-gated, EXL3_REF_VERIFY), with
     the one einsum given optimize=True so the two 128x128 Hadamard sides run
-    as tensordot GEMMs instead of an nditer loop (minutes -> <1 s per
-    2048x4096 matrix). The accumulation order inside the 128-term sums may
-    differ from the canonical path; verify_loader gates the fast path against
-    the canonical output at 4.4e-5 max rel on the real fixture (and reports
-    the exact-match count).
+    as tensordot GEMMs instead of an nditer loop (minutes -> ~0.5 s per
+    2048x4096 matrix). Different f32 summation order -> 99.87% of elements
+    bit-identical to the canonical path; the rest differ by one fp16 grid
+    point (max |diff| 3.05e-5, weights std 1.17e-2 — the canonical path's own
+    max |diff| vs the exllamav3 oracle is 1.22e-4). verify_loader gates the
+    fast path against the canonical golden: max |diff| <= 4.4e-5 and the P1
+    criterion count(|diff| > 3e-3) == 0.
     """
     from exl3 import exl3_ref
     kb, nb, words = trellis.shape
@@ -496,15 +501,29 @@ if __name__ == "__main__":
     st = ld.tree_status()
     print(f"tree: complete={st['complete_marker']} shards_ok={st['shards_ok']} "
           f"indexed={st['indexed_shards']} bad={st['shards_bad']}")
-    for i in (0, 2, 3):
-        if i in ld.layers:
-            b = ld.layer_bytes(i)
-            print(f"layer {i} ({b['type']}): {b['n_tensors']} tensors, "
-                  f"stored {format_gib(b['stored'])}, "
-                  f"experts stored {format_gib(b['expert_stored'])}, "
-                  f"all-288 f16 would be {format_gib(b['expert_f16_all'])}, "
-                  f"top-8 f16 {format_gib(b['expert_f16_topk'])}")
+    print(f"{'layer':>5} {'type':>9} {'tensors':>7} {'stored':>10} {'f32-res':>10} "
+          f"{'exp-stored':>11} {'exp-f16-all':>11} {'top8-f16':>9}")
+    for i in sorted(ld.layers):
+        b = ld.layer_bytes(i)
+        print(f"{i:>5} {b['type']:>9} {b['n_tensors']:>7} "
+              f"{format_gib(b['stored']):>10} {format_gib(b['effective_f32']):>10} "
+              f"{format_gib(b['expert_stored']):>11} "
+              f"{format_gib(b['expert_f16_all']):>11} "
+              f"{format_gib(b['expert_f16_topk']):>9}")
+    groups = {}
+    for name, info in ld.other.items():
+        pre = ".".join(name.split(".")[:2]) if name.startswith("model.") \
+            else name.split(".")[0]
+        g = groups.setdefault(pre, [0, 0])
+        g[0] += 1
+        g[1] += info.nbytes
+    for pre, (n, by) in sorted(groups.items()):
+        print(f"other: {n:>3} tensors, {format_gib(by)}  ({pre}.*)")
     mb = ld.model_bytes()
-    print(f"discovered so far: stored {format_gib(mb['stored_total'])}, "
+    print(f"TOTALS: stored {format_gib(mb['stored_total'])}, "
           f"body f32 {format_gib(mb['body_f32_total'])}, "
-          f"experts {format_gib(mb['expert_stored_total'])}")
+          f"experts EXL3 {format_gib(mb['expert_stored_total'])}, "
+          f"layers {len(ld.layers)}")
+    import kv_cache
+    kv_cache.table()
+    kv_cache.tp2_plan()

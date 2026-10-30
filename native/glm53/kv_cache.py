@@ -188,6 +188,9 @@ def tp2_plan(ctx=1_048_576):
               f"{v['kda_conv_bf16']/MIB:.1f} MiB")
     print(f"  replicated: embed_tokens (rank 0), lm_head + final norm (rank 1); "
           f"boundary traffic 8 KiB/token (4096 x bf16 hidden)")
+    print(f"  MTP draft layer 45 (dsa+moe, 288 experts) + its extra "
+          f"{(ctx * (d['kv_lora_rank'] + d['index_head_dim']) * 2)/GIB:.2f} GiB "
+          f"of {ctx}-token KV sits with rank 1 (next to lm_head)")
     print(f"  KDA recurrent state is per-sequence O(1): "
           f"{ranks['rank0']['kda_state_bf16']/MIB:.0f} + "
           f"{ranks['rank1']['kda_state_bf16']/MIB:.0f} MiB — "
