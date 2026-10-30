@@ -1,0 +1,141 @@
+# gx.vyb — the GLM-5.3 checkpoint index, Vyb-only (no Python in the path).
+#
+# Resolves tensor names to (shard, offset, length, dtype) via:
+#   1. model.safetensors.index.json (5 MB) read ONCE and substring-searched for the
+#      name, giving its shard — the HF weight_map has ~157k entries and the JSON
+#      module has no key iteration, but index_of() over the raw text is cheap;
+#   2. that shard's safetensors header (native/torchload/safetensors.vyb, already
+#      gated byte-identical against an independent Python oracle) for the byte range.
+#
+# Scanning all 83 headers instead was measured too slow (>7 min) in Vyb — the
+# index-first order is what makes this practical.
+#
+# Nothing here touches CUDA: gx answers WHERE the bytes are. A host driver opens the
+# shard, reads the range and uploads it (the native/host/*_driver pattern).
+import safetensors
+import io::{open_read, read_all, read_at, close}
+
+share(all)
+struct GxLoc {
+    found<Vec<Int>>,
+    shard<Vec<Int>>,
+    tix<Vec<Int>>,
+    off<Vec<Int>>,
+    nbytes<Vec<Int>>,
+    dts<Vec<String>>,
+    paths<Vec<String>>
+}
+
+share(all)
+gx_pad5(n<Int>)<String> -> {
+    s<String> = n.to_string()
+    while (s.len() < 5) { s = "0" + s }
+    return s
+}
+
+share(all)
+gx_shard_path(dir<String>, shard<Int>, total<Int>)<String> -> {
+    return dir + "/model-" + gx_pad5(shard) + "-of-" + gx_pad5(total) + ".safetensors"
+}
+
+share(all)
+gx_read_index(dir<String>)<String> -> {
+    r<String> = ""
+    match (open_read(dir + "/model.safetensors.index.json")) {
+        f -> {
+            match (read_all(f)) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+# Shard number for a tensor name, from the index text; 0 when absent.
+# The weight_map entries read `"<name>": "model-00003-of-00083.safetensors"`.
+share(all)
+gx_shard_for(index<String>, name<String>)<Int> -> {
+    if (index.len() == 0) { return 0 }
+    key<String> = "\"" + name + "\": \"model-"
+    p<Int> = index.index_of(key)
+    if (p < 0) { return 0 }
+    d0<Int> = p + key.len()
+    n<Int> = 0
+    i<Int> = 0
+    while (i < 5) {
+        c<Int> = (index.char_at(d0 + i) as Int) & 255
+        if (c < 48 || c > 57) { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    return n
+}
+
+# Resolve every wanted name: index -> shard -> header -> byte range.
+share(all)
+gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                       dts = Vec(), paths = Vec() }
+    index<String> = gx_read_index(dir)
+    i<Int> = 0
+    for (i in 0..want.len() - 1) {
+        g.found.push(0)
+        g.shard.push(0)
+        g.tix.push(-1)
+        g.off.push(-1)
+        g.nbytes.push(0)
+        g.dts.push("")
+        g.paths.push("")
+    }
+    w<Int> = 0
+    while (w < want.len()) {
+        sh<Int> = gx_shard_for(index, want.get(w))
+        if (sh > 0) {
+            path<String> = gx_shard_path(dir, sh, total)
+            ix<StIndex> = st_open(path)
+            if (ix.n > 0) {
+                t<Int> = st_find(ix, want.get(w))
+                if (t >= 0) {
+                    g.found.set(w, 1)
+                    g.shard.set(w, sh)
+                    g.tix.set(w, t)
+                    g.off.set(w, ix.data_base + ix.doff.get(t))
+                    g.nbytes.set(w, ix.dlen.get(t))
+                    g.dts.set(w, ix.dtypes.get(t))
+                    g.paths.set(w, path)
+                }
+            }
+        }
+        w = w + 1
+    }
+    return g
+}
+
+share(all)
+gx_bytes(g<GxLoc>, i<Int>)<Int> -> {
+    if (i < 0 || i >= g.nbytes.len()) { return 0 }
+    return g.nbytes.get(i)
+}
+
+# Read a resolved tensor's bytes. The caller uploads or hashes immediately: a
+# multi-GB read must not be held twice.
+share(all)
+gx_read(g<GxLoc>, i<Int>)<String> -> {
+    r<String> = ""
+    if (i < 0 || i >= g.found.len()) { return r }
+    if (g.found.get(i) != 1) { return r }
+    match (open_read(g.paths.get(i))) {
+        f -> {
+            match (read_at(f, g.off.get(i), g.nbytes.get(i))) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
