@@ -7,6 +7,7 @@
 // tile_slot_composition.json by gen_map_bin.py; its header carries cw + ntiles.
 import io::{open_read, read_at, read_all, open_write, write_str, close}
 import env::{env_get}
+import gx
 
 extern "C" {
     cuInit(flags<CUInt>)<CInt>
@@ -53,44 +54,67 @@ main()<Int> -> {
     }
     if (cw <= 0 || ntiles <= 0) { println("BAD_MAP_HEADER cw=" + cw.to_string()); return 22 }
 
-    # --- trellis.bin: ntiles x 128 bytes ---
+    # --- tensor source: checkpoint via gx (VYBFORGE_GX_DIR) or the local fixture ---
     tre<String> = ""
-    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_trellis.bin")) {
-        f -> {
-            match (read_all(f)) {
-                g -> { tre = g }
-                ? -> { return 12 }
-            }
-            close(f)
+    suhraw<String> = ""
+    svhraw<String> = ""
+    ckdir<String> = env_get("VYBFORGE_GX_DIR") else ""
+    if (ckdir.len() > 0) {
+        # the real checkpoint: resolve an expert's three EXL3 parts through gx and read
+        # the bytes here (gx answers WHERE; this driver moves them to the device)
+        ckexp<String> = env_get("VYBFORGE_EXL3_EXPERT") else "0"
+        pre<String> = "model.language_model.layers.3.mlp.experts." + ckexp +
+                      ".down_proj."
+        want<Vec<String>> = Vec()
+        want.push(pre + "trellis")
+        want.push(pre + "suh")
+        want.push(pre + "svh")
+        g<GxLoc> = gx_resolve(ckdir, 83, want)
+        if (g.found.get(0) != 1 || g.found.get(1) != 1 || g.found.get(2) != 1) {
+            println("CKPT_RESOLVE_FAIL trellis=" + g.found.get(0).to_string() +
+                    " suh=" + g.found.get(1).to_string() + " svh=" + g.found.get(2).to_string())
+            return 12
         }
-        ? -> { println("NO_TRELLIS"); return 12 }
+        tre = gx_read(g, 0)
+        suhraw = gx_read(g, 1)
+        svhraw = gx_read(g, 2)
+        println("CKPT_SOURCE expert=" + ckexp + " shards=" + g.shard.get(0).to_string() + "/" +
+                g.shard.get(1).to_string() + "/" + g.shard.get(2).to_string())
+    } else {
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_trellis.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { tre = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_TRELLIS"); return 12 }
+        }
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_suh.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { suhraw = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_SUH"); return 12 }
+        }
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_svh.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { svhraw = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_SVH"); return 12 }
+        }
     }
     tb<Int> = tre.len()
     if (tb < ntiles * 128) { println("SHORT_TRELLIS got=" + tb.to_string()); return 22 }
     kn<Int> = (ntiles / (cw / 16)) * 16 * cw     # k * n elements
-    # suh (k, fp16) + svh (n, fp16) for the scale stage
-    suhraw<String> = ""
-    svhraw<String> = ""
-    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_suh.bin")) {
-        f -> {
-            match (read_all(f)) {
-                g -> { suhraw = g }
-                ? -> { return 12 }
-            }
-            close(f)
-        }
-        ? -> { println("NO_SUH"); return 12 }
-    }
-    match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_svh.bin")) {
-        f -> {
-            match (read_all(f)) {
-                g -> { svhraw = g }
-                ? -> { return 12 }
-            }
-            close(f)
-        }
-        ? -> { println("NO_SVH"); return 12 }
-    }
     krows<Int> = kn / cw
     sub<Int> = suhraw.len()
     svb<Int> = svhraw.len()
