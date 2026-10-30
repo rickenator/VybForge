@@ -2297,7 +2297,7 @@ main()<Int> -> {
     dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
     out<String> = env_get("VYBFORGE_PREFILL_OUT") else "native/out/prefill_vyb.txt"
     total<Int> = 83
-    nlay<Int> = 46
+    nlay<Int> = 45
     n<Int> = 0
     i<Int> = 0
     r<Int> = 0
@@ -2401,8 +2401,11 @@ main()<Int> -> {
         lpre = "model.language_model.layers." + n.to_string() + "."
         is_dsa = 0
         # 3 KDA layers then 1 DSA layer, repeating; the last layer (45) is DSA too.
-        if ((n % 4) == 3 || n == 45) { is_dsa = 1 }
-        if (n >= 46) { break }
+        # 3 KDA layers then 1 DSA layer, repeating: DSA on 3,7,...,43 (11 of the 45).
+        # Layer 45 in the checkpoint is NOT a decoder layer -- it is the multi-token
+        # prediction head (eh_proj / enorm / hnorm, its own experts), so the forward
+        # stack is 0..44 and the MTP head is driven separately.
+        if ((n % 4) == 3) { is_dsa = 1 }
         if (is_dsa == 1) {
             streams1 = dsa_attn_site(streams, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         } else {
