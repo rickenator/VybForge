@@ -20,6 +20,14 @@ def parse(path):
     return out
 
 
+INT64_MIN = -9223372036854775808
+
+
+def _overflowed(a, b):
+    """`sq` is stored as an Int64 of sum(v^2)*2^40; a big matrix overflows it."""
+    return a == INT64_MIN or b == INT64_MIN or abs(b) > 9.0e18
+
+
 def main():
     try:
         v = parse(f"{OUT}/l3hc_vyb.txt")
@@ -37,6 +45,8 @@ def main():
             continue
         worst = 0.0
         for k in ("sum", "abs", "sq", "max"):
+            if k == "sq" and _overflowed(v[stage][k], g[stage][k]):
+                continue
             den = abs(float(g[stage]["abs"])) if k == "sum" else max(1.0, abs(float(g[stage][k])))
             worst = max(worst, abs(v[stage][k] - g[stage][k]) / den)
         good = worst <= t

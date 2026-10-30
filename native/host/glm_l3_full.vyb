@@ -46,7 +46,9 @@ Q_LORA<Int> = 1536
 IHEADS<Int> = 32
 IDIM<Int> = 128
 KPOOL<Int> = 4
-TOPK<Int> = 2048
+TOPK<Int> = 2048        # indexer: top-k pool columns
+ROUTE_TOPK<Int> = 8     # MoE: experts per token -- the attn site's TOPK is 2048, and
+                        # shadowing it here silently made the router pick 288 experts
 INTER<Int> = 12288
 NE<Int> = 288
 EINTER<Int> = 2048
@@ -1449,7 +1451,7 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
     rsel<Vec<Int>> = Vec()        # [R, 8]
     rwt<Vec<Float>> = Vec()       # [R, 8]
     i = 0
-    while (i < R * TOPK) {
+    while (i < R * ROUTE_TOPK) {
         rsel.push(-1)
         rwt.push(0.0)
         i = i + 1
@@ -1457,7 +1459,7 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
     r = 0
     while (r < R) {
         lane = 0
-        while (lane < TOPK) {
+        while (lane < ROUTE_TOPK) {
             best = -1
             bestv = 0.0 - 1e30
             j = 0
@@ -1465,7 +1467,7 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
                 dup = 0
                 k = 0
                 while (k < lane) {
-                    if (rsel.get(r * TOPK + k) == j) { dup = 1 }
+                    if (rsel.get(r * ROUTE_TOPK + k) == j) { dup = 1 }
                     k = k + 1
                 }
                 if (dup == 0) {
@@ -1477,19 +1479,19 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
                 }
                 j = j + 1
             }
-            rsel.set(r * TOPK + lane, best)
+            rsel.set(r * ROUTE_TOPK + lane, best)
             lane = lane + 1
         }
         sm = 0.0
         lane = 0
-        while (lane < TOPK) {
-            sm = sm + scores.get(r * NE + rsel.get(r * TOPK + lane))
+        while (lane < ROUTE_TOPK) {
+            sm = sm + scores.get(r * NE + rsel.get(r * ROUTE_TOPK + lane))
             lane = lane + 1
         }
         lane = 0
-        while (lane < TOPK) {
-            rwt.set(r * TOPK + lane,
-                    scores.get(r * NE + rsel.get(r * TOPK + lane)) / (sm + 1e-20) * ROUTED_SCALE)
+        while (lane < ROUTE_TOPK) {
+            rwt.set(r * ROUTE_TOPK + lane,
+                    scores.get(r * NE + rsel.get(r * ROUTE_TOPK + lane)) / (sm + 1e-20) * ROUTED_SCALE)
             lane = lane + 1
         }
         r = r + 1
@@ -1518,8 +1520,8 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
         r = 0
         while (r < R) {
             lane = 0
-            while (lane < TOPK) {
-                if (rsel.get(r * TOPK + lane) == e) {
+            while (lane < ROUTE_TOPK) {
+                if (rsel.get(r * ROUTE_TOPK + lane) == e) {
                     toks.push(r)
                     lanes.push(lane)
                 }
@@ -1591,7 +1593,7 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
             j = 0
             while (j < nt) {
                 tk = toks.get(j)
-                wt = rwt.get(tk * TOPK + lanes.get(j))
+                wt = rwt.get(tk * ROUTE_TOPK + lanes.get(j))
                 d2 = 0
                 while (d2 < H) {
                     accr.set(tk * H + d2, accr.get(tk * H + d2) + wt * yv.get(j * H + d2))
@@ -1651,6 +1653,10 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
 
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
+    match (open_write("native/out/l3tail_vyb.txt")) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { }
+    }
     println(digest("streams2", streams2))
     lines = lines + digest("mlp", mlp) + "\n" + digest("streams2", streams2) + "\n"
 
