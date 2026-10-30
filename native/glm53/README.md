@@ -51,6 +51,28 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## Layer 3 MoE (Gate B) — gated on the oracle's own reproducibility
+
+`verify_layer3_moe.py` runs the REAL layer 3 (DSA + 288-expert MoE) twice against
+HF: pass 1 with zero experts captures HF's own h2 and top-k (the router bias is an
+`nn.Buffer`, not a parameter — it must be assigned explicitly or HF routes without
+it); the 8 selected experts are dequantized from EXL3 and loaded in place; pass 2
+compares the MoE block on identical (h2, top-k, weights). **LAYER3_MOE_VERIFY: OK**
+— rel(f64 w) 4.8e-3, rel(bf16-rounded w) 5.1e-3 on |out| 0.93.
+
+The controlling finding: **expert selection is chaotically sensitive** — the MoE
+output changes by **335% for one bf16 ulp on h2** (a near-tied score flips the
+top-8 set). Consequences, both recorded here:
+- Any implementation whose h2 differs by even 1 ulp (different accumulation order,
+  fp32 vs bf16 routing arithmetic) can select a different expert set — outputs are
+  then NOT comparable element-wise, only distributionally. The Vyb router must
+  reproduce the reference precision path (bf16 routing arithmetic) for token-level
+  parity, or parity gates must use logprob/distribution criteria (which P8 already
+  specifies).
+- Gate criteria for MoE layers must be measured against the oracle's own
+  reproducibility (this gate measures HF's h2-ulp sensitivity and gates against it)
+  rather than against fixed fp64 tolerances.
+
 ## Tokenizer (P5) — contract pinned
 
 `tokenizer.json` (20 MB) extracted from the checkpoint into `fixture/`. Facts:
