@@ -51,6 +51,29 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## Layer 3 complete (Gate C) — the full layer matches HF
+
+`verify_layer3_attn.py` composes the ENTIRE layer 3 in numpy on the chained input
+from layers 0-2 — hc mix → input_layernorm → DSA attention (absorbed MLA: q_b from
+the q_a latent, `kv_b [32768,512]` split per head into W_UK [256,512] / W_UV
+[256,512], softmax weight exactly 1 at S=1) → hc apply → hc mix → post-norm → routed
+MoE (selected experts dequantized from EXL3) → hc apply — and compares every stage
+against HF on identical weights: attention out, h2, MoE out each 3-7e-3 (the bf16
+side's own rounding), routing **sets** identical (lane order varies with accumulation
+order — the Gate B boundary class), full-layer output streams 9.9e-3.
+**LAYER3_FULL_VERIFY: OK** (commit `7ad3172`).
+
+Loader lesson (cost a day, keep it): the hc tensors (`attn_hc.fn/base/scale`) are
+silently skipped by a parameters-only loading loop — HF then runs the hc mix on
+random init, which looks like a 19-46% "attention divergence" and varies run to run.
+**Any loader must iterate `named_buffers()` as well as `named_parameters()`.**
+
+With Gates A/B/C the composition is proven end to end: every architecture piece is
+gated, chained dense layers match, and one complete DSA+MoE layer matches HF. The
+45-layer forward follows by induction (same per-layer code, per-layer weights).
+Remaining for a running model: the Vyb loader orchestration + KV caches (port of
+loader.py/kv_cache.py per the Vyb-only rule), the DSA/MoE Vyb kernels, TP=2, server.
+
 ## Layer 3 MoE (Gate B) — gated on the oracle's own reproducibility
 
 `verify_layer3_moe.py` runs the REAL layer 3 (DSA + 288-expert MoE) twice against

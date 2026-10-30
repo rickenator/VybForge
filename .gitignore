@@ -28,3 +28,5 @@ native/glm53/layer0/*.bin
 
 # loader gate canonical-dequant caches (50 MB, rebuilt from fixtures)
 native/glm53/prep/*golden*
+native/glm53/prep/*fast*
+native/tts/out/
