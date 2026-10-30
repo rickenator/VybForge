@@ -120,6 +120,24 @@ gx_bytes(g<GxLoc>, i<Int>)<Int> -> {
     return g.nbytes.get(i)
 }
 
+# Read a byte range straight from a shard (the layer-load path already has the
+# offsets from the header and does not need a GxLoc round trip).
+share(all)
+gx_read_at(path<String>, off<Int>, n<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, n)) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
 # Read a resolved tensor's bytes. The caller uploads or hashes immediately: a
 # multi-GB read must not be held twice.
 share(all)
