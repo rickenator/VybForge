@@ -8,6 +8,9 @@
 VYBHOME ?= $(HOME)/Projects/Vyb
 VYBDIR  ?= $(VYBHOME)
 VYB     ?= $(VYBDIR)/build/vyb
+# Python oracle interpreter: the venv that has torch/safetensors/transformers (the
+# oracles are the only Python in the tree, and they need those libs).
+PYORACLE ?= $(HOME)/venvs/exl3/bin/python
 # VYB_BIN is the name the kernel build scripts read, but make itself only honours VYB/VYBHOME:
 # say so instead of silently building with a different compiler than the one asked for.
 ifneq ($(origin VYB_BIN),undefined)
@@ -158,6 +161,14 @@ exl3: $(ROOT)/native/build/exl3.ptx
 	cd $(ROOT)/native/exl3 && python3 gen_map_bin.py
 	cd $(ROOT) && $(VYB) native/host/exl3_driver.vyb
 	cd $(ROOT) && python3 native/exl3/verify_exl3_vyb.py
+
+# P4 loader step 0: the checkpoint index resolved in Vyb (gx.vyb) — name -> shard,
+# byte offset, length, dtype, plus sha256 of the first MiB — gated byte-for-byte
+# against an independent parse of the same shards with the safetensors library.
+gx:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 native/host/gx_check.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_ref.py
+	cd $(ROOT) && cmp native/out/gx_listing_ref.txt native/out/gx_listing_vyb.txt && echo "GX_INDEX_MATCH: OK"
 
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
