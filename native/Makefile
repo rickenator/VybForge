@@ -228,6 +228,19 @@ glm3tail: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_tail_fwd.vyb
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_tail_vyb.py
 
+# P4 layer 3 end to end: streams0 -> hc_attn mix -> attention -> hc_apply -> hc_ffn mix
+# -> MoE -> hc_apply -> streams2, in ONE Vyb process.
+glm3full: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_full.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_full.py
+
+# P4 layer-3 attention-site hc mix/apply in isolation (fast; localises the join).
+glm3hc: $(ROOT)/native/build/gemm.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_hc.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_hc_check.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_hc.py
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx

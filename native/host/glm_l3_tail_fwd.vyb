@@ -310,19 +310,18 @@ hc_glue(mv<Vec<Float>>, base<Vec<Float>>, scale<Vec<Float>>, streams<Vec<Float>>
     }
     r = 0
     while (r < R) {
-        mx = 0.0 - 1e30
         a = 0
         while (a < HC) {
+            # per-ROW max, like gold's softmax(axis=-1, keepdims): a global max underflows
+            # the smaller entries of a row whose logits sit far below the global peak, which
+            # then differ by whole multiples after the eps floor.
+            mx = 0.0 - 1e30
             b<Int> = 0
             while (b < HC) {
                 v = comb.get((r * HC + a) * HC + b)
                 if (v > mx) { mx = v }
                 b = b + 1
             }
-            a = a + 1
-        }
-        a = 0
-        while (a < HC) {
             sm = 0.0
             b = 0
             while (b < HC) {
@@ -362,6 +361,8 @@ hc_glue(mv<Vec<Float>>, base<Vec<Float>>, scale<Vec<Float>>, streams<Vec<Float>>
             b = b + 1
         }
         it = 1
+        # gold: softmax -> colsum -> (sinkhorn_iters-1) x {rowsum, colsum}. One colsum pass
+        # already happened above and `it` starts at 1, so < 20 is exactly 19 pairs.
         while (it < 20) {
             a = 0
             while (a < HC) {

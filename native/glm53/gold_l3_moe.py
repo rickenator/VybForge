@@ -115,6 +115,10 @@ def load_h2():
     streams = np.repeat(x[:, None, :], 4, axis=1)
     for lay in (0, 1, 2):
         streams, _, _ = G3.kda_layer(streams, G3.weights(lay, kda=True))
+    with open(f"{OUT}/gold_l3_streams0.txt", "w") as f:
+        for r in range(streams.shape[0]):
+            for h in range(streams.shape[1]):
+                f.write(" ".join(str(int(v * 1099511627776.0)) for v in streams[r, h]) + " ")
     w3 = G3.weights(3, kda=False)
     post, comb, collapsed, _ = hc_ref.mix(streams, w3["attn_fn"], w3["attn_base"],
                                           w3["attn_scale"], EPS)
