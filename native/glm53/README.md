@@ -94,6 +94,20 @@ here sees all tokens causally, so selection == causal mask. The pool-score order
 pooling math and tail layout are gated; pruning is gated by construction once a long
 context run exists.
 
+## Vyb checkpoint index (P4) — GX_INDEX_MATCH: OK
+
+`native/glm53/gx.vyb` resolves a tensor name to (shard, byte offset, length, dtype)
+in pure Vyb: a substring scan of `model.safetensors.index.json` gives the shard
+(the weight_map has ~157k entries and the JSON module has no key iteration, but
+`index_of()` over the raw text is cheap), then the gated safetensors header reader
+gives the byte range, then `gx_read` returns the bytes for upload.
+`native/host/gx_check.vyb` + `native/glm53/gx_ref.py` (independent safetensors-library
+oracle) agree **byte for byte** on 10 real tensors — layer-0 attention/mlp/hc,
+layer-3 router/shared/hc, three EXL3 expert parts and expert 287's trellis — with the
+deliberate bogus name reported MISSING on both sides. Resolution is ~40 s for a
+one-off batch (5 MB index scan + 3 header parses); shard opens must be cached per
+layer for the full 45-layer load.
+
 ## Layer 3 complete (Gate C) — the full layer matches HF
 
 `verify_layer3_attn.py` composes the ENTIRE layer 3 in numpy on the chained input
