@@ -27,6 +27,7 @@ CKPT = "/mnt/apex/rick/vybforge/glm53-checkpoint"
 OUT = "native/out"
 H = 4096
 HEADS, HDIM = 64, 128
+KDIM = HDIM
 INTER = 12288
 EPS = 1e-5
 PROMPT = ("The capital of France is Paris, and the largest city in Germany is Berlin, "
@@ -86,6 +87,21 @@ def main():
     mv_attn = flat @ w["attn_fn"].astype(np.float64).T
     post, comb, collapsed, _ = hc_ref.mix(streams, w["attn_fn"], w["attn_base"], w["attn_scale"], EPS)
     h = layer0_ref.rms_weight(collapsed, w["in_ln"])
+    # KDA intermediates, in the order the Vyb driver computes them
+    qpre = h @ w["q"]
+    kpre = h @ w["k"]
+    vpre = h @ w["v"]
+    qc = gdn_ref.short_conv_silu(qpre[None], w["conv_q"])[0]
+    kc = gdn_ref.short_conv_silu(kpre[None], w["conv_k"])[0]
+    vc = gdn_ref.short_conv_silu(vpre[None], w["conv_v"])[0]
+    qn = (gdn_ref.l2norm(qc.reshape(s, HEADS, KDIM)) * (KDIM ** -0.5)).reshape(s, HEADS * KDIM)
+    kn = gdn_ref.l2norm(kc.reshape(s, HEADS, KDIM)).reshape(s, HEADS * KDIM)
+    bet = 1.0 / (1.0 + np.exp(-(h @ w["b"])))
+    fa_ = h @ w["f_a"]
+    fraw = fa_ @ w["f_b"]
+    gdec = gdn_ref.kda_log_decay(fraw, w["dt_bias"], w["A_log"])
+    ga_ = h @ w["g_a"]
+    zraw = ga_ @ w["g_b"]
     y_attn = layer0_ref.kda(h, w)
     streams1 = hc_ref.apply_(streams, y_attn, post, comb)
     post2, comb2, collapsed2, _ = hc_ref.mix(streams1, w["ffn_fn"], w["ffn_base"], w["ffn_scale"], EPS)
@@ -102,6 +118,14 @@ def main():
     np.save(f"{OUT}/gold_l0_mlp.npy", y_mlp)
     np.save(f"{OUT}/gold_l0_streams2.npy", streams2)
     np.save(f"{OUT}/gold_l0_mv_attn.npy", mv_attn)
+    np.save(f"{OUT}/gold_l0_qpre.npy", qpre)
+    np.save(f"{OUT}/gold_l0_qc.npy", qc)
+    np.save(f"{OUT}/gold_l0_qn.npy", qn)
+    np.save(f"{OUT}/gold_l0_kn.npy", kn)
+    np.save(f"{OUT}/gold_l0_beta.npy", bet)
+    np.save(f"{OUT}/gold_l0_fraw.npy", fraw)
+    np.save(f"{OUT}/gold_l0_gdec.npy", gdec)
+    np.save(f"{OUT}/gold_l0_zraw.npy", zraw)
     np.save(f"{OUT}/gold_l0_collapsed.npy", collapsed)
     np.save(f"{OUT}/gold_l0_post_attn.npy", post)
     np.save(f"{OUT}/gold_l0_comb_attn.npy", comb)

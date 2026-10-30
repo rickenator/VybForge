@@ -61,11 +61,16 @@ def main():
                     ("collapsed", "gold_l0_collapsed.npy"),
                     ("post_attn", "gold_l0_post_attn.npy"),
                     ("comb_attn", "gold_l0_comb_attn.npy"),
+                    ("qpre", "gold_l0_qpre.npy"), ("qc", "gold_l0_qc.npy"),
+                    ("qn", "gold_l0_qn.npy"), ("kn", "gold_l0_kn.npy"),
+                    ("beta", "gold_l0_beta.npy"), ("fraw", "gold_l0_fraw.npy"),
+                    ("zraw", "gold_l0_zraw.npy"), ("vc", None),
+                    ("gdec", "gold_l0_gdec.npy"),
                     ("attn", "gold_l0_attn.npy"), ("h2", "gold_l0_h2.npy"),
                     ("mlp", "gold_l0_mlp.npy"), ("streams2", "gold_l0_streams2.npy")):
         try:
             arr[name] = np.load(f"{OUT}/{f}")
-        except FileNotFoundError:
+        except (FileNotFoundError, TypeError):
             pass
     if len(vyb) == 0:
         print("LAYER0_VYB_MATCH: FAIL")

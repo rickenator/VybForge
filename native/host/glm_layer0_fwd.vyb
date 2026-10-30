@@ -145,14 +145,17 @@ l2_rows(x<Vec<Float>>, rows<Int>, D<Int>)<Vec<Float>> -> {
     return dst
 }
 
+# NOTE the loop order: `dst` is built by PUSH, so the pushes must follow the array's
+# row-major (t*C + c) order — iterating channels outside tokens silently produced a
+# transposed result whose digests (sum/abs/sq/max) still matched.
 conv_silu(x<Vec<Float>>, rows<Int>, C<Int>, w<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     c<Int> = 0
     t<Int> = 0
     j<Int> = 0
-    while (c < C) {
-        t = 0
-        while (t < rows) {
+    while (t < rows) {
+        c = 0
+        while (c < C) {
             acc<Float> = 0.0
             j = 0
             while (j < CONV_K) {
@@ -161,9 +164,9 @@ conv_silu(x<Vec<Float>>, rows<Int>, C<Int>, w<Vec<Float>>)<Vec<Float>> -> {
                 j = j + 1
             }
             dst.push(silu(acc))
-            t = t + 1
+            c = c + 1
         }
-        c = c + 1
+        t = t + 1
     }
     return dst
 }
@@ -449,6 +452,189 @@ dumps(name<String>, v<Vec<Float>>)<String> -> {
     return out
 }
 
+# ---------------------------------------------------------------- GPU matmul helpers
+# C[M,N] = A[M,K] @ B[K,N] on the device; returns the device pointer (0 on failure).
+mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
+    var<Int> C = 0
+    var<Int> scr = 0
+    C = alloc_dev(M * N * 8)
+    scr = alloc_dev(64)
+    if (C == 0 || scr == 0) { return 0 }
+    if (gemm(faddr, scr, A, B, C, M, N, K, 1.0, 0.0) != 0) { return 0 }
+    sync()
+    free_dev(scr)
+    return C
+}
+
+# host x[rows,K] @ W[K,N] -> host [rows,N]
+mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    var<Int> dA = 0
+    dA = alloc_dev(rows * K * 8)
+    if (dA == 0) { return out }
+    htod_vec(dA, x)
+    var<Int> dC = 0
+    dC = mm_dev(dA, B, rows, N, K, faddr)
+    free_dev(dA)
+    if (dC == 0) { return out }
+    out = dtoh_vec(dC, rows * N)
+    free_dev(dC)
+    return out
+}
+
+# GLM's log-decay gate: g = sigmoid((f + dt_bias) * exp(A_log)) * (-5), per (head, k-channel)
+log_decay(f<Vec<Float>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    c<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            dec<Float> = vexp(alog.get(h))
+            c = 0
+            while (c < KD) {
+                idx<Int> = (r * HEADS + h) * KD + c
+                tix<Int> = h * KD + c
+                out.push(sigmoid((f.get(idx) + dt.get(tix)) * dec) * GATE_LB)
+                c = c + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+# the KDA delta-rule recurrence (gdn_ref.kda_recurrent): q,k,v [R,HEADS,KD], g [R,HEADS,KD],
+# beta [R,HEADS]; q is already l2-normalised and scaled by 1/sqrt(KD), k l2-normalised.
+delta_rule(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>, beta<Vec<Float>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    st<Vec<Float>> = Vec()
+    var<Int> n = 0
+    while (n < HEADS * KD * KD) {
+        st.push(0.0)
+        n = n + 1
+    }
+    n = 0
+    while (n < R * HEADS * KD) {
+        out.push(0.0)
+        n = n + 1
+    }
+    r<Int> = 0
+    h<Int> = 0
+    a<Int> = 0
+    b<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            # decay the whole state block by exp(g)
+            a = 0
+            while (a < KD) {
+                ge<Float> = vexp(g.get((r * HEADS + h) * KD + a))
+                b = 0
+                while (b < KD) {
+                    st.set((h * KD + a) * KD + b, st.get((h * KD + a) * KD + b) * ge)
+                    b = b + 1
+                }
+                a = a + 1
+            }
+            be<Float> = beta.get(r * HEADS + h)
+            # one sweep over v-channels: delta, state update, read-out (numpy's order)
+            b = 0
+            while (b < KD) {
+                kvb<Float> = 0.0
+                a = 0
+                while (a < KD) {
+                    kvb = kvb + st.get((h * KD + a) * KD + b) * k.get((r * HEADS + h) * KD + a)
+                    a = a + 1
+                }
+                dl<Float> = (v.get((r * HEADS + h) * KD + b) - kvb) * be
+                a = 0
+                while (a < KD) {
+                    st.set((h * KD + a) * KD + b,
+                           st.get((h * KD + a) * KD + b) + k.get((r * HEADS + h) * KD + a) * dl)
+                    a = a + 1
+                }
+                rd<Float> = 0.0
+                a = 0
+                while (a < KD) {
+                    rd = rd + st.get((h * KD + a) * KD + b) * q.get((r * HEADS + h) * KD + a)
+                    a = a + 1
+                }
+                out.set((r * HEADS + h) * KD + b, rd)
+                b = b + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+# gated RMSNorm with the sigmoid (KDA) activation, per (token, head) row of KD, times w
+gated_norm(x<Vec<Float>>, z<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    i<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            ss<Float> = 0.0
+            i = 0
+            while (i < KD) {
+                vv<Float> = x.get((r * HEADS + h) * KD + i)
+                ss = ss + vv * vv
+                i = i + 1
+            }
+            inv<Float> = 1.0 / vsqrt(ss / (KD as Float) + EPS, 40)
+            i = 0
+            while (i < KD) {
+                idx<Int> = (r * HEADS + h) * KD + i
+                out.push(x.get(idx) * inv * w.get(i) * sigmoid(z.get(idx)))
+                i = i + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+# hyper-connection apply: dst = post ⊗ y + comb^T streams
+hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    d<Int> = 0
+    j<Int> = 0
+    n<Int> = 0
+    while (n < R * HC * H) {
+        dst.push(0.0)
+        n = n + 1
+    }
+    while (r < R) {
+        h = 0
+        while (h < HC) {
+            d = 0
+            while (d < H) {
+                acc<Float> = post.get(r * HC + h) * y.get(r * H + d)
+                j = 0
+                while (j < HC) {
+                    acc = acc + comb.get((r * HC + j) * HC + h) * streams.get((r * HC + j) * H + d)
+                    j = j + 1
+                }
+                dst.set((r * HC + h) * H + d, acc)
+                d = d + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
 main()<Int> -> {
     dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
     out<String> = env_get("VYBFORGE_L0_OUT") else "native/out/l0_vyb.txt"
@@ -488,6 +674,9 @@ main()<Int> -> {
     want.push(pre + "hc_ffn_base")
     want.push(pre + "hc_ffn_scale")
     want.push(EMB)
+    want.push(pre + "self_attn.q_conv1d.weight")
+    want.push(pre + "self_attn.k_conv1d.weight")
+    want.push(pre + "self_attn.v_conv1d.weight")
 
     g<GxLoc> = gx_resolve(dir, total, want)
     i = 0
@@ -662,13 +851,205 @@ main()<Int> -> {
     h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
     println(digest("h", h_a))
     lines = lines + digest("h", h_a) + "\n"
+    # =============================================================== KDA attention
+    # projections (host batch [R,H] @ [H,out] on the GPU)
+    d_q<Int> = deq_bf16(fbf, gx_read(g, 0), H * HEADS * KD, H)
+    d_k<Int> = deq_bf16(fbf, gx_read(g, 1), H * HEADS * KD, H)
+    d_v<Int> = deq_bf16(fbf, gx_read(g, 2), H * HEADS * KD, H)
+    d_o<Int> = deq_bf16(fbf, gx_read(g, 3), HEADS * KD * H, HEADS * KD)
+    d_b<Int> = deq_bf16(fbf, gx_read(g, 4), H * HEADS, H)
+    d_fa<Int> = deq_bf16(fbf, gx_read(g, 5), H * 128, H)
+    d_fb<Int> = deq_bf16(fbf, gx_read(g, 6), 128 * HEADS * KD, 128)
+    d_ga<Int> = deq_bf16(fbf, gx_read(g, 7), H * 128, H)
+    d_gb<Int> = deq_bf16(fbf, gx_read(g, 8), 128 * HEADS * KD, 128)
+    if (d_q == 0 || d_k == 0 || d_v == 0 || d_o == 0 || d_b == 0 || d_fa == 0 || d_fb == 0 || d_ga == 0 || d_gb == 0) {
+        println("L0_FAIL weight deq")
+        return 17
+    }
+    qp<Vec<Float>> = mm_host(h_a, R, H, d_q, HEADS * KD, fgemm)
+    kp<Vec<Float>> = mm_host(h_a, R, H, d_k, HEADS * KD, fgemm)
+    vp<Vec<Float>> = mm_host(h_a, R, H, d_v, HEADS * KD, fgemm)
+    println(digest("qpre", qp))
+    lines = lines + digest("qpre", qp) + "\n"
+
+    # conv+silu over the token axis, then l2-normalise (q also scaled by 1/sqrt(KD))
+    # conv1d weights are BF16 (only dt_bias / A_log / hc base+scale are FP32 here)
+    var<Int> t2 = 0
+    var<Int> d_cq = 0
+    var<Int> d_ck = 0
+    var<Int> d_cv = 0
+    d_cq = deq_bf16(fbf, gx_read(g, 24), HEADS * KD * CONV_K, 0)
+    d_ck = deq_bf16(fbf, gx_read(g, 25), HEADS * KD * CONV_K, 0)
+    d_cv = deq_bf16(fbf, gx_read(g, 26), HEADS * KD * CONV_K, 0)
+    if (d_cq == 0 || d_ck == 0 || d_cv == 0) { return 18 }
+    convq<Vec<Float>> = dtoh_vec(d_cq, HEADS * KD * CONV_K)
+    convk<Vec<Float>> = dtoh_vec(d_ck, HEADS * KD * CONV_K)
+    convv<Vec<Float>> = dtoh_vec(d_cv, HEADS * KD * CONV_K)
+    free_dev(d_cq)
+    free_dev(d_ck)
+    free_dev(d_cv)
+    qc<Vec<Float>> = conv_silu(qp, R, HEADS * KD, convq)
+    kc<Vec<Float>> = conv_silu(kp, R, HEADS * KD, convk)
+    vc<Vec<Float>> = conv_silu(vp, R, HEADS * KD, convv)
+    println(digest("qc", qc))
+    lines = lines + digest("qc", qc) + "\n"
+    println(digest("vc", vc))
+    lines = lines + digest("vc", vc) + "\n"
+    qn<Vec<Float>> = l2_rows(qc, R * HEADS, KD)
+    kn<Vec<Float>> = l2_rows(kc, R * HEADS, KD)
+    t2 = 0
+    while (t2 < qn.len()) {
+        qn.set(t2, qn.get(t2) * (1.0 / vsqrt(KD as Float, 40)))
+        t2 = t2 + 1
+    }
+
+    println(digest("qn", qn))
+    lines = lines + digest("qn", qn) + "\n"
+    lines = lines + dumps("qnvals", qn) + "\n"
+    println(digest("kn", kn))
+    lines = lines + digest("kn", kn) + "\n"
+    bet<Vec<Float>> = mm_host(h_a, R, H, d_b, HEADS, fgemm)
+    t2 = 0
+    while (t2 < bet.len()) {
+        bet.set(t2, sigmoid(bet.get(t2)))
+        t2 = t2 + 1
+    }
+
+    println(digest("beta", bet))
+    lines = lines + digest("beta", bet) + "\n"
+    fa<Vec<Float>> = mm_host(h_a, R, H, d_fa, 128, fgemm)
+    fraw<Vec<Float>> = mm_host(fa, R, 128, d_fb, HEADS * KD, fgemm)
+    ga<Vec<Float>> = mm_host(h_a, R, H, d_ga, 128, fgemm)
+    zraw<Vec<Float>> = mm_host(ga, R, 128, d_gb, HEADS * KD, fgemm)
+
+    raw_dt<String> = gx_read(g, 10)          # FP32 in the checkpoint
+    dt<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < HEADS * KD) {
+        dt.push(f32_at(raw_dt, t2))
+        t2 = t2 + 1
+    }
+    raw_alog<String> = gx_read(g, 11)
+    alog<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < HEADS) {
+        alog.push(f32_at(raw_alog, t2))
+        t2 = t2 + 1
+    }
+    println(digest("fraw", fraw))
+    lines = lines + digest("fraw", fraw) + "\n"
+    println(digest("zraw", zraw))
+    lines = lines + digest("zraw", zraw) + "\n"
+    gdec<Vec<Float>> = log_decay(fraw, dt, alog)
+    println(digest("gdec", gdec))
+    lines = lines + digest("gdec", gdec) + "\n"
+
+    att<Vec<Float>> = delta_rule(qn, kn, vc, gdec, bet)
+    println(digest("delta", att))
+    lines = lines + digest("delta", att) + "\n"
+
+    d_onorm<Int> = deq_bf16(fbf, gx_read(g, 9), KD, 0)
+    if (d_onorm == 0) { return 19 }
+    onorm<Vec<Float>> = dtoh_vec(d_onorm, KD)
+    free_dev(d_onorm)
+    gnorm<Vec<Float>> = gated_norm(att, zraw, onorm)
+    attn<Vec<Float>> = mm_host(gnorm, R, HEADS * KD, d_o, H, fgemm)
+    println(digest("attn", attn))
+    lines = lines + digest("attn", attn) + "\n"
+
+    streams1<Vec<Float>> = hc_apply(streams, attn, postA, combA)
+    println(digest("streams1", streams1))
+    lines = lines + digest("streams1", streams1) + "\n"
+    free_dev(d_q)
+    free_dev(d_k)
+    free_dev(d_v)
+    free_dev(d_o)
+    free_dev(d_b)
+    free_dev(d_fa)
+    free_dev(d_fb)
+    free_dev(d_ga)
+    free_dev(d_gb)
     free_dev(d_fnA)
+
+    # =============================================================== ffn site + MLP
+    d_ln2<Int> = deq_bf16(fbf, gx_read(g, 16), H, 0)
+    if (d_ln2 == 0) { return 20 }
+    post_ln<Vec<Float>> = dtoh_vec(d_ln2, H)
+    free_dev(d_ln2)
+
+    var<Int> d_flat2 = 0
+    var<Int> d_mv2 = 0
+    var<Int> d_scr2 = 0
+    reflat<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < streams1.len()) {
+        reflat.push(streams1.get(t2))
+        t2 = t2 + 1
+    }
+    reflat = rms_rows(reflat, R, HC * H, Vec())
+    d_flat2 = alloc_dev(R * HC * H * 8)
+    d_mv2 = alloc_dev(R * 24 * 8)
+    d_scr2 = alloc_dev(64)
+    if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return 21 }
+    htod_vec(d_flat2, reflat)
+    if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return 22 }
+    sync()
+    mv2<Vec<Float>> = dtoh_vec(d_mv2, R * 24)
+    free_dev(d_flat2)
+    free_dev(d_mv2)
+    free_dev(d_scr2)
     free_dev(d_fnF)
+
+    res2<Vec<Float>> = hc_glue(mv2, baseF, scaleF, streams1)
+    collapsed2<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < R * H) {
+        collapsed2.push(res2.get(t2))
+        t2 = t2 + 1
+    }
+    postF<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < R * HC) {
+        postF.push(res2.get(R * H + t2))
+        t2 = t2 + 1
+    }
+    combF<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < R * HC * HC) {
+        combF.push(res2.get(R * H + R * HC + t2))
+        t2 = t2 + 1
+    }
+    h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln)
+    println(digest("h2", h2))
+    lines = lines + digest("h2", h2) + "\n"
+
+    d_gate<Int> = deq_bf16(fbf, gx_read(g, 12), H * INTER, H)
+    d_up<Int> = deq_bf16(fbf, gx_read(g, 13), H * INTER, H)
+    d_down<Int> = deq_bf16(fbf, gx_read(g, 14), INTER * H, INTER)
+    if (d_gate == 0 || d_up == 0 || d_down == 0) { return 23 }
+    mg<Vec<Float>> = mm_host(h2, R, H, d_gate, INTER, fgemm)
+    mu<Vec<Float>> = mm_host(h2, R, H, d_up, INTER, fgemm)
+    act<Vec<Float>> = Vec()
+    t2 = 0
+    while (t2 < mg.len()) {
+        act.push(silu(mg.get(t2)) * mu.get(t2))
+        t2 = t2 + 1
+    }
+    mlp<Vec<Float>> = mm_host(act, R, INTER, d_down, H, fgemm)
+    println(digest("mlp", mlp))
+    lines = lines + digest("mlp", mlp) + "\n"
+    free_dev(d_gate)
+    free_dev(d_up)
+    free_dev(d_down)
+
+    streams2<Vec<Float>> = hc_apply(streams1, mlp, postF, combF)
+    println(digest("streams2", streams2))
+    lines = lines + digest("streams2", streams2) + "\n"
 
     match (open_write(out)) {
         f -> { write_str(f, lines); close(f) }
         ? -> { println("L0_FAIL write"); return 15 }
     }
-    println("L0_STAGE1_OK x/streams/hc-attn-mix/h  (attention + MLP next)")
+    println("L0_OK full layer 0: hc -> KDA attn -> o_proj -> hc -> MLP -> hc (22 tokens)")
     return 0
 }
