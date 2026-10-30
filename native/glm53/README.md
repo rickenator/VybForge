@@ -126,6 +126,31 @@ function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2
 the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
 `freedom { }` block as the other host drivers do.
 
+## EXL3 dequant as a callable Vyb path — `make glm3x` → EXL3_LOAD_VYB: OK
+
+The MoE's routed experts are EXL3 4 bpw. The P1 gate proved that pipeline on one fixture
+tensor; this makes it a **repeatable call at real expert shape**: layer 3, expert 0,
+`gate_proj` [4096, 2048] → 8,388,608 f64 values in [in, out] order, gemm-ready.
+
+`native/host/glm_exl3_check.vyb` runs trellis → `exl3deq` → `exl3hgen`/`exl3had1`/
+`exl3had2` with the 256-slot tile map re-headered at load time (cw = out features,
+ntiles = (in/16)·(out/16)), i.e. no Python in the path and no per-shape Python tooling.
+
+Against the P1 oracle: sq rel 8.4e-7, max rel 7.8e-5 (max abs ≈ 1.2e-5), abs rel 5.5e-7
+— inside the band the P1 gate established (max abs 4.4e-5, 0/8.4M over 3e-3).
+
+Two things worth knowing:
+- **`extern "C"` FFI declarations do not cross module boundaries.** `native/glm53/exl3_load.vyb`
+  holds the cleaned-up version of this function, but importing it fails: the module's own
+  `share(all)` functions cannot see its `extern "C"` cu\* declarations ("Undefined
+  identifier: cuMemFree_v2"). The sanctioned route is `import cuda_binding` (Vyb's
+  `bindings/cuda`), which exposes alloc/free/module-load/launch but **no bulk host→device
+  copy**, so a 4 MB trellis currently uploads in 8-byte words (that is the 37 s). A bulk
+  copy in `cuda_binding` would make this fast and make the module importable — a Vyb-side
+  gap, not a VybForge one.
+- Reading a dequantized expert back to the host is 67 MB; the MoE should keep it on the
+  device and gemm against it (the check driver downloads only to make a digest).
+
 ## Layer 3's MoE router + shared expert in Vyb — `make glm3moe` → both gates OK
 
 `native/host/glm_l3_moe_fwd.vyb` runs the ffn site's front half on real weights: the router
