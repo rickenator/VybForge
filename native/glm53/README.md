@@ -137,25 +137,34 @@ fix below was found by timing the real work, not by reading the code:
 | `st_open` (one shard header) | **5,534 ms** (1185 tensors) | **22 ms** | it called `st_arr_ints()`/`jgetstr()` three times per tensor, and those take the `JsonDoc` **by value** — Vyb structs are value types, so each call deep-copied all ~9k nodes (0.94 ms). The reads are inlined through the doc's own methods. |
 | `gx_index` (name -> shard for 150k names) | **159,000 ms** | **555 ms** | `JsonDoc.get(id, key)` is a *linear* scan over an object's children, so one keyed lookup per name is O(n^2). Children are now walked by index (`elem` + `ckey_at`), which is O(n). |
 
-Whole-checkpoint plan (`make gxplan`): **34.8 s** for 150,226 tensors / 163.6 GiB,
-digest-identical to the independent oracle (`GX_PLAN_MATCH: OK`). The same fix sped the
+Whole-checkpoint plan (`make gxplan`): **2.3 s** for 150,226 tensors / 163.6 GiB
+(34.8 s before the two Vyb runtime fixes below), digest-identical to the independent
+oracle (`GX_PLAN_MATCH: OK`). The same fix sped the
 older gates up too: `make gx gxload` went from ~90 s to 3.2 s.
 
-## Two open Vyb runtime problems this path hit (not fixed — reported)
+## Two Vyb runtime defects this path hit — FIXED in Vyb (`3347863c`)
 
-1. **SIGSEGV under sustained allocation churn.** A driver that (a) built a 150k-entry
-   plan struct, (b) walked it twice and (c) wrote 150k composed lines crashed with
-   signal 11, at a *different* point each run (once right after the plan was built, once
-   at count i=125000). Returning a struct with 150k items from a function is fine on its
-   own (reproduced green), and 200k `write_str` calls are fine on their own, so it is the
-   combination/heap pressure, not one API. The streaming rewrite of `gx_plan.vyb` avoids
-   the pattern and completes.
-2. **Progressive slowdown with a large live heap.** In the non-streaming driver the last
-   shards took 15-43 s each while the first took ~15 ms with the same tensor counts, and
-   per-operation microbenchmarks on the same data stayed at micro/nanoseconds. Same
-   `st_open` code, same header sizes: the runtime degrades as the heap grows (150k
-   Strings + a 150k-entry HashMap live). Consequence for the engine: **never hold a
-   global name->tensor map**; resolve per shard / per layer and let strings go.
+Both were found by this loader, fixed in the Vyb repo, and are now covered by Vyb tests.
+
+1. **Loop-body temporaries leaked stack (SIGSEGV).** Codegen emitted `alloca` at the point
+   of use, so a temporary inside a loop body took a fresh stack slot every iteration and
+   LLVM only reclaims stack at function exit. A 130k-iteration loop copying a 5-field
+   struct out of a `Vec` overflowed the default 8 MB stack and died in
+   `__vyb_string_release` (crash point varied run to run, backtrace useless). Fixed by
+   hoisting every constant-size alloca into the entry block (`hoistStaticAllocas`);
+   reproducer `repro/loop_stack_leak.vyb`, test `test/memory/loop_stack_no_leak.vyb`.
+2. **String registry live-count drift (progressive slowdown, then SIGSEGV).** Reusing a
+   tombstone slot decremented tombstones but not the live count, while `release()` always
+   decrements it: under churn the live count drifted down, the table stopped growing and
+   linear-probe clusters grew without bound. Measured here: parsing all 83 shard headers
+   took **1.4 s with an empty heap and 127 s with 150k live Strings**; a rehash now
+   re-derives the counter from the table. Same workload after the fix: **1.09 s**
+   (`native/glm53/perf/st_open_all_shards.vyb` reproduces the measurement).
+
+Effect on this repo's numbers: `make gxplan` (150,226 tensors, 163.6 GiB) went from
+**34.8 s to 2.3 s**, and the older `make gx gxload` pair stays at ~3 s. The consequence for
+the engine also stands: still resolve per shard / per layer and never hold a global
+name→tensor map, because a large live heap is expensive even when it is correct.
 
 Also worth knowing: Vyb's `^` is XOR, not power (`2 ^ 8` is 10) — a header-length decode
 using it silently produced garbage. `JsonDoc` has no iterator; `keys()` materialises a
