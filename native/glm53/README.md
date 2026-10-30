@@ -51,6 +51,49 @@ P2 is done (`MOE_VYB_MATCH: OK`). Carried into P4 with the loader: distinct
 per-expert weights, a per-expert pointer table instead of the single expert-0
 set, and the grouped/batched GEMM shape that beats the simple per-lane loop.
 
+## DSA indexer — the WEIGHTS path, corrected (dsa_ref.py + verify_dsa.py)
+
+`mla_ref.indexer_select` models **exllamav3's `QSAIndexer`** (rope'd q/k, *mean*
+pooling of complete cr-blocks). The checkpoint does not contain those tensors. Layers
+3-44 carry, verbatim:
+
+    self_attn.indexer.wq_b.weight                [4096, 1536]   (from the q_a latent)
+    self_attn.indexer.wk.weight                  [128, 4096]    (from the layer input)
+    self_attn.indexer.k_norm.{weight,bias}       [128]          LayerNorm, eps 1e-6
+    self_attn.indexer.weights_proj.weight        [32, 4096]
+    self_attn.indexer.index_kpool_compress_ape   [4, 128]       per-slot pooling bias
+    self_attn.indexer.index_kpool_compress_gate  [128, 4096]    learned pooling gate
+
+i.e. **learned gate-weighted pooling with a per-slot bias, no rope** — exactly HF's
+`Glm5NextTextIndexer`. `DSA_SELECT_VERIFY` could not catch this: it compares
+*selection geometry* against exllamav3 with synthetic q/pooled arrays (no checkpoint
+weights), and at S=1 (the only length the earlier gates ran) every token is visible,
+so any pooling rule selects the same set. The weights path was simply ungated.
+
+`dsa_ref.py` is the corrected reference (HF semantics, batch 1, no cache):
+`indexer_topk()` + `masked_attention()` + `layer_attention()`. Two layout facts that
+cost time and are now pinned by the gate:
+- HF **drops pools that are not fully valid** (`keep = pool_valid.any(0)`) before
+  `select_k = min(index_topk // kpool, n_pools)`; dropping a pool narrows the pool
+  block and moves the appended tail's column offset. Pool count therefore drives the
+  topk *layout*, not just the selection.
+- the appended incomplete tail lands at column `select_k*kpool`, padded with -1 to
+  `index_topk + kpool - 1` (= 2051) columns.
+
+`verify_dsa.py` (real layer-3 tensors, S=22, layers 0-2 chained in numpy first):
+`DSA_INDEXER_VERIFY: OK` — per-query selected token sets identical on all 22 queries,
+and 45102/45122 topk entries **bit-identical**; the 20 that differ are the *order of
+the selected pool blocks* (same tokens, two near-tied pool scores swapping under
+bf16), the documented lane-order boundary class. `DSA_ATTN_VERIFY: OK` — masked MLA
+attention out rel 8.3e-3 on |out| 1.9 (bf16 side's own rounding); projections on the
+way: input_layernorm 6.0e-3, q_a latent 7.9e-3, q_b 6.0e-3, kv_a_layernorm 7.4e-3.
+
+Not exercised (and cannot be at these lengths): actual top-k *pruning* needs
+> index_topk tokens (8,192+ for pools to outnumber `index_topk/kpool`); every query
+here sees all tokens causally, so selection == causal mask. The pool-score ordering,
+pooling math and tail layout are gated; pruning is gated by construction once a long
+context run exists.
+
 ## Layer 3 complete (Gate C) — the full layer matches HF
 
 `verify_layer3_attn.py` composes the ENTIRE layer 3 in numpy on the chained input

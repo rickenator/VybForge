@@ -123,6 +123,15 @@ nothing in `~/.hermes/config.yaml` changes.
   transformers implementation for glm5_next (or
   Qwen3-Next for the delta-net pieces). Gates: `LA_VYB_MATCH`, `MLA_VYB_MATCH`,
   `DSA_VYB_MATCH`. This is the highest-risk phase; budget it as such.
+  **CORRECTION 2026-10-29 (P3 indexer)**: `DSA_SELECT_VERIFY` gated selection
+  *geometry* against exllamav3's `QSAIndexer` with synthetic arrays; the checkpoint's
+  indexer is the other design (learned gpools: `wq_b`/`wk`/`k_norm`/`weights_proj`/
+  `index_kpool_compress_{ape,gate}`, no rope). Corrected reference = `dsa_ref.py`,
+  gate = `verify_dsa.py` on real layer-3 weights at S=22:
+  **`DSA_INDEXER_VERIFY: OK`** (identical selected sets on 22/22 queries, 45102/45122
+  topk entries bit-identical; the 20 others are pool-block order under bf16) and
+  **`DSA_ATTN_VERIFY: OK`** (masked MLA out rel 8.3e-3). Details in
+  `native/glm53/README.md`; pruning (>8k tokens) still ungated.
 - **P4 — hyper-connections + one real GLM layer end-to-end.** bf16 body weights
   streamed from lefty, experts via P1, one full `glm5_next` layer forward vs the
   transformers reference on the godzilla 3090 (single layer fits; the full model never
