@@ -151,6 +151,21 @@ Two things worth knowing:
 - Reading a dequantized expert back to the host is 67 MB; the MoE should keep it on the
   device and gemm against it (the check driver downloads only to make a digest).
 
+## Layer 3's complete MoE, all 22 tokens — `make glm3all` → L3_MOE_ALL_VYB: OK
+
+`native/host/glm_l3_moe_all.vyb` is the whole ffn site for the real batch, self-contained:
+it computes the router, dequantizes **each of the 109 distinct routed experts once** from
+EXL3 on the device, runs the clamped SwiGLU FFN on only the tokens that chose that expert
+(gather → 3 gemms → scatter with the renormed weight), then adds the shared expert.
+
+vs `gold_l3_mlp.npy` [22, 4096]: sum 5.6e-8 (vs abs-sum), abs 5.3e-6, sq 8.5e-6, max 1.1e-5.
+
+Cost is the number worth keeping: **327 dequant pipelines + 130 gemms in 41 s** on one
+card, ~1.3 GB of trellis read off the checkpoint. That projects a full 45-layer forward at
+roughly half an hour, and it means expert dequant should be *cached per (layer, expert)*
+across a generation step only if memory allows — at 67 MB per expert in f64, all 288
+experts of one layer is 19 GB, which fits, so a per-layer expert pool is the design.
+
 ## Layer 3's routed experts in Vyb — `make glm3exp` → L3_EXPERT_VYB: OK
 
 `native/host/glm_l3_expert_fwd.vyb` closes the expert path for one token: for each of its
