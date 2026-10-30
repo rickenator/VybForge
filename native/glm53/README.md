@@ -126,6 +126,41 @@ function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2
 the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
 `freedom { }` block as the other host drivers do.
 
+## Loader performance: three substrate hot spots fixed (measured, not guessed)
+
+The first version of this path was ~300x too slow to load a 163.6 GiB checkpoint. Each
+fix below was found by timing the real work, not by reading the code:
+
+| what | before | after | why |
+|---|---|---|---|
+| `json_parse` of the 15.5 MB weight_map | **134,489 ms** | **439 ms** | `parse_string_raw` appended the body **one character at a time** (`out = out + src.substring(i, i+1)`): an allocation plus a growing copy per char. Fast path now scans for the closing quote with `char_at` and takes ONE `substring`; the escape path still runs per-char, but JSON strings rarely take it. Synthetic scaling after: 44 MB/s (32k entries in 66 ms). |
+| `st_open` (one shard header) | **5,534 ms** (1185 tensors) | **22 ms** | it called `st_arr_ints()`/`jgetstr()` three times per tensor, and those take the `JsonDoc` **by value** — Vyb structs are value types, so each call deep-copied all ~9k nodes (0.94 ms). The reads are inlined through the doc's own methods. |
+| `gx_index` (name -> shard for 150k names) | **159,000 ms** | **555 ms** | `JsonDoc.get(id, key)` is a *linear* scan over an object's children, so one keyed lookup per name is O(n^2). Children are now walked by index (`elem` + `ckey_at`), which is O(n). |
+
+Whole-checkpoint plan (`make gxplan`): **34.8 s** for 150,226 tensors / 163.6 GiB,
+digest-identical to the independent oracle (`GX_PLAN_MATCH: OK`). The same fix sped the
+older gates up too: `make gx gxload` went from ~90 s to 3.2 s.
+
+## Two open Vyb runtime problems this path hit (not fixed — reported)
+
+1. **SIGSEGV under sustained allocation churn.** A driver that (a) built a 150k-entry
+   plan struct, (b) walked it twice and (c) wrote 150k composed lines crashed with
+   signal 11, at a *different* point each run (once right after the plan was built, once
+   at count i=125000). Returning a struct with 150k items from a function is fine on its
+   own (reproduced green), and 200k `write_str` calls are fine on their own, so it is the
+   combination/heap pressure, not one API. The streaming rewrite of `gx_plan.vyb` avoids
+   the pattern and completes.
+2. **Progressive slowdown with a large live heap.** In the non-streaming driver the last
+   shards took 15-43 s each while the first took ~15 ms with the same tensor counts, and
+   per-operation microbenchmarks on the same data stayed at micro/nanoseconds. Same
+   `st_open` code, same header sizes: the runtime degrades as the heap grows (150k
+   Strings + a 150k-entry HashMap live). Consequence for the engine: **never hold a
+   global name->tensor map**; resolve per shard / per layer and let strings go.
+
+Also worth knowing: Vyb's `^` is XOR, not power (`2 ^ 8` is 10) — a header-length decode
+using it silently produced garbage. `JsonDoc` has no iterator; `keys()` materialises a
+Vec of every key (150k Strings) — prefer `nchildren`/`ckey_at`/`elem` in loops.
+
 ## Layer 3 complete (Gate C) — the full layer matches HF
 
 `verify_layer3_attn.py` composes the ENTIRE layer 3 in numpy on the chained input

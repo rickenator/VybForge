@@ -177,6 +177,13 @@ gxload:
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_load_ref.py
 	cd $(ROOT) && cmp native/out/gx_load_ref.txt native/out/gx_load_vyb.txt && echo "GX_LOAD_MATCH: OK"
 
+# P4 loader step 2: the WHOLE checkpoint planned in Vyb (150,226 tensors, 163.6 GiB)
+# and gated by a sha256 digest against an independent parse.
+gxplan:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path $(VYBDIR)/stdlib/collections native/host/gx_plan.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_plan_ref.py
+	cd $(ROOT) && grep -v '^PLAN' native/out/gx_plan_ref.txt > /tmp/gxplan_ref.txt && grep -v '^PLAN' native/out/gx_plan_vyb.txt > /tmp/gxplan_vyb.txt && diff /tmp/gxplan_ref.txt /tmp/gxplan_vyb.txt && echo "GX_PLAN_MATCH: OK"
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx

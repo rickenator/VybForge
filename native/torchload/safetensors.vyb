@@ -76,6 +76,11 @@ st_dtsize(dt<String>)<Int> -> {
 # integers that look plausible (node ids) instead of an error, which is exactly how this cost
 # a gate run. Values, not ids.
 share(all)
+# PERF: `d` here is BY VALUE. Vyb structs are value types, so every call copies the
+# whole JsonDoc — 0.94 ms for a 9k-node shard header, and this used to be called twice
+# per tensor (i.e. ~2 s of pure copying per shard, most of st_open's cost). Hot loops
+# read the array through the doc's own methods instead (see st_open); keep this helper
+# for cold paths only.
 st_arr_ints(d<JsonDoc>, id<Int>, key<String>)<Vec<Int>> -> {
     out<Vec<Int>> = Vec()
     cid<Int> = d.get(id, key)
@@ -107,18 +112,43 @@ st_open(path<String>)<StIndex> -> {
                             match (json_parse(hdr)) {
                                 d -> {
                                     rid<Int> = d.rootid()
-                                    ks<Vec<String>> = d.keys(rid)
+                                    # Walk children BY INDEX: get(rid, name) is a linear
+                                    # scan over the object's children, which made this
+                                    # loop O(n^2) per shard (5.1 s for a 1185-tensor
+                                    # header; 150k tensors across 83 shards).
                                     k<Int> = 0
-                                    for (k in 0..ks.len() - 1) {
-                                        nm<String> = ks.get(k)
+                                    while (k < d.nchildren(rid)) {
+                                        nm<String> = d.ckey_at(rid, k)
                                         if (nm == "__metadata__") { } else {
-                                            tid<Int> = d.get(rid, nm)
+                                            tid<Int> = d.elem(rid, k)
                                             if (tid >= 0) {
-                                                sh<Vec<Int>> = st_arr_ints(d, tid, "shape")
-                                                ofs<Vec<Int>> = st_arr_ints(d, tid, "data_offsets")
+                                                # INLINE the three reads: st_arr_ints/jgetstr
+                                                # take the JsonDoc BY VALUE, which copies all
+                                                # ~9k nodes per call (0.94 ms) — 3 copies per
+                                                # tensor made st_open 5.5 s per shard.
+                                                shid<Int> = d.get(tid, "shape")
+                                                ofid<Int> = d.get(tid, "data_offsets")
+                                                sh<Vec<Int>> = Vec()
+                                                ofs<Vec<Int>> = Vec()
+                                                if (shid >= 0) {
+                                                    sl<Int> = d.len(shid)
+                                                    s3<Int> = 0
+                                                    while (s3 < sl) {
+                                                        sh.push(d.int(d.elem(shid, s3)))
+                                                        s3 = s3 + 1
+                                                    }
+                                                }
+                                                if (ofid >= 0) {
+                                                    ol<Int> = d.len(ofid)
+                                                    o3<Int> = 0
+                                                    while (o3 < ol) {
+                                                        ofs.push(d.int(d.elem(ofid, o3)))
+                                                        o3 = o3 + 1
+                                                    }
+                                                }
                                                 if (ofs.len() >= 2) {
                                                     ix.names.push(nm)
-                                                    ix.dtypes.push(jgetstr(d, tid, "dtype"))
+                                                    ix.dtypes.push(d.hstr(d.get(tid, "dtype")))
                                                     ix.shp_off.push(ix.shp.len())
                                                     ix.shp_len.push(sh.len())
                                                     s2<Int> = 0
@@ -128,6 +158,7 @@ st_open(path<String>)<StIndex> -> {
                                                 }
                                             }
                                         }
+                                        k = k + 1
                                     }
                                     ix.n = ix.names.len()
                                 }

@@ -1,9 +1,10 @@
 # gx.vyb — the GLM-5.3 checkpoint index, Vyb-only (no Python in the path).
 #
 # Resolves tensor names to (shard, offset, length, dtype) via:
-#   1. model.safetensors.index.json (5 MB) read ONCE and substring-searched for the
-#      name, giving its shard — the HF weight_map has ~157k entries and the JSON
-#      module has no key iteration, but index_of() over the raw text is cheap;
+#   1. model.safetensors.index.json (15.5 MB, 150,226 entries) parsed ONCE into a
+#      name -> shard table. NOTE: JsonDoc.get(id, key) is a LINEAR scan over an
+#      object's children, so a keyed lookup per name is O(n^2) (>5 min, killed);
+#      gx_index walks the children by index (elem + ckey_at) and is O(n) (~200 ms);
 #   2. that shard's safetensors header (native/torchload/safetensors.vyb, already
 #      gated byte-identical against an independent Python oracle) for the byte range.
 #
@@ -13,6 +14,7 @@
 # Nothing here touches CUDA: gx answers WHERE the bytes are. A host driver opens the
 # shard, reads the range and uploads it (the native/host/*_driver pattern).
 import safetensors
+import json_parse
 import io::{open_read, read_all, read_at, close}
 
 share(all)
@@ -157,3 +159,79 @@ gx_read(g<GxLoc>, i<Int>)<String> -> {
     }
     return r
 }
+
+# ---- fast whole-model plan (loader path) -------------------------------------------
+#
+# gx_shard_for above re-reads the index text per name and st_open()s a shard header per
+# tensor: fine for a probe, unusable for a load (150k tensors). gx_plan resolves the
+# WHOLE checkpoint in two linear passes: the weight_map once (name -> shard), then each
+# of the 83 shard headers once (shard-major), filling a dense plan the loader then walks
+# layer by layer.
+
+share(all)
+struct GxIndex {
+    n<Int>,
+    names<Vec<String>>,
+    shard<Vec<Int>>
+}
+
+share(all)
+struct GxTensor {
+    name<String>,
+    shard<Int>,
+    off<Int>,
+    nbytes<Int>,
+    dtype<String>
+}
+
+share(all)
+struct GxPlan {
+    n<Int>,
+    found<Int>,
+    tensors<Vec<GxTensor>>
+}
+
+share(all)
+gx_digits(s<String>)<Int> -> {
+    n<Int> = 0
+    i<Int> = 0
+    while (i < s.len()) {
+        c<Int> = (s.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { n = n * 10 + (c - 48) }
+        i = i + 1
+    }
+    return n
+}
+
+# weight_map: name -> shard number, one linear walk of the object's children.
+share(all)
+gx_index(dir<String>)<GxIndex> -> {
+    ix<GxIndex> = GxIndex { n = 0, names = Vec(), shard = Vec() }
+    text<String> = gx_read_index(dir)
+    if (text.len() == 0) { return ix }
+    match (json_parse(text)) {
+        d -> {
+            rid<Int> = d.rootid()
+            wm<Int> = d.get(rid, "weight_map")
+            if (wm >= 0) {
+                cnt<Int> = d.nchildren(wm)
+                i<Int> = 0
+                while (i < cnt) {
+                    ix.names.push(d.ckey_at(wm, i))
+                    # "model-00007-of-00083.safetensors" -> 7
+                    ix.shard.push(gx_digits(d.hstr(d.elem(wm, i))))
+                    i = i + 1
+                }
+                ix.n = ix.names.len()
+            }
+        }
+        ? -> { }
+    }
+    return ix
+}
+
+# NOTE: this module deliberately does NOT offer a whole-model plan function. Building
+# a 150k-entry plan struct in memory and walking it repeatedly crashed the Vyb runtime
+# (SIGSEGV, position varies) and degraded progressively as the heap grew. The loader
+# streams instead: see native/host/gx_plan.vyb, which walks the shards and writes the
+# plan out as it goes, holding only per-layer counters.
