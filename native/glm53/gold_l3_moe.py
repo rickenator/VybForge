@@ -91,7 +91,14 @@ def main():
             "stages": {"h2": dig(h2), "shared": dig(y_shared), "mlp": dig(y)},
             "route": sel, "rw": [[float(x) for x in row] for row in r_w],
             "distinct_experts": union}
+    s1 = np.load(f"{OUT}/gold_l3_streams1.npy")
+    p2 = np.load(f"{OUT}/gold_l3_post2.npy")
+    c2 = np.load(f"{OUT}/gold_l3_comb2.npy")
+    streams2 = hc_ref.apply_(s1, y, p2, c2)
+    np.save(f"{OUT}/gold_l3_streams2.npy", streams2)
+    meta["stages"]["streams2"] = dig(streams2)
     json.dump(meta, open(f"{OUT}/gold_l3_moe.json", "w"), indent=1)
+    print("gold streams2 max=%.6e" % np.abs(streams2).max())
     print(f"GOLD_L3_MOE_OK tokens={h2.shape[0]} mlp max={np.abs(y).max():.6e}")
     print(f"  route[0]={sel[0]}  route[21]={sel[21]}")
     return 0
@@ -122,6 +129,10 @@ def load_h2():
                                              w3["ffn_scale"], EPS)
     h2 = layer0_ref.rms_weight(collapsed2, w3["post_ln"])
     np.save(f"{OUT}/gold_l3_streams1.npy", streams1)
+    with open(f"{OUT}/gold_l3_streams1.txt", "w") as f:
+        for r in range(streams1.shape[0]):
+            for h in range(streams1.shape[1]):
+                f.write(" ".join(str(int(v * 1099511627776.0)) for v in streams1[r, h]) + " ")
     np.save(f"{OUT}/gold_l3_post2.npy", post2)
     np.save(f"{OUT}/gold_l3_comb2.npy", comb2)
     np.save(f"{OUT}/gold_l3_moe_h2.npy", h2)

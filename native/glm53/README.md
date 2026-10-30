@@ -151,6 +151,25 @@ Two things worth knowing:
 - Reading a dequantized expert back to the host is 67 MB; the MoE should keep it on the
   device and gemm against it (the check driver downloads only to make a digest).
 
+## Layer 3's ffn site, chained — `make glm3tail` → L3_TAIL_VYB: OK
+
+`native/host/glm_l3_tail_fwd.vyb` starts from the layer's post-attention residual streams
+and does the rest with **no gold intermediates**:
+
+    flat = rms_rows(streams1)              -> mv = flat @ hc_ffn_fn^T   [R,24]
+    hc_glue(mv, hc_ffn_base, hc_ffn_scale) -> collapsed / post2 / comb2
+    h2       = rms_rows(collapsed, post_attention_layernorm.weight)
+    mlp      = MoE(h2)                     (router + 109 routed experts + shared)
+    streams2 = hc_apply(streams1, mlp, post2, comb2)
+
+vs the gold: **h2 7e-11, mlp 8.5e-6, streams2 1e-5**. The h2 agreement is the interesting
+one — it says the hyper-connection mix (pre/post/comb + 20 sinkhorn iterations) reproduces
+the gold from raw streams at the full batch, not just at S=1.
+
+Layer 3 is now gated piece by piece and chained on the ffn side; the attention side is
+gated separately (`L3_ATTN_VYB_MATCH`) and the remaining join is one driver:
+streams -> hc_attn mix -> h_a -> DSA attention -> hc_apply -> this tail.
+
 ## Layer 3's complete MoE, all 22 tokens — `make glm3all` → L3_MOE_ALL_VYB: OK
 
 `native/host/glm_l3_moe_all.vyb` is the whole ffn site for the real batch, self-contained:
