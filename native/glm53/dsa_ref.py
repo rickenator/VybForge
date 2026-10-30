@@ -184,4 +184,4 @@ def layer_attention(h_a, w, iw, attention_mask=None):
     topk = indexer_topk(h_a, q_resid, iw, attention_mask=attention_mask)
     o = masked_attention(q, ckv, uk, uv, topk)
     return ((o @ np.asarray(w["o_proj"]).T), topk,
-            {"q_resid": q_resid, "qb": q.reshape(s, -1), "ckv": ckv})
+            {"q_resid": q_resid, "qb": q.reshape(s, -1), "ckv": ckv, "o_pre": o})

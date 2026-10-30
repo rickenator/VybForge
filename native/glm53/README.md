@@ -126,6 +126,39 @@ function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2
 the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
 `freedom { }` block as the other host drivers do.
 
+## Layer 3's DSA attention in Vyb — `make glm3` → L3_ATTN_VYB_MATCH: OK
+
+The first Vyb code for the sparse-attention path (11 of the 45 layers):
+`native/host/glm_l3_attn_fwd.vyb` runs q_a→q_b, the kv_a latent, the per-head absorbed
+keys/values out of `kv_b`, the **gpool indexer** (learned pooling over 4-token pools with
+the per-slot bias, per-head score weights, top-k pools + the visible tail), the **masked
+MLA attention** and `o_proj` — all on real layer-3 weights.
+
+Input `h_a` is the layer-3 input chained through layers 0-2 in numpy (dumped as scaled
+integers; Vyb has no f64 reinterpret), so this gate measures the DSA implementation
+itself. Results against the numpy gold:
+
+| stage | rel (sum / sq / max) |
+|---|---|
+| ha (input round-trip) | 1.5e-11 |
+| qres (q_a projection) | 2.4e-11 |
+| qb (q_a norm + q_b) | 4.1e-12 |
+| ckv (kv_a latent) | 1.6e-12 |
+| ao (attention, pre-o_proj) | 1.2e-11 |
+| **attn (DSA out)** | **2.7e-12 / 3.4e-12 / 1.9e-12** |
+| indexer selections | **22/22 queries identical token sets** |
+
+Two bugs found here: the q_a/kv_a latents each have their OWN RMSNorm weight (passing an
+empty weight vector silently computes an unweighted norm — qb and ckv were 40-200% off
+while qres matched), and `var` is a reserved word in Vyb.
+
+Cost: 143 s wall for the 22-token batch — dominated by the host per-head attention loops
+(2 billion-element naive form would never finish; materialising the probabilities per
+(query, head) brings it to ~100 M ops). This path wants the kernel next.
+
+Remaining for a full layer: the 288-expert MoE (EXL3 + `moe` kernels) at layer 3's ffn
+site, then the 45-layer pass, TP=2 and the endpoint.
+
 ## Layer 0 COMPLETE in Vyb — `make glm0` → LAYER0_VYB_MATCH: OK (all stages)
 
 `native/host/glm_layer0_fwd.vyb` runs the entire GLM-5.3 layer 0 inside Vyb on the real
