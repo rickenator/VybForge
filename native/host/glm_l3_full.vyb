@@ -1653,12 +1653,12 @@ tail_site(streams1<Vec<Float>>)<Vec<Float>> -> {
 
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
+    println(digest("streams2", streams2))
+    lines = lines + digest("mlp", mlp) + "\n" + digest("streams2", streams2) + "\n"
     match (open_write("native/out/l3tail_vyb.txt")) {
         f -> { write_str(f, lines); close(f) }
         ? -> { }
     }
-    println(digest("streams2", streams2))
-    lines = lines + digest("mlp", mlp) + "\n" + digest("streams2", streams2) + "\n"
 
     return streams2
 }

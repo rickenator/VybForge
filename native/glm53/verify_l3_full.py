@@ -48,6 +48,13 @@ def main():
     except FileNotFoundError:
         print("L3_FULL_VYB_MATCH: FAIL (no l3full_vyb.txt)")
         return 1
+    # The ffn site keeps its h2/mlp digests in the tail's line buffer; the driver writes
+    # them to l3tail_vyb.txt. Fold those in so every stage is covered.
+    try:
+        for k, d in parse(f"{OUT}/l3tail_vyb.txt").items():
+            v.setdefault(k, d)
+    except FileNotFoundError:
+        pass
     ok = True
     for stage, (gold_path, tol) in GOLD.items():
         if stage not in v:
