@@ -70,17 +70,21 @@ def main():
                  for p in ("gate_proj", "up_proj", "down_proj")}
 
     y = np.zeros_like(h2)
+    y_routed = np.zeros_like(h2)
     for t in range(h2.shape[0]):
         for lane in range(8):
             e = sel[t][lane]
             w = float(r_w[t][lane])
-            y[t] += w * moe_ref.ffn(h2[t:t + 1], ew[e]["gate_proj"], ew[e]["up_proj"],
-                                    ew[e]["down_proj"])[0]
+            contrib = moe_ref.ffn(h2[t:t + 1], ew[e]["gate_proj"], ew[e]["up_proj"],
+                                  ew[e]["down_proj"])[0]
+            y_routed[t] += w * contrib
+            y[t] += w * contrib
     y_shared = moe_ref.ffn(h2, *shared)
     y += y_shared
     np.save(f"{OUT}/gold_l3_shared.npy", y_shared)
 
     np.save(f"{OUT}/gold_l3_mlp.npy", y)
+    np.save(f"{OUT}/gold_l3_routed.npy", y_routed)
     np.save(f"{OUT}/gold_l3_route.npy", np.array(sel))
     np.save(f"{OUT}/gold_l3_rw.npy", r_w)
     meta = {"tokens": int(h2.shape[0]),

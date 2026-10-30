@@ -142,14 +142,30 @@ Against the P1 oracle: sq rel 8.4e-7, max rel 7.8e-5 (max abs ≈ 1.2e-5), abs r
 Two things worth knowing:
 - **`extern "C"` FFI declarations do not cross module boundaries.** `native/glm53/exl3_load.vyb`
   holds the cleaned-up version of this function, but importing it fails: the module's own
-  `share(all)` functions cannot see its `extern "C"` cu\* declarations ("Undefined
+  `share(all)` functions cannot see its `extern "C"` cu* declarations ("Undefined
   identifier: cuMemFree_v2"). The sanctioned route is `import cuda_binding` (Vyb's
-  `bindings/cuda`), which exposes alloc/free/module-load/launch but **no bulk host→device
-  copy**, so a 4 MB trellis currently uploads in 8-byte words (that is the 37 s). A bulk
-  copy in `cuda_binding` would make this fast and make the module importable — a Vyb-side
-  gap, not a VybForge one.
+  `bindings/cuda`), which until now had no bulk host→device copy — a 4 MB trellis had to go
+  through the driver's own externs instead. `cuda_binding.cuda_memcpy_h2d` now exists for
+  this (one call, any length). The 37 s this driver spends is *not* uploads: the trellis
+  already went bulk; it is the 8.4M-element digest loop plus the 67 MB download.
 - Reading a dequantized expert back to the host is 67 MB; the MoE should keep it on the
   device and gemm against it (the check driver downloads only to make a digest).
+
+## Layer 3's routed experts in Vyb — `make glm3exp` → L3_EXPERT_VYB: OK
+
+`native/host/glm_l3_expert_fwd.vyb` closes the expert path for one token: for each of its
+top-8 experts it dequantizes `gate_proj`/`up_proj`/`down_proj` from EXL3 **on the device**,
+runs the clamped SwiGLU FFN through the fp64 gemm kernel, and accumulates `w · y`.
+
+vs the gold's routed-only row for token 0 (experts 202, 149, 10, 205, 285, 20, 97, 252 at
+weights 0.925…0.064): abs rel 2.3e-5, sq rel 4.3e-5, max rel 8.1e-5, sum rel 1.6e-6
+(measured against the abs-sum, since the signed sum nearly cancels — |sum| is ~1/700 of
+abs-sum, and a gate that asks for 1e-4 on its own magnitude is measuring noise).
+
+Layer 3's ffn site is now fully covered by gated pieces: router (`L3_MOE_ROUTE_VYB`),
+shared expert (`L3_MOE_SHARED_VYB`), routed experts (`L3_EXPERT_VYB`), plus the weight path
+at real shape (`EXL3_LOAD_VYB`). The next run sweeps all 22 tokens (109 distinct experts,
+~8 min of dequant) to produce the complete `mlp` row-set and then the closing hc apply.
 
 ## Layer 3's MoE router + shared expert in Vyb — `make glm3moe` → both gates OK
 

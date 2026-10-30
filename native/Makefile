@@ -210,6 +210,12 @@ glm3x: $(ROOT)/native/build/exl3.ptx
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_exl3_check.vyb
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_exl3_load.py
 
+# P4 layer-3 routed experts: EXL3 dequant + clamped SwiGLU FFN per lane, token 0.
+glm3exp: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && eval $$(env -u PYTHONPATH $(PYORACLE) native/glm53/exp_env.py) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_expert_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_expert_vyb.py
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx
