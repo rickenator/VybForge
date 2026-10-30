@@ -108,6 +108,24 @@ deliberate bogus name reported MISSING on both sides. Resolution is ~40 s for a
 one-off batch (5 MB index scan + 3 header parses); shard opens must be cached per
 layer for the full 45-layer load.
 
+## Vyb-side loader (P4) — bytes to the device, gated
+
+Python `loader.py`/`kv_cache.py` stay the oracle; the runtime path is Vyb.
+**`native/host/gx_load_driver.vyb` + `native/glm53/gx_load_ref.py` → `GX_LOAD_MATCH: OK`**
+(`make -f native/Makefile gxload`): reads the byte range `gx` resolved, uploads the raw
+payload to the 3090 (`cuMemcpyHtoD_v2` straight from the Vyb String, no per-word loop),
+then reads three 8-byte words back from the device (first / 8-aligned middle / last) and
+compares them to the host bytes in-driver, so a lossy transfer fails here rather than in
+a kernel. 10 real tensors: 64 MB and 96 MB dense bodies, a 12-byte F32 buffer, the router
+table, a shared expert, a DSA `kv_b_proj`, EXL3 `trellis`/`suh` parts. The oracle parses
+the shards independently (header `data_offsets` + a plain file handle) and the listings
+must match byte for byte.
+
+Vyb gotchas hit here: no module-level constants (a string literal must live inside the
+function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2` takes
+the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
+`freedom { }` block as the other host drivers do.
+
 ## Layer 3 complete (Gate C) — the full layer matches HF
 
 `verify_layer3_attn.py` composes the ENTIRE layer 3 in numpy on the chained input

@@ -170,6 +170,13 @@ gx:
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_ref.py
 	cd $(ROOT) && cmp native/out/gx_listing_ref.txt native/out/gx_listing_vyb.txt && echo "GX_INDEX_MATCH: OK"
 
+# P4 loader step 1: resolved tensors -> shard bytes -> device memory, gated on the
+# three byte windows per tensor (host read) and on device readback (in Vyb).
+gxload:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 native/host/gx_load_driver.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_load_ref.py
+	cd $(ROOT) && cmp native/out/gx_load_ref.txt native/out/gx_load_vyb.txt && echo "GX_LOAD_MATCH: OK"
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx
