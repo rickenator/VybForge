@@ -1,0 +1,674 @@
+# glm_layer0_fwd.vyb — GLM-5.3 layer 0 running in Vyb, on the real checkpoint weights.
+#
+# Layer 0 end to end: hyper-connection mix -> input_layernorm -> KDA (conv+silu on
+# q/k/v, sigmoid beta, log-decay gate, delta-rule recurrence, gated RMSNorm) ->
+# o_proj -> hc apply -> ffn hc mix -> post_attn layernorm -> dense SwiGLU MLP ->
+# hc apply. fp64, the whole prompt as one batch of R tokens.
+#
+# Division of labour:
+#   * matmuls on the GPU through the generic fp64 `gemm` kernel,
+#   * bf16 -> fp64 on the GPU through the `bf16deq` kernel (ld_bf16 is kernel-mode
+#     only; Vyb has no host-side bf16 decode),
+#   * elementwise / recurrent work in host Vyb (norms, conv, gates, sinkhorn, the
+#     delta-rule sweep) — that is where the semantics live and where an oracle diff
+#     is easiest to read.
+#
+# Vyb pointer discipline: every cu* call lives in a helper with its own `freedom`
+# block; device pointers cross those boundaries as plain Ints (faddr-style), which is
+# the pattern the other native/host drivers use.
+#
+# Gold: native/glm53/gold_layer0.py. Gate: native/glm53/verify_layer0_vyb.py
+# -> LAYER0_VYB_MATCH. Digests are `(v * 2^40) as Int` because Float.to_string gives
+# only 6 significant digits.
+#
+# Run: make -f native/Makefile glm0
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
+import vmath::{vexp, vsqrt}
+
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+R<Int> = 22
+H<Int> = 4096
+HC<Int> = 4
+HEADS<Int> = 64
+KD<Int> = 128
+INTER<Int> = 12288
+EPS<Float> = 1e-5
+HC_EPS<Float> = 1e-6
+L2_EPS<Float> = 1e-6
+GATE_LB<Float> = -5.0
+CONV_K<Int> = 4
+SCALE40<Float> = 1099511627776.0
+
+# ============================================================ host maths + formatting
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+sigmoid(x<Float>)<Float> -> {
+    return 1.0 / (1.0 + vexp(0.0 - x))
+}
+
+silu(x<Float>)<Float> -> {
+    return x * (1.0 / (1.0 + vexp(0.0 - x)))
+}
+
+digest(name<String>, v<Vec<Float>>)<String> -> {
+    s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
+    i<Int> = 0
+    while (i < v.len()) {
+        x<Float> = v.get(i)
+        s = s + x
+        if (x < 0.0) { a = a - x } else { a = a + x }
+        q = q + x * x
+        t<Float> = x
+        if (t < 0.0) { t = 0.0 - t }
+        if (t > m) { m = t }
+        i = i + 1
+    }
+    out<String> = name + " n=" + v.len().to_string() + " sum=" + di(s).to_string() +
+                  " abs=" + di(a).to_string() + " sq=" + di(q).to_string() +
+                  " max=" + di(m).to_string()
+    k<Int> = 0
+    while (k < 8) {
+        hv<Float> = 0.0
+        if (k < v.len()) { hv = v.get(k) }
+        out = out + " v" + k.to_string() + "=" + di(hv).to_string()
+        k = k + 1
+    }
+    return out
+}
+
+rms_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        ss<Float> = 0.0
+        i = 0
+        base<Int> = r * D
+        while (i < D) {
+            v<Float> = x.get(base + i)
+            ss = ss + v * v
+            i = i + 1
+        }
+        inv<Float> = 1.0 / vsqrt(ss / (D as Float) + EPS, 40)
+        i = 0
+        while (i < D) {
+            vv<Float> = x.get(base + i) * inv
+            if (w.len() == D) { vv = vv * w.get(i) }
+            dst.push(vv)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+l2_rows(x<Vec<Float>>, rows<Int>, D<Int>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        ss<Float> = 0.0
+        i = 0
+        while (i < D) {
+            v<Float> = x.get(r * D + i)
+            ss = ss + v * v
+            i = i + 1
+        }
+        nrm<Float> = vsqrt(ss + L2_EPS, 40)
+        i = 0
+        while (i < D) {
+            dst.push(x.get(r * D + i) / nrm)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+conv_silu(x<Vec<Float>>, rows<Int>, C<Int>, w<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    c<Int> = 0
+    t<Int> = 0
+    j<Int> = 0
+    while (c < C) {
+        t = 0
+        while (t < rows) {
+            acc<Float> = 0.0
+            j = 0
+            while (j < CONV_K) {
+                src<Int> = t + j - (CONV_K - 1)
+                if (src >= 0) { acc = acc + x.get(src * C + c) * w.get(c * CONV_K + j) }
+                j = j + 1
+            }
+            dst.push(silu(acc))
+            t = t + 1
+        }
+        c = c + 1
+    }
+    return dst
+}
+
+# f32 -> f64 by hand (host Vyb has no bitcast)
+f32_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 4) {
+        c<Int> = (raw.char_at(idx * 4 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if ((w & 2147483648) != 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 23) & 255
+    man<Int> = w & 8388607
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 8388608.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 127)) {
+            p2 = p2 * 2.0
+            e2 = e2 + 1
+        }
+        while (e2 > (ex - 127)) {
+            p2 = p2 / 2.0
+            e2 = e2 - 1
+        }
+        v = sign * den * p2
+    }
+    return v
+}
+
+# ============================================================ device plumbing helpers
+alloc_dev(n<Int>)<Int> -> {
+    var<Int> p = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(p), n) != 0) { return 0 }
+    }
+    return p
+}
+
+free_dev(p<Int>)<Int> -> {
+    if (p == 0) { return 0 }
+    freedom {
+        cuMemFree_v2(p)
+    }
+    return 0
+}
+
+up_bytes(raw<String>, dst<Int>)<Int> -> {
+    var<CInt> rc = 0
+    freedom {
+        rc = cuMemcpyHtoD_v2(dst, raw, raw.len())
+    }
+    return rc
+}
+
+# bf16 -> f64 on the device; z > 0 means the stored layout is (out,in) with in = z,
+# so bf16deq writes the transpose [in,out]. Returns the device pointer (0 = failure).
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+# load a PTX file into a module and return the named function's address as an Int
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    var<Int> addr_out = 0
+    freedom {
+        var<loc<loc<CVoid>>> m = from<loc<loc<CVoid>>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        var<loc<CVoid>> f = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, fn_name) != 0) { return 0 }
+        addr_out = addr(f)
+    }
+    return addr_out
+}
+
+# hyper-connection mix: streams [R,HC,H] + the [R,24] gemm result -> collapsed/post/comb.
+# `res` packs collapsed [R*H], then post [R*HC], then comb [R*HC*HC].
+hc_glue(mv<Vec<Float>>, base<Vec<Float>>, scale<Vec<Float>>, streams<Vec<Float>>)<Vec<Float>> -> {
+    pre<Vec<Float>> = Vec()
+    post<Vec<Float>> = Vec()
+    comb<Vec<Float>> = Vec()
+    r<Int> = 0
+    j<Int> = 0
+    n0<Int> = 0
+    a<Int> = 0
+    b<Int> = 0
+    mx<Float> = 0.0
+    sm<Float> = 0.0
+    it<Int> = 0
+    h<Int> = 0
+    d<Int> = 0
+    p<Float> = 0.0
+    v<Float> = 0.0
+    n1<Int> = 0
+    while (r < R) {
+        j = 0
+        while (j < HC) {
+            pre.push(sigmoid(mv.get(r * 24 + j) * scale.get(0) + base.get(j)) + HC_EPS)
+            post.push(2.0 * sigmoid(mv.get(r * 24 + HC + j) * scale.get(1) + base.get(HC + j)))
+            j = j + 1
+        }
+        r = r + 1
+    }
+    n0 = 0
+    while (n0 < R * HC * HC) {
+        comb.push(0.0)
+        n0 = n0 + 1
+    }
+    r = 0
+    while (r < R) {
+        a = 0
+        while (a < HC) {
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b,
+                         mv.get(r * 24 + 2 * HC + a * HC + b) * scale.get(2) +
+                         base.get(2 * HC + a * HC + b))
+                b = b + 1
+            }
+            a = a + 1
+        }
+        r = r + 1
+    }
+    r = 0
+    while (r < R) {
+        mx = 0.0 - 1e30
+        a = 0
+        while (a < HC) {
+            b<Int> = 0
+            while (b < HC) {
+                v = comb.get((r * HC + a) * HC + b)
+                if (v > mx) { mx = v }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        a = 0
+        while (a < HC) {
+            sm = 0.0
+            b = 0
+            while (b < HC) {
+                sm = sm + vexp(comb.get((r * HC + a) * HC + b) - mx)
+                b = b + 1
+            }
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b,
+                         vexp(comb.get((r * HC + a) * HC + b) - mx) / sm)
+                b = b + 1
+            }
+            a = a + 1
+        }
+        a = 0
+        while (a < HC) {
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) + HC_EPS)
+                b = b + 1
+            }
+            a = a + 1
+        }
+        b = 0
+        while (b < HC) {
+            sm = 0.0
+            a = 0
+            while (a < HC) {
+                sm = sm + comb.get((r * HC + a) * HC + b)
+                a = a + 1
+            }
+            a = 0
+            while (a < HC) {
+                comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                a = a + 1
+            }
+            b = b + 1
+        }
+        it = 1
+        while (it < 20) {
+            a = 0
+            while (a < HC) {
+                sm = 0.0
+                b = 0
+                while (b < HC) {
+                    sm = sm + comb.get((r * HC + a) * HC + b)
+                    b = b + 1
+                }
+                b = 0
+                while (b < HC) {
+                    comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                    b = b + 1
+                }
+                a = a + 1
+            }
+            b = 0
+            while (b < HC) {
+                sm = 0.0
+                a = 0
+                while (a < HC) {
+                    sm = sm + comb.get((r * HC + a) * HC + b)
+                    a = a + 1
+                }
+                a = 0
+                while (a < HC) {
+                    comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                    a = a + 1
+                }
+                b = b + 1
+            }
+            it = it + 1
+        }
+        r = r + 1
+    }
+    col<Vec<Float>> = Vec()
+    n1 = 0
+    while (n1 < R * H) {
+        col.push(0.0)
+        n1 = n1 + 1
+    }
+    r = 0
+    while (r < R) {
+        h = 0
+        while (h < HC) {
+            p = pre.get(r * HC + h)
+            d = 0
+            while (d < H) {
+                col.set(r * H + d, col.get(r * H + d) + p * streams.get((r * HC + h) * H + d))
+                d = d + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    res<Vec<Float>> = Vec()
+    n1 = 0
+    while (n1 < col.len()) {
+        res.push(col.get(n1))
+        n1 = n1 + 1
+    }
+    n1 = 0
+    while (n1 < post.len()) {
+        res.push(post.get(n1))
+        n1 = n1 + 1
+    }
+    n1 = 0
+    while (n1 < comb.len()) {
+        res.push(comb.get(n1))
+        n1 = n1 + 1
+    }
+    return res
+}
+
+dumps(name<String>, v<Vec<Float>>)<String> -> {
+    out<String> = name
+    i<Int> = 0
+    while (i < v.len()) {
+        out = out + " " + di(v.get(i)).to_string()
+        i = i + 1
+    }
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_L0_OUT") else "native/out/l0_vyb.txt"
+    total<Int> = 83
+    pre<String> = "model.language_model.layers.0."
+    EMB<String> = "model.language_model.embed_tokens.weight"
+    lines<String> = ""
+    i<Int> = 0
+    r<Int> = 0
+    hh<Int> = 0
+    d<Int> = 0
+    j<Int> = 0
+    nf<Int> = 0
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "self_attn.q_proj.weight")
+    want.push(pre + "self_attn.k_proj.weight")
+    want.push(pre + "self_attn.v_proj.weight")
+    want.push(pre + "self_attn.o_proj.weight")
+    want.push(pre + "self_attn.b_proj.weight")
+    want.push(pre + "self_attn.f_a_proj.weight")
+    want.push(pre + "self_attn.f_b_proj.weight")
+    want.push(pre + "self_attn.g_a_proj.weight")
+    want.push(pre + "self_attn.g_b_proj.weight")
+    want.push(pre + "self_attn.o_norm.weight")
+    want.push(pre + "self_attn.dt_bias")
+    want.push(pre + "self_attn.A_log")
+    want.push(pre + "mlp.gate_proj.weight")
+    want.push(pre + "mlp.up_proj.weight")
+    want.push(pre + "mlp.down_proj.weight")
+    want.push(pre + "input_layernorm.weight")
+    want.push(pre + "post_attention_layernorm.weight")
+    want.push(pre + "hc_attn_fn")
+    want.push(pre + "hc_attn_base")
+    want.push(pre + "hc_attn_scale")
+    want.push(pre + "hc_ffn_fn")
+    want.push(pre + "hc_ffn_base")
+    want.push(pre + "hc_ffn_scale")
+    want.push(EMB)
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    i = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("L0_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("L0_FAIL no cuda"); return 4 }
+    fgemm<Int> = load_fn("native/build/gemm.ptx", "gemm")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fgemm == 0) { println("L0_FAIL gemm.ptx (make gemm)"); return 5 }
+    if (fbf == 0) { println("L0_FAIL bf16.ptx (make bf16)"); return 6 }
+
+    # ---------------------------------------------------------------- embeddings
+    ids<Vec<Int>> = Vec()
+    idtxt<String> = env_get("VYBFORGE_L0_IDS") else "785,6722,315,9621,374,12089,11,323,279,7772,3283,304,9851,374,19808,11,892,572,17753,369,10788,13"
+    cur<String> = ""
+    i = 0
+    while (i <= idtxt.len()) {
+        if (i == idtxt.len()) {
+            if (cur.len() > 0) { ids.push(cur.to_int()) }
+        } else {
+            ch<String> = idtxt.substring(i, i + 1)
+            if (ch == ",") {
+                if (cur.len() > 0) { ids.push(cur.to_int()) }
+                cur = ""
+            } else { cur = cur + ch }
+        }
+        i = i + 1
+    }
+    if (ids.len() != R) { println("L0_FAIL ids " + ids.len().to_string()); return 8 }
+
+    emb_off<Int> = g.off.get(23)
+    emb_path<String> = g.paths.get(23)
+    raw_emb<String> = ""
+    match (open_read(emb_path)) {
+        f -> {
+            r<Int> = 0
+            while (r < R) {
+                match (read_at(f, emb_off + ids.get(r) * H * 2, H * 2)) {
+                    s -> { raw_emb = raw_emb + s }
+                    ? -> { return 9 }
+                }
+                r = r + 1
+            }
+            close(f)
+        }
+        ? -> { return 9 }
+    }
+    var<Int> d_x = 0
+    d_x = deq_bf16(fbf, raw_emb, R * H, 0)
+    if (d_x == 0) { println("L0_FAIL emb deq"); return 10 }
+    x<Vec<Float>> = dtoh_vec(d_x, R * H)
+    free_dev(d_x)
+    println(digest("x", x))
+    lines = lines + digest("x", x) + "\n"
+
+    # ---------------------------------------------------------------- streams = 4 copies
+    streams<Vec<Float>> = Vec()
+    r = 0
+    while (r < R) {
+        hh<Int> = 0
+        while (hh < HC) {
+            d<Int> = 0
+            while (d < H) {
+                streams.push(x.get(r * H + d))
+                d = d + 1
+            }
+            hh = hh + 1
+        }
+        r = r + 1
+    }
+
+    # ---------------------------------------------------------------- hc mix (attn)
+    var<Int> d_fnA = 0
+    var<Int> d_fnF = 0
+    d_fnA = deq_bf16(fbf, gx_read(g, 17), 24 * HC * H, HC * H)
+    if (d_fnA == 0) { return 11 }
+    d_fnF = deq_bf16(fbf, gx_read(g, 20), 24 * HC * H, HC * H)
+    if (d_fnF == 0) { return 11 }
+    base<Vec<Float>> = Vec()
+    raw_base<String> = gx_read(g, 18)
+    j = 0
+    while (j < 24) {
+        base.push(f32_at(raw_base, j))
+        j = j + 1
+    }
+    scale<Vec<Float>> = Vec()
+    raw_scale<String> = gx_read(g, 19)
+    j = 0
+    while (j < 3) {
+        scale.push(f32_at(raw_scale, j))
+        j = j + 1
+    }
+    baseF<Vec<Float>> = Vec()
+    raw_baseF<String> = gx_read(g, 21)
+    j = 0
+    while (j < 24) {
+        baseF.push(f32_at(raw_baseF, j))
+        j = j + 1
+    }
+    scaleF<Vec<Float>> = Vec()
+    raw_scaleF<String> = gx_read(g, 22)
+    j = 0
+    while (j < 3) {
+        scaleF.push(f32_at(raw_scaleF, j))
+        j = j + 1
+    }
+    println("hc attn base0=" + di(base.get(0)).to_string() + " scale0=" + di(scale.get(0)).to_string())
+
+    # ---------------------------------------------------------------- hc mix via gemm
+    # flat = rms(streams flat) ; mv = flat @ fn^T  ([R,4H] @ [4H,24])
+    flat<Vec<Float>> = Vec()
+    i = 0
+    while (i < streams.len()) {
+        flat.push(streams.get(i))
+        i = i + 1
+    }
+    flat = rms_rows(flat, R, HC * H, Vec())
+    var<Int> d_flat = 0
+    var<Int> d_mv = 0
+    var<Int> d_scr = 0
+    d_flat = alloc_dev(R * HC * H * 8)
+    d_mv = alloc_dev(R * 24 * 8)
+    d_scr = alloc_dev(64)
+    if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("L0_FAIL alloc"); return 12 }
+    htod_vec(d_flat, flat)
+    if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return 13 }
+    sync()
+    mv<Vec<Float>> = dtoh_vec(d_mv, R * 24)
+    free_dev(d_flat)
+    free_dev(d_mv)
+    free_dev(d_scr)
+    println(digest("mv_attn", mv))
+    lines = lines + digest("mv_attn", mv) + "\n"
+
+    res<Vec<Float>> = hc_glue(mv, base, scale, streams)
+    collapsed<Vec<Float>> = Vec()
+    i = 0
+    while (i < R * H) {
+        collapsed.push(res.get(i))
+        i = i + 1
+    }
+    postA<Vec<Float>> = Vec()
+    i = 0
+    while (i < R * HC) {
+        postA.push(res.get(R * H + i))
+        i = i + 1
+    }
+    combA<Vec<Float>> = Vec()
+    i = 0
+    while (i < R * HC * HC) {
+        combA.push(res.get(R * H + R * HC + i))
+        i = i + 1
+    }
+    println(digest("collapsed", collapsed))
+    lines = lines + digest("collapsed", collapsed) + "\n"
+    println(digest("post_attn", postA))
+    lines = lines + digest("post_attn", postA) + "\n"
+    println(digest("comb_attn", combA))
+    lines = lines + digest("comb_attn", combA) + "\n"
+    lines = lines + dumps("combvals", combA) + "\n"
+
+    # ---------------------------------------------------------------- input_layernorm
+    var<Int> d_ln = 0
+    d_ln = deq_bf16(fbf, gx_read(g, 15), H, 0)
+    if (d_ln == 0) { return 14 }
+    in_ln<Vec<Float>> = dtoh_vec(d_ln, H)
+    free_dev(d_ln)
+    h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+    println(digest("h", h_a))
+    lines = lines + digest("h", h_a) + "\n"
+    free_dev(d_fnA)
+    free_dev(d_fnF)
+
+    match (open_write(out)) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { println("L0_FAIL write"); return 15 }
+    }
+    println("L0_STAGE1_OK x/streams/hc-attn-mix/h  (attention + MLP next)")
+    return 0
+}

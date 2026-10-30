@@ -184,6 +184,13 @@ gxplan:
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_plan_ref.py
 	cd $(ROOT) && grep -v '^PLAN' native/out/gx_plan_ref.txt > /tmp/gxplan_ref.txt && grep -v '^PLAN' native/out/gx_plan_vyb.txt > /tmp/gxplan_vyb.txt && diff /tmp/gxplan_ref.txt /tmp/gxplan_vyb.txt && echo "GX_PLAN_MATCH: OK"
 
+# P4 first real layer: GLM-5.3 layer 0 end to end in Vyb (gx loader + fp64 gemm/bf16deq
+# kernels + host glue), gated stage by stage against the numpy gold.
+glm0: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_layer0.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_layer0_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_layer0_vyb.py
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx

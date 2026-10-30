@@ -126,6 +126,38 @@ function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2
 the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
 `freedom { }` block as the other host drivers do.
 
+## Layer 0 in Vyb — first half gated (`make glm0` → LAYER0_VYB_MATCH: OK, 6/6 stages)
+
+`native/host/glm_layer0_fwd.vyb` runs the start of a real GLM layer inside Vyb on the
+actual checkpoint: token embeddings → 4-wide hyper-connection streams → hc mix
+(`flat @ fn^T` on the GPU, sinkhorn on the host) → `input_layernorm`. No Python in the
+path: tensors are resolved by `gx`, dequantised bf16→f64 by the `bf16deq` kernel, all
+matmuls are the generic fp64 `gemm` kernel, and the elementwise/recurrent work is host
+Vyb.
+
+Verified stage by stage against `native/glm53/gold_layer0.py` (numpy fp64, same tokens,
+same weights) with 22 real tokens:
+
+| stage | rel diff (sum / sq / max) |
+|---|---|
+| x (embeddings) | 0 / 0 / 0 — bf16→f64 is exact |
+| mv_attn (hc gemm) | 7e-15 / 6e-16 / 0 |
+| collapsed | 2.6e-12 / 1e-12 / 0 |
+| post_attn | 3.3e-12 / 2.7e-12 / 5e-13 |
+| comb_attn | 3e-12 / 6.9e-5 / 0 (≤3e-4 absolute per entry — see below) |
+| h | 1.8e-12 / 2.6e-12 / 1.8e-12 |
+
+`comb` is the only stage with slack, and for a physical reason: its 20 alternating
+row/column normalisations amplify `vmath`'s ~1e-9 `exp` error in rows whose weights are
+very skewed (0.90 / 0.12 / 0.001), so entries agree to ~3e-4 absolute instead of 1e-12.
+The gate states that tolerance explicitly rather than hiding it; a higher-precision
+exp for this one softmax is the clean fix later.
+
+Still to add to the driver (same structure, same gate): KDA attention (conv+silu on
+q/k/v, sigmoid beta, log-decay gate, delta-rule recurrence, gated RMSNorm, o_proj), hc
+apply, the ffn hc mix + post-attn norm, and the dense SwiGLU MLP. `gold_layer0.py`
+already emits those targets (`gold_l0_attn/h2/mlp/streams2.npy`).
+
 ## Loader performance: three substrate hot spots fixed (measured, not guessed)
 
 The first version of this path was ~300x too slow to load a 163.6 GiB checkpoint. Each
