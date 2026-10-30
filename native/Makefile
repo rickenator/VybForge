@@ -198,6 +198,12 @@ glm3: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_attn_fwd.vyb
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_vyb.py
 
+# P4 layer-3 MoE: router + shared expert in Vyb (routed experts need the exl3 pipeline).
+glm3moe: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_moe_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_moe_vyb.py
+
 # P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
 # against exllamav3's own routing reference in verify_moe.py).
 moe: $(ROOT)/native/build/moe.ptx

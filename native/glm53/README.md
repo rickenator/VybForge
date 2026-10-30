@@ -126,6 +126,23 @@ function), there is no `Int.to_char` (slice `"0123456789abcdef"`), `cuMemFree_v2
 the device pointer value, not `loc(ptr)`, and the ctx/alloc loop belongs inside one
 `freedom { }` block as the other host drivers do.
 
+## Layer 3's MoE router + shared expert in Vyb — `make glm3moe` → both gates OK
+
+`native/host/glm_l3_moe_fwd.vyb` runs the ffn site's front half on real weights: the router
+(sigmoid scores, selection-only `e_score_correction_bias`, top-8, renorm ×2.5) and the
+clamped shared expert (`min(gate,10)`, `clamp(up,±10)`, silu·u @ down).
+
+- `L3_MOE_ROUTE_VYB: OK` — **22/22 tokens select the identical top-8 expert set**, weights
+  agree to 2.1e-10. This matters more than it looks: the routing gate in `verify_layer3_moe`
+  measured a 335 % output change for ONE bf16 ulp on h2, i.e. selection is chaotic — the Vyb
+  router reproduces numpy's selection exactly on all 22 tokens, not merely "close".
+- `L3_MOE_SHARED_VYB: OK` — shared-expert output 1.5e-11 relative.
+
+Still missing at this site: the 109 routed experts these 22 tokens touch (EXL3-packed,
+4 bpw). That needs the P1 `exl3` dequant pipeline lifted into a reusable Vyb function
+(today it lives inside `native/exl3/exl3_driver.vyb` for a single fixture tensor), after
+which the expert FFN can reuse the same gemm calls as the shared expert.
+
 ## Layer 3's DSA attention in Vyb — `make glm3` → L3_ATTN_VYB_MATCH: OK
 
 The first Vyb code for the sparse-attention path (11 of the 45 layers):
