@@ -25,3 +25,6 @@ native/gguf/qwen3-4b-head.bin
 # generated legitimization receipts
 native/legit/receipts/
 native/glm53/layer0/*.bin
+
+# loader gate canonical-dequant caches (50 MB, rebuilt from fixtures)
+native/glm53/prep/*golden*
