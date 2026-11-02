@@ -191,6 +191,12 @@ glm0: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_layer0_fwd.vyb
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_layer0_vyb.py
 
+# P4 decode: single-token layer-0 step decode, state carried (KDA recurrence + conv rings),
+# gated against the step-decode oracle's two teacher-forced steps.
+decstep: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_decode_step.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_step_vyb.py
+
 # P4 second real layer piece: layer 3's DSA attention (gpool indexer + masked MLA +
 # o_proj) in Vyb, on the layer-3 input chained through layers 0-2 in numpy.
 glm3: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
