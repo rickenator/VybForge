@@ -77,11 +77,22 @@ gx_shard_for(index<String>, name<String>)<Int> -> {
 }
 
 # Resolve every wanted name: index -> shard -> header -> byte range.
+#
+# st_open() parses one shard's header (~8 ms, 1185 tensors). Opening it per NAME was
+# 9 opens (73 ms) per expert resolve -> 8 s per MoE layer and ~1.2 GB of retained header
+# structs per layer in the 45-layer prefill. Names are shard-ordered, so keep the last
+# opened header and reopen only when the shard changes.
 share(all)
 gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    return gx_resolve_idx(gx_read_index(dir), dir, total, want)
+}
+
+# Same resolution with the index text already in hand. A hot loop that resolves many batches
+# (one per expert) was re-reading and re-parsing the 15.5 MB index every call: hold it once.
+share(all)
+gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
     g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
                        dts = Vec(), paths = Vec() }
-    index<String> = gx_read_index(dir)
     i<Int> = 0
     for (i in 0..want.len() - 1) {
         g.found.push(0)
@@ -92,14 +103,19 @@ gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
         g.dts.push("")
         g.paths.push("")
     }
+    lastsh<Int> = 0
+    ix<StIndex> = st_open("")
     w<Int> = 0
     while (w < want.len()) {
         sh<Int> = gx_shard_for(index, want.get(w))
         if (sh > 0) {
-            path<String> = gx_shard_path(dir, sh, total)
-            ix<StIndex> = st_open(path)
+            if (sh != lastsh || ix.n == 0) {
+                path<String> = gx_shard_path(dir, sh, total)
+                ix = st_open(path)
+                lastsh = sh
+            }
             if (ix.n > 0) {
-                t<Int> = st_find(ix, want.get(w))
+                t<Int> = st_find(view(ix), want.get(w))
                 if (t >= 0) {
                     g.found.set(w, 1)
                     g.shard.set(w, sh)
@@ -107,7 +123,7 @@ gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
                     g.off.set(w, ix.data_base + ix.doff.get(t))
                     g.nbytes.set(w, ix.dlen.get(t))
                     g.dts.set(w, ix.dtypes.get(t))
-                    g.paths.set(w, path)
+                    g.paths.set(w, ix.path)
                 }
             }
         }

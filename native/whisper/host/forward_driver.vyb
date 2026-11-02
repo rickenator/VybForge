@@ -80,7 +80,7 @@ bulk(data<String>, dst<Int>, nbytes<Int>)<Int> -> {
 
 // Bring a named f32 tensor from the checkpoint into a device buffer as raw bytes.
 load_f32_raw(path<String>, ix<StIndex>, name<String>, dst<Int>)<Int> -> {
-    idx<Int> = st_find(ix, name)
+    idx<Int> = st_find(view(ix), name)
     if (idx < 0) {
         println("MISSING tensor " + name)
         return 0
@@ -118,7 +118,7 @@ pi(pp<Int>, off<Int>, v<Int>)<Int> -> {
 // host string to copy a tensor that lives on the device.
 widen_chunked(ckpt<String>, ix<StIndex>, name<String>, N<Int>, dOut<Int>, RAW<Int>,
               ford<Int>, PK<Int>)<Int> -> {
-    idx<Int> = st_find(ix, name)
+    idx<Int> = st_find(view(ix), name)
     if (idx < 0) {
         println("MISSING tensor " + name)
         return 1
@@ -761,7 +761,7 @@ main()<Int> -> {
     # the operand layout the tied head needs: loading it once in that form means
     # the gather reads it with one index change instead of a second 159 MB copy.
     # Chunked over the input rows (5187 x 384 f32 = 7.97 MB per piece).
-    tidx<Int> = st_find(ix, "model.decoder.embed_tokens.weight")
+    tidx<Int> = st_find(view(ix), "model.decoder.embed_tokens.weight")
     if (tidx < 0) { println("MISSING token table"); return 68 }
     tbase<Int> = ix.data_base + ix.doff.get(tidx)
     trow<Int> = 0

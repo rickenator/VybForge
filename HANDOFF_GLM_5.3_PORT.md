@@ -20,7 +20,7 @@ weights (see §8).
 | loader (83 shards, 164 GB, 150,226 tensors) | gated, 2.3 s for the whole plan |
 | layer 0 (KDA attention + dense MLP) | gated, every stage ≤6e-11 |
 | layer 3 (DSA attention + router + MoE + shared + hc) | **L3_FULL_VYB_MATCH: OK**, all six stages |
-| full 45-layer prefill | **runs to completion**, `PREFILL_OK layers=45`, 5697 s, peak RSS 53.6 GB |
+| full 45-layer prefill | **runs to completion**, `PREFILL_OK layers=45`, **914 s (15:14), peak RSS 7.1 GB** — was 5697 s / 53.6 GB; see §6 |
 | KV cache / decode | not started |
 | TP=2 across the Sparks | not started |
 | endpoint | not started; `verify_full_forward.py` is still a stub |
@@ -184,49 +184,121 @@ top-k is 2048 while the router wants top-8, so defining `TOPK` once made the rou
 ran the expert path hundreds of extra times and OOM-killed the driver). The router constant
 is `ROUTE_TOPK`.
 
+Two more driver-level root causes were found and fixed later, both measured: the per-element
+`htod_vec`/`dtoh_vec` copy path in `native/tensor/tensor.vyb` (now `bulk_htod`/`bulk_dtoh`),
+and `gx_resolve` calling `st_open` once per wanted name instead of once per shard. See §6 —
+those two were 4.3x of wall time and 7.8x of peak RSS on the 45-layer prefill.
+
 ---
 
 ## 6. Performance — measured, and what it means
 
-45-layer prefill, 22 tokens, 3090: **5697 s (95 min), peak RSS 53.6 GB**. ~259 s/token.
-DSA layers dominate (~210 s each); KDA layers are much cheaper.
+45-layer prefill, 22 tokens, 3090: **914 s (15:14), peak RSS 7.1 GB** after the fixes below.
+The progression, each step verified value-identical at all 45 layers: 5697 s (as written) ->
+1315 s (bulk DMA + shard-header cache) -> 908-914 s (deq scale/map bulk copies, `st_find` borrow,
+index hoist). 6.2x total; the last three micro-fixes moved the layer-3 driver from 16.4 s to
+13.5 s but are within noise at 45 layers, because the drift described at the end of this section
+dominates at depth. Per-layer digests are identical to the pre-fix run at every layer
+(max|stream| 0.059 / 2.653 / 9.405 / 24.151 / 27.072 / 47.781 / 290.367 on layers 0/3/10/18/29/43/44),
+so both fixes are value-exact.
 
-Per-expert profile inside a MoE layer (layer 3):
+**The old profile blamed the fp64 gemm. It was the copy path.** Instrumented layer 3 (the
+`T_*` prints in `native/host/glm_l3_full.vyb`), milliseconds:
 
-    resolve (gx_resolve)      89 ms
-    deq (3 matrices)          93 ms      ← bulk DMA, fine
-    gemms + host math        212 ms
+| phase | before | after |
+|---|---|---|
+| indexer deq (4 bf16 tensors) | 12 | 6 |
+| `mm_host` qidx / kraw / gsc / wproj | 522 / 328 / 330 / 322 | 2 / 1 / 1 / 1 |
+| uk/uv build + K/V gemms ("pool_sel 62 s" in the old note) | 64 540 | 171 |
+| poolk / index scores / selection | 1 / 0 / 0 | 1 / 0 / 0 |
+| masked MLA | 18 | 18 |
+| o_proj | 1596 | 16 |
+
+Two root causes, both now fixed:
+
+1. **`htod_vec`/`dtoh_vec` in `native/tensor/tensor.vyb` moved one 8-byte element per
+   `cuMemcpy`.** ~4 us of driver overhead per element: a 90k-element activation upload cost
+   330 ms and the 16.7M-element `kv_b` download cost ~60 s. `bulk_htod` / `bulk_dtoh` use
+   `addr(v)` — a `Vec<Float>` is `{data ptr, size, cap}`, so the first word of the header is
+   the element buffer — and move the whole buffer in one call. `bulk_htod` takes
+   `their<Vec<Float> const>` and is called as `view(x)`: a by-value Vec parameter would
+   deep-copy 134 MB before the copy even started. All 26 call sites in `glm_l3_full.vyb` and
+   `glm_prefill.vyb` now use the bulk form.
+2. **`gx_resolve` called `st_open` once per wanted NAME** (`native/glm53/gx.vyb`): 9 header
+   parses (8 ms each) per expert resolve, and the `StIndex` structs accumulated — that was the
+   "residual ~1.2 GB/layer". Each expert is resolved once per layer, 109 experts per MoE layer,
+   so it cost ~8 s/layer and the growth that made late layers 2.5x slower than early ones.
+   Now the last opened header is kept and reopened only when the shard changes: one 9-name
+   resolve went 98 ms -> 18 ms and 100 resolves 9.85 s/1.18 GB -> 1.84 s/0.22 GB.
+
+Result: the prefill's per-layer time is flat (~23 s/layer) instead of rising, and RSS peaks at
+6.9 GB — small enough that a KV cache now fits on the 3090 box.
+
+Per-expert profile inside a MoE layer, before these fixes (still useful for what remains):
+
+    resolve (gx_resolve)      89 ms   -> ~10 ms (fixed: header reuse)
+    deq (3 matrices)          93 ms      bulk DMA, fine
+    gemms + host math        212 ms      mostly gone: mm_host was per-element DMA
     ────────────────────────────────
     ~380 ms/expert × 109 = ~42 s/layer of the ~210 s
 
-Attention site inside the same layer:
+Two more, same class, found by instrumenting the MoE layer the same way (layer 3, 109 routed
+experts, milliseconds per layer):
 
-    proj_qk (q_a/q_b/kv_a)     0.7 s
-    indexer_proj              76 s
-    pool_sel (gpool + top-k)  62 s
-    masked MLA **0.018 s**    ← the actual attention is free
+| phase | before | after |
+|---|---|---|
+| resolve (`gx_resolve` per expert) | 2346 | 1418 at ONE layer / 2355-4700 per layer at depth — see 4. |
+| deq pipeline (9 tensors) | 9013 | 6843 |
+| the three gemms | 228 | 232 |
+| gather / SwiGLU / scatter host math | 3 | 7 |
 
-So the GPU is idle and the time is in (a) the fp64 gemm kernel's memory access pattern and
-(b) Vyb host loops. Two concrete observations to start from:
+3. **The EXL3 map body and both fp16 scale vectors were uploaded 8 bytes at a time** inside
+   `exl3_deq` — 1536 `cuMemcpyHtoD` calls per matrix, ~3.3 s per MoE layer. Both are Strings, so
+   each is now ONE copy (`cuMemcpyHtoD_v2(sud, suh, nsuh)`); the lengths are hoisted out of the
+   `freedom` block because `.len()` on an outer String is not readable inside one.
+4. **Tried: `gx_resolve` once per layer for all 288 experts' 2592 names** (indexed with
+   `i0 = e * 9`). It is 40% cheaper at a single layer (1418 ms vs 2346 ms) and gives identical
+   digests, **but it does not hold at depth**: in the 12-layer prefill the resolve term grew
+   ~1 s per layer (1.7 -> 9.5 s by layer 11, measured), and the full 45-layer run went from
+   21:55 to 25:53. Per-expert resolution also drifts but only ~0.3 s/layer. String churn is the
+   suspected mechanism (a 2592-entry `Vec<String>` per layer vs 109 short-lived 9-name ones);
+   it is a compiler/runtime question, not a driver one. **Reverted in the prefill**
+   (`glm_prefill.vyb`), kept in the single-layer gate driver (`glm_l3_full.vyb`) where it is a
+   straight win. This is the one change here that was measured, looked good, and was undone.
 
-- Inside `indexer_proj` the individually timed calls (`deq_bf16` ×4 ≈ 8 ms, `mm_qidx`
-  0.5 s, `mm_wproj` 0.3 s, `ln_rows` ~0) sum to ~1 s, yet the block reports **76 s**. The
-  time is therefore in the untimed `mm_host(kraw)` / `mm_host(gsc)` and the `dtoh_vec`s, or
-  in deferred GPU work being flushed at the first sync — i.e. **the fp64 gemm kernel is the
-  suspect**. It is one-thread-per-output with strided f64 reads: for M=22, K=1536, N=4096 it
-  moves ~1.1 GB uncoalesced. Do not trust intuition here — instrument those two calls first.
-- `pool_sel` is 62 s of Vyb host loops over 2048 pool columns per query; that is
-  pointer-chasing Vyb code, the worst shape for a 273 GB/s unified-memory part.
+5. **Two more, after the reverted experiment, both kept:**
+   - `st_find` took `StIndex` BY VALUE, so every name lookup deep-copied the shard header
+     (~1185 names + six Vecs). Resolving one expert's 9 tensors was 9 header copies. It now
+     takes `their<StIndex const>` and is called as `view(ix)`: layer 3's resolve went
+     1450 -> 801 ms. Call sites updated: `native/glm53/gx.vyb`, `native/whisper/host/forward_driver.vyb`.
+   - The 15.5 MB index was re-read and re-parsed for every expert. `gx_resolve` now delegates to
+     `gx_resolve_idx(index, ...)`, and the prefill's MoE loop reads the index once per layer:
+     ~200-500 ms/layer, small but free.
 
-Levers, in the order the evidence supports:
+   Neither fixes the **drift**: resolve still rises ~250 ms per layer (1866 ms at layer 3 ->
+   4160 ms at layer 11 in the 12-layer test), while deq/mm stay flat and the digests stay
+   identical. At this point the evidence is that String-heavy code slows down as the process
+   ages (fewer strings created does not help, borrowed params do not help, one big resolve does
+   not help) — i.e. the String registry / allocator, not the driver. That needs a Vyb-side
+   experiment, and Vyb is the implementation agent's territory.
 
-1. **f32 instead of f64** through dequant + hadamard + gemm. Halves write traffic, and the
-   3090's fp64 rate is 1/64 of fp32 (GB10's is weak too), so a tiled f32 gemm is the single
-   biggest win on both machines. `native/kernels/gemm32_probe.vyb` exists as a starting point.
-2. **Kernelize `pool_sel`** (pooling + top-k) — removes host loops entirely.
-3. Cache dequantized experts across decode steps (only worth it once decode exists; 288
-   experts × 67 MB in f64 does not fit a 3090, 9.6 GB in f32 does not fit either — so this
-   is a TP=2 / Spark-memory decision, not a 3090 one).
+Finally, the deq itself: instrumented per stage, one matrix costs deq 1.0 ms, hgen 0.0 ms,
+**had1 8.0 ms, had2 8.2 ms** — so the two Hadamard passes are 5.3 s of a ~8.7 s MoE layer, and
+they are fp64. **That, not the gemm, is the next speed lever**: the gemm pair is 232 ms/layer
+(0.7 ms per expert), so wiring `gemm32_p` into `mm_host` would buy ~2%, while an f32
+deq/hadamard path is where the remaining time actually is. f32 also halves the 8-byte-per-element
+writes on a bandwidth-starved Spark.
+
+Layer-3 driver after all of this: 16.4 s -> 13.5 s, `L3_FULL_VYB_MATCH` unchanged at
+streams2 abs 3.32e-06.
+
+**The biggest remaining item is the growth, not the arithmetic.** Across the 45-layer run the
+per-layer `gx_resolve` term drifts from 2.3 s (layer 3) to 12.2 s (layer 44) while deq/mm stay
+flat, so at layer 44 resolve is ~half the layer. It is the same String-churn shape that made the
+resolve-all variant lose; anything that touches how names/index/headers are handled per layer
+should be measured over 12+ layers, never on one. A Vyb runtime question (String registry live
+count / Vec<String> release) is the plausible root, and it is worth one focused experiment
+before more driver-level tuning.
 
 ---
 
@@ -239,9 +311,8 @@ Levers, in the order the evidence supports:
   `systemd-run --user --scope -q -p MemoryMax=80G --unit=<name> bash -c '<cmd>'`.
 - `malloc_trim(0)` once per layer is worth keeping (EXL3 trellis churn retains ~0.5-0.8 GB
   per layer in allocator arenas) but it is not a substitute for the leak fix.
-- Residual growth after the leak fix is ~0.6-1.2 GB/layer; 45 layers peak at 53.6 GB. Suspects:
-  `gx_resolve`'s per-expert `st_open` and the `mm_host` download Vecs. It fits 80 GB but will
-  not fit 80 GB plus a KV cache, so it is worth another pass before decode.
+- Residual growth after the leak fix is **gone**: the ~1.2 GB/layer was `gx_resolve` retaining a
+  parsed `StIndex` per wanted name (§6). The 45-layer peak is now 6.9 GB, so a KV cache fits.
 
 ---
 
@@ -273,18 +344,59 @@ conversion and kernelized `pool_sel` matter more on the Sparks than on the 3090.
 
 ## 9. Next steps, in order
 
-1. **Instrument `mm_host(kraw)` / `mm_host(gsc)` and the `dtoh_vec`s in `indexer_proj`** to
-   pin the 76 s (suspicion: the fp64 gemm kernel). Then replace the gemm with a tiled f32
-   kernel and re-run `make glm3full` — `L3_FULL_VYB_MATCH` must stay OK.
-2. **Kernelize `pool_sel`** (62 s/layer): the gpool pooling and top-k over 2048 columns.
-   Same gate must stay green.
-3. **Unblock the Spark weights** (§8), then run `VYBFORGE_NLAYERS=4` there and record the
-   real per-phase numbers; re-plan speed work against those.
+**Done since this was written:** the layer-3 profile (the 76 s / 62 s attribution was wrong — it
+was the per-element copy path), the bulk-copy fix, the `gx_resolve` header-reuse fix, and the
+45-layer re-run at 1315 s / 6.9 GB. Details in §6.
+
+1. **Unblock the Spark weights** (§8), then run `VYBFORGE_NLAYERS=4` there and record the real
+   per-phase numbers; re-plan speed work against those. This is now the cheapest real work
+   available and it is blocked on access, not code.
+2. **The per-layer `gx_resolve` growth** (§6): 2.3 s at layer 3 -> 12.2 s at layer 44, ~40% of a
+   late layer, while deq and the gemms stay flat. Same String-churn family as the resolve-all
+   regression, so it is one experiment in the Vyb runtime (String registry live count /
+   `Vec<String>` release) rather than more driver tuning. Measure over 12+ layers.
+3. **f32 in the EXL3 deq + Hadamard path** — after the growth this is the next lever (had1+had2
+   = 5.3 s of a ~8.7 s MoE layer, all fp64; the gemms are 232 ms). The 3090's fp64 rate is 1/64
+   of fp32 and GB10's is weak too, and f32 halves the writes. Gate: `L3_FULL_VYB_MATCH` must
+   stay OK (tolerance for mlp/streams is 2e-4, so f32's ~1e-6 is not the risk — the risk is the
+   `deq -> had1 -> had2 -> gemm` dtype plumbing, so add an f32 gemm at the same time).
 4. **KV cache + one-token decode.** Prefill needs no cache (at S=22 each attention sees the
-   whole prompt); generation does. `native/glm53/kv_cache.py` is the reference sketch.
+   whole prompt); generation does. `native/glm53/kv_cache.py` is the reference sketch and the
+   `rdelta*` kernels already carry the KDA recurrence — what is missing is carrying the
+   per-layer KDA state and the DSA latent/indexer keys across steps.
+
+   **The step-decode oracle now exists** (`native/glm53/gold_decode_step.py`, layer 0 =
+   KDA + dense MLP + both hc sites). It threads the two pieces of state the batched gold throws
+   away: the KDA recurrence (64x128x128 per layer) and the k=4 depthwise conv, which needs the
+   last 3 PRE-CONV vectors per channel for q, k and v (a ring buffer, not a scalar carry).
+   Self-gates, both printed by the run:
+     conv_step_vs_batch                        max_abs 0.0            (the ring order is the check)
+     stepwise walk vs gated gold_l0_streams2    max_abs 1.388e-16      (fp64 noise)
+   so the per-token path IS the gated layer-0 math. It also emits 2 teacher-forced decode steps
+   (token ids 13, 10788 = the prompt's last two) with `gold_dec_step{0,1}_{streams2,attn,mlp}.npy`
+   and `gold_decode.json`. Next unit: a Vyb driver (`native/host/glm_decode_step.vyb`) that
+   reproduces those two arrays, then the same shape for layer 3 (DSA latent + indexer key cache),
+   then all 45 layers.
+
+   The oracle also dumps the exact state a decode step STARTS from, so that driver can run one
+   step in isolation instead of re-deriving the 22-token prefill. Both `.npy` and raw
+   little-endian f64 `.bin` (the `.bin` is what a Vyb driver can actually read — it has no .npy
+   parser), in `native/out/`:
+     gold_dec_state_kda_start.bin  [64,128,128]  8,388,608 B   carried recurrence
+     gold_dec_ring_{q,k,v}.bin     [3,8192]        196,608 B   pre-conv history for the k=4 conv
+     gold_dec_streams_prev.bin     [4,4096]        131,072 B   the last prefill token's streams2,
+                                                               i.e. decode step 0's input
+     gold_dec_step{0,1}_{streams2,attn,mlp}.npy                the two steps' expected outputs
+
+   So the gate for the driver is: read those five files, run one step, match
+   `gold_dec_step0_attn.npy` and `gold_dec_step0_streams2.npy`. The new logic it needs is exactly
+   two state-threading changes to the already-gated layer-0 code: `delta_rule` must take and
+   return `st` instead of zeroing it per call, and `conv_silu` must take the 3-row ring instead of
+   rebuilding the conv from the prompt. Everything else (hc mix/apply, rmsnorm, the gemms, the
+   gated norm, o_proj, the dense MLP) is unchanged and already gated at 1.87e-11.
 5. **Extend the oracle past layer 3**: a gold for layer 4 (KDA + MoE — the one combination no
    gold covers) using the same numpy path as `gold_l3_moe.py`, then check the layer-44
-   magnitude jump.
+   magnitude jump (still 6.08x, reproduced at 47.781 -> 290.367).
 6. **TP=2 across lefty/righty**, then the OpenAI-compatible endpoint, then
    `verify_full_forward.py` stops being a stub.
 

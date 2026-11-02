@@ -177,8 +177,11 @@ st_open(path<String>)<StIndex> -> {
     return ix
 }
 
+# Look up a tensor name in an opened header. `ix` is BORROWED (call with view(ix)): a by-value
+# StIndex deep-copies the whole header -- ~1185 names plus six Vecs -- on every lookup, which is
+# 981 header copies per MoE layer when resolving one expert's 9 tensors at a time.
 share(all)
-st_find(ix<StIndex>, name<String>)<Int> -> {
+st_find(ix<their<StIndex const>>, name<String>)<Int> -> {
     i<Int> = 0
     for (i in 0..ix.n - 1) {
         if (ix.names.get(i) == name) { return i }

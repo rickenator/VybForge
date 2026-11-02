@@ -31,8 +31,9 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import env::{env_get}
 import safetensors
 import gx
-import tensor::{tensor_init, module_load_path, module_func, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
 import vmath::{vexp, vsqrt}
+import time::{time_mono_millis}
 
 extern "C" {
     cuMemFree_v2(dptr<Int>)<CInt>
@@ -285,12 +286,12 @@ mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>
     var<Int> dA = 0
     dA = alloc_dev(rows * K * 8)
     if (dA == 0) { return out }
-    htod_vec(dA, x)
+    bulk_htod(dA, view(x))
     var<Int> dC = 0
     dC = mm_dev(dA, B, rows, N, K, faddr)
     free_dev(dA)
     if (dC == 0) { return out }
-    out = dtoh_vec(dC, rows * N)
+    out = bulk_dtoh(dC, rows * N)
     free_dev(dC)
     return out
 }
@@ -723,6 +724,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
     chq<Int> = 0
     var<Int> out = 0
     tb = trellis.len()
+    nbody<Int> = body.len()
+    nsuh<Int> = suh.len()
+    nsvh<Int> = svh.len()
     if (tb < ntiles * 128) { return 0 }
     kn = (ntiles / (cw / 16)) * 16 * cw
     krows = kn / cw
@@ -769,17 +773,8 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             bq = bq + 1
         }
         if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { return 0 }
-        u = 0
-        while (u < body.len()) {
-            ch = 0
-            b = 0
-            while (b < 8) {
-                ch = ch | ((((body.char_at(u + b) as Int) & 255)) << (b * 8))
-                b = b + 1
-            }
-            if (cuMemcpyHtoD_v2(td + 16 + u, loc(ch), 8) != 0) { return 0 }
-            u = u + 8
-        }
+        # map body: ONE copy from the String's own buffer (per-8-byte copies cost ~2 us each)
+        if (cuMemcpyHtoD_v2(td + 16, body, nbody) != 0) { return 0 }
         # dequant
         if (cuda_launch4i(from<loc<CVoid>>(fdeq), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) != 0) {
             return 0
@@ -787,29 +782,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         cuCtxSynchronize()
         cuMemFree_v2(qd)
         cuMemFree_v2(td)
-        # scales (fp16) to the device
-        u = 0
-        while (u < suh.len()) {
-            ch = 0
-            b = 0
-            while (b < 8) {
-                ch = ch | ((((suh.char_at(u + b) as Int) & 255)) << (b * 8))
-                b = b + 1
-            }
-            if (cuMemcpyHtoD_v2(sud + u, loc(ch), 8) != 0) { return 0 }
-            u = u + 8
-        }
-        u = 0
-        while (u < svh.len()) {
-            ch = 0
-            b = 0
-            while (b < 8) {
-                ch = ch | ((((svh.char_at(u + b) as Int) & 255)) << (b * 8))
-                b = b + 1
-            }
-            if (cuMemcpyHtoD_v2(svd + u, loc(ch), 8) != 0) { return 0 }
-            u = u + 8
-        }
+        # scales (fp16) to the device: one copy each, same reason as the map body
+        if (cuMemcpyHtoD_v2(sud, suh, nsuh) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(svd, svh, nsvh) != 0) { return 0 }
         # hgen: H at pd+0
         if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
         if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
@@ -1004,7 +979,7 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     var<Int> d_qaln = 0
     d_qaln = deq_bf16(fbf, gx_read(g, 1), Q_LORA, 0)
     if (d_qaln == 0) { return nonev }
-    qaln_w<Vec<Float>> = dtoh_vec(d_qaln, Q_LORA)
+    qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
     free_dev(d_qaln)
     qa_ln<Vec<Float>> = rms_rows(qres, R, Q_LORA, qaln_w)
     qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
@@ -1015,14 +990,14 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     var<Int> d_kvaln = 0
     d_kvaln = deq_bf16(fbf, gx_read(g, 4), KV_LORA, 0)
     if (d_kvaln == 0) { return nonev }
-    kvaln_w<Vec<Float>> = dtoh_vec(d_kvaln, KV_LORA)
+    kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     free_dev(d_kvaln)
     ckv<Vec<Float>> = rms_rows(ckraw, R, KV_LORA, kvaln_w)
     println(digest("ckv", ckv))
     lines = lines + digest("ckv", ckv) + "\n"
 
     # ---- per-head absorbed keys/values from kv_b ----
-    kvb<Vec<Float>> = dtoh_vec(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
+    kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
     free_dev(d_kvb)
     println(digest("kvb", kvb))
     lines = lines + digest("kvb", kvb) + "\n"
@@ -1045,8 +1020,8 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     d_knw = deq_bf16(fbf, gx_read(g, 9), IDIM, 0)
     d_knb = deq_bf16(fbf, gx_read(g, 10), IDIM, 0)
     if (d_knw == 0 || d_knb == 0) { return nonev }
-    knw = dtoh_vec(d_knw, IDIM)
-    knb = dtoh_vec(d_knb, IDIM)
+    knw = bulk_dtoh(d_knw, IDIM)
+    knb = bulk_dtoh(d_knb, IDIM)
     free_dev(d_knw)
     free_dev(d_knb)
     kn<Vec<Float>> = ln_rows(kraw, R, IDIM, knw, knb)
@@ -1090,8 +1065,8 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     d_ukm = alloc_dev(KV_LORA * HEADS * NOPE * 8)
     d_uvm = alloc_dev(KV_LORA * HEADS * VDIM * 8)
     if (d_ukm == 0 || d_uvm == 0) { return nonev }
-    htod_vec(d_ukm, ukm)
-    htod_vec(d_uvm, uvm)
+    bulk_htod(d_ukm, view(ukm))
+    bulk_htod(d_uvm, view(uvm))
     K<Vec<Float>> = mm_host(ckv, R, KV_LORA, d_ukm, HEADS * NOPE, fgemm)
     V<Vec<Float>> = mm_host(ckv, R, KV_LORA, d_uvm, HEADS * VDIM, fgemm)
     free_dev(d_ukm)
@@ -1420,6 +1395,17 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     d_fnF<Int> = 0
     d_ln2 = 0
     dup = 0
+    ee<Int> = 0
+    i0<Int> = 0
+    acc_res<Int> = 0
+    acc_deq<Int> = 0
+    acc_mm<Int> = 0
+    acc_host<Int> = 0
+    tA<Int> = 0
+    tB<Int> = 0
+    allw<Vec<String>> = Vec()
+    galle<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                           dts = Vec(), paths = Vec() }
     dir = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
     out = env_get("VYBFORGE_L3TAIL_OUT") else "native/out/l3tail_vyb.txt"
     spath = env_get("VYBFORGE_L3_STREAMS1") else "native/out/gold_l3_streams1.txt"
@@ -1469,17 +1455,17 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         j = j + 1
     }
     d_ln2 = deq_bf16(fbf, gx_read(gt, 3), H, 0)
-    post_ln<Vec<Float>> = dtoh_vec(d_ln2, H)
+    post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
 
     flat<Vec<Float>> = rms_rows(streams1, R, HC * H, Vec())
     d_flat2 = alloc_dev(R * HC * H * 8)
     d_mv2 = alloc_dev(R * 24 * 8)
     d_scr2 = alloc_dev(64)
     if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return nonev }
-    htod_vec(d_flat2, flat)
+    bulk_htod(d_flat2, view(flat))
     if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return nonev }
     sync()
-    mv2<Vec<Float>> = dtoh_vec(d_mv2, R * 24)
+    mv2<Vec<Float>> = bulk_dtoh(d_mv2, R * 24)
     free_dev(d_flat2)
     free_dev(d_mv2)
     free_dev(d_scr2)
@@ -1598,6 +1584,12 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         i = i + 1
     }
     nex = 0
+    # NOTE: resolving all 288 experts' 9 tensors in ONE gx_resolve is ~40% cheaper at a single
+    # layer (1.4 s vs 2.4 s), but measured in the 12-layer prefill it grows ~1 s per layer
+    # (1.7 -> 9.5 s) from the String churn, so at 45 layers it loses badly. Keep per-expert
+    # resolution here; the win came from caching the shard header inside gx_resolve and from
+    # reading the 15.5 MB index ONCE per layer instead of once per expert.
+    idxtext<String> = gx_read_index(dir)
     e = 0
     while (e < NE) {
         # collect this expert's (token, lane) pairs
@@ -1618,6 +1610,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         nt = toks.len()
         if (nt > 0) {
             nex = nex + 1
+            tA = time_mono_millis()
             epre = lpre + "mlp.experts." + e.to_string() + "."
             w2<Vec<String>> = Vec()
             w2.push(epre + "gate_proj.trellis")
@@ -1629,7 +1622,8 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            ge<GxLoc> = gx_resolve(dir, total, w2)
+            ge<GxLoc> = gx_resolve_idx(idxtext, dir, total, w2)
+            acc_res = acc_res + (time_mono_millis() - tA)
             nfound = 0
             j = 0
             while (j < w2.len()) {
@@ -1638,12 +1632,14 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
             }
             if (nfound != w2.len()) { println("ALL_FAIL resolve expert " + e.to_string()); return nonev }
 
+            tA = time_mono_millis()
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
                                 gx_read(ge, 2), body, EINTER, 32768)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
                                 gx_read(ge, 5), body, EINTER, 32768)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 6), gx_read(ge, 7),
                                 gx_read(ge, 8), body, H, 32768)
+            acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
                 return nonev
@@ -1661,6 +1657,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
                 }
                 j = j + 1
             }
+            tA = time_mono_millis()
             gv<Vec<Float>> = mm_host(sub, nt, H, dWg, EINTER, fgemm)
             uv<Vec<Float>> = mm_host(sub, nt, H, dWu, EINTER, fgemm)
             act<Vec<Float>> = Vec()
@@ -1675,6 +1672,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
                 j = j + 1
             }
             yv<Vec<Float>> = mm_host(act, nt, EINTER, dWd, H, fgemm)
+            acc_mm = acc_mm + (time_mono_millis() - tA)
             # scatter w*y back
             j = 0
             while (j < nt) {
@@ -1699,6 +1697,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         e = e + 1
     }
     println("routed experts used: " + nex.to_string())
+    println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string())
 
     # ---- shared expert ----
     w3<Vec<String>> = Vec()
@@ -1878,10 +1877,10 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     d_mv = alloc_dev(R * 24 * 8)
     d_scr = alloc_dev(64)
     if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("L0_FAIL alloc"); return nonev }
-    htod_vec(d_flat, flat)
+    bulk_htod(d_flat, view(flat))
     if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return nonev }
     sync()
-    mv<Vec<Float>> = dtoh_vec(d_mv, R * 24)
+    mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
     free_dev(d_flat)
     free_dev(d_mv)
     free_dev(d_scr)
@@ -1919,7 +1918,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     var<Int> d_ln = 0
     d_ln = deq_bf16(fbf, gx_read(g, 12), H, 0)
     if (d_ln == 0) { return nonev }
-    in_ln<Vec<Float>> = dtoh_vec(d_ln, H)
+    in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     free_dev(d_ln)
     h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
     println(digest("h", h_a))
@@ -1955,9 +1954,9 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     d_ck = deq_bf16(fbf, gx_read(g, 22), HEADS * KD * CONV_K, 0)
     d_cv = deq_bf16(fbf, gx_read(g, 23), HEADS * KD * CONV_K, 0)
     if (d_cq == 0 || d_ck == 0 || d_cv == 0) { return nonev }
-    convq<Vec<Float>> = dtoh_vec(d_cq, HEADS * KD * CONV_K)
-    convk<Vec<Float>> = dtoh_vec(d_ck, HEADS * KD * CONV_K)
-    convv<Vec<Float>> = dtoh_vec(d_cv, HEADS * KD * CONV_K)
+    convq<Vec<Float>> = bulk_dtoh(d_cq, HEADS * KD * CONV_K)
+    convk<Vec<Float>> = bulk_dtoh(d_ck, HEADS * KD * CONV_K)
+    convv<Vec<Float>> = bulk_dtoh(d_cv, HEADS * KD * CONV_K)
     free_dev(d_cq)
     free_dev(d_ck)
     free_dev(d_cv)
@@ -2023,7 +2022,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
 
     d_onorm = deq_bf16(fbf, gx_read(g, 9), KD, 0)
     if (d_onorm == 0) { return nonev }
-    onorm<Vec<Float>> = dtoh_vec(d_onorm, KD)
+    onorm<Vec<Float>> = bulk_dtoh(d_onorm, KD)
     free_dev(d_onorm)
     gnorm<Vec<Float>> = gated_norm(att, zraw, onorm)
     attn<Vec<Float>> = mm_host(gnorm, R, HEADS * KD, d_o, H, fgemm)
@@ -2125,7 +2124,7 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
     # =============================================================== ffn site + MLP
     d_ln2 = deq_bf16(fbf, gx_read(g, 3), H, 0)
     if (d_ln2 == 0) { return nonev }
-    post_ln<Vec<Float>> = dtoh_vec(d_ln2, H)
+    post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
     free_dev(d_ln2)
 
     var<Int> d_flat2 = 0
@@ -2142,10 +2141,10 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
     d_mv2 = alloc_dev(R * 24 * 8)
     d_scr2 = alloc_dev(64)
     if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return nonev }
-    htod_vec(d_flat2, reflat)
+    bulk_htod(d_flat2, view(reflat))
     if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return nonev }
     sync()
-    mv2<Vec<Float>> = dtoh_vec(d_mv2, R * 24)
+    mv2<Vec<Float>> = bulk_dtoh(d_mv2, R * 24)
     free_dev(d_flat2)
     free_dev(d_mv2)
     free_dev(d_scr2)
@@ -2243,17 +2242,17 @@ dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm
         j = j + 1
     }
     d_lnA = deq_bf16(fbf, gx_read(g, 3), H, 0)
-    in_ln<Vec<Float>> = dtoh_vec(d_lnA, H)
+    in_ln<Vec<Float>> = bulk_dtoh(d_lnA, H)
 
     flat<Vec<Float>> = rms_rows(streams0, R, HC * H, Vec())
     d_flat = alloc_dev(R * HC * H * 8)
     d_mv = alloc_dev(R * 24 * 8)
     d_scr = alloc_dev(64)
     if (d_flat == 0 || d_mv == 0 || d_scr == 0) { return nonev }
-    htod_vec(d_flat, flat)
+    bulk_htod(d_flat, view(flat))
     if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return nonev }
     sync()
-    mv<Vec<Float>> = dtoh_vec(d_mv, R * 24)
+    mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
     free_dev(d_flat)
     free_dev(d_mv)
     free_dev(d_scr)
@@ -2374,7 +2373,7 @@ main()<Int> -> {
     var<Int> d_x = 0
     d_x = deq_bf16(fbf, raw_emb, R * H, 0)
     if (d_x == 0) { println("L0_FAIL emb deq"); return 10 }
-    x<Vec<Float>> = dtoh_vec(d_x, R * H)
+    x<Vec<Float>> = bulk_dtoh(d_x, R * H)
     free_dev(d_x)
     println(digest("x", x))
     lines = lines + digest("x", x) + "\n"
