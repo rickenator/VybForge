@@ -21,7 +21,7 @@ weights (see §8).
 | layer 0 (KDA attention + dense MLP) | gated, every stage ≤6e-11 |
 | layer 3 (DSA attention + router + MoE + shared + hc) | **L3_FULL_VYB_MATCH: OK**, all six stages |
 | full 45-layer prefill | **runs to completion**, `PREFILL_OK layers=45`, **914 s (15:14), peak RSS 7.1 GB** — was 5697 s / 53.6 GB; see §6 |
-| KV cache / decode | not started |
+| KV cache / decode | **step decode in Vyb: DEC_STEP_VYB OK** — `glm_decode_step.vyb` runs layer 0 one token at a time with the KDA recurrence and conv rings carried, matching the oracle's two teacher-forced steps at worst 1.9e-12 (`make -f native/Makefile decstep`). Next: the same shape for layer 3 (DSA latent + indexer key cache), then all 45 layers |
 | TP=2 across the Sparks | not started |
 | endpoint | not started; `verify_full_forward.py` is still a stub |
 
