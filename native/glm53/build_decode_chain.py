@@ -554,6 +554,629 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, dir<String>, total<Int>, idxte
 }
 ''')
 
+# ---------------------------------------------------------------- MTP head (layer 45)
+w('''# ============================================================ MTP head (layer 45)
+# The MTP input row: trunk final norm (model.language_model.norm.weight) applied to the
+# mean over the 4 layer-44 streams, then hnorm; e = enorm(embed(tid)); concat
+# [enorm(emb), hnorm(h)] (EMBEDDING FIRST -- pinned from the shipped exllamav3
+# Qwen3_5MTPInputLayer forward) -> eh_proj (BF16 [4096, 8192] out-in) -> [H].
+# hnorm/enorm are PLAIN RMSNorms (scale = x_norm * w): the shipped GLM-5.3 MTP passes
+# constant_bias=0.0 (architecture/glm5_next_mtp.py), overriding the rmsnorm.py default
+# of 1.0 the older handoff note quoted.
+mtp_build_row(tvec<Vec<Float>>, raw_e<String>, dir<String>, total<Int>,
+              fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+    i<Int> = 0
+    nf<Int> = 0
+    wantM<Vec<String>> = Vec()
+    wantM.push("model.language_model.norm.weight")
+    wantM.push("model.language_model.layers.45.hnorm.weight")
+    wantM.push("model.language_model.layers.45.enorm.weight")
+    wantM.push("model.language_model.layers.45.eh_proj.weight")
+    gm<GxLoc> = gx_resolve(dir, total, wantM)
+    nf = 0
+    i = 0
+    while (i < 4) {
+        if (gm.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != 4) { println("CHAIN_FAIL mtp resolve input"); return vecf() }
+    d_tn<Int> = deq_bf16(fbf, gx_read(gm, 0), H, 0)
+    d_hn<Int> = deq_bf16(fbf, gx_read(gm, 1), H, 0)
+    d_en<Int> = deq_bf16(fbf, gx_read(gm, 2), H, 0)
+    d_eh<Int> = deq_bf16(fbf, gx_read(gm, 3), H * 2 * H, 2 * H)
+    if (d_tn == 0 || d_hn == 0 || d_en == 0 || d_eh == 0) {
+        println("CHAIN_FAIL mtp deq input")
+        return vecf()
+    }
+    tn_w<Vec<Float>> = bulk_dtoh(d_tn, H)
+    hn_w<Vec<Float>> = bulk_dtoh(d_hn, H)
+    en_w<Vec<Float>> = bulk_dtoh(d_en, H)
+    free_dev(d_tn)
+    free_dev(d_hn)
+    free_dev(d_en)
+    d_ex<Int> = deq_bf16(fbf, raw_e, H, 0)
+    if (d_ex == 0) { println("CHAIN_FAIL mtp emb deq"); return vecf() }
+    ev<Vec<Float>> = bulk_dtoh(d_ex, H)
+    free_dev(d_ex)
+    hn1<Vec<Float>> = rms_rows(tvec, 1, H, tn_w)     # trunk final norm over the mean
+    hp<Vec<Float>> = rms_rows(hn1, 1, H, hn_w)       # hnorm (plain scale)
+    en<Vec<Float>> = rms_rows(ev, 1, H, en_w)        # enorm(embed) (plain scale)
+    cat<Vec<Float>> = vecf()
+    i = 0
+    while (i < H) { cat.push(en.get(i)); i = i + 1 }
+    i = 0
+    while (i < H) { cat.push(hp.get(i)); i = i + 1 }
+    hin<Vec<Float>> = mm_host(cat, 1, 2 * H, d_eh, H, fgemm)
+    free_dev(d_eh)
+    return hin
+}
+
+# Layer 45 as a PLAIN residual block (no hyper-connections), one token: input_layernorm
+# -> DSA attention (no rope, own ckv/indexer-k/gsc cache appended at `row`) -> residual
+# -> post_attention_layernorm -> dots-router MoE (sigmoid + noaux_tc bias, top-8,
+# renorm * 2.5, lazy per-expert EXL3 resolve) -> residual. Returns the post-block hidden.
+mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, dir<String>, total<Int>,
+               idxtext<String>, mapbody<String>, mckv<their<Vec<Float>>>,
+               mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, fgemm<Int>, fbf<Int>,
+               fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>)<Vec<Float>> -> {
+    nonev<Vec<Float>> = vecf()
+    i<Int> = 0
+    j<Int> = 0
+    k<Int> = 0
+    nf<Int> = 0
+    nfound<Int> = 0
+    d2<Int> = 0
+    hh<Int> = 0
+    p<Int> = 0
+    c<Int> = 0
+    a<Int> = 0
+    e<Int> = 0
+    lane<Int> = 0
+    r<Int> = 0
+    best<Int> = 0
+    bestv<Float> = 0.0
+    bestp<Int> = 0
+    last<Int> = 0
+    used<Int> = 0
+    mx<Float> = 0.0
+    sm<Float> = 0.0
+    acc<Float> = 0.0
+    pr<Float> = 0.0
+    dot<Float> = 0.0
+    rl<Float> = 0.0
+    sc<Float> = 0.0
+    sv<Float> = 0.0
+    g1<Float> = 0.0
+    u1<Float> = 0.0
+    wt<Float> = 0.0
+    cv<Float> = 0.0
+    tk<Int> = 0
+    nt<Int> = 0
+    nex<Int> = 0
+    nckv<Int> = 0
+    npools<Int> = 0
+    select_k<Int> = 0
+    tstart<Int> = 0
+    tcount<Int> = 0
+    vcount<Int> = 0
+    i0<Int> = 0
+    epre<String> = ""
+    body<String> = mapbody
+    scale_iq<Float> = 1.0 / vsqrt(IDIM as Float, 40)
+    sc_scale<Float> = 1.0 / vsqrt(NOPE as Float, 40)
+    wscale<Float> = 1.0 / vsqrt(IHEADS as Float, 40)
+
+    wantL45<Vec<String>> = Vec()
+    wantL45.push(lpre + "input_layernorm.weight")
+    wantL45.push(lpre + "post_attention_layernorm.weight")
+    wantL45.push(lpre + "self_attn.q_a_proj.weight")
+    wantL45.push(lpre + "self_attn.q_a_layernorm.weight")
+    wantL45.push(lpre + "self_attn.q_b_proj.weight")
+    wantL45.push(lpre + "self_attn.kv_a_proj_with_mqa.weight")
+    wantL45.push(lpre + "self_attn.kv_a_layernorm.weight")
+    wantL45.push(lpre + "self_attn.kv_b_proj.weight")
+    wantL45.push(lpre + "self_attn.o_proj.weight")
+    wantL45.push(lpre + "self_attn.indexer.wq_b.weight")
+    wantL45.push(lpre + "self_attn.indexer.wk.weight")
+    wantL45.push(lpre + "self_attn.indexer.k_norm.weight")
+    wantL45.push(lpre + "self_attn.indexer.k_norm.bias")
+    wantL45.push(lpre + "self_attn.indexer.weights_proj.weight")
+    wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
+    wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
+    wantL45.push(lpre + "mlp.gate.weight")
+    wantL45.push(lpre + "mlp.gate.e_score_correction_bias")
+    wantL45.push(lpre + "mlp.shared_experts.gate_proj.weight")
+    wantL45.push(lpre + "mlp.shared_experts.up_proj.weight")
+    wantL45.push(lpre + "mlp.shared_experts.down_proj.weight")
+    gm45<GxLoc> = gx_resolve(dir, total, wantL45)
+    nf = 0
+    i = 0
+    while (i < wantL45.len()) {
+        if (gm45.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != wantL45.len()) { println("CHAIN_FAIL mtp resolve layer"); return nonev }
+
+    d_ln<Int> = deq_bf16(fbf, gx_read(gm45, 0), H, 0)
+    d_ln2<Int> = deq_bf16(fbf, gx_read(gm45, 1), H, 0)
+    d_qa<Int> = deq_bf16(fbf, gx_read(gm45, 2), Q_LORA * H, H)
+    d_qb<Int> = deq_bf16(fbf, gx_read(gm45, 4), HEADS * NOPE * Q_LORA, Q_LORA)
+    d_kva<Int> = deq_bf16(fbf, gx_read(gm45, 5), KV_LORA * H, H)
+    d_kvb<Int> = deq_bf16(fbf, gx_read(gm45, 7), HEADS * (NOPE + VDIM) * KV_LORA, 0)
+    d_o<Int> = deq_bf16(fbf, gx_read(gm45, 8), HEADS * VDIM * H, HEADS * VDIM)
+    d_wqb<Int> = deq_bf16(fbf, gx_read(gm45, 9), Q_LORA * IHEADS * IDIM, Q_LORA)
+    d_wk<Int> = deq_bf16(fbf, gx_read(gm45, 10), H * IDIM, H)
+    d_wproj<Int> = deq_bf16(fbf, gx_read(gm45, 13), H * IHEADS, H)
+    d_gatei<Int> = deq_bf16(fbf, gx_read(gm45, 15), H * IDIM, H)
+    d_gw<Int> = deq_bf16(fbf, gx_read(gm45, 16), NE * H, H)
+    if (d_ln == 0 || d_ln2 == 0 || d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 ||
+        d_o == 0 || d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gatei == 0 || d_gw == 0) {
+        println("CHAIN_FAIL mtp weight deq")
+        return nonev
+    }
+    in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
+    post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
+    free_dev(d_ln)
+    free_dev(d_ln2)
+    d_qaln<Int> = deq_bf16(fbf, gx_read(gm45, 3), Q_LORA, 0)
+    d_kvaln<Int> = deq_bf16(fbf, gx_read(gm45, 6), KV_LORA, 0)
+    d_knw<Int> = deq_bf16(fbf, gx_read(gm45, 11), IDIM, 0)
+    d_knb<Int> = deq_bf16(fbf, gx_read(gm45, 12), IDIM, 0)
+    if (d_qaln == 0 || d_kvaln == 0 || d_knw == 0 || d_knb == 0) { return nonev }
+    qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
+    kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
+    knw<Vec<Float>> = bulk_dtoh(d_knw, IDIM)
+    knb<Vec<Float>> = bulk_dtoh(d_knb, IDIM)
+    free_dev(d_qaln)
+    free_dev(d_kvaln)
+    free_dev(d_knw)
+    free_dev(d_knb)
+    ape<Vec<Float>> = Vec()
+    raw_ape<String> = gx_read(gm45, 14)
+    i = 0
+    while (i < KPOOL * IDIM) { ape.push(f32_at(raw_ape, i)); i = i + 1 }
+    raw_bias<String> = gx_read(gm45, 17)
+    bias<Vec<Float>> = Vec()
+    i = 0
+    while (i < NE) { bias.push(f32_at(raw_bias, i)); i = i + 1 }
+
+    # absorbed per-head keys/values from kv_b (same as the trunk DSA step)
+    kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
+    free_dev(d_kvb)
+    ukm<Vec<Float>> = Vec()
+    uvm<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < KV_LORA * HEADS * NOPE) {
+        ukm.push(0.0)
+        uvm.push(0.0)
+        d2 = d2 + 1
+    }
+    hh = 0
+    while (hh < HEADS) {
+        j = 0
+        while (j < NOPE) {
+            d2 = 0
+            while (d2 < KV_LORA) {
+                ukm.set(d2 * (HEADS * NOPE) + hh * NOPE + j,
+                        kvb.get((hh * (NOPE + VDIM) + j) * KV_LORA + d2))
+                uvm.set(d2 * (HEADS * VDIM) + hh * VDIM + j,
+                        kvb.get((hh * (NOPE + VDIM) + NOPE + j) * KV_LORA + d2))
+                d2 = d2 + 1
+            }
+            j = j + 1
+        }
+        hh = hh + 1
+    }
+    d_ukm<Int> = alloc_dev(KV_LORA * HEADS * NOPE * 8)
+    d_uvm<Int> = alloc_dev(KV_LORA * HEADS * VDIM * 8)
+    if (d_ukm == 0 || d_uvm == 0) { return nonev }
+    bulk_htod(d_ukm, view(ukm))
+    bulk_htod(d_uvm, view(uvm))
+
+    # ---- input_layernorm (no hc: consumes the eh_proj output directly)
+    h_a<Vec<Float>> = rms_rows(hin, 1, H, in_ln)
+
+    # ---- latent projections; append this row to the MTP caches
+    qres<Vec<Float>> = mm_host(h_a, 1, H, d_qa, Q_LORA, fgemm)
+    qa_ln<Vec<Float>> = rms_rows(qres, 1, Q_LORA, qaln_w)
+    qfull<Vec<Float>> = mm_host(qa_ln, 1, Q_LORA, d_qb, HEADS * NOPE, fgemm)
+    ckraw<Vec<Float>> = mm_host(h_a, 1, H, d_kva, KV_LORA, fgemm)
+    ckv_new<Vec<Float>> = rms_rows(ckraw, 1, KV_LORA, kvaln_w)
+    nckv = row
+    i = 0
+    while (i < KV_LORA) {
+        mckv.set(nckv * KV_LORA + i, ckv_new.get(i))
+        i = i + 1
+    }
+    qidx<Vec<Float>> = mm_host(qres, 1, Q_LORA, d_wqb, IHEADS * IDIM, fgemm)
+    kraw<Vec<Float>> = mm_host(h_a, 1, H, d_wk, IDIM, fgemm)
+    k_new<Vec<Float>> = ln_rows(kraw, 1, IDIM, knw, knb)
+    i = 0
+    while (i < IDIM) {
+        mik.set(nckv * IDIM + i, k_new.get(i))
+        i = i + 1
+    }
+    gsc_new<Vec<Float>> = mm_host(h_a, 1, H, d_gatei, IDIM, fgemm)
+    i = 0
+    while (i < IDIM) {
+        migsc.set(nckv * IDIM + i, gsc_new.get(i))
+        i = i + 1
+    }
+    wproj<Vec<Float>> = mm_host(h_a, 1, H, d_wproj, IHEADS, fgemm)
+    i = 0
+    while (i < wproj.len()) {
+        wproj.set(i, wproj.get(i) * wscale)
+        i = i + 1
+    }
+    nckv = nckv + 1
+
+    # ---- indexer: pool + topk over the cache (per-channel softmax over the 4 slots)
+    ckv_t<Vec<Float>> = Vec()
+    ik_t<Vec<Float>> = Vec()
+    gsc_t<Vec<Float>> = Vec()
+    i = 0
+    while (i < nckv * KV_LORA) { ckv_t.push(mckv.get(i)); i = i + 1 }
+    i = 0
+    while (i < nckv * IDIM) {
+        ik_t.push(mik.get(i))
+        gsc_t.push(migsc.get(i))
+        i = i + 1
+    }
+    npools = nckv / KPOOL
+    poolk<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < npools * IDIM) { poolk.push(0.0); d2 = d2 + 1 }
+    p = 0
+    while (p < npools) {
+        c = 0
+        while (c < IDIM) {
+            mx = 0.0 - 1e30
+            a = 0
+            while (a < KPOOL) {
+                lgf<Float> = gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c)
+                if (lgf > mx) { mx = lgf }
+                a = a + 1
+            }
+            sm = 0.0
+            a = 0
+            while (a < KPOOL) {
+                sm = sm + vexp(gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx)
+                a = a + 1
+            }
+            acc = 0.0
+            a = 0
+            while (a < KPOOL) {
+                pr = vexp(gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx) / sm
+                acc = acc + pr * ik_t.get((p * KPOOL + a) * IDIM + c)
+                a = a + 1
+            }
+            poolk.set(p * IDIM + c, acc)
+            c = c + 1
+        }
+        p = p + 1
+    }
+    isc<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < npools) { isc.push(0.0); d2 = d2 + 1 }
+    p = 0
+    while (p < npools) {
+        acc = 0.0
+        hh = 0
+        while (hh < IHEADS) {
+            dot = 0.0
+            c = 0
+            while (c < IDIM) {
+                dot = dot + qidx.get(hh * IDIM + c) * poolk.get(p * IDIM + c)
+                c = c + 1
+            }
+            rl = dot * scale_iq
+            if (rl < 0.0) { rl = 0.0 }
+            acc = acc + wproj.get(hh) * rl
+            hh = hh + 1
+        }
+        isc.set(p, acc)
+        p = p + 1
+    }
+    sel<Vec<Int>> = Vec()
+    d2 = 0
+    while (d2 < nckv) { sel.push(-1); d2 = d2 + 1 }
+    select_k = TOPK / KPOOL
+    if (select_k > npools) { select_k = npools }
+    taken<Vec<Int>> = Vec()
+    k = 0
+    while (k < select_k) {
+        bestp = -1
+        bestv = 0.0 - 1e30
+        p = 0
+        while (p < npools) {
+            last = p * KPOOL + KPOOL - 1
+            used = 0
+            j = 0
+            while (j < taken.len()) {
+                if (taken.get(j) == p) { used = 1 }
+                j = j + 1
+            }
+            if (last <= nckv - 1 && used == 0) {
+                sc = isc.get(p)
+                if (sc > bestv) { bestv = sc; bestp = p }
+            }
+            p = p + 1
+        }
+        if (bestp < 0) { k = select_k } else {
+            taken.push(bestp)
+            a = 0
+            while (a < KPOOL) {
+                sel.set(bestp * KPOOL + a, bestp * KPOOL + a)
+                a = a + 1
+            }
+            k = k + 1
+        }
+    }
+    vcount = nckv
+    tcount = vcount % KPOOL
+    tstart = vcount - tcount
+    a = 0
+    while (a < tcount) {
+        sel.set(tstart + a, tstart + a)
+        a = a + 1
+    }
+
+    # ---- masked MLA over the selected cache rows
+    Kv<Vec<Float>> = mm_host(ckv_t, nckv, KV_LORA, d_ukm, HEADS * NOPE, fgemm)
+    Vm<Vec<Float>> = mm_host(ckv_t, nckv, KV_LORA, d_uvm, HEADS * VDIM, fgemm)
+    probs<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < HEADS * nckv) { probs.push(0.0); d2 = d2 + 1 }
+    hh = 0
+    while (hh < HEADS) {
+        mx = 0.0 - 1e30
+        i = 0
+        while (i < nckv) {
+            if (sel.get(i) >= 0) {
+                dot = 0.0
+                c = 0
+                while (c < NOPE) {
+                    dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                    c = c + 1
+                }
+                sv = dot * sc_scale
+                if (sv > mx) { mx = sv }
+            }
+            i = i + 1
+        }
+        sm = 0.0
+        i = 0
+        while (i < nckv) {
+            if (sel.get(i) >= 0) {
+                dot = 0.0
+                c = 0
+                while (c < NOPE) {
+                    dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                    c = c + 1
+                }
+                sm = sm + vexp(dot * sc_scale - mx)
+            }
+            i = i + 1
+        }
+        i = 0
+        while (i < nckv) {
+            if (sel.get(i) >= 0) {
+                dot = 0.0
+                c = 0
+                while (c < NOPE) {
+                    dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                    c = c + 1
+                }
+                probs.set(hh * nckv + i, vexp(dot * sc_scale - mx) / sm)
+            }
+            i = i + 1
+        }
+        hh = hh + 1
+    }
+    ao<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < HEADS * VDIM) { ao.push(0.0); d2 = d2 + 1 }
+    hh = 0
+    while (hh < HEADS) {
+        c = 0
+        while (c < VDIM) {
+            acc = 0.0
+            i = 0
+            while (i < nckv) {
+                pv<Float> = probs.get(hh * nckv + i)
+                if (pv != 0.0) {
+                    acc = acc + pv * Vm.get((i * HEADS + hh) * VDIM + c)
+                }
+                i = i + 1
+            }
+            ao.set(hh * VDIM + c, acc)
+            c = c + 1
+        }
+        hh = hh + 1
+    }
+    attn45<Vec<Float>> = mm_host(ao, 1, HEADS * VDIM, d_o, H, fgemm)
+    free_dev(d_ukm)
+    free_dev(d_uvm)
+    free_dev(d_qa)
+    free_dev(d_qb)
+    free_dev(d_kva)
+    free_dev(d_o)
+    free_dev(d_wqb)
+    free_dev(d_wk)
+    free_dev(d_wproj)
+    free_dev(d_gatei)
+
+    # ---- plain residual, post_attention_layernorm
+    x1<Vec<Float>> = vecf()
+    i = 0
+    while (i < H) { x1.push(hin.get(i) + attn45.get(i)); i = i + 1 }
+    h2<Vec<Float>> = rms_rows(x1, 1, H, post_ln)
+
+    # ---- router: sigmoid + noaux_tc bias + top-8 + renorm * 2.5
+    logits45<Vec<Float>> = mm_host(h2, 1, H, d_gw, NE, fgemm)
+    freedom {
+        cuMemFree_v2(d_gw)
+    }
+    scores45<Vec<Float>> = Vec()
+    i = 0
+    while (i < logits45.len()) {
+        scores45.push(sigmoid(logits45.get(i)))
+        i = i + 1
+    }
+    rsel<Vec<Int>> = Vec()
+    rwt<Vec<Float>> = Vec()
+    i = 0
+    while (i < ROUTE_TOPK) { rsel.push(-1); rwt.push(0.0); i = i + 1 }
+    lane = 0
+    while (lane < ROUTE_TOPK) {
+        best = -1
+        bestv = 0.0 - 1e30
+        j = 0
+        while (j < NE) {
+            used = 0
+            k = 0
+            while (k < lane) {
+                if (rsel.get(k) == j) { used = 1 }
+                k = k + 1
+            }
+            if (used == 0) {
+                cv = scores45.get(j) + bias.get(j)
+                if (cv > bestv) { bestv = cv; best = j }
+            }
+            j = j + 1
+        }
+        rsel.set(lane, best)
+        lane = lane + 1
+    }
+    sm = 0.0
+    lane = 0
+    while (lane < ROUTE_TOPK) {
+        sm = sm + scores45.get(rsel.get(lane))
+        lane = lane + 1
+    }
+    lane = 0
+    while (lane < ROUTE_TOPK) {
+        rwt.set(lane, scores45.get(rsel.get(lane)) / (sm + 1e-20) * ROUTED_SCALE)
+        lane = lane + 1
+    }
+
+    # ---- routed experts: lazy per-expert resolve (9 names), EXL3 deq
+    accr<Vec<Float>> = Vec()
+    i = 0
+    while (i < H) { accr.push(0.0); i = i + 1 }
+    nex = 0
+    e = 0
+    while (e < NE) {
+        nt = 0
+        lane = 0
+        while (lane < ROUTE_TOPK) {
+            if (rsel.get(lane) == e) { nt = 1 }
+            lane = lane + 1
+        }
+        if (nt == 1) {
+            nex = nex + 1
+            epre = lpre + "mlp.experts." + e.to_string() + "."
+            w2<Vec<String>> = Vec()
+            w2.push(epre + "gate_proj.trellis")
+            w2.push(epre + "gate_proj.suh")
+            w2.push(epre + "gate_proj.svh")
+            w2.push(epre + "up_proj.trellis")
+            w2.push(epre + "up_proj.suh")
+            w2.push(epre + "up_proj.svh")
+            w2.push(epre + "down_proj.trellis")
+            w2.push(epre + "down_proj.suh")
+            w2.push(epre + "down_proj.svh")
+            gexp<GxLoc> = gx_resolve_idx(idxtext, dir, total, w2)
+            nfound = 0
+            j = 0
+            while (j < 9) {
+                if (gexp.found.get(j) == 1) { nfound = nfound + 1 }
+                j = j + 1
+            }
+            if (nfound != 9) {
+                println("CHAIN_FAIL mtp resolve expert " + e.to_string())
+                return nonev
+            }
+            dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 0),
+                                gx_read(gexp, 1), gx_read(gexp, 2), body,
+                                EINTER, 32768)
+            dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 3),
+                                gx_read(gexp, 4), gx_read(gexp, 5), body,
+                                EINTER, 32768)
+            dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 6),
+                                gx_read(gexp, 7), gx_read(gexp, 8), body,
+                                H, 32768)
+            if (dWg == 0 || dWu == 0 || dWd == 0) {
+                println("CHAIN_FAIL mtp deq expert " + e.to_string())
+                return nonev
+            }
+            gv<Vec<Float>> = mm_host(h2, 1, H, dWg, EINTER, fgemm)
+            uv45<Vec<Float>> = mm_host(h2, 1, H, dWu, EINTER, fgemm)
+            act45<Vec<Float>> = Vec()
+            j = 0
+            while (j < gv.len()) {
+                g1 = gv.get(j)
+                if (g1 > SWIGLU_LIMIT) { g1 = SWIGLU_LIMIT }
+                u1 = uv45.get(j)
+                if (u1 > SWIGLU_LIMIT) { u1 = SWIGLU_LIMIT }
+                if (u1 < 0.0 - SWIGLU_LIMIT) { u1 = 0.0 - SWIGLU_LIMIT }
+                act45.push(silu(g1) * u1)
+                j = j + 1
+            }
+            yv<Vec<Float>> = mm_host(act45, 1, EINTER, dWd, H, fgemm)
+            wt = 0.0
+            lane = 0
+            while (lane < ROUTE_TOPK) {
+                if (rsel.get(lane) == e) { wt = rwt.get(lane) }
+                lane = lane + 1
+            }
+            i = 0
+            while (i < H) {
+                accr.set(i, accr.get(i) + wt * yv.get(i))
+                i = i + 1
+            }
+            freedom {
+                cuMemFree_v2(dWg)
+                cuMemFree_v2(dWu)
+                cuMemFree_v2(dWd)
+            }
+        }
+        e = e + 1
+    }
+
+    # ---- shared expert
+    d_sg<Int> = deq_bf16(fbf, gx_read(gm45, 18), EINTER * H, H)
+    d_su<Int> = deq_bf16(fbf, gx_read(gm45, 19), EINTER * H, H)
+    d_sd<Int> = deq_bf16(fbf, gx_read(gm45, 20), H * EINTER, EINTER)
+    if (d_sg == 0 || d_su == 0 || d_sd == 0) { return nonev }
+    sgate<Vec<Float>> = mm_host(h2, 1, H, d_sg, EINTER, fgemm)
+    sup<Vec<Float>> = mm_host(h2, 1, H, d_su, EINTER, fgemm)
+    sact<Vec<Float>> = Vec()
+    i = 0
+    while (i < sgate.len()) {
+        g1 = sgate.get(i)
+        if (g1 > SWIGLU_LIMIT) { g1 = SWIGLU_LIMIT }
+        u1 = sup.get(i)
+        if (u1 > SWIGLU_LIMIT) { u1 = SWIGLU_LIMIT }
+        if (u1 < 0.0 - SWIGLU_LIMIT) { u1 = 0.0 - SWIGLU_LIMIT }
+        sact.push(silu(g1) * u1)
+        i = i + 1
+    }
+    shared45<Vec<Float>> = mm_host(sact, 1, EINTER, d_sd, H, fgemm)
+    free_dev(d_sg)
+    free_dev(d_su)
+    free_dev(d_sd)
+
+    mlp45<Vec<Float>> = vecf()
+    i = 0
+    while (i < H) { mlp45.push(accr.get(i) + shared45.get(i)); i = i + 1 }
+    x2<Vec<Float>> = vecf()
+    i = 0
+    while (i < H) { x2.push(x1.get(i) + mlp45.get(i)); i = i + 1 }
+    return x2
+}
+''')
+
 # ---------------------------------------------------------------- main
 w(open('/home/rick/Projects/VybForge/native/glm53/_chain_main_snippet.txt').read())
 

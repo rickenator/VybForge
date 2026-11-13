@@ -213,6 +213,15 @@ decchain: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx $(ROOT)/na
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_decode_chain.vyb
 	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_chain.py
 
+# P6 MTP head (layer 45) inside the chain: phase 1 primes layer 45's own DSA cache over
+# the prompt and each decode step runs the MTP row + final head (shared_head.norm ->
+# lm_head -> argmax = draft). gold_mtp.py recomputes everything downstream of the
+# dumped layer-44 trunk state with real weights; verify_decode_mtp.py compares
+# element-wise -> DECODE_MTP_MATCH.
+decmtp: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_mtp.py
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_mtp.py
+
 # P4 second real layer piece: layer 3's DSA attention (gpool indexer + masked MLA +
 # o_proj) in Vyb, on the layer-3 input chained through layers 0-2 in numpy.
 glm3: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx

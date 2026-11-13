@@ -56,6 +56,29 @@ main()<Int> -> {
     nlay<Int> = 45
     is_dsa<Int> = 0
     lpre<String> = ""
+    lpre45<String> = "model.language_model.layers.45."
+    tvec<Vec<Float>> = Vec()
+    hin<Vec<Float>> = Vec()
+    x2<Vec<Float>> = Vec()
+    raw_e<String> = ""
+    mrow<Int> = 0
+    mckv<Vec<Float>> = Vec()
+    mik<Vec<Float>> = Vec()
+    migsc<Vec<Float>> = Vec()
+    logv<Vec<Float>> = Vec()
+    shn_w<Vec<Float>> = Vec()
+    finv<Vec<Float>> = Vec()
+    chunk<Vec<Float>> = Vec()
+    lmraw<String> = ""
+    lmpath<String> = ""
+    lmoff<Int> = 0
+    crows<Int> = 8192
+    cbase<Int> = 0
+    cn<Int> = 0
+    cbestv<Float> = 0.0
+    cbesti<Int> = 0
+    lmg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                        dts = Vec(), paths = Vec() }
     baseF<Vec<Float>> = Vec()
     scaleF<Vec<Float>> = Vec()
     kslot<Int> = 0
@@ -176,6 +199,11 @@ main()<Int> -> {
     while (i < NDSLOT * CAPT * KV_LORA) { ckvAll.push(0.0); i = i + 1 }
     i = 0
     while (i < NDSLOT * CAPT * IDIM) { ikAll.push(0.0); gscAll.push(0.0); i = i + 1 }
+    # MTP head (layer 45) own DSA cache: rows for the 20 prefill tokens + 2 decode steps
+    i = 0
+    while (i < CAPT * KV_LORA) { mckv.push(0.0); i = i + 1 }
+    i = 0
+    while (i < CAPT * IDIM) { mik.push(0.0); migsc.push(0.0); i = i + 1 }
 
     # ================================================================ phase 1: prefill R = 20
     # embeddings for ids[0..19] -> streams (HC copies), verbatim from glm_prefill.vyb
@@ -255,6 +283,59 @@ main()<Int> -> {
         println("phase1 layer " + n.to_string() + " done")
         lines = lines + "phase1 layer " + n.to_string() + " " + digest("streams", streams) + "\n"
         n = n + 1
+    }
+
+    # ================================================================ phase 1b: MTP head
+    # prime layer 45's own cache over the prompt: for each prefill token, the trunk
+    # state is the mean over its 4 layer-44 streams -> trunk final norm -> hnorm, and
+    # e = enorm(embed(token)); the per-row MTP input + post-layer hidden are dumped
+    # full precision for the gold oracle (gate A / gate B inputs).
+    if (nlay == 45) {
+        println("CHAIN phase 1b: MTP head over " + R.to_string() + " prompt tokens")
+        # fresh index/map strings: phase 1's 45 layers of String churn corrupt a buffer
+        # held across it (the phase-2 refresh below brackets the same window)
+        match (open_read("native/exl3/map.bin")) {
+            f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
+            ? -> { return 5 }
+        }
+        mapbody = mapd.substring(16, mapd.len())
+        idxtext = gx_read_index(dir)
+        r = 0
+        while (r < R) {
+            tvec = vecf()
+            d2 = 0
+            while (d2 < H) {
+                acc = 0.0
+                hh = 0
+                while (hh < HC) {
+                    acc = acc + streams.get(r * HC * H + hh * H + d2)
+                    hh = hh + 1
+                }
+                tvec.push(acc / 4.0)
+                d2 = d2 + 1
+            }
+            lines = lines + dumps("mtptrunk" + r.to_string(), tvec) + "\n"
+            raw_e = ""
+            match (open_read(emb_path)) {
+                f -> {
+                    match (read_at(f, emb_off + ids.get(r) * H * 2, H * 2)) {
+                        s -> { raw_e = s }
+                        ? -> { return 9 }
+                    }
+                    close(f)
+                }
+                ? -> { return 9 }
+            }
+            hin = mtp_build_row(tvec, raw_e, dir, total, fgemm, fbf)
+            if (hin.len() != H) { println("CHAIN_FAIL mtp build row " + r.to_string()); return 40 }
+            lines = lines + dumps("mtphin" + r.to_string(), hin) + "\n"
+            x2 = mtp_layer_step(hin, r, lpre45, dir, total, idxtext, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2)
+            if (x2.len() != H) { println("CHAIN_FAIL mtp layer row " + r.to_string()); return 41 }
+            lines = lines + dumps("mtpx" + r.to_string(), x2) + "\n"
+            println("mtp row " + r.to_string() + " done")
+            i = trim_heap()
+            r = r + 1
+        }
     }
     println("CHAIN phase 1 done: caches built")
 
@@ -1258,6 +1339,106 @@ main()<Int> -> {
             streams = streams2
             i = trim_heap()
             n = n + 1
+        }
+
+        # ============================================================ MTP head (layer 45)
+        if (nlay == 45) {
+            # refresh the index/map strings: the 45-layer walk churned Strings (the
+            # same corruption window the per-step refresh above brackets)
+            match (open_read("native/exl3/map.bin")) {
+                f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
+                ? -> { return 5 }
+            }
+            mapbody = mapd.substring(16, mapd.len())
+            idxtext = gx_read_index(dir)
+            tvec = vecf()
+            d2 = 0
+            while (d2 < H) {
+                acc = 0.0
+                hh = 0
+                while (hh < HC) {
+                    acc = acc + streams2.get(hh * H + d2)
+                    hh = hh + 1
+                }
+                tvec.push(acc / 4.0)
+                d2 = d2 + 1
+            }
+            mrow = 20 + t
+            lines = lines + dumps("mtptrunk" + mrow.to_string(), tvec) + "\n"
+            raw_e = ""
+            match (open_read(emb_path)) {
+                f -> {
+                    match (read_at(f, emb_off + tid * H * 2, H * 2)) {
+                        s -> { raw_e = s }
+                        ? -> { return 9 }
+                    }
+                    close(f)
+                }
+                ? -> { return 9 }
+            }
+            hin = mtp_build_row(tvec, raw_e, dir, total, fgemm, fbf)
+            if (hin.len() != H) { println("CHAIN_FAIL mtp build step " + t.to_string()); return 42 }
+            lines = lines + dumps("mtphin" + mrow.to_string(), hin) + "\n"
+            x2 = mtp_layer_step(hin, mrow, lpre45, dir, total, idxtext, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2)
+            if (x2.len() != H) { println("CHAIN_FAIL mtp layer step " + t.to_string()); return 43 }
+            lines = lines + dumps("mtpx" + mrow.to_string(), x2) + "\n"
+            println("mtp step" + t.to_string() + " done")
+            if (t == nsteps - 1) {
+                # ---- final head: shared_head.norm -> lm_head (chunked, untied) -> argmax
+                wantH<Vec<String>> = Vec()
+                wantH.push(lpre45 + "shared_head.norm.weight")
+                wantH.push("lm_head.weight")
+                lmg = gx_resolve(dir, total, wantH)
+                nf = 0
+                i = 0
+                while (i < 2) {
+                    if (lmg.found.get(i) == 1) { nf = nf + 1 }
+                    i = i + 1
+                }
+                if (nf != 2) { println("CHAIN_FAIL mtp head resolve"); return 44 }
+                d_shn<Int> = deq_bf16(fbf, gx_read(lmg, 0), H, 0)
+                if (d_shn == 0) { return 44 }
+                shn_w = bulk_dtoh(d_shn, H)
+                free_dev(d_shn)
+                finv = rms_rows(x2, 1, H, shn_w)
+                lmpath = lmg.paths.get(1)
+                lmoff = lmg.off.get(1)
+                logv = vecf()
+                cbesti = 0
+                cbestv = 0.0 - 1e308
+                cbase = 0
+                while (cbase < 154880) {
+                    cn = 154880 - cbase
+                    if (cn > crows) { cn = crows }
+                    lmraw = ""
+                    match (open_read(lmpath)) {
+                        f -> {
+                            match (read_at(f, lmoff + cbase * H * 2, cn * H * 2)) {
+                                s -> { lmraw = s }
+                                ? -> { return 9 }
+                            }
+                            close(f)
+                        }
+                        ? -> { return 9 }
+                    }
+                    d_lmw<Int> = deq_bf16(fbf, lmraw, cn * H, H)
+                    if (d_lmw == 0) { println("CHAIN_FAIL mtp lmhead deq"); return 45 }
+                    chunk = mm_host(finv, 1, H, d_lmw, cn, fgemm)
+                    free_dev(d_lmw)
+                    i = 0
+                    while (i < cn) {
+                        logv.push(chunk.get(i))
+                        if (chunk.get(i) > cbestv) {
+                            cbestv = chunk.get(i)
+                            cbesti = cbase + i
+                        }
+                        i = i + 1
+                    }
+                    cbase = cbase + cn
+                }
+                lines = lines + dumps("mtplogits" + t.to_string(), logv) + "\n"
+                println("MTP draft token: " + cbesti.to_string() + " (logit " + cbestv.to_string() + ")")
+            }
         }
         t = t + 1
     }
