@@ -455,6 +455,35 @@ is also stored under this prefix. MTP decode shape: enorm(enorm'd hidden) + hnor
 drafted token) -> eh_proj (2H -> H) -> the layer -> draft logits; pin the exact composition
 against the checkpoint's own MTP usage (the config's num_nextn_predict_layers) before wiring.
 
+**MTP semantics — PINNED from the shipped implementation** (exllamav3
+`architecture/glm5_next_mtp.py` + `modules/arch_specific/qwen3_5_mtp.py` + `modules/rmsnorm.py`;
+config: num_nextn_predict_layers=1, index_share_for_mtp_iteration=true, tie_word_embeddings=false,
+vocab 154880, eh_proj BF16 [4096, 8192] = [H, 2H] out-in, hnorm/enorm BF16 [4096]):
+
+1. Trunk state: layer-44 streams2 [4,H] -> MEAN over the 4 streams -> trunk final norm
+   (`model.language_model.norm.weight`, exists, eps 1e-5) -> hnorm (RMSNorm with
+   constant_bias=1.0, i.e. scale = x_norm * (w + 1.0) — pinned from modules/rmsnorm.py:84).
+2. e = enorm(embed(next_token)) with the same (w + 1.0) scale.
+3. concat [h, e] (2H) -> eh_proj (2H -> H) -> MTP input.
+4. Layer 45 as a PLAIN residual block, no hc: input_layernorm -> DSA attention (MLA + indexer
+   mode "full", NO rope, select_hq_bits=2, its OWN kv cache built by running the MTP layer over
+   the prompt — the trunk prefill must push every token through steps 1-4 to prime it) ->
+   residual -> post_attention_layernorm -> MoE -> residual. The shipped impl lets layer 45's
+   own indexer score instead of reusing the trunk's top-k (index_share_for_mtp_iteration), and
+   notes the two agree below index_topk context.
+5. shared_head.norm (plain weighted RMSNorm, constant_bias 0) -> lm_head (untied, borrowed from
+   the trunk) -> argmax = the draft token. The shipped impl computes the norms in fp16 — the
+   exllamav3 draft is only a SEMANTIC reference (top-1 agreement); the numeric gate is our own
+   fp64 oracle vs our fp64 driver, element-wise tight like the other gates.
+
+Gate design: extend the chain generator so phase 1 (batched prefill) also runs steps 1-4 per
+token and layer 45 batched (dumping the MTP hidden per token), and phase 2 runs the MTP layer
+per decode step appending to its cache; the driver's final draft logits are compared against
+`native/glm53/gold_mtp.py`, a numpy fp64 oracle that reads the chain's dumped layer-44 hidden
+(chain<N> dumps, already full precision), applies steps 1-5 with real weights, and emits
+logits + top-1. `DECODE_MTP_MATCH` = element-wise logits/hidden agreement with the oracle;
+top-1 agreement with exllamav3 is the semantic smoke check.
+
 **TP=2 / endpoint (owner directive)**: likely Spark-only (dual GB10), so it must be
 RUNTIME-configurable, not compiled in — the driver reads `VYBFORGE_TP` (0/1 = single card,
 2 = layer-sharded across two devices) and the layer->rank map from env/config, with the 3090
