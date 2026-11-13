@@ -1,0 +1,81 @@
+DISPATCH_PROBE begin
+TZFILE
+/usr/share/zoneinfo/America/Los_Angeles
+NOW
+1791738381
+OFFSET
+-25200
+UTT
+hello
+REPLY
+Hello. I'm listening.
+QUIT
+0
+UTT
+what time is it
+REPLY
+It is 10:06 AM.
+QUIT
+0
+UTT
+
+REPLY
+I didn't catch that.
+QUIT
+0
+UTT
+can you tell me the time?
+REPLY
+It is 10:06 AM.
+QUIT
+0
+UTT
+what is the date
+REPLY
+Today is Sunday, October 11, 2026.
+QUIT
+0
+UTT
+what day is it
+REPLY
+Today is Sunday, October 11, 2026.
+QUIT
+0
+UTT
+help
+REPLY
+I can tell you the time or the date, and I can transcribe a recording. Say goodbye to stop.
+QUIT
+0
+UTT
+what can you do
+REPLY
+I can tell you the time or the date, and I can transcribe a recording. Say goodbye to stop.
+QUIT
+0
+UTT
+transcribe my recording
+REPLY
+Give me a WAV file and I can transcribe it locally with the Vyb Whisper model.
+QUIT
+0
+UTT
+make me a sandwich
+REPLY
+I don't know how to do that yet. Say help to hear what I can do.
+QUIT
+0
+UTT
+goodbye
+REPLY
+Goodbye.
+QUIT
+1
+UTT
+
+REPLY
+I didn't catch that.
+QUIT
+0
+DISPATCH_PROBE done
+0

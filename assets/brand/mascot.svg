@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="mTitle mDesc">
+  <title id="mTitle">Billet — the VybForge mascot</title>
+  <desc id="mDesc">A dark-iron shop-floor sprite with a molten V visor, leaning on a V-struck hammer.</desc>
+
+  <defs>
+    <linearGradient id="iron" x1="0.12" y1="0" x2="0.78" y2="1">
+      <stop offset="0" stop-color="#5a7591"/>
+      <stop offset="0.38" stop-color="#31404f"/>
+      <stop offset="1" stop-color="#141d28"/>
+    </linearGradient>
+    <linearGradient id="ironFlat" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c3949"/>
+      <stop offset="1" stop-color="#0b1119"/>
+    </linearGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b6c9e0"/>
+      <stop offset="0.5" stop-color="#697c92"/>
+      <stop offset="1" stop-color="#2e3b49"/>
+    </linearGradient>
+    <linearGradient id="shaft" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3c4c5e"/>
+      <stop offset="0.42" stop-color="#5d728a"/>
+      <stop offset="1" stop-color="#28323e"/>
+    </linearGradient>
+    <linearGradient id="magma" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff2c0"/>
+      <stop offset="0.42" stop-color="#ffa22e"/>
+      <stop offset="1" stop-color="#ff4508"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff8f2c" stop-opacity="0.4"/>
+      <stop offset="0.58" stop-color="#ff6a10" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#ff6a10" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="panelGlow" cx="0.5" cy="0.55" r="0.62">
+      <stop offset="0" stop-color="#ff9a3c" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ff6a00" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="tight" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4.5"/>
+    </filter>
+  </defs>
+
+  <!-- ambient heat -->
+  <circle cx="252" cy="250" r="214" fill="url(#halo)"/>
+
+  <!-- ===================== hammer: leaning, head on the floor at right ===================== -->
+  <g>
+    <line x1="396" y1="316" x2="410" y2="408" stroke="#0b1119" stroke-width="30" stroke-linecap="round"/>
+    <line x1="396" y1="316" x2="410" y2="408" stroke="url(#shaft)" stroke-width="22" stroke-linecap="round"/>
+    <line x1="392" y1="322" x2="396" y2="346" stroke="#dfe9f5" stroke-width="5" stroke-linecap="round" opacity="0.3"/>
+    <rect x="366" y="404" width="102" height="48" rx="13" fill="url(#steel)" stroke="#0b1119" stroke-width="5"/>
+    <rect x="376" y="411" width="82" height="10" rx="5" fill="#eaf1f9" opacity="0.3"/>
+    <rect x="366" y="404" width="13" height="48" rx="6.5" fill="#0b1119" opacity="0.32"/>
+    <path d="M 398 417 L 417 438 L 436 417" fill="none" stroke="#ff6a10" stroke-width="12"
+          stroke-linecap="round" stroke-linejoin="round" opacity="0.5" filter="url(#tight)"/>
+    <path d="M 398 417 L 417 438 L 436 417" fill="none" stroke="url(#magma)" stroke-width="8"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- ===================== arms ===================== -->
+  <g stroke-linecap="round">
+    <line x1="166" y1="338" x2="112" y2="364" stroke="#05090e" stroke-width="48"/>
+    <line x1="166" y1="338" x2="112" y2="364" stroke="#131c27" stroke-width="38"/>
+    <line x1="348" y1="338" x2="396" y2="350" stroke="#05090e" stroke-width="48"/>
+    <line x1="348" y1="338" x2="396" y2="350" stroke="#131c27" stroke-width="38"/>
+  </g>
+  <circle cx="108" cy="366" r="23" fill="url(#steel)" stroke="#05090e" stroke-width="4"/>
+  <circle cx="100" cy="358" r="6.5" fill="#e8f0fa" opacity="0.45"/>
+  <circle cx="402" cy="352" r="24" fill="url(#steel)" stroke="#05090e" stroke-width="4"/>
+  <circle cx="394" cy="344" r="6.5" fill="#e8f0fa" opacity="0.45"/>
+
+  <!-- ===================== plinth ===================== -->
+  <rect x="127" y="374" width="258" height="50" rx="19" fill="url(#ironFlat)" stroke="#0a1018" stroke-width="5"/>
+  <rect x="145" y="383" width="222" height="8" rx="4" fill="#677e99" opacity="0.38"/>
+  <path d="M 214 406 L 296 406" stroke="url(#magma)" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
+
+  <!-- ===================== torso (anvil body) ===================== -->
+  <rect x="158" y="308" width="196" height="84" rx="24" fill="url(#iron)" stroke="#0a1018" stroke-width="5"/>
+  <path d="M 186 322 Q 176 344 180 372" fill="none" stroke="#a9bdd6" stroke-width="7"
+        stroke-linecap="round" opacity="0.16"/>
+  <!-- neck -->
+  <rect x="230" y="282" width="52" height="40" rx="10" fill="url(#ironFlat)" stroke="#0a1018" stroke-width="5"/>
+
+  <!-- ===================== head ===================== -->
+  <rect x="136" y="90" width="240" height="204" rx="66" fill="url(#iron)" stroke="#0a1018" stroke-width="5"/>
+  <!-- top bevel + rim light -->
+  <path d="M 176 106 H 336" stroke="#9fb4cd" stroke-width="7" stroke-linecap="round" opacity="0.2"/>
+  <path d="M 168 150 Q 152 200 158 246" fill="none" stroke="#aabfd8" stroke-width="8"
+        stroke-linecap="round" opacity="0.18"/>
+  <!-- head cooling seam -->
+  <path d="M 340 122 L 328 138 L 338 150" fill="none" stroke="#ff7a1a" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
+
+  <!-- face -->
+  <rect x="170" y="126" width="172" height="130" rx="40" fill="#080d15" stroke="#0a1119" stroke-width="5"/>
+  <ellipse cx="256" cy="200" rx="72" ry="52" fill="url(#panelGlow)"/>
+
+  <g>
+    <rect x="198" y="158" width="40" height="46" rx="18" fill="#ff6a10" opacity="0.55" filter="url(#tight)"/>
+    <rect x="274" y="158" width="40" height="46" rx="18" fill="#ff6a10" opacity="0.55" filter="url(#tight)"/>
+    <rect x="198" y="158" width="40" height="46" rx="18" fill="url(#magma)"/>
+    <rect x="274" y="158" width="40" height="46" rx="18" fill="url(#magma)"/>
+    <rect x="206" y="166" width="13" height="16" rx="6.5" fill="#fff6da"/>
+    <rect x="282" y="166" width="13" height="16" rx="6.5" fill="#fff6da"/>
+  </g>
+
+  <path d="M 218 220 L 256 250 L 294 220" fill="none" stroke="#ff6a10" stroke-width="16"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.4" filter="url(#tight)"/>
+  <path d="M 218 220 L 256 250 L 294 220" fill="none" stroke="url(#magma)" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- ===================== sparks ===================== -->
+  <g fill="#ffd06b">
+    <circle cx="398" cy="70" r="6.5"/>
+    <circle cx="452" cy="102" r="5"/>
+    <circle cx="330" cy="52" r="4"/>
+    <circle cx="476" cy="158" r="4.5"/>
+    <circle cx="418" cy="204" r="3.5"/>
+  </g>
+  <g fill="#ffeab4">
+    <path d="M 356 40 L 361 58 L 379 63 L 361 68 L 356 86 L 351 68 L 333 63 L 351 58 Z"/>
+    <path d="M 452 36 L 455 47 L 466 50 L 455 53 L 452 64 L 449 53 L 438 50 L 449 47 Z"/>
+  </g>
+  <g fill="#ff8a25" opacity="0.45" filter="url(#tight)">
+    <circle cx="398" cy="70" r="12"/>
+    <circle cx="452" cy="102" r="10"/>
+    <circle cx="356" cy="58" r="14"/>
+  </g>
+</svg>

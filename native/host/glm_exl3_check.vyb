@@ -1,0 +1,301 @@
+# glm_exl3_check.vyb — the reusable EXL3 dequant (native/glm53/exl3_load.vyb) against the
+# P1 oracle on a REAL expert tensor: layer 3, expert 0, gate_proj [4096, 2048] at 4 bpw.
+#
+# This is the piece the MoE needs for its 109 routed experts; once it matches the oracle
+# here it can be called per (expert, projection) inside the ffn site.
+#
+# Gold: native/glm53/gold_exl3_deq.py (loader.dequant_exl3_fast, P1-gated)
+# Gate: EXL3_LOAD_VYB (digest compare, tolerance from the P1 gate: max abs 3e-3)
+#
+# Run: make -f native/Makefile glm3x
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, dtoh_vec, sync}
+
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+SCALE40<Float> = 1099511627776.0
+
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+digest(name<String>, v<Vec<Float>>)<String> -> {
+    s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
+    i<Int> = 0
+    while (i < v.len()) {
+        x<Float> = v.get(i)
+        s = s + x
+        if (x < 0.0) { a = a - x } else { a = a + x }
+        q = q + x * x
+        t<Float> = x
+        if (t < 0.0) { t = 0.0 - t }
+        if (t > m) { m = t }
+        i = i + 1
+    }
+    out<String> = name + " n=" + v.len().to_string() + " sum=" + di(s).to_string() +
+                  " abs=" + di(a).to_string() + " sq=" + di(q).to_string() +
+                  " max=" + di(m).to_string()
+    i = 0
+    while (i < 8) {
+        hv<Float> = 0.0
+        if (i < v.len()) { hv = v.get(i) }
+        out = out + " v" + i.to_string() + "=" + di(hv).to_string()
+        i = i + 1
+    }
+    return out
+}
+
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    var<Int> addr_out = 0
+    freedom {
+        var<loc<loc<CVoid>>> m = from<loc<loc<CVoid>>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        var<loc<CVoid>> f = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, fn_name) != 0) { return 0 }
+        addr_out = addr(f)
+    }
+    return addr_out
+}
+
+# Dequantize one EXL3-packed expert tensor to f64 [in, out] on the device.
+#   body: the 256x16 tile-map body (map.bin minus its 16-byte header)
+share(all)
+exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
+         trellis<String>, suh<String>, svh<String>, body<String>,
+         cw<Int>, ntiles<Int>)<Int> -> {
+    tb<Int> = 0
+    kn<Int> = 0
+    krows<Int> = 0
+    nbc<Int> = 0
+    nblocks<Int> = 0
+    mb<Int> = 0
+    hwide<Int> = 0
+    bq<Int> = 0
+    u<Int> = 0
+    ch<Int> = 0
+    b<Int> = 0
+    pq<Int> = 0
+    chq<Int> = 0
+    var<Int> out = 0
+    tb = trellis.len()
+    if (tb < ntiles * 128) { return 0 }
+    kn = (ntiles / (cw / 16)) * 16 * cw
+    krows = kn / cw
+    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { return 0 }
+    if (suh.len() != krows * 2 || svh.len() != cw * 2) { return 0 }
+    nbc = cw / 128
+    nblocks = (kn / cw / 128) * nbc
+    mb = 16 + body.len()
+    freedom {
+        var<Int> qd = 0
+        var<Int> td = 0
+        var<Int> od = 0
+        var<Int> hd = 0
+        var<Int> td2 = 0
+        var<Int> fd = 0
+        var<Int> pd = 0
+        var<Int> sud = 0
+        var<Int> svd = 0
+        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 0 }
+
+        # trellis: bulk copy straight from the String
+        if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { return 0 }
+        # map: 16-byte header + the 256-slot body
+        var<CInt> rc = 0
+        hwide = 0
+        bq = 0
+        while (bq < 8) {
+            hwide = hwide | (((cw >> (bq * 8)) & 255) << (bq * 8))
+            bq = bq + 1
+        }
+        if (cuMemcpyHtoD_v2(td, loc(hwide), 8) != 0) { return 0 }
+        hwide = 0
+        bq = 0
+        while (bq < 8) {
+            hwide = hwide | (((ntiles >> (bq * 8)) & 255) << (bq * 8))
+            bq = bq + 1
+        }
+        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { return 0 }
+        u = 0
+        while (u < body.len()) {
+            ch = 0
+            b = 0
+            while (b < 8) {
+                ch = ch | ((((body.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(td + 16 + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        # dequant
+        if (cuda_launch4i(from<loc<CVoid>>(fdeq), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(qd)
+        cuMemFree_v2(td)
+        # scales (fp16) to the device
+        u = 0
+        while (u < suh.len()) {
+            ch = 0
+            b = 0
+            while (b < 8) {
+                ch = ch | ((((suh.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(sud + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        u = 0
+        while (u < svh.len()) {
+            ch = 0
+            b = 0
+            while (b < 8) {
+                ch = ch | ((((svh.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(svd + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        # hgen: H at pd+0
+        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
+        if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
+        pq = 0
+        while (pq < 6) {
+            chq = 0
+            if (pq == 0) { chq = od }
+            if (pq == 1) { chq = td2 }
+            if (pq == 2) { chq = hd }
+            if (pq == 3) { chq = cw }
+            if (pq == 4) { chq = nbc }
+            if (pq == 5) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            pq = pq + 1
+        }
+        if (cuda_launch4i(from<loc<CVoid>>(fhad1), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        # had2: tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks
+        pq = 0
+        while (pq < 8) {
+            chq = 0
+            if (pq == 0) { chq = td2 }
+            if (pq == 1) { chq = fd }
+            if (pq == 2) { chq = hd }
+            if (pq == 3) { chq = sud }
+            if (pq == 4) { chq = svd }
+            if (pq == 5) { chq = cw }
+            if (pq == 6) { chq = nbc }
+            if (pq == 7) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            pq = pq + 1
+        }
+        if (cuda_launch4i(from<loc<CVoid>>(fhad2), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(od)
+        cuMemFree_v2(hd)
+        cuMemFree_v2(td2)
+        cuMemFree_v2(pd)
+        cuMemFree_v2(sud)
+        cuMemFree_v2(svd)
+        out = fd
+    }
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_EXL3_OUT") else "native/out/exl3_load_vyb.txt"
+    total<Int> = 83
+    expert<String> = env_get("VYBFORGE_EXPERT") else "0"
+    pre<String> = "model.language_model.layers.3.mlp.experts." + expert + ".gate_proj."
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "trellis")
+    want.push(pre + "suh")
+    want.push(pre + "svh")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("EXL3_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("EXL3_FAIL no cuda"); return 4 }
+    fdeq<Int> = load_fn("native/build/exl3.ptx", "exl3deq")
+    fhgen<Int> = load_fn("native/build/exl3.ptx", "exl3hgen")
+    fhad1<Int> = load_fn("native/build/exl3.ptx", "exl3had1")
+    fhad2<Int> = load_fn("native/build/exl3.ptx", "exl3had2")
+    if (fdeq == 0 || fhgen == 0 || fhad1 == 0 || fhad2 == 0) {
+        println("EXL3_FAIL kernels (make exl3)")
+        return 5
+    }
+
+    # map.bin: 16-byte header + 256*16 body; the body is shape-independent
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 6 } } close(f) }
+        ? -> { println("EXL3_FAIL no map.bin (make exl3)"); return 6 }
+    }
+    body<String> = mapd.substring(16, mapd.len())
+
+    trellis<String> = gx_read(g, 0)
+    suh<String> = gx_read(g, 1)
+    svh<String> = gx_read(g, 2)
+    # gate_proj: [in=4096, out=2048] -> cw (out) 2048, ntiles = (4096/16)*(2048/16)
+    dW<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, trellis, suh, svh, body, 2048, 32768)
+    if (dW == 0) { println("EXL3_FAIL deq"); return 7 }
+    sync()
+    W<Vec<Float>> = dtoh_vec(dW, 4096 * 2048)
+    freedom {
+        cuMemFree_v2(dW)
+    }
+
+    line<String> = digest("gp0", W)
+    println(line)
+    match (open_write(out)) {
+        f -> { write_str(f, line + "\n"); close(f) }
+        ? -> { println("EXL3_FAIL write"); return 8 }
+    }
+    println("EXL3_LOAD_OK expert=" + expert + " elements=" + W.len().to_string())
+    return 0
+}

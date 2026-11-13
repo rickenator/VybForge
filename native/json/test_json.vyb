@@ -82,6 +82,40 @@ main()<Int> -> {
         ? -> { println("LITERAL_PARSE_FAILED") }
     }
 
+    # ---------- 1b) object children by index (no keyed lookup) ----------
+    # A keyed get() over a big object is O(children) per call, i.e. O(n^2) in a loop;
+    # the checkpoint weight_map has 150k entries, so the loader walks children by
+    # index: elem(id, i) + ckey_at(id, i). Both must apply to OBJECTS, in the same
+    # order keys() reports.
+    olit<String> = "{\"a\":1,\"bb\":\"two\",\"ccc\":[3,4],\"d\":null}"
+    match (json_parse(olit)) {
+        d -> {
+            println("== object children ==")
+            n<Int> = d.nchildren(d.root)
+            println("nchildren=")
+            println_int(n)
+            ks2<Vec<String>> = d.keys(d.root)
+            i<Int> = 0
+            while (i < n) {
+                kk<String> = d.ckey_at(d.root, i)
+                vv<Int> = d.elem(d.root, i)
+                println("  " + kk + " -> " + d.hstr(vv) + " (key from keys(): " + ks2.get(i) + ")")
+                i = i + 1
+            }
+            # out-of-range / wrong-kind behaviour stays ddefined: -1 / ""
+            println("elem oob=")
+            println_int(d.elem(d.root, n + 5))
+            println("ckey oob=[" )
+            println(d.ckey_at(d.root, n + 5) + "]")
+            scur<Int> = d.get(d.root, "bb")
+            println("elem on a string=")
+            println_int(d.elem(scur, 0))
+            println("ckey on a string=[")
+            println(d.ckey_at(scur, 0) + "]")
+        }
+        ? -> { println("OBJECT_CHILDREN_PARSE_FAILED") }
+    }
+
     # ---------- 2) config/mock-system.json from disk via io ----------
     match (open_read("config/mock-system.json")) {
         f -> {

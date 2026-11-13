@@ -1,0 +1,32 @@
+import env::{env_get}
+import time::{time_mono_millis}
+import safetensors
+import gx
+
+main()<Int> -> {
+    live<Int> = 0
+    lv<String> = env_get("LIVE") else ""
+    if (lv.len() > 0) { live = lv.to_int() }
+    dir<String> = "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    keep<Vec<String>> = Vec()
+    i<Int> = 0
+    while (i < live) {
+        keep.push("live_string_payload_number_" + i.to_string())
+        i = i + 1
+    }
+    println("live=" + keep.len().to_string())
+    tstart<Int> = time_mono_millis()
+    s<Int> = 1
+    while (s <= 83) {
+        t0<Int> = time_mono_millis()
+        hd<StIndex> = st_open(gx_shard_path(dir, s, 83))
+        t1<Int> = time_mono_millis()
+        if (s <= 6 || s >= 78) {
+            println("  shard " + s.to_string() + " ms=" + (t1 - t0).to_string() + " n=" + hd.n.to_string())
+        }
+        s = s + 1
+    }
+    tend<Int> = time_mono_millis()
+    println("all shards ms=" + (tend - tstart).to_string())
+    return 0
+}

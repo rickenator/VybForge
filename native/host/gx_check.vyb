@@ -1,0 +1,75 @@
+# gx_check.vyb — the Vyb checkpoint index resolved against the real GLM-5.3 shards,
+# emitting a canonical listing for the gate. The independent other side is
+# native/glm53/gx_ref.py (safetensors library, its own parse): both must agree on
+# shard, offset, byte length and the sha256 of the first 1 MiB of every tensor.
+#
+#   VYBFORGE_GX_DIR   checkpoint dir (default: the apex copy)
+#   VYBFORGE_GX_OUT   listing path
+#
+# Run:  "$VYB" --module-path native/json --module-path native/torchload \
+#          --module-path native/glm53 native/host/gx_check.vyb
+import io::{open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+main()<Int> -> {
+    dir<String> = env("VYBFORGE_GX_DIR", "/mnt/apex/rick/vybforge/glm53-checkpoint")
+    out<String> = env("VYBFORGE_GX_OUT", "native/out/gx_listing_vyb.txt")
+    total<Int> = 83
+    WIN<Int> = 1048576
+
+    # a spread of real tensors: layer-0 attention/mlp/hc, layer-3 router/shared/hc,
+    # and one expert's three EXL3 parts (the quantized path the loader must resolve)
+    want<Vec<String>> = Vec()
+    want.push("model.language_model.layers.0.self_attn.q_proj.weight")
+    want.push("model.language_model.layers.0.mlp.down_proj.weight")
+    want.push("model.language_model.layers.0.hc_attn_fn")
+    want.push("model.language_model.layers.3.mlp.gate.weight")
+    want.push("model.language_model.layers.3.mlp.shared_experts.up_proj.weight")
+    want.push("model.language_model.layers.3.hc_ffn_scale")
+    want.push("model.language_model.layers.3.mlp.experts.0.gate_proj.trellis")
+    want.push("model.language_model.layers.3.mlp.experts.0.up_proj.suh")
+    want.push("model.language_model.layers.3.mlp.experts.0.down_proj.svh")
+    want.push("model.language_model.layers.3.mlp.experts.287.down_proj.trellis")
+    want.push("model.language_model.nonexistent.tensor")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    r<String> = "TOTAL " + total.to_string() + "\n"
+    hc<Int> = 0
+    miss<Int> = 0
+    i<Int> = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) {
+            hl<Int> = g.nbytes.get(i)
+            if (hl > WIN) { hl = WIN }
+            sha<String> = st_sha(g.paths.get(i), g.off.get(i), hl)
+            if (sha.len() == 0) { sha = "ERR" } else { hc = hc + 1 }
+            r = r + want.get(i) + "|" + g.shard.get(i).to_string() + "|" +
+                g.off.get(i).to_string() + "|" + g.nbytes.get(i).to_string() + "|" +
+                g.dts.get(i) + "|" + sha + "\n"
+        } else {
+            miss = miss + 1
+            r = r + want.get(i) + "|MISSING\n"
+        }
+        i = i + 1
+    }
+    r = r + "HASHED " + hc.to_string() + "\n"
+    r = r + "MISSING " + miss.to_string() + "\n"
+
+    wrc<Int> = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) {
+        println("GX_CHECK_FAIL write=" + out)
+        exit(1)
+    }
+    println("GX_CHECK_OK hashed=" + hc.to_string() + " missing=" + miss.to_string() + " out=" + out)
+    return 0
+}

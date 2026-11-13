@@ -1,0 +1,124 @@
+PHONE_PROBE begin
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_i.wav
+PHONE i
+0
+1
+27000
+229000
+301000
+400
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_i.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_a.wav
+PHONE a
+0
+1
+73000
+109000
+244000
+400
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_a.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_u.wav
+PHONE u
+0
+1
+30000
+87000
+224000
+400
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_u.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_m.wav
+PHONE m
+2
+1
+30000
+110000
+230000
+200
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_m.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_n.wav
+PHONE n
+2
+1
+30000
+170000
+260000
+200
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_n.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_l.wav
+PHONE l
+4
+1
+40000
+120000
+260000
+160
+0
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_l.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_s.wav
+PHONE s
+1
+0
+320000
+550000
+700000
+250
+300000
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_s.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_sh.wav
+PHONE sh
+1
+0
+200000
+250000
+350000
+250
+120000
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_sh.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_t.wav
+PHONE t
+3
+0
+100000
+350000
+500000
+90
+250000
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_t.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_k.wav
+PHONE k
+3
+0
+90000
+220000
+320000
+90
+200000
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_k.wav
+WROTE /home/rick/Projects/VybForge/native/tts/out/ph_h.wav
+PHONE h
+5
+0
+50000
+150000
+250000
+80
+40000
+FILE
+/home/rick/Projects/VybForge/native/tts/out/ph_h.wav
+PHONE_PROBE done
+0

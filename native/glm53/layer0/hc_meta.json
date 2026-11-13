@@ -1,0 +1,204 @@
+{
+ "model.language_model.layers.0.hc_attn_base": {
+  "file": "model_language_model_layers_0_hc_attn_base.bin",
+  "dtype": "F32",
+  "shape": [
+   24
+  ]
+ },
+ "model.language_model.layers.0.hc_attn_fn": {
+  "file": "model_language_model_layers_0_hc_attn_fn.bin",
+  "dtype": "BF16",
+  "shape": [
+   24,
+   16384
+  ]
+ },
+ "model.language_model.layers.0.hc_attn_scale": {
+  "file": "model_language_model_layers_0_hc_attn_scale.bin",
+  "dtype": "F32",
+  "shape": [
+   3
+  ]
+ },
+ "model.language_model.layers.0.hc_ffn_base": {
+  "file": "model_language_model_layers_0_hc_ffn_base.bin",
+  "dtype": "F32",
+  "shape": [
+   24
+  ]
+ },
+ "model.language_model.layers.0.hc_ffn_fn": {
+  "file": "model_language_model_layers_0_hc_ffn_fn.bin",
+  "dtype": "BF16",
+  "shape": [
+   24,
+   16384
+  ]
+ },
+ "model.language_model.layers.0.hc_ffn_scale": {
+  "file": "model_language_model_layers_0_hc_ffn_scale.bin",
+  "dtype": "F32",
+  "shape": [
+   3
+  ]
+ },
+ "model.language_model.layers.0.input_layernorm.weight": {
+  "file": "model_language_model_layers_0_input_layernorm_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   4096
+  ]
+ },
+ "model.language_model.layers.0.mlp.down_proj.weight": {
+  "file": "model_language_model_layers_0_mlp_down_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   4096,
+   12288
+  ]
+ },
+ "model.language_model.layers.0.mlp.gate_proj.weight": {
+  "file": "model_language_model_layers_0_mlp_gate_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   12288,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.mlp.up_proj.weight": {
+  "file": "model_language_model_layers_0_mlp_up_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   12288,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.post_attention_layernorm.weight": {
+  "file": "model_language_model_layers_0_post_attention_layernorm_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.A_log": {
+  "file": "model_language_model_layers_0_self_attn_A_log.bin",
+  "dtype": "F32",
+  "shape": [
+   64
+  ]
+ },
+ "model.language_model.layers.0.self_attn.b_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_b_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   64,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.dt_bias": {
+  "file": "model_language_model_layers_0_self_attn_dt_bias.bin",
+  "dtype": "F32",
+  "shape": [
+   8192
+  ]
+ },
+ "model.language_model.layers.0.self_attn.f_a_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_f_a_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   128,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.f_b_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_f_b_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   128
+  ]
+ },
+ "model.language_model.layers.0.self_attn.g_a_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_g_a_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   128,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.g_b_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_g_b_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   128
+  ]
+ },
+ "model.language_model.layers.0.self_attn.k_conv1d.weight": {
+  "file": "model_language_model_layers_0_self_attn_k_conv1d_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   1,
+   4
+  ]
+ },
+ "model.language_model.layers.0.self_attn.k_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_k_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.o_norm.weight": {
+  "file": "model_language_model_layers_0_self_attn_o_norm_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   128
+  ]
+ },
+ "model.language_model.layers.0.self_attn.o_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_o_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   4096,
+   8192
+  ]
+ },
+ "model.language_model.layers.0.self_attn.q_conv1d.weight": {
+  "file": "model_language_model_layers_0_self_attn_q_conv1d_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   1,
+   4
+  ]
+ },
+ "model.language_model.layers.0.self_attn.q_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_q_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   4096
+  ]
+ },
+ "model.language_model.layers.0.self_attn.v_conv1d.weight": {
+  "file": "model_language_model_layers_0_self_attn_v_conv1d_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   1,
+   4
+  ]
+ },
+ "model.language_model.layers.0.self_attn.v_proj.weight": {
+  "file": "model_language_model_layers_0_self_attn_v_proj_weight.bin",
+  "dtype": "BF16",
+  "shape": [
+   8192,
+   4096
+  ]
+ }
+}

@@ -1,9 +1,12 @@
 # VybForge
 
 VybForge is the shop floor where the Vyb language stops being a compiler demo
-and starts doing work on the machine. Two products share one repo: **Spec**, a
-desired-state configuration interviewer for VybOS with a deterministic applier,
-and **Infer**, a Vyb-native, on-GPU model-inference and compute substrate.
+and starts doing work on the machine. Two products share one repo, plus the
+voice loop that ties them together: **Spec**, a desired-state configuration
+interviewer for VybOS with a deterministic applier; **Infer**, a Vyb-native,
+on-GPU model-inference and compute substrate; and **Voice**, the
+audio-in → text → audio loop built on Infer (`native/mel`, `native/whisper`,
+`native/tts`, `native/voice`).
 
 Everything here **drafts desired state only.** It never builds, realizes,
 activates, deploys, or edits VybOS or the host, and it never touches the
@@ -47,7 +50,7 @@ optional; the deterministic backbone is not:
 ```
 config/default-state.json   (a known-good SystemSpec baseline)
         + confirmed proposed_changes  ({path, op, value, reason})
-        ── tools/apply.vyb (Vyb 0.7.3, runs locally) ──>
+        ── tools/apply.vyb (Vyb-native, runs locally) ──>
         out/spec.json    (validated, merged machine contract)
         out/system.vyb   (a self-contained config-as-program that reproduces it)
 ```
@@ -91,9 +94,31 @@ central (never committed): see `MODELS.md`.
 ### Ridge 27B chat (`./ridge-chat`)
 
 `./ridge-chat` chats with the 27B Ridge (qwen35) model. The engine is all Vyb (`native/host/ridge_decode.vyb`).
-On an RTX 3090 it runs at 35.8 tok/s decode and 791 tok/s prefill; llama.cpp does 47.4 / 1258.
+On an RTX 3090 it runs at 40.4 tok/s decode and 791 tok/s prefill; llama.cpp does 47.4 / 1258.
 Setup, the flags, the perf tables for the 3090 and DGX Spark, and the exactness/KLD gates are in
 [`doc/RIDGE-27B.md`](doc/RIDGE-27B.md). Build the kernels with `make -C native ridge-kernels`.
+
+## Voice — the self-contained audio loop
+
+`native/audio` → `native/mel` → `native/whisper` → `native/voice` →
+`native/tts`: microphone in, text, action, speech out, with no Python, no
+external ASR/TTS service and no cloud at runtime. Architecture and layer
+contracts: `doc/VOICE-LOOP.md`.
+
+| layer | state | gate |
+|---|---|---|
+| `native/audio` (L1) | **done** — 4 s captured from the host mic into a valid WAV; a synthesised 440 Hz tone captured at the sink's monitor, 99.9 % of its energy within 40 Hz | its own probe + WAV dump |
+| `native/mel` (L2 front) | **done** — Vyb-native FFT (Bluestein over a radix-2 kernel), Slaney filterbank, 80×3000 log-mel within 1.3e-5 of `transformers.WhisperFeatureExtractor` | `native/mel/build.sh` |
+| `native/whisper` (L2 STT) | **done** — whisper tiny.en: all 14 encoder stages gated, decoder logits within 5.2e-05, 24-token greedy decode matches the reference token for token, id→text matches character for character | `native/whisper/build.sh decoder` |
+| `native/voice` (L3 dispatch) | **done** — a fixed phrase set routed to actions, deliberately not a model; the clock is a parameter (TZif parsed in Vyb, no `date`/C shim) so every case is reproducible | `native/voice/check_dispatch.py` |
+| `native/tts` (L4) | **core gated, loop open** — Klatt cascade formant synthesiser; a vowel's spectrum matches the cascade response re-derived in numpy, formant transitions added | `native/tts/build.sh` |
+
+The honest gap is in L4: `./native/tts/round_trip.sh hello` does not yet come
+back as speech. Whisper labels the synthetic word "(singing)"/"(music)" — a
+pitched non-speech label it never emits for real speech — so that measurement
+says as much about the oracle as about the synthesiser; `native/tts/README.md`
+records the progression and the two candidate next steps (fix the oracle first;
+port a neural vocoder if recognition-by-ASR is the actual bar).
 
 ## Configuration
 
@@ -233,3 +258,16 @@ gates, and `native/legit/run_phase1_battery.sh` remains the regression gate.
 - Ask the owner before: the GitHub-side repo rename, force-push/rewriting
   history, deleting `artifacts/vybos-configurator-lora/`, or running a training
   job.
+
+
+## The Vyb family
+
+Vyb is a language with more than one consumer; each project below is written in
+it and is a real, running thing rather than a demo.
+
+| project | what it is |
+|---|---|
+| **[Vyb](https://github.com/rickenator/Vyb)** | the language, the LLVM JIT/AOT compiler and the standard library — [vyb-lang.org](https://vyb-lang.org/) |
+| **[VybOS](https://github.com/rickenator/VybOS)** | a Linux-based OS whose declarative, content-addressed configuration and control framework are Vyb; PID 1 is Vyb |
+| **VybWin** *(private for now)* | the window environment for VybOS: apps are cards summoned into an arena, with the ledger one flip away |
+| **[VybFly](https://github.com/rickenator/VybFly)** | FlyScale — a whole-brain connectome scaling study run on a Vyb-native simulator and Vyb GPU kernels |

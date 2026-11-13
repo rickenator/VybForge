@@ -1,0 +1,364 @@
+# glm_l3_moe_fwd.vyb — layer 3's MoE ffn site in Vyb: router + shared expert.
+#
+#   router:  logits = h2 @ gate.weight^T          (bf16 [288, 4096] -> [4096, 288])
+#            scores = sigmoid(logits)
+#            choice = scores + e_score_correction_bias      (bias is selection-only)
+#            idx    = top8(choice)
+#            w      = scores[idx] / (sum + 1e-20) * 2.5     (routed_scaling_factor)
+#   shared:  g = min(x@Wg, 10); u = clamp(x@Wu, +-10); y = (silu(g) * u) @ Wd
+#
+# The routed experts (EXL3-packed, 109 distinct over these 22 tokens) are the next step —
+# they need the exl3 dequant pipeline in Vyb (`native/exl3`); everything else here is
+# already real, gated code.
+#
+# Input h2 comes from native/out/gold_l3_moe_h2.txt (the chain's pre-ffn layernorm).
+# Gold: native/glm53/gold_l3_moe.py. Gate: native/glm53/verify_l3_moe_vyb.py
+# -> L3_MOE_ROUTE_VYB + L3_MOE_SHARED_VYB.
+#
+# Run: make -f native/Makefile glm3moe
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
+import vmath::{vexp, vsqrt}
+
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+R<Int> = 22
+H<Int> = 4096
+NE<Int> = 288
+TOPK<Int> = 8
+EINTER<Int> = 2048
+SCALE40<Float> = 1099511627776.0
+SWIGLU_LIMIT<Float> = 10.0
+ROUTED_SCALE<Float> = 2.5
+
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+sigmoid(x<Float>)<Float> -> {
+    return 1.0 / (1.0 + vexp(0.0 - x))
+}
+
+silu(x<Float>)<Float> -> {
+    return x * (1.0 / (1.0 + vexp(0.0 - x)))
+}
+
+digest(name<String>, v<Vec<Float>>)<String> -> {
+    s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
+    i<Int> = 0
+    while (i < v.len()) {
+        x<Float> = v.get(i)
+        s = s + x
+        if (x < 0.0) { a = a - x } else { a = a + x }
+        q = q + x * x
+        t<Float> = x
+        if (t < 0.0) { t = 0.0 - t }
+        if (t > m) { m = t }
+        i = i + 1
+    }
+    out<String> = name + " n=" + v.len().to_string() + " sum=" + di(s).to_string() +
+                  " abs=" + di(a).to_string() + " sq=" + di(q).to_string() +
+                  " max=" + di(m).to_string()
+    i = 0
+    while (i < 8) {
+        hv<Float> = 0.0
+        if (i < v.len()) { hv = v.get(i) }
+        out = out + " v" + i.to_string() + "=" + di(hv).to_string()
+        i = i + 1
+    }
+    return out
+}
+
+f32_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 4) {
+        c<Int> = (raw.char_at(idx * 4 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if ((w & 2147483648) != 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 23) & 255
+    man<Int> = w & 8388607
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 8388608.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 127)) {
+            p2 = p2 * 2.0
+            e2 = e2 + 1
+        }
+        while (e2 > (ex - 127)) {
+            p2 = p2 / 2.0
+            e2 = e2 - 1
+        }
+        v = sign * den * p2
+    }
+    return v
+}
+
+alloc_dev(n<Int>)<Int> -> {
+    var<Int> p = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(p), n) != 0) { return 0 }
+    }
+    return p
+}
+
+free_dev(p<Int>)<Int> -> {
+    if (p == 0) { return 0 }
+    freedom {
+        cuMemFree_v2(p)
+    }
+    return 0
+}
+
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    var<Int> addr_out = 0
+    freedom {
+        var<loc<loc<CVoid>>> m = from<loc<loc<CVoid>>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        var<loc<CVoid>> f = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, fn_name) != 0) { return 0 }
+        addr_out = addr(f)
+    }
+    return addr_out
+}
+
+mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
+    var<Int> C = 0
+    var<Int> scr = 0
+    C = alloc_dev(M * N * 8)
+    scr = alloc_dev(64)
+    if (C == 0 || scr == 0) { return 0 }
+    if (gemm(faddr, scr, A, B, C, M, N, K, 1.0, 0.0) != 0) { return 0 }
+    sync()
+    free_dev(scr)
+    return C
+}
+
+mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    var<Int> dA = 0
+    dA = alloc_dev(rows * K * 8)
+    if (dA == 0) { return out }
+    htod_vec(dA, x)
+    var<Int> dC = 0
+    dC = mm_dev(dA, B, rows, N, K, faddr)
+    free_dev(dA)
+    if (dC == 0) { return out }
+    out = dtoh_vec(dC, rows * N)
+    free_dev(dC)
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_L3MOE_OUT") else "native/out/l3moe_vyb.txt"
+    h2path<String> = env_get("VYBFORGE_L3MOE_H2") else "native/out/gold_l3_moe_h2.txt"
+    total<Int> = 83
+    pre<String> = "model.language_model.layers.3."
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "mlp.gate.weight")
+    want.push(pre + "mlp.gate.e_score_correction_bias")
+    want.push(pre + "mlp.shared_experts.gate_proj.weight")
+    want.push(pre + "mlp.shared_experts.up_proj.weight")
+    want.push(pre + "mlp.shared_experts.down_proj.weight")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("L3MOE_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("L3MOE_FAIL no cuda"); return 4 }
+    fgemm<Int> = load_fn("native/build/gemm.ptx", "gemm")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fgemm == 0 || fbf == 0) { println("L3MOE_FAIL kernels"); return 5 }
+
+    # ---- h2 from the gold (scaled integers, 22 x 4096) ----
+    t<String> = ""
+    match (open_read(h2path)) {
+        f -> { match (read_all(f)) { s -> { t = s } ? -> { return 6 } } close(f) }
+        ? -> { println("L3MOE_FAIL no " + h2path); return 6 }
+    }
+    h2<Vec<Float>> = Vec()
+    cur<String> = ""
+    i = 0
+    while (i <= t.len()) {
+        ch<String> = ""
+        if (i < t.len()) { ch = t.substring(i, i + 1) }
+        if (i == t.len() || ch == " " || ch == "\n") {
+            if (cur.len() > 0) {
+                h2.push((cur.to_int() as Float) / SCALE40)
+                cur = ""
+            }
+        } else { cur = cur + ch }
+        i = i + 1
+    }
+    if (h2.len() != R * H) { println("L3MOE_FAIL h2 len " + h2.len().to_string()); return 7 }
+
+    lines<String> = digest("h2", h2) + "\n"
+
+    # ---- router ----
+    var<Int> d_gw = 0
+    d_gw = deq_bf16(fbf, gx_read(g, 0), NE * H, H)          # [H, NE]
+    if (d_gw == 0) { return 8 }
+    logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
+    free_dev(d_gw)
+    raw_bias<String> = gx_read(g, 1)
+    bias<Vec<Float>> = Vec()
+    i = 0
+    while (i < NE) {
+        bias.push(f32_at(raw_bias, i))
+        i = i + 1
+    }
+
+    scores<Vec<Float>> = Vec()
+    i = 0
+    while (i < logits.len()) {
+        scores.push(sigmoid(logits.get(i)))
+        i = i + 1
+    }
+    lines = lines + digest("scores", scores) + "\n"
+    println(digest("scores", scores))
+
+    # top-8 by (score + bias), then renorm the score weights over the selected set
+    routeline<String> = "route"
+    wline<String> = "weights"
+    r<Int> = 0
+    while (r < R) {
+        used<Vec<Int>> = Vec()
+        lane<Int> = 0
+        sel<Vec<Int>> = Vec()
+        while (lane < TOPK) {
+            best<Int> = -1
+            bestv<Float> = 0.0 - 1e30
+            j<Int> = 0
+            while (j < NE) {
+                dup<Int> = 0
+                k<Int> = 0
+                while (k < sel.len()) {
+                    if (sel.get(k) == j) { dup = 1 }
+                    k = k + 1
+                }
+                if (dup == 0) {
+                    cv<Float> = scores.get(r * NE + j) + bias.get(j)
+                    if (cv > bestv) {
+                        bestv = cv
+                        best = j
+                    }
+                }
+                j = j + 1
+            }
+            sel.push(best)
+            lane = lane + 1
+        }
+        sm<Float> = 0.0
+        lane = 0
+        while (lane < TOPK) {
+            sm = sm + scores.get(r * NE + sel.get(lane))
+            lane = lane + 1
+        }
+        routeline = routeline + " q" + r.to_string() + "=["
+        wline = wline + " q" + r.to_string() + "=["
+        lane = 0
+        while (lane < TOPK) {
+            e<Int> = sel.get(lane)
+            wv<Float> = scores.get(r * NE + e) / (sm + 1e-20) * ROUTED_SCALE
+            if (lane > 0) {
+                routeline = routeline + ","
+                wline = wline + ","
+            }
+            routeline = routeline + e.to_string()
+            wline = wline + di(wv).to_string()
+            lane = lane + 1
+        }
+        routeline = routeline + "]"
+        wline = wline + "]"
+        r = r + 1
+    }
+    lines = lines + routeline + "\n" + wline + "\n"
+    println(routeline)
+
+    # ---- shared expert (clamped SwiGLU) ----
+    var<Int> d_sg = 0
+    var<Int> d_su = 0
+    var<Int> d_sd = 0
+    d_sg = deq_bf16(fbf, gx_read(g, 2), EINTER * H, H)      # [H, EINTER]
+    d_su = deq_bf16(fbf, gx_read(g, 3), EINTER * H, H)
+    d_sd = deq_bf16(fbf, gx_read(g, 4), H * EINTER, EINTER) # [EINTER, H]
+    if (d_sg == 0 || d_su == 0 || d_sd == 0) { return 9 }
+    sgate<Vec<Float>> = mm_host(h2, R, H, d_sg, EINTER, fgemm)
+    sup<Vec<Float>> = mm_host(h2, R, H, d_su, EINTER, fgemm)
+    sact<Vec<Float>> = Vec()
+    i = 0
+    while (i < sgate.len()) {
+        gv<Float> = sgate.get(i)
+        if (gv > SWIGLU_LIMIT) { gv = SWIGLU_LIMIT }
+        uv<Float> = sup.get(i)
+        if (uv > SWIGLU_LIMIT) { uv = SWIGLU_LIMIT }
+        if (uv < 0.0 - SWIGLU_LIMIT) { uv = 0.0 - SWIGLU_LIMIT }
+        sact.push(silu(gv) * uv)
+        i = i + 1
+    }
+    shared<Vec<Float>> = mm_host(sact, R, EINTER, d_sd, H, fgemm)
+    lines = lines + digest("shared", shared) + "\n"
+    println(digest("shared", shared))
+    free_dev(d_sg)
+    free_dev(d_su)
+    free_dev(d_sd)
+
+    match (open_write(out)) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { println("L3MOE_FAIL write"); return 10 }
+    }
+    println("L3MOE_OK router + shared expert (routed experts next)")
+    return 0
+}

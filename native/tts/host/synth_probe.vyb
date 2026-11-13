@@ -1,0 +1,52 @@
+# synth_probe.vyb — render the vowel table to WAV and declare what was asked for.
+#
+# It prints the SPEC it synthesised to, not just the filename: the gate measures
+# the audio and compares against these numbers, so the table has one source of
+# truth (synth.vyb) and the check is a measurement rather than a restatement.
+#
+#   vyb host/synth_probe.vyb --module-path ..
+import synth::{Vowel, SR, BW1, BW2, BW3, std_vowels, render_vowel, wav_of}
+import io::{open_write, write_bytes}
+import env::{env_get}
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+main()<Int> -> {
+    println("SYNTH_PROBE begin")
+    outdir<String> = env("TTS_OUT", "out")
+    vs<Vec<Vowel>> = std_vowels()
+    i<Int> = 0
+    for (i in 0..vs.len() - 1) {
+        v<Vowel> = vs.get(i)
+        samples<Vec<Float>> = render_vowel(v, SR, 0.5)
+        path<String> = outdir + "/" + v.name + ".wav"
+        w<Vec<UInt8>> = wav_of(samples, SR)
+        match (open_write(path)) {
+            f -> {
+                match (write_bytes(f, borrow(w))) {
+                    n -> { println("WROTE " + path + " bytes=" + n.to_string()) }
+                    ? -> { println("WRITE FAILED " + path); return 2 }
+                }
+            }
+            ? -> { println("OPEN FAILED " + path); return 1 }
+        }
+        # the spec, as synthesised
+        println("SPEC")
+        println_int((v.f1 * 100.0) as Int)
+        println_int((v.f2 * 100.0) as Int)
+        println_int((v.f3 * 100.0) as Int)
+        println_int((v.f0 * 100.0) as Int)
+        println_int(v.ms)
+        println_int((BW1 * 100.0) as Int)
+        println_int((BW2 * 100.0) as Int)
+        println_int((BW3 * 100.0) as Int)
+        println("NAME")
+        println(v.name)
+        println("FILE")
+        println(path)
+    }
+    println("SYNTH_PROBE done")
+    return 0
+}
