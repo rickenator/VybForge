@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VybForge — brand sheet</title>
+<style>
+  :root{
+    --ink:#070b11;
+    --ink-2:#0e1620;
+    --panel:#141d29;
+    --line:#22303f;
+    --text:#dbe6f2;
+    --dim:#8ba0b6;
+    --magma:#ff6a10;
+    --ember:#ffa22e;
+    --gold:#ffd06b;
+    --cream:#fff6da;
+    --steel:#a9bcd4;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:48px 40px 72px;
+    background:
+      radial-gradient(900px 520px at 18% -10%, rgba(255,106,16,.16), transparent 62%),
+      radial-gradient(700px 420px at 92% 8%, rgba(255,162,46,.09), transparent 60%),
+      var(--ink);
+    color:var(--text);
+    font-family:"Inter",-apple-system,"Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto}
+  header{display:flex;align-items:center;gap:18px;margin-bottom:8px}
+  header img{width:64px;height:64px;border-radius:16px;box-shadow:0 12px 34px rgba(0,0,0,.55)}
+  h1{font-size:30px;margin:0;letter-spacing:-.02em}
+  h1 span{color:var(--ember)}
+  .sub{color:var(--dim);font-size:14px;margin:4px 0 0}
+  section{margin-top:56px}
+  h2{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--dim);
+     margin:0 0 20px;font-weight:600}
+  .hero{
+    display:grid;grid-template-columns:1.05fr .95fr;gap:36px;align-items:center;
+    margin-top:44px;padding:32px;border:1px solid var(--line);border-radius:26px;
+    background:linear-gradient(160deg,#101924 0%,#080d14 62%,#0b1017 100%);
+  }
+  .hero img{width:100%;max-width:440px;display:block;margin:0 auto;
+    filter:drop-shadow(0 26px 60px rgba(255,106,16,.22))}
+  .hero h3{font-size:26px;margin:0 0 6px;letter-spacing:-.01em}
+  .hero .tag{color:var(--ember);font-size:13px;letter-spacing:.16em;text-transform:uppercase}
+  .hero p{color:var(--dim);font-size:15px;line-height:1.6;margin:14px 0 0}
+  .sizes{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap;
+         padding:26px 28px;border:1px solid var(--line);border-radius:20px;background:var(--ink-2)}
+  .sizes figure{margin:0;text-align:center}
+  .sizes figcaption{font-size:11px;color:var(--dim);margin-top:10px;letter-spacing:.08em}
+  .sizes img{display:block;image-rendering:auto}
+  .quad{border-radius:22px;background:var(--ink-2);border:1px solid var(--line);
+        display:flex;align-items:center;justify-content:center;padding:18px;min-height:150px}
+  .pal{display:grid;grid-template-columns:repeat(6,1fr);gap:14px}
+  .sw{border-radius:14px;overflow:hidden;border:1px solid var(--line);background:var(--ink-2)}
+  .sw .chip{height:78px}
+  .sw .meta{padding:10px 12px;font-size:11px;color:var(--dim);line-height:1.5}
+  .sw .meta b{display:block;color:var(--text);font-size:12px;letter-spacing:.02em}
+  .lock{display:flex;align-items:center;gap:20px;padding:30px 34px;border:1px solid var(--line);
+        border-radius:22px;background:var(--ink-2)}
+  .lock img{width:76px;height:76px;border-radius:19px}
+  .lock .wm{font-size:38px;font-weight:700;letter-spacing:-.025em}
+  .lock .wm em{font-style:normal;color:var(--ember)}
+  .lock small{display:block;color:var(--dim);font-size:12px;letter-spacing:.2em;
+              text-transform:uppercase;margin-top:6px}
+  .rules{display:grid;grid-template-columns:1fr 1fr;gap:18px;font-size:14px;color:var(--dim);line-height:1.65}
+  .rules div{padding:20px 22px;border:1px solid var(--line);border-radius:16px;background:var(--ink-2)}
+  .rules b{color:var(--text);display:block;margin-bottom:8px;font-size:13px;letter-spacing:.06em;text-transform:uppercase}
+  code{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:12px;color:var(--steel)}
+  footer{margin-top:56px;color:#5c6f84;font-size:12px}
+  @media (max-width:820px){.hero{grid-template-columns:1fr}.pal{grid-template-columns:repeat(3,1fr)}
+    .rules{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <img src="icon.svg" alt="VybForge icon">
+    <div>
+      <h1>Vyb<span>Forge</span></h1>
+      <p class="sub">Brand sheet — mascot, icon, palette. One repo, two products, one voice.</p>
+    </div>
+  </header>
+
+  <div class="hero">
+    <img src="mascot.svg" alt="Billet, the VybForge mascot">
+    <div>
+      <div class="tag">Mascot</div>
+      <h3>Billet</h3>
+      <p>A block of hot iron that got tired of being stock and started smithing.
+         The visor is a molten <b>V</b> — Vyb, struck into the face and into the hammer.
+         Billet drafts desired state; it never swings the hammer at your host.</p>
+      <p><code>assets/brand/mascot.svg</code> — transparent, 512 × 512, vector.</p>
+    </div>
+  </div>
+
+  <section>
+    <h2>Icon — 1:1 pixels</h2>
+    <div class="sizes">
+      <figure><img src="png/icon-256.png" width="256" height="256" alt="icon 256"><figcaption>256</figcaption></figure>
+      <figure><img src="png/icon-128.png" width="128" height="128" alt="icon 128"><figcaption>128</figcaption></figure>
+      <figure><img src="png/icon-64.png" width="64" height="64" alt="icon 64"><figcaption>64</figcaption></figure>
+      <figure><img src="png/icon-48.png" width="48" height="48" alt="icon 48"><figcaption>48</figcaption></figure>
+      <figure><img src="png/icon-32.png" width="32" height="32" alt="icon 32"><figcaption>32</figcaption></figure>
+      <figure><img src="png/icon-16.png" width="16" height="16" alt="icon 16"><figcaption>16</figcaption></figure>
+    </div>
+  </section>
+
+  <section>
+    <h2>Lockup</h2>
+    <div class="lock">
+      <img src="icon.svg" alt="VybForge icon">
+      <div>
+        <div class="wm">Vyb<em>Forge</em></div>
+        <small>desired state, forged</small>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Palette</h2>
+    <div class="pal">
+      <div class="sw"><div class="chip" style="background:#070b11"></div><div class="meta"><b>#070b11</b>forge black</div></div>
+      <div class="sw"><div class="chip" style="background:#141d29"></div><div class="meta"><b>#141d29</b>panel iron</div></div>
+      <div class="sw"><div class="chip" style="background:#2a3745"></div><div class="meta"><b>#2a3745</b>cold iron</div></div>
+      <div class="sw"><div class="chip" style="background:#a9bcd4"></div><div class="meta"><b>#a9bcd4</b>steel</div></div>
+      <div class="sw"><div class="chip" style="background:linear-gradient(180deg,#ffa22e,#ff6a10)"></div><div class="meta"><b>#ff6a10</b>magma</div></div>
+      <div class="sw"><div class="chip" style="background:linear-gradient(180deg,#fff2c0,#ffd06b)"></div><div class="meta"><b>#ffe9a6</b>hot core</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Rules</h2>
+    <div class="rules">
+      <div><b>Do</b>
+        Keep the V visor and the two eye lamps visible — they are the whole mark.
+        Use the icon on the dark tile for app/favicon duties, and the mascot bare on
+        dark surfaces. Minimum icon size 16 px; minimum mascot width 96 px.
+      </div>
+      <div><b>Don't</b>
+        Recolor the visor away from magma amber/orange, rotate the mascot, add a second
+        glow hue, put the transparent mascot on a light background without the dark tile,
+        or let the hammer overlap the face panel.
+      </div>
+    </div>
+  </section>
+
+  <footer>VybForge · assets/brand/ · mascot + icon are original vector work for this repo, covered by the repo LICENSE.</footer>
+</div>
+</body>
+</html>
