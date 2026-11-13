@@ -484,11 +484,17 @@ per decode step appending to its cache; the driver's final draft logits are comp
 logits + top-1. `DECODE_MTP_MATCH` = element-wise logits/hidden agreement with the oracle;
 top-1 agreement with exllamav3 is the semantic smoke check.
 
-**TP=2 / endpoint (owner directive)**: likely Spark-only (dual GB10), so it must be
-RUNTIME-configurable, not compiled in — the driver reads `VYBFORGE_TP` (0/1 = single card,
-2 = layer-sharded across two devices) and the layer->rank map from env/config, with the 3090
-path the default. Nothing TP-specific may be baked into the kernel or layer code; the split is
-a driver-level concern (§9's kv_cache.py TP notes already sketch the layer->rank ownership).
+**TP=2 / endpoint (owner decision)**: TP=2 applies ONLY to the GLM-5.3-Flash model and can
+ONLY run on the dual Sparks — godzilla's single 3090 has no second device, so TP=2 is
+unreachable there by construction. Therefore it must be RUNTIME-configurable, never compiled
+in: the driver reads `VYBFORGE_TP` (0/1 = single card, the default and the only mode that
+exists on the 3090; 2 = layer-sharded across lefty+righty) plus a layer->rank map, with the
+split purely at the driver level (no kernel or layer-code changes; the per-layer structure the
+chained decode already has is what makes the shard a loop-boundary change). The Qwen/ridge
+path stays single-card regardless. The endpoint, by contrast, runs fine on the 3090 at TP=1 —
+chain + MTP + tokenizer behind a localhost-only OpenAI-compatible listener, same shape as the
+existing :8888 Vyb-native server. Still blocked for any Spark run: weight access (§8 — the
+checkpoint is root-owned on lefty, /etc/exports empty).
 
 ---
 
