@@ -1,0 +1,46 @@
+# fft_probe.vyb — gate for the Vyb FFT (native/mel/fft.vyb).
+#
+#   ./build.sh fft            # from native/mel
+#
+# Computes a 400-point real DFT of two fixtures and prints the result as integers
+# scaled by 1e6 (Vyb's float->String prints only 6 significant digits, so the
+# integer channel is the only lossless one). check_fft.py compares them against
+# numpy's rfft of the same quantised inputs.
+import wav::{load_wav}
+import fft::{rfft}
+
+N<Int> = 400
+SCALE<Float> = 1000000.0
+
+emit(tag<String>, x<Vec<Float>>)<Int> -> {
+    println(tag)
+    s<Vec<Float>> = rfft(x, N)
+    println("n=")
+    println_int(s.len())
+    i<Int> = 0
+    for (i in 0..s.len() - 1) {
+        println_int((s.get(i) * SCALE) as Int)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    r<Vec<Float>> = Vec<Float>()
+    match (load_wav("gold/fft_random_input.wav")) {
+        v -> { r = v }
+        ? -> { println("LOAD_FAIL random"); return 1 }
+    }
+    if (r.len() != N) { println("BAD_LEN random"); return 2 }
+    emit("SECTION random", r)
+
+    f<Vec<Float>> = Vec<Float>()
+    match (load_wav("gold/frame_input.wav")) {
+        v -> { f = v }
+        ? -> { println("LOAD_FAIL frame"); return 3 }
+    }
+    if (f.len() != N) { println("BAD_LEN frame"); return 4 }
+    emit("SECTION frame", f)
+
+    println("FFT_PROBE done")
+    return 0
+}

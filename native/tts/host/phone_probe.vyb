@@ -1,0 +1,48 @@
+# phone_probe.vyb — render the phone inventory and declare what each one claims.
+#
+# As with the vowel probe: the Vyb side prints the PROPERTIES it synthesised to
+# (voiced or not, the noise corner, the formants) and the checker measures the
+# audio against those claims. The table has one source of truth.
+#
+#   vyb host/phone_probe.vyb --module-path ..
+import synth::{Phone, SR, phone_table, render_phone, wav_of}
+import io::{open_write, write_bytes}
+import env::{env_get}
+
+env(n<String>, d<String>)<String> -> {
+    return env_get(n) else d
+}
+
+main()<Int> -> {
+    println("PHONE_PROBE begin")
+    outdir<String> = env("TTS_OUT", "out")
+    ts<Vec<Phone>> = phone_table()
+    i<Int> = 0
+    for (i in 0..ts.len() - 1) {
+        p<Phone> = ts.get(i)
+        samples<Vec<Float>> = render_phone(p, SR, 0.5, 12345 + i * 7919)
+        path<String> = outdir + "/ph_" + p.name + ".wav"
+        w<Vec<UInt8>> = wav_of(samples, SR)
+        match (open_write(path)) {
+            f -> {
+                match (write_bytes(f, borrow(w))) {
+                    n -> { println("WROTE " + path) }
+                    ? -> { println("WRITE FAILED " + path); return 2 }
+                }
+            }
+            ? -> { println("OPEN FAILED " + path); return 1 }
+        }
+        println("PHONE " + p.name)
+        println_int(p.kind)
+        println_int(p.voiced)
+        println_int((p.f1 * 100.0) as Int)
+        println_int((p.f2 * 100.0) as Int)
+        println_int((p.f3 * 100.0) as Int)
+        println_int(p.ms)
+        println_int((p.noise_hz * 100.0) as Int)
+        println("FILE")
+        println(path)
+    }
+    println("PHONE_PROBE done")
+    return 0
+}

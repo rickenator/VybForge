@@ -1,0 +1,182 @@
+# gx_load_driver.vyb — loader step 1: resolve real GLM-5.3 tensors in Vyb (gx), read
+# the byte range from the shard, upload the RAW payload to the device, and read words
+# back from the device. This is the piece between "gx says where the bytes are" and
+# "a kernel can use the weight": the bytes must land in device memory unmodified.
+#
+# The gate's other side is native/glm53/gx_load_ref.py (safetensors library): for each
+# tensor both sides print `name|nbytes|w0|wmid|wlast` as 16 hex digits and the two
+# listings must be identical (GX_LOAD_MATCH). Device readback is compared against the
+# host bytes in-driver, so a corrupted transfer fails here, not in a kernel later.
+#
+#   VYBFORGE_GX_DIR   checkpoint dir (default: the apex copy)
+#   VYBFORGE_GX_OUT   listing path
+#
+# Run:  make -f native/Makefile gxload
+import io::{open_read, read_at, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+}
+
+share(all)
+gx_nib(n<Int>)<String> -> {
+    d<String> = "0123456789abcdef"
+    return d.substring(n, n + 1)
+}
+
+# 16 hex digits of the 8 bytes at s[off..off+8]
+share(all)
+gx_hex8(s<String>, off<Int>)<String> -> {
+    r<String> = ""
+    i<Int> = 0
+    while (i < 8) {
+        c<Int> = (s.char_at(off + i) as Int) & 255
+        r = r + gx_nib(c / 16) + gx_nib(c % 16)
+        i = i + 1
+    }
+    return r
+}
+
+# 16 hex digits of the 8 bytes an Int local holds (device readback)
+share(all)
+gx_hexword(w<Int>)<String> -> {
+    r<String> = ""
+    i<Int> = 0
+    while (i < 8) {
+        c<Int> = (w >> (i * 8)) & 255
+        r = r + gx_nib(c / 16) + gx_nib(c % 16)
+        i = i + 1
+    }
+    return r
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_GX_OUT") else "native/out/gx_load_vyb.txt"
+    total<Int> = 83
+
+    # a spread of the shapes the loader must handle: two big dense bodies, a small f32
+    # buffer, a router table, a shared expert, a DSA kv_b, and EXL3 packed expert parts
+    want<Vec<String>> = Vec()
+    want.push("model.language_model.layers.0.self_attn.q_proj.weight")
+    want.push("model.language_model.layers.0.mlp.down_proj.weight")
+    want.push("model.language_model.layers.0.hc_attn_fn")
+    want.push("model.language_model.layers.3.hc_ffn_scale")
+    want.push("model.language_model.layers.3.mlp.gate.weight")
+    want.push("model.language_model.layers.3.mlp.shared_experts.up_proj.weight")
+    want.push("model.language_model.layers.7.self_attn.kv_b_proj.weight")
+    want.push("model.language_model.layers.3.mlp.experts.0.gate_proj.trellis")
+    want.push("model.language_model.layers.3.mlp.experts.0.up_proj.suh")
+    want.push("model.language_model.layers.3.mlp.experts.287.down_proj.trellis")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    if (g.found.len() != want.len()) { println("GX_RESOLVE_SHAPE_BAD"); return 3 }
+
+    r<String> = "TOTAL " + total.to_string() + "\n"
+    var<Int> n_ok = 0
+    var<Int> n_fail = 0
+    var<Int> n_miss = 0
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+
+        var<Int> i = 0
+        while (i < want.len()) {
+            if (g.found.get(i) != 1) {
+                n_miss = n_miss + 1
+                r = r + want.get(i) + "|MISSING\n"
+            } else {
+                nb<Int> = g.nbytes.get(i)
+                payload<String> = gx_read(g, i)
+                if (payload.len() != nb) {
+                    n_fail = n_fail + 1
+                    r = r + want.get(i) + "|SHORT_READ got=" + payload.len().to_string() +
+                        " want=" + nb.to_string() + "\n"
+                } else {
+                    var<Int> d = 0
+                    if (cuMemAlloc_v2(loc(d), nb) != 0) {
+                        n_fail = n_fail + 1
+                        r = r + want.get(i) + "|ALLOC_FAIL\n"
+                    } else {
+                        if (cuMemcpyHtoD_v2(d, payload, nb) != 0) {
+                            n_fail = n_fail + 1
+                            r = r + want.get(i) + "|H2D_FAIL\n"
+                        } else {
+                            cuCtxSynchronize()
+                            mid<Int> = ((nb / 2) / 8) * 8
+                            last<Int> = nb - 8
+                            var<Int> w0 = 0
+                            var<Int> wm = 0
+                            var<Int> wl = 0
+                            var<CInt> rc = 0
+                            rc = cuMemcpyDtoH_v2(loc(w0), d, 8)
+                            if (rc == 0) { rc = cuMemcpyDtoH_v2(loc(wm), d + mid, 8) }
+                            if (rc == 0) { rc = cuMemcpyDtoH_v2(loc(wl), d + last, 8) }
+                            if (rc != 0) {
+                                n_fail = n_fail + 1
+                                r = r + want.get(i) + "|D2H_FAIL\n"
+                            } else {
+                                h0<String> = gx_hex8(payload, 0)
+                                hm<String> = gx_hex8(payload, mid)
+                                hl<String> = gx_hex8(payload, last)
+                                d0<String> = gx_hexword(w0)
+                                dm<String> = gx_hexword(wm)
+                                dl<String> = gx_hexword(wl)
+                                same<Int> = 1
+                                if (h0 != d0) { same = 0 }
+                                if (hm != dm) { same = 0 }
+                                if (hl != dl) { same = 0 }
+                                if (same == 1) {
+                                    n_ok = n_ok + 1
+                                    r = r + want.get(i) + "|" + nb.to_string() + "|" +
+                                        h0 + "|" + hm + "|" + hl + "\n"
+                                } else {
+                                    n_fail = n_fail + 1
+                                    r = r + want.get(i) + "|DEVICE_MISMATCH host=" + h0 + "," +
+                                        hm + "," + hl + " dev=" + d0 + "," + dm + "," + dl + "\n"
+                                }
+                            }
+                        }
+                        cuMemFree_v2(d)
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    r = r + "LOADED " + n_ok.to_string() + "\n"
+    r = r + "FAILED " + n_fail.to_string() + "\n"
+    r = r + "MISSING " + n_miss.to_string() + "\n"
+
+    wrc<Int> = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) {
+        println("GX_LOAD_FAIL write=" + out)
+        exit(1)
+    }
+    println("GX_LOAD_OK loaded=" + n_ok.to_string() + " failed=" + n_fail.to_string() +
+            " missing=" + n_miss.to_string() + " out=" + out)
+    if (n_fail != 0 || n_miss != 0) { return 1 }
+    return 0
+}

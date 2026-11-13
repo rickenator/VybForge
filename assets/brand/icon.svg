@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="iTitle iDesc">
+  <title id="iTitle">VybForge app icon</title>
+  <desc id="iDesc">Billet's iron head with a molten V visor on a dark rounded-square tile.</desc>
+
+  <defs>
+    <linearGradient id="tile" x1="0.2" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#131e2a"/>
+      <stop offset="0.55" stop-color="#0a1119"/>
+      <stop offset="1" stop-color="#070b11"/>
+    </linearGradient>
+    <linearGradient id="iron" x1="0.12" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#5f7a96"/>
+      <stop offset="0.4" stop-color="#334252"/>
+      <stop offset="1" stop-color="#151f2a"/>
+    </linearGradient>
+    <linearGradient id="magma" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff2c0"/>
+      <stop offset="0.42" stop-color="#ffa22e"/>
+      <stop offset="1" stop-color="#ff4508"/>
+    </linearGradient>
+    <radialGradient id="heat" cx="0.5" cy="0.52" r="0.5">
+      <stop offset="0" stop-color="#ff8f2c" stop-opacity="0.34"/>
+      <stop offset="0.62" stop-color="#ff6a10" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#ff6a10" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="panelGlow" cx="0.5" cy="0.52" r="0.6">
+      <stop offset="0" stop-color="#ff9a3c" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ff6a00" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect width="512" height="512" rx="118" fill="url(#tile)"/>
+  <circle cx="256" cy="262" r="232" fill="url(#heat)"/>
+  <rect x="14" y="14" width="484" height="484" rx="106" fill="none" stroke="#8fa8c4" stroke-width="2" opacity="0.1"/>
+
+  <!-- plinth -->
+  <rect x="112" y="370" width="288" height="48" rx="19" fill="#0a1119" stroke="#05080d" stroke-width="5"/>
+  <rect x="132" y="379" width="248" height="8" rx="4" fill="#677e99" opacity="0.35"/>
+  <path d="M 198 394 L 314 394" stroke="url(#magma)" stroke-width="8" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- head -->
+  <rect x="112" y="94" width="288" height="262" rx="78" fill="url(#iron)" stroke="#05080d" stroke-width="6"/>
+  <path d="M 156 112 H 356" stroke="#a3bace" stroke-width="8" stroke-linecap="round" opacity="0.18"/>
+  <path d="M 388 200 Q 396 260 372 322" fill="none" stroke="#a3bace" stroke-width="7"
+        stroke-linecap="round" opacity="0.14"/>
+
+  <!-- face -->
+  <rect x="156" y="134" width="200" height="180" rx="54" fill="#060a10" stroke="#05080d" stroke-width="6"/>
+  <ellipse cx="256" cy="216" rx="80" ry="62" fill="url(#panelGlow)"/>
+
+  <!-- eyes -->
+  <rect x="172" y="168" width="58" height="66" rx="27" fill="#ff6a10" opacity="0.55" filter="url(#soft)"/>
+  <rect x="282" y="168" width="58" height="66" rx="27" fill="#ff6a10" opacity="0.55" filter="url(#soft)"/>
+  <rect x="172" y="168" width="58" height="66" rx="27" fill="url(#magma)"/>
+  <rect x="282" y="168" width="58" height="66" rx="27" fill="url(#magma)"/>
+  <rect x="184" y="179" width="18" height="22" rx="9" fill="#fff6da"/>
+  <rect x="294" y="179" width="18" height="22" rx="9" fill="#fff6da"/>
+
+  <!-- V mouth -->
+  <path d="M 196 242 L 256 292 L 316 242" fill="none" stroke="#ff6a10" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.4" filter="url(#soft)"/>
+  <path d="M 196 242 L 256 292 L 316 242" fill="none" stroke="url(#magma)" stroke-width="18"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- sparks -->
+  <g fill="#ffeab4">
+    <path d="M 398 46 L 402 62 L 418 66 L 402 70 L 398 86 L 394 70 L 378 66 L 394 62 Z"/>
+    <path d="M 444 108 L 446 118 L 456 120 L 446 123 L 444 132 L 441 123 L 431 120 L 441 118 Z"/>
+  </g>
+</svg>

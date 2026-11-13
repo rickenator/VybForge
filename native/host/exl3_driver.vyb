@@ -1,0 +1,348 @@
+// EXL3 P1 gate driver: run the exl3deq kernel over the real down_proj fixture
+// (native/exl3/fixture/layers_3_mlp_experts_0_down_proj_trellis.bin, expert 0 of
+// layer 3 of GLM-5.3-Flash, bytes pulled from lefty:/srv/models/hf) and dump the
+// full rotated-basis [in, out] f64 matrix as text for verify_exl3_vyb.py.
+// Pattern follows q4k_load_driver.vyb (io::read_at, chunked H2D, one-retry module
+// load, per-element DtoH). The map (map.bin) is generated from the oracle-probed
+// tile_slot_composition.json by gen_map_bin.py; its header carries cw + ntiles.
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import gx
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+main()<Int> -> {
+    hm<String> = env_get("HOME") else "."
+    fx<String> = env_get("VYBFORGE_EXL3_FIXTURE") else "native/exl3/fixture"
+
+    # --- map.bin (16-byte header + 256 x 16-byte slot entries) ---
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> {
+            match (read_all(f)) {
+                g -> { mapd = g }
+                ? -> { return 12 }
+            }
+            close(f)
+        }
+        ? -> { println("NO_MAP native/exl3/map.bin (make exl3 generates it)"); return 12 }
+    }
+    if (mapd.len() < 16 + 256 * 16) { println("SHORT_MAP"); return 22 }
+    cw<Int> = 0
+    ntiles<Int> = 0
+    # header: two little-endian i64 — decode via char_at (avoid endianness doubt)
+    hb<Int> = 0
+    while (hb < 8) {
+        cw = cw | (((mapd.char_at(hb) as Int) & 255) << (hb * 8))
+        ntiles = ntiles | (((mapd.char_at(8 + hb) as Int) & 255) << (hb * 8))
+        hb = hb + 1
+    }
+    if (cw <= 0 || ntiles <= 0) { println("BAD_MAP_HEADER cw=" + cw.to_string()); return 22 }
+
+    # --- tensor source: checkpoint via gx (VYBFORGE_GX_DIR) or the local fixture ---
+    tre<String> = ""
+    suhraw<String> = ""
+    svhraw<String> = ""
+    ckdir<String> = env_get("VYBFORGE_GX_DIR") else ""
+    if (ckdir.len() > 0) {
+        # the real checkpoint: resolve an expert's three EXL3 parts through gx and read
+        # the bytes here (gx answers WHERE; this driver moves them to the device)
+        ckexp<String> = env_get("VYBFORGE_EXL3_EXPERT") else "0"
+        pre<String> = "model.language_model.layers.3.mlp.experts." + ckexp +
+                      ".down_proj."
+        want<Vec<String>> = Vec()
+        want.push(pre + "trellis")
+        want.push(pre + "suh")
+        want.push(pre + "svh")
+        g<GxLoc> = gx_resolve(ckdir, 83, want)
+        if (g.found.get(0) != 1 || g.found.get(1) != 1 || g.found.get(2) != 1) {
+            println("CKPT_RESOLVE_FAIL trellis=" + g.found.get(0).to_string() +
+                    " suh=" + g.found.get(1).to_string() + " svh=" + g.found.get(2).to_string())
+            return 12
+        }
+        tre = gx_read(g, 0)
+        suhraw = gx_read(g, 1)
+        svhraw = gx_read(g, 2)
+        println("CKPT_SOURCE expert=" + ckexp + " shards=" + g.shard.get(0).to_string() + "/" +
+                g.shard.get(1).to_string() + "/" + g.shard.get(2).to_string())
+    } else {
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_trellis.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { tre = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_TRELLIS"); return 12 }
+        }
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_suh.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { suhraw = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_SUH"); return 12 }
+        }
+        match (open_read(fx + "/layers_3_mlp_experts_0_down_proj_svh.bin")) {
+            f -> {
+                match (read_all(f)) {
+                    g -> { svhraw = g }
+                    ? -> { return 12 }
+                }
+                close(f)
+            }
+            ? -> { println("NO_SVH"); return 12 }
+        }
+    }
+    tb<Int> = tre.len()
+    if (tb < ntiles * 128) { println("SHORT_TRELLIS got=" + tb.to_string()); return 22 }
+    kn<Int> = (ntiles / (cw / 16)) * 16 * cw     # k * n elements
+    krows<Int> = kn / cw
+    sub<Int> = suhraw.len()
+    svb<Int> = svhraw.len()
+    if (suhraw.len() < krows * 2) { println("SHORT_SUH"); return 22 }
+    if (svhraw.len() < cw * 2) { println("SHORT_SVH"); return 22 }
+    if ((sub % 8) != 0) { println("SUH_NOT_8_ALIGNED len=" + sub.to_string()); return 23 }
+    if ((svb % 8) != 0) { println("SVH_NOT_8_ALIGNED len=" + svb.to_string()); return 23 }
+
+    println("EXL3_DRIVER cw=" + cw.to_string() + " ntiles=" + ntiles.to_string() +
+            " trellis_bytes=" + tb.to_string() + " elements=" + kn.to_string())
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no CUDA device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    ptx<String> = ""
+    match (open_read("native/build/exl3.ptx")) {
+        f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 13 } } }
+        ? -> { println("NO_PTX native/build/exl3.ptx (make exl3 builds it)"); return 13 }
+    }
+
+    freedom {
+        hmod<loc<CVoid>> = from<loc<CVoid>>(0)
+        lrc<CInt> = cuModuleLoadData(loc(hmod), ptx)
+        if (lrc != 0) {
+            ptx2<String> = ""
+            match (open_read("native/build/exl3.ptx")) {
+                f -> {
+                    match (read_all(f)) {
+                        g -> { ptx2 = g }
+                        ? -> { return 20 }
+                    }
+                    close(f)
+                }
+                ? -> { return 20 }
+            }
+            hmod = from<loc<CVoid>>(0)
+            lrc = cuModuleLoadData(loc(hmod), ptx2)
+        }
+        if (lrc != 0) { return 9 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), hmod, "exl3deq") != 0) { return 10 }
+
+        qd<Int> = 0
+        td<Int> = 0
+        od<Int> = 0
+        mb<Int> = mapd.len()
+        ob<Int> = kn * 8
+        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(od), ob) != 0) { return 11 }
+
+        # chunked H2D (8 bytes per call, little-endian Int = bytes) — q4k pattern
+        up<Int> = 0
+        while (up < mb) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                if (up + bj < mb) {
+                    ch = ch | ((((mapd.char_at(up + bj) as Int) & 255)) << (bj * 8))
+                }
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(td + up, loc(ch), 8) != 0) { return 15 }
+            up = up + 8
+        }
+        # bulk H2D straight from the String (the same conversion cuModuleLoadData
+        # uses for the PTX text) — one call instead of one per 8 bytes
+        if (cuMemcpyHtoD_v2(qd, tre, tb) != 0) { return 15 }
+
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(hf)), ntiles, 1, 1, 256, 1, 1,
+                                 qd, td, od, 0)
+        if (rc != 0) { println("launch rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # ---- Hadamard + scales on GPU: H, tmp = What.Hs, out = suh.svh.(Hs.tmp) ----
+        hd<Int> = 0
+        td2<Int> = 0
+        fd<Int> = 0
+        pd<Int> = 0
+        sud<Int> = 0
+        svd<Int> = 0
+        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 11 }
+        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 11 }
+        # Hadamard stage tiles are 128x128: blocks per row = n/128 (NOT cw/16, which
+        # is the count of 16-wide dequant subtiles — using it gave every block a
+        # wrong (kb, nb) and collapsed the output onto the first column blocks).
+        nbc<Int> = cw / 128
+        nblocks<Int> = (kn / cw / 128) * nbc
+
+        uq<Int> = 0
+        while (uq < sub) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                ch = ch | ((((suhraw.char_at(uq + bj) as Int) & 255)) << (bj * 8))
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(sud + uq, loc(ch), 8) != 0) { return 41 }
+            uq = uq + 8
+        }
+        uq = 0
+        while (uq < svb) {
+            ch<Int> = 0
+            bj<Int> = 0
+            while (bj < 8) {
+                ch = ch | ((((svhraw.char_at(uq + bj) as Int) & 255)) << (bj * 8))
+                bj = bj + 1
+            }
+            if (cuMemcpyHtoD_v2(svd + uq, loc(ch), 8) != 0) { return 42 }
+            uq = uq + 8
+        }
+
+        # params buffer for the three stages (i64 entries, qwen3rope idiom)
+        pv<Int> = 0
+        while (pv < 8) {
+            chp<Int> = 0
+            if (pv == 0) { chp = pd }
+            if (pv == 1) { chp = hd }
+            if (pv == 2) { chp = td2 }
+            if (pv == 3) { chp = fd }
+            if (pv == 4) { chp = cw }
+            if (pv == 5) { chp = nbc }
+            if (pv == 6) { chp = nblocks }
+            if (pv == 7) { chp = 0 }
+            if (cuMemcpyHtoD_v2(pd + pv * 8, loc(chp), 8) != 0) { return 43 }
+            pv = pv + 1
+        }
+
+        hfH<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hfH), hmod, "exl3hgen") != 0) { return 10 }
+        hf1<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf1), hmod, "exl3had1") != 0) { return 10 }
+        hf2<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf2), hmod, "exl3had2") != 0) { return 10 }
+
+        # hgen: H at pd+0 = hd
+        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 44 }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hfH)), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch hgen rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # had1: params what=od, tmp=td2, H=hd, cw, nbc, nblocks at +0..+40
+        hq<Int> = 0
+        while (hq < 6) {
+            chq<Int> = 0
+            if (hq == 0) { chq = od }
+            if (hq == 1) { chq = td2 }
+            if (hq == 2) { chq = hd }
+            if (hq == 3) { chq = cw }
+            if (hq == 4) { chq = nbc }
+            if (hq == 5) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + hq * 8, loc(chq), 8) != 0) { return 45 }
+            hq = hq + 1
+        }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hf1)), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch had1 rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        # had2: params tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks at +0..+56
+        hq = 0
+        while (hq < 8) {
+            chq<Int> = 0
+            if (hq == 0) { chq = td2 }
+            if (hq == 1) { chq = fd }
+            if (hq == 2) { chq = hd }
+            if (hq == 3) { chq = sud }
+            if (hq == 4) { chq = svd }
+            if (hq == 5) { chq = cw }
+            if (hq == 6) { chq = nbc }
+            if (hq == 7) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + hq * 8, loc(chq), 8) != 0) { return 45 }
+            hq = hq + 1
+        }
+        rc = cuda_launch4i(from<loc<CVoid>>(addr(hf2)), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0)
+        if (rc != 0) { println("launch had2 rc"); println_int(rc); return 12 }
+        cuCtxSynchronize()
+
+        match (open_write("native/out/exl3_rotated.txt")) {
+            w -> {
+                i2<Int> = 0
+                while (i2 < kn) {
+                    rv<Float> = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv), od + i2 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    i2 = i2 + 1
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+
+        # final W (Hadamard + scales applied on the GPU)
+        match (open_write("native/out/exl3_w.txt")) {
+            w -> {
+                i3<Int> = 0
+                while (i3 < kn) {
+                    rv2<Float> = 0.0
+                    if (cuMemcpyDtoH_v2(loc(rv2), fd + i3 * 8, 8) != 0) { return 16 }
+                    match (write_str(w, rv2.to_string() + "\n")) { q -> { } ? -> { return 17 } }
+                    i3 = i3 + 1
+                }
+                close(w)
+            }
+            ? -> { return 17 }
+        }
+
+        cuMemFree_v2(qd)
+        cuMemFree_v2(td)
+        cuMemFree_v2(od)
+        cuMemFree_v2(hd)
+        cuMemFree_v2(td2)
+        cuMemFree_v2(fd)
+        cuMemFree_v2(pd)
+        cuMemFree_v2(sud)
+        cuMemFree_v2(svd)
+
+        println("EXL3_DEQ_DONE elements=" + kn.to_string() + " nblocks=" + nblocks.to_string())
+        return 0
+    }
+}

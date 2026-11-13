@@ -1559,6 +1559,38 @@ silu32(g<Int>, u<Int>, h<Int>, n<Int>) -> {
     }
 }
 
+// silu32 + xq8 (rgemv7.vyb) in one launch for the decode FFN: H = silu(G) * U as f32, plus the q8_1
+// copy (n int8 then n/32 f32 scales) the IQ down GEMV reads. Params at p: G U H n Y8. Same element per
+// thread as both kernels (256-thread blocks), the quantised value is the same f32 rounding of hv that
+// st_f32 stores and xq8 reloads, and each warp holds the same 32 aligned elements -> bit-identical.
+// Host uses it only when n % 32 == 0. Out-of-range lanes take x = 0, as in xq8.
+silu32q(p<Int>) -> {
+    g<Int> = ld_i64(p + 0)
+    u<Int> = ld_i64(p + 8)
+    h<Int> = ld_i64(p + 16)
+    n<Int> = ld_i64(p + 24)
+    Y8<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    x8<Float32> = 0.0 as Float32
+    if (gid < n) {
+        gv<Float> = ld_f64(g + gid * 8)
+        uv<Float> = ld_f64(u + gid * 8)
+        sg<Float> = 1.0 / (1.0 + vexp(0.0 - gv))
+        hv<Float> = gv * sg * uv
+        st_f32(h + gid * 4, hv)
+        x8 = hv as Float32
+    }
+    a8<Float32> = max_f32(x8, (0.0 as Float32) - x8)
+    a8 = warp_max_f32(a8)
+    dd8<Float32> = a8 / (127.0 as Float32)
+    iv8<Float32> = 0.0 as Float32
+    if (a8 > (0.0 as Float32)) { iv8 = (127.0 as Float32) / a8 }
+    if (gid < n) {
+        st_i8(Y8 + gid, sat_s8(rni_f32(x8 * iv8)))
+        if (gid % 32 == 0) { st_f32(Y8 + n + (gid / 32) * 4, dd8) }
+    }
+}
+
 // q-norm + k-norm + RoPE in ONE launch (Ursela, launch fusion; was rms_blk x2 + qwen3rope). One block of
 // HD = 128 threads per (row, head) over the S*H q heads then the S*KVH k heads. Same f64 math as
 // rms_blk (its 256-thread tree's first step only adds the +0.0 partials of idle threads, exact) and

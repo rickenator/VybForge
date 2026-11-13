@@ -1,0 +1,11 @@
+SAY_PROBE begin
+TEXT
+hello
+WORD hello -> h e l o
+WROTE /home/rick/Projects/VybForge/native/tts/out/say.wav
+FRAMES
+19040
+BYTES
+38124
+SAY_PROBE done
+0

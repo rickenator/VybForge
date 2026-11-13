@@ -1,0 +1,253 @@
+# gx.vyb — the GLM-5.3 checkpoint index, Vyb-only (no Python in the path).
+#
+# Resolves tensor names to (shard, offset, length, dtype) via:
+#   1. model.safetensors.index.json (15.5 MB, 150,226 entries) parsed ONCE into a
+#      name -> shard table. NOTE: JsonDoc.get(id, key) is a LINEAR scan over an
+#      object's children, so a keyed lookup per name is O(n^2) (>5 min, killed);
+#      gx_index walks the children by index (elem + ckey_at) and is O(n) (~200 ms);
+#   2. that shard's safetensors header (native/torchload/safetensors.vyb, already
+#      gated byte-identical against an independent Python oracle) for the byte range.
+#
+# Scanning all 83 headers instead was measured too slow (>7 min) in Vyb — the
+# index-first order is what makes this practical.
+#
+# Nothing here touches CUDA: gx answers WHERE the bytes are. A host driver opens the
+# shard, reads the range and uploads it (the native/host/*_driver pattern).
+import safetensors
+import json_parse
+import io::{open_read, read_all, read_at, close}
+
+share(all)
+struct GxLoc {
+    found<Vec<Int>>,
+    shard<Vec<Int>>,
+    tix<Vec<Int>>,
+    off<Vec<Int>>,
+    nbytes<Vec<Int>>,
+    dts<Vec<String>>,
+    paths<Vec<String>>
+}
+
+share(all)
+gx_pad5(n<Int>)<String> -> {
+    s<String> = n.to_string()
+    while (s.len() < 5) { s = "0" + s }
+    return s
+}
+
+share(all)
+gx_shard_path(dir<String>, shard<Int>, total<Int>)<String> -> {
+    return dir + "/model-" + gx_pad5(shard) + "-of-" + gx_pad5(total) + ".safetensors"
+}
+
+share(all)
+gx_read_index(dir<String>)<String> -> {
+    r<String> = ""
+    match (open_read(dir + "/model.safetensors.index.json")) {
+        f -> {
+            match (read_all(f)) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+# Shard number for a tensor name, from the index text; 0 when absent.
+# The weight_map entries read `"<name>": "model-00003-of-00083.safetensors"`.
+share(all)
+gx_shard_for(index<String>, name<String>)<Int> -> {
+    if (index.len() == 0) { return 0 }
+    key<String> = "\"" + name + "\": \"model-"
+    p<Int> = index.index_of(key)
+    if (p < 0) { return 0 }
+    d0<Int> = p + key.len()
+    n<Int> = 0
+    i<Int> = 0
+    while (i < 5) {
+        c<Int> = (index.char_at(d0 + i) as Int) & 255
+        if (c < 48 || c > 57) { return 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    return n
+}
+
+# Resolve every wanted name: index -> shard -> header -> byte range.
+#
+# st_open() parses one shard's header (~8 ms, 1185 tensors). Opening it per NAME was
+# 9 opens (73 ms) per expert resolve -> 8 s per MoE layer and ~1.2 GB of retained header
+# structs per layer in the 45-layer prefill. Names are shard-ordered, so keep the last
+# opened header and reopen only when the shard changes.
+share(all)
+gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    return gx_resolve_idx(gx_read_index(dir), dir, total, want)
+}
+
+# Same resolution with the index text already in hand. A hot loop that resolves many batches
+# (one per expert) was re-reading and re-parsing the 15.5 MB index every call: hold it once.
+share(all)
+gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                       dts = Vec(), paths = Vec() }
+    i<Int> = 0
+    for (i in 0..want.len() - 1) {
+        g.found.push(0)
+        g.shard.push(0)
+        g.tix.push(-1)
+        g.off.push(-1)
+        g.nbytes.push(0)
+        g.dts.push("")
+        g.paths.push("")
+    }
+    lastsh<Int> = 0
+    ix<StIndex> = st_open("")
+    w<Int> = 0
+    while (w < want.len()) {
+        sh<Int> = gx_shard_for(index, want.get(w))
+        if (sh > 0) {
+            if (sh != lastsh || ix.n == 0) {
+                path<String> = gx_shard_path(dir, sh, total)
+                ix = st_open(path)
+                lastsh = sh
+            }
+            if (ix.n > 0) {
+                t<Int> = st_find(view(ix), want.get(w))
+                if (t >= 0) {
+                    g.found.set(w, 1)
+                    g.shard.set(w, sh)
+                    g.tix.set(w, t)
+                    g.off.set(w, ix.data_base + ix.doff.get(t))
+                    g.nbytes.set(w, ix.dlen.get(t))
+                    g.dts.set(w, ix.dtypes.get(t))
+                    g.paths.set(w, ix.path)
+                }
+            }
+        }
+        w = w + 1
+    }
+    return g
+}
+
+share(all)
+gx_bytes(g<GxLoc>, i<Int>)<Int> -> {
+    if (i < 0 || i >= g.nbytes.len()) { return 0 }
+    return g.nbytes.get(i)
+}
+
+# Read a byte range straight from a shard (the layer-load path already has the
+# offsets from the header and does not need a GxLoc round trip).
+share(all)
+gx_read_at(path<String>, off<Int>, n<Int>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_at(f, off, n)) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+# Read a resolved tensor's bytes. The caller uploads or hashes immediately: a
+# multi-GB read must not be held twice.
+share(all)
+gx_read(g<GxLoc>, i<Int>)<String> -> {
+    r<String> = ""
+    if (i < 0 || i >= g.found.len()) { return r }
+    if (g.found.get(i) != 1) { return r }
+    match (open_read(g.paths.get(i))) {
+        f -> {
+            match (read_at(f, g.off.get(i), g.nbytes.get(i))) {
+                s -> { r = s }
+                ? -> { r = "" }
+            }
+            close(f)
+        }
+        ? -> { r = "" }
+    }
+    return r
+}
+
+# ---- fast whole-model plan (loader path) -------------------------------------------
+#
+# gx_shard_for above re-reads the index text per name and st_open()s a shard header per
+# tensor: fine for a probe, unusable for a load (150k tensors). gx_plan resolves the
+# WHOLE checkpoint in two linear passes: the weight_map once (name -> shard), then each
+# of the 83 shard headers once (shard-major), filling a dense plan the loader then walks
+# layer by layer.
+
+share(all)
+struct GxIndex {
+    n<Int>,
+    names<Vec<String>>,
+    shard<Vec<Int>>
+}
+
+share(all)
+struct GxTensor {
+    name<String>,
+    shard<Int>,
+    off<Int>,
+    nbytes<Int>,
+    dtype<String>
+}
+
+share(all)
+struct GxPlan {
+    n<Int>,
+    found<Int>,
+    tensors<Vec<GxTensor>>
+}
+
+share(all)
+gx_digits(s<String>)<Int> -> {
+    n<Int> = 0
+    i<Int> = 0
+    while (i < s.len()) {
+        c<Int> = (s.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { n = n * 10 + (c - 48) }
+        i = i + 1
+    }
+    return n
+}
+
+# weight_map: name -> shard number, one linear walk of the object's children.
+share(all)
+gx_index(dir<String>)<GxIndex> -> {
+    ix<GxIndex> = GxIndex { n = 0, names = Vec(), shard = Vec() }
+    text<String> = gx_read_index(dir)
+    if (text.len() == 0) { return ix }
+    match (json_parse(text)) {
+        d -> {
+            rid<Int> = d.rootid()
+            wm<Int> = d.get(rid, "weight_map")
+            if (wm >= 0) {
+                cnt<Int> = d.nchildren(wm)
+                i<Int> = 0
+                while (i < cnt) {
+                    ix.names.push(d.ckey_at(wm, i))
+                    # "model-00007-of-00083.safetensors" -> 7
+                    ix.shard.push(gx_digits(d.hstr(d.elem(wm, i))))
+                    i = i + 1
+                }
+                ix.n = ix.names.len()
+            }
+        }
+        ? -> { }
+    }
+    return ix
+}
+
+# NOTE: this module deliberately does NOT offer a whole-model plan function. Building
+# a 150k-entry plan struct in memory and walking it repeatedly crashed the Vyb runtime
+# (SIGSEGV, position varies) and degraded progressively as the heap grew. The loader
+# streams instead: see native/host/gx_plan.vyb, which walks the shards and writes the
+# plan out as it goes, holding only per-layer counters.

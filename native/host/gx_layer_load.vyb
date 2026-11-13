@@ -1,0 +1,174 @@
+# gx_layer_load.vyb — load ONE GLM-5.3 layer's tensors, Vyb-only.
+#
+# Finds every tensor of layer N by scanning model.safetensors.index.json for the
+# layer prefix, collecting the DISTINCT shards it maps to, then enumerating those
+# shards' safetensors headers (native/torchload/safetensors.vyb) for name/offset/
+# length. Uploads each tensor to the device and reports the layer's byte total —
+# the accounting the memory plan (41 GiB resident at 1M ctx, 2.9x Spark headroom)
+# rests on, measured here rather than asserted.
+#
+#   VYBFORGE_GX_DIR   checkpoint dir
+#   VYBFORGE_LAYER    layer index (default 0)
+#   VYBFORGE_UPLOAD   1 = upload to the GPU (default 1)
+#
+# Run: "$VYB" --module-path native/json --module-path native/torchload \
+#        --module-path native/glm53 native/host/gx_layer_load.vyb
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+}
+
+share(all)
+struct GxLayer {
+    n<Int>,
+    names<Vec<String>>,
+    off<Vec<Int>>,
+    nb<Vec<Int>>,
+    paths<Vec<String>>,
+    dts<Vec<String>>
+}
+
+# Distinct shard numbers referenced by the layer's prefix, in encounter order.
+share(all)
+gx_layer_shards(index<String>, prefix<String>)<Vec<Int>> -> {
+    out<Vec<Int>> = Vec()
+    pos<Int> = index.index_of(prefix)
+    key<String> = "\": \"model-"
+    while (pos > 0) {
+        q<Int> = index.index_of_from(key, pos)
+        if (q < 0) { return out }
+        d0<Int> = q + key.len()
+        n<Int> = 0
+        i<Int> = 0
+        bad<Bool> = false
+        while (i < 5) {
+            c<Int> = (index.char_at(d0 + i) as Int) & 255
+            if (c < 48 || c > 57) { bad = true }
+            if (!bad) { n = n * 10 + (c - 48) }
+            i = i + 1
+        }
+        if (!bad) {
+            seen<Bool> = false
+            j<Int> = 0
+            for (j in 0..out.len() - 1) {
+                if (out.get(j) == n) { seen = true }
+            }
+            if (!seen) { out.push(n) }
+        }
+        nxt<Int> = index.index_of_from(prefix, pos + 1)
+        if (nxt <= pos) { return out }
+        pos = nxt
+    }
+    return out
+}
+
+share(all)
+gx_collect(dir<String>, layer<Int>)<GxLayer> -> {
+    L<GxLayer> = GxLayer { n = 0, names = Vec(), off = Vec(), nb = Vec(), paths = Vec(), dts = Vec() }
+    index<String> = gx_read_index(dir)
+    if (index.len() == 0) { return L }
+    prefix<String> = "\"model.language_model.layers." + layer.to_string() + "."
+    want<String> = "model.language_model.layers." + layer.to_string() + "."
+    shards<Vec<Int>> = gx_layer_shards(index, prefix)
+    s<Int> = 0
+    while (s < shards.len()) {
+        path<String> = gx_shard_path(dir, shards.get(s), 83)
+        ix<StIndex> = st_open(path)
+        if (ix.n > 0) {
+            i<Int> = 0
+            while (i < ix.n) {
+                nm<String> = ix.names.get(i)
+                if (nm.len() > want.len()) {
+                    if (nm.substring(0, want.len()) == want) {
+                        L.names.push(nm)
+                        L.off.push(ix.data_base + ix.doff.get(i))
+                        L.nb.push(ix.dlen.get(i))
+                        L.paths.push(path)
+                        L.dts.push(ix.dtypes.get(i))
+                        L.n = L.n + 1
+                    }
+                }
+                i = i + 1
+            }
+        }
+        s = s + 1
+    }
+    return L
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    lay<Int> = (env_get("VYBFORGE_LAYER") else "0").to_int()
+    up<Int> = (env_get("VYBFORGE_UPLOAD") else "1").to_int()
+
+    L<GxLayer> = gx_collect(dir, lay)
+    if (L.n <= 0) {
+        println("GX_LAYER_FAIL layer=" + lay.to_string() + " tensors=0")
+        return 1
+    }
+    total<Int> = 0
+    exl3<Int> = 0
+    bf16<Int> = 0
+    i<Int> = 0
+    while (i < L.n) {
+        total = total + L.nb.get(i)
+        if (L.dts.get(i) == "BF16") { bf16 = bf16 + L.nb.get(i) }
+        if (L.names.get(i).index_of(".trellis") > 0) { exl3 = exl3 + L.nb.get(i) }
+        i = i + 1
+    }
+    println("GX_LAYER layer=" + lay.to_string() + " tensors=" + L.n.to_string() +
+            " bytes=" + total.to_string() + " bf16_bytes=" + bf16.to_string() +
+            " trellis_bytes=" + exl3.to_string())
+
+    if (up != 1) { println("GX_LAYER_OK (no upload)"); return 0 }
+
+    freedom {
+        if (cuInit(0) != 0) { println("SKIP: no CUDA"); return 0 }
+        var<CInt> ndev = 0
+        if (cuDeviceGetCount(loc(ndev)) != 0 || ndev < 1) { println("SKIP: no device"); return 0 }
+        var<CInt> dev = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 14 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 14 }
+    }
+
+    freed<Int> = 0
+    ptrs<Vec<Int>> = Vec()
+    i = 0
+    while (i < L.n) {
+        blob<String> = gx_read_at(L.paths.get(i), L.off.get(i), L.nb.get(i))
+        if (blob.len() != L.nb.get(i)) {
+            println("GX_LAYER_FAIL read " + L.names.get(i) + " got=" + blob.len().to_string())
+            return 16
+        }
+        dv<Int> = 0
+        var<CInt> rc = 255
+        freedom {
+            rc = cuMemAlloc_v2(loc(dv), blob.len())
+            if (rc == 0) {
+                if (cuMemcpyHtoD_v2(dv, blob, blob.len()) != 0) { rc = 1 }
+            }
+        }
+        if (rc != 0) {
+            println("GX_LAYER_FAIL alloc/upload " + L.names.get(i))
+            return 15
+        }
+        freed = freed + blob.len()
+        i = i + 1
+    }
+    println("GX_LAYER_OK layer=" + lay.to_string() + " tensors=" + L.n.to_string() +
+            " resident_bytes=" + freed.to_string() +
+            " resident_mib=" + (freed / 1048576).to_string())
+    return 0
+}

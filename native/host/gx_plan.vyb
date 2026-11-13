@@ -1,0 +1,174 @@
+# gx_plan.vyb — the loader's whole-model plan, in Vyb, gated by digest.
+#
+# STREAMING by design: open each of the 83 shard headers once, emit one
+# `name|shard|off|nbytes|dtype` line per tensor straight to the body file, keep only a
+# 46-slot per-layer counter in memory. No 150k-entry plan struct is built, which also
+# dodges a Vyb runtime crash (SIGSEGV, position varies) seen when this driver held the
+# plan and walked it several times under heavy allocation churn.
+#
+# Cost model (measured on godzilla, apex NFS): index parse 0.44 s, 83 header parses
+# ~25 ms each, body 13 MB written in ~0.1 s, sha256 ~0.1 s -> a few seconds total.
+#
+# Two Vyb traps shaped this:
+#   * JsonDoc.get(id, key) is a linear scan over an object's children -> a keyed lookup
+#     per name over the 150k-entry weight_map is O(n^2) (134 s, killed). Walk children
+#     by index instead (`elem` + `ckey_at`).
+#   * String `+` copies, so accumulating the 13 MB listing in a loop is O(n^2): stream it.
+#
+# Output (native/out/gx_plan_vyb.txt):
+#   PLAN tensors=<n> found=<n> missing=<n> ms=<ms>
+#   LAYER <i> tensors=<n>
+#   OTHER tensors=<n>
+#   DIGEST <sha256 of the body lines, in weight_map order>
+# native/glm53/gx_plan_ref.py must produce the same LAYER/OTHER/DIGEST lines.
+#
+# Run:  make -f native/Makefile gxplan
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import crypto::{sha256}
+import safetensors
+import collections::{HashMap}
+import gx
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_GX_OUT") else "native/out/gx_plan_vyb.txt"
+    body_path<String> = env_get("VYBFORGE_GX_BODY") else "native/out/gx_plan_body.txt"
+    total<Int> = 83
+    nl<Int> = 45
+    pre<String> = "model.language_model.layers."
+
+    t0<Int> = time_mono_millis()
+    ix<GxIndex> = gx_index(dir)
+    t1<Int> = time_mono_millis()
+    if (ix.n == 0) { println("GX_PLAN_EMPTY"); return 3 }
+    println("index tensors=" + ix.n.to_string() + " ms=" + (t1 - t0).to_string())
+
+    # name -> plan slot, so a shard's header entries can be matched in O(1)
+    pos<HashMap<String, Int>> = HashMap<String, Int>(ix.n)
+    i<Int> = 0
+    while (i < ix.n) {
+        pos.put(ix.names.get(i), i)
+        i = i + 1
+    }
+    t2<Int> = time_mono_millis()
+    println("map built ms=" + (t2 - t1).to_string())
+
+    counts<Vec<Int>> = Vec()
+    l<Int> = 0
+    while (l <= nl) {
+        counts.push(0)
+        l = l + 1
+    }
+    seen<Vec<Int>> = Vec()
+    i = 0
+    while (i < ix.n) {
+        seen.push(0)
+        i = i + 1
+    }
+
+    nfound<Int> = 0
+    miss<Int> = 0
+    t_open<Int> = 0
+    t_look<Int> = 0
+    t_write<Int> = 0
+    t_tally<Int> = 0
+    wrc<Int> = 1
+    match (open_write(body_path)) {
+        f -> {
+            s<Int> = 1
+            while (s <= total) {
+                ta<Int> = time_mono_millis()
+                hd<StIndex> = st_open(gx_shard_path(dir, s, total))
+                t_open = t_open + (time_mono_millis() - ta)
+                j<Int> = 0
+                while (j < hd.n) {
+                    nm<String> = hd.names.get(j)
+                    tl<Int> = time_mono_millis()
+                    k<Int> = pos.get(nm) else -1
+                    t_look = t_look + (time_mono_millis() - tl)
+                    if (k >= 0) {
+                        if (seen.get(k) == 0) {
+                            seen.set(k, 1)
+                            nfound = nfound + 1
+                            off<Int> = hd.data_base + hd.doff.get(j)
+                            tw<Int> = time_mono_millis()
+                            write_str(f, nm + "|" + s.to_string() + "|" + off.to_string() + "|" +
+                                      hd.dlen.get(j).to_string() + "|" + hd.dtypes.get(j) + "\n")
+                            t_write = t_write + (time_mono_millis() - tw)
+                            # per-layer tally
+                            slot<Int> = nl
+                            if (nm.index_of(pre) == 0) {
+                                p0<Int> = pre.len()
+                                lnum<Int> = 0
+                                got<Bool> = false
+                                kk<Int> = 0
+                                while (kk < 3) {
+                                    c<Int> = 0
+                                    if (p0 + kk < nm.len()) { c = (nm.char_at(p0 + kk) as Int) & 255 }
+                                    if (c >= 48 && c <= 57) {
+                                        lnum = lnum * 10 + (c - 48)
+                                        got = true
+                                        kk = kk + 1
+                                    } else {
+                                        kk = 3
+                                    }
+                                }
+                                if (got && lnum < nl) { slot = lnum }
+                            }
+                            counts.set(slot, counts.get(slot) + 1)
+                        }
+                    }
+                    j = j + 1
+                }
+                s = s + 1
+            }
+            close(f)
+            wrc = 0
+        }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) { println("GX_PLAN_BODY_FAIL " + body_path); return 4 }
+    t3<Int> = time_mono_millis()
+    println("shards scanned found=" + nfound.to_string() + " ms=" + (t3 - t2).to_string() +
+            " | st_open=" + t_open.to_string() + " lookup=" + t_look.to_string() +
+            " write=" + t_write.to_string())
+
+    # tensors the index lists but no shard header carries
+    i = 0
+    while (i < ix.n) {
+        if (seen.get(i) == 0) { miss = miss + 1 }
+        i = i + 1
+    }
+
+    body<String> = ""
+    match (open_read(body_path)) {
+        f -> { match (read_all(f)) { s2 -> { body = s2 } ? -> { return 5 } } close(f) }
+        ? -> { return 5 }
+    }
+    dig<String> = sha256(body)
+    t4<Int> = time_mono_millis()
+    println("body bytes=" + body.len().to_string() + " hash ms=" + (t4 - t3).to_string())
+
+    r<String> = "PLAN tensors=" + ix.n.to_string() + " found=" + nfound.to_string() +
+                " missing=" + miss.to_string() + " ms=" + (t3 - t0).to_string() + "\n"
+    l = 0
+    while (l < nl) {
+        r = r + "LAYER " + l.to_string() + " tensors=" + counts.get(l).to_string() + "\n"
+        l = l + 1
+    }
+    r = r + "OTHER tensors=" + counts.get(nl).to_string() + "\n"
+    r = r + "DIGEST " + dig + "\n"
+
+    wrc = 1
+    match (open_write(out)) {
+        f -> { write_str(f, r); close(f); wrc = 0 }
+        ? -> { wrc = 1 }
+    }
+    if (wrc != 0) { println("GX_PLAN_FAIL write=" + out); return 1 }
+    println("GX_PLAN_OK tensors=" + ix.n.to_string() + " found=" + nfound.to_string() +
+            " missing=" + miss.to_string() + " ms_total=" + (t3 - t0).to_string())
+    println("DIGEST " + dig)
+    return 0
+}

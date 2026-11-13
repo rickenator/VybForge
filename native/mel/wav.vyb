@@ -1,0 +1,146 @@
+# wav.vyb — minimal 16-bit PCM WAV reader (voice loop fixtures).
+#
+# The loop lives on raw frames from the audio module, but every gate and
+# regression needs a *file* path: the oracle fixtures are WAVs, and so is the
+# capture probe's own output. Vyb has no float bit-cast, so a float32/float64
+# container is not readable — 16-bit PCM is, and it is also what a WAV from the
+# microphone chain looks like.
+#
+# Chunks are walked rather than assumed at fixed offsets: `fmt ` and `data` can
+# appear in either order and `LIST`/`fact` chunks are common in the wild.
+import io::{open_read, read_bytes, close}
+
+# Header facts about a WAV file.
+share(all)
+struct WavInfo {
+    rate<Int>,
+    channels<Int>,
+    bits<Int>,
+    data_off<Int>,
+    data_bytes<Int>
+}
+
+share(all)
+byte_at(buf<Vec<UInt8>>, i<Int>)<Int> -> {
+    return (buf.get(i) as Int) & 0xFF
+}
+
+share(all)
+u16_at(buf<Vec<UInt8>>, i<Int>)<Int> -> {
+    return byte_at(buf, i) + byte_at(buf, i + 1) * 256
+}
+
+share(all)
+u32_at(buf<Vec<UInt8>>, i<Int>)<Int> -> {
+    return byte_at(buf, i) + byte_at(buf, i + 1) * 256 + byte_at(buf, i + 2) * 65536 + byte_at(buf, i + 3) * 16777216
+}
+
+# True when a 4-byte RIFF tag at `i` equals `want`.
+share(all)
+tag_is(buf<Vec<UInt8>>, i<Int>, want<String>)<Bool> -> {
+    a<Int> = byte_at(buf, i)
+    b<Int> = byte_at(buf, i + 1)
+    c<Int> = byte_at(buf, i + 2)
+    d<Int> = byte_at(buf, i + 3)
+    w0<Int> = want.char_at(0)
+    w1<Int> = want.char_at(1)
+    w2<Int> = want.char_at(2)
+    w3<Int> = want.char_at(3)
+    return a == w0 && b == w1 && c == w2 && d == w3
+}
+
+# Parse the file into a WAV header description. Absent when it is not RIFF/WAVE
+# or has no `fmt `/`data` pair.
+share(all)
+read_info(path<String>)<WavInfo?> -> {
+    buf<Vec<UInt8>> = Vec<UInt8>()
+    match (open_read(path)) {
+        f -> {
+            match (read_bytes(f)) {
+                d -> {
+                    i<Int> = 0
+                    n<Int> = d.len()
+                    for (i in 0..n - 1) {
+                        buf.push(d.get(i))
+                    }
+                }
+                ? -> { }
+            }
+            close(f)
+        }
+        ? -> { }
+    }
+    if (buf.len() < 44) { return WavInfo?() }
+    if (!tag_is(buf, 0, "RIFF") || !tag_is(buf, 8, "WAVE")) { return WavInfo?() }
+
+    rate<Int> = 0
+    channels<Int> = 0
+    bits<Int> = 0
+    doff<Int> = 0
+    dbytes<Int> = 0
+    pos<Int> = 12
+    n<Int> = buf.len()
+    while (pos + 8 <= n) {
+        size<Int> = u32_at(buf, pos + 4)
+        if (tag_is(buf, pos, "fmt ")) {
+            channels = u16_at(buf, pos + 10)
+            rate = u32_at(buf, pos + 12)
+            bits = u16_at(buf, pos + 22)
+        }
+        if (tag_is(buf, pos, "data")) {
+            doff = pos + 8
+            dbytes = size
+            if (doff + dbytes > n) { dbytes = n - doff }
+        }
+        pos = pos + 8 + size + (size % 2)
+    }
+    if (channels == 0 || dbytes == 0) { return WavInfo?() }
+    return WavInfo?(WavInfo { rate = rate, channels = channels, bits = bits, data_off = doff, data_bytes = dbytes })
+}
+
+# Load a mono float signal from a WAV file. Channels are averaged; 8- and
+# 24-bit files are rejected rather than guessed at. Absent on any failure.
+share(all)
+load_wav(path<String>)<Vec<Float>?> -> {
+    info<WavInfo> = WavInfo { rate = 0, channels = 0, bits = 0, data_off = 0, data_bytes = 0 }
+    match (read_info(path)) {
+        i -> { info = i }
+        ? -> { return Vec<Float>?() }
+    }
+    if (info.bits != 16) { return Vec<Float>?() }
+
+    raw<Vec<UInt8>> = Vec<UInt8>()
+    match (open_read(path)) {
+        f -> {
+            match (read_bytes(f)) {
+                d -> {
+                    j<Int> = 0
+                    n<Int> = d.len()
+                    for (j in 0..n - 1) {
+                        raw.push(d.get(j))
+                    }
+                }
+                ? -> { }
+            }
+            close(f)
+        }
+        ? -> { return Vec<Float>?() }
+    }
+
+    out<Vec<Float>> = Vec<Float>()
+    ch<Int> = info.channels
+    frames<Int> = info.data_bytes / (2 * ch)
+    i<Int> = 0
+    for (i in 0..frames - 1) {
+        acc<Int> = 0
+        c<Int> = 0
+        for (c in 0..ch - 1) {
+            p<Int> = info.data_off + (i * ch + c) * 2
+            v<Int> = byte_at(raw, p) + byte_at(raw, p + 1) * 256
+            if (v >= 32768) { v = v - 65536 }
+            acc = acc + v
+        }
+        out.push((acc as Float) / (32768.0 * (ch as Float)))
+    }
+    return Vec<Float>?(out)
+}

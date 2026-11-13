@@ -1,0 +1,43 @@
+import env::{env_get}
+import time::{time_mono_millis}
+import safetensors
+import collections::{HashMap}
+import gx
+
+main()<Int> -> {
+    live<Int> = 0
+    lv<String> = env_get("LIVE") else ""
+    if (lv.len() > 0) { live = lv.to_int() }
+    usehash<Int> = 0
+    hv<String> = env_get("HASH") else ""
+    if (hv.len() > 0) { usehash = hv.to_int() }
+    dir<String> = "/mnt/apex/rick/vybforge/glm53-checkpoint"
+
+    keep<Vec<String>> = Vec()
+    i<Int> = 0
+    while (i < live) {
+        keep.push("live_string_payload_number_" + i.to_string())
+        i = i + 1
+    }
+    if (usehash == 1) {
+        m<HashMap<String, Int>> = HashMap<String, Int>(keep.len())
+        i = 0
+        while (i < keep.len()) {
+            m.put(keep.get(i), i)
+            i = i + 1
+        }
+        println("hash built " + keep.len().to_string())
+    }
+    println("live=" + keep.len().to_string() + " hash=" + usehash.to_string())
+
+    # time st_open on the last shards, in this heap state
+    s<Int> = 79
+    while (s <= 82) {
+        t0<Int> = time_mono_millis()
+        hd<StIndex> = st_open(gx_shard_path(dir, s, 83))
+        t1<Int> = time_mono_millis()
+        println("  shard " + s.to_string() + " ms=" + (t1 - t0).to_string() + " n=" + hd.n.to_string())
+        s = s + 1
+    }
+    return 0
+}

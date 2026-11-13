@@ -1,0 +1,1271 @@
+# ============================================================ main
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_CHAIN_OUT") else "native/out/decchain_vyb.txt"
+    total<Int> = 83
+    lines<String> = ""
+    mapbody<String> = ""
+    idxtext<String> = ""
+    i<Int> = 0
+    j<Int> = 0
+    k<Int> = 0
+    r<Int> = 0
+    hh<Int> = 0
+    d2<Int> = 0
+    c<Int> = 0
+    a<Int> = 0
+    p<Int> = 0
+    e<Int> = 0
+    lane<Int> = 0
+    nfound<Int> = 0
+    nf<Int> = 0
+    mx<Float> = 0.0
+    sm<Float> = 0.0
+    acc<Float> = 0.0
+    pr<Float> = 0.0
+    dot<Float> = 0.0
+    rl<Float> = 0.0
+    sc<Float> = 0.0
+    sv<Float> = 0.0
+    scale_iq<Float> = 0.0
+    sc_scale<Float> = 0.0
+    wscale<Float> = 0.0
+    best<Int> = 0
+    bestv<Float> = 0.0
+    bestp<Int> = 0
+    last<Int> = 0
+    used<Int> = 0
+    tstart<Int> = 0
+    slot<Int> = 0
+    tv<Int> = 0
+    g1<Float> = 0.0
+    u1<Float> = 0.0
+    wt<Float> = 0.0
+    cv<Float> = 0.0
+    i0<Int> = 0
+    nt<Int> = 0
+    tk<Int> = 0
+    n<Int> = 0
+    npools<Int> = 0
+    select_k<Int> = 0
+    vcount<Int> = 0
+    tcount<Int> = 0
+    nex<Int> = 0
+    t<Int> = 0
+    tid<Int> = 0
+    nlay<Int> = 45
+    is_dsa<Int> = 0
+    lpre<String> = ""
+    baseF<Vec<Float>> = Vec()
+    scaleF<Vec<Float>> = Vec()
+    kslot<Int> = 0
+    dslot<Int> = 0
+    nckv<Int> = 0
+    d_q<Int> = 0
+    d_k<Int> = 0
+    d_v<Int> = 0
+    d_o<Int> = 0
+    d_b<Int> = 0
+    d_fa<Int> = 0
+    d_fb<Int> = 0
+    d_ga<Int> = 0
+    d_gb<Int> = 0
+    d_ln<Int> = 0
+    d_ln2<Int> = 0
+    d_cq<Int> = 0
+    d_ck<Int> = 0
+    d_cv<Int> = 0
+    d_onorm<Int> = 0
+    d_fnA<Int> = 0
+    d_fnF<Int> = 0
+    d_gate<Int> = 0
+    d_up<Int> = 0
+    d_down<Int> = 0
+    d_qa<Int> = 0
+    d_qb<Int> = 0
+    d_kva<Int> = 0
+    d_kvb<Int> = 0
+    d_wqb<Int> = 0
+    d_wk<Int> = 0
+    d_wproj<Int> = 0
+    d_gatei<Int> = 0
+    d_gw<Int> = 0
+    d_sg<Int> = 0
+    d_su<Int> = 0
+    d_sd<Int> = 0
+    d_qaln<Int> = 0
+    d_kvaln<Int> = 0
+    d_knw<Int> = 0
+    d_knb<Int> = 0
+    d_ukm<Int> = 0
+    d_uvm<Int> = 0
+    d_flat<Int> = 0
+    d_mv<Int> = 0
+    d_scr<Int> = 0
+    d_flat2<Int> = 0
+    d_mv2<Int> = 0
+    d_scr2<Int> = 0
+    d_x<Int> = 0
+    lg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                        dts = Vec(), paths = Vec() }
+    streams1<Vec<Float>> = Vec()
+    streams2<Vec<Float>> = Vec()
+    attn<Vec<Float>> = Vec()
+    mlp<Vec<Float>> = Vec()
+
+    if (tensor_init() != 0) { println("CHAIN_FAIL no cuda"); return 3 }
+    fgemm<Int> = load_fn("native/build/gemm.ptx", "gemm")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    fdeq<Int> = load_fn("native/build/exl3.ptx", "exl3deq")
+    fhgen<Int> = load_fn("native/build/exl3.ptx", "exl3hgen")
+    fhad1<Int> = load_fn("native/build/exl3.ptx", "exl3had1")
+    fhad2<Int> = load_fn("native/build/exl3.ptx", "exl3had2")
+    if (fgemm == 0 || fbf == 0 || fdeq == 0 || fhgen == 0 || fhad1 == 0 || fhad2 == 0) {
+        println("CHAIN_FAIL kernels")
+        return 4
+    }
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
+        ? -> { println("CHAIN_FAIL no map.bin"); return 5 }
+    }
+    mapbody = mapd.substring(16, mapd.len())
+    idxtext = gx_read_index(dir)
+
+    # ---------------------------------------------------------------- prompt ids
+    # the prefill's default id list (22 tokens); phase 1 prefills ids[0..19], the two
+    # decode steps re-walk ids[20] and ids[21] teacher-forced.
+    ids<Vec<Int>> = Vec()
+    idtxt<String> = env_get("VYBFORGE_L0_IDS") else "785,6722,315,9621,374,12089,11,323,279,7772,3283,304,9851,374,19808,11,892,572,17753,369,10788,13"
+    cur<String> = ""
+    i = 0
+    while (i <= idtxt.len()) {
+        if (i == idtxt.len()) {
+            if (cur.len() > 0) { ids.push(cur.to_int()) }
+        } else {
+            ch<String> = idtxt.substring(i, i + 1)
+            if (ch == ",") {
+                if (cur.len() > 0) { ids.push(cur.to_int()) }
+                cur = ""
+            } else { cur = cur + ch }
+        }
+        i = i + 1
+    }
+    if (ids.len() != 22) { println("CHAIN_FAIL ids " + ids.len().to_string()); return 8 }
+    nl2<String> = env_get("VYBFORGE_NLAYERS") else ""
+    if (nl2.len() > 0) { nlay = nl2.to_int() }
+    ns<String> = env_get("VYBFORGE_NSTEPS") else ""
+    nsteps<Int> = 2
+    if (ns.len() > 0) { nsteps = ns.to_int() }
+
+    # carried state, flat per layer slot:
+    #   KDA (34 slots): recurrence [64,128,128] + conv rings [3,8192] per tensor q/k/v
+    #   DSA (11 slots): ckv [CAPT,512], indexer k [CAPT,128], gsc [CAPT,128]
+    stAll<Vec<Float>> = Vec()
+    ringQ<Vec<Float>> = Vec()
+    ringK<Vec<Float>> = Vec()
+    ringV<Vec<Float>> = Vec()
+    ckvAll<Vec<Float>> = Vec()
+    ikAll<Vec<Float>> = Vec()
+    gscAll<Vec<Float>> = Vec()
+    i = 0
+    while (i < NSLOT * HEADS * KD * KD) { stAll.push(0.0); i = i + 1 }
+    i = 0
+    while (i < NSLOT * (CONV_K - 1) * HEADS * KD) { ringQ.push(0.0); ringK.push(0.0); ringV.push(0.0); i = i + 1 }
+    i = 0
+    while (i < NDSLOT * CAPT * KV_LORA) { ckvAll.push(0.0); i = i + 1 }
+    i = 0
+    while (i < NDSLOT * CAPT * IDIM) { ikAll.push(0.0); gscAll.push(0.0); i = i + 1 }
+
+    # ================================================================ phase 1: prefill R = 20
+    # embeddings for ids[0..19] -> streams (HC copies), verbatim from glm_prefill.vyb
+    want0<Vec<String>> = Vec()
+    want0.push("model.language_model.embed_tokens.weight")
+    ge0<GxLoc> = gx_resolve(dir, total, want0)
+    emb_off<Int> = ge0.off.get(0)
+    emb_path<String> = ge0.paths.get(0)
+    raw_emb1<String> = ""
+    r = 0
+    while (r < R) {
+        match (open_read(emb_path)) {
+            f -> {
+                match (read_at(f, emb_off + ids.get(r) * H * 2, H * 2)) {
+                    s -> { raw_emb1 = raw_emb1 + s }
+                    ? -> { return 9 }
+                }
+                close(f)
+            }
+            ? -> { return 9 }
+        }
+        r = r + 1
+    }
+    d_x = deq_bf16(fbf, raw_emb1, R * H, 0)
+    if (d_x == 0) { println("CHAIN_FAIL emb deq"); return 10 }
+    x<Vec<Float>> = bulk_dtoh(d_x, R * H)
+    free_dev(d_x)
+    println(digest("x", x))
+    lines = lines + digest("x", x) + "\n"
+    streams<Vec<Float>> = Vec()
+    r = 0
+    while (r < R) {
+        hh = 0
+        while (hh < HC) {
+            d2 = 0
+            while (d2 < H) {
+                streams.push(x.get(r * H + d2))
+                d2 = d2 + 1
+            }
+            hh = hh + 1
+        }
+        r = r + 1
+    }
+
+    println("CHAIN phase 1: prefill " + R.to_string() + " tokens, 45 layers")
+    n = 0
+    while (n < nlay) {
+        lpre = "model.language_model.layers." + n.to_string() + "."
+        is_dsa = 0
+        if ((n % 4) == 3) { is_dsa = 1 }
+        if (is_dsa == 1) {
+            dslot = (n - 3) / 4
+            streams1 = dsa_attn_site_c(streams, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, borrow(ckvAll), borrow(ikAll), borrow(gscAll), dslot)
+        } else {
+            kslot = n - ((n + 1) / 4)
+            streams1 = kda_attn_site_c(streams, dir, total, lpre, fgemm, fbf, borrow(stAll), kslot, borrow(ringQ), borrow(ringK), borrow(ringV))
+        }
+        if (streams1.len() != R * HC * H) {
+            println("CHAIN_FAIL attention layer " + n.to_string())
+            return 30
+        }
+        if (n < 3) {
+            streams2 = ffn_dense_site(streams1, dir, total, lpre, fgemm, fbf)
+        } else {
+            streams2 = tail_site(streams1, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+        }
+        if (streams2.len() != R * HC * H) {
+            println("CHAIN_FAIL ffn layer " + n.to_string())
+            return 31
+        }
+        streams = streams2
+        i = trim_heap()
+        ckvs<Vec<Float>> = Vec()
+        i = 0
+        while (i < 512) { ckvs.push(ckvAll.get(i)); i = i + 1 }
+        lines = lines + dumps("p1ck" + n.to_string(), ckvs) + "\n"
+        println("phase1 layer " + n.to_string() + " done")
+        lines = lines + "phase1 layer " + n.to_string() + " " + digest("streams", streams) + "\n"
+        n = n + 1
+    }
+    println("CHAIN phase 1 done: caches built")
+
+    # ================================================================ phase 2: two decode steps
+    # cache-sniff dumps: full DSA slot-0 rows as phase 1 left them, and again at the
+    # top of each decode step -- brackets any corruption window.
+    p1ckv<Vec<Float>> = Vec()
+    p1ik<Vec<Float>> = Vec()
+    p1gsc<Vec<Float>> = Vec()
+    i = 0
+    while (i < CAPT * KV_LORA) { p1ckv.push(ckvAll.get(i)); p1ik.push(ikAll.get(i)); p1gsc.push(gscAll.get(i)); i = i + 1 }
+    lines = lines + dumps("p1ckvF", p1ckv) + "\n"
+    lines = lines + dumps("p1ikF", p1ik) + "\n"
+    lines = lines + dumps("p1gscF", p1gsc) + "\n"
+    R = 1
+    scale_iq = 1.0 / vsqrt(IDIM as Float, 40)
+    sc_scale = 1.0 / vsqrt(NOPE as Float, 40)
+    wscale = 1.0 / vsqrt(IHEADS as Float, 40)
+
+    t = 0
+    while (t < nsteps) {
+        # Refresh the long-lived index/map strings. Phase 1's 45 layers of String
+        # churn corrupt a buffer held across it (the 12-layer debug run showed every
+        # EXL3 dequant in phase 2 reading the same wrong map: mlp max bit-identical
+        # across layers). Phase 1 re-reads both per layer and is immune; phase 2
+        # re-reads both per step here.
+        match (open_read("native/exl3/map.bin")) {
+            f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
+            ? -> { return 5 }
+        }
+        mapbody = mapd.substring(16, mapd.len())
+        idxtext = gx_read_index(dir)
+        tid = ids.get(20 + t)
+        i = 0
+        while (i < CAPT * KV_LORA) { p1ckv.set(i, ckvAll.get(i)); p1ik.set(i, ikAll.get(i)); p1gsc.set(i, gscAll.get(i)); i = i + 1 }
+        lines = lines + dumps("p2ckvF" + t.to_string(), p1ckv) + "\n"
+        lines = lines + dumps("p2ikF" + t.to_string(), p1ik) + "\n"
+        lines = lines + dumps("p2gscF" + t.to_string(), p1gsc) + "\n"
+        raw_emb<String> = ""
+        match (open_read(emb_path)) {
+            f -> {
+                match (read_at(f, emb_off + tid * H * 2, H * 2)) {
+                    s -> { raw_emb = s }
+                    ? -> { return 9 }
+                }
+                close(f)
+            }
+            ? -> { return 9 }
+        }
+        d_x = deq_bf16(fbf, raw_emb, R * H, 0)
+        if (d_x == 0) { println("CHAIN_FAIL emb deq step"); return 10 }
+        x = bulk_dtoh(d_x, R * H)
+        free_dev(d_x)
+        streams = vecf()
+        hh = 0
+        while (hh < HC) {
+            d2 = 0
+            while (d2 < H) {
+                streams.push(x.get(d2))
+                d2 = d2 + 1
+            }
+            hh = hh + 1
+        }
+
+        n = 0
+        while (n < nlay) {
+            lpre = "model.language_model.layers." + n.to_string() + "."
+            is_dsa = 0
+            if ((n % 4) == 3) { is_dsa = 1 }
+            # resolve this layer's main tensors FRESH, used immediately (the stored
+            # GxLoc paths did not survive the surrounding String churn)
+            wantL<Vec<String>> = Vec()
+            if (is_dsa == 1) {
+                wantL.push(lpre + "hc_attn_fn")
+                wantL.push(lpre + "hc_attn_base")
+                wantL.push(lpre + "hc_attn_scale")
+                wantL.push(lpre + "input_layernorm.weight")
+                wantL.push(lpre + "self_attn.q_a_proj.weight")
+                wantL.push(lpre + "self_attn.q_a_layernorm.weight")
+                wantL.push(lpre + "self_attn.q_b_proj.weight")
+                wantL.push(lpre + "self_attn.kv_a_proj_with_mqa.weight")
+                wantL.push(lpre + "self_attn.kv_a_layernorm.weight")
+                wantL.push(lpre + "self_attn.kv_b_proj.weight")
+                wantL.push(lpre + "self_attn.o_proj.weight")
+                wantL.push(lpre + "self_attn.indexer.wq_b.weight")
+                wantL.push(lpre + "self_attn.indexer.wk.weight")
+                wantL.push(lpre + "self_attn.indexer.k_norm.weight")
+                wantL.push(lpre + "self_attn.indexer.k_norm.bias")
+                wantL.push(lpre + "self_attn.indexer.weights_proj.weight")
+                wantL.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
+                wantL.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
+                wantL.push(lpre + "hc_ffn_fn")
+                wantL.push(lpre + "hc_ffn_base")
+                wantL.push(lpre + "hc_ffn_scale")
+                wantL.push(lpre + "post_attention_layernorm.weight")
+                wantL.push(lpre + "mlp.gate.weight")
+                wantL.push(lpre + "mlp.gate.e_score_correction_bias")
+                wantL.push(lpre + "mlp.shared_experts.gate_proj.weight")
+                wantL.push(lpre + "mlp.shared_experts.up_proj.weight")
+                wantL.push(lpre + "mlp.shared_experts.down_proj.weight")
+            } else {
+                wantL.push(lpre + "self_attn.q_proj.weight")
+                wantL.push(lpre + "self_attn.k_proj.weight")
+                wantL.push(lpre + "self_attn.v_proj.weight")
+                wantL.push(lpre + "self_attn.o_proj.weight")
+                wantL.push(lpre + "self_attn.b_proj.weight")
+                wantL.push(lpre + "self_attn.f_a_proj.weight")
+                wantL.push(lpre + "self_attn.f_b_proj.weight")
+                wantL.push(lpre + "self_attn.g_a_proj.weight")
+                wantL.push(lpre + "self_attn.g_b_proj.weight")
+                wantL.push(lpre + "self_attn.o_norm.weight")
+                wantL.push(lpre + "self_attn.dt_bias")
+                wantL.push(lpre + "self_attn.A_log")
+                if (n < 3) {
+                    wantL.push(lpre + "mlp.gate_proj.weight")
+                    wantL.push(lpre + "mlp.up_proj.weight")
+                    wantL.push(lpre + "mlp.down_proj.weight")
+                    wantL.push(lpre + "input_layernorm.weight")
+                    wantL.push(lpre + "post_attention_layernorm.weight")
+                    wantL.push(lpre + "hc_attn_fn")
+                    wantL.push(lpre + "hc_attn_base")
+                    wantL.push(lpre + "hc_attn_scale")
+                    wantL.push(lpre + "hc_ffn_fn")
+                    wantL.push(lpre + "hc_ffn_base")
+                    wantL.push(lpre + "hc_ffn_scale")
+                    wantL.push("model.language_model.embed_tokens.weight")
+                    wantL.push(lpre + "self_attn.q_conv1d.weight")
+                    wantL.push(lpre + "self_attn.k_conv1d.weight")
+                    wantL.push(lpre + "self_attn.v_conv1d.weight")
+                } else {
+                    wantL.push(lpre + "input_layernorm.weight")
+                    wantL.push(lpre + "post_attention_layernorm.weight")
+                    wantL.push(lpre + "hc_attn_fn")
+                    wantL.push(lpre + "hc_attn_base")
+                    wantL.push(lpre + "hc_attn_scale")
+                    wantL.push(lpre + "hc_ffn_fn")
+                    wantL.push(lpre + "hc_ffn_base")
+                    wantL.push(lpre + "hc_ffn_scale")
+                    wantL.push(lpre + "self_attn.q_conv1d.weight")
+                    wantL.push(lpre + "self_attn.k_conv1d.weight")
+                    wantL.push(lpre + "self_attn.v_conv1d.weight")
+                }
+            }
+            gL2<GxLoc> = gx_resolve(dir, total, wantL)
+            nf = 0
+            i = 0
+            while (i < wantL.len()) {
+                if (gL2.found.get(i) == 1) { nf = nf + 1 }
+                i = i + 1
+            }
+            if (nf != wantL.len()) {
+                println("CHAIN_FAIL resolve layer " + n.to_string() + " step " + t.to_string() + " (" + nf.to_string() + ")")
+                return 12
+            }
+            lg = gL2
+
+            if (is_dsa == 1) {
+                # ------------------------------------------------ DSA layer step
+                # (glm_decode_l3.vyb's step body; caches ride in ckvAll/ikAll/gscAll)
+                dslot = (n - 3) / 4
+                d_fnA = deq_bf16(fbf, gx_read(lg, 0), 24 * HC * H, HC * H)
+                if (d_fnA == 0) { return 11 }
+                baseA<Vec<Float>> = Vec()
+                raw_baseA<String> = gx_read(lg, 1)
+                j = 0
+                while (j < 24) { baseA.push(f32_at(raw_baseA, j)); j = j + 1 }
+                scaleA<Vec<Float>> = Vec()
+                raw_scaleA<String> = gx_read(lg, 2)
+                j = 0
+                while (j < 3) { scaleA.push(f32_at(raw_scaleA, j)); j = j + 1 }
+                d_lnA<Int> = deq_bf16(fbf, gx_read(lg, 3), H, 0)
+                if (d_lnA == 0) { return 11 }
+                in_ln<Vec<Float>> = bulk_dtoh(d_lnA, H)
+                free_dev(d_lnA)
+
+                d_qa = deq_bf16(fbf, gx_read(lg, 4), Q_LORA * H, H)
+                d_qb = deq_bf16(fbf, gx_read(lg, 6), HEADS * NOPE * Q_LORA, Q_LORA)
+                d_kva = deq_bf16(fbf, gx_read(lg, 7), KV_LORA * H, H)
+                d_kvb = deq_bf16(fbf, gx_read(lg, 9), HEADS * (NOPE + VDIM) * KV_LORA, 0)
+                d_o = deq_bf16(fbf, gx_read(lg, 10), HEADS * VDIM * H, HEADS * VDIM)
+                d_wqb = deq_bf16(fbf, gx_read(lg, 11), Q_LORA * IHEADS * IDIM, Q_LORA)
+                d_wk = deq_bf16(fbf, gx_read(lg, 12), H * IDIM, H)
+                d_wproj = deq_bf16(fbf, gx_read(lg, 15), H * IHEADS, H)
+                d_gatei = deq_bf16(fbf, gx_read(lg, 17), H * IDIM, H)
+                d_gw = deq_bf16(fbf, gx_read(lg, 22), NE * H, H)
+                if (d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 || d_o == 0 ||
+                    d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gatei == 0 || d_gw == 0) {
+                    println("CHAIN_FAIL weight deq dsa " + n.to_string())
+                    return 13
+                }
+                d_qaln = deq_bf16(fbf, gx_read(lg, 5), Q_LORA, 0)
+                d_kvaln = deq_bf16(fbf, gx_read(lg, 8), KV_LORA, 0)
+                d_knw = deq_bf16(fbf, gx_read(lg, 13), IDIM, 0)
+                d_knb = deq_bf16(fbf, gx_read(lg, 14), IDIM, 0)
+                d_ln2 = deq_bf16(fbf, gx_read(lg, 21), H, 0)
+                if (d_qaln == 0 || d_kvaln == 0 || d_knw == 0 || d_knb == 0 || d_ln2 == 0) { return 13 }
+                qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
+                kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
+                knw<Vec<Float>> = bulk_dtoh(d_knw, IDIM)
+                knb<Vec<Float>> = bulk_dtoh(d_knb, IDIM)
+                post_ln2<Vec<Float>> = bulk_dtoh(d_ln2, H)
+                free_dev(d_qaln)
+                free_dev(d_kvaln)
+                free_dev(d_knw)
+                free_dev(d_knb)
+                free_dev(d_ln2)
+
+                ape<Vec<Float>> = Vec()
+                raw_ape<String> = gx_read(lg, 16)
+                i = 0
+                while (i < KPOOL * IDIM) { ape.push(f32_at(raw_ape, i)); i = i + 1 }
+
+                baseF = vecf()
+                raw_baseF<String> = gx_read(lg, 19)
+                j = 0
+                while (j < 24) { baseF.push(f32_at(raw_baseF, j)); j = j + 1 }
+                scaleF = vecf()
+                raw_scaleF<String> = gx_read(lg, 20)
+                j = 0
+                while (j < 3) { scaleF.push(f32_at(raw_scaleF, j)); j = j + 1 }
+                d_fnF = deq_bf16(fbf, gx_read(lg, 18), 24 * HC * H, HC * H)
+                if (d_fnF == 0) { return 11 }
+
+                raw_bias<String> = gx_read(lg, 23)
+                bias<Vec<Float>> = Vec()
+                i = 0
+                while (i < NE) { bias.push(f32_at(raw_bias, i)); i = i + 1 }
+
+                # absorbed per-head keys/values from kv_b
+                kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
+                free_dev(d_kvb)
+                ukm<Vec<Float>> = Vec()
+                uvm<Vec<Float>> = Vec()
+                d2 = 0
+                while (d2 < KV_LORA * HEADS * NOPE) {
+                    ukm.push(0.0)
+                    uvm.push(0.0)
+                    d2 = d2 + 1
+                }
+                hh = 0
+                while (hh < HEADS) {
+                    j = 0
+                    while (j < NOPE) {
+                        d2 = 0
+                        while (d2 < KV_LORA) {
+                            ukm.set(d2 * (HEADS * NOPE) + hh * NOPE + j,
+                                    kvb.get((hh * (NOPE + VDIM) + j) * KV_LORA + d2))
+                            uvm.set(d2 * (HEADS * VDIM) + hh * VDIM + j,
+                                    kvb.get((hh * (NOPE + VDIM) + NOPE + j) * KV_LORA + d2))
+                            d2 = d2 + 1
+                        }
+                        j = j + 1
+                    }
+                    hh = hh + 1
+                }
+                d_ukm = alloc_dev(KV_LORA * HEADS * NOPE * 8)
+                d_uvm = alloc_dev(KV_LORA * HEADS * VDIM * 8)
+                if (d_ukm == 0 || d_uvm == 0) { return 13 }
+                bulk_htod(d_ukm, view(ukm))
+                bulk_htod(d_uvm, view(uvm))
+
+                # ---- hc_attn mix -> input_layernorm -> h_a
+                flat<Vec<Float>> = rms_rows(streams, R, HC * H, Vec())
+                d_flat = alloc_dev(R * HC * H * 8)
+                d_mv = alloc_dev(R * 24 * 8)
+                d_scr = alloc_dev(64)
+                if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("CHAIN_FAIL alloc"); return 14 }
+                bulk_htod(d_flat, view(flat))
+                if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return 14 }
+                sync()
+                mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
+                free_dev(d_flat)
+                free_dev(d_mv)
+                free_dev(d_scr)
+                free_dev(d_fnA)
+
+                res<Vec<Float>> = hc_glue(mv, baseA, scaleA, streams)
+                collapsed<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * H) { collapsed.push(res.get(i)); i = i + 1 }
+                postA<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC) { postA.push(res.get(R * H + i)); i = i + 1 }
+                combA<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC * HC) { combA.push(res.get(R * H + R * HC + i)); i = i + 1 }
+                h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+
+                # ---- latent projections; append the new cache rows
+                qres<Vec<Float>> = mm_host(h_a, R, H, d_qa, Q_LORA, fgemm)
+                qa_ln<Vec<Float>> = rms_rows(qres, R, Q_LORA, qaln_w)
+                qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
+                ckraw<Vec<Float>> = mm_host(h_a, R, H, d_kva, KV_LORA, fgemm)
+                ckv_new<Vec<Float>> = rms_rows(ckraw, R, KV_LORA, kvaln_w)
+                nckv = 20 + t                       # rows already in this layer's cache
+                i = 0
+                while (i < R * KV_LORA) {
+                    ckvAll.set(dslot * CAPT * KV_LORA + nckv * KV_LORA + i, ckv_new.get(i))
+                    i = i + 1
+                }
+                qidx<Vec<Float>> = mm_host(qres, R, Q_LORA, d_wqb, IHEADS * IDIM, fgemm)
+                kraw<Vec<Float>> = mm_host(h_a, R, H, d_wk, IDIM, fgemm)
+                k_new<Vec<Float>> = ln_rows(kraw, R, IDIM, knw, knb)
+                i = 0
+                while (i < R * IDIM) {
+                    ikAll.set(dslot * CAPT * IDIM + nckv * IDIM + i, k_new.get(i))
+                    i = i + 1
+                }
+                gsc_new<Vec<Float>> = mm_host(h_a, R, H, d_gatei, IDIM, fgemm)
+                i = 0
+                while (i < R * IDIM) {
+                    gscAll.set(dslot * CAPT * IDIM + nckv * IDIM + i, gsc_new.get(i))
+                    i = i + 1
+                }
+                wproj<Vec<Float>> = mm_host(h_a, R, H, d_wproj, IHEADS, fgemm)
+                i = 0
+                while (i < wproj.len()) {
+                    wproj.set(i, wproj.get(i) * wscale)
+                    i = i + 1
+                }
+
+                # ---- indexer: pool + topk over the cache with causal visibility
+                nckv = nckv + 1                     # the cache now holds nckv rows
+                # copy this slot's cache rows into locals sized [nckv, ...]
+                ckv_t<Vec<Float>> = Vec()
+                ik_t<Vec<Float>> = Vec()
+                gsc_t<Vec<Float>> = Vec()
+                i = 0
+                while (i < nckv * KV_LORA) {
+                    ckv_t.push(ckvAll.get(dslot * CAPT * KV_LORA + i))
+                    i = i + 1
+                }
+                i = 0
+                while (i < nckv * IDIM) {
+                    ik_t.push(ikAll.get(dslot * CAPT * IDIM + i))
+                    gsc_t.push(gscAll.get(dslot * CAPT * IDIM + i))
+                    i = i + 1
+                }
+                lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "ckv", ckv_t) + "\n"
+                lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "ik", ik_t) + "\n"
+                lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "gsc", gsc_t) + "\n"
+                npools = nckv / KPOOL
+                poolk<Vec<Float>> = Vec()
+                d2 = 0
+                while (d2 < npools * IDIM) { poolk.push(0.0); d2 = d2 + 1 }
+                p = 0
+                while (p < npools) {
+                    c = 0
+                    while (c < IDIM) {
+                        mx = 0.0 - 1e30
+                        a = 0
+                        while (a < KPOOL) {
+                            lgf<Float> = gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c)
+                            if (lgf > mx) { mx = lgf }
+                            a = a + 1
+                        }
+                        sm = 0.0
+                        a = 0
+                        while (a < KPOOL) {
+                            sm = sm + vexp(gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx)
+                            a = a + 1
+                        }
+                        acc = 0.0
+                        a = 0
+                        while (a < KPOOL) {
+                            pr = vexp(gsc_t.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx) / sm
+                            acc = acc + pr * ik_t.get((p * KPOOL + a) * IDIM + c)
+                            a = a + 1
+                        }
+                        poolk.set(p * IDIM + c, acc)
+                        c = c + 1
+                    }
+                    p = p + 1
+                }
+                isc<Vec<Float>> = Vec()
+                d2 = 0
+                while (d2 < npools) { isc.push(0.0); d2 = d2 + 1 }
+                p = 0
+                while (p < npools) {
+                    acc = 0.0
+                    hh = 0
+                    while (hh < IHEADS) {
+                        dot = 0.0
+                        c = 0
+                        while (c < IDIM) {
+                            dot = dot + qidx.get(hh * IDIM + c) * poolk.get(p * IDIM + c)
+                            c = c + 1
+                        }
+                        rl = dot * scale_iq
+                        if (rl < 0.0) { rl = 0.0 }
+                        acc = acc + wproj.get(hh) * rl
+                        hh = hh + 1
+                    }
+                    isc.set(p, acc)
+                    p = p + 1
+                }
+                sel<Vec<Int>> = Vec()
+                d2 = 0
+                while (d2 < nckv) { sel.push(-1); d2 = d2 + 1 }
+                select_k = TOPK / KPOOL
+                if (select_k > npools) { select_k = npools }
+                taken<Vec<Int>> = Vec()
+                k = 0
+                while (k < select_k) {
+                    bestp = -1
+                    bestv = 0.0 - 1e30
+                    p = 0
+                    while (p < npools) {
+                        last = p * KPOOL + KPOOL - 1
+                        used = 0
+                        j = 0
+                        while (j < taken.len()) {
+                            if (taken.get(j) == p) { used = 1 }
+                            j = j + 1
+                        }
+                        if (last <= nckv - 1 && used == 0) {
+                            sc = isc.get(p)
+                            if (sc > bestv) { bestv = sc; bestp = p }
+                        }
+                        p = p + 1
+                    }
+                    if (bestp < 0) { k = select_k } else {
+                        taken.push(bestp)
+                        a = 0
+                        while (a < KPOOL) {
+                            sel.set(bestp * KPOOL + a, bestp * KPOOL + a)
+                            a = a + 1
+                        }
+                        k = k + 1
+                    }
+                }
+                vcount = nckv
+                tcount = vcount % KPOOL
+                tstart = vcount - tcount
+                a = 0
+                while (a < tcount) {
+                    sel.set(tstart + a, tstart + a)
+                    a = a + 1
+                }
+
+                # ---- masked MLA over the selected cache rows
+                Kv<Vec<Float>> = mm_host(ckv_t, nckv, KV_LORA, d_ukm, HEADS * NOPE, fgemm)
+                Vm<Vec<Float>> = mm_host(ckv_t, nckv, KV_LORA, d_uvm, HEADS * VDIM, fgemm)
+                probs<Vec<Float>> = Vec()
+                d2 = 0
+                while (d2 < R * HEADS * nckv) { probs.push(0.0); d2 = d2 + 1 }
+                hh = 0
+                while (hh < HEADS) {
+                    mx = 0.0 - 1e30
+                    i = 0
+                    while (i < nckv) {
+                        if (sel.get(i) >= 0) {
+                            dot = 0.0
+                            c = 0
+                            while (c < NOPE) {
+                                dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                                c = c + 1
+                            }
+                            sv = dot * sc_scale
+                            if (sv > mx) { mx = sv }
+                        }
+                        i = i + 1
+                    }
+                    sm = 0.0
+                    i = 0
+                    while (i < nckv) {
+                        if (sel.get(i) >= 0) {
+                            dot = 0.0
+                            c = 0
+                            while (c < NOPE) {
+                                dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                                c = c + 1
+                            }
+                            sm = sm + vexp(dot * sc_scale - mx)
+                        }
+                        i = i + 1
+                    }
+                    i = 0
+                    while (i < nckv) {
+                        if (sel.get(i) >= 0) {
+                            dot = 0.0
+                            c = 0
+                            while (c < NOPE) {
+                                dot = dot + qfull.get(hh * NOPE + c) * Kv.get((i * HEADS + hh) * NOPE + c)
+                                c = c + 1
+                            }
+                            probs.set(hh * nckv + i, vexp(dot * sc_scale - mx) / sm)
+                        }
+                        i = i + 1
+                    }
+                    hh = hh + 1
+                }
+                ao<Vec<Float>> = Vec()
+                d2 = 0
+                while (d2 < R * HEADS * VDIM) { ao.push(0.0); d2 = d2 + 1 }
+                hh = 0
+                while (hh < HEADS) {
+                    c = 0
+                    while (c < VDIM) {
+                        acc = 0.0
+                        i = 0
+                        while (i < nckv) {
+                            pv<Float> = probs.get(hh * nckv + i)
+                            if (pv != 0.0) {
+                                acc = acc + pv * Vm.get((i * HEADS + hh) * VDIM + c)
+                            }
+                            i = i + 1
+                        }
+                        ao.set(hh * VDIM + c, acc)
+                        c = c + 1
+                    }
+                    hh = hh + 1
+                }
+                attn = mm_host(ao, R, HEADS * VDIM, d_o, H, fgemm)
+                free_dev(d_ukm)
+                free_dev(d_uvm)
+                free_dev(d_qa)
+                free_dev(d_qb)
+                free_dev(d_kva)
+                free_dev(d_o)
+                free_dev(d_wqb)
+                free_dev(d_wk)
+                free_dev(d_wproj)
+                free_dev(d_gatei)
+
+                streams1 = hc_apply(streams, attn, postA, combA)
+
+                # ---- ffn site: hc_ffn mix -> post_attn LN -> router -> experts -> shared
+                reflat<Vec<Float>> = rms_rows(streams1, R, HC * H, Vec())
+                d_flat2 = alloc_dev(R * HC * H * 8)
+                d_mv2 = alloc_dev(R * 24 * 8)
+                d_scr2 = alloc_dev(64)
+                if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return 21 }
+                bulk_htod(d_flat2, view(reflat))
+                if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return 22 }
+                sync()
+                mv2<Vec<Float>> = bulk_dtoh(d_mv2, R * 24)
+                free_dev(d_flat2)
+                free_dev(d_mv2)
+                free_dev(d_scr2)
+                free_dev(d_fnF)
+
+                res2<Vec<Float>> = hc_glue(mv2, baseF, scaleF, streams1)
+                collapsed2<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * H) { collapsed2.push(res2.get(i)); i = i + 1 }
+                post2<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC) { post2.push(res2.get(R * H + i)); i = i + 1 }
+                comb2<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC * HC) { comb2.push(res2.get(R * H + R * HC + i)); i = i + 1 }
+                h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln2)
+
+                # router: sigmoid + noaux_tc bias + top-8 + renorm * 2.5
+                logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
+                freedom {
+                    cuMemFree_v2(d_gw)
+                }
+                scores<Vec<Float>> = Vec()
+                i = 0
+                while (i < logits.len()) {
+                    scores.push(sigmoid(logits.get(i)))
+                    i = i + 1
+                }
+                rsel<Vec<Int>> = Vec()
+                rwt<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * ROUTE_TOPK) { rsel.push(-1); rwt.push(0.0); i = i + 1 }
+                r = 0
+                while (r < R) {
+                    lane = 0
+                    while (lane < ROUTE_TOPK) {
+                        best = -1
+                        bestv = 0.0 - 1e30
+                        j = 0
+                        while (j < NE) {
+                            used = 0
+                            k = 0
+                            while (k < lane) {
+                                if (rsel.get(r * ROUTE_TOPK + k) == j) { used = 1 }
+                                k = k + 1
+                            }
+                            if (used == 0) {
+                                cv = scores.get(r * NE + j) + bias.get(j)
+                                if (cv > bestv) { bestv = cv; best = j }
+                            }
+                            j = j + 1
+                        }
+                        rsel.set(r * ROUTE_TOPK + lane, best)
+                        lane = lane + 1
+                    }
+                    sm = 0.0
+                    lane = 0
+                    while (lane < ROUTE_TOPK) {
+                        sm = sm + scores.get(r * NE + rsel.get(r * ROUTE_TOPK + lane))
+                        lane = lane + 1
+                    }
+                    lane = 0
+                    while (lane < ROUTE_TOPK) {
+                        rwt.set(r * ROUTE_TOPK + lane,
+                                scores.get(r * NE + rsel.get(r * ROUTE_TOPK + lane)) / (sm + 1e-20) * ROUTED_SCALE)
+                        lane = lane + 1
+                    }
+                    r = r + 1
+                }
+
+                # routed experts: lazy per-expert resolve (9 names), EXL3 deq, then shared
+                accr<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * H) { accr.push(0.0); i = i + 1 }
+                nex = 0
+                e = 0
+                while (e < NE) {
+                    toks<Vec<Int>> = Vec()
+                    lanes<Vec<Int>> = Vec()
+                    r = 0
+                    while (r < R) {
+                        lane = 0
+                        while (lane < ROUTE_TOPK) {
+                            if (rsel.get(r * ROUTE_TOPK + lane) == e) {
+                                toks.push(r)
+                                lanes.push(lane)
+                            }
+                            lane = lane + 1
+                        }
+                        r = r + 1
+                    }
+                    nt = toks.len()
+                    if (nt > 0) {
+                        nex = nex + 1
+                        i0 = e * 9
+                        epre<String> = lpre + "mlp.experts." + e.to_string() + "."
+                        w2<Vec<String>> = Vec()
+                        w2.push(epre + "gate_proj.trellis")
+                        w2.push(epre + "gate_proj.suh")
+                        w2.push(epre + "gate_proj.svh")
+                        w2.push(epre + "up_proj.trellis")
+                        w2.push(epre + "up_proj.suh")
+                        w2.push(epre + "up_proj.svh")
+                        w2.push(epre + "down_proj.trellis")
+                        w2.push(epre + "down_proj.suh")
+                        w2.push(epre + "down_proj.svh")
+                        gexp<GxLoc> = gx_resolve_idx(idxtext, dir, total, w2)
+                        nfound = 0
+                        j = 0
+                        while (j < 9) {
+                            if (gexp.found.get(j) == 1) { nfound = nfound + 1 }
+                            j = j + 1
+                        }
+                        if (nfound != 9) {
+                            println("CHAIN_FAIL resolve expert " + e.to_string() + " layer " + n.to_string())
+                            return 23
+                        }
+                        dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 0),
+                                            gx_read(gexp, 1), gx_read(gexp, 2), mapbody,
+                                            EINTER, 32768)
+                        dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 3),
+                                            gx_read(gexp, 4), gx_read(gexp, 5), mapbody,
+                                            EINTER, 32768)
+                        dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 6),
+                                            gx_read(gexp, 7), gx_read(gexp, 8), mapbody,
+                                            H, 32768)
+                        if (dWg == 0 || dWu == 0 || dWd == 0) {
+                            println("CHAIN_FAIL deq expert " + e.to_string())
+                            return 24
+                        }
+                        sub<Vec<Float>> = Vec()
+                        j = 0
+                        while (j < nt) {
+                            tk = toks.get(j) * H
+                            d2 = 0
+                            while (d2 < H) {
+                                sub.push(h2.get(tk + d2))
+                                d2 = d2 + 1
+                            }
+                            j = j + 1
+                        }
+                        gv<Vec<Float>> = mm_host(sub, nt, H, dWg, EINTER, fgemm)
+                        uv<Vec<Float>> = mm_host(sub, nt, H, dWu, EINTER, fgemm)
+                        act<Vec<Float>> = Vec()
+                        j = 0
+                        while (j < gv.len()) {
+                            g1 = gv.get(j)
+                            if (g1 > SWIGLU_LIMIT) { g1 = SWIGLU_LIMIT }
+                            u1 = uv.get(j)
+                            if (u1 > SWIGLU_LIMIT) { u1 = SWIGLU_LIMIT }
+                            if (u1 < 0.0 - SWIGLU_LIMIT) { u1 = 0.0 - SWIGLU_LIMIT }
+                            act.push(silu(g1) * u1)
+                            j = j + 1
+                        }
+                        yv<Vec<Float>> = mm_host(act, nt, EINTER, dWd, H, fgemm)
+                        j = 0
+                        while (j < nt) {
+                            tk = toks.get(j)
+                            wt = rwt.get(tk * ROUTE_TOPK + lanes.get(j))
+                            d2 = 0
+                            while (d2 < H) {
+                                accr.set(tk * H + d2, accr.get(tk * H + d2) + wt * yv.get(j * H + d2))
+                                d2 = d2 + 1
+                            }
+                            j = j + 1
+                        }
+                        freedom {
+                            cuMemFree_v2(dWg)
+                            cuMemFree_v2(dWu)
+                            cuMemFree_v2(dWd)
+                        }
+                    }
+                    e = e + 1
+                }
+
+                d_sg = deq_bf16(fbf, gx_read(lg, 24), EINTER * H, H)
+                d_su = deq_bf16(fbf, gx_read(lg, 25), EINTER * H, H)
+                d_sd = deq_bf16(fbf, gx_read(lg, 26), H * EINTER, EINTER)
+                if (d_sg == 0 || d_su == 0 || d_sd == 0) { return 25 }
+                sgate<Vec<Float>> = mm_host(h2, R, H, d_sg, EINTER, fgemm)
+                sup<Vec<Float>> = mm_host(h2, R, H, d_su, EINTER, fgemm)
+                sact<Vec<Float>> = Vec()
+                i = 0
+                while (i < sgate.len()) {
+                    g1 = sgate.get(i)
+                    if (g1 > SWIGLU_LIMIT) { g1 = SWIGLU_LIMIT }
+                    u1 = sup.get(i)
+                    if (u1 > SWIGLU_LIMIT) { u1 = SWIGLU_LIMIT }
+                    if (u1 < 0.0 - SWIGLU_LIMIT) { u1 = 0.0 - SWIGLU_LIMIT }
+                    sact.push(silu(g1) * u1)
+                    i = i + 1
+                }
+                shared<Vec<Float>> = mm_host(sact, R, EINTER, d_sd, H, fgemm)
+                free_dev(d_sg)
+                free_dev(d_su)
+                free_dev(d_sd)
+
+                mlp = vecf()
+                i = 0
+                while (i < R * H) { mlp.push(accr.get(i) + shared.get(i)); i = i + 1 }
+                streams2 = hc_apply(streams1, mlp, post2, comb2)
+            } else {
+                # ------------------------------------------------ KDA layer step
+                kslot = n - ((n + 1) / 4)
+                if (n < 3) {
+                    d_fnA = deq_bf16(fbf, gx_read(lg, 17), 24 * HC * H, HC * H)
+                } else {
+                    d_fnA = deq_bf16(fbf, gx_read(lg, 14), 24 * HC * H, HC * H)
+                }
+                if (d_fnA == 0) { return 11 }
+                base<Vec<Float>> = Vec()
+                raw_base<String> = ""
+                if (n < 3) { raw_base = gx_read(lg, 18) } else { raw_base = gx_read(lg, 15) }
+                j = 0
+                while (j < 24) { base.push(f32_at(raw_base, j)); j = j + 1 }
+                scale<Vec<Float>> = Vec()
+                raw_scale<String> = ""
+                if (n < 3) { raw_scale = gx_read(lg, 19) } else { raw_scale = gx_read(lg, 16) }
+                j = 0
+                while (j < 3) { scale.push(f32_at(raw_scale, j)); j = j + 1 }
+
+                d_q = deq_bf16(fbf, gx_read(lg, 0), H * HEADS * KD, H)
+                d_k = deq_bf16(fbf, gx_read(lg, 1), H * HEADS * KD, H)
+                d_v = deq_bf16(fbf, gx_read(lg, 2), H * HEADS * KD, H)
+                d_o = deq_bf16(fbf, gx_read(lg, 3), HEADS * KD * H, HEADS * KD)
+                d_b = deq_bf16(fbf, gx_read(lg, 4), H * HEADS, H)
+                d_fa = deq_bf16(fbf, gx_read(lg, 5), H * 128, H)
+                d_fb = deq_bf16(fbf, gx_read(lg, 6), 128 * HEADS * KD, 128)
+                d_ga = deq_bf16(fbf, gx_read(lg, 7), H * 128, H)
+                d_gb = deq_bf16(fbf, gx_read(lg, 8), 128 * HEADS * KD, 128)
+                if (n < 3) {
+                    d_ln = deq_bf16(fbf, gx_read(lg, 15), H, 0)
+                    d_ln2 = deq_bf16(fbf, gx_read(lg, 16), H, 0)
+                    d_cq = deq_bf16(fbf, gx_read(lg, 24), HEADS * KD * CONV_K, 0)
+                    d_ck = deq_bf16(fbf, gx_read(lg, 25), HEADS * KD * CONV_K, 0)
+                    d_cv = deq_bf16(fbf, gx_read(lg, 26), HEADS * KD * CONV_K, 0)
+                } else {
+                    d_ln = deq_bf16(fbf, gx_read(lg, 12), H, 0)
+                    d_ln2 = deq_bf16(fbf, gx_read(lg, 13), H, 0)
+                    d_cq = deq_bf16(fbf, gx_read(lg, 20), HEADS * KD * CONV_K, 0)
+                    d_ck = deq_bf16(fbf, gx_read(lg, 21), HEADS * KD * CONV_K, 0)
+                    d_cv = deq_bf16(fbf, gx_read(lg, 22), HEADS * KD * CONV_K, 0)
+                }
+                if (d_q == 0 || d_k == 0 || d_v == 0 || d_o == 0 || d_b == 0 || d_fa == 0 || d_fb == 0 ||
+                    d_ga == 0 || d_gb == 0 || d_ln == 0 || d_ln2 == 0 || d_cq == 0 || d_ck == 0 || d_cv == 0) {
+                    println("CHAIN_FAIL weight deq kda " + n.to_string())
+                    return 15
+                }
+                in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
+                post_ln3<Vec<Float>> = bulk_dtoh(d_ln2, H)
+                convq<Vec<Float>> = bulk_dtoh(d_cq, HEADS * KD * CONV_K)
+                convk<Vec<Float>> = bulk_dtoh(d_ck, HEADS * KD * CONV_K)
+                convv<Vec<Float>> = bulk_dtoh(d_cv, HEADS * KD * CONV_K)
+                free_dev(d_cq)
+                free_dev(d_ck)
+                free_dev(d_cv)
+
+                d_onorm = deq_bf16(fbf, gx_read(lg, 9), KD, 0)
+                if (d_onorm == 0) { return 16 }
+                onorm<Vec<Float>> = bulk_dtoh(d_onorm, KD)
+                free_dev(d_onorm)
+
+                raw_dt<String> = gx_read(lg, 10)
+                dt<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS * KD) { dt.push(f32_at(raw_dt, i)); i = i + 1 }
+                raw_alog<String> = gx_read(lg, 11)
+                alog<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS) { alog.push(f32_at(raw_alog, i)); i = i + 1 }
+
+                # ---- attn site: hc mix -> input_layernorm -> KDA -> o_proj -> hc apply
+                flat<Vec<Float>> = rms_rows(streams, R, HC * H, Vec())
+                d_flat = alloc_dev(R * HC * H * 8)
+                d_mv = alloc_dev(R * 24 * 8)
+                d_scr = alloc_dev(64)
+                if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("CHAIN_FAIL alloc"); return 17 }
+                bulk_htod(d_flat, view(flat))
+                if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return 17 }
+                sync()
+                mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
+                free_dev(d_flat)
+                free_dev(d_mv)
+                free_dev(d_scr)
+                free_dev(d_fnA)
+
+                res<Vec<Float>> = hc_glue(mv, base, scale, streams)
+                collapsed<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * H) { collapsed.push(res.get(i)); i = i + 1 }
+                postA<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC) { postA.push(res.get(R * H + i)); i = i + 1 }
+                combA<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HC * HC) { combA.push(res.get(R * H + R * HC + i)); i = i + 1 }
+                h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+
+                qp<Vec<Float>> = mm_host(h_a, R, H, d_q, HEADS * KD, fgemm)
+                kp<Vec<Float>> = mm_host(h_a, R, H, d_k, HEADS * KD, fgemm)
+                vp<Vec<Float>> = mm_host(h_a, R, H, d_v, HEADS * KD, fgemm)
+
+                # conv step against this layer's carried ring (copy in, rotate, copy out)
+                ringq<Vec<Float>> = Vec()
+                ringk<Vec<Float>> = Vec()
+                ringv<Vec<Float>> = Vec()
+                i = 0
+                while (i < (CONV_K - 1) * HEADS * KD) {
+                    ringq.push(ringQ.get(kslot * (CONV_K - 1) * HEADS * KD + i))
+                    ringk.push(ringK.get(kslot * (CONV_K - 1) * HEADS * KD + i))
+                    ringv.push(ringV.get(kslot * (CONV_K - 1) * HEADS * KD + i))
+                    i = i + 1
+                }
+                qres2<Vec<Float>> = conv1_step(qp, ringq, convq)
+                kres2<Vec<Float>> = conv1_step(kp, ringk, convk)
+                vres2<Vec<Float>> = conv1_step(vp, ringv, convv)
+                qc<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS * KD) { qc.push(qres2.get(i)); i = i + 1 }
+                i = HEADS * KD
+                while (i < qres2.len()) { ringq.set(i - HEADS * KD, qres2.get(i)); i = i + 1 }
+                kc<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS * KD) { kc.push(kres2.get(i)); i = i + 1 }
+                i = HEADS * KD
+                while (i < kres2.len()) { ringk.set(i - HEADS * KD, kres2.get(i)); i = i + 1 }
+                vc<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS * KD) { vc.push(vres2.get(i)); i = i + 1 }
+                i = HEADS * KD
+                while (i < vres2.len()) { ringv.set(i - HEADS * KD, vres2.get(i)); i = i + 1 }
+                i = 0
+                while (i < (CONV_K - 1) * HEADS * KD) {
+                    ringQ.set(kslot * (CONV_K - 1) * HEADS * KD + i, ringq.get(i))
+                    ringK.set(kslot * (CONV_K - 1) * HEADS * KD + i, ringk.get(i))
+                    ringV.set(kslot * (CONV_K - 1) * HEADS * KD + i, ringv.get(i))
+                    i = i + 1
+                }
+
+                qn<Vec<Float>> = l2_rows(qc, R * HEADS, KD)
+                kn2<Vec<Float>> = l2_rows(kc, R * HEADS, KD)
+                i = 0
+                while (i < qn.len()) {
+                    qn.set(i, qn.get(i) * (1.0 / vsqrt(KD as Float, 40)))
+                    i = i + 1
+                }
+
+                bet<Vec<Float>> = mm_host(h_a, R, H, d_b, HEADS, fgemm)
+                i = 0
+                while (i < bet.len()) {
+                    bet.set(i, sigmoid(bet.get(i)))
+                    i = i + 1
+                }
+                fa<Vec<Float>> = mm_host(h_a, R, H, d_fa, 128, fgemm)
+                fraw<Vec<Float>> = mm_host(fa, R, 128, d_fb, HEADS * KD, fgemm)
+                ga<Vec<Float>> = mm_host(h_a, R, H, d_ga, 128, fgemm)
+                zraw<Vec<Float>> = mm_host(ga, R, 128, d_gb, HEADS * KD, fgemm)
+
+                gdec<Vec<Float>> = log_decay(fraw, dt, alog)
+
+                # recurrence with the carried state (copy slot in, step, copy back)
+                st_t<Vec<Float>> = Vec()
+                i = 0
+                while (i < HEADS * KD * KD) {
+                    st_t.push(stAll.get(kslot * HEADS * KD * KD + i))
+                    i = i + 1
+                }
+                dres<Vec<Float>> = delta_rule_step(qn, kn2, vc, gdec, bet, view(st_t))
+                att0<Vec<Float>> = Vec()
+                i = 0
+                while (i < R * HEADS * KD) { att0.push(dres.get(i)); i = i + 1 }
+                i = R * HEADS * KD
+                while (i < dres.len()) {
+                    stAll.set(kslot * HEADS * KD * KD + (i - R * HEADS * KD), dres.get(i))
+                    i = i + 1
+                }
+
+                gnorm<Vec<Float>> = gated_norm(att0, zraw, onorm)
+                attn = mm_host(gnorm, R, HEADS * KD, d_o, H, fgemm)
+                free_dev(d_q)
+                free_dev(d_k)
+                free_dev(d_v)
+                free_dev(d_o)
+                free_dev(d_b)
+                free_dev(d_fa)
+                free_dev(d_fb)
+                free_dev(d_ga)
+                free_dev(d_gb)
+
+                streams1 = hc_apply(streams, attn, postA, combA)
+
+                if (n < 3) {
+                    # ---- dense SwiGLU MLP tail (glm_decode_step.vyb's step body)
+                    d_fnF = deq_bf16(fbf, gx_read(lg, 20), 24 * HC * H, HC * H)
+                    if (d_fnF == 0) { return 18 }
+                    baseF = vecf()
+                    raw_baseF<String> = gx_read(lg, 21)
+                    j = 0
+                    while (j < 24) { baseF.push(f32_at(raw_baseF, j)); j = j + 1 }
+                    scaleF = vecf()
+                    raw_scaleF<String> = gx_read(lg, 22)
+                    j = 0
+                    while (j < 3) { scaleF.push(f32_at(raw_scaleF, j)); j = j + 1 }
+                    d_gate = deq_bf16(fbf, gx_read(lg, 12), H * INTER, H)
+                    d_up = deq_bf16(fbf, gx_read(lg, 13), H * INTER, H)
+                    d_down = deq_bf16(fbf, gx_read(lg, 14), INTER * H, INTER)
+                    if (d_gate == 0 || d_up == 0 || d_down == 0) { return 19 }
+
+                    reflat<Vec<Float>> = rms_rows(streams1, R, HC * H, Vec())
+                    d_flat2 = alloc_dev(R * HC * H * 8)
+                    d_mv2 = alloc_dev(R * 24 * 8)
+                    d_scr2 = alloc_dev(64)
+                    if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return 20 }
+                    bulk_htod(d_flat2, view(reflat))
+                    if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return 20 }
+                    sync()
+                    mv2<Vec<Float>> = bulk_dtoh(d_mv2, R * 24)
+                    free_dev(d_flat2)
+                    free_dev(d_mv2)
+                    free_dev(d_scr2)
+                    free_dev(d_fnF)
+
+                    res2<Vec<Float>> = hc_glue(mv2, baseF, scaleF, streams1)
+                    collapsed2<Vec<Float>> = Vec()
+                    i = 0
+                    while (i < R * H) { collapsed2.push(res2.get(i)); i = i + 1 }
+                    post2<Vec<Float>> = Vec()
+                    i = 0
+                    while (i < R * HC) { post2.push(res2.get(R * H + i)); i = i + 1 }
+                    comb2<Vec<Float>> = Vec()
+                    i = 0
+                    while (i < R * HC * HC) { comb2.push(res2.get(R * H + R * HC + i)); i = i + 1 }
+                    h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln3)
+
+                    mg<Vec<Float>> = mm_host(h2, R, H, d_gate, INTER, fgemm)
+                    mu<Vec<Float>> = mm_host(h2, R, H, d_up, INTER, fgemm)
+                    act<Vec<Float>> = Vec()
+                    i = 0
+                    while (i < mg.len()) {
+                        act.push(silu(mg.get(i)) * mu.get(i))
+                        i = i + 1
+                    }
+                    mlp = mm_host(act, R, INTER, d_down, H, fgemm)
+                    free_dev(d_gate)
+                    free_dev(d_up)
+                    free_dev(d_down)
+                    streams2 = hc_apply(streams1, mlp, post2, comb2)
+                } else {
+                    # ---- MoE tail (tail_site's body, R = 1)
+                    streams2 = moe_tail_step(streams1, lpre, dir, total, idxtext, mapbody, lg,
+                                             fgemm, fbf, fdeq, fhgen, fhad1, fhad2)
+                }
+            }
+
+            println("step" + t.to_string() + " layer " + n.to_string() + " done")
+            println(digest("l" + n.to_string() + "s" + t.to_string() + " s2", streams2))
+            lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "attn", attn) + "\n"
+            lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "mlp", mlp) + "\n"
+            lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "s2", streams2) + "\n"
+            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "s2", streams2) + "\n"
+            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "s1", streams1) + "\n"
+            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "attn", attn) + "\n"
+            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp) + "\n"
+            streams = streams2
+            i = trim_heap()
+            n = n + 1
+        }
+        t = t + 1
+    }
+
+    match (open_write(out)) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { println("CHAIN_FAIL write"); return 26 }
+    }
+    println("CHAIN_OK 45 layers x 2 teacher-forced decode steps, all caches carried")
+    return 0
+}
