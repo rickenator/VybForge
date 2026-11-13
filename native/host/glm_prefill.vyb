@@ -2427,6 +2427,20 @@ main()<Int> -> {
         i = trim_heap()
         println("layer " + n.to_string() + " done")
         lines = lines + "layer " + n.to_string() + " " + digest("streams", streams) + "\n"
+        # chained-decode gate oracle (HANDOFF §11): the LAST TWO tokens' streams at full
+        # precision, per layer -- the decode walk's step-t layer-N output must equal this
+        # element-wise (causal attention makes the stepwise walk exact).
+        chain<Vec<Float>> = Vec()
+        chainT<Int> = R - 2
+        while (chainT < R) {
+            chainI<Int> = 0
+            while (chainI < HC * H) {
+                chain.push(streams.get(chainT * HC * H + chainI))
+                chainI = chainI + 1
+            }
+            chainT = chainT + 1
+        }
+        lines = lines + dumps("chain" + n.to_string(), chain) + "\n"
         n = n + 1
     }
     match (open_write(out)) {
