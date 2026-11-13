@@ -8,6 +8,9 @@
 VYBHOME ?= $(HOME)/Projects/Vyb
 VYBDIR  ?= $(VYBHOME)
 VYB     ?= $(VYBDIR)/build/vyb
+# Python oracle interpreter: the venv that has torch/safetensors/transformers (the
+# oracles are the only Python in the tree, and they need those libs).
+PYORACLE ?= $(HOME)/venvs/exl3/bin/python
 # VYB_BIN is the name the kernel build scripts read, but make itself only honours VYB/VYBHOME:
 # say so instead of silently building with a different compiler than the one asked for.
 ifneq ($(origin VYB_BIN),undefined)
@@ -29,10 +32,10 @@ S02MODS := --module-path native/config --module-path native/json --module-path n
 # state path), iq2s.ptx and iq3s.ptx (W1: Ridge's FFN types, staged through the grid launcher)
 # unconditionally, so all three belong here: q8_0 was a latent gap — the file existed on disk from
 # an explicit `make q8_0` but a fresh `make verify` did not build it.
-KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s
+KERNELS := gemm rmsnorm math_probe layer deq q4k q6k qwen3 backprop train dtcvt gdn rope q5k attn35 q8_0 iq2s iq3s exl3 moe
 PTX     := $(addprefix $(ROOT)/native/build/, $(addsuffix .ptx, $(KERNELS)))
 
-.PHONY: all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
+.PHONY: ridge-tensors ridge-tensors-check all verify gemm rmsnorm mathprobe layer gguf gguf-real q4k stack tensor decode gdecode ridge-kernels clean
 
 all: verify
 
@@ -150,6 +153,122 @@ gguf-real:
 q4k: $(ROOT)/native/build/q4k.ptx
 	cd $(ROOT) && $(VYB) native/host/q4k_driver.vyb
 	cd $(ROOT) && python3 native/gguf/q4k_verify.py
+
+# EXL3 4bpw (GLM-5.3 routed experts, P1 in doc/ROADMAP-GLM53-ON-VYB.md): generate the
+# slot map from the oracle-verified composition, run the exl3deq kernel on the real
+# fixture, gate the rotated basis + full pipeline against the numpy reference.
+exl3: $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT)/native/exl3 && python3 gen_map_bin.py
+	cd $(ROOT) && $(VYB) native/host/exl3_driver.vyb
+	cd $(ROOT) && python3 native/exl3/verify_exl3_vyb.py
+
+# P4 loader step 0: the checkpoint index resolved in Vyb (gx.vyb) — name -> shard,
+# byte offset, length, dtype, plus sha256 of the first MiB — gated byte-for-byte
+# against an independent parse of the same shards with the safetensors library.
+gx:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 native/host/gx_check.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_ref.py
+	cd $(ROOT) && cmp native/out/gx_listing_ref.txt native/out/gx_listing_vyb.txt && echo "GX_INDEX_MATCH: OK"
+
+# P4 loader step 1: resolved tensors -> shard bytes -> device memory, gated on the
+# three byte windows per tensor (host read) and on device readback (in Vyb).
+gxload:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 native/host/gx_load_driver.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_load_ref.py
+	cd $(ROOT) && cmp native/out/gx_load_ref.txt native/out/gx_load_vyb.txt && echo "GX_LOAD_MATCH: OK"
+
+# P4 loader step 2: the WHOLE checkpoint planned in Vyb (150,226 tensors, 163.6 GiB)
+# and gated by a sha256 digest against an independent parse.
+gxplan:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path $(VYBDIR)/stdlib/collections native/host/gx_plan.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gx_plan_ref.py
+	cd $(ROOT) && grep -v '^PLAN' native/out/gx_plan_ref.txt > /tmp/gxplan_ref.txt && grep -v '^PLAN' native/out/gx_plan_vyb.txt > /tmp/gxplan_vyb.txt && diff /tmp/gxplan_ref.txt /tmp/gxplan_vyb.txt && echo "GX_PLAN_MATCH: OK"
+
+# P4 first real layer: GLM-5.3 layer 0 end to end in Vyb (gx loader + fp64 gemm/bf16deq
+# kernels + host glue), gated stage by stage against the numpy gold.
+glm0: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_layer0.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_layer0_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_layer0_vyb.py
+
+# P4 decode: single-token layer-0 step decode, state carried (KDA recurrence + conv rings),
+# gated against the step-decode oracle's two teacher-forced steps.
+decstep: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_decode_step.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_step_vyb.py
+
+# P4 decode, layer 3: single-token DSA attention + 288-expert MoE decode with the ckv /
+# indexer-key / indexer-gsc caches carried across steps (loaded from the gold oracle's
+# raw f64 .bin dumps), gated against the step-decode oracle's two teacher-forced steps.
+decl3step: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_decode_l3.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_l3_vyb.py
+
+# P6 chained decode: the FULL 45-layer model as prefill-then-decode in one process
+# (glm_decode_chain.vyb, generated by native/glm53/build_decode_chain.py), gated
+# element-wise against the modified prefill's chain<N> dumps (last two tokens'
+# per-layer streams) -> DECODE_CHAIN_MATCH. The reference comes from a full run of the
+# chain-dump-enabled glm_prefill.vyb (its chain<N> lines land in native/out/prefill_vyb.txt).
+decchain: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_decode_chain.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_decode_chain.py
+
+# P4 second real layer piece: layer 3's DSA attention (gpool indexer + masked MLA +
+# o_proj) in Vyb, on the layer-3 input chained through layers 0-2 in numpy.
+glm3: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_attn.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_attn_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_vyb.py
+
+# P4 layer-3 MoE: router + shared expert in Vyb (routed experts need the exl3 pipeline).
+glm3moe: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/bf16.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_moe_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_moe_vyb.py
+
+# P4: EXL3 dequant on a real expert tensor through the reusable Vyb path.
+glm3x: $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_exl3_deq.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_exl3_check.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_exl3_load.py
+
+# P4 layer-3 routed experts: EXL3 dequant + clamped SwiGLU FFN per lane, token 0.
+glm3exp: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && eval $$(env -u PYTHONPATH $(PYORACLE) native/glm53/exp_env.py) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_expert_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_expert_vyb.py
+
+# P4 layer-3 MoE, all 22 tokens: router + every routed expert + shared -> full mlp.
+glm3all: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_moe_all.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_moe_all.py
+
+# P4 layer-3 tail: hc_ffn mix -> post-norm -> MoE -> hc_apply -> streams2.
+glm3tail: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_tail_fwd.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_tail_vyb.py
+
+# P4 layer 3 end to end: streams0 -> hc_attn mix -> attention -> hc_apply -> hc_ffn mix
+# -> MoE -> hc_apply -> streams2, in ONE Vyb process.
+glm3full: $(ROOT)/native/build/gemm.ptx $(ROOT)/native/build/exl3.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_moe.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_full.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_full.py
+
+# P4 layer-3 attention-site hc mix/apply in isolation (fast; localises the join).
+glm3hc: $(ROOT)/native/build/gemm.ptx
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/gold_l3_hc.py
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib $(VYB) --module-path native/json --module-path native/torchload --module-path native/glm53 --module-path native/kernels --module-path native/tensor --module-path $(VYBDIR)/bindings/cuda --module-path $(VYBDIR)/stdlib/collections native/host/glm_l3_hc_check.vyb
+	cd $(ROOT) && env -u PYTHONPATH $(PYORACLE) native/glm53/verify_l3_hc.py
+
+# P2: MoE block kernels (native/glm53/moe_ref.py is the reference; router gated
+# against exllamav3's own routing reference in verify_moe.py).
+moe: $(ROOT)/native/build/moe.ptx
+	cd $(ROOT) && python3 native/glm53/prepare_moe_fixture.py
+	cd $(ROOT) && $(VYB) native/host/moe_driver.vyb
+	cd $(ROOT) && python3 native/glm53/verify_moe_vyb.py
 
 # Phase-3 swap-in (issue #5 storage boundary): stream real Q4_K weights via
 # read_at + bulk q4k dequant to f32, packed stays canonical, memory reported
@@ -518,7 +637,14 @@ chat-gen: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/na
 # averaged -> tokens/sec once the model is resident. No re-load per interaction.
 CHAT_GEN ?= 3
 RESIDENT_RUNS ?= 3
+# The gold in verify_resident_bench.py is for this prompt, so the ids are re-encoded HERE every run (same
+# encode probe -> emit_prompt_ids.py path as chat-prompt). resident-bench used to read whatever
+# native/out/prompt_ids.txt held; a stale 16-id file ("Add a package to a QEMU x86_64 boot test.") left by
+# an older checkout made the gate FAIL on a correct build (2026-10-26).
+RESIDENT_PROMPT := The capital of France is
 resident-bench: $(ROOT)/native/build/layer.ptx $(ROOT)/native/build/q4k.ptx $(ROOT)/native/build/q6k.ptx $(ROOT)/native/build/qwen3.ptx
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT="$(RESIDENT_PROMPT)" $(VYB) native/llm/llm_encode_probe.vyb --module-path native/llm | tee native/out/chat_prompt_encode.log
+	cd $(ROOT) && .venv/bin/python native/tools/emit_prompt_ids.py "$(RESIDENT_PROMPT)"
 	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_PROMPT_IDS=native/out/prompt_ids.txt VYB_GEN=$(CHAT_GEN) VYB_RUNS=$(RESIDENT_RUNS) $(VYB) native/host/resident_driver.vyb --module-path native/llm 2>&1 | tee native/out/resident_bench.log
 	cd $(ROOT) && .venv/bin/python native/tools/verify_resident_bench.py
 
@@ -534,6 +660,19 @@ RIDGE_GGUF ?= $(HOME)/Models/qwen38-27b-ridge/Qwen3.8-27B-Ridge-3.7bpw.gguf
 ridge-inventory:
 	cd $(ROOT) && .venv/bin/python native/gguf/ridge_inventory.py "$(RIDGE_GGUF)" \
 	  --tsv native/gguf/ridge-3.7bpw-inventory.tsv --meta native/out/ridge_meta.txt
+
+# The engine's tensor index (name, dims, type, absolute offset) for ridge_decode.vyb, projected from the
+# tracked inventory; native/out/ is not tracked, so a fresh checkout (e.g. a Spark) needs this once.
+# ridge-tensors-check: ridge_decode.vyb must refuse a missing index with a named ERR, not "alloc region".
+ridge-tensors:
+	cd $(ROOT) && env -u PYTHONPATH python3 native/tools/inventory_to_tsv.py \
+	  --inventory native/gguf/ridge-3.7bpw-inventory.tsv --out native/out/ridge_tensors.tsv
+
+ridge-tensors-check:
+	cd $(ROOT) && VYB_STDLIB=$(VYBDIR)/stdlib VYB_TSV=/nonexistent/ridge_tensors.tsv VYB_GEN=1 $(VYB) native/host/ridge_decode.vyb \
+	  --module-path native/config --module-path native/json --module-path native/tensor --module-path native/dtype \
+	  --module-path native/llm 2>&1 | grep -q "ERR tensor index /nonexistent/ridge_tensors.tsv is missing or empty" \
+	  && echo "ridge-tensors-check: ok" || { echo "ridge-tensors-check: FAIL"; exit 1; }
 
 # ── S0.2e capability / layer descriptor gate (VybForge#10 phase 2) ───────────────
 # model_caps.vyb answers "what does this model REQUIRE of the engine" (layer kinds and their

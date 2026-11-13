@@ -1,0 +1,52 @@
+# playback_probe.vyb — L1 gate (playback): synthesise a tone in Vyb and push it
+# to the output device through the same module the loop will use.
+#
+#   ./build.sh playback
+#
+# Prints the frames written; the audible result is the check. Amplitude is
+# deliberately modest (0.15) and the tone is windowed, so a wrong scale can be
+# heard rather than wincing through it.
+import audio::{start, open_playback, write_block, stop, last_error}
+
+RATE<Int> = 16000
+SECONDS<Int> = 2
+FREQ<Float> = 440.0
+AMP<Float> = 0.15
+
+main()<Int> -> {
+    match (start()) {
+        ? -> {
+            println("VYB_AUDIO: init failed")
+            return 1
+        }
+        ok -> { }
+    }
+
+    h<Int> = open_playback("default", RATE)
+    if (h == 0) {
+        println("VYB_AUDIO: open failed: ")
+        println(last_error())
+        return 2
+    }
+    println("VYB_AUDIO: opened default playback @16000 mono")
+
+    total<Int> = RATE * SECONDS
+    tone<Vec<Float>> = Vec<Float>()
+    ramp<Int> = RATE / 50            # 20 ms fade in / out
+    i<Int> = 0
+    for (i in 0..total - 1) {
+        s<Float> = sin(2.0 * 3.14159265358979 * FREQ * (i as Float) / (RATE as Float))
+        g<Float> = AMP
+        if (i < ramp) { g = AMP * ((i as Float) / (ramp as Float)) }
+        if (i > total - ramp - 1) { g = AMP * (((total - 1 - i) as Float) / (ramp as Float)) }
+        tone.push(s * g)
+    }
+
+    n<Int> = write_block(h, tone)
+    println("VYB_AUDIO wrote frames=")
+    println_int(n)
+    stop(h, true)
+    if (n <= 0) { return 3 }
+    println("VYB_AUDIO_PLAYBACK: OK")
+    return 0
+}

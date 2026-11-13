@@ -37,8 +37,15 @@ else:
     for r, ms, toks in runs:
         print(f"  run {r}: {toks} tokens in {ms} ms -> {int(toks)/(int(ms)/1000.0):.2f} t/s")
 
-# correctness on the (last) interaction
-if stream and stream != GOLD:
+# The first len(PROMPT) ids of the stream are the seed the driver was given: if they are not the gold prompt,
+# the input (native/out/prompt_ids.txt) is wrong, not the forward. Say so instead of a bare stream mismatch.
+GOLD_PROMPT = GOLD[:5]
+if stream and stream[:len(GOLD_PROMPT)] != GOLD_PROMPT:
+    print(f"RESIDENT-BENCH: FAIL — seed ids {stream[:len(GOLD_PROMPT)]}... are not the gold prompt {GOLD_PROMPT} "
+          "(\"The capital of France is\"): native/out/prompt_ids.txt is stale or for another prompt; "
+          "`make resident-bench` re-encodes it")
+    fail = True
+elif stream and stream != GOLD:
     print(f"RESIDENT-BENCH: FAIL — generated stream {stream} != gold {GOLD}")
     fail = True
 elif not stream:

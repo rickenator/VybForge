@@ -1,0 +1,1090 @@
+# glm_decode_step.vyb — GLM-5.3 single-token decode, layer 0, in Vyb on the real checkpoint.
+#
+# The gated layer-0 driver (glm_layer0_fwd.vyb) runs the whole prompt as one batch. Generation
+# needs the SAME math one token at a time, with state carried across steps:
+#   * the KDA recurrence  state [64,128,128]  — delta_rule now takes it in and returns it out
+#   * the k=4 depthwise conv — a 3-row ring of PRE-conv vectors per channel for q, k and v
+# Everything else (hc mix/apply, rmsnorm, the gemms, the gated norm, o_proj, dense MLP) is
+# unchanged code that is already gold-matched at 1e-11.
+#
+# Inputs (raw little-endian f64, dumped by native/glm53/gold_decode_step.py):
+#   native/out/gold_dec_state_kda_start.bin  [64,128,128]  the carried recurrence
+#   native/out/gold_dec_ring_{q,k,v}.bin     [3,8192]      pre-conv history for the k=4 conv
+# Each step's token embedding comes from the checkpoint (teacher-forced: step 0 = the prompt's
+# last token id, step 1 = the one before it — exactly what the gold ran).
+#
+# Gate: read the four .bin files, run two steps, match gold_dec_step{0,1}_{attn,mlp,streams2}.npy.
+# The driver dumps each stage as v*2^40 integers into native/out/dec_step_vyb.txt;
+# native/glm53/verify_decode_step_vyb.py does the comparison and prints DEC_STEP_VYB.
+#
+# Run: make -f native/Makefile decstep
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
+import vmath::{vexp, vsqrt}
+
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+R<Int> = 1
+H<Int> = 4096
+HC<Int> = 4
+HEADS<Int> = 64
+KD<Int> = 128
+INTER<Int> = 12288
+EPS<Float> = 1e-5
+HC_EPS<Float> = 1e-6
+L2_EPS<Float> = 1e-6
+GATE_LB<Float> = -5.0
+CONV_K<Int> = 4
+SCALE40<Float> = 1099511627776.0
+NSTEPS<Int> = 2
+
+# ============================================================ host maths + formatting
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+sigmoid(x<Float>)<Float> -> {
+    return 1.0 / (1.0 + vexp(0.0 - x))
+}
+
+silu(x<Float>)<Float> -> {
+    return x * (1.0 / (1.0 + vexp(0.0 - x)))
+}
+
+digest(name<String>, v<Vec<Float>>)<String> -> {
+    s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
+    i<Int> = 0
+    while (i < v.len()) {
+        x<Float> = v.get(i)
+        s = s + x
+        if (x < 0.0) { a = a - x } else { a = a + x }
+        q = q + x * x
+        t<Float> = x
+        if (t < 0.0) { t = 0.0 - t }
+        if (t > m) { m = t }
+        i = i + 1
+    }
+    out<String> = name + " n=" + v.len().to_string() + " sum=" + di(s).to_string() +
+                  " abs=" + di(a).to_string() + " sq=" + di(q).to_string() +
+                  " max=" + di(m).to_string()
+    return out
+}
+
+dumps(name<String>, v<Vec<Float>>)<String> -> {
+    out<String> = name
+    i<Int> = 0
+    while (i < v.len()) {
+        out = out + " " + di(v.get(i)).to_string()
+        i = i + 1
+    }
+    return out
+}
+
+rms_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        ss<Float> = 0.0
+        i = 0
+        base<Int> = r * D
+        while (i < D) {
+            v<Float> = x.get(base + i)
+            ss = ss + v * v
+            i = i + 1
+        }
+        inv<Float> = 1.0 / vsqrt(ss / (D as Float) + EPS, 40)
+        i = 0
+        while (i < D) {
+            vv<Float> = x.get(base + i) * inv
+            if (w.len() == D) { vv = vv * w.get(i) }
+            dst.push(vv)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+l2_rows(x<Vec<Float>>, rows<Int>, D<Int>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        ss<Float> = 0.0
+        i = 0
+        while (i < D) {
+            v<Float> = x.get(r * D + i)
+            ss = ss + v * v
+            i = i + 1
+        }
+        nrm<Float> = vsqrt(ss + L2_EPS, 40)
+        i = 0
+        while (i < D) {
+            dst.push(x.get(r * D + i) / nrm)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+# f32 -> f64 by hand (host Vyb has no bitcast)
+f32_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 4) {
+        c<Int> = (raw.char_at(idx * 4 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if ((w & 2147483648) != 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 23) & 255
+    man<Int> = w & 8388607
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 8388608.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 127)) {
+            p2 = p2 * 2.0
+            e2 = e2 + 1
+        }
+        while (e2 > (ex - 127)) {
+            p2 = p2 / 2.0
+            e2 = e2 - 1
+        }
+        v = sign * den * p2
+    }
+    return v
+}
+
+# exact little-endian f64 -> Float from a raw byte String (the .bin state dumps)
+f64_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 8) {
+        c<Int> = (raw.char_at(idx * 8 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if (w < 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 52) & 2047
+    man<Int> = w & 4503599627370495
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 4503599627370496.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 1023)) {
+            p2 = p2 * 2.0
+            e2 = e2 + 1
+        }
+        while (e2 > (ex - 1023)) {
+            p2 = p2 / 2.0
+            e2 = e2 - 1
+        }
+        v = sign * den * p2
+    }
+    return v
+}
+
+# a whole .bin of little-endian f64 -> Vec<Float>
+f64_vec(raw<String>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < raw.len() / 8) {
+        dst.push(f64_at(raw, i))
+        i = i + 1
+    }
+    return dst
+}
+
+read_bin(path<String>)<String> -> {
+    raw<String> = ""
+    match (open_read(path)) {
+        f -> {
+            match (read_all(f)) {
+                s -> { raw = s }
+                ? -> { return "" }
+            }
+            close(f)
+        }
+        ? -> { return "" }
+    }
+    return raw
+}
+
+# ============================================================ device plumbing helpers
+alloc_dev(n<Int>)<Int> -> {
+    var<Int> p = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(p), n) != 0) { return 0 }
+    }
+    return p
+}
+
+free_dev(p<Int>)<Int> -> {
+    if (p == 0) { return 0 }
+    freedom {
+        cuMemFree_v2(p)
+    }
+    return 0
+}
+
+up_bytes(raw<String>, dst<Int>)<Int> -> {
+    var<CInt> rc = 0
+    freedom {
+        rc = cuMemcpyHtoD_v2(dst, raw, raw.len())
+    }
+    return rc
+}
+
+# bf16 -> f64 on the device; z > 0 means the stored layout is (out,in) with in = z,
+# so bf16deq writes the transpose [in,out]. Returns the device pointer (0 = failure).
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+# load a PTX file into a module and return the named function's address as an Int
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    var<Int> addr_out = 0
+    freedom {
+        var<loc<loc<CVoid>>> m = from<loc<loc<CVoid>>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        var<loc<CVoid>> f = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, fn_name) != 0) { return 0 }
+        addr_out = addr(f)
+    }
+    return addr_out
+}
+
+# ============================================================ hyper-connections
+# mix: streams [R,HC,H] + the [R,24] gemm result -> collapsed/post/comb packed in res.
+hc_glue(mv<Vec<Float>>, base<Vec<Float>>, scale<Vec<Float>>, streams<Vec<Float>>)<Vec<Float>> -> {
+    pre<Vec<Float>> = Vec()
+    post<Vec<Float>> = Vec()
+    comb<Vec<Float>> = Vec()
+    r<Int> = 0
+    j<Int> = 0
+    n0<Int> = 0
+    a<Int> = 0
+    b<Int> = 0
+    mx<Float> = 0.0
+    sm<Float> = 0.0
+    it<Int> = 0
+    h<Int> = 0
+    d<Int> = 0
+    p<Float> = 0.0
+    v<Float> = 0.0
+    n1<Int> = 0
+    while (r < R) {
+        j = 0
+        while (j < HC) {
+            pre.push(sigmoid(mv.get(r * 24 + j) * scale.get(0) + base.get(j)) + HC_EPS)
+            post.push(2.0 * sigmoid(mv.get(r * 24 + HC + j) * scale.get(1) + base.get(HC + j)))
+            j = j + 1
+        }
+        r = r + 1
+    }
+    n0 = 0
+    while (n0 < R * HC * HC) {
+        comb.push(0.0)
+        n0 = n0 + 1
+    }
+    r = 0
+    while (r < R) {
+        a = 0
+        while (a < HC) {
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b,
+                         mv.get(r * 24 + 2 * HC + a * HC + b) * scale.get(2) +
+                         base.get(2 * HC + a * HC + b))
+                b = b + 1
+            }
+            a = a + 1
+        }
+        r = r + 1
+    }
+    r = 0
+    while (r < R) {
+        a = 0
+        while (a < HC) {
+            # per-ROW max, like gold's softmax(axis=-1, keepdims)
+            mx = 0.0 - 1e30
+            b<Int> = 0
+            while (b < HC) {
+                v = comb.get((r * HC + a) * HC + b)
+                if (v > mx) { mx = v }
+                b = b + 1
+            }
+            sm = 0.0
+            b = 0
+            while (b < HC) {
+                sm = sm + vexp(comb.get((r * HC + a) * HC + b) - mx)
+                b = b + 1
+            }
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b,
+                         vexp(comb.get((r * HC + a) * HC + b) - mx) / sm)
+                b = b + 1
+            }
+            a = a + 1
+        }
+        a = 0
+        while (a < HC) {
+            b = 0
+            while (b < HC) {
+                comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) + HC_EPS)
+                b = b + 1
+            }
+            a = a + 1
+        }
+        b = 0
+        while (b < HC) {
+            sm = 0.0
+            a = 0
+            while (a < HC) {
+                sm = sm + comb.get((r * HC + a) * HC + b)
+                a = a + 1
+            }
+            a = 0
+            while (a < HC) {
+                comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                a = a + 1
+            }
+            b = b + 1
+        }
+        it = 1
+        while (it < 20) {
+            a = 0
+            while (a < HC) {
+                sm = 0.0
+                b = 0
+                while (b < HC) {
+                    sm = sm + comb.get((r * HC + a) * HC + b)
+                    b = b + 1
+                }
+                b = 0
+                while (b < HC) {
+                    comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                    b = b + 1
+                }
+                a = a + 1
+            }
+            b = 0
+            while (b < HC) {
+                sm = 0.0
+                a = 0
+                while (a < HC) {
+                    sm = sm + comb.get((r * HC + a) * HC + b)
+                    a = a + 1
+                }
+                a = 0
+                while (a < HC) {
+                    comb.set((r * HC + a) * HC + b, comb.get((r * HC + a) * HC + b) / (sm + HC_EPS))
+                    a = a + 1
+                }
+                b = b + 1
+            }
+            it = it + 1
+        }
+        r = r + 1
+    }
+    col<Vec<Float>> = Vec()
+    n1 = 0
+    while (n1 < R * H) {
+        col.push(0.0)
+        n1 = n1 + 1
+    }
+    r = 0
+    while (r < R) {
+        h = 0
+        while (h < HC) {
+            p = pre.get(r * HC + h)
+            d = 0
+            while (d < H) {
+                col.set(r * H + d, col.get(r * H + d) + p * streams.get((r * HC + h) * H + d))
+                d = d + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    res<Vec<Float>> = Vec()
+    n1 = 0
+    while (n1 < col.len()) {
+        res.push(col.get(n1))
+        n1 = n1 + 1
+    }
+    n1 = 0
+    while (n1 < post.len()) {
+        res.push(post.get(n1))
+        n1 = n1 + 1
+    }
+    n1 = 0
+    while (n1 < comb.len()) {
+        res.push(comb.get(n1))
+        n1 = n1 + 1
+    }
+    return res
+}
+
+# apply: dst = post ⊗ y + comb^T streams
+hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    d<Int> = 0
+    j<Int> = 0
+    n<Int> = 0
+    while (n < R * HC * H) {
+        dst.push(0.0)
+        n = n + 1
+    }
+    while (r < R) {
+        h = 0
+        while (h < HC) {
+            d = 0
+            while (d < H) {
+                acc<Float> = post.get(r * HC + h) * y.get(r * H + d)
+                j = 0
+                while (j < HC) {
+                    acc = acc + comb.get((r * HC + j) * HC + h) * streams.get((r * HC + j) * H + d)
+                    j = j + 1
+                }
+                dst.set((r * HC + h) * H + d, acc)
+                d = d + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+# ============================================================ GPU matmul helpers
+mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
+    var<Int> C = 0
+    var<Int> scr = 0
+    C = alloc_dev(M * N * 8)
+    scr = alloc_dev(64)
+    if (C == 0 || scr == 0) { return 0 }
+    if (gemm(faddr, scr, A, B, C, M, N, K, 1.0, 0.0) != 0) { return 0 }
+    sync()
+    free_dev(scr)
+    return C
+}
+
+mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    var<Int> dA = 0
+    dA = alloc_dev(rows * K * 8)
+    if (dA == 0) { return out }
+    htod_vec(dA, x)
+    var<Int> dC = 0
+    dC = mm_dev(dA, B, rows, N, K, faddr)
+    free_dev(dA)
+    if (dC == 0) { return out }
+    out = dtoh_vec(dC, rows * N)
+    free_dev(dC)
+    return out
+}
+
+# GLM's log-decay gate: g = sigmoid((f + dt_bias) * exp(A_log)) * (-5), per (head, k-channel)
+log_decay(f<Vec<Float>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    c<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            dec<Float> = vexp(alog.get(h))
+            c = 0
+            while (c < KD) {
+                idx<Int> = (r * HEADS + h) * KD + c
+                tix<Int> = h * KD + c
+                out.push(sigmoid((f.get(idx) + dt.get(tix)) * dec) * GATE_LB)
+                c = c + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+# ============================================================ the two state-threading changes
+
+# ONE token through the causal k=4 depthwise conv + silu.
+# x is the current token's PRE-conv vector [C]; ring is [CONV_K-1, C], oldest first.
+# weight[c*CONV_K + j], j = CONV_K-1 applies to the current token (pinned by the gold).
+# Returns out [C] followed by the new ring [CONV_K-1, C].
+conv1_step(x<Vec<Float>>, ring<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
+    res<Vec<Float>> = Vec()
+    c<Int> = 0
+    j<Int> = 0
+    while (c < HEADS * KD) {
+        acc<Float> = 0.0
+        j = 0
+        while (j < CONV_K) {
+            src<Int> = j - (CONV_K - 1)
+            xv<Float> = x.get(c)
+            if (src < 0) { xv = ring.get((src + CONV_K - 1) * (HEADS * KD) + c) }
+            acc = acc + xv * w.get(c * CONV_K + j)
+            j = j + 1
+        }
+        res.push(silu(acc))
+        c = c + 1
+    }
+    j = 1
+    while (j < CONV_K) {
+        c = 0
+        while (c < HEADS * KD) {
+            xv<Float> = x.get(c)
+            if (j < CONV_K - 1) { xv = ring.get(j * (HEADS * KD) + c) }
+            res.push(xv)
+            c = c + 1
+        }
+        j = j + 1
+    }
+    return res
+}
+
+# the KDA delta-rule recurrence for ONE token, taking the carried state in and returning it.
+# q,k,v,g [R,HEADS,KD] (R=1), beta [R,HEADS]; st0 [HEADS,KD,KD] row-major.
+# Returns out [R*HEADS*KD] followed by the updated state [HEADS*KD*KD].
+delta_rule_step(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>,
+                beta<Vec<Float>>, st0<their<Vec<Float> const>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    st<Vec<Float>> = Vec()
+    var<Int> n = 0
+    while (n < HEADS * KD * KD) {
+        st.push(st0.get(n))
+        n = n + 1
+    }
+    n = 0
+    while (n < R * HEADS * KD) {
+        out.push(0.0)
+        n = n + 1
+    }
+    r<Int> = 0
+    h<Int> = 0
+    a<Int> = 0
+    b<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            # decay the whole state block by exp(g)
+            a = 0
+            while (a < KD) {
+                ge<Float> = vexp(g.get((r * HEADS + h) * KD + a))
+                b = 0
+                while (b < KD) {
+                    st.set((h * KD + a) * KD + b, st.get((h * KD + a) * KD + b) * ge)
+                    b = b + 1
+                }
+                a = a + 1
+            }
+            be<Float> = beta.get(r * HEADS + h)
+            # one sweep over v-channels: delta, state update, read-out (numpy's order)
+            b = 0
+            while (b < KD) {
+                kvb<Float> = 0.0
+                a = 0
+                while (a < KD) {
+                    kvb = kvb + st.get((h * KD + a) * KD + b) * k.get((r * HEADS + h) * KD + a)
+                    a = a + 1
+                }
+                dl<Float> = (v.get((r * HEADS + h) * KD + b) - kvb) * be
+                a = 0
+                while (a < KD) {
+                    st.set((h * KD + a) * KD + b,
+                           st.get((h * KD + a) * KD + b) + k.get((r * HEADS + h) * KD + a) * dl)
+                    a = a + 1
+                }
+                rd<Float> = 0.0
+                a = 0
+                while (a < KD) {
+                    rd = rd + st.get((h * KD + a) * KD + b) * q.get((r * HEADS + h) * KD + a)
+                    a = a + 1
+                }
+                out.set((r * HEADS + h) * KD + b, rd)
+                b = b + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    n = 0
+    while (n < st.len()) {
+        out.push(st.get(n))
+        n = n + 1
+    }
+    return out
+}
+
+# gated RMSNorm with the sigmoid (KDA) activation, per (token, head) row of KD, times w
+gated_norm(x<Vec<Float>>, z<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    r<Int> = 0
+    h<Int> = 0
+    i<Int> = 0
+    while (r < R) {
+        h = 0
+        while (h < HEADS) {
+            ss<Float> = 0.0
+            i = 0
+            while (i < KD) {
+                vv<Float> = x.get((r * HEADS + h) * KD + i)
+                ss = ss + vv * vv
+                i = i + 1
+            }
+            inv<Float> = 1.0 / vsqrt(ss / (KD as Float) + EPS, 40)
+            i = 0
+            while (i < KD) {
+                idx<Int> = (r * HEADS + h) * KD + i
+                out.push(x.get(idx) * inv * w.get(i) * sigmoid(z.get(idx)))
+                i = i + 1
+            }
+            h = h + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    outdir<String> = env_get("VYBFORGE_DEC_OUT") else "native/out"
+    out<String> = outdir + "/dec_step_vyb.txt"
+    total<Int> = 83
+    pre<String> = "model.language_model.layers.0."
+    EMB<String> = "model.language_model.embed_tokens.weight"
+    lines<String> = ""
+    i<Int> = 0
+    r<Int> = 0
+    hh<Int> = 0
+    d<Int> = 0
+    j<Int> = 0
+    nf<Int> = 0
+
+    # ---------------------------------------------------------------- resolve weights
+    want<Vec<String>> = Vec()
+    want.push(pre + "self_attn.q_proj.weight")
+    want.push(pre + "self_attn.k_proj.weight")
+    want.push(pre + "self_attn.v_proj.weight")
+    want.push(pre + "self_attn.o_proj.weight")
+    want.push(pre + "self_attn.b_proj.weight")
+    want.push(pre + "self_attn.f_a_proj.weight")
+    want.push(pre + "self_attn.f_b_proj.weight")
+    want.push(pre + "self_attn.g_a_proj.weight")
+    want.push(pre + "self_attn.g_b_proj.weight")
+    want.push(pre + "self_attn.o_norm.weight")
+    want.push(pre + "self_attn.dt_bias")
+    want.push(pre + "self_attn.A_log")
+    want.push(pre + "mlp.gate_proj.weight")
+    want.push(pre + "mlp.up_proj.weight")
+    want.push(pre + "mlp.down_proj.weight")
+    want.push(pre + "input_layernorm.weight")
+    want.push(pre + "post_attention_layernorm.weight")
+    want.push(pre + "hc_attn_fn")
+    want.push(pre + "hc_attn_base")
+    want.push(pre + "hc_attn_scale")
+    want.push(pre + "hc_ffn_fn")
+    want.push(pre + "hc_ffn_base")
+    want.push(pre + "hc_ffn_scale")
+    want.push(EMB)
+    want.push(pre + "self_attn.q_conv1d.weight")
+    want.push(pre + "self_attn.k_conv1d.weight")
+    want.push(pre + "self_attn.v_conv1d.weight")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    i = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("DEC_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("DEC_FAIL no cuda"); return 4 }
+    fgemm<Int> = load_fn("native/build/gemm.ptx", "gemm")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fgemm == 0) { println("DEC_FAIL gemm.ptx (make gemm)"); return 5 }
+    if (fbf == 0) { println("DEC_FAIL bf16.ptx (make bf16)"); return 6 }
+
+    # ---------------------------------------------------------------- carried state (.bin f64)
+    kda_raw<String> = read_bin(outdir + "/gold_dec_state_kda_start.bin")
+    ringq_raw<String> = read_bin(outdir + "/gold_dec_ring_q.bin")
+    ringk_raw<String> = read_bin(outdir + "/gold_dec_ring_k.bin")
+    ringv_raw<String> = read_bin(outdir + "/gold_dec_ring_v.bin")
+    if (kda_raw.len() != HEADS * KD * KD * 8) {
+        println("DEC_FAIL kda state bytes " + kda_raw.len().to_string()); return 7
+    }
+    if (ringq_raw.len() != 3 * HEADS * KD * 8) {
+        println("DEC_FAIL ring bytes"); return 7
+    }
+    st<Vec<Float>> = f64_vec(kda_raw)
+    ringq<Vec<Float>> = f64_vec(ringq_raw)
+    ringk<Vec<Float>> = f64_vec(ringk_raw)
+    ringv<Vec<Float>> = f64_vec(ringv_raw)
+
+    # ---------------------------------------------------------------- weights on the device
+    d_fnA = deq_bf16(fbf, gx_read(g, 17), 24 * HC * H, HC * H)
+    if (d_fnA == 0) { return 11 }
+    d_fnF = deq_bf16(fbf, gx_read(g, 20), 24 * HC * H, HC * H)
+    if (d_fnF == 0) { return 11 }
+    base<Vec<Float>> = Vec()
+    raw_base<String> = gx_read(g, 18)
+    j = 0
+    while (j < 24) {
+        base.push(f32_at(raw_base, j))
+        j = j + 1
+    }
+    scale<Vec<Float>> = Vec()
+    raw_scale<String> = gx_read(g, 19)
+    j = 0
+    while (j < 3) {
+        scale.push(f32_at(raw_scale, j))
+        j = j + 1
+    }
+    baseF<Vec<Float>> = Vec()
+    raw_baseF<String> = gx_read(g, 21)
+    j = 0
+    while (j < 24) {
+        baseF.push(f32_at(raw_baseF, j))
+        j = j + 1
+    }
+    scaleF<Vec<Float>> = Vec()
+    raw_scaleF<String> = gx_read(g, 22)
+    j = 0
+    while (j < 3) {
+        scaleF.push(f32_at(raw_scaleF, j))
+        j = j + 1
+    }
+
+    d_q<Int> = deq_bf16(fbf, gx_read(g, 0), H * HEADS * KD, H)
+    d_k<Int> = deq_bf16(fbf, gx_read(g, 1), H * HEADS * KD, H)
+    d_v<Int> = deq_bf16(fbf, gx_read(g, 2), H * HEADS * KD, H)
+    d_o<Int> = deq_bf16(fbf, gx_read(g, 3), HEADS * KD * H, HEADS * KD)
+    d_b<Int> = deq_bf16(fbf, gx_read(g, 4), H * HEADS, H)
+    d_fa<Int> = deq_bf16(fbf, gx_read(g, 5), H * 128, H)
+    d_fb<Int> = deq_bf16(fbf, gx_read(g, 6), 128 * HEADS * KD, 128)
+    d_ga<Int> = deq_bf16(fbf, gx_read(g, 7), H * 128, H)
+    d_gb<Int> = deq_bf16(fbf, gx_read(g, 8), 128 * HEADS * KD, 128)
+    d_ln<Int> = deq_bf16(fbf, gx_read(g, 15), H, 0)
+    d_ln2<Int> = deq_bf16(fbf, gx_read(g, 16), H, 0)
+    d_cq = deq_bf16(fbf, gx_read(g, 24), HEADS * KD * CONV_K, 0)
+    d_ck = deq_bf16(fbf, gx_read(g, 25), HEADS * KD * CONV_K, 0)
+    d_cv = deq_bf16(fbf, gx_read(g, 26), HEADS * KD * CONV_K, 0)
+    if (d_q == 0 || d_k == 0 || d_v == 0 || d_o == 0 || d_b == 0 || d_fa == 0 || d_fb == 0 ||
+        d_ga == 0 || d_gb == 0 || d_ln == 0 || d_ln2 == 0 || d_cq == 0 || d_ck == 0 || d_cv == 0) {
+        println("DEC_FAIL weight deq")
+        return 17
+    }
+    in_ln<Vec<Float>> = dtoh_vec(d_ln, H)
+    post_ln<Vec<Float>> = dtoh_vec(d_ln2, H)
+    convq<Vec<Float>> = dtoh_vec(d_cq, HEADS * KD * CONV_K)
+    convk<Vec<Float>> = dtoh_vec(d_ck, HEADS * KD * CONV_K)
+    convv<Vec<Float>> = dtoh_vec(d_cv, HEADS * KD * CONV_K)
+    free_dev(d_cq)
+    free_dev(d_ck)
+    free_dev(d_cv)
+
+    d_onorm<Int> = deq_bf16(fbf, gx_read(g, 9), KD, 0)
+    if (d_onorm == 0) { return 19 }
+    onorm<Vec<Float>> = dtoh_vec(d_onorm, KD)
+    free_dev(d_onorm)
+
+    raw_dt<String> = gx_read(g, 10)          # FP32 in the checkpoint
+    dt<Vec<Float>> = Vec()
+    i = 0
+    while (i < HEADS * KD) {
+        dt.push(f32_at(raw_dt, i))
+        i = i + 1
+    }
+    raw_alog<String> = gx_read(g, 11)
+    alog<Vec<Float>> = Vec()
+    i = 0
+    while (i < HEADS) {
+        alog.push(f32_at(raw_alog, i))
+        i = i + 1
+    }
+
+    d_gate<Int> = deq_bf16(fbf, gx_read(g, 12), H * INTER, H)
+    d_up<Int> = deq_bf16(fbf, gx_read(g, 13), H * INTER, H)
+    d_down<Int> = deq_bf16(fbf, gx_read(g, 14), INTER * H, INTER)
+    if (d_gate == 0 || d_up == 0 || d_down == 0) { return 23 }
+
+    emb_off<Int> = g.off.get(23)
+    emb_path<String> = g.paths.get(23)
+
+    # ---------------------------------------------------------------- two decode steps
+    tids<Vec<Int>> = Vec()
+    tids.push(13)        # the prompt's last token (teacher-forced), exactly like the gold
+    tids.push(10788)     # the one before it
+    t<Int> = 0
+    while (t < NSTEPS) {
+        tid<Int> = tids.get(t)
+        raw_emb<String> = ""
+        match (open_read(emb_path)) {
+            f -> {
+                match (read_at(f, emb_off + tid * H * 2, H * 2)) {
+                    s -> { raw_emb = s }
+                    ? -> { return 9 }
+                }
+                close(f)
+            }
+            ? -> { return 9 }
+        }
+        var<Int> d_x = 0
+        d_x = deq_bf16(fbf, raw_emb, R * H, 0)
+        if (d_x == 0) { println("DEC_FAIL emb deq"); return 10 }
+        x<Vec<Float>> = dtoh_vec(d_x, R * H)
+        free_dev(d_x)
+
+        # streams = HC copies of the embedding
+        streams<Vec<Float>> = Vec()
+        hh = 0
+        while (hh < HC) {
+            d = 0
+            while (d < H) {
+                streams.push(x.get(d))
+                d = d + 1
+            }
+            hh = hh + 1
+        }
+
+        # ---- attn site: hc mix -> input_layernorm -> KDA -> o_proj -> hc apply
+        flat<Vec<Float>> = Vec()
+        i = 0
+        while (i < streams.len()) {
+            flat.push(streams.get(i))
+            i = i + 1
+        }
+        flat = rms_rows(flat, R, HC * H, Vec())
+        var<Int> d_flat = 0
+        var<Int> d_mv = 0
+        var<Int> d_scr = 0
+        d_flat = alloc_dev(R * HC * H * 8)
+        d_mv = alloc_dev(R * 24 * 8)
+        d_scr = alloc_dev(64)
+        if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("DEC_FAIL alloc"); return 12 }
+        htod_vec(d_flat, flat)
+        if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return 13 }
+        sync()
+        mv<Vec<Float>> = dtoh_vec(d_mv, R * 24)
+        free_dev(d_flat)
+        free_dev(d_mv)
+        free_dev(d_scr)
+
+        res<Vec<Float>> = hc_glue(mv, base, scale, streams)
+        collapsed<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * H) {
+            collapsed.push(res.get(i))
+            i = i + 1
+        }
+        postA<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * HC) {
+            postA.push(res.get(R * H + i))
+            i = i + 1
+        }
+        combA<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * HC * HC) {
+            combA.push(res.get(R * H + R * HC + i))
+            i = i + 1
+        }
+
+        h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+
+        qp<Vec<Float>> = mm_host(h_a, R, H, d_q, HEADS * KD, fgemm)
+        kp<Vec<Float>> = mm_host(h_a, R, H, d_k, HEADS * KD, fgemm)
+        vp<Vec<Float>> = mm_host(h_a, R, H, d_v, HEADS * KD, fgemm)
+
+        qres<Vec<Float>> = conv1_step(qp, ringq, convq)
+        kres<Vec<Float>> = conv1_step(kp, ringk, convk)
+        vres<Vec<Float>> = conv1_step(vp, ringv, convv)
+        qc<Vec<Float>> = Vec()
+        i = 0
+        while (i < HEADS * KD) { qc.push(qres.get(i)); i = i + 1 }
+        i = HEADS * KD
+        while (i < qres.len()) { ringq.set(i - HEADS * KD, qres.get(i)); i = i + 1 }
+        kc<Vec<Float>> = Vec()
+        i = 0
+        while (i < HEADS * KD) { kc.push(kres.get(i)); i = i + 1 }
+        i = HEADS * KD
+        while (i < kres.len()) { ringk.set(i - HEADS * KD, kres.get(i)); i = i + 1 }
+        vc<Vec<Float>> = Vec()
+        i = 0
+        while (i < HEADS * KD) { vc.push(vres.get(i)); i = i + 1 }
+        i = HEADS * KD
+        while (i < vres.len()) { ringv.set(i - HEADS * KD, vres.get(i)); i = i + 1 }
+
+        qn<Vec<Float>> = l2_rows(qc, R * HEADS, KD)
+        kn<Vec<Float>> = l2_rows(kc, R * HEADS, KD)
+        i = 0
+        while (i < qn.len()) {
+            qn.set(i, qn.get(i) * (1.0 / vsqrt(KD as Float, 40)))
+            i = i + 1
+        }
+
+        bet<Vec<Float>> = mm_host(h_a, R, H, d_b, HEADS, fgemm)
+        i = 0
+        while (i < bet.len()) {
+            bet.set(i, sigmoid(bet.get(i)))
+            i = i + 1
+        }
+        fa<Vec<Float>> = mm_host(h_a, R, H, d_fa, 128, fgemm)
+        fraw<Vec<Float>> = mm_host(fa, R, 128, d_fb, HEADS * KD, fgemm)
+        ga<Vec<Float>> = mm_host(h_a, R, H, d_ga, 128, fgemm)
+        zraw<Vec<Float>> = mm_host(ga, R, 128, d_gb, HEADS * KD, fgemm)
+
+        gdec<Vec<Float>> = log_decay(fraw, dt, alog)
+
+        dres<Vec<Float>> = delta_rule_step(qn, kn, vc, gdec, bet, view(st))
+        att0<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * HEADS * KD) { att0.push(dres.get(i)); i = i + 1 }
+        i = R * HEADS * KD
+        while (i < dres.len()) { st.set(i - R * HEADS * KD, dres.get(i)); i = i + 1 }
+
+        gnorm<Vec<Float>> = gated_norm(att0, zraw, onorm)
+        attn<Vec<Float>> = mm_host(gnorm, R, HEADS * KD, d_o, H, fgemm)
+
+        streams1<Vec<Float>> = hc_apply(streams, attn, postA, combA)
+
+        # ---- ffn site: hc mix -> post_attn layernorm -> dense SwiGLU MLP -> hc apply
+        reflat<Vec<Float>> = Vec()
+        i = 0
+        while (i < streams1.len()) {
+            reflat.push(streams1.get(i))
+            i = i + 1
+        }
+        reflat = rms_rows(reflat, R, HC * H, Vec())
+        var<Int> d_flat2 = 0
+        var<Int> d_mv2 = 0
+        var<Int> d_scr2 = 0
+        d_flat2 = alloc_dev(R * HC * H * 8)
+        d_mv2 = alloc_dev(R * 24 * 8)
+        d_scr2 = alloc_dev(64)
+        if (d_flat2 == 0 || d_mv2 == 0 || d_scr2 == 0) { return 21 }
+        htod_vec(d_flat2, reflat)
+        if (gemm(fgemm, d_scr2, d_flat2, d_fnF, d_mv2, R, 24, HC * H, 1.0, 0.0) != 0) { return 22 }
+        sync()
+        mv2<Vec<Float>> = dtoh_vec(d_mv2, R * 24)
+        free_dev(d_flat2)
+        free_dev(d_mv2)
+        free_dev(d_scr2)
+
+        res2<Vec<Float>> = hc_glue(mv2, baseF, scaleF, streams1)
+        collapsed2<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * H) {
+            collapsed2.push(res2.get(i))
+            i = i + 1
+        }
+        postF<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * HC) {
+            postF.push(res2.get(R * H + i))
+            i = i + 1
+        }
+        combF<Vec<Float>> = Vec()
+        i = 0
+        while (i < R * HC * HC) {
+            combF.push(res2.get(R * H + R * HC + i))
+            i = i + 1
+        }
+        h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln)
+
+        mg<Vec<Float>> = mm_host(h2, R, H, d_gate, INTER, fgemm)
+        mu<Vec<Float>> = mm_host(h2, R, H, d_up, INTER, fgemm)
+        act<Vec<Float>> = Vec()
+        i = 0
+        while (i < mg.len()) {
+            act.push(silu(mg.get(i)) * mu.get(i))
+            i = i + 1
+        }
+        mlp<Vec<Float>> = mm_host(act, R, INTER, d_down, H, fgemm)
+
+        streams2<Vec<Float>> = hc_apply(streams1, mlp, postF, combF)
+
+        println("step" + t.to_string() + " token=" + tid.to_string())
+        println(digest("attn", attn))
+        println(digest("mlp", mlp))
+        println(digest("streams2", streams2))
+        lines = lines + dumps("s" + t.to_string() + "attn", attn) + "\n"
+        lines = lines + dumps("s" + t.to_string() + "mlp", mlp) + "\n"
+        lines = lines + dumps("s" + t.to_string() + "s2", streams2) + "\n"
+
+        t = t + 1
+    }
+
+    free_dev(d_q)
+    free_dev(d_k)
+    free_dev(d_v)
+    free_dev(d_o)
+    free_dev(d_b)
+    free_dev(d_fa)
+    free_dev(d_fb)
+    free_dev(d_ga)
+    free_dev(d_gb)
+    free_dev(d_fnA)
+    free_dev(d_fnF)
+    free_dev(d_ln)
+    free_dev(d_ln2)
+    free_dev(d_gate)
+    free_dev(d_up)
+    free_dev(d_down)
+
+    match (open_write(out)) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { println("DEC_FAIL write"); return 15 }
+    }
+    println("DEC_OK layer 0 step decode: " + NSTEPS.to_string() + " teacher-forced steps, state carried")
+    return 0
+}

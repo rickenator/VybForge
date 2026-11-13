@@ -104,6 +104,8 @@ share(all) dtoh(p<Int>)<Float> -> {
 }
 
 // Copy a whole host Vec<Float> into device memory at `base` (contiguous f64).
+// One 8-byte cuMemcpy per element: ~5 us of driver overhead each, so this is the
+// SLOW path -- keep it for small vectors and use bulk_htod for anything large.
 share(all) htod_vec(base<Int>, v<Vec<Float>>)<CInt> -> {
     i<Int> = 0
     for (i in 0..v.len() - 1) {
@@ -113,10 +115,49 @@ share(all) htod_vec(base<Int>, v<Vec<Float>>)<CInt> -> {
 }
 
 // Read `n` contiguous Float elements from device memory at `base` into a Vec.
+// Per-element like htod_vec: the SLOW path. See bulk_dtoh.
 share(all) dtoh_vec(base<Int>, n<Int>)<Vec<Float>> -> {
     r<Vec<Float>> = Vec()
     i<Int> = 0
     for (i in 0..n - 1) { r.push(dtoh(base + i * 8)) }
+    return r
+}
+
+// Bulk H2D: ONE cuMemcpyDtoH/HtoD for the whole contiguous f64 buffer.
+//
+// A Vec<Float> is { data ptr, size, cap } (runtime/vyb_runtime.c), so `addr(v)` names
+// the header and its first word is the element buffer. That turns a 16.7M-element
+// transfer from 16.7M driver calls (~60 s on a 3090) into one call (~30 ms).
+//
+// `v` is BORROWED (`their<... const>`, call with `view(x)`): a by-value Vec<Float>
+// parameter deep-copies, which for a 134 MB kv_b tensor is the bug this fixes.
+share(all) bulk_htod(base<Int>, v<their<Vec<Float> const>>)<Int> -> {
+    n<Int> = v.len()
+    if (n == 0) { return 0 }
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(v))
+        dp<Int> = at(hdr)
+        if (dp == 0) { return 2 }
+        return cuMemcpyHtoD_v2(base, from<loc<CVoid>>(dp), n * 8) as Int
+    }
+    return 1
+}
+
+// Bulk D2H counterpart of bulk_htod: grow the Vec to `n` f64 zeros (the allocator
+// doubling makes this O(n)), then one cuMemcpyDtoH into its element buffer.
+share(all) bulk_dtoh(base<Int>, n<Int>)<Vec<Float>> -> {
+    r<Vec<Float>> = Vec()
+    if (n <= 0) { return r }
+    i<Int> = 0
+    while (i < n) {
+        r.push(0.0)
+        i = i + 1
+    }
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(r))
+        dp<Int> = at(hdr)
+        if (dp != 0) { cuMemcpyDtoH_v2(from<loc<CVoid>>(dp), base, n * 8) }
+    }
     return r
 }
 

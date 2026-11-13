@@ -220,6 +220,34 @@ bind JParserOps -> JParser {
     parse_string_raw(self<their<JParser>>)<String?> -> {
         if (self.pc() != 34) { return String?() }
         i<Int> = self.pos + 1
+        # FAST PATH: no backslash in the string, so the body is ONE substring.
+        # The escape path below appends char by char (`out = out + substring(i, i+1)`),
+        # which allocates and re-copies per character — 0.6 us/char over a 15 MB
+        # document (134 s for the checkpoint weight_map). Scanning for the closing
+        # quote with char_at costs ~10 ns/char and most JSON is escape-free.
+        nsrc<Int> = self.src.len()
+        jscan<Int> = i
+        quote_at<Int> = -1
+        sawesc<Bool> = false
+        while (jscan < nsrc) {
+            cs<Int> = (self.src.char_at(jscan) as Int) & 255
+            if (cs == 34) {
+                quote_at = jscan
+                jscan = nsrc
+            } else if (cs == 92) {
+                sawesc = true
+                jscan = nsrc
+            } else {
+                if (self.strict) { if (cs < 32) { return String?() } }
+                jscan = jscan + 1
+            }
+        }
+        if (sawesc == false) {
+            if (quote_at < 0) { return String?() }
+            plain<String> = self.src.substring(i, quote_at)
+            self.pos = quote_at + 1
+            return String?(plain)
+        }
         out<String> = ""
         # JSON escape -> byte, indexed by the `idx` assignments below:
         # 0 `"`  1 `\`  2 `/`  3 BS  4 FF  5 LF  6 CR  7 TAB.
@@ -522,6 +550,8 @@ aspect JsonDocOps {
     get(self<their<JsonDoc>>, id<Int>, key<String>)<Int> -> { }
     len(self<their<JsonDoc>>, id<Int>)<Int> -> { }
     elem(self<their<JsonDoc>>, id<Int>, i<Int>)<Int> -> { }
+    ckey_at(self<their<JsonDoc>>, id<Int>, i<Int>)<String> -> { }
+    nchildren(self<their<JsonDoc>>, id<Int>)<Int> -> { }
     keys(self<their<JsonDoc>>, id<Int>)<Vec<String>> -> { }
     sval(self<their<JsonDoc>>, id<Int>)<String> -> { }
     num(self<their<JsonDoc>>, id<Int>)<Float> -> { }
@@ -569,12 +599,28 @@ bind JsonDocOps -> JsonDoc {
         if (oob(id, self.nodes.len())) { return 0 }
         return self.nodes.get(id).nchild
     }
+    # i-th child of an ARRAY or an OBJECT. Objects used to return -1 here, which left
+    # `get(id, key)` (a linear scan over the children) as the only way to read an
+    # object's values — O(n^2) for the 150k-entry checkpoint weight_map. With this,
+    # a caller walks children in one linear pass: elem(id, i) + ckey_at(id, i).
     elem(self<their<JsonDoc>>, id<Int>, i<Int>)<Int> -> {
         if (oob(id, self.nodes.len())) { return -1 }
         nd<JNode> = self.nodes.get(id)
-        if (nd.tag != JTag::J_ARR) { return -1 }
+        if (nd.tag != JTag::J_ARR && nd.tag != JTag::J_OBJ) { return -1 }
         if (oob(i, nd.nchild)) { return -1 }
         return self.child.get(nd.first + i)
+    }
+    # key of an object's i-th child (empty for arrays / bad ids)
+    ckey_at(self<their<JsonDoc>>, id<Int>, i<Int>)<String> -> {
+        if (oob(id, self.nodes.len())) { return "" }
+        nd<JNode> = self.nodes.get(id)
+        if (nd.tag != JTag::J_OBJ) { return "" }
+        if (oob(i, nd.nchild)) { return "" }
+        return self.ckey.get(nd.first + i)
+    }
+    nchildren(self<their<JsonDoc>>, id<Int>)<Int> -> {
+        if (oob(id, self.nodes.len())) { return 0 }
+        return self.nodes.get(id).nchild
     }
     keys(self<their<JsonDoc>>, id<Int>)<Vec<String>> -> {
         out<Vec<String>> = Vec()

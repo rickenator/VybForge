@@ -1,0 +1,425 @@
+// whisper_enc.vyb — GPU kernels for the Whisper encoder/decoder (voice loop).
+//
+// Same conventions as native/kernels/gemm.vyb: one thread per output element, and
+// every pointer/dimension arrives through a device params buffer because
+// cuda_launch4i hands the kernel exactly one Int. All params are 8-byte words at
+// fixed byte offsets, so the host packing order is the contract.
+//
+// Conv layers are expressed as GEMM after an im2col gather, which reuses the
+// already-verified f64 gemm kernel instead of adding a convolution kernel:
+//   out[C_out, T_out] = W[C_out, K*C_in] @ X_unf[K*C_in, T_out]
+// The weight reorder that makes that possible ((C_in, K) -> (K, C_in) inside the
+// flattened row) is done by the reorder kernel below, on the GPU, while widening
+// the checkpoint's f32 weights to the substrate's f64.
+//
+// Device math: kernel mode has no libm (an `exp`/`erf` call is a compile error —
+// "not available in NVPTX device code"), so transcendentals come from
+// native/kernels/vmath.vyb, which is pure arithmetic (vexp ~1e-9 rel).
+import vmath::{vexp, vsqrt}
+
+// ---------------------------------------------------------------------------
+// erf_approx: erf(x) to ~1.2e-7 absolute.
+//
+// The kernel language has exp/sqrt/sin/cos/log but NOT erf, so the exact gelu
+// needs its own erf. This is the Numerical Recipes erfc rational approximation
+// (|error| <= 1.2e-7), which is two orders of magnitude below the gate tolerance
+// and far below float32 noise — the tanh-approximation gelu would be ~1e-3 off
+// and is not usable here.
+erf_approx(x<Float>)<Float> -> {
+    ax<Float> = x
+    if (ax < 0.0) { ax = 0.0 - ax }
+    t<Float> = 1.0 / (1.0 + 0.5 * ax)
+    p<Float> = 0.17087277
+    p = p * t - 0.82215223
+    p = p * t + 1.48851587
+    p = p * t - 1.13520398
+    p = p * t + 0.27886807
+    p = p * t - 0.18628806
+    p = p * t + 0.09678418
+    p = p * t + 0.37409196
+    p = p * t + 1.00002368
+    tv<Float> = t * vexp(0.0 - ax * ax - 1.26551223 + t * p)
+    res<Float> = 1.0 - tv
+    if (x < 0.0) {
+        neg<Float> = 0.0 - res
+        return neg
+    }
+    return res
+}
+
+// ---------------------------------------------------------------------------
+// gelu_bias: Y[i] = gelu(X[i] + B[i / W])
+//   params: X, B, Y, N (element count), W (row width = number of positions)
+//   One thread per element. `W` converts a flat index into its output channel so
+//   the conv bias is per channel, not per element.
+// gelu is the exact erf form (not the tanh approximation) because the model was
+// trained with it and the difference is ~1e-3, far above the gate tolerance.
+gelu_bias(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 24)
+    W<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        c<Int> = gid / W
+        bv<Float> = ld_f64(B + c * 8)
+        xv<Float> = ld_f64(X + gid * 8) + bv
+        g<Float> = 0.5 * xv * (1.0 + erf_approx(xv * 0.7071067811865476))
+        st_f64(Y + gid * 8, g)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gelu: Y[i] = gelu(X[i])   (no bias — the bias belongs to the linear layer that
+// precedes it, so adding it here would double-count)
+//   params: X, Y, N
+gelu(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        xv<Float> = ld_f64(X + gid * 8)
+        st_f64(Y + gid * 8, 0.5 * xv * (1.0 + erf_approx(xv * 0.7071067811865476)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reorder_w: read the checkpoint's f32 weights once, write them as f64 in the
+// layout the GEMM expects.
+//   params: in, out, N (output element count), C_in, K (conv kernel width), mode
+//   mode 0 — plain widen:  out[i] = f64(in[i])
+//   mode 1 — conv weight:  out[c*(K*C_in) + k*C_in + i] = f64(in[c*(C_in*K) + i*K + k])
+//            (torch's Conv1d weight is (C_out, C_in, K); the GEMM needs
+//             (C_out, K*C_in) with the kernel tap as the OUTER of the two, so
+//             that the im2col rows line up with it)
+//   mode 2 — linear weight: out is the TRANSPOSE, out[col*R + row] = f64(in[row*C + col])
+//            with R = +24 and C = +32. Every torch linear layer stores (out, in)
+//            and computes y = x @ W^T, which is the GEMM's B = W^T.
+//            A square (384,384) projection is its own shape either way, so this
+//            mode is invisible unless it is missing entirely.
+reorder_w(p<Int>) -> {
+    inp<Int> = ld_i64(p + 0)
+    outp<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    CIn<Int> = ld_i64(p + 24)
+    K<Int> = ld_i64(p + 32)
+    mode<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        src<Int> = gid
+        if (mode == 2) {
+            # R and C are read from the +24/+32 words in this mode
+            col<Int> = gid / CIn
+            row<Int> = gid % CIn
+            src = row * K + col
+        }
+        if (mode == 1) {
+            c<Int> = gid / (K * CIn)
+            r<Int> = gid % (K * CIn)
+            k<Int> = r / CIn
+            i<Int> = r % CIn
+            src = c * (CIn * K) + i * K + k
+        }
+        st_f64(outp + gid * 8, ld_f32(inp + src * 4))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// im2col_conv: gather the sliding window of a 1-D convolution into a matrix.
+//   out[(k*C_in + i)*T_out + t] = x[i*T_in + (t*stride + k - pad)]
+//   params: src, dst, C_in, T_in, T_out, K, pad, stride
+// Out-of-range positions read as 0.0 (zero padding, which is what Whisper's
+// encoder uses: padding=1 for both convs).
+im2col_conv(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    CIn<Int> = ld_i64(p + 16)
+    TIn<Int> = ld_i64(p + 24)
+    TOut<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    pad<Int> = ld_i64(p + 48)
+    stride<Int> = ld_i64(p + 56)
+    total<Int> = K * CIn * TOut
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        t<Int> = gid % TOut
+        rest<Int> = gid / TOut
+        i<Int> = rest % CIn
+        k<Int> = rest / CIn
+        pos<Int> = t * stride + k - pad
+        v<Float> = 0.0
+        if (pos >= 0 && pos < TIn) {
+            v = ld_f64(src + (i * TIn + pos) * 8)
+        }
+        st_f64(dst + gid * 8, v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attn: scaled dot-product attention, no mask, separate K/V source
+//   out[i, :] over head h = softmax_j( scale * q_i . k_j ) v_j
+//   params: Q, K, V, OUT, T_q, T_k, H, HD, scale (Float), causal
+//   causal = 0: every query sees every key (encoder self-attention and the
+//               decoder's cross-attention over the encoder output)
+//   causal != 0: query i sees keys 0..i (the decoder's self-attention)
+//   The mode is a param word rather than a second kernel: the score loops are
+//   identical apart from the key bound.
+//   Q/OUT are (T_q, H*HD); K/V are (T_k, H*HD); row-major, heads inside the row.
+//
+// One thread per (head, query). Whisper attention is NOT causal (the encoder sees
+// the whole utterance) and the decoder's cross-attention differs only in where
+// K/V come from, so one kernel covers both.
+//
+// Three passes over the scores rather than a scratch buffer: max, then the exp
+// sum, then the weighted V accumulation. That trades ~2x arithmetic for zero
+// extra memory (a per-thread score row would be 9000 x 1500 doubles here).
+//
+// The exponent is vmath's vexp, which clamps its argument at -20: a probability
+// below ~2e-9 is indistinguishable from zero at this precision, and the reference
+// (torch softmax) differs from that by less than the gate tolerance.
+attn(p<Int>) -> {
+    Q<Int> = ld_i64(p + 0)
+    KK<Int> = ld_i64(p + 8)
+    V<Int> = ld_i64(p + 16)
+    OUT<Int> = ld_i64(p + 24)
+    Tq<Int> = ld_i64(p + 32)
+    Tk<Int> = ld_i64(p + 40)
+    H<Int> = ld_i64(p + 48)
+    HD<Int> = ld_i64(p + 56)
+    scale<Float> = ld_f64(p + 64)
+    cau<Int> = ld_i64(p + 72)
+    total<Int> = Tq * H
+    pid<Int> = blk_x() * dim_x() + tid_x()
+    if (pid < total) {
+        h<Int> = pid % H
+        i<Int> = pid / H
+        D<Int> = H * HD
+        qb<Int> = i * D + h * HD
+        kb<Int> = h * HD
+
+        # causal: only keys up to and including this query
+        jmax<Int> = Tk - 1
+        if (cau != 0) {
+            jmax = i
+            if (jmax > Tk - 1) { jmax = Tk - 1 }
+        }
+
+        best<Float> = -1000000.0
+        j<Int> = 0
+        for (j in 0..jmax) {
+            s<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            if (s > best) { best = s }
+        }
+
+        z<Float> = 0.0
+        for (j in 0..jmax) {
+            s<Float> = 0.0
+            d<Int> = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            z = z + vexp(s - best)
+        }
+
+        acc<[Float; 128]>
+        d<Int> = 0
+        for (d in 0..HD - 1) { acc[d] = 0.0 }
+        for (j in 0..jmax) {
+            s<Float> = 0.0
+            d = 0
+            for (d in 0..HD - 1) {
+                s = s + ld_f64(Q + (qb + d) * 8) * ld_f64(KK + (j * D + kb + d) * 8)
+            }
+            s = s * scale
+            w<Float> = vexp(s - best) / z
+            d = 0
+            for (d in 0..HD - 1) {
+                acc[d] = acc[d] + w * ld_f64(V + (j * D + kb + d) * 8)
+            }
+        }
+        d = 0
+        for (d in 0..HD - 1) {
+            st_f64(OUT + (qb + d) * 8, acc[d])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embed: gather rows of an embedding table by token id
+//   out[s*D + d] = table[id[s]*D + d]
+//   params: table, ids, out, S, D, mode, vocab
+//   mode 0: table is (vocab, D) row-major      -> row `tok` starts at tok*D
+//   mode 1: table is (D, vocab) TRANSPOSED     -> element d of row `tok` is at
+//           d*vocab + tok
+//   The transposed form is the one the tied head needs as a GEMM operand, and
+//   loading the table once in that layout and gathering from it costs one index
+//   change instead of a second 159 MB copy.
+// The decoder needs this twice: to build the layer-0 input from the prompt, and
+// again for the tied output projection (proj_out IS embed_tokens in this model).
+embed(p<Int>) -> {
+    table<Int> = ld_i64(p + 0)
+    ids<Int> = ld_i64(p + 8)
+    outp<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    mode<Int> = ld_i64(p + 40)
+    vocab<Int> = ld_i64(p + 48)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    total<Int> = S * D
+    if (gid < total) {
+        s<Int> = gid / D
+        d<Int> = gid % D
+        tok<Int> = ld_i64(ids + s * 8)
+        if (mode == 0) {
+            st_f64(outp + gid * 8, ld_f64(table + (tok * D + d) * 8))
+        } else {
+            st_f64(outp + gid * 8, ld_f64(table + (d * vocab + tok) * 8))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// stage_table: copy a chunk of the f32 token table into the f64 TRANSPOSED table
+//   out[d*vocab + (row_off + i)] = f32(in[i*D + d])
+//   params: in, out, nrows (this chunk), D, vocab, row_off
+// Chunked because the tensor is 79.7 MB f32 / 159 MB f64 — and transposing it
+// with the generic reorder kernel would need the whole tensor resident at once.
+stage_table(p<Int>) -> {
+    inp<Int> = ld_i64(p + 0)
+    outp<Int> = ld_i64(p + 8)
+    nrows<Int> = ld_i64(p + 16)
+    Dd<Int> = ld_i64(p + 24)
+    vocab<Int> = ld_i64(p + 32)
+    roff<Int> = ld_i64(p + 40)
+    total<Int> = nrows * Dd
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        i<Int> = gid / Dd
+        d<Int> = gid % Dd
+        st_f64(outp + (d * vocab + roff + i) * 8, ld_f32(inp + (i * Dd + d) * 4))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// argmax: index of the largest value in `n` floats
+//   params: x, out (one Int word), n
+// ONE thread scans the whole row. That is a deliberately simple first cut: the
+// vote is 51864 sequential loads (~0.5 ms measured), which is noise next to the
+// rest of a decode step. A block reduction is the optimisation if it ever matters.
+argmax(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    if (blk_x() * dim_x() + tid_x() == 0) {
+        best<Float> = -1.0e300
+        bi<Int> = 0
+        i<Int> = 0
+        for (i in 0..N - 1) {
+            v<Float> = ld_f64(X + i * 8)
+            if (v > best) {
+                best = v
+                bi = i
+            }
+        }
+        st_i64(O, bi)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// layernorm: Y[s][d] = (X[s][d] - mean_s) * invstd_s * W[d] + B[d]
+//   params: X, W, B, Y, S, D, eps (Float)
+// One thread per ROW (not per element): the row statistics are computed twice in
+// registers instead of being recomputed by every element thread. sqrt is the
+// pure-arithmetic Newton form from vmath — the libm `sqrt` does not lower
+// reliably in kernel mode.
+layernorm(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    W<Int> = ld_i64(p + 8)
+    B<Int> = ld_i64(p + 16)
+    Y<Int> = ld_i64(p + 24)
+    S<Int> = ld_i64(p + 32)
+    D<Int> = ld_i64(p + 40)
+    eps<Float> = ld_f64(p + 48)
+    row<Int> = blk_x() * dim_x() + tid_x()
+    if (row < S) {
+        base<Int> = row * D
+        mean<Float> = 0.0
+        d<Int> = 0
+        for (d in 0..D - 1) {
+            mean = mean + ld_f64(X + (base + d) * 8)
+        }
+        mean = mean / (D as Float)
+        vari<Float> = 0.0           # `var` is a language keyword, not a name
+        for (d in 0..D - 1) {
+            dev<Float> = ld_f64(X + (base + d) * 8) - mean
+            vari = vari + dev * dev
+        }
+        vari = vari / (D as Float)
+        inv<Float> = 1.0 / vsqrt(vari + eps, 24)
+        for (d in 0..D - 1) {
+            wv<Float> = ld_f64(W + d * 8)
+            bv<Float> = ld_f64(B + d * 8)
+            xv<Float> = ld_f64(X + (base + d) * 8)
+            st_f64(Y + (base + d) * 8, (xv - mean) * inv * wv + bv)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// transpose2d: out[j*R + i] = in[i*C + j]   (row-major (R,C) -> (C,R))
+//   params: in, out, R, C
+// The conv stack is channel-major (C_out, T); every transformer stage after it is
+// token-major (T, D), so the encoder transposes once here rather than paying a
+// transposed index pattern in every later kernel.
+transpose2d(p<Int>) -> {
+    inp<Int> = ld_i64(p + 0)
+    outp<Int> = ld_i64(p + 8)
+    R<Int> = ld_i64(p + 16)
+    C<Int> = ld_i64(p + 24)
+    total<Int> = R * C
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        rr<Int> = gid / C
+        cc<Int> = gid % C
+        st_f64(outp + (cc * R + rr) * 8, ld_f64(inp + (rr * C + cc) * 8))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// add_bias_row: Y[s*D + d] = X[s*D + d] + B[d]
+//   params: X, B, Y, S, D     (residual/positional adds and the decoder's bias)
+add_bias_row(p<Int>) -> {
+    X<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    S<Int> = ld_i64(p + 24)
+    D<Int> = ld_i64(p + 32)
+    total<Int> = S * D
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        d<Int> = gid % D
+        st_f64(Y + gid * 8, ld_f64(X + gid * 8) + ld_f64(B + d * 8))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// add2: Y[i] = A[i] + B[i]   (residual connection)
+//   params: A, B, Y, N
+add2(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    N<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        st_f64(Y + gid * 8, ld_f64(A + gid * 8) + ld_f64(B + gid * 8))
+    }
+}

@@ -1,0 +1,740 @@
+# glm_l3_attn_fwd.vyb — GLM-5.3 layer 3's DSA attention in Vyb.
+#
+# The first Vyb code for the sparse-attention path (11 of the model's 45 layers):
+#   q_a/q_b + kv_a latent        -> absorbed MLA keys/values (per-head, from kv_b_proj)
+#   indexer                      -> learned-gpool pooling, per-pool scores, top-k pools
+#                                   + the visible tail (dsa_ref semantics, HF's design)
+#   masked MLA attention         -> softmax(q·k/sqrt(256)) @ v over the selected tokens
+#   o_proj
+#
+# Input `h_a` (the layer's input_layernorm output) comes from native/out/gold_l3_ha.txt —
+# the layer-3 input chained through layers 0-2 in numpy — so this gate measures the DSA
+# implementation itself, with the chain's own gate to follow (`gold_l3_attn.py` writes
+# gold_l3_chain.npy for it).
+#
+# Gold: native/glm53/gold_l3_attn.py (dsa_ref, already gated against HF).
+# Gate: native/glm53/verify_l3_vyb.py -> L3_ATTN_VYB_MATCH (+ indexer selections).
+#
+# Run: make -f native/Makefile glm3
+import io::{open_read, read_at, read_all, open_write, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
+import vmath::{vexp, vsqrt}
+
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+R<Int> = 22
+H<Int> = 4096
+HEADS<Int> = 64
+NOPE<Int> = 256
+VDIM<Int> = 256
+KV_LORA<Int> = 512
+Q_LORA<Int> = 1536
+IHEADS<Int> = 32
+IDIM<Int> = 128
+KPOOL<Int> = 4
+TOPK<Int> = 2048
+EPS<Float> = 1e-5
+LN_EPS<Float> = 1e-6
+SCALE40<Float> = 1099511627776.0
+
+# ---------------------------------------------------------------- formatting + maths
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+digest(name<String>, v<Vec<Float>>)<String> -> {
+    s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
+    i<Int> = 0
+    while (i < v.len()) {
+        x<Float> = v.get(i)
+        s = s + x
+        if (x < 0.0) { a = a - x } else { a = a + x }
+        q = q + x * x
+        t<Float> = x
+        if (t < 0.0) { t = 0.0 - t }
+        if (t > m) { m = t }
+        i = i + 1
+    }
+    out<String> = name + " n=" + v.len().to_string() + " sum=" + di(s).to_string() +
+                  " abs=" + di(a).to_string() + " sq=" + di(q).to_string() +
+                  " max=" + di(m).to_string()
+    i = 0
+    while (i < 8) {
+        hv<Float> = 0.0
+        if (i < v.len()) { hv = v.get(i) }
+        out = out + " v" + i.to_string() + "=" + di(hv).to_string()
+        i = i + 1
+    }
+    return out
+}
+
+sigmoid(x<Float>)<Float> -> {
+    return 1.0 / (1.0 + vexp(0.0 - x))
+}
+
+# per-row rms over width D, times w when w.len() == D
+rms_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        ss<Float> = 0.0
+        i = 0
+        base<Int> = r * D
+        while (i < D) {
+            v<Float> = x.get(base + i)
+            ss = ss + v * v
+            i = i + 1
+        }
+        inv<Float> = 1.0 / vsqrt(ss / (D as Float) + EPS, 40)
+        i = 0
+        while (i < D) {
+            vv<Float> = x.get(base + i) * inv
+            if (w.len() == D) { vv = vv * w.get(i) }
+            dst.push(vv)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+# LayerNorm (mean/variance, weight + bias) — the indexer's k_norm is a real LayerNorm
+ln_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>, b<Vec<Float>>)<Vec<Float>> -> {
+    dst<Vec<Float>> = Vec()
+    r<Int> = 0
+    i<Int> = 0
+    while (r < rows) {
+        mu<Float> = 0.0
+        i = 0
+        while (i < D) {
+            mu = mu + x.get(r * D + i)
+            i = i + 1
+        }
+        mu = mu / (D as Float)
+        vr<Float> = 0.0
+        i = 0
+        while (i < D) {
+            dv<Float> = x.get(r * D + i) - mu
+            vr = vr + dv * dv
+            i = i + 1
+        }
+        vr = vr / (D as Float)
+        inv<Float> = 1.0 / vsqrt(vr + LN_EPS, 40)
+        i = 0
+        while (i < D) {
+            dst.push((x.get(r * D + i) - mu) * inv * w.get(i) + b.get(i))
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return dst
+}
+
+f32_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 4) {
+        c<Int> = (raw.char_at(idx * 4 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if ((w & 2147483648) != 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 23) & 255
+    man<Int> = w & 8388607
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 8388608.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 127)) {
+            p2 = p2 * 2.0
+            e2 = e2 + 1
+        }
+        while (e2 > (ex - 127)) {
+            p2 = p2 / 2.0
+            e2 = e2 - 1
+        }
+        v = sign * den * p2
+    }
+    return v
+}
+
+# ---------------------------------------------------------------- device plumbing
+alloc_dev(n<Int>)<Int> -> {
+    var<Int> p = 0
+    freedom {
+        if (cuMemAlloc_v2(loc(p), n) != 0) { return 0 }
+    }
+    return p
+}
+
+free_dev(p<Int>)<Int> -> {
+    if (p == 0) { return 0 }
+    freedom {
+        cuMemFree_v2(p)
+    }
+    return 0
+}
+
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    var<Int> addr_out = 0
+    freedom {
+        var<loc<loc<CVoid>>> m = from<loc<loc<CVoid>>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        var<loc<CVoid>> f = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, fn_name) != 0) { return 0 }
+        addr_out = addr(f)
+    }
+    return addr_out
+}
+
+mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
+    var<Int> C = 0
+    var<Int> scr = 0
+    C = alloc_dev(M * N * 8)
+    scr = alloc_dev(64)
+    if (C == 0 || scr == 0) { return 0 }
+    if (gemm(faddr, scr, A, B, C, M, N, K, 1.0, 0.0) != 0) { return 0 }
+    sync()
+    free_dev(scr)
+    return C
+}
+
+mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
+    out<Vec<Float>> = Vec()
+    var<Int> dA = 0
+    dA = alloc_dev(rows * K * 8)
+    if (dA == 0) { return out }
+    htod_vec(dA, x)
+    var<Int> dC = 0
+    dC = mm_dev(dA, B, rows, N, K, faddr)
+    free_dev(dA)
+    if (dC == 0) { return out }
+    out = dtoh_vec(dC, rows * N)
+    free_dev(dC)
+    return out
+}
+
+main()<Int> -> {
+    total<Int> = 0
+    nf<Int> = 0
+    i<Int> = 0
+    fgemm<Int> = 0
+    fbf<Int> = 0
+    d_knw<Int> = 0
+    d_knb<Int> = 0
+    d2<Int> = 0
+    hh<Int> = 0
+    j2<Int> = 0
+    npools<Int> = 0
+    p<Int> = 0
+    c<Int> = 0
+    mx<Float> = 0.0
+    a<Int> = 0
+    lg<Float> = 0.0
+    sm<Float> = 0.0
+    acc<Float> = 0.0
+    pr<Float> = 0.0
+    scale_iq<Float> = 0.0
+    q2<Int> = 0
+    dot<Float> = 0.0
+    rl<Float> = 0.0
+    select_k<Int> = 0
+    k2<Int> = 0
+    bestp<Int> = 0
+    best<Float> = 0.0
+    last<Int> = 0
+    used<Int> = 0
+    k3<Int> = 0
+    sc<Float> = 0.0
+    vcount<Int> = 0
+    tcount<Int> = 0
+    tstart<Int> = 0
+    slot<Int> = 0
+    first<Int> = 0
+    tv<Int> = 0
+    sc_scale<Float> = 0.0
+    sv<Float> = 0.0
+    pv<Float> = 0.0
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    out<String> = env_get("VYBFORGE_L3_OUT") else "native/out/l3_vyb.txt"
+    hapath<String> = env_get("VYBFORGE_L3_HA") else "native/out/gold_l3_ha.txt"
+    total = 83
+    pre<String> = "model.language_model.layers.3."
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "self_attn.q_a_proj.weight")
+    want.push(pre + "self_attn.q_a_layernorm.weight")
+    want.push(pre + "self_attn.q_b_proj.weight")
+    want.push(pre + "self_attn.kv_a_proj_with_mqa.weight")
+    want.push(pre + "self_attn.kv_a_layernorm.weight")
+    want.push(pre + "self_attn.kv_b_proj.weight")
+    want.push(pre + "self_attn.o_proj.weight")
+    want.push(pre + "self_attn.indexer.wq_b.weight")
+    want.push(pre + "self_attn.indexer.wk.weight")
+    want.push(pre + "self_attn.indexer.k_norm.weight")
+    want.push(pre + "self_attn.indexer.k_norm.bias")
+    want.push(pre + "self_attn.indexer.weights_proj.weight")
+    want.push(pre + "self_attn.indexer.index_kpool_compress_ape")
+    want.push(pre + "self_attn.indexer.index_kpool_compress_gate")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    nf = 0
+    i = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("L3_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("L3_FAIL no cuda"); return 4 }
+    fgemm = load_fn("native/build/gemm.ptx", "gemm")
+    fbf = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fgemm == 0 || fbf == 0) { println("L3_FAIL kernels"); return 5 }
+
+    # ---- h_a from the gold (scaled integers, 22 rows x 4096) ----
+    hair<String> = ""
+    match (open_read(hapath)) {
+        f -> { match (read_all(f)) { s -> { hair = s } ? -> { return 6 } } close(f) }
+        ? -> { println("L3_FAIL no " + hapath); return 6 }
+    }
+    h_a<Vec<Float>> = Vec()
+    cur<String> = ""
+    i = 0
+    while (i <= hair.len()) {
+        ch<String> = ""
+        if (i < hair.len()) { ch = hair.substring(i, i + 1) }
+        if (i == hair.len() || ch == " " || ch == "\n") {
+            if (cur.len() > 0) {
+                h_a.push((cur.to_int() as Float) / SCALE40)
+                cur = ""
+            }
+        } else { cur = cur + ch }
+        i = i + 1
+    }
+    if (h_a.len() != R * H) { println("L3_FAIL ha len " + h_a.len().to_string()); return 7 }
+    println(digest("ha", h_a))
+
+    lines<String> = digest("ha", h_a) + "\n"
+
+    # ---- q_a latent, q_b, kv_a latent ----
+    var<Int> d_qa = 0
+    var<Int> d_qb = 0
+    var<Int> d_kva = 0
+    var<Int> d_kvb = 0
+    var<Int> d_o = 0
+    d_qa = deq_bf16(fbf, gx_read(g, 0), Q_LORA * H, H)
+    d_qb = deq_bf16(fbf, gx_read(g, 2), HEADS * NOPE * Q_LORA, Q_LORA)
+    d_kva = deq_bf16(fbf, gx_read(g, 3), KV_LORA * H, H)
+    d_kvb = deq_bf16(fbf, gx_read(g, 5), HEADS * (NOPE + VDIM) * KV_LORA, 0)
+    d_o = deq_bf16(fbf, gx_read(g, 6), HEADS * VDIM * H, HEADS * VDIM)
+    if (d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 || d_o == 0) { return 8 }
+
+    qres<Vec<Float>> = mm_host(h_a, R, H, d_qa, Q_LORA, fgemm)
+    println(digest("qres", qres))
+    lines = lines + digest("qres", qres) + "\n"
+
+    var<Int> d_qaln = 0
+    d_qaln = deq_bf16(fbf, gx_read(g, 1), Q_LORA, 0)
+    if (d_qaln == 0) { return 8 }
+    qaln_w<Vec<Float>> = dtoh_vec(d_qaln, Q_LORA)
+    free_dev(d_qaln)
+    qa_ln<Vec<Float>> = rms_rows(qres, R, Q_LORA, qaln_w)
+    qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
+    println(digest("qb", qfull))
+    lines = lines + digest("qb", qfull) + "\n"
+
+    ckraw<Vec<Float>> = mm_host(h_a, R, H, d_kva, KV_LORA, fgemm)
+    var<Int> d_kvaln = 0
+    d_kvaln = deq_bf16(fbf, gx_read(g, 4), KV_LORA, 0)
+    if (d_kvaln == 0) { return 8 }
+    kvaln_w<Vec<Float>> = dtoh_vec(d_kvaln, KV_LORA)
+    free_dev(d_kvaln)
+    ckv<Vec<Float>> = rms_rows(ckraw, R, KV_LORA, kvaln_w)
+    println(digest("ckv", ckv))
+    lines = lines + digest("ckv", ckv) + "\n"
+
+    # ---- per-head absorbed keys/values from kv_b ----
+    kvb<Vec<Float>> = dtoh_vec(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
+    free_dev(d_kvb)
+    println(digest("kvb", kvb))
+    lines = lines + digest("kvb", kvb) + "\n"
+
+    # ---- indexer: projections ----
+    var<Int> d_wqb = 0
+    var<Int> d_wk = 0
+    var<Int> d_wproj = 0
+    var<Int> d_gate = 0
+    d_wqb = deq_bf16(fbf, gx_read(g, 7), Q_LORA * IHEADS * IDIM, Q_LORA)
+    d_wk = deq_bf16(fbf, gx_read(g, 8), H * IDIM, H)
+    d_wproj = deq_bf16(fbf, gx_read(g, 11), H * IHEADS, H)
+    d_gate = deq_bf16(fbf, gx_read(g, 13), H * IDIM, H)
+    if (d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gate == 0) { return 9 }
+
+    qidx<Vec<Float>> = mm_host(qres, R, Q_LORA, d_wqb, IHEADS * IDIM, fgemm)
+    kraw<Vec<Float>> = mm_host(h_a, R, H, d_wk, IDIM, fgemm)
+    knw<Vec<Float>> = Vec()
+    knb<Vec<Float>> = Vec()
+    d_knw = deq_bf16(fbf, gx_read(g, 9), IDIM, 0)
+    d_knb = deq_bf16(fbf, gx_read(g, 10), IDIM, 0)
+    if (d_knw == 0 || d_knb == 0) { return 10 }
+    knw = dtoh_vec(d_knw, IDIM)
+    knb = dtoh_vec(d_knb, IDIM)
+    free_dev(d_knw)
+    free_dev(d_knb)
+    kn<Vec<Float>> = ln_rows(kraw, R, IDIM, knw, knb)
+    gsc<Vec<Float>> = mm_host(h_a, R, H, d_gate, IDIM, fgemm)
+    wproj<Vec<Float>> = mm_host(h_a, R, H, d_wproj, IHEADS, fgemm)
+    println(digest("kidx", kn))
+    lines = lines + digest("kidx", kn) + "\n"
+    println(digest("gsc", gsc))
+    lines = lines + digest("gsc", gsc) + "\n"
+    println(digest("wproj", wproj))
+    lines = lines + digest("wproj", wproj) + "\n"
+
+    # ---- absorbed per-head keys/values: K = ckv @ [uk_h | ...], V = ckv @ [uv_h | ...] ----
+    # kvb holds [heads, nope+v, kv_lora]; uk[h] = kvb[h][:NOPE], uv[h] = kvb[h][NOPE:]
+    ukm<Vec<Float>> = Vec()          # [KV_LORA, HEADS*NOPE]
+    uvm<Vec<Float>> = Vec()          # [KV_LORA, HEADS*VDIM]
+    d2 = 0
+    while (d2 < KV_LORA * HEADS * NOPE) {
+        ukm.push(0.0)
+        uvm.push(0.0)
+        d2 = d2 + 1
+    }
+    hh = 0
+    while (hh < HEADS) {
+        j2 = 0
+        while (j2 < NOPE) {
+            d2 = 0
+            while (d2 < KV_LORA) {
+                ukm.set(d2 * (HEADS * NOPE) + hh * NOPE + j2,
+                        kvb.get((hh * (NOPE + VDIM) + j2) * KV_LORA + d2))
+                uvm.set(d2 * (HEADS * VDIM) + hh * VDIM + j2,
+                        kvb.get((hh * (NOPE + VDIM) + NOPE + j2) * KV_LORA + d2))
+                d2 = d2 + 1
+            }
+            j2 = j2 + 1
+        }
+        hh = hh + 1
+    }
+    var<Int> d_ukm = 0
+    var<Int> d_uvm = 0
+    d_ukm = alloc_dev(KV_LORA * HEADS * NOPE * 8)
+    d_uvm = alloc_dev(KV_LORA * HEADS * VDIM * 8)
+    if (d_ukm == 0 || d_uvm == 0) { return 12 }
+    htod_vec(d_ukm, ukm)
+    htod_vec(d_uvm, uvm)
+    K<Vec<Float>> = mm_host(ckv, R, KV_LORA, d_ukm, HEADS * NOPE, fgemm)
+    V<Vec<Float>> = mm_host(ckv, R, KV_LORA, d_uvm, HEADS * VDIM, fgemm)
+    free_dev(d_ukm)
+    free_dev(d_uvm)
+    println(digest("K", K))
+    lines = lines + digest("K", K) + "\n"
+
+    # ---- indexer: gpool pooling + per-query pool scores (dsa_ref.indexer_topk) ----
+    ape<Vec<Float>> = Vec()
+    raw_ape<String> = gx_read(g, 12)
+    i = 0
+    while (i < KPOOL * IDIM) {
+        ape.push(f32_at(raw_ape, i))
+        i = i + 1
+    }
+    npools = R / KPOOL                    # complete pools (a partial tail pool is dropped)
+    poolk<Vec<Float>> = Vec()                  # [npools, IDIM]
+    d2 = 0
+    while (d2 < npools * IDIM) {
+        poolk.push(0.0)
+        d2 = d2 + 1
+    }
+    p = 0
+    while (p < npools) {
+        c = 0
+        while (c < IDIM) {
+            # softmax over the pool's slots of (gate + ape), per channel
+            mx = 0.0 - 1e30
+            a = 0
+            while (a < KPOOL) {
+                lg = gsc.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c)
+                if (lg > mx) { mx = lg }
+                a = a + 1
+            }
+            sm = 0.0
+            a = 0
+            while (a < KPOOL) {
+                sm = sm + vexp(gsc.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx)
+                a = a + 1
+            }
+            acc = 0.0
+            a = 0
+            while (a < KPOOL) {
+                pr = vexp(gsc.get((p * KPOOL + a) * IDIM + c) + ape.get(a * IDIM + c) - mx) / sm
+                acc = acc + pr * kn.get((p * KPOOL + a) * IDIM + c)
+                a = a + 1
+            }
+            poolk.set(p * IDIM + c, acc)
+            c = c + 1
+        }
+        p = p + 1
+    }
+    println(digest("poolk", poolk))
+    lines = lines + digest("poolk", poolk) + "\n"
+
+    # index_scores[q][p] = sum_h w[q][h] * relu(dot(q_idx[q,h], poolk[p]) / sqrt(IDIM))
+    isc<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < R * npools) {
+        isc.push(0.0)
+        d2 = d2 + 1
+    }
+    scale_iq = 1.0 / vsqrt(IDIM as Float, 40)
+    q2 = 0
+    while (q2 < R) {
+        p = 0
+        while (p < npools) {
+            acc = 0.0
+            hh = 0
+            while (hh < IHEADS) {
+                dot = 0.0
+                c = 0
+                while (c < IDIM) {
+                    dot = dot + qidx.get((q2 * IHEADS + hh) * IDIM + c) * poolk.get(p * IDIM + c)
+                    c = c + 1
+                }
+                rl = dot * scale_iq
+                if (rl < 0.0) { rl = 0.0 }
+                acc = acc + wproj.get(q2 * IHEADS + hh) * (1.0 / vsqrt(IHEADS as Float, 40)) * rl
+                hh = hh + 1
+            }
+            isc.set(q2 * npools + p, acc)
+            p = p + 1
+        }
+        q2 = q2 + 1
+    }
+
+    # selection per query: candidate pools are those whose LAST token is visible, top
+    # select_k = min(TOPK/KPOOL, npools); then the visible tail; -1 pads. One line per
+    # query so verify_l3_vyb.py can diff the token sets against the gold's topk.
+    sel<Vec<Int>> = Vec()
+    d2 = 0
+    while (d2 < R * R) {
+        sel.push(-1)
+        d2 = d2 + 1
+    }
+    select_k = TOPK / KPOOL
+    if (select_k > npools) { select_k = npools }
+    q2 = 0
+    while (q2 < R) {
+        # order candidate pools by score desc (candidates only; partial pools already dropped)
+        taken<Vec<Int>> = Vec()
+        k2 = 0
+        while (k2 < select_k) {
+            bestp = -1
+            best = 0.0 - 1e30
+            p = 0
+            while (p < npools) {
+                last = p * KPOOL + KPOOL - 1
+                used = 0
+                k3 = 0
+                while (k3 < taken.len()) {
+                    if (taken.get(k3) == p) { used = 1 }
+                    k3 = k3 + 1
+                }
+                if (last <= q2 && used == 0) {
+                    sc = isc.get(q2 * npools + p)
+                    if (sc > best) {
+                        best = sc
+                        bestp = p
+                    }
+                }
+                p = p + 1
+            }
+            if (bestp < 0) { k2 = select_k } else {
+                taken.push(bestp)
+                a = 0
+                while (a < KPOOL) {
+                    sel.set(q2 * R + taken.len() * KPOOL - KPOOL + a, bestp * KPOOL + a)
+                    a = a + 1
+                }
+                k2 = k2 + 1
+            }
+        }
+        # visible tail: the tokens after the last complete selected pool region
+        vcount = q2 + 1
+        tcount = vcount % KPOOL
+        tstart = vcount - tcount
+        a = 0
+        while (a < tcount) {
+            slot = taken.len() * KPOOL + a
+            if (slot < R) { sel.set(q2 * R + slot, tstart + a) }
+            a = a + 1
+        }
+        q2 = q2 + 1
+    }
+    selline<String> = "sel"
+    q2 = 0
+    while (q2 < R) {
+        selline = selline + " q" + q2.to_string() + "=["
+        first = 1
+        i = 0
+        while (i < R) {
+            tv = sel.get(q2 * R + i)
+            if (tv >= 0) {
+                if (first == 0) { selline = selline + "," }
+                selline = selline + tv.to_string()
+                first = 0
+            }
+            i = i + 1
+        }
+        selline = selline + "]"
+        q2 = q2 + 1
+    }
+    lines = lines + selline + "\n"
+    println(selline)
+
+    # ---- masked MLA attention per head, then o_proj ----
+    # probs[q][h][i] is materialised once per (query, head): the naive form recomputed the
+    # q·k dot inside the value loop, which is O(R^2 * H * VDIM * NOPE) and never finishes.
+    sc_scale = 1.0 / vsqrt(NOPE as Float, 40)
+    probs<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < R * HEADS * R) {
+        probs.push(0.0)
+        d2 = d2 + 1
+    }
+    hh = 0
+    while (hh < HEADS) {
+        q2 = 0
+        while (q2 < R) {
+            mx = 0.0 - 1e30
+            i = 0
+            while (i < R) {
+                if (sel.get(q2 * R + i) >= 0) {
+                    dot = 0.0
+                    c = 0
+                    while (c < NOPE) {
+                        dot = dot + qfull.get((q2 * HEADS + hh) * NOPE + c) *
+                                    K.get((i * HEADS + hh) * NOPE + c)
+                        c = c + 1
+                    }
+                    sv = dot * sc_scale
+                    if (sv > mx) { mx = sv }
+                }
+                i = i + 1
+            }
+            sm = 0.0
+            i = 0
+            while (i < R) {
+                if (sel.get(q2 * R + i) >= 0) {
+                    dot = 0.0
+                    c = 0
+                    while (c < NOPE) {
+                        dot = dot + qfull.get((q2 * HEADS + hh) * NOPE + c) *
+                                    K.get((i * HEADS + hh) * NOPE + c)
+                        c = c + 1
+                    }
+                    sm = sm + vexp(dot * sc_scale - mx)
+                }
+                i = i + 1
+            }
+            i = 0
+            while (i < R) {
+                if (sel.get(q2 * R + i) >= 0) {
+                    dot = 0.0
+                    c = 0
+                    while (c < NOPE) {
+                        dot = dot + qfull.get((q2 * HEADS + hh) * NOPE + c) *
+                                    K.get((i * HEADS + hh) * NOPE + c)
+                        c = c + 1
+                    }
+                    probs.set((q2 * HEADS + hh) * R + i, vexp(dot * sc_scale - mx) / sm)
+                }
+                i = i + 1
+            }
+            q2 = q2 + 1
+        }
+        hh = hh + 1
+    }
+    ao<Vec<Float>> = Vec()
+    d2 = 0
+    while (d2 < R * HEADS * VDIM) {
+        ao.push(0.0)
+        d2 = d2 + 1
+    }
+    hh = 0
+    while (hh < HEADS) {
+        q2 = 0
+        while (q2 < R) {
+            c = 0
+            while (c < VDIM) {
+                acc = 0.0
+                i = 0
+                while (i < R) {
+                    pv = probs.get((q2 * HEADS + hh) * R + i)
+                    if (pv != 0.0) {
+                        acc = acc + pv * V.get((i * HEADS + hh) * VDIM + c)
+                    }
+                    i = i + 1
+                }
+                ao.set((q2 * HEADS + hh) * VDIM + c, acc)
+                c = c + 1
+            }
+            q2 = q2 + 1
+        }
+        hh = hh + 1
+    }
+    println(digest("ao", ao))
+    lines = lines + digest("ao", ao) + "\n"
+    attn<Vec<Float>> = mm_host(ao, R, HEADS * VDIM, d_o, H, fgemm)
+    println(digest("attn", attn))
+    lines = lines + digest("attn", attn) + "\n"
+
+    match (open_write(out)) {
+        f -> { write_str(f, lines); close(f) }
+        ? -> { println("L3_FAIL write"); return 13 }
+    }
+    println("L3_OK DSA attention (projections, gpool, selection, masked MLA, o_proj)")
+    return 0
+}

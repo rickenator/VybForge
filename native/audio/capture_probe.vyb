@@ -1,0 +1,161 @@
+# capture_probe.vyb — L1 gate (capture): record real audio from the mic path in
+# Vyb and write a WAV, printing level statistics so the result is checkable
+# against an independent tool (sox/ffmpeg/python) without listening.
+#
+#   ./build.sh            # compiles the shim, builds this, runs it
+#
+# Device "default" goes through PipeWire, so this follows whatever the system
+# input is: the USB audio interface today, the BT earbud mic once paired.
+#
+# Prints:  frames / rms_micro / peak_micro   (levels scaled by 1e6, integers)
+# Writes:  capture_vyb.wav (16 kHz, mono, 16-bit PCM)
+import audio::{start, open_capture, read_block, stop, last_error}
+import io::{open_write, write_bytes, close}
+
+SECONDS<Int> = 4
+RATE<Int> = 16000
+
+# The byte buffer is passed as `borrow(...)`. A `their<T>` parameter must be
+# called with an explicit borrow on this build; passing the Vec itself fails with
+# "Argument type mismatch: Expected ptr but got { ptr, i64, i64 }" (same idiom as
+# stdlib/png/mod.vyb, which documents it).
+share(all)
+push_i16(out<their<Vec<UInt8>>>, v<Int>)<Int> -> {
+    out.push((v & 0xFF) as UInt8)
+    out.push(((v >> 8) & 0xFF) as UInt8)
+    return 2
+}
+
+share(all)
+push_u32(out<their<Vec<UInt8>>>, v<Int>)<Int> -> {
+    out.push((v & 0xFF) as UInt8)
+    out.push(((v >> 8) & 0xFF) as UInt8)
+    out.push(((v >> 16) & 0xFF) as UInt8)
+    out.push(((v >> 24) & 0xFF) as UInt8)
+    return 4
+}
+
+share(all)
+push_ascii(out<their<Vec<UInt8>>>, s<String>)<Int> -> {
+    i<Int> = 0
+    n<Int> = s.len()
+    for (i in 0..n - 1) {
+        out.push(s.char_at(i) as UInt8)
+    }
+    return n
+}
+
+# 44-byte canonical WAV header for PCM 16-bit mono at `rate`.
+share(all)
+wav_header(rate<Int>, frames<Int>)<Vec<UInt8>> -> {
+    out<Vec<UInt8>> = Vec<UInt8>()
+    data_bytes<Int> = frames * 2
+    push_ascii(borrow(out), "RIFF")
+    push_u32(borrow(out), 36 + data_bytes)
+    push_ascii(borrow(out), "WAVE")
+    push_ascii(borrow(out), "fmt ")
+    push_u32(borrow(out), 16)              # fmt chunk size
+    push_i16(borrow(out), 1)               # PCM
+    push_i16(borrow(out), 1)               # mono
+    push_u32(borrow(out), rate)
+    push_u32(borrow(out), rate * 2)        # byte rate = rate * block align
+    push_i16(borrow(out), 2)               # block align
+    push_i16(borrow(out), 16)              # bits per sample
+    push_ascii(borrow(out), "data")
+    push_u32(borrow(out), data_bytes)
+    return out
+}
+
+share(all)
+micro(x<Float>)<Int> -> {
+    return (x * 1000000.0) as Int
+}
+
+main()<Int> -> {
+    match (start()) {
+        ? -> {
+            println("VYB_AUDIO: init failed")
+            return 1
+        }
+        ok -> { }
+    }
+
+    h<Int> = open_capture("default", RATE)
+    if (h == 0) {
+        println("VYB_AUDIO: open failed: ")
+        println(last_error())
+        return 2
+    }
+    println("VYB_AUDIO: opened default capture @16000 mono")
+
+    total<Int> = RATE * SECONDS
+    pcm<Vec<Float>> = Vec<Float>()
+    rms_sum<Float> = 0.0
+    peak<Float> = 0.0
+    got<Int> = 0
+    chunks<Int> = 0
+    while (got < total) {
+        want<Int> = total - got
+        if (want > 4096) { want = 4096 }
+        match (read_block(h, want)) {
+            block -> {
+                n<Int> = block.len()
+                if (n == 0) { break }
+                i<Int> = 0
+                for (i in 0..n - 1) {
+                    s<Float> = block.get(i)
+                    rms_sum = rms_sum + s * s
+                    a<Float> = abs(s)
+                    if (a > peak) { peak = a }
+                    pcm.push(s)
+                }
+                got = got + n
+                chunks = chunks + 1
+            }
+            ? -> {
+                println("VYB_AUDIO: read failed: ")
+                println(last_error())
+                break
+            }
+        }
+    }
+    stop(h, false)
+
+    rms<Float> = 0.0
+    if (got > 0) { rms = sqrt(rms_sum / (got as Float)) }
+    println("VYB_AUDIO frames=")
+    println_int(got)
+    println(" chunks=")
+    println_int(chunks)
+    println(" rms_micro=")
+    println_int(micro(rms))
+    println(" peak_micro=")
+    println_int(micro(peak))
+
+    wav<Vec<UInt8>> = wav_header(RATE, got)
+    i<Int> = 0
+    for (i in 0..got - 1) {
+        s<Float> = pcm.get(i)
+        if (s > 1.0) { s = 1.0 }
+        if (s < -1.0) { s = -1.0 }
+        push_i16(borrow(wav), (s * 32767.0) as Int)
+    }
+
+    match (open_write("capture_vyb.wav")) {
+        f -> {
+            match (write_bytes(f, borrow(wav))) {
+                n -> { println("VYB_AUDIO: wrote capture_vyb.wav, bytes="); println_int(n) }
+                ? -> { println("VYB_AUDIO: write failed") }
+            }
+            close(f)
+        }
+        ? -> {
+            println("VYB_AUDIO: cannot open capture_vyb.wav for writing")
+            return 3
+        }
+    }
+
+    if (got == 0) { return 4 }
+    println("VYB_AUDIO_CAPTURE: OK")
+    return 0
+}

@@ -1,0 +1,6 @@
+# build products of ./build.sh (sources are the .c/.h/.vyb files)
+libvybaudio.so
+capture_probe
+playback_probe
+*.o
+capture_vyb.wav

@@ -4,6 +4,10 @@
 configurator is its first instance and proving slice, not the target — read `doc/SUBSTRATE-SCOPE.md`
 before treating anything here as the whole job.
 
+**Next named target: GLM-5.3-Flash on Vyb** — `doc/ROADMAP-GLM53-ON-VYB.md` (P0 serve-harness →
+P1 EXL3 expert dequant → P2 MoE → P3 hybrid attention → P4 layer parity → P8 cutover; TensorFold
+stays the daily driver until that gate passes).
+
 Tracked here so phases can be worked serially and, where independent, in
 parallel. All GPU work lives under `native/`; the production pipeline is Vyb
 only (Python appears solely as a *reference-verification* harness).

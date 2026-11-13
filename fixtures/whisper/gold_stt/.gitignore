@@ -1,0 +1,5 @@
+# The staged tensor dumps are 35 MB of raw float32 and are regenerable:
+#   cd fixtures/whisper && ~/miniconda/bin/python oracle_stt.py
+# Keep the small text artifacts (listings, ref_text, token ids) tracked.
+*.f32
+*.shape

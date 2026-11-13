@@ -1,0 +1,175 @@
+# exl3_load.vyb — EXL3 4bpw expert dequant as a reusable Vyb call.
+#
+# Lifts the pipeline that `native/host/exl3_driver.vyb` proved on one fixture tensor
+# (P1 gate EXL3_VYB_MATCH) into a function the MoE can call per expert:
+#
+#   trellis (ntiles x 128 B) + the 256-slot tile map  ->  exl3deq   -> rotated basis [kn]
+#   128x128 Walsh-Hadamard                           ->  exl3hgen  -> H
+#   H . W                                            ->  exl3had1  -> tmp
+#   suh . svh . tmp                                  ->  exl3had2  -> W [in, out] f64
+#
+# The tile map is shape-independent (it is the 16x16 tile's slot composition); only its
+# 16-byte header (cw = out features, ntiles) changes per tensor, so the caller passes the
+# 256x16 body and this module rewrites the header — no Python at load time.
+#
+# Returns a device pointer to `in*out` f64 values in [in, out] order (gemm-ready), or 0.
+import io::{open_read, read_all, close}
+
+share(all)
+extern "C" {
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+# Dequantize one EXL3-packed expert tensor to f64 [in, out] on the device.
+#   body: the 256x16 tile-map body (map.bin minus its 16-byte header)
+share(all)
+exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
+         trellis<String>, suh<String>, svh<String>, body<String>,
+         cw<Int>, ntiles<Int>)<Int> -> {
+    var<Int> out = 0
+    tb<Int> = trellis.len()
+    if (tb < ntiles * 128) { return 0 }
+    kn<Int> = (ntiles / (cw / 16)) * 16 * cw
+    krows<Int> = kn / cw
+    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { return 0 }
+    if (suh.len() != krows * 2 || svh.len() != cw * 2) { return 0 }
+    nbc<Int> = cw / 128
+    nblocks<Int> = (kn / cw / 128) * nbc
+    mb<Int> = 16 + body.len()
+    freedom {
+        var<Int> qd = 0
+        var<Int> td = 0
+        var<Int> od = 0
+        var<Int> hd = 0
+        var<Int> td2 = 0
+        var<Int> fd = 0
+        var<Int> pd = 0
+        var<Int> sud = 0
+        var<Int> svd = 0
+        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 0 }
+
+        # trellis: bulk copy straight from the String
+        if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { return 0 }
+        # map: 16-byte header + the 256-slot body
+        var<CInt> rc = 0
+        hwide<Int> = 0
+        bq<Int> = 0
+        while (bq < 8) {
+            hwide = hwide | (((cw >> (bq * 8)) & 255) << (bq * 8))
+            bq = bq + 1
+        }
+        if (cuMemcpyHtoD_v2(td, loc(hwide), 8) != 0) { return 0 }
+        hwide = 0
+        bq = 0
+        while (bq < 8) {
+            hwide = hwide | (((ntiles >> (bq * 8)) & 255) << (bq * 8))
+            bq = bq + 1
+        }
+        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { return 0 }
+        u<Int> = 0
+        while (u < body.len()) {
+            ch<Int> = 0
+            b<Int> = 0
+            while (b < 8) {
+                ch = ch | ((((body.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(td + 16 + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        # dequant
+        if (cuda_launch4i(from<loc<CVoid>>(fdeq), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(qd)
+        cuMemFree_v2(td)
+        # scales (fp16) to the device
+        u = 0
+        while (u < suh.len()) {
+            ch<Int> = 0
+            b = 0
+            while (b < 8) {
+                ch = ch | ((((suh.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(sud + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        u = 0
+        while (u < svh.len()) {
+            ch<Int> = 0
+            b = 0
+            while (b < 8) {
+                ch = ch | ((((svh.char_at(u + b) as Int) & 255)) << (b * 8))
+                b = b + 1
+            }
+            if (cuMemcpyHtoD_v2(svd + u, loc(ch), 8) != 0) { return 0 }
+            u = u + 8
+        }
+        # hgen: H at pd+0
+        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
+        if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
+        pq<Int> = 0
+        while (pq < 6) {
+            chq<Int> = 0
+            if (pq == 0) { chq = od }
+            if (pq == 1) { chq = td2 }
+            if (pq == 2) { chq = hd }
+            if (pq == 3) { chq = cw }
+            if (pq == 4) { chq = nbc }
+            if (pq == 5) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            pq = pq + 1
+        }
+        if (cuda_launch4i(from<loc<CVoid>>(fhad1), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        # had2: tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks
+        pq = 0
+        while (pq < 8) {
+            chq<Int> = 0
+            if (pq == 0) { chq = td2 }
+            if (pq == 1) { chq = fd }
+            if (pq == 2) { chq = hd }
+            if (pq == 3) { chq = sud }
+            if (pq == 4) { chq = svd }
+            if (pq == 5) { chq = cw }
+            if (pq == 6) { chq = nbc }
+            if (pq == 7) { chq = nblocks }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            pq = pq + 1
+        }
+        if (cuda_launch4i(from<loc<CVoid>>(fhad2), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(od)
+        cuMemFree_v2(hd)
+        cuMemFree_v2(td2)
+        cuMemFree_v2(pd)
+        cuMemFree_v2(sud)
+        cuMemFree_v2(svd)
+        out = fd
+    }
+    return out
+}

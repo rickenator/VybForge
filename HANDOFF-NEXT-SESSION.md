@@ -418,8 +418,24 @@ current lengths and, more importantly, FLAT instead of degrading as the context 
 >
 > **CONCLUSION on the gemm: it is at a local optimum for this kernel model, and every structural
 > alternative has now been measured and lost** -- RB=2/8, a 4-way unroll, KSP=64, f16/packed weights
-> (moot: not bandwidth-bound), [N][K] B layout, shared-memory tiling. The remaining gap to peak is real
+> (STILL OPEN -- the 'moot' claim was WRONG, see the correction below), [N][K] B layout, shared-memory tiling. The remaining gap to peak is real
 > but is not reachable by any single axis I have been able to measure.
+
+> **CORRECTION (the paragraph above is WRONG).** Every sweep that produced that conclusion was taken
+> with `runk()`, which calls `cuModuleLoadData` + `cuModuleGetFunction` on EVERY call -- so each timed
+> "launch" included a PTX JIT compile (~93 us/call). That is why M=1 vs M=5, K x4 and KSP x4 all looked
+> work-independent. The harness now has `bench_n()` (module loaded ONCE, then reps launches).
+> Re-measured there:
+>
+>   A) K=9728 KSP=8   176 us/gemm   124.5M MACs, 99.6 MB of B
+>   B) K=2432 KSP=8    60 us/gemm    31.1M MACs, 24.9 MB     -> work+bytes /4 => time /2.9
+>   C) K=9728 KSP=32  153 us/gemm   same bytes, chain /4     -> only -13%
+>
+> The gemm DOES scale with work and bytes, nearly linearly; the k-chain is NOT the driver. So the
+> weight-format lever is BACK ON: keep the weights packed (q4k/q6k, ~2.3 GB vs 14.5 GB) with the dequant
+> fused into the gemm, or f16 (7.25 GB) as the cheaper intermediate first. The RB=2/RB=8/unroll/KSP/
+> tiled entries above are valid only as RELATIVE comparisons (all carry the same +93 us/call handicap).
+> Anything about the gemm concluded from a per-call-module-load timing must be re-measured.
 
 ### Traps this line cost real time (do not repeat)
 
