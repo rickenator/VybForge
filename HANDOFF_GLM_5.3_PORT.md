@@ -484,6 +484,23 @@ per decode step appending to its cache; the driver's final draft logits are comp
 logits + top-1. `DECODE_MTP_MATCH` = element-wise logits/hidden agreement with the oracle;
 top-1 agreement with exllamav3 is the semantic smoke check.
 
+**P12 — endpoint on the 3090 (next buildable unit after MTP)**: a GLM chat server on the
+existing pattern. Pieces that already exist: `native/tokenizer/tokenizer.vyb` (Vyb-native
+byte-level BPE, verified exact vs transformers on ASCII — needs adapting to GLM-5.3's
+tokenizer.json, same GPT-2 byte-level scheme but its own vocab/merges/pre-tokenizer) and
+`native/host/chat_server.vyb` (pure-Vyb localhost HTTP listener that encodes, exec's the decode
+driver with ids+gen env, decodes, replies — correctness first, minutes-per-request honestly
+costed). What's missing: (a) point the tokenizer at GLM-5.3's tokenizer.json and re-prove
+round-trip exactness (non-ASCII divergences documented, as with Qwen3), (b) a GENERATION loop in
+the chain driver: after the prefill caches, argmax the trunk logits (trunk final norm -> lm_head
+-> argmax), feed the token back through the decode steps with the MTP draft computed alongside
+(its acceptance/rejection logic can be a later slice — draft-then-verify needs the target
+forward for the drafted token anyway, so greedy-via-target is the honest first mode), (c) the
+server exec's the chain per request and returns text. Localhost-only per the standing rule
+(LAN/no Tailnet). Speed honestly costed: per-request prefill is minutes at current fp64 dequant
+speed — the f32 deq/hadamard lever (§9 item 3) and a per-layer expert pool are what make it
+conversational; the gated-correctness server comes first, exactly as chat_server.vyb did.
+
 **TP=2 / endpoint (owner decision)**: TP=2 applies ONLY to the GLM-5.3-Flash model and can
 ONLY run on the dual Sparks — godzilla's single 3090 has no second device, so TP=2 is
 unreachable there by construction. Therefore it must be RUNTIME-configurable, never compiled
