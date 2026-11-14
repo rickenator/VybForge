@@ -553,6 +553,32 @@ chain + MTP + tokenizer behind a localhost-only OpenAI-compatible listener, same
 existing :8888 Vyb-native server. Still blocked for any Spark run: weight access (§8 — the
 checkpoint is root-owned on lefty, /etc/exports empty).
 
+**Deployment capacity/bandwidth math (measured + derived, 2026-11)**: the engine is weight-
+streaming — compute is nearly free, and a token's speed = aggregate memory bandwidth / bytes
+touched per token. GLM-5.3-Flash stores 164 GB but touches only ~27 GB/token (8 of 288 experts
+fire; attention + shared + dense always touched). The storage-vs-touched distinction is what
+makes sparse MoE scale: a 1 TB 4-bit MoE warehouse stores 6x more but only multiplies the
+TOUCHED bytes if the active set widens. Measured/derived per-token ceilings, best config each:
+
+| touched/token | godzilla 3090 (24 GB VRAM + 128 GB host cache + local NVMe) | dual Sparks (242 GB pool @ 546 GB/s aggregate) | margin |
+|---|---|---|---|
+| 27 GB (GLM-5.3-Flash) | 0.64 tok/s | 18.2 tok/s | 28x |
+| 60 GB | 0.31 tok/s | 9.1 tok/s | 29x |
+| 120 GB | 0.14 tok/s | 4.5 tok/s | 32x |
+| 230 GB | 0.04 tok/s | 2.4 tok/s | 60x |
+| 500 GB | 0.014 tok/s | 0.005 tok/s | ~1x, both unusable |
+
+The Sparks win any model whose touched set fits their 242 GB pool, because their fast tier
+(LPDDR5X against the compute, 546 GB/s aggregate) is 10x wider than godzilla's (24 GB VRAM,
+then host RAM at ~18 GB/s, then NVMe at ~6 GB/s). The topology rule: keep the touched-per-token
+set inside the pool; the NVMe warehouse can grow almost without limit (only the touched slice
+streams). A dense 1 TB 4-bit model is dead on both (all 1 TB touched/token -> 0.01 tok/s).
+Checkpoint placement measured: apex NFS read 16.5-87 MB/s (the 914 s prefill was over half
+apex-NFS stall); local NVMe copies on godzilla (/usr/export, nvme1n1, 765 GB free) and lefty
+(/srv/models, 1.9 TB SSD, 1.3 TB free) remove it — 6.1 GB/s reads. lefty->righty CX7 (measured
+1272 MB/s) serves TP=2's cross-rank tensors; a direct godzilla-lefty RJ45 caps at 1 GbE (lefty's
+spare ports) and is not worth pulling.
+
 ---
 
 ## 10. Working agreements that keep this moving
