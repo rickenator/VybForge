@@ -605,6 +605,21 @@ target: runtime/vyb_runtime.c __vyb_string_release — retire the slot when
 refs reach <= 0 (or make borrowed registrations not count as live). The
 microbench verifies in seconds; the 45-layer wall is the acceptance test.
 
+**DRIFT ROOT CAUSE v2 (traced, same evening)**: full-lifecycle tracing
+(VYB_STR_TRACE=1 logs REG/RET/REL per registry op) shows the growth is
+STRANDED RETAINS, not unretired slots of freed memory: each header string's
+refcount gains exactly +1 per gx_resolve_idx call (REG 1 -> RET 2 -> REL 1,
+then +1 per resolve forever), so ~5,928 refs strand per resolve and slots
+never reach the retire threshold. The strand is in the st_open ->
+caller StIndex transfer: the return path (or the caller's local StIndex
+teardown) retains every Vec<String> element once per call without a matching
+release. Repro: repro/str_leak_micro.vyb (shrunken: 10 iterations, 1 name) —
++5,928 registry live per iteration, each header string +1 ref/resolve. The
+registry itself is correct (LSan-clean; strings legitimately alive mid-run —
+the earlier t_struct3 "leak" was a main-scoped-binding misread). Fix target:
+the compiler's struct-return transfer for Vec<String> fields (cgen_expr_call
+return path / cgen_ownership release balance).
+
 **Deployment capacity/bandwidth math (measured + derived, 2026-11)**: the engine is weight-
 streaming — compute is nearly free, and a token's speed = aggregate memory bandwidth / bytes
 touched per token. GLM-5.3-Flash stores 164 GB but touches only ~27 GB/token (8 of 288 experts

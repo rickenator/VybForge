@@ -36,7 +36,7 @@ main() -> {
     parts.push("down_proj.mcg")
 
     e<Int> = 0
-    while (e < 20) {
+    while (e < 10) {
         want<Vec<String>> = Vec()
         p<Int> = 0
         while (p < parts.len()) {
@@ -45,18 +45,10 @@ main() -> {
         }
         stats("pre-resolve e" + e.to_string())
         idx<String> = gx_read_index(dir)
-        stats("post-read-index e" + e.to_string())
-        sh<Int> = gx_shard_for(idx, want.get(0))
-        stats("post-shard-for e" + e.to_string())
-        path<String> = gx_shard_path(dir, sh, total)
-        ix<StIndex> = st_open(path)
-        stats("post-st-open e" + e.to_string())
-        t<Int> = st_find(view(ix), want.get(0))
-        stats("post-st-find e" + e.to_string())
         g<GxLoc> = gx_resolve_idx(idx, dir, total, want)
         stats("post-resolve e" + e.to_string())
         r<Int> = 0
-        while (r < want.len()) {
+        while (r < 1) {
             if (g.found.get(r) == 1) {
                 b<String> = gx_read(g, r)
                 stats("post-read e" + e.to_string() + " r" + r.to_string())
