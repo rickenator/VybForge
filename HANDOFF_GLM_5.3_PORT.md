@@ -631,8 +631,17 @@ unwind stops at the function baseline). Suite 1356/1358: the my_struct
 corruption FIXED; ONE failure remains — test_main_exit_code's runner output
 is garbled (a returned string's storage freed early somewhere in the
 runner's helper chain — the runner is test/run_tests.vyb, string-heavy;
-the unwind's keepAlive covers its visible shapes, so the dangling case
-needs the runner traced with VYB_STR_TRACE=1). NOT merged to main yet —
+the unwind's keepAlive covers its visible shapes). THE RUNNER TRACED
+(runner_trace_abort.log in repro/): the runner ABORTS with a tcache double
+free, and the trace shows the mechanism: a binding's CLEANUP fires multiple
+times (the vyb binding cleaned 4x — the cleanup IR emitted at multiple block
+exits), and a late release arrives after the address's re-registration —
+__vyb_string_release matches the re-registered slot and kills the NEW string
+at the same address -> the tcache double free. THE FIX REQUIRES the
+registry's slot semantics under address reuse (the release must verify the
+slot's generation/identity, or the cleanup must not fire multiple times) —
+compiler-author territory (the registry is Rick's design). The WIP stays on
+diag/str-registry-trace; main is clean and releasable. NOT merged to main yet —
 merge after the last failure is fixed; the 45-layer acceptance (~1308 ->
 ~950 s) follows.
 
