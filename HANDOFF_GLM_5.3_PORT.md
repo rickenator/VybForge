@@ -553,6 +553,25 @@ chain + MTP + tokenizer behind a localhost-only OpenAI-compatible listener, same
 existing :8888 Vyb-native server. Still blocked for any Spark run: weight access (§8 — the
 checkpoint is root-owned on lefty, /etc/exports empty).
 
+**Allocator regression bisected + pooled (2026-11-14)**: the 914 s -> 1276 s prefill
+regression was bisected to Vyb `7ff7b9e0` ("fix(codegen): free a discarded Vec<scalar>?
+call result") — the leak fix made every hot-loop free a real libc free, and multi-MB
+buffer frees route through mmap/munmap (deq 6.8 -> 13.8 s/layer, resolve 2.3 -> 6.2
+s/layer; `fd0bf4ee` and `c3e1d76b` both profile at the 914 s baseline). A large-block
+pool (`__vyb_pool_alloc`/`__vyb_pool_free`, side-table ownership, double-free
+absorption) was implemented in the Vyb repo, branch `fix/pool-alloc-regression`
+(d209b613, pushed): prefill4 deq 13753 -> 7304 ms / resolve 1796 -> 1134 ms (baseline
+7088/1056), 45-layer prefill stable, suite 1358/1358 + ctest 4/4. NOT yet merged to
+main; the build-release tree builds it, `build/vyb` is untouched. TWO open findings
+from the work: (1) the generated code has a latent double-free/use-after-free the
+leaky free masked (crashed the pool at layer ~33 until absorbed) — the real fix is in
+the codegen ownership classification, likely in 7ff7b9e0's isFreshNonAliasingCall;
+(2) a depth-dependent slowdown remains even pooled (deq/resolve inflate with layer
+index; 45-layer wall 1249-1274 s vs the 914 s leaky baseline) — partly cold shard
+reads on the first pass, partly adjacent to the known String-registry resolve drift;
+its root cause is its own investigation. Note the layer-4 gate CANNOT see either
+effect — depth effects need the full 45-layer run (12+ layer rule applies doubly).
+
 **Deployment capacity/bandwidth math (measured + derived, 2026-11)**: the engine is weight-
 streaming — compute is nearly free, and a token's speed = aggregate memory bandwidth / bytes
 touched per token. GLM-5.3-Flash stores 164 GB but touches only ~27 GB/token (8 of 288 experts
