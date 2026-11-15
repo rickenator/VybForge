@@ -1,0 +1,63 @@
+seven_fixture did not pass
+wrong_fixture did not fail
+=================================================================
+==1875977==ERROR: AddressSanitizer: heap-use-after-free on address 0x5250006cc100 at pc 0x7a3fa5a7d96f bp 0x7ffd999d6a40 sp 0x7ffd999d61e8
+READ of size 4 at 0x5250006cc100 thread T0
+    #0 0x7a3fa5a7d96e in strlen ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors.inc:391
+    #1 0x7a3fa515712d in std::basic_ostream<char, std::char_traits<char> >& std::operator<< <std::char_traits<char> >(std::basic_ostream<char, std::char_traits<char> >&, char const*) (/lib/x86_64-linux-gnu/libstdc++.so.6+0x15712d) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 0x5fc12bfa89bb in __vyb_println /home/rick/Projects/Vyb/src/vre/intrinsics.cpp:142
+    #3 0x7a3fa461e110  (<unknown module>)
+    #4 0x5fc12c8f8f97 in run_vyb_code(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, bool, int) /home/rick/Projects/Vyb/src/main.cpp:4321
+    #5 0x5fc12c93d753 in main /home/rick/Projects/Vyb/src/main.cpp:5719
+    #6 0x7a3fa442a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+    #7 0x7a3fa442a28a in __libc_start_main_impl ../csu/libc-start.c:360
+    #8 0x5fc12b88bb84 in _start (/home/rick/Projects/Vyb/build-asan/vyb+0x3159b84) (BuildId: 981ccc457db54e961fbffc45fbba700357e14ff8)
+
+0x5250006cc100 is located 0 bytes inside of 8192-byte region [0x5250006cc100,0x5250006ce100)
+freed by thread T0 here:
+    #0 0x7a3fa5afc4d8 in free ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:52
+    #1 0x5fc12c7ebbb7 in __vyb_string_release /home/rick/Projects/Vyb/runtime/vyb_runtime.c:699
+    #2 0x5fc12c7ebe3b in __vyb_string_free /home/rick/Projects/Vyb/runtime/vyb_runtime.c:712
+    #3 0x7a3fa461eb6c  (<unknown module>)
+
+previously allocated by thread T0 here:
+    #0 0x7a3fa5afc778 in realloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:85
+    #1 0x5fc12c7ff9a2 in __vyb_exec_output_opt /home/rick/Projects/Vyb/runtime/vyb_runtime.c:2585
+    #2 0x7a3fa461c3ab  (<unknown module>)
+
+SUMMARY: AddressSanitizer: heap-use-after-free ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors.inc:391 in strlen
+Shadow bytes around the buggy address:
+  0x5250006cbe80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x5250006cbf00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x5250006cbf80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x5250006cc000: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x5250006cc080: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+=>0x5250006cc100:[fd]fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x5250006cc180: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x5250006cc200: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x5250006cc280: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x5250006cc300: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x5250006cc380: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==1875977==ABORTING
+
+===== Vyb call stack at death (most recent first) =====
+===== end Vyb call stack =====
