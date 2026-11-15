@@ -1,0 +1,27 @@
+diff --git a/src/vre/llvm/cgen_stmt.cpp b/src/vre/llvm/cgen_stmt.cpp
+index e893b56e..92a7d55d 100644
+--- a/src/vre/llvm/cgen_stmt.cpp
++++ b/src/vre/llvm/cgen_stmt.cpp
+@@ -199,13 +199,17 @@ void LLVMCodegen::visit(vyb::ast::ReturnStatement *node) {
+         // process-lifetime "leak" in main is harmless.
+         const bool isMainReturn = currentFunction && currentFunction->getName() == "main";
+         if (!isMainReturn) while (scopeStack.size() > 1) {
+-            // Stop at the function's own top scope (size 1): emptying the stack
+-            // breaks every later registerVariable in this function's codegen
+-            // and corrupts the exit-status plumbing.
++            // Surgical scope: free ONLY the match-scrutinee temps. The blanket
++            // unwind broke borrowed my<Struct> returns (double free) and nested
++            // fixture string chains (storage freed early); the temps are the
++            // drift's actual source and their ownership is unambiguous (the
++            // temp is the call result's only owner).
+             auto& scopeVars = scopeStack.back();
+             for (auto& var : scopeVars) {
+-                if (keepAlive.count(var.name)) continue;
+-                cleanupVariable(var);
++                if (var.name == "__match_tmp" && var.needsCleanup) {
++                    cleanupVariable(var);
++                    var.needsCleanup = false;  // reclaimed here; the scope pop must not re-run it
++                }
+             }
+             scopeStack.pop_back();
+         }
