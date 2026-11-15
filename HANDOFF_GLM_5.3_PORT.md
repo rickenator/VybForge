@@ -605,6 +605,21 @@ target: runtime/vyb_runtime.c __vyb_string_release — retire the slot when
 refs reach <= 0 (or make borrowed registrations not count as live). The
 microbench verifies in seconds; the 45-layer wall is the acceptance test.
 
+**DEEPEST LAYER (traced, next morning)**: the drift is not one leak — it is
+PARTIAL CLEANUP COVERAGE for match-scrutinee temps. One 15.5 MB json_parse
+executes ~450k token-level matches but emits only ~30 match-temp cleanups
+(VYB_STR_TRACE now logs OPTREG <loc> at registration, OPTPAYLOAD at reclaim,
+CLEANUP per temp). The un-covered matches strand their payload strings
+(refs end 1-4; 59,281 of 59,300 generations never retire in the 2-iteration
+micro). Also verified this session: gx_read_index is clean; the leak is
+entirely inside json_parse/st_open; LSan is masked by the program-exit sweep.
+The instrumentation for the coverage audit is all on
+branch diag/str-registry-trace (OPTREG locs + OPTPAYLOAD + CLEANUP +
+REG/REL/RET). The audit: per OPTREG site, count OPTPAYLOAD/CLEANUP firings
+vs executions; the uncovered sites are the fix targets (likely the
+match-inside-loop / match-as-tail-statement paths where the scope-exit
+emission is skipped).
+
 **DRIFT ROOT CAUSE v2 (traced, same evening)**: full-lifecycle tracing
 (VYB_STR_TRACE=1 logs REG/RET/REL per registry op) shows the growth is
 STRANDED RETAINS, not unretired slots of freed memory: each header string's
