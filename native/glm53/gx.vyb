@@ -76,6 +76,10 @@ gx_shard_for(index<String>, name<String>)<Int> -> {
     return n
 }
 
+# (A module-level st_open memo was attempted here and parked: assigning a global
+# StIndex crashed glibc — see the note in gx_resolve_idx. The JsonDoc string leak
+# needs a runtime-side fix first.)
+
 # Resolve every wanted name: index -> shard -> header -> byte range.
 #
 # st_open() parses one shard's header (~8 ms, 1185 tensors). Opening it per NAME was
@@ -111,6 +115,10 @@ gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc>
         if (sh > 0) {
             if (sh != lastsh || ix.n == 0) {
                 path<String> = gx_shard_path(dir, sh, total)
+                # NOTE: a module-level memo (g_stc_ix reassignment) crashes glibc
+                # ("double free or corruption") — global struct assignment appears
+                # to release a value whose strings are still shared. Parked; the
+                # proper fix is JsonDoc string release in the runtime.
                 ix = st_open(path)
                 lastsh = sh
             }

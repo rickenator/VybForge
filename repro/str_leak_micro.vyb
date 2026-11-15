@@ -1,0 +1,69 @@
+# repro/str_leak_micro.vyb — deterministic isolation of the resolve-depth string leak.
+# The 45-layer prefill's registry live-count grows ~6k-770k strings/layer (varies by
+# run); this microbench runs the per-expert loop stages in isolation with a str_stats
+# probe between them, so the leaking stage is named in seconds, not per 20-min run.
+#
+#   VYB_STR_STATS=1 VYBFORGE_GX_DIR=<ckpt> build/vyb repro/str_leak_micro.vyb
+import gx
+import safetensors
+import env::{env_get}
+import io::{open_read, read_at, close}
+
+extern "C" {
+    vyb_str_stats()<CVoid>
+}
+
+stats(tag<String>) -> {
+    println("STAT " + tag)
+    freedom {
+        vyb_str_stats()
+    }
+}
+
+pick_dir()<String> -> {
+    d<String> = ""
+    match (env_get("VYBFORGE_GX_DIR")) { dd -> { d = dd } ? -> { d = "/mnt/apex/rick/vybforge/glm53-checkpoint" } }
+    return d
+}
+
+main() -> {
+    dir<String> = pick_dir()
+    total<Int> = 83
+    lpre<String> = "model.language_model.layers.3."
+    parts<Vec<String>> = Vec()
+    parts.push("gate_proj.mcg")
+    parts.push("up_proj.mcg")
+    parts.push("down_proj.mcg")
+
+    e<Int> = 0
+    while (e < 20) {
+        want<Vec<String>> = Vec()
+        p<Int> = 0
+        while (p < parts.len()) {
+            want.push(lpre + "mlp.experts." + e.to_string() + "." + parts.get(p))
+            p = p + 1
+        }
+        stats("pre-resolve e" + e.to_string())
+        idx<String> = gx_read_index(dir)
+        stats("post-read-index e" + e.to_string())
+        sh<Int> = gx_shard_for(idx, want.get(0))
+        stats("post-shard-for e" + e.to_string())
+        path<String> = gx_shard_path(dir, sh, total)
+        ix<StIndex> = st_open(path)
+        stats("post-st-open e" + e.to_string())
+        t<Int> = st_find(view(ix), want.get(0))
+        stats("post-st-find e" + e.to_string())
+        g<GxLoc> = gx_resolve_idx(idx, dir, total, want)
+        stats("post-resolve e" + e.to_string())
+        r<Int> = 0
+        while (r < want.len()) {
+            if (g.found.get(r) == 1) {
+                b<String> = gx_read(g, r)
+                stats("post-read e" + e.to_string() + " r" + r.to_string())
+            }
+            r = r + 1
+        }
+        e = e + 1
+    }
+    println("done")
+}
