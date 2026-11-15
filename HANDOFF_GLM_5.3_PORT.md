@@ -624,9 +624,17 @@ traces (VYB_STR_TRACE=1) are on main's runtime now. ACCEPTANCE MEASURED:
 the 45-layer wall is UNCHANGED (1308 s vs 1270-1276 pre-fix; resolve mean
 6,705 vs 6,012) — the match-temp fix freed real memory but the wall impact
 persists, confirming the StIndex-transfer strand is the dominant half. The
-branch fix/return-path-cleanup-v2 (a7d1f9f1) is suite-green and safe; not
-merged to main yet (its wall benefit is nil until the transfer strand is
-also fixed — merge then, or now for the memory hygiene).
+branch fix/return-path-cleanup-v2 — the return-path cleanup is now
+COMMITTED (e2bab515: the match-scrutinee temps freed at return, keepAlive
+excludes moved identifiers/select-arms/member bases, main() exempt, the
+unwind stops at the function baseline). Suite 1356/1358: the my_struct
+corruption FIXED; ONE failure remains — test_main_exit_code's runner output
+is garbled (a returned string's storage freed early somewhere in the
+runner's helper chain — the runner is test/run_tests.vyb, string-heavy;
+the unwind's keepAlive covers its visible shapes, so the dangling case
+needs the runner traced with VYB_STR_TRACE=1). NOT merged to main yet —
+merge after the last failure is fixed; the 45-layer acceptance (~1308 ->
+~950 s) follows.
 
 **DEEPEST LAYER (traced, next morning)**: the drift is not one leak — it is
 PARTIAL CLEANUP COVERAGE for match-scrutinee temps. One 15.5 MB json_parse
