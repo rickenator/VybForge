@@ -605,6 +605,23 @@ target: runtime/vyb_runtime.c __vyb_string_release — retire the slot when
 refs reach <= 0 (or make borrowed registrations not count as live). The
 microbench verifies in seconds; the 45-layer wall is the acceptance test.
 
+**RESOLUTION STATUS (next morning)**: two fixes landed and the drift's
+remaining half is precisely bounded. (1) The JsonDoc fix (13293775, on main)
+releases the doc's memory — correct, LSan-clean. (2) The surgical
+return-path cleanup (fix/return-path-cleanup-v2 a7d1f9f1) frees the
+match-scrutinee temps at return — suite 1358/1358, the two earlier failures
+fixed by scoping the unwind to the temps only (the blanket unwind broke
+borrowed my<Struct> returns and helper-chain strings; main() is exempt —
+its serialization tail reads the returned storage). REMAINING: the strand
+persists at +5,928/resolve with the temps freed — the remaining half is the
+st_open -> caller StIndex transfer: each Vec<String> element gains +1
+stranded ref per resolve (the return transfer's retain vs the local
+teardown's release, off by one). The traced evidence: ~6.9 RETs vs ~5.6
+RELs per string per resolve; the ghost refs grow +1/resolve. Next: audit
+the struct-return transfer's element retain (cgen_expr_call / the return
+path in cgen_stmt) against the caller's StIndex teardown release. The
+traces (VYB_STR_TRACE=1) are on main's runtime now.
+
 **DEEPEST LAYER (traced, next morning)**: the drift is not one leak — it is
 PARTIAL CLEANUP COVERAGE for match-scrutinee temps. One 15.5 MB json_parse
 executes ~450k token-level matches but emits only ~30 match-temp cleanups
