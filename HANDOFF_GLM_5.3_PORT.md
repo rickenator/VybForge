@@ -620,7 +620,13 @@ teardown's release, off by one). The traced evidence: ~6.9 RETs vs ~5.6
 RELs per string per resolve; the ghost refs grow +1/resolve. Next: audit
 the struct-return transfer's element retain (cgen_expr_call / the return
 path in cgen_stmt) against the caller's StIndex teardown release. The
-traces (VYB_STR_TRACE=1) are on main's runtime now.
+traces (VYB_STR_TRACE=1) are on main's runtime now. ACCEPTANCE MEASURED:
+the 45-layer wall is UNCHANGED (1308 s vs 1270-1276 pre-fix; resolve mean
+6,705 vs 6,012) — the match-temp fix freed real memory but the wall impact
+persists, confirming the StIndex-transfer strand is the dominant half. The
+branch fix/return-path-cleanup-v2 (a7d1f9f1) is suite-green and safe; not
+merged to main yet (its wall benefit is nil until the transfer strand is
+also fixed — merge then, or now for the memory hygiene).
 
 **DEEPEST LAYER (traced, next morning)**: the drift is not one leak — it is
 PARTIAL CLEANUP COVERAGE for match-scrutinee temps. One 15.5 MB json_parse
