@@ -1,0 +1,69 @@
+// GLM-5.3 tokenizer gate corpus. Run with the GLM env knobs:
+//   VYBFORGE_TOKDIR=artifacts/glm53-tokenizer VYBFORGE_DIGMAX=3 VYBFORGE_TOKIGNORE=1
+// Prints "<label>: [ids]" per prompt for verify_glm_tokenizer.py, plus the
+// encode->decode round trip per prompt (RT ok / X bad).
+import tokenizer::{encode, decode}
+
+share(all) p0()<String> -> { return "I want a disposable container rootfs for CI. What should we decide first?" }
+share(all) p1()<String> -> { return "Add a package to a QEMU x86_64 boot test." }
+share(all) p2()<String> -> { return "Can VybOS already build a kernel and boot it in QEMU?" }
+share(all) p3()<String> -> { return "Name this an ARM64 appliance image host." }
+share(all) p4()<String> -> { return "Apply this configuration to the current machine now." }
+share(all) p5()<String> -> { return "Enable a service on a rescue image with a serial console." }
+share(all) p6()<String> -> { return "Make this target an ARM64 image instead of x86_64." }
+share(all) p7()<String> -> { return "I no longer need interactive console access on a QEMU x86_64 boot test." }
+share(all) p8()<String> -> { return "I want an x86_64 development VM. What should we decide first?" }
+share(all) p9()<String> -> { return "Add a package to an ARM64 appliance image." }
+share(all) p10()<String> -> { return "Name this a rescue image with a serial console host." }
+share(all) p11()<String> -> { return "Enable a service on a QEMU x86_64 boot test." }
+share(all) p12()<String> -> { return "I no longer need interactive console access on an ARM64 appliance image." }
+share(all) p13()<String> -> { return "I want a reproducible server image. What should we decide first?" }
+share(all) p14()<String> -> { return "Add a package to a rescue image with a serial console." }
+share(all) p15()<String> -> { return "Name this a QEMU x86_64 boot test host." }
+share(all) p16()<String> -> { return "Enable a service on an ARM64 appliance image." }
+share(all) p17()<String> -> { return "I no longer need interactive console access on a rescue image with a serial console." }
+// tricky ASCII: contractions, digit runs, punctuation + CRLF, whitespace runs
+share(all) p18()<String> -> { return "The kernel version is 6.12.41, don't you know? It's 2026-11-13." }
+share(all) p19()<String> -> { return "  leading spaces and   multiple   gaps	here
+newline ends: " }
+share(all) p20()<String> -> { return "id=12345 count=007 x9y8z7 3.14159 100%" }
+share(all) p21()<String> -> { return "Hello, world! (parenthetical) [bracketed] {braced} <angled> a/b\\c|d&e*f" }
+share(all) p22()<String> -> { return "line one
+line two
+
+line four	tabbed	end " }
+share(all) p23()<String> -> { return "What's the system's initramfs? It'll be built; we've decided." }
+// non-ASCII divergence probes (expected to be documented, possibly not exact)
+share(all) p24()<String> -> { return "Resume: café naïve résumé — em-dash, ellipsis… done." }
+share(all) p25()<String> -> { return "中文测试：内核配置与引导参数。" }
+share(all) p26()<String> -> { return "emoji test: ok 👍🏽 done" }
+
+main()<Int> -> {
+    texts<Vec<String>> = Vec()
+    texts.push(p0()); texts.push(p1()); texts.push(p2()); texts.push(p3())
+    texts.push(p4()); texts.push(p5()); texts.push(p6()); texts.push(p7())
+    texts.push(p8()); texts.push(p9()); texts.push(p10()); texts.push(p11())
+    texts.push(p12()); texts.push(p13()); texts.push(p14()); texts.push(p15())
+    texts.push(p16()); texts.push(p17()); texts.push(p18()); texts.push(p19())
+    texts.push(p20()); texts.push(p21()); texts.push(p22()); texts.push(p23())
+    texts.push(p24()); texts.push(p25()); texts.push(p26())
+    bad<Int> = 0
+    k<Int> = 0
+    for (k in 0..texts.len() - 1) {
+        src<String> = texts.get(k)
+        ids<Vec<Int>> = encode(src)
+        back<String> = decode(ids)
+        line<String> = k.to_string() + ": ["
+        j<Int> = 0
+        for (j in 0..ids.len() - 1) {
+            if (j > 0) { line = line + "," }
+            line = line + ids.get(j).to_string()
+        }
+        line = line + "] RT"
+        if (back == src) { line = line + " ok" } else { line = line + " X"; bad = bad + 1 }
+        println(line)
+    }
+    println(texts.len().to_string() + " prompts, rt_bad=" + bad.to_string())
+    if (bad == 0) { println("GLM_TOKENIZER_RT_OK") } else { println("GLM_TOKENIZER_RT_FAIL") }
+    return 0
+}
