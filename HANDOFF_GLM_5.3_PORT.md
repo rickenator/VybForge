@@ -620,6 +620,21 @@ vs executions; the uncovered sites are the fix targets (likely the
 match-inside-loop / match-as-tail-statement paths where the scope-exit
 emission is skipped).
 
+**MECHANISM v3 (final, next morning)**: coverage is actually COMPLETE for
+every OPTREG site (per-site CLEANUP counts all >= 1) — the real defect is the
+CLEANUP's TIMING: the doc's strings retire ONE FULL ITERATION LATE (trace:
+iteration N's strings release after iteration N+1's REGs). The match-temp's
+cleanup IR lands in a CFG block that executes a full loop iteration after the
+binding's scope exit (match-end/loop-latch placement), so in a loop every
+snapshot catches one full iteration of strings stranded, and in the 45-layer
+driver the releases only happen at program exit (the table grows to 64M slots
+mid-run; RSS stays bounded because the buffers are freed late, not never).
+MINIMAL REPRO: VYB_LEAK_STAGE=small VYB_LEAK_ITERS=3 repro/str_leak_micro.vyb
+-> live 14/20/26 (+6/iteration, deterministic, seconds). FIX: emit the
+match-temp payload reclaim into the match's own end block (or the binding's
+scope-exit block), not wherever cleanupVariable's insert point lands after
+the loop back-edge. The registry itself is exonerated completely.
+
 **DRIFT ROOT CAUSE v2 (traced, same evening)**: full-lifecycle tracing
 (VYB_STR_TRACE=1 logs REG/RET/REL per registry op) shows the growth is
 STRANDED RETAINS, not unretired slots of freed memory: each header string's

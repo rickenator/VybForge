@@ -5,6 +5,7 @@
 #
 #   VYB_STR_STATS=1 VYBFORGE_GX_DIR=<ckpt> build/vyb repro/str_leak_micro.vyb
 import gx
+import json_parse::{json_parse}
 import safetensors
 import env::{env_get}
 import io::{open_read, read_at, close}
@@ -35,8 +36,12 @@ main() -> {
     parts.push("up_proj.mcg")
     parts.push("down_proj.mcg")
 
+    stage<String> = ""
+    match (env_get("VYB_LEAK_STAGE")) { sg -> { stage = sg } ? -> { stage = "full" } }
+    iters<Int> = 10
+    match (env_get("VYB_LEAK_ITERS")) { it -> { iters = it.to_int() } ? -> { } }
     e<Int> = 0
-    while (e < 10) {
+    while (e < iters) {
         want<Vec<String>> = Vec()
         p<Int> = 0
         while (p < parts.len()) {
@@ -45,15 +50,29 @@ main() -> {
         }
         stats("pre-resolve e" + e.to_string())
         idx<String> = gx_read_index(dir)
-        g<GxLoc> = gx_resolve_idx(idx, dir, total, want)
-        stats("post-resolve e" + e.to_string())
-        r<Int> = 0
-        while (r < 1) {
-            if (g.found.get(r) == 1) {
-                b<String> = gx_read(g, r)
-                stats("post-read e" + e.to_string() + " r" + r.to_string())
+        g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
+        if (stage == "index") {
+            stats("post-index e" + e.to_string())
+        } else if (stage == "small") {
+            match (json_parse("{\"a\": \"value-one\", \"b\": \"value-two\", \"c\": \"value-three\"}")) {
+                d -> { println("small parsed " + d.nodes.len().to_string()) }
+                ? -> { println("small failed") }
             }
-            r = r + 1
+            stats("post-small e" + e.to_string())
+        } else if (stage == "parse") {
+            match (json_parse(idx)) { d -> { println("parsed " + d.nodes.len().to_string()) } ? -> { println("parse failed") } }
+            stats("post-parse e" + e.to_string())
+        } else {
+            g = gx_resolve_idx(idx, dir, total, want)
+            stats("post-resolve e" + e.to_string())
+            r<Int> = 0
+            while (r < 1) {
+                if (g.found.get(r) == 1) {
+                    b<String> = gx_read(g, r)
+                    stats("post-read e" + e.to_string() + " r" + r.to_string())
+                }
+                r = r + 1
+            }
         }
         e = e + 1
     }
