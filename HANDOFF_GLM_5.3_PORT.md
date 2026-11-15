@@ -594,6 +594,17 @@ module-level struct (an st_open memo attempt) crashed glibc — global struct
 reassignment appears to release values whose strings are still shared; repro
 recipe in the gx.vyb parked note.
 
+**FOLLOW-UP (same evening)**: the optional-payload cleanup fix LANDED in Vyb
+main (13293775, LSan-clean, suite 1358/1358) — real memory is now released —
+but the registry LIVE-COUNT growth persists (+11,856/resolve iteration on the
+fixed build, LSan clean). So the drift is NOT unreleased memory: registry
+slots never RETIRE. Likely path: strings registered via the borrowed variant
+(refs=0) released once — fetch_sub gives 0, the retire condition is old==1,
+so the slot stays live forever while the buffer is freed elsewhere. Fix
+target: runtime/vyb_runtime.c __vyb_string_release — retire the slot when
+refs reach <= 0 (or make borrowed registrations not count as live). The
+microbench verifies in seconds; the 45-layer wall is the acceptance test.
+
 **Deployment capacity/bandwidth math (measured + derived, 2026-11)**: the engine is weight-
 streaming — compute is nearly free, and a token's speed = aggregate memory bandwidth / bytes
 touched per token. GLM-5.3-Flash stores 164 GB but touches only ~27 GB/token (8 of 288 experts
