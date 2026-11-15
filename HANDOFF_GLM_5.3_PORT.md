@@ -575,6 +575,25 @@ reads on the first pass, partly adjacent to the known String-registry resolve dr
 its root cause is its own investigation. Note the layer-4 gate CANNOT see either
 effect — depth effects need the full 45-layer run (12+ layer rule applies doubly).
 
+**Resolve-depth drift ROOT-CAUSED (2026-11-14, evening)**: the drift is a string
+leak, measured deterministically by `repro/str_leak_micro.vyb` (isolation in
+seconds, not per 20-min run). `st_open` leaks ~5,930 registry strings per
+1185-tensor header parse, and `gx_resolve_idx` re-opens the SAME shard per call
+(~109 calls/layer) -> ~646k leaked strings/layer -> the registry table grows to
+64M slots -> every string op turns cache-miss-heavy (resolve 2.3 -> 11 s/layer).
+Root cause: json_parse returns JsonDoc by value and function-returned structs
+never get return-transfer cleanup (the codegen's isOwnedStruct is 'resolved
+lazily at cleanup / return-transfer time' and never resolves for returned
+values) — the doc's ckey keys and nested JNode.sval strings all leak. A Vyb-
+level json_free cannot fix it (strings reachable from Vyb code are retained
+copies; the doc's own refs are only reachable via codegen cleanup). Fix target:
+src/vre/llvm/cgen_ownership.cpp return-transfer cleanup for structs owning
+Vec<String> / Vec<struct-with-String>. Expect the 45-layer wall to drop from
+~1250 s toward ~950 s after the fix. SECOND finding parked with it: assigning a
+module-level struct (an st_open memo attempt) crashed glibc — global struct
+reassignment appears to release values whose strings are still shared; repro
+recipe in the gx.vyb parked note.
+
 **Deployment capacity/bandwidth math (measured + derived, 2026-11)**: the engine is weight-
 streaming — compute is nearly free, and a token's speed = aggregate memory bandwidth / bytes
 touched per token. GLM-5.3-Flash stores 164 GB but touches only ~27 GB/token (8 of 288 experts
