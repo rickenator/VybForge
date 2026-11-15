@@ -563,9 +563,12 @@ absorption) was implemented in the Vyb repo, branch `fix/pool-alloc-regression`
 (d209b613, pushed): prefill4 deq 13753 -> 7304 ms / resolve 1796 -> 1134 ms (baseline
 7088/1056), 45-layer prefill stable, suite 1358/1358 + ctest 4/4. NOT yet merged to
 main; the build-release tree builds it, `build/vyb` is untouched. TWO open findings
-from the work: (1) the generated code has a latent double-free/use-after-free the
-leaky free masked (crashed the pool at layer ~33 until absorbed) — the real fix is in
-the codegen ownership classification, likely in 7ff7b9e0's isFreshNonAliasingCall;
+from the work: (1) ~~the generated code has a latent double-free/use-after-free~~
+DISPROVEN — the depth crashes were the pool's own class-exhaustion bug (bucket walk
+overran to a 16-GiB class; clamped), and four consecutive 45-layer runs with the
+reclaim enabled complete clean with zero absorbed double frees; the real fix is in
+the pool, already on the branch (00e9ec26 adds a VYB_NO_DISCARD_FREE diagnostic knob
+and a DOUBLE FREE tripwire);
 (2) a depth-dependent slowdown remains even pooled (deq/resolve inflate with layer
 index; 45-layer wall 1249-1274 s vs the 914 s leaky baseline) — partly cold shard
 reads on the first pass, partly adjacent to the known String-registry resolve drift;
