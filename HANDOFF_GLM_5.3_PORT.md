@@ -1568,3 +1568,27 @@ Measured rate on the live run: **3.9 s/expert -> ~18.6 min per MoE layer**, i.e.
 `timeout 86400` (24 h); the first attempt's log is kept as
 `native/out/prefill45_attempt1_12h_cap.log` (it reached layer 4). Relaunched 11:05, pid 3720445,
 live log `native/out/prefill45.log`, ETA ~00:35 next day (PREFILL_OK layers=45).
+
+### PERF (2026-11-16, after Rick's "13.5 h? what is the slowdown?"): MoE resolve was 85-99% of the run
+Measured with new timers (`DEQT` per deq in the gate, `MMT` per mm_host, `EXPT` per expert;
+`T_MOE` already existed in the prefill):
+```
+gate, 109 experts:  resolve 132.3 s (84.8%) | deq3 10.5 s (6.7%) | mm 12.9 s (8.2%)
+prefill layer 3:    T_MOE resolve=1145661 ms  deq=9804 ms  mm=503 ms
+inside one resolve:   stopen=757 ms   scan=0 ms   stfind=1 ms
+```
+So the 13.5 h was **st_open()**: the shard's safetensors header was re-parsed once per expert
+(288 x 0.757 s = 3.6 min/layer; the prefill paid 3 shard opens per expert). The 15.5 MB index scan
+was not the cost once narrowed to the layer's ~400 KB expert block.
+
+Fix (gx.vyb + both MoE drivers): `gx_expert_window` (one scan -> the layer's expert block),
+`gx_resolve_ix` (resolve against a caller-owned, already-open StIndex — no globals, which crash),
+`gx_resolve_maybe` (cached header + fallback for the ~2-in-288 experts that straddle two shards).
+Both drivers now keep ONE open header and re-open only on a shard change (3 per layer).
+
+Result: gate 156 s -> **27.6 s** (`L3_MOE_ALL_VYB: OK`, identical digests); prefill NLAYERS=4 wall
+**85 s**, T_MOE resolve 1145661 -> **12542 ms (91x)**, `PREFILL_OK layers=4`. Full 45-layer run
+relaunched 11:33: now ~3-4 min per MoE layer (~2-2.8 h) instead of ~18.6 min (13.5 h).
+Remaining per-MoE-layer split: deq 8.5-9.2 s (exl3hgen 8.7 + had1 8.9 ms/deq are the two hottest
+kernels), mm 0.4 s, and ~2-3 min of NON-MoE layer work (attention/GDN/dense streaming/digests) —
+that is the next profiling target, not the MoE loop.
