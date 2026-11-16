@@ -1106,6 +1106,21 @@ garbage retained_pool counter). NEXT: run the l3moeall gate
 (glm_l3_moe_all.vyb + verify_l3_moe_all.py — the standalone expert
 path) with the same M/N/K print, and compare od's bounds against the
 deq kernel's expected output extent for ntiles/cw.
+   BISECTED TO THE COMMIT (glm3all): 13293775 + 50e1f2c6 (Vec clones)
+PASSES the MoE gate (exit 0); adding 5520f9de (the struct call-result
+clones) BREAKS it (ALL_FAIL deq, expert index varies). The struct
+deep-copy of the call-result GxLoc (5 Vec<Int> + 2 Vec<String>
+fields) in the 109-expert resolve loop corrupts memory — the
+long-suspected generateStructDeepCopy sizing/copy bug, NOT the
+aliasing it fixed (without the clone the L0 gate's g read garbage;
+with it the MoE loop corrupts). BOTH facts hold: the aliasing is real
+AND the deep copy is broken. NEXT: audit generateStructDeepCopy
+(cgen_ownership.cpp) against GxLoc — per-field copy of Vec<Int>
+(POD elements, no retain needed) vs Vec<String> (element retains) and
+the sizing; test a standalone repro (a function returning a struct
+with Vec<Int>+Vec<String> fields, assigned, looped 100x, digested)
+before re-running glm3all. Interim option: keep the struct clone for
+correctness (the L0 gate needs it) and fix the deep copy.
    MOE-GATE ISOLATION DONE (make glm3all / gold via ~/venvs/exl3/bin
 python — note the oracle needs `env -i HOME=$HOME PATH=/usr/bin:/bin`
 or the hermes venv's numpy poisons the import): **the standalone MoE
