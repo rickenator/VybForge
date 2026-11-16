@@ -1122,6 +1122,18 @@ f624030c (extraction copy + free routing). Bisect these against
 `glm3all` next; the driver probes (EXL3FAIL/DEVMEM) are in
 glm_prefill.vyb only — copy them into glm_l3_moe_all.vyb's exl3_deq
 copy for the bisect runs.
+   BISECT PROGRESS (glm3all): 13293775 (optional-payload scope-exit
+release) PASSES; a7d1f9f1 (the return-path match-temp cleanup) FAILS.
+Removing the return-path cleanup from HEAD did NOT fix the gate
+(still ALL_FAIL deq, expert 20 — so a SECOND regression exists in the
+window, most likely the site-8/paired-retain return-transfer
+refcounting (0bcb3af5/47707da7) stranding the expert resolve's
+Strings — the stale-buffer family again). The cleanup removal was
+REVERTED to keep the suite-green state (1358/1358 + all the clone
+fixes). The bisect must continue commit-by-commit across
+a7d1f9f1..4ae941da with the glm3all gate (each build ~2 min, each
+run ~1 min); the failing expert index varies per run
+(7/12/20/22/28/51/87) — treat ANY ALL_FAIL/segfault as a failure.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
