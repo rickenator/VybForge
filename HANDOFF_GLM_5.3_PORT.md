@@ -813,8 +813,16 @@ final split): inside digest(), right after the entry, print v.get(0) —
 if it prints -0.000312805 (correct), the corruption happens inside the
 digest's loop (the accumulation or the census's variables); if it prints
 -3.4e8, the param's copy's buffer contents changed between the VECCOPY
-verify and the body's reads (a write through a stale alias). Then: the
-L0 gate, the 45-layer run, the suite.
+verify and the body's reads (a write through a stale alias). DONE:
+**DIGESTENTRY x v0=-0.000312805 — the param's copy is CORRECT inside the
+digest.** The census reads garbage -> the buffer is PARTIALLY OVERWRITTEN
+DURING the digest's loop ([0] stays correct, [i>0] turns to garbage): an
+allocation reuses or stomps the param buffer mid-loop. NEXT: with
+VYB_STR_TRACE, watch the param buffer's address during the digest's
+execution (the FREE-F/QUAR-ABSORB/VECCOPY lines between DIGESTENTRY x
+and the census line) — the stomping allocation names itself. This is the
+last gap; every other link is verified. Then: the L0 gate, the 45-layer
+run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
