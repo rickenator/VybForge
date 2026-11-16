@@ -1387,3 +1387,68 @@ spare ports) and is not worth pulling.
   a function's closing brace, not to the next function you remember, and expect a copied
   prelude to re-zero parameters and to arrive untyped.
 - Reports want HOST + FULL path per artifact; apex NFS (`/mnt/apex/rick`) is the landing zone.
+
+---
+
+# SESSION 2026-11-15/16 — STATE AT HANDOFF (read this first for the GLM port)
+
+## Environment facts (verified tonight; save time)
+- The compiler binary is `~/Projects/Vyb/build-release/vyb` — **`~/Projects/Vyb/build/vyb` DOES NOT EXIST**
+  (its rebuild was terminated); `build-merge-check/vyb` is the Oct 29 pre-session binary used as the
+  regression baseline.
+- The Python oracle needs a clean env: `env -i HOME=$HOME PATH=/usr/bin:/bin ~/venvs/exl3/bin/python`
+  — the Hermes venv's numpy (py3.14) poisons the import otherwise.
+- Heavy runs get OOM-killed by the gateway cgroup at 4 GiB: wrap in
+  `systemd-run --user --scope -q -p MemoryMax=80G timeout 3000 <cmd>`.
+- Long background jobs also need an explicit `timeout N` prefix (the worker TERMs ~285 s without one).
+- `VYB_STRQ_OFF=1` (runtime switch) bypasses the retired-buffer quarantine for A/B — the quarantine
+  is ~unused by this driver (verified: <1000 pushes/run), so the switch is only a bisect tool.
+- Probes live in `native/host/glm_prefill.vyb` (DIGESTENTRY/BDPROBE/DEVMEM/EXL3FAIL/MMSYNC/DEQFAIL/
+  G9PROBE/L0_UNFOUND) and `native/host/glm_l3_moe_all.vyb` (ROUTE/GEXL3FAIL). The oracle-side gates:
+  `make -C native glm3all` (build with `-C native ... VYB=~/Projects/Vyb/build-release/vyb` if the
+  ptx rule fires) and the L0/prefill runs as documented below.
+
+## What is DONE and verified
+- Suite: **1358/1358 green** (Vyb `4dff29ec` — the return-path cleanup no longer pops the
+  compile-time scopeStack; the runner's opt() borrow-return fixed).
+- L0 gate: green at NLAYERS=2 (both layers, attn len 360448, zero FAILs).
+- The 83 GB OOM: **solved** — the driver's `dumps()` was an O(n²) concat (~360 GB churn/call);
+  `dump_to()` streams 32 KB chunks. 2-layer gate now 12.6 s / 2.7 GB peak (was 2.5+ min / 83.6 GB).
+- The `builtin` stale-release kill (Vyb `4ae941da`), struct call-result clones (`5520f9de`),
+  Vec call-result clones (`50e1f2c6`), the fd dangling-return fix (VybForge `069a2a3`).
+
+## What is OPEN (the one blocker)
+**The 45-layer run dies in layer 3's MoE.** Evidence chain:
+1. Bisect (glm3all gate): Oct 29 binary PASSES (`MOE_ALL_OK experts=109`); `13293775`+Vec-clones
+   passes; **+`5520f9de` (struct call-result clones) FAILS** → the struct `GxLoc` deep copy is the
+   trigger.
+2. Failure mode: device Xid 31 MMU faults (journalctl -k | grep Xid) from the fd-dangling era;
+   after the fd fix, `rc=2` (context dead) at ~expert 12 with device use flat at 2.75 GB and NO new
+   Xid → **host-side corruption of the CUDA driver's context state** (heap stomp), consistent with
+   the struct deep-copy bug corrupting adjacent host heap (also explains the garbage
+   `retained_pool=3.65e17` counter).
+3. `repro/struct_clone_loop.vyb` (GxShape loop, 109×) PASSES — the simple shape is not enough; the
+   real path's JsonDoc-derived `Vec<String>` fields / the 15.5 MB idxtext / per-expert st_open are
+   required.
+
+## Next steps in order (fresh session)
+1. Extend `repro/struct_clone_loop.vyb` to build its `Vec<String>` fields from a parsed JsonDoc
+   (mirror `gx_resolve_idx`'s construction) and loop 109× — expect the corruption in seconds.
+2. Fix `generateStructDeepCopy` (cgen_ownership.cpp:1811) for that case: the per-field Vec<String>
+   element retain vs the doc's teardown; also audit the assignment-site arm in cgen_expr.cpp:1259.
+3. Verify: repro → `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,
+   1358/1358) → the 45-layer run:
+   `VYBFORGE_GX_DIR=/usr/export/rick/vybforge/glm53-checkpoint VYBFORGE_PREFILL_OUT=... timeout 3000
+   systemd-run --user --scope -q -p MemoryMax=80G <binary> --module-path native/json --module-path
+   native/torchload --module-path native/glm53 --module-path native/kernels --module-path
+   native/tensor --module-path ~/Projects/Vyb/bindings/cuda --module-path
+   ~/Projects/Vyb/stdlib/collections native/host/glm_prefill.vyb`
+   (expect ~36 s/MoE layer, peak ~4.6 GB host; PREFILL_OK at the end).
+4. Merge `fix/return-path-cleanup-v2` → Vyb main (ruleset PUT → merge → re-enable) and decide which
+   driver probes to keep.
+
+## Branch/commit map
+- Vyb: `fix/return-path-cleanup-v2` @ `4dff29ec` (suite green; not merged). Session commits:
+  0bcb3af5, 1f679169, 1c2fce65, f624030c, 47707da7, 50e1f2c6, 5520f9de, 4ae941da, 4dff29ec.
+- VybForge main: `31962be` (diag: Xid 31) and `069a2a3` (fd fix) and the rest of the session's
+  diag/fix commits above them.
