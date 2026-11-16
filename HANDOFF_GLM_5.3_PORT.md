@@ -1072,6 +1072,26 @@ GxLoc/idxtext in the expert loop is the struct-clone family). The
 EXL3FAIL/DEVMEM probes and the dump_to fix are all committed; the
 45-layer run gets through layers 0-2 + layer 3's attention with
 bounded host memory.
+   REFINED AGAIN: sync+rc after each exl3_deq launch (deq/hgen/had1/
+had2) never fires — the fault is NOT in exl3_deq's own kernels; the
+MMSYNC probe in mm_dev (cuCtxSynchronize rc after each gemm) fires
+rc=700 on an expert-loop matmul. Runs are nondeterministic in HOW the
+poisoned context dies: sticky 700s (most runs) or rc=2
+NOT_INITIALIZED mid-run (the primary context destroyed by the fatal
+fault). The faulting kernel is one of: the expert-loop gemms (MMSYNC
+prints M/N/K now), the layer-3 attention kernels (which complete —
+attn-done=3 — but their async fault could surface later), or the
+exl3 staging kernels (exonerated by the per-launch syncs).
+   NEXT: (1) the MMSYNC M/N/K print names the matmul shape — run
+NLAYERS=4 again; (2) better isolation: the dedicated MoE gate
+(glm_l3_moe_all.vyb + verify_l3_moe_all.py, make l3moeall) runs the
+expert path standalone — if it faults, bisect ITS kernels; if it
+passes, the fault is in the full driver's layer-3 state (attention
+kernels or the layer-2 -> layer-3 handoff). (3) An alternative class:
+the gemm over `sub`/`act` rows where nt=0 or a stale gather — the
+gather sub<Vec> per expert is built from the router output; a stale
+router value (the struct/borrow family again) could zero/poison the
+gemm shape.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
