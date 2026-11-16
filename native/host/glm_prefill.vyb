@@ -246,12 +246,15 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     freedom {
         var<Int> q = 0
         var<Int> o = 0
-        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
-        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { println("DEQFAIL alloc q len=" + raw.len().to_string()); return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { println("DEQFAIL alloc o n=" + n.to_string()); return 0 }
+        hrc<Int> = cuMemcpyHtoD_v2(q, raw, raw.len()) as Int
+        if (hrc != 0) { println("DEQFAIL htod rc=" + hrc.to_string() + " len=" + raw.len().to_string()); return 0 }
 
         blocks<Int> = (n + 255) / 256
-        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
+        lrc<Int> = cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) as Int
+        if (lrc != 0) {
+            println("DEQFAIL launch rc=" + lrc.to_string() + " blocks=" + blocks.to_string() + " len=" + raw.len().to_string())
             return 0
         }
         cuCtxSynchronize()
@@ -1828,7 +1831,15 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
         if (g.found.get(i) == 1) { nf = nf + 1 }
         i = i + 1
     }
-    if (nf != want.len()) { println("L0_FAIL resolve " + nf.to_string()); return nonev }
+    if (nf != want.len()) {
+        i = 0
+        while (i < want.len()) {
+            if (g.found.get(i) != 1) { println("L0_UNFOUND " + want.get(i)) }
+            i = i + 1
+        }
+        println("L0_FAIL resolve " + nf.to_string())
+        return nonev
+    }
 
     if (tensor_init() != 0) { println("L0_FAIL no cuda"); return nonev }
     fgemm = load_fn("native/build/gemm.ptx", "gemm")
@@ -2032,6 +2043,9 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     println(digest("delta", att))
     lines = lines + digest("delta", att) + "\n"
 
+    println("G9PROBE found=" + g.found.get(9).to_string() + " off=" + g.off.get(9).to_string() +
+            " nbytes=" + g.nbytes.get(9).to_string() + " pathlen=" + g.paths.get(9).len().to_string() +
+            " path=" + g.paths.get(9))
     d_onorm = deq_bf16(fbf, gx_read(g, 9), KD, 0)
     if (d_onorm == 0) { return nonev }
     onorm<Vec<Float>> = bulk_dtoh(d_onorm, KD)

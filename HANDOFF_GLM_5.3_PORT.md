@@ -919,7 +919,49 @@ traced run — the bdtrace.log shows size=90112 cap=131072 for the x's
 clone: correct); (2) the digest's function entry: print v.len() as the
 first statement — if it prints 180224, the size field was already
 doubled at the binding; if 90112, the doubling happens inside the
-digest. DONE: **DIGESTENTRY x len=90112 — the size is NOT doubled.** The
+digest. DONE: **DIGESTENTRY x len=90112 — the size is NOT doubled.**
+
+**2026-11-15 (evening) — the x-scale trail was a PHANTOM; the real bug
+found and half-fixed.** The x digest (x n=90112 sum=-3692488466944 ...)
+is byte-identical in EVERY log including the Oct 30 PASSING 45-layer
+run (prefill45_bulk.log) — the embeddings were always correct and that
+digest IS the historical pin. "L0_FAIL resolve 21" is a resolve COUNT
+(nf=21 of want.len()=24 in kda_attn_site), not a digest value; the
+"1600x scale" theory is dead. Two real bugs, in order:
+
+1. **FIXED (Vyb 5520f9de, branch fix/return-path-cleanup-v2)**: a
+   call-result STRUCT assigned to a binding was stored shallowly — the
+   callee's cleanup reclaims the returned struct's owned field buffers,
+   so `g<GxLoc> = gx_resolve(...)` aliased freed storage (G9PROBE:
+   found=25, off=garbage, path=binary junk, from field index 9 on).
+   Fixed by adding the CallExpression arm to the struct deep-copy gates
+   at cgen_decl.cpp:376 and cgen_expr.cpp:1259 (mirrors 50e1f2c6's Vec
+   arm). With it: **the L0 gate's layer 0 passes fully** (attn len
+   360448, all digests sane).
+2. **REMAINING**: at layer 1, 3 of the 24 freshly-concatenated want
+   names are STALE STRINGS (L0_UNFOUND prints other layers' names,
+   truncated — the recycled-registry-address class: a stale release
+   kills the new string at a recycled slot, its buffer is freed, reads
+   show the previous occupant). The fix is the documented registry
+   defense-in-depth: __vyb_string_release must verify the slot's
+   generation/identity before retiring (runtime/vyb_runtime.c — the
+   registry is Rick's design; coordinate). The 4096-entry quarantine
+   cannot cover it (eviction recycles addresses within one layer).
+
+Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
+DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
+G9PROBE (the GxLoc field dump before the o_norm read). The suite
+RUNNER is broken on this build (1354/1358 false FAILs — its documented
+helper-chain string bug; the compiler itself passes a direct sample).
+L0 run command: `cd <VybForge> && VYB_STDLIB=~/Projects/Vyb/stdlib
+VYB=~/Projects/Vyb/build-release/vyb VYBFORGE_GX_DIR=/usr/export/rick/
+vybforge/glm53-checkpoint VYBFORGE_NLAYERS=2 $VYB --module-path
+native/json --module-path native/torchload --module-path native/glm53
+--module-path native/kernels --module-path native/tensor
+--module-path ~/Projects/Vyb/bindings/cuda --module-path
+~/Projects/Vyb/stdlib/collections native/host/glm_prefill.vyb`.
+NOTE: build/vyb is MISSING (its rebuild was terminated); build-release
+(Nov 15 18:34 + 5520f9de) is the current diag build. The
 digest iterates 90112 elements and still reads garbage values (v0=-3.4e8
 vs the verified -0.000312805). So the x binding's BUFFER is freed and
 reused between the clone and the digest — a stale buffer read, the same
