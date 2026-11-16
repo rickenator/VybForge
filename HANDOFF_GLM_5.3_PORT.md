@@ -791,6 +791,18 @@ and digest("x", x). NEXT: instrument the digest's param copy (the size
 at entry) and the clone's {ptr,size,cap} triple as stored — find where
 size 90112 becomes 180224 (the clone's size field vs the digest's copy
 sizing). This is now a size-field corruption, not a content corruption.
+**ROOT CAUSE FOUND (addrwatch, the second 90112 dst):** the digest's
+param copy shows TWO VECCOPYs at the SAME dst (the by-value Vec param is
+deep-copied TWICE — matching the 2x warning), then FREE-EVICT freed that
+buffer while the digest's param still referenced it. THE MECHANISM: the
+first copy's cleanup frees the buffer the second copy's data lives in
+(the pool reuses the address), the quarantine holds it, the ring
+eviction frees it under the live binding -> the stale read. THE FIX:
+the by-value Vec param must be deep-copied ONCE — find the two copy
+sites (the call's argument preparation AND the param's binding copy in
+cgen_decl/cgen_expr_call) and drop one. This also explains the 2x
+deep-copy perf cost on every kernel-boundary call. Then: the L0 gate,
+the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
