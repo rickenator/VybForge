@@ -880,8 +880,16 @@ is right but the decimal exponent is shifted by ~13 for values ~1e0
 The whole memory-corruption theory for the census is DEAD — the x data,
 the clone, the reads, and the accumulation are all correct. THE FIX: the
 f64->string dtoa in the runtime (the decimal-exponent computation for
-the ~1e0 range). Then: the L0 gate (the digest's numbers will finally be
-meaningful), the 45-layer run, the suite.
+the ~1e0 range). CORRECTION: the runtime's __vyb_float_to_string is
+snprintf("%g") — correct. So the digest's s is CLOBBERED between the
+loop's end (-3.35685, the last ONSET) and the return's string-build (the
+to_string receives -3.7e12). The ratios differ per number (not a constant
+formatting shift), so these are genuinely different values in the s/a
+locals at build time. NEXT: probe the s's value between the two loops
+and just before the return's to_string (the ONSET-style prints) to catch
+the clobbering write — the suspects: the second (hv) loop's locals under
+the new unwind, or the string-build's temporaries aliasing the frame.
+Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
