@@ -577,9 +577,17 @@ hypothesis DISPROVEN: the gate diagnostic (RECLAIM-vec-elem, a83e69a6) proves
 reclaimOwnedStructAt's Vec<struct> branch DOES emit the per-element owned-
 field reclaim for Vec<JNode> (known=1 owned=1) — that site is NOT the strand.
 The strand is elsewhere: the remaining +1/element/resolve retain still
-unidentified. NEXT PROBE: the site-tagged RET/REL trace (add the return-
-address/site to the RET/REL prints in __vyb_string_retain/release) to name
-the retaining site. Verify: the microbench stage=full live flat; then the
+unidentified. THE SITE-TAGGED TRACE IS BUILT (a83e69a6+ on the branch): 12
+emitStrSiteMarker call sites in the codegen (1=decl-init 2=param 3=struct-
+field 4=assign 5=expr-payload 6=deepcopy 7=? 8=return-transfer 9=match-arm
+10=vec-push 11=vec-growth 12=vec-copy) + __vyb_str_site in the runtime +
+the JIT symbol wired. PARSE-STAGE RESULT: net +450K refs/iter; the candidate
+retain sites: 8 return-transfer (600K retains), 9 match-arm (300K), 10
+vec-push (300K), 3 struct-field (300K); the aggregate cannot disambiguate
+which release is missing — NEXT: the per-pointer lifecycle attribution (the
+strand = the pointer whose RET count exceeds REL by the strand) to name the
+exact site. NOTE: the full stage SEGFAULTS with the markers present (open;
+the parse stage is clean). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
 effect — depth effects need the full 45-layer run (12+ layer rule applies doubly).
 
