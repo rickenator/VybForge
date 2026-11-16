@@ -246,6 +246,7 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
         if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
         if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
         if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+
         blocks<Int> = (n + 255) / 256
         if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) {
             return 0
@@ -2401,6 +2402,9 @@ main()<Int> -> {
     var<Int> d_x = 0
     d_x = deq_bf16(fbf, raw_emb, R * H, 0)
     if (d_x == 0) { println("L0_FAIL emb deq"); return 10 }
+    # value probe: the device's first output f64 as the kernel wrote it
+    dv0<Vec<Float>> = bulk_dtoh(d_x, 1)
+    println("DV0 " + dv0.get(0).to_string())
     x<Vec<Float>> = bulk_dtoh(d_x, R * H)
     free_dev(d_x)
     println(digest("x", x))

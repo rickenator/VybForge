@@ -770,9 +770,17 @@ call-result clone (50e1f2c6) of the DtoH's contents. NEXT PROBE
 (value-level): inside deq_bf16's freedom block, after the HtoD, do a
 DtoH of the FIRST 8 bytes back and print the f64 (the raw's first value
 as the device sees it) — that splits the HtoD from the kernel in one run;
-and inside bulk_dtoh after the DtoH, print at(dp)'s first f64. The x's
-garbage is DETERMINISTIC (the same v0=-343932928 across the runs), so
-whichever link flips the bits does it consistently. Also
+and inside bulk_dtoh after the DtoH, print at(dp)'s first f64. DONE —
+**DV0 = -0.000312805**: the device's first output f64 is a perfectly
+plausible embedding value — THE KERNEL, THE HtoD, AND THE RAW ARE ALL
+EXONERATED. The corruption is in the FULL-SIZE bulk_dtoh->clone handoff
+(the probe's n=1 works; the x's n=90112 path yields the deterministic
+garbage). The candidates: the bulk_dtoh's buffer growth across 90112
+pushes (the realloc chain vs the dp read), the DtoH's 720896-byte write,
+or the clone's interaction with the grown buffer. NEXT: inside
+bulk_dtoh, right after the DtoH, print r.get(0) (the Vyb-level read of
+the just-written buffer) — if it is correct there, the clone/copy is the
+last link; if wrong, the DtoH's destination moved during the pushes. Also
 noted: "L0_FAIL weight deq" appeared in the last run where the attention
 previously reached — likely device-memory exhaustion from the prior
 aborted runs (re-run on a clean GPU state to confirm). The probe edits
