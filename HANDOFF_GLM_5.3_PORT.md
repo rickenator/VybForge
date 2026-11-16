@@ -780,7 +780,17 @@ pushes (the realloc chain vs the dp read), the DtoH's 720896-byte write,
 or the clone's interaction with the grown buffer. NEXT: inside
 bulk_dtoh, right after the DtoH, print r.get(0) (the Vyb-level read of
 the just-written buffer) — if it is correct there, the clone/copy is the
-last link; if wrong, the DtoH's destination moved during the pushes. Also
+last link; if wrong, the DtoH's destination moved during the pushes.
+DONE: **BDPROBE r0=-0.000312805 at n=90112** — the buffer is CORRECT
+inside bulk_dtoh at full size; AND the x's clone ran and verified
+byte-perfect (VECCOPY size=90112 cap=131072, VECCOPY-OK bytes=720896,
+zero mismatches). Yet the census reads garbage. THE LEAD: the digest's
+own deep-copy warning says "1441792 bytes" = 180224 elements = **2x the
+x's size** — the x's element count doubles somewhere between the clone
+and digest("x", x). NEXT: instrument the digest's param copy (the size
+at entry) and the clone's {ptr,size,cap} triple as stored — find where
+size 90112 becomes 180224 (the clone's size field vs the digest's copy
+sizing). This is now a size-field corruption, not a content corruption. Also
 noted: "L0_FAIL weight deq" appeared in the last run where the attention
 previously reached — likely device-memory exhaustion from the prior
 aborted runs (re-run on a clean GPU state to confirm). The probe edits
