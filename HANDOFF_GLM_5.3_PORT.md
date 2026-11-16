@@ -857,16 +857,20 @@ has ~1e-2-magnitude varied embeddings — extend the repro to
 0.001*(i%1000)) and (e) the DtoH-written source (the repro's buffer is
 push-built; the real x's buffer is written by the device read-back).
 DONE: (d) EXONERATED — the varied values give the mathematically correct
-sum (census s=29955.5 for 0.001*(i%1000)). (e) IN PROGRESS: the repro's
-device roundtrip (dev_alloc -> bulk_htod -> bulk_dtoh -> the acc) returns
-all zeros — but the probe has a bug: my "htod failed" check fires on rc==0
-which is SUCCESS (the rc convention), so the HtoD may be fine and the
-zeros come from the DtoH leg (the base passed or the read). NEXT: fix the
-repro's rc check (the htod's rc: 0=ok), verify the DtoH leg's base/size,
-and complete the delta (e) test. If (e) reproduces the garbage: the
-DtoH-written buffer + the clone/acc chain is the bug's shape; if not, the
-last delta is the digest's REAL driver context (the fbf/gx_resolve state).
-Then: the L0 gate, the 45-layer run, the suite.
+sum (census s=29955.5 for 0.001*(i%1000)). (e) BLOCKED IN THE REPRO: the repro's dev_alloc returns 0 with rc=3
+(NOT_INITIALIZED) even after tensor_init and with the GPU free (a 22.4GB
+stale holder died mid-session; the GPU now shows 1356/24576 MiB) — the
+repro's context never becomes current, while the DRIVER's device path
+works fine. So delta (e) must be tested in the driver's context: the
+driver's L0 IS the delta-(e) test (the x: the DtoH-written buffer, the
+real context) — and there the x's clone is verified byte-perfect and the
+digest's reads are all correct. CONCLUSION SO FAR: every reproducible
+layer is exonerated; the garbage appears only in the driver's full
+context. NEXT: (1) in the driver's digest, print the sum's INTERMEDIATE
+value (the s at i=1000/i=45056) to catch the accumulation's divergence
+point in the real context; (2) or diff the digest's generated IR between
+the repro (correct) and the driver (garbage) — the IR diff names the
+miscompiled op directly. Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting

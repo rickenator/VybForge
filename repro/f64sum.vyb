@@ -24,7 +24,7 @@ acc(v<Vec<Float>>)<String> -> {
     }
     return "census s=" + s.to_string() + " a=" + a.to_string() + " m=" + m.to_string() + " h=" + h.to_string()
 }
-import tensor::{bulk_htod, bulk_dtoh, dev_alloc}
+import tensor::{tensor_init, bulk_htod, bulk_dtoh, dev_alloc}
 makev()<Vec<Float>> -> {
     r<Vec<Float>> = Vec()
     i<Int> = 0
@@ -34,7 +34,9 @@ makev()<Vec<Float>> -> {
     }
     # delta (e): the source buffer written by the DEVICE read-back
     d<Int> = dev_alloc(90112 * 8)
+    println("DEVALLOC d=" + d.to_string())
     hrc<Int> = bulk_htod(d, view(r))
+    println("HTOD rc=" + hrc.to_string())
     if (d == 0) { println("htod failed") }
     out<Vec<Float>> = bulk_dtoh(d, 90112)
     return out
