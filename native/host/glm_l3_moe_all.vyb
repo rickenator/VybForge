@@ -346,6 +346,10 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             return 0
         }
         cuCtxSynchronize()
+        # qd (the trellis staging copy) leaked ~4 MB x 3 deqs x 109+ experts
+        # and exhausted the device (rc=2 CUDA_ERROR_OUT_OF_MEMORY at random
+        # experts). fd is the RETURNED weights — never free it.
+        cuMemFree_v2(qd)
         cuMemFree_v2(od)
         cuMemFree_v2(hd)
         cuMemFree_v2(td2)
@@ -575,6 +579,13 @@ main()<Int> -> {
             println("GEDIG e=" + e.to_string() + " n=" + gnn.to_string() + " f0=" + gf0.to_string() +
                     " off0=" + go0.to_string() + " plen=" + gp0.to_string() + " dlen=" + gd0.to_string())
 
+            # HtoD length sanity + a pre-deq sync rc: a corrupt String length
+            # feeding cuMemcpyHtoD, or a dying context, names itself here.
+            tsan<Int> = gx_read(ge, 0).len()
+            if (tsan <= 0 || tsan > 67108864) { println("LENSAN expert " + e.to_string() + " tb=" + tsan.to_string()) }
+            prerc<Int> = 0
+            freedom { prerc = cuCtxSynchronize() as Int }
+            if (prerc != 0) { println("PRESYNC expert " + e.to_string() + " rc=" + prerc.to_string()) }
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
                                 gx_read(ge, 2), body, EINTER, 32768)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
