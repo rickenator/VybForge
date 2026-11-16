@@ -849,7 +849,14 @@ the return, (c) the digest's extra locals (a/q/m + the v0-v7 census
 assignments), (d) the digest's second loop (the hv census loop). NEXT:
 extend the repro by those deltas one at a time (the clone-of-clone
 first: acc(bulk_dtoh-shaped clone)), find the delta that flips the sum,
-and fix. Then: the L0 gate, the 45-layer run, the suite.
+and fix. DONE: the clone-of-clone EXONERATED (90112 correct) AND the
+census shape EXONERATED (the extra locals + the second loop + the census
+string build: census s=90112 a=90112 m=1 h=1 — all correct). REMAINING
+DELTAS: (d) the VARIED values (the repro used uniform 1.0s; the real x
+has ~1e-2-magnitude varied embeddings — extend the repro to
+0.001*(i%1000)) and (e) the DtoH-written source (the repro's buffer is
+push-built; the real x's buffer is written by the device read-back).
+Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting

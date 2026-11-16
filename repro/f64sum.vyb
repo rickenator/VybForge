@@ -1,24 +1,41 @@
-# Minimal repro: the f64 accumulation over a by-value Vec param.
-# Expected: 90112 twice (the direct Vec + the by-value param copy).
-acc(v<Vec<Float>>)<Float> -> {
+# Delta (a): the param's source is itself a call-result clone.
+acc(v<Vec<Float>>)<String> -> {
     s<Float> = 0.0
+    a<Float> = 0.0
+    q<Float> = 0.0
+    m<Float> = 0.0
     j<Int> = 0
     while (j < v.len()) {
         x<Float> = v.get(j)
         s = s + x * x
+        ax<Float> = x
+        if (x < 0.0) { ax = 0.0 - x }
+        a = a + ax
+        q = q + x * x * x * x
+        if (x > m) { m = x }
+        if (j < 8) { println("BODY j=" + j.to_string() + " x=" + x.to_string()) }
         j = j + 1
     }
-    return s
+    hv<Int> = 0
+    h<Float> = 0.0
+    while (hv < 8) {
+        if (hv < v.len()) { h = v.get(hv) }
+        hv = hv + 1
+    }
+    return "census s=" + s.to_string() + " a=" + a.to_string() + " m=" + m.to_string() + " h=" + h.to_string()
 }
-main()<Int> -> {
-    v<Vec<Float>> = Vec()
-    n<Int> = 90112
+makev()<Vec<Float>> -> {
+    r<Vec<Float>> = Vec()
     i<Int> = 0
-    while (i < n) {
-        v.push(1.0)
+    while (i < 90112) {
+        r.push(1.0)
         i = i + 1
     }
-    println("DIRECT " + acc(v).to_string() + " (expected 90112)")
-    println("BYVAL  " + acc(v).to_string() + " (expected 90112)")
+    return r
+}
+main()<Int> -> {
+    v<Vec<Float>> = makev()
+    println(acc(v))
+    println(acc(v))
     return 0
 }
