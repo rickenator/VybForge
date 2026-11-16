@@ -938,15 +938,22 @@ digest IS the historical pin. "L0_FAIL resolve 21" is a resolve COUNT
    at cgen_decl.cpp:376 and cgen_expr.cpp:1259 (mirrors 50e1f2c6's Vec
    arm). With it: **the L0 gate's layer 0 passes fully** (attn len
    360448, all digests sane).
-2. **REMAINING**: at layer 1, 3 of the 24 freshly-concatenated want
-   names are STALE STRINGS (L0_UNFOUND prints other layers' names,
-   truncated — the recycled-registry-address class: a stale release
-   kills the new string at a recycled slot, its buffer is freed, reads
-   show the previous occupant). The fix is the documented registry
-   defense-in-depth: __vyb_string_release must verify the slot's
-   generation/identity before retiring (runtime/vyb_runtime.c — the
-   registry is Rick's design; coordinate). The 4096-entry quarantine
-   cannot cover it (eviction recycles addresses within one layer).
+2. **REMAINING → RESOLVED (Vyb 4ae941da, same evening)**: the layer-1 stale
+   want-name strings were the stale-RELEASE kill (a late release matched the
+   re-registered slot at a recycled address and retired the NEW string). Fix:
+   __vyb_string_release absorbs any release of a quarantined pointer (a mapped
+   retired buffer cannot be a live string, so the match is stale BY
+   DEFINITION — the identity check needs no generation token); the
+   quarantine grew to 65536 entries with a held-byte budget (VYB_STRQ_MB,
+   default 512) and an O(1) shadow hash set for the hot release path.
+   **RESULT: the L0 gate is GREEN at NLAYERS=2 — both layers complete (attn
+   len 360448, zero FAILs, exit 0; native/out/glm53/prefill_genfix.log).**
+   Per-directory suite runs are green (base64 1/1, arrays 9/9). The full-run
+   suite still decays after ~180 tests — the runner's own stale-READ bug
+   (its limitPrefix string goes stale → malformed `timeout` args → every
+   later child fails with "Try 'timeout --help'"); the runtime fix moved the
+   runner's healthy span from 4 to ~184 tests. The runner bug lives in
+   test/run_tests.vyb's own string handling — separate from the registry.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
