@@ -619,7 +619,19 @@ whose ref was 2 under the borrow-retain is now 1, freed early, then freed
 again by the second site). NEXT: instrument __vyb_pool_free's foreign
 branch (print the pointer + the caller marker per free) and diff the two
 frees of the aborting block to name both codegen sites, then fix whichever
-site double-frees. The microbench remains green (live=6 flat). The suite runner
+site double-frees. DONE — THE FINDING (ff3.log): the FREE-F instrumentation
+works (the earlier install silently no-oped on an indent mismatch); the
+aborting block is freed TWICE BY THE SAME JIT'D CALL SITE (0x...9051e x2,
+no intervening alloc), and the site sits in a function whose adjacent frees
+are ~21B apart — the signature of reclaimOwnedStructAt's per-field buffer
+frees; the aliasing source: a MOVED PAYLOAD whose fields share one buffer
+pointer (the extraction/move aliases two fields, the reclaim frees both).
+NEXT: (1) name the function: gdb "info symbol" on the JIT'd address at the
+abort, or map the offsets via the .ll's function order; (2) fix the
+aliasing: either the move must not alias two fields (the extraction's
+per-field retain already exists — find the path that skips it), or the
+reclaim must null the field after freeing (the clear-store exists for some
+fields — extend it). The microbench remains green trace-less (live=6). The microbench remains green (live=6 flat). The suite runner
 still aborts with the pre-existing tcache double free (the runner's own
 documented issue, independent of this fix). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
