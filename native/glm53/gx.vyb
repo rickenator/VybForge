@@ -17,6 +17,7 @@ import safetensors
 import json_parse
 import io::{open_read, read_all, read_at, close}
 import env::{env_get}
+import time::{time_mono_millis}
 
 share(all)
 struct GxLoc {
@@ -142,6 +143,138 @@ gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc>
     }
     println("MARK resolve-exit")
     return g
+}
+
+# One layer's expert block inside the index text. The expert entries of a layer are
+# CONTIGUOUS in the index (measured 358,501 bytes between layers.3 and layers.4), so a
+# single index_of finds the block and every per-expert name lookup can then search a
+# ~400 KB window instead of the whole 15.5 MB index. This is not a micro-optimisation:
+# per-NAME scans over the full index cost 19 MINUTES per MoE layer (T_MOE
+# resolve=1145661 ms for one layer, ~13.5 h for the 45-layer run); inside the window
+# the same 9 lookups are ~30x cheaper.
+share(all)
+gx_expert_window(index<String>, layer_prefix<String>)<Vec<Int>> -> {
+    w<Vec<Int>> = Vec()
+    ws<Int> = 0
+    we<Int> = 0
+    p<Int> = index.index_of("\"" + layer_prefix + "mlp.experts.")
+    if (p >= 0) {
+        ws = p
+        we = p + 400000
+        if (we > index.len()) { we = index.len() }
+    }
+    w.push(ws)
+    w.push(we)
+    return w
+}
+
+# gx_resolve_idx with the shard lookup narrowed to [ws, we) of the index text; a name
+# that falls outside the window still resolves (falls back to the full-index scan).
+share(all)
+gx_resolve_win(index<String>, dir<String>, total<Int>, want<Vec<String>>,
+               ws<Int>, we<Int>)<GxLoc> -> {
+    g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                       dts = Vec(), paths = Vec() }
+    win<String> = ""
+    if (ws > 0 && we > ws) { win = index.substring(ws, we) }
+    i<Int> = 0
+    for (i in 0..want.len() - 1) {
+        g.found.push(0)
+        g.shard.push(0)
+        g.tix.push(-1)
+        g.off.push(-1)
+        g.nbytes.push(0)
+        g.dts.push("")
+        g.paths.push("")
+    }
+    lastsh<Int> = 0
+    ix<StIndex> = st_open("")
+    w<Int> = 0
+    while (w < want.len()) {
+        sh<Int> = 0
+        if (win.len() > 0) { sh = gx_shard_for(win, want.get(w)) }
+        if (sh == 0) { sh = gx_shard_for(index, want.get(w)) }
+        if (sh > 0) {
+            if (sh != lastsh || ix.n == 0) {
+                path<String> = gx_shard_path(dir, sh, total)
+                ix = st_open(path)
+                lastsh = sh
+            }
+            if (ix.n > 0) {
+                t<Int> = st_find(view(ix), want.get(w))
+                if (t >= 0) {
+                    g.found.set(w, 1)
+                    g.shard.set(w, sh)
+                    g.tix.set(w, t)
+                    g.off.set(w, ix.data_base + ix.doff.get(t))
+                    g.nbytes.set(w, ix.dlen.get(t))
+                    g.dts.set(w, ix.dtypes.get(t))
+                    g.paths.set(w, ix.path)
+                }
+            }
+        }
+        w = w + 1
+    }
+    return g
+}
+
+
+# Resolve names against an ALREADY-OPEN shard header. st_open() re-parses a shard
+# header (~757 ms measured on shard 3 of the 83-shard checkpoint) and the MoE loops
+# were paying it once PER EXPERT — 288 experts x 0.757 s = 3.6 min per layer, i.e.
+# the whole 13.5 h of the 45-layer run. The caller keeps one StIndex for the shard it
+# is currently in and only re-opens when the expert's shard changes (3 shards per
+# layer, 2 of 288 experts straddle two). `sh` is the shard the header belongs to.
+share(all)
+gx_resolve_ix(ix<their<StIndex const>>, sh<Int>, want<Vec<String>>)<GxLoc> -> {
+    g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                       dts = Vec(), paths = Vec() }
+    i<Int> = 0
+    for (i in 0..want.len() - 1) {
+        g.found.push(0)
+        g.shard.push(0)
+        g.tix.push(-1)
+        g.off.push(-1)
+        g.nbytes.push(0)
+        g.dts.push("")
+        g.paths.push("")
+    }
+    if (ix.n > 0) {
+        w<Int> = 0
+        while (w < want.len()) {
+            t<Int> = st_find(ix, want.get(w))
+            if (t >= 0) {
+                g.found.set(w, 1)
+                g.shard.set(w, sh)
+                g.tix.set(w, t)
+                g.off.set(w, ix.data_base + ix.doff.get(t))
+                g.nbytes.set(w, ix.dlen.get(t))
+                g.dts.set(w, ix.dtypes.get(t))
+                g.paths.set(w, ix.path)
+            }
+            w = w + 1
+        }
+    }
+    return g
+}
+
+# Cached-header resolve with the straddle case handled: when every wanted name is in
+# the cached shard `sh` the open header is reused (no st_open); the ~2-in-288 experts
+# whose tensors split across two shards go down the full path instead.
+share(all)
+gx_resolve_maybe(ix<their<StIndex const>>, sh<Int>, index<String>, dir<String>, total<Int>,
+                 want<Vec<String>>, win<String>, ws<Int>, we<Int>)<GxLoc> -> {
+    if (ix.n > 0) {
+        g<GxLoc> = gx_resolve_ix(ix, sh, want)
+        miss<Int> = 0
+        i<Int> = 0
+        while (i < g.found.len()) {
+            if (g.found.get(i) != 1) { miss = 1 }
+            i = i + 1
+        }
+        if (miss == 0) { return g }
+    }
+    return gx_resolve_win(index, dir, total, want, ws, we)
 }
 
 share(all)

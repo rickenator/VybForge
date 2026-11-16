@@ -1649,6 +1649,17 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     # resolution here; the win came from caching the shard header inside gx_resolve and from
     # reading the 15.5 MB index ONCE per layer instead of once per expert.
     idxtext<String> = gx_read_index(dir)
+    # The per-expert resolve re-parsed the shard's safetensors header EVERY call (st_open
+    # = ~757 ms measured on this checkpoint), which is what made one MoE layer 19 min
+    # (T_MOE resolve=1145661 ms). Keep ONE open header for the shard the loop is in and
+    # narrow the index scan to this layer's expert block: resolve drops to ~3 ms/expert.
+    winv<Vec<Int>> = gx_expert_window(idxtext, lpre)
+    win0<Int> = winv.get(0)
+    win1<Int> = winv.get(1)
+    winsub<String> = ""
+    if (win1 > win0) { winsub = idxtext.substring(win0, win1) }
+    ixL<StIndex> = st_open("")
+    shL<Int> = 0
     e = 0
     while (e < NE) {
         # collect this expert's (token, lane) pairs
@@ -1681,7 +1692,12 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            ge<GxLoc> = gx_resolve_idx(idxtext, dir, total, w2)
+            shq<Int> = gx_shard_for(winsub, w2.get(0))
+            if (shq != shL) {
+                ixL = st_open(gx_shard_path(dir, shq, total))
+                shL = shq
+            }
+            ge<GxLoc> = gx_resolve_maybe(view(ixL), shq, idxtext, dir, total, w2, winsub, win0, win1)
             acc_res = acc_res + (time_mono_millis() - tA)
             nfound = 0
             j = 0

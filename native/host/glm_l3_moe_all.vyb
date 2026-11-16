@@ -18,6 +18,7 @@ import safetensors
 import gx
 import tensor::{tensor_init, dev_alloc, htod_vec, dtoh_vec, sync, gemm}
 import vmath::{vexp, vsqrt}
+import time::{time_mono_millis}
 
 extern "C" {
     cuMemFree_v2(dptr<Int>)<CInt>
@@ -188,16 +189,25 @@ mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
 
 mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
+    mt0<Int> = time_mono_millis()
     var<Int> dA = 0
     dA = alloc_dev(rows * K * 8)
     if (dA == 0) { return out }
+    mt1<Int> = time_mono_millis()
     htod_vec(dA, x)
+    mt2<Int> = time_mono_millis()
     var<Int> dC = 0
     dC = mm_dev(dA, B, rows, N, K, faddr)
     free_dev(dA)
+    mt3<Int> = time_mono_millis()
     if (dC == 0) { return out }
     out = dtoh_vec(dC, rows * N)
     free_dev(dC)
+    mt4<Int> = time_mono_millis()
+    println("MMT rows=" + rows.to_string() + " k=" + K.to_string() + " n=" + N.to_string() +
+            " alloc=" + (mt1 - mt0).to_string() + " htod=" + (mt2 - mt1).to_string() +
+            " gemm=" + (mt3 - mt2).to_string() + " dtoh=" + (mt4 - mt3).to_string() +
+            " total=" + (mt4 - mt0).to_string())
     return out
 }
 
@@ -239,6 +249,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         var<Int> sud = 0
         var<Int> svd = 0
         dfree0<Int> = dmem("pre")
+        dt0<Int> = time_mono_millis()
         grc1<Int> = cuMemAlloc_v2(loc(qd), tb) as Int
         if (grc1 != 0) { println("GEXL3FAIL alloc rc=" + grc1.to_string()); return 0 }
         grc2<Int> = cuMemAlloc_v2(loc(td), mb) as Int
@@ -261,6 +272,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         if (grc8 != 0) { println("GEXL3FAIL alloc rc=" + grc8.to_string()); return 0 }
         grc9<Int> = cuMemAlloc_v2(loc(svd), cw * 2) as Int
         if (grc9 != 0) { println("GEXL3FAIL alloc rc=" + grc9.to_string()); return 0 }
+        dt1<Int> = time_mono_millis()
 
         # trellis: bulk copy straight from the String
         if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { println("GEXL3FAIL site"); return 0 }
@@ -291,6 +303,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             if (cuMemcpyHtoD_v2(td + 16 + u, loc(ch), 8) != 0) { return 0 }
             u = u + 8
         }
+        dt2<Int> = time_mono_millis()
         # dequant
         if (cuda_launch4i(from<loc<CVoid>>(fdeq), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) != 0) {
             return 0
@@ -298,7 +311,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         cuCtxSynchronize()
         cuMemFree_v2(qd)
         cuMemFree_v2(td)
+        dt3<Int> = time_mono_millis()
         # scales (fp16) to the device
+
         u = 0
         while (u < suh.len()) {
             ch = 0
@@ -327,7 +342,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             return 0
         }
         cuCtxSynchronize()
+        dt4<Int> = time_mono_millis()
         # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
+
         pq = 0
         while (pq < 6) {
             chq = 0
@@ -344,7 +361,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             return 0
         }
         cuCtxSynchronize()
+        dt5<Int> = time_mono_millis()
         # had2: tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks
+
         pq = 0
         while (pq < 8) {
             chq = 0
@@ -363,7 +382,9 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             return 0
         }
         cuCtxSynchronize()
+        dt6<Int> = time_mono_millis()
         # qd was already freed right after the deq launch; fd is the
+
         # RETURNED weights (out = fd) and must never be freed here.
         fr1<Int> = cuMemFree_v2(od) as Int
         fr2<Int> = cuMemFree_v2(hd) as Int
@@ -375,6 +396,12 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             println("FREEFAIL rcs=" + fr1.to_string() + "," + fr2.to_string() + "," + fr3.to_string() + "," + fr4.to_string() + "," + fr5.to_string() + "," + fr6.to_string())
         }
         dfree1<Int> = dmem("end")
+        dt7<Int> = time_mono_millis()
+        println("DEQT alloc=" + (dt1 - dt0).to_string() + " htod=" + (dt2 - dt1).to_string() +
+                " deqk=" + (dt3 - dt2).to_string() + " scales=" + (dt4 - dt3).to_string() +
+                " hgen=" + (dt5 - dt4).to_string() + " had1=" + (dt6 - dt5).to_string() +
+                " had2=" + (dt7 - dt6).to_string() + " total=" + (dt7 - dt0).to_string())
+
         # net device-free change for THIS deq: exactly -kn*8 = the returned fd
         # block is what a clean call must show. Anything else is a real leak.
         println("DEQNET fd=" + (dfree1 - dfree0).to_string() + " expect=" + (0 - kn * 8).to_string())
@@ -552,6 +579,19 @@ main()<Int> -> {
     }
     nex = 0
     e = 0
+    # Index text + this layer's expert-block window, hoisted: the per-expert resolve
+    # was re-scanning the whole 15.5 MB index once per name (9 scans per expert).
+    idxtext<String> = gx_read_index(dir)
+    winv<Vec<Int>> = gx_expert_window(idxtext, pre)
+    win0<Int> = winv.get(0)
+    win1<Int> = winv.get(1)
+    winsub<String> = ""
+    if (win1 > win0) { winsub = idxtext.substring(win0, win1) }
+    # ONE open shard header reused across experts (st_open re-parses the header,
+    # ~757 ms, and the loop was paying that per expert).
+    ixL<StIndex> = st_open("")
+    shL<Int> = 0
+
     while (e < NE) {
         # collect this expert's (token, lane) pairs
         toks<Vec<Int>> = Vec()
@@ -583,7 +623,13 @@ main()<Int> -> {
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            ge<GxLoc> = gx_resolve(dir, total, w2)
+            xt0<Int> = time_mono_millis()
+            shq<Int> = gx_shard_for(winsub, w2.get(0))
+            if (shq != shL) {
+                ixL = st_open(gx_shard_path(dir, shq, total))
+                shL = shq
+            }
+            ge<GxLoc> = gx_resolve_maybe(view(ixL), shq, idxtext, dir, total, w2, winsub, win0, win1)
             nfound = 0
             j = 0
             while (j < w2.len()) {
@@ -612,12 +658,14 @@ main()<Int> -> {
             prerc<Int> = 0
             freedom { prerc = cuCtxSynchronize() as Int }
             if (prerc != 0) { println("PRESYNC expert " + e.to_string() + " rc=" + prerc.to_string()) }
+            xt1<Int> = time_mono_millis()
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
                                 gx_read(ge, 2), body, EINTER, 32768)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
                                 gx_read(ge, 5), body, EINTER, 32768)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 6), gx_read(ge, 7),
                                 gx_read(ge, 8), body, H, 32768)
+            xt2<Int> = time_mono_millis()
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
                 return 10
@@ -661,6 +709,7 @@ main()<Int> -> {
                 }
                 j = j + 1
             }
+            xt3<Int> = time_mono_millis()
             freedom {
                 lf1<Int> = cuMemFree_v2(dWg) as Int
                 lf2<Int> = cuMemFree_v2(dWu) as Int
@@ -672,6 +721,11 @@ main()<Int> -> {
                 freedom { cuMemGetInfo_v2(loc(dbfree), loc(dbtot)) }
                 println("GDEVMEM e=" + e.to_string() + " used=" + (dbtot - dbfree).to_string())
             }
+            xt4<Int> = time_mono_millis()
+            println("EXPT e=" + e.to_string() + " nt=" + nt.to_string() +
+                    " resolve=" + (xt1 - xt0).to_string() + " deq3=" + (xt2 - xt1).to_string() +
+                    " mmact=" + (xt3 - xt2).to_string() + " free=" + (xt4 - xt3).to_string() +
+                    " total=" + (xt4 - xt0).to_string())
             if (nex % 10 == 0) {
                 println("  experts done " + nex.to_string() + " (last id " + e.to_string() + ")")
             }
