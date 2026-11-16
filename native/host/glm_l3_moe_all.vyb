@@ -24,6 +24,7 @@ extern "C" {
     cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
     cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
     cuCtxSynchronize()<CInt>
+    cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
@@ -346,10 +347,8 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             return 0
         }
         cuCtxSynchronize()
-        # qd (the trellis staging copy) leaked ~4 MB x 3 deqs x 109+ experts
-        # and exhausted the device (rc=2 CUDA_ERROR_OUT_OF_MEMORY at random
-        # experts). fd is the RETURNED weights — never free it.
-        cuMemFree_v2(qd)
+        # qd was already freed right after the deq launch; fd is the
+        # RETURNED weights (out = fd) and must never be freed here.
         cuMemFree_v2(od)
         cuMemFree_v2(hd)
         cuMemFree_v2(td2)
@@ -639,6 +638,10 @@ main()<Int> -> {
                 cuMemFree_v2(dWg)
                 cuMemFree_v2(dWu)
                 cuMemFree_v2(dWd)
+                dbfree<Int> = 0
+                dbtot<Int> = 0
+                freedom { cuMemGetInfo_v2(loc(dbfree), loc(dbtot)) }
+                println("GDEVMEM e=" + e.to_string() + " used=" + (dbtot - dbfree).to_string())
             }
             if (nex % 10 == 0) {
                 println("  experts done " + nex.to_string() + " (last id " + e.to_string() + ")")
