@@ -16,6 +16,7 @@
 import safetensors
 import json_parse
 import io::{open_read, read_all, read_at, close}
+import env::{env_get}
 
 share(all)
 struct GxLoc {
@@ -95,12 +96,8 @@ gx_resolve(dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
 # (one per expert) was re-reading and re-parsing the 15.5 MB index every call: hold it once.
 share(all)
 gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
-    extern "C" {
-        vyb_str_stats()<CVoid>
-    }
     g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
                        dts = Vec(), paths = Vec() }
-    freedom { vyb_str_stats() }
     println("MARK resolve-enter")
     i<Int> = 0
     for (i in 0..want.len() - 1) {
@@ -128,7 +125,6 @@ gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc>
                 lastsh = sh
             }
             if (ix.n > 0) {
-                freedom { vyb_str_stats() }
                 println("MARK post-st-open-shard w" + w.to_string())
                 t<Int> = st_find(view(ix), want.get(w))
                 if (t >= 0) {
@@ -144,7 +140,6 @@ gx_resolve_idx(index<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc>
         }
         w = w + 1
     }
-    freedom { vyb_str_stats() }
     println("MARK resolve-exit")
     return g
 }

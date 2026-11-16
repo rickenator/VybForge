@@ -53,7 +53,6 @@ extern "C" {
 # 46-layer pass then holds tens of GB that nothing is using.
 # Registry/heap diagnostics: __vyb_str_stats in the runtime (VYB_STR_STATS=1 gates the print).
 extern "C" {
-    vyb_str_stats()<CVoid>
 }
 
 trim_heap()<Int> -> {
@@ -1713,7 +1712,6 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     println("routed experts used: " + nex.to_string())
     println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string())
     freedom {
-        vyb_str_stats()
     }
 
     # ---- shared expert ----
@@ -2462,7 +2460,6 @@ main()<Int> -> {
             streams1 = kda_attn_site(streams, dir, total, lpre, fgemm, fbf)
         }
         println("attn len " + streams1.len().to_string() + " layer " + n.to_string())
-        freedom { vyb_str_stats() }
         println("MARK attn-done layer " + n.to_string())
         if (streams1.len() != R * HC * H) {
             println("PF_FAIL attention layer " + n.to_string())
@@ -2478,7 +2475,6 @@ main()<Int> -> {
             return 31
         }
         i = trim_heap()
-        freedom { vyb_str_stats() }
         println("MARK ffn-done layer " + n.to_string())
         println("layer " + n.to_string() + " done")
         lines = lines + "layer " + n.to_string() + " " + digest("streams", streams) + "\n"
