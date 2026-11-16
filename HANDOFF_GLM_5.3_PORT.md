@@ -1491,3 +1491,61 @@ spare ports) and is not worth pulling.
   0bcb3af5, 1f679169, 1c2fce65, f624030c, 47707da7, 50e1f2c6, 5520f9de, 4ae941da, 4dff29ec.
 - VybForge main: `31962be` (diag: Xid 31) and `069a2a3` (fd fix) and the rest of the session's
   diag/fix commits above them.
+
+---
+
+# SESSION 2026-11-16 (later) — THE MoE DEVICE LEAK WAS A GPU CO-TENANT. BLOCKER CLOSED.
+
+## The answer, in one line
+**There is no device leak in the MoE gate.** The card was not filling from our code — it was
+filling from a **crash-looping vLLM container on the same 3090**
+(`hyperqwen-abliterated-single-1`, image ghcr.io/syv-ai/hyperqwen, `restart=unless-stopped`,
+**1054 restarts**), which re-attempts engine init every ~30-60 s and holds **15-22 GB of 24 GB**
+while doing it. Every "nondeterministic" MoE OOM (expert 12 / 20 / 50 / 96 / 117 / 130, and the one
+run that passed all 288) is that container's restart phase landing on our gate.
+
+## How it was found (the instrument that finally named it)
+1. `dmem()` in `native/host/glm_l3_moe_all.vyb` = a `cuMemGetInfo_v2` bracket around each deq.
+   Printing device-free after every alloc/free site (9 allocs + 8 frees) showed the deq is
+   **exactly balanced**; the only net change per deq is `-kn*8 = -67108864 B` = the returned fd
+   block, which the caller frees (that was the "67 MB per deq never returns" from the last
+   session — it is the RETURN VALUE, not a leak).
+2. The remaining jump was between two probes with **no driver code in between**: -14.99 GB between
+   expert 10's end and expert 12's start, -6.95 GB later. So an external process took the memory.
+3. A per-process VRAM sampler (`nvidia-smi --query-compute-apps=pid,process_name,used_memory` once
+   a second, run alongside the gate) named it:
+   `VLLM::EngineCore` 14420 -> 15660 -> 22086 MiB appearing mid-run, then dying. The container's own
+   log: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 960.00 MiB ... Process
+   3641187 has 21.41 GiB memory in use` -> `RuntimeError: Engine core initialization failed`.
+
+## Why it never self-heals
+Its first real crash was 11-02 05:49 (`AsyncLLM output_handler failed`). Since then every restart
+attempt races the PREVIOUS EngineCore process, which still holds ~21 GB while draining, so the new
+attempt OOMs at 45-50 MB free and dies -> restart. Two weeks of a 1-minute crash loop that quietly
+sabotages every multi-minute GPU run on godzilla.
+
+## Verified after `docker stop hyperqwen-abliterated-single-1`
+- `make -C native glm3all` equivalent, **5 consecutive runs, all `MOE_ALL_OK experts=109`**,
+  `L3_MOE_ALL_VYB: OK` (mlp max rel 1.07e-05) on the final one.
+- Device use over a full run: **peak 1.69 GiB, final 1.69 GiB, flat** (was 23.5 GiB at expert 20
+  before). Per-deq net: **327/327 = -67108864 B exactly, zero exceptions**
+  (`DEQNET fd=-67108864 expect=-67108864` x327).
+- Vyb suite: **1358/1358 PASS** (build-release/vyb).
+- The real driver: `glm_prefill.vyb` reached **`layer 3 done`** — the first time the actual prefill
+  got through layer 3's MoE — with its own DEVMEM probe flat at 2.58 GiB across all 288 experts.
+
+## Cost of the acceptance run (new, measured)
+One MoE layer = **~14 min** (288 experts x 3 deqs x ~0.9 s), so the full 45-layer prefill
+(43 MoE layers) is a **~10-hour job**. The old `timeout 3000` command kills it at layer ~6.
+Launcher for the long variant: `tools/run_prefill45.sh` (timeout 43200, local ext4 checkpoint
+`/usr/export/...`, detached via `setsid nohup`), log `native/out/prefill45.log`, ends
+`PREFILL_OK layers=45`.
+`tools/run_glm3all_vram.sh` = the gate + a per-process VRAM sampler; keep it, it is what proved
+co-tenancy. **Any device-memory diagnosis on godzilla must now check `nvidia-smi --query-compute-apps`
+before believing a curve.**
+
+## Still open
+1. The ~10 h 45-layer acceptance run (launch decisions belong to Rick — it owns the 3090).
+2. `hyperqwen-abliterated-single-1` is **stopped** (was crash-looping since 11-02). Restarting it on a
+   clean card should work; if it OOMs again at engine init it needs its own fix, not a GPU quarantine.
+3. Merge `fix/return-path-cleanup-v2` -> Vyb main (unchanged from the previous session).

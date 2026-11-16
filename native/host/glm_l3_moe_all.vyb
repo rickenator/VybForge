@@ -128,6 +128,16 @@ free_dev(p<Int>)<Int> -> {
     return 0
 }
 
+dmem(tag<String>)<Int> -> {
+    # silent device-free probe: returns cuMemGetInfo free bytes, so a caller can
+    # bracket a region and print the net. cuMemGetInfo is device-wide, so a
+    # non-zero net here that is not the handed-out return block is a real leak.
+    var<Int> fr = 0
+    var<Int> tt = 0
+    freedom { cuMemGetInfo_v2(loc(fr), loc(tt)) }
+    return fr
+}
+
 deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     var<Int> out = 0
     freedom {
@@ -228,6 +238,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         var<Int> pd = 0
         var<Int> sud = 0
         var<Int> svd = 0
+        dfree0<Int> = dmem("pre")
         grc1<Int> = cuMemAlloc_v2(loc(qd), tb) as Int
         if (grc1 != 0) { println("GEXL3FAIL alloc rc=" + grc1.to_string()); return 0 }
         grc2<Int> = cuMemAlloc_v2(loc(td), mb) as Int
@@ -363,6 +374,10 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         if (fr1 + fr2 + fr3 + fr4 + fr5 + fr6 != 0) {
             println("FREEFAIL rcs=" + fr1.to_string() + "," + fr2.to_string() + "," + fr3.to_string() + "," + fr4.to_string() + "," + fr5.to_string() + "," + fr6.to_string())
         }
+        dfree1<Int> = dmem("end")
+        # net device-free change for THIS deq: exactly -kn*8 = the returned fd
+        # block is what a clean call must show. Anything else is a real leak.
+        println("DEQNET fd=" + (dfree1 - dfree0).to_string() + " expect=" + (0 - kn * 8).to_string())
         out = fd
     }
     return out
