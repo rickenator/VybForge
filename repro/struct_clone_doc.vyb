@@ -1,0 +1,78 @@
+// Repro #2: the GxLoc shape built from a PARSED JSON doc (mirroring
+// gx_resolve_idx: st_open's JsonDoc strings into the struct's Vec<String>
+// fields), assigned at declaration from a call result, looped 109x — the
+// expert-resolve shape that corrupts with 5520f9de's struct deep copy.
+// @test: struct call-result clone with JsonDoc-derived strings
+// @expect-return: 0
+
+import json_parse
+
+share(all)
+struct GxShape {
+    found<Vec<Int>>,
+    off<Vec<Int>>,
+    nbytes<Vec<Int>>,
+    dts<Vec<String>>,
+    paths<Vec<String>>
+}
+
+mk_doc_text(tag<Int>)<String> -> {
+    s<String> = "{\"weight_map\":{"
+    i<Int> = 0
+    while (i < 24) {
+        s = s + "\"model.language_model.layers.3.mlp.experts." + tag.to_string() + "." + i.to_string() + ".trellis\":\"model-00003-of-00083.safetensors\","
+        s = s + "\"model.language_model.layers.3.mlp.experts." + tag.to_string() + "." + i.to_string() + ".suh\":\"model-00004-of-00083.safetensors\","
+        i = i + 1
+    }
+    s = s + "\"end\":\"model-00005-of-00083.safetensors\"}}"
+    return s
+}
+
+mk_loc(tag<Int>)<GxShape> -> {
+    g<GxShape> = GxShape { found = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
+    text<String> = mk_doc_text(tag)
+    match (json_parse(text)) {
+        d -> {
+            rid<Int> = d.rootid()
+            wm<Int> = d.get(rid, "weight_map")
+            if (wm >= 0) {
+                cnt<Int> = d.nchildren(wm)
+                i<Int> = 0
+                while (i < cnt) {
+                    g.found.push(1)
+                    g.off.push(1646384088 + i * 256)
+                    g.nbytes.push(256 + i)
+                    g.dts.push(d.hstr(d.elem(wm, i)))
+                    g.paths.push(d.ckey_at(wm, i))
+                    i = i + 1
+                }
+            }
+        }
+        ? -> { }
+    }
+    return g
+}
+
+digest_loc(g<GxShape>, tag<Int>)<Int> -> {
+    acc<Int> = 0
+    i<Int> = 0
+    while (i < g.off.len()) {
+        if (g.paths.get(i).len() < 10) { return 0 - 1 }
+        if (g.dts.get(i).len() < 10) { return 0 - 2 }
+        acc = acc + g.off.get(i) % 1000
+        i = i + 1
+    }
+    return acc % 100000 + tag
+}
+
+main()<Int> -> {
+    i<Int> = 0
+    while (i < 109) {
+        g<GxShape> = mk_loc(i)
+        d<Int> = digest_loc(g, i)
+        if (d < 0) { println("DOCORRUPT iter " + i.to_string() + " d=" + d.to_string()); return 1 }
+        i = i + 1
+    }
+    println("DOCSHAPE_OK")
+    return 0
+}
