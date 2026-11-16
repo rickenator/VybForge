@@ -1462,6 +1462,17 @@ spare ports) and is not worth pulling.
    device staging buffer per call; if it leaks for rows>1 the curve grows only for multi-token
    experts — matching the observed onset). That is the FIRST thing to check next session; the
    gate's own accounting is now fully exonerated.
+   FINAL DATA (this session): (1) **the gate COMPLETED all 288 experts once** (MOE_ALL_OK, exit 0)
+   with the PREALLOC probe in place - the gate is achievable, the failure is marginal/layout-driven;
+   (2) the PREALLOC fd line shows cuMemGetInfo free dropping **exactly 67 MB per deq call**
+   (23442882560 -> 23375773696 -> 23308664832), i.e. one kn*8 staging block per deq never returns
+   to the pool, so 288 experts x ~200 MB drains the card to the OOM edge; (3) the loop's
+   dWg/dWu/dWd frees all return 0 and the FDPTR addresses show the allocator RECYCLING freed blocks
+   - so the drain is one specific 67 MB staging alloc per deq (candidates: od, td2 or fd) whose
+   free path succeeds yet does not release (or which is allocated twice). NEXT: print
+   cuMemGetInfo after EACH of the nine allocs and after EACH of the six frees inside exl3_deq for
+   one expert - the alloc/free line pair that does not cancel names the block. Then the 45-layer
+   run.
 2. (SUPERSEDED — no host fix needed; keep `generateStructDeepCopy` unmodified.)
 3. Verify: gate 5x → `MOE_ALL_OK` each time; then full suite → the 45-layer acceptance.
    Full-suite/45-layer commands: `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,

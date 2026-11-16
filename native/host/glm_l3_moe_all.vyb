@@ -238,6 +238,10 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         if (grc4 != 0) { println("GEXL3FAIL alloc rc=" + grc4.to_string()); return 0 }
         grc5<Int> = cuMemAlloc_v2(loc(td2), kn * 8) as Int
         if (grc5 != 0) { println("GEXL3FAIL alloc rc=" + grc5.to_string()); return 0 }
+        qfr<Int> = 0
+        qtot<Int> = 0
+        freedom { cuMemGetInfo_v2(loc(qfr), loc(qtot)) }
+        println("PREALLOC fd need=" + (kn * 8).to_string() + " free=" + qfr.to_string())
         grc6<Int> = cuMemAlloc_v2(loc(fd), kn * 8) as Int
         if (grc6 != 0) { println("GEXL3FAIL alloc rc=" + grc6.to_string()); return 0 }
         grc7<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
@@ -643,9 +647,11 @@ main()<Int> -> {
                 j = j + 1
             }
             freedom {
-                cuMemFree_v2(dWg)
-                cuMemFree_v2(dWu)
-                cuMemFree_v2(dWd)
+                lf1<Int> = cuMemFree_v2(dWg) as Int
+                lf2<Int> = cuMemFree_v2(dWu) as Int
+                lf3<Int> = cuMemFree_v2(dWd) as Int
+                if (lf1 + lf2 + lf3 != 0) { println("LOOPFREEFAIL " + lf1.to_string() + "," + lf2.to_string() + "," + lf3.to_string()) }
+                println("FDPTR dWg=" + dWg.to_string() + " dWu=" + dWu.to_string() + " dWd=" + dWd.to_string())
                 dbfree<Int> = 0
                 dbtot<Int> = 0
                 freedom { cuMemGetInfo_v2(loc(dbfree), loc(dbtot)) }
