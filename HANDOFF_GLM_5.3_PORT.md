@@ -627,11 +627,21 @@ are ~21B apart — the signature of reclaimOwnedStructAt's per-field buffer
 frees; the aliasing source: a MOVED PAYLOAD whose fields share one buffer
 pointer (the extraction/move aliases two fields, the reclaim frees both).
 NEXT: (1) name the function: gdb "info symbol" on the JIT'd address at the
-abort, or map the offsets via the .ll's function order; (2) fix the
-aliasing: either the move must not alias two fields (the extraction's
-per-field retain already exists — find the path that skips it), or the
-reclaim must null the field after freeing (the clear-store exists for some
-fields — extend it). The microbench remains green trace-less (live=6). The microbench remains green (live=6 flat). The suite runner
+abort, or map the offsets via the .ll's function order; (2) DONE + RESOLVED + NEW STATE: the extraction copy (copyOwnedValueForBinding,
+#345's rule) applied at the optional arm; ALL free paths now route through
+the quarantine (the foreign branch, the over-cap path). THE PREFILL'S
+RESOLVE CRASH IS FIXED (it runs past resolve-enter, live ~18.8K stable).
+REMAINING: (a) PF_FAIL attention layer 1 (the digest mismatch, before the
+LAYER0 gate prints); (b) the pool's retained counter reads 3.65e17 (garbage).
+BOTH are consistent with ONE BUFFER OVERFLOW introduced by this session's
+ref changes — the prime suspect: copyOwnedValueForBinding's sizing at the
+extraction (the copy's buffers under-sized). NEXT: audit
+copyOwnedValueForBinding's per-field sizing (the Vec buffers' byte counts,
+the String copies' len+1), or run the prefill's pre-CUDA stages under ASan.
+The microbench full stage: no abort, but the strand re-emerged at iteration
+3 (live=5936) — the extraction copy's retains are +1/string/iter unbalanced;
+audit that too. All the instrumentation (FREE-F, FREE-EVICT, QUAR-ABSORB,
+RETIRE content) is committed and working. The microbench remains green trace-less (live=6). The microbench remains green (live=6 flat). The suite runner
 still aborts with the pre-existing tcache double free (the runner's own
 documented issue, independent of this fix). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
