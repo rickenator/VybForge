@@ -707,7 +707,16 @@ site-4 retain). THE FIX: the assignment's Vec branch must route the RHS
 through copyOwnedValueForBinding (the deep clone, cgen_ownership.cpp:2686)
 when the RHS is a call result — same family as the site-8 strand, at the
 assignment boundary instead of the return boundary. After the fix: the
-microbench, the L0 gate, the layer-0 attention, then the 45-layer run. (b) the strand at the microbench's iteration 3 (live=5936) — the
+microbench, the L0 gate, the layer-0 attention, then the 45-layer run.
+DONE (47707da7+): the call-result Vec clones installed at BOTH the
+declaration init and the assignment — **the fraw zeros are FIXED** (the
+fraw census: non-zero data; the stale-buffer class resolved; the binding
+owns a live clone). REMAINING: the kernel output's contents have garbage
+magnitudes (the fraw max=6.3e12 vs the expected ~1e0-1e2) — the embedding
+kernel's output buffer holds uninitialized-looking data: the dispatch/
+launch diagnostic (the kernel's args, the by-value param copies' pointers,
+the launch's success), NOT an ownership issue. Then: the L0 gate, the
+45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
