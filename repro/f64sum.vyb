@@ -24,14 +24,20 @@ acc(v<Vec<Float>>)<String> -> {
     }
     return "census s=" + s.to_string() + " a=" + a.to_string() + " m=" + m.to_string() + " h=" + h.to_string()
 }
+import tensor::{bulk_htod, bulk_dtoh, dev_alloc}
 makev()<Vec<Float>> -> {
     r<Vec<Float>> = Vec()
     i<Int> = 0
     while (i < 90112) {
-        r.push(1.0)
+        r.push(0.001 * (i % 1000))
         i = i + 1
     }
-    return r
+    # delta (e): the source buffer written by the DEVICE read-back
+    d<Int> = dev_alloc(90112 * 8)
+    hrc<Int> = bulk_htod(d, view(r))
+    if (d == 0) { println("htod failed") }
+    out<Vec<Float>> = bulk_dtoh(d, 90112)
+    return out
 }
 main()<Int> -> {
     v<Vec<Float>> = makev()
