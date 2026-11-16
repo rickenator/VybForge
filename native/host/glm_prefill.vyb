@@ -2378,6 +2378,26 @@ main()<Int> -> {
         }
         ? -> { return 9 }
     }
+    # split probe: the concat's contents vs a direct read of the same region
+    match (open_read(emb_path)) {
+        f2 -> {
+            rr = 0
+            bad = 0
+            while (rr < R) {
+                match (read_at(f2, emb_off + ids.get(rr) * H * 2, H * 2)) {
+                    sd -> {
+                        row<String> = raw_emb.substring(rr * H * 2, rr * H * 2 + H * 2)
+                        if (row != sd) { bad = bad + 1 }
+                    }
+                    ? -> { bad = bad + 1 }
+                }
+                rr = rr + 1
+            }
+            println("SPLITPROBE badrows=" + bad.to_string() + " of " + R.to_string())
+            close(f2)
+        }
+        ? -> { println("direct open fail") }
+    }
     var<Int> d_x = 0
     d_x = deq_bf16(fbf, raw_emb, R * H, 0)
     if (d_x == 0) { println("L0_FAIL emb deq"); return 10 }
