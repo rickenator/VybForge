@@ -1019,6 +1019,28 @@ and the 45-layer run becomes possible on godzilla without a scope. The
 ALL_FAIL deq expert 287 (the stale-pointer class returning with the
 defenses off) — keep the quarantine ON once the churn is fixed.
 
+**THE CHURN FOUND AND FIXED (VybForge 3330519)**: the 186 GB/layer was
+the driver's OWN dumps() — an O(n^2) repeated-concat dump (out = out +
+di(v.get(i)).to_string()) over the 180224-element qnvals/chain dumps:
+~360 GB of churn PER CALL, which fragmented the glibc arena to the 83 GB
+OOM. dump_to() now streams the identical content in 32 KB chunks
+straight to PREFILL_OUT (open_append + write_str per chunk). The hot
+by-value Vec params (rms_rows, log_decay, delta_rule's q/k/v/g,
+kda_attn_site's streams) are now const borrows. RESULTS: the 2-layer
+gate runs in 12.6 s (was 2.5-6 min) at 2.7 GB peak (was 83.6 GB); the
+45-layer run passes layers 0-2 and layer 3's attention with bounded
+memory (4.6 GB peak) — host-side memory is SOLVED.
+   NEXT (the new, bounded failure): the 45-layer run dies at the MoE
+expert deq — `ALL_FAIL deq expert 22` (run3) and `expert 28` (the
+VYB_STRQ_OFF run), i.e. exl3_deq returns 0 for a specific expert
+index, deterministically, with host memory clean. The expert loop
+frees dWg/dWu/dWd per iteration (cuMemFree_v2), so suspect device-side
+accumulation or a device alloc/launch failure inside exl3_deq (the
+DEQFAIL probes cover deq_bf16 only — instrument exl3_deq's allocs and
+launch rcs the same way). Also verify on a clean GPU (a leftover vyb
+held 17 GB after one run). The 2-layer gate does not reach the MoE
+(dense L0-2) — the MoE gate needs NLAYERS>=4.
+
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
 G9PROBE (the GxLoc field dump before the o_norm read). The suite
