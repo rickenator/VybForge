@@ -870,7 +870,18 @@ context. NEXT: (1) in the driver's digest, print the sum's INTERMEDIATE
 value (the s at i=1000/i=45056) to catch the accumulation's divergence
 point in the real context; (2) or diff the digest's generated IR between
 the repro (correct) and the driver (garbage) — the IR diff names the
-miscompiled op directly. Then: the L0 gate, the 45-layer run, the suite.
+miscompiled op directly.
+**ROOT CAUSE FOUND (the s intermediates): THE ARITHMETIC IS CORRECT.**
+The sum runs 0 -> -0.0003 -> 0.0126 -> 0.0599 -> 0.398 -> 0.429 -> -1.247
+-> **-3.35685 at i=90111** — sane and smooth — but the census prints
+-3692488466944. THE FLOAT to_string FORMATTING IS THE BUG: the mantissa
+is right but the decimal exponent is shifted by ~13 for values ~1e0
+(the small values like -0.000312805 format correctly; -3.36 does not).
+The whole memory-corruption theory for the census is DEAD — the x data,
+the clone, the reads, and the accumulation are all correct. THE FIX: the
+f64->string dtoa in the runtime (the decimal-exponent computation for
+the ~1e0 range). Then: the L0 gate (the digest's numbers will finally be
+meaningful), the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
