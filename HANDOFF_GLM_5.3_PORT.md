@@ -572,15 +572,14 @@ and a DOUBLE FREE tripwire);
 (2) a depth-dependent slowdown remains even pooled (deq/resolve inflate with layer
 index; 45-layer wall 1249-1274 s vs the 914 s leaky baseline) — partly cold shard
 reads on the first pass, partly adjacent to the known String-registry resolve drift;
-its root cause is its own investigation. THE TRANSFER STRAND'S SITE FOUND
-(the IR audit): the doc's reclaim handles Vec<String> (the ckey's
-release_each, emitted) but for Vec<JNode> it only pool-frees the buffer —
-the JNode elements' String fields (the svals) are NEVER released, stranding
-exactly the ~5,930 strings per parse (+1 ref per element per resolve). THE
-FIX: reclaimOwnedStructAt's Vec<struct> branch (cgen_ownership.cpp) must,
-before the pool_free, emit a per-element loop releasing each element's owned
-fields (the same per-struct logic as the direct struct reclaim, depth 1
-covers the JNode). Verify: the microbench stage=full live flat; then the
+its root cause is its own investigation. THE TRANSFER STRAND'S SITE — first
+hypothesis DISPROVEN: the gate diagnostic (RECLAIM-vec-elem, a83e69a6) proves
+reclaimOwnedStructAt's Vec<struct> branch DOES emit the per-element owned-
+field reclaim for Vec<JNode> (known=1 owned=1) — that site is NOT the strand.
+The strand is elsewhere: the remaining +1/element/resolve retain still
+unidentified. NEXT PROBE: the site-tagged RET/REL trace (add the return-
+address/site to the RET/REL prints in __vyb_string_retain/release) to name
+the retaining site. Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
 effect — depth effects need the full 45-layer run (12+ layer rule applies doubly).
 
