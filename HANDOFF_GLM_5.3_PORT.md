@@ -1592,3 +1592,23 @@ relaunched 11:33: now ~3-4 min per MoE layer (~2-2.8 h) instead of ~18.6 min (13
 Remaining per-MoE-layer split: deq 8.5-9.2 s (exl3hgen 8.7 + had1 8.9 ms/deq are the two hottest
 kernels), mm 0.4 s, and ~2-3 min of NON-MoE layer work (attention/GDN/dense streaming/digests) —
 that is the next profiling target, not the MoE loop.
+
+### Phase split, NLAYERS=8 with T_LAYER/T_TAIL (2026-11-16, PREFILL_OK layers=8 in 19 min)
+```
+n=0 dense  attn=1.5s  ffn=0.4s
+n=1 dense  attn=4.1s  ffn=2.5s
+n=2 dense  attn=12.3s ffn=3.4s
+n=3 DSA    attn=20.1s ffn=92.8s   total=113s   (T_MOE resolve=30.3s deq=21.9s mm=0.5s;
+                                              T_TAIL router+MoE+shared+hc_apply=74.8s)
+n=4 KDA    attn=122s  ffn=134s    total=256s   (resolve=68.0s deq=17.7s)
+n=5 KDA    attn=86.5s ffn=124s    total=211s   (resolve=63.8s)
+n=6 KDA    attn=85.0s ffn=139s    total=224s
+n=7 DSA    attn=23.7s ffn=136s    total=160s
+```
+Per-layer cost model: KDA layers ~3.5-4.3 min (34 of them), DSA ~1.9-2.7 min (11), dense ~seconds
+-> the 2h11m full run is consistent. Ranked targets:
+1. **KDA attention site: 85-122 s/layer x 34 layers = ~40% of the whole run.** Untouched so far.
+2. **MoE resolve 30-68 s/layer x 43**: still 10 window scans (400 KB each) per expert + up to 3
+   st_open per layer; a per-layer name->(shard,off,len) table built once would cut it to ~5 s.
+3. deq 17-22 s/layer: exl3hgen (8.7 ms) + exl3had1 (8.9 ms) per deq are the hot kernels.
+4. shared expert + hc_apply ~22 s/layer inside T_TAIL.
