@@ -801,8 +801,20 @@ eviction frees it under the live binding -> the stale read. THE FIX:
 the by-value Vec param must be deep-copied ONCE — find the two copy
 sites (the call's argument preparation AND the param's binding copy in
 cgen_decl/cgen_expr_call) and drop one. This also explains the 2x
-deep-copy perf cost on every kernel-boundary call. Then: the L0 gate,
-the 45-layer run, the suite.
+deep-copy perf cost on every kernel-boundary call.
+CORRECTED (the driver's source): the driver calls digest("x", x) TWICE
+(the println + the lines accumulation) — the two VECCOPYs at the same dst
+are the TWO CALLS (the pool reuses the address legitimately), and the
+FREE-EVICT is the second call's param buffer's legitimate
+quarantine+eviction after its scope. The x's contents are correct at both
+calls. THE DIVERGENCE IS INSIDE THE DIGEST'S BODY: the param's copy is
+verified byte-perfect, yet the census values are garbage. NEXT PROBE (the
+final split): inside digest(), right after the entry, print v.get(0) —
+if it prints -0.000312805 (correct), the corruption happens inside the
+digest's loop (the accumulation or the census's variables); if it prints
+-3.4e8, the param's copy's buffer contents changed between the VECCOPY
+verify and the body's reads (a write through a stale alias). Then: the
+L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
