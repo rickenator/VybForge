@@ -696,9 +696,18 @@ stale pointer now returns the stale page's zeros instead of segfaulting —
 the quarantine converted the crash into silent garbage. NEXT: with
 VYB_STR_TRACE the RETIRE content print names the freed buffer (look for
 the fraw-sized retirement, n=180224 floats = 1.4 MB) and its position
-relative to the attn; then fix the producer's ownership (the embedding
-kernel call's result: the move/keepAlive gap — likely the same
-returned-value family as the site-8 strand, now at the kernel boundary); (b) the strand at the microbench's iteration 3 (live=5936) — the
+relative to the attn. DONE — THE SMOKING GUN (frawtrace.log): just before
+the fraw census: FREE-F of the source buffer, then VECCOPY size=180224
+cap=262144 elemsz=8 VECCOPY-OK bytes=1441792 (the by-value param deep
+copy, byte-verified). THE FRAW BINDING POINTS AT THE FREED SOURCE BUFFER:
+the kernel call's result Vec was assigned to fraw SHALLOWLY (the pointer
+copied, no retain/clone) and the callee's cleanup freed it — the Vec
+assignment lacks the ownership copy that the String assignment has (the
+site-4 retain). THE FIX: the assignment's Vec branch must route the RHS
+through copyOwnedValueForBinding (the deep clone, cgen_ownership.cpp:2686)
+when the RHS is a call result — same family as the site-8 strand, at the
+assignment boundary instead of the return boundary. After the fix: the
+microbench, the L0 gate, the layer-0 attention, then the 45-layer run. (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
