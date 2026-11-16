@@ -1,0 +1,24 @@
+# Minimal repro: the f64 accumulation over a by-value Vec param.
+# Expected: 90112 twice (the direct Vec + the by-value param copy).
+acc(v<Vec<Float>>)<Float> -> {
+    s<Float> = 0.0
+    j<Int> = 0
+    while (j < v.len()) {
+        x<Float> = v.get(j)
+        s = s + x * x
+        j = j + 1
+    }
+    return s
+}
+main()<Int> -> {
+    v<Vec<Float>> = Vec()
+    n<Int> = 90112
+    i<Int> = 0
+    while (i < n) {
+        v.push(1.0)
+        i = i + 1
+    }
+    println("DIRECT " + acc(v).to_string() + " (expected 90112)")
+    println("BYVAL  " + acc(v).to_string() + " (expected 90112)")
+    return 0
+}

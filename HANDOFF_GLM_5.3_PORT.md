@@ -839,10 +839,17 @@ values from correct +-1e-2 inputs: a miscompilation of the f64
 accumulation (the multiply/add or the accumulator locals), NOT a memory
 issue. NEXT: the digest's loop's arithmetic: minimize (a standalone repro:
 the accumulation over a Vec of known values -> the sum) and bisect the
-codegen's f64 arithmetic against the pre-session build — the suspects:
-the loop's locals under the new unwind, the by-value param copy's f64
-reads, or the to_string/census's float formatting. Then: the L0 gate,
-the 45-layer run, the suite.
+codegen's f64 arithmetic against the pre-session build. DONE
+(repro/f64sum.vyb, committed): the minimal accumulation EXONERATED
+(SUM 90112 correct) AND the by-value param path EXONERATED (90112 both
+calls). The bug needs more of the digest's exact shape — the remaining
+shape deltas: (a) the param's copy is a CLONE-OF-CLONE (the source is
+itself a call-result clone), (b) the census's to_string/concat chain at
+the return, (c) the digest's extra locals (a/q/m + the v0-v7 census
+assignments), (d) the digest's second loop (the hv census loop). NEXT:
+extend the repro by those deltas one at a time (the clone-of-clone
+first: acc(bulk_dtoh-shaped clone)), find the delta that flips the sum,
+and fix. Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
