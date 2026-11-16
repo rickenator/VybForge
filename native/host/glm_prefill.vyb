@@ -105,6 +105,8 @@ digest(name<String>, v<Vec<Float>>)<String> -> {
     i<Int> = 0
     while (i < v.len()) {
         x<Float> = v.get(i)
+        if (name == "x" && (i < 3 || i == 100 || i == 1000 || i == 10000 || i == 45056 || i == 90111)) {
+            println("ONSET i=" + i.to_string() + " v=" + x.to_string()) }
         s = s + x
         if (x < 0.0) { a = a - x } else { a = a + x }
         q = q + x * x

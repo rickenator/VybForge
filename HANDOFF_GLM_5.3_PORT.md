@@ -831,7 +831,18 @@ verify (the verify's memcmp vs the get's read: different pointers! the
 verify reads newDataPtr; the get reads the header's ptr — if the
 header's ptr differs from newDataPtr, the clone's stored ptr is wrong);
 if they print correct values, the corruption accumulates during the
-loop. Then: the L0 gate, the 45-layer run, the suite.
+loop. DONE: **ALL sampled reads are CORRECT** (i=0/1/2/100/1000/10000/
+45056/90111 — every value a plausible embedding ~+-1e-2). The buffer, the
+clone, the reads: all correct. THE GARBAGE IS IN THE DIGEST'S
+ACCUMULATION ARITHMETIC — the sum/abs/sq locals produce -3.7e12-scale
+values from correct +-1e-2 inputs: a miscompilation of the f64
+accumulation (the multiply/add or the accumulator locals), NOT a memory
+issue. NEXT: the digest's loop's arithmetic: minimize (a standalone repro:
+the accumulation over a Vec of known values -> the sum) and bisect the
+codegen's f64 arithmetic against the pre-session build — the suspects:
+the loop's locals under the new unwind, the by-value param copy's f64
+reads, or the to_string/census's float formatting. Then: the L0 gate,
+the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
