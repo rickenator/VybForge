@@ -1436,7 +1436,17 @@ spare ports) and is not worth pulling.
    on the same binary to estimate the flake rate, then instrument the expert immediately before
    the OOM with a print of every cuMemAlloc_v2 SIZE argument (a garbage size — e.g. a corrupt
    `kn`/`tb`/`mb` — is the remaining hypothesis; rc=2 = OUT_OF_MEMORY with cuMemGetInfo showing
-   free memory only if the requested size itself is absurd).
+   free memory only if the requested size itself is absurd). RESULT: sizes are CONSTANT and sane
+   across all 129 deq calls (tb=4194304, kn8=67108864, mb=4112, krows2=4096/8192) — the
+   garbage-size hypothesis is DEAD. So the device genuinely fills: each expert's ~200 MB of deq
+   staging is freed early in the run (experts 1-21 exactly neutral) and stops being freed later,
+   or the driver retains the freed pool; the loop's own frees are all present in the source. NEXT
+   remaining levers: (a) a cuMemGetInfo print INSIDE exl3_deq (after each of its frees) for the
+   experts around the growth onset — one of the nine frees may be a no-op because the block was
+   reallocated (double-free-then-reuse) or the free list's pointer differs from the alloc; (b)
+   VYB_POOL_TRACE / a device-alloc counter in alloc_dev/cuMemFree_v2 pair to name which of the
+   nine never balances; (c) run the gate under cuda-memcheck (compute-sanitizer) — a double free
+   or an invalid free is reported with the exact call.
 2. (SUPERSEDED — no host fix needed; keep `generateStructDeepCopy` unmodified.)
 3. Verify: gate 5x → `MOE_ALL_OK` each time; then full suite → the 45-layer acceptance.
    Full-suite/45-layer commands: `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,

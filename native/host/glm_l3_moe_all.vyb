@@ -217,6 +217,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
     nbc = cw / 128
     nblocks = (kn / cw / 128) * nbc
     mb = 16 + body.len()
+    if (1 == 1) { println("SIZES tb=" + tb.to_string() + " kn8=" + (kn * 8).to_string() + " mb=" + mb.to_string() + " krows2=" + (krows * 2).to_string() + " cw2=" + (cw * 2).to_string() + " ntiles=" + ntiles.to_string()) }
     freedom {
         var<Int> qd = 0
         var<Int> td = 0
