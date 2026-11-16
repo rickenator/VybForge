@@ -1561,3 +1561,10 @@ before believing a curve.**
   FDPTR/GPRE/GDEVMEM/DEQNET/GEDIG/LENSAN/PRESYNC) and `glm_prefill.vyb`
   (DIGESTENTRY/BDPROBE/DEVMEM/EXL3FAIL/MMSYNC/DEQFAIL/G9PROBE/L0_UNFOUND). They are gate-only
   diagnostics and cost a print, not a pass; DEQNET is the one that answers "is this a leak?".
+
+### 45-layer acceptance run — timeout corrected, relaunched 11:05
+Measured rate on the live run: **3.9 s/expert -> ~18.6 min per MoE layer**, i.e. 43 MoE layers is
+**~13.5 h**, which the 43200 s cap would have cut at ~layer 40. `tools/run_prefill45.sh` now uses
+`timeout 86400` (24 h); the first attempt's log is kept as
+`native/out/prefill45_attempt1_12h_cap.log` (it reached layer 4). Relaunched 11:05, pid 3720445,
+live log `native/out/prefill45.log`, ETA ~00:35 next day (PREFILL_OK layers=45).
