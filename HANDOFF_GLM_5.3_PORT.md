@@ -1445,8 +1445,16 @@ spare ports) and is not worth pulling.
    experts around the growth onset — one of the nine frees may be a no-op because the block was
    reallocated (double-free-then-reuse) or the free list's pointer differs from the alloc; (b)
    VYB_POOL_TRACE / a device-alloc counter in alloc_dev/cuMemFree_v2 pair to name which of the
-   nine never balances; (c) run the gate under cuda-memcheck (compute-sanitizer) — a double free
-   or an invalid free is reported with the exact call.
+   nine never balances; (c) run the gate under cuda-memcheck (compute-sanitizer) — DONE:
+   /usr/local/cuda-12.8/bin/compute-sanitizer --tool memcheck gives ZERO invalid accesses and ZERO
+   double frees; the ONLY errors are the three CUDA_ERROR_OUT_OF_MEMORY from cuMemAlloc_v2. So the
+   code's device accesses are clean and the device genuinely exhausts — which leaves the FREE
+   CALLS as the suspect: cuMemFree_v2's rc is IGNORED at every call site (the `cuMemFree_v2(x)`
+   statements discard the CInt). A free that returns an error (invalid/duplicate pointer) leaves
+   the block allocated with no diagnostics. NEXT (first thing next session): capture and print the
+   rc of every cuMemFree_v2 in exl3_deq and around the expert loop's dWg/dWu/dWd frees; the first
+   non-zero free rc names the block whose free is a no-op. This is a ~10-line change and one 4-min
+   gate run.
 2. (SUPERSEDED — no host fix needed; keep `generateStructDeepCopy` unmodified.)
 3. Verify: gate 5x → `MOE_ALL_OK` each time; then full suite → the 45-layer acceptance.
    Full-suite/45-layer commands: `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,
