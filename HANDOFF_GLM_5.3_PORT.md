@@ -1052,6 +1052,18 @@ loop's device high-water (print cudaMemGetInfo.free per expert) and
 diff the alloc/free sets; the leak is bounded to one layer's expert
 loop (~23 experts × leaked bytes = ~17 GB → ~700 KB-1 MB leaked per
 expert iteration).
+   REFINED (DEVMEM probe per expert + cuMemGetInfo_v2 extern added to
+glm_prefill): expert 1's deq completes with only 2.57 GB device used,
+then the NEXT expert's qd alloc (cuda1, ~29 MB trellis) fails — NOT
+out-of-memory. So cuda1 is a non-memory CUDA error whose rc is
+discarded by the `!= 0` check. NEXT: capture the rc at each EXL3FAIL
+site (`rc<Int> = cuMemAlloc_v2(...) as Int` + print) — likely a
+context/alignment/invalid-arg class, possibly the stale-pointer class
+hitting the expert resolve's strings (the copied GxLoc/idxtext in the
+expert loop is the same family the struct-clone fix addressed). The
+EXL3FAIL/DEVMEM probes and the dump_to fix are all committed; the
+45-layer run gets through layers 0-2 + layer 3's attention in ~36 s
+per MoE layer with bounded host memory.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
