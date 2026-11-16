@@ -1092,6 +1092,20 @@ the gemm over `sub`/`act` rows where nt=0 or a stale gather — the
 gather sub<Vec> per expert is built from the router output; a stale
 router value (the struct/borrow family again) could zero/poison the
 gemm shape.
+   NAMED (MMSYNC M/N/K): the faulting launch is the expert-loop gemm
+at M=3, N=2048, K=4096 (a 3-token routing to one expert; the gemm
+runs right after that expert's exl3_deq succeeded). Two candidate
+mechanisms: (a) the gemm kernel's config is wrong for tiny M — check
+whether nt=3 is itself the anomaly versus the Oct 30 passing runs'
+routing (22 tokens over 288 experts); (b) the gemm's B operand (the
+expert's freshly dequantized dWg/dWu/dWd) is corrupted — an exl3_deq
+output overrun (od = kn*8) would stomp adjacent device allocations,
+which would BOTH fault the gemm AND corrupt the allocator's
+bookkeeping (explaining the earlier 17 GB "exhaustion" and the
+garbage retained_pool counter). NEXT: run the l3moeall gate
+(glm_l3_moe_all.vyb + verify_l3_moe_all.py — the standalone expert
+path) with the same M/N/K print, and compare od's bounds against the
+deq kernel's expected output extent for ntiles/cw.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
