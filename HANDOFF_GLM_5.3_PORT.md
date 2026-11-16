@@ -1106,6 +1106,22 @@ garbage retained_pool counter). NEXT: run the l3moeall gate
 (glm_l3_moe_all.vyb + verify_l3_moe_all.py — the standalone expert
 path) with the same M/N/K print, and compare od's bounds against the
 deq kernel's expected output extent for ntiles/cw.
+   MOE-GATE ISOLATION DONE (make glm3all / gold via ~/venvs/exl3/bin
+python — note the oracle needs `env -i HOME=$HOME PATH=/usr/bin:/bin`
+or the hermes venv's numpy poisons the import): **the standalone MoE
+gate REPRODUCES the failure with the current compiler** (ALL_FAIL deq
+expert 87, exit 10) and **PASSES on the Oct 29 binary** (MOE_ALL_OK
+experts=109) — the regression is compiler-side, in the expert path.
+Bisect bounds: 47707da7 segfaults on the gate; 4ae941da fails
+ALL_FAIL deq expert 12 (the failure mode varies — 700 sticky vs deq
+fail vs segfault — but every post-Oct-29 build fails the MoE gate).
+The window is Oct 29 .. 47707da7: a7d1f9f1, e2bab515 (match-temp
+return cleanup), f7abc0a4, a3b49d33, 1af9e5a0, 0bcb3af5 (site-8
+borrow-retain), 7887c302, 1f679169 (quarantine v1), 1c2fce65,
+f624030c (extraction copy + free routing). Bisect these against
+`glm3all` next; the driver probes (EXL3FAIL/DEVMEM) are in
+glm_prefill.vyb only — copy them into glm_l3_moe_all.vyb's exl3_deq
+copy for the bisect runs.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
