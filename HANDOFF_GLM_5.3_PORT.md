@@ -1427,16 +1427,19 @@ spare ports) and is not worth pulling.
    Xid → **host-side corruption of the CUDA driver's context state** (heap stomp), consistent with
    the struct deep-copy bug corrupting adjacent host heap (also explains the garbage
    `retained_pool=3.65e17` counter).
-3. `repro/struct_clone_loop.vyb` (GxShape loop, 109×) PASSES — the simple shape is not enough; the
-   real path's JsonDoc-derived `Vec<String>` fields / the 15.5 MB idxtext / per-expert st_open are
-   required.
+3. ALL THREE host-shape repros PASS (`struct_clone_loop`, `struct_clone_shard`,
+   `struct_clone_doc` — the last one's earlier "corruption" was a bad assertion on the doc's
+   `"end"` sentinel key). There is NO host string bug; the "open" item below is device-side.
 
 ## Next steps in order (fresh session)
-1. Extend `repro/struct_clone_loop.vyb` to build its `Vec<String>` fields from a parsed JsonDoc
-   (mirror `gx_resolve_idx`'s construction) and loop 109× — expect the corruption in seconds.
-2. Fix `generateStructDeepCopy` (cgen_ownership.cpp:1811) for that case: the per-field Vec<String>
-   element retain vs the doc's teardown; also audit the assignment-site arm in cgen_expr.cpp:1259.
-3. Verify: repro → `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,
+1. (CORRECTED) No host repro to extend — all pass. Go straight at the device side: run the gate 5x
+   on the same binary to estimate the flake rate, then instrument the expert immediately before
+   the OOM with a print of every cuMemAlloc_v2 SIZE argument (a garbage size — e.g. a corrupt
+   `kn`/`tb`/`mb` — is the remaining hypothesis; rc=2 = OUT_OF_MEMORY with cuMemGetInfo showing
+   free memory only if the requested size itself is absurd).
+2. (SUPERSEDED — no host fix needed; keep `generateStructDeepCopy` unmodified.)
+3. Verify: gate 5x → `MOE_ALL_OK` each time; then full suite → the 45-layer acceptance.
+   Full-suite/45-layer commands: `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,
    1358/1358) → the 45-layer run:
    `VYBFORGE_GX_DIR=/usr/export/rick/vybforge/glm53-checkpoint VYBFORGE_PREFILL_OUT=... timeout 3000
    systemd-run --user --scope -q -p MemoryMax=80G <binary> --module-path native/json --module-path
