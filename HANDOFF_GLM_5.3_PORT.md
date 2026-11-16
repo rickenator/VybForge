@@ -731,7 +731,18 @@ cuda_launch4i with the rc CHECKED (glm_prefill.vyb:250 etc.) — the silent
 launch failure is unlikely; PRIME SUSPECT: the IDS buffer's host contents
 (the ids: a call-result Vec<Int>: the same shallow-assignment class just
 fixed — verify the clone covers the ids' path) or the EMB device tensor's
-state (the dequantize chain: the qd/td/od launch at glm_prefill.vyb:784). (b) the strand at the microbench's iteration 3 (live=5936) — the
+state (the dequantize chain: the qd/td/od launch at glm_prefill.vyb:784).
+SHARPENED — the L0 path is HOST-SIDE, no CUDA: the ids come from the
+tokenizer (glm_prefill.vyb:2346-2362), the embedding rows are read straight
+from the safetensors file (read_at at 2371), deq_bf16 -> bulk_dtoh -> x,
+and **x itself is garbage** (x n=90112 max=5.3e10 v0=-3.4e8 vs the expected
+~1e0-1e2). Valid-bf16 but wrong values = the WRONG FILE REGION = the ids'
+values are garbage => THE TOKENIZER'S PARSE READS STALE/FREED STRINGS (the
+same stale-string family: the tokenizer's parse doc/svals hit the early-
+free path). NEXT: VYB_STR_TRACE the tokenizer's parse (the ids' RETIRE
+content prints + the RET/REL around the token strings), find the
+tokenizer's stale-string read, and close the last ownership gap. Then:
+the L0 gate, the 45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
