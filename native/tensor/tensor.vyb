@@ -158,6 +158,8 @@ share(all) bulk_dtoh(base<Int>, n<Int>)<Vec<Float>> -> {
         dp<Int> = at(hdr)
         if (dp != 0) { cuMemcpyDtoH_v2(from<loc<CVoid>>(dp), base, n * 8) }
     }
+    # probe: the just-written buffer as Vyb reads it back
+    println("BDPROBE r0=" + r.get(0).to_string() + " n=" + n.to_string())
     return r
 }
 
