@@ -687,8 +687,18 @@ PAIRED RETAIN+RELEASE (the borrow-retain restored; the unwind releases the
 moved identifier: 2 -> 1 for the caller -> 0 at the caller's teardown):
 **L0_FAIL resolve 21 IS GONE — the resolve gate passes** (the failure moved
 downstream: PF_FAIL attention layer 0). REMAINING: (a) the layer-0
-attention's failure (the next diagnostic; the resolve's corruption is
-fixed); (b) the strand at the microbench's iteration 3 (live=5936) — the
+attention's failure — ROOT VISIBLE: the attention's input fraw is ALL
+ZEROS (the census: fraw n=180224 sum=0 abs=0 max=0), so log_decay(0)
+produced the garbage (gdec max=2.7e12) and delta zeroed -> attn len 0.
+The fraw zeros = A STALE-BUFFER READ: the embedding's result buffer was
+freed (a raw free -> quarantined, held mapped) before the read, so the
+stale pointer now returns the stale page's zeros instead of segfaulting —
+the quarantine converted the crash into silent garbage. NEXT: with
+VYB_STR_TRACE the RETIRE content print names the freed buffer (look for
+the fraw-sized retirement, n=180224 floats = 1.4 MB) and its position
+relative to the attn; then fix the producer's ownership (the embedding
+kernel call's result: the move/keepAlive gap — likely the same
+returned-value family as the site-8 strand, now at the kernel boundary); (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
