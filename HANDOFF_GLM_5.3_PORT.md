@@ -990,8 +990,34 @@ digest IS the historical pin. "L0_FAIL resolve 21" is a resolve COUNT
    OOM-killed at the gateway's 4 GiB cgroup — heavy runs need
    `systemd-run --user --scope -p MemoryMax=80G`.
    NEXT: instrument __vyb_pool_alloc/free byte counters (or run the 2-layer
-   gate under heaptrack/massif) to name the leaked allocation's call site;
+   gate under heaptrack/valgrind) to name the leaked allocation's call site;
    the bisect already bounds it to f624030c's two changes.
+
+**LEAK ROOT-CAUSED (same night, LD_PRELOAD malloc counter — see
+~/.hermes/cache/scratch/malcount.c)**: it is NOT a leak and NOT the
+registry/pool/quarantine. The 2-layer run issues **4.9M allocations
+totaling 373 GB (186 GB/layer, ~12 GB/s churn)** and frees them all
+(freeGB == allocGB) — the 83 GB RSS is glibc main-arena fragmentation
+from that churn (the arena cannot release interleaved free space; one
+29 GB contiguous anon mapping observed). Neither pool_alloc/free (<5000
+calls per 2 layers) nor quarantine pushes (<1000) carry the traffic —
+the churn flows through RAW malloc, i.e. the runtime's Vec/String
+operations and the by-value parameter deep copies the compiler's own
+warnings flag every run: rms_rows 2.8 MB, delta_rule q/k/g 3x1.4 MB,
+log_decay 1.4 MB, digest 2x1.4 MB, PER CALL. mallopt(M_MMAP_THRESHOLD=64K)
+did NOT help (the deep copies are interleaved with long-lived small
+allocations, so the arena fragments regardless). VYB_STRQ_OFF=1 (a
+quarantine bypass switch now in the runtime) coincided with a 1.7 GB
+2-layer run but the quarantine provably holds almost nothing — the A/B
+was confounded; do not trust it.
+   NEXT: convert the hot by-value Vec params in glm_prefill.vyb (the ones
+the deep-copy warnings name: rms_rows, log_decay, delta_rule's q/k/g,
+digest, kda_attn_site's streams) to `their<Vec<Float> const>` + view()
+at the call sites — the churn should drop from 186 GB/layer to ~nothing
+and the 45-layer run becomes possible on godzilla without a scope. The
+45-layer attempt with VYB_STRQ_OFF=1 reached layer 3's MoE and failed
+ALL_FAIL deq expert 287 (the stale-pointer class returning with the
+defenses off) — keep the quarantine ON once the churn is fixed.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
