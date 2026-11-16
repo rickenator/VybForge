@@ -1461,6 +1461,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     acc_mm<Int> = 0
     acc_host<Int> = 0
     tA<Int> = 0
+    tt0<Int> = 0
     tB<Int> = 0
     allw<Vec<String>> = Vec()
     galle<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
@@ -1553,6 +1554,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     println(digest("h2", h2))
     lines = digest("h2", h2) + "\n"
 
+    tt0 = time_mono_millis()
     # ---- router (same code path as L3_MOE_ROUTE_VYB) ----
     want<Vec<String>> = Vec()
     want.push(lpre + "mlp.gate.weight")
@@ -1826,6 +1828,8 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         ? -> { }
     }
 
+    println("T_TAIL total=" + (time_mono_millis() - tt0).to_string() +
+            " (router+MoE+shared+hc_apply)")
     return streams2
 }
 
@@ -2400,6 +2404,10 @@ main()<Int> -> {
     streams1<Vec<Float>> = Vec()
     is_dsa<Int> = 0
 
+    lt0<Int> = 0
+    lt1<Int> = 0
+    lt2<Int> = 0
+    lt3<Int> = 0
     nl<String> = env_get("VYBFORGE_NLAYERS") else ""
     if (nl.len() > 0) { nlay = nl.to_int() }
 
@@ -2519,6 +2527,7 @@ main()<Int> -> {
         # Layer 45 in the checkpoint is NOT a decoder layer -- it is the multi-token
         # prediction head (eh_proj / enorm / hnorm, its own experts), so the forward
         # stack is 0..44 and the MTP head is driven separately.
+        lt0 = time_mono_millis()
         if ((n % 4) == 3) { is_dsa = 1 }
         if (is_dsa == 1) {
             streams1 = dsa_attn_site(streams, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
@@ -2531,6 +2540,7 @@ main()<Int> -> {
             println("PF_FAIL attention layer " + n.to_string())
             return 30
         }
+        lt1 = time_mono_millis()
         if (n < 3) {
             streams = ffn_dense_site(streams1, dir, total, lpre, fgemm, fbf)
         } else {
@@ -2541,7 +2551,12 @@ main()<Int> -> {
             return 31
         }
         i = trim_heap()
+        lt2 = time_mono_millis()
         println("MARK ffn-done layer " + n.to_string())
+        lt3 = time_mono_millis()
+        println("T_LAYER n=" + n.to_string() + " attn=" + (lt1 - lt0).to_string() +
+                " ffn=" + (lt2 - lt1).to_string() + " post=" + (lt3 - lt2).to_string() +
+                " total=" + (lt3 - lt0).to_string())
         println("layer " + n.to_string() + " done")
         lines = lines + "layer " + n.to_string() + " " + digest("streams", streams) + "\n"
         # chained-decode gate oracle (HANDOFF §11): the LAST TWO tokens' streams at full
