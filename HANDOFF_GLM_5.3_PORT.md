@@ -887,9 +887,19 @@ to_string receives -3.7e12). The ratios differ per number (not a constant
 formatting shift), so these are genuinely different values in the s/a
 locals at build time. NEXT: probe the s's value between the two loops
 and just before the return's to_string (the ONSET-style prints) to catch
-the clobbering write — the suspects: the second (hv) loop's locals under
-the new unwind, or the string-build's temporaries aliasing the frame.
-Then: the L0 gate, the 45-layer run, the suite.
+the clobbering write. **REVERSED — THE CENSUS WAS NEVER GARBAGE:** the
+census line is di(hv).to_string() where di(v) = (v * SCALE40) as Int —
+it scales by 1099511627776 BY DESIGN. The "garbage" -3692488466944 is
+exactly -3.35685 * SCALE40. The digest's arithmetic, the x data, the
+clone, the reads: ALL correct; the census: correct by design. THE REAL
+DISCREPANCY: the scaled digest is **21 vs the pinned 360448** — a factor
+of ~1600, matching the x's values being ~1600x too large (the measured
+~1e-2 vs the implied ~6e-6 from 360448/SCALE40/90112). THE TRAIL: the
+x's values' scale — the deq_bf16's z param (the driver passes z=0 for
+the embedding deq; the other calls pass strides/offsets) or the read's
+region. NEXT: verify the embedding deq's z semantics against the kernel
+(bf16.vyb: the z param's role) and the x's expected value scale. Then:
+the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
