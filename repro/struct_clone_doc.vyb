@@ -50,6 +50,7 @@ mk_loc(tag<Int>)<GxShape> -> {
         }
         ? -> { }
     }
+    if (g.paths.len() > 0) { println("IN_LOC path0len=" + g.paths.get(0).len().to_string() + " dts0len=" + g.dts.get(0).len().to_string()) }
     return g
 }
 
