@@ -1,0 +1,30 @@
+// Repro: a call-result String assigned at declaration must stay valid across
+// heavy registry churn. If the decl-init aliases the temporary shallowly, the
+// callee's cleanup frees the buffer; the quarantine holds it mapped until
+// eviction recycles the address, and the read then shows another string's
+// contents (the suite runner's `vyb` path corruption at ~test 180).
+// @test: string decl-init aliasing under churn
+// @expect-output: STABLE-TAIL
+
+producer()<String> -> {
+    return "/some/long/path/that/is/the/compiler/binary/path-ish"
+}
+
+churn(n<Int>)<Int> -> {
+    i<Int> = 0
+    acc<Int> = 0
+    while (i < n) {
+        s<String> = "churn-string-" + i.to_string() + "-with-some-length"
+        acc = acc + s.len()
+        i = i + 1
+    }
+    return acc
+}
+
+main()<Int> -> {
+    held<String> = producer()
+    c<Int> = churn(200000)
+    println("STABLE-TAIL")
+    println("len=" + held.len().to_string())
+    return 0
+}

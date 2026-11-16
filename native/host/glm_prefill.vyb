@@ -246,8 +246,10 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     freedom {
         var<Int> q = 0
         var<Int> o = 0
-        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { println("DEQFAIL alloc q len=" + raw.len().to_string()); return 0 }
-        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { println("DEQFAIL alloc o n=" + n.to_string()); return 0 }
+        qrc<Int> = cuMemAlloc_v2(loc(q), raw.len()) as Int
+        if (qrc != 0) { println("DEQFAIL alloc q rc=" + qrc.to_string() + " len=" + raw.len().to_string()); return 0 }
+        orc<Int> = cuMemAlloc_v2(loc(o), n * 8) as Int
+        if (orc != 0) { println("DEQFAIL alloc o rc=" + orc.to_string() + " n=" + n.to_string()); return 0 }
         hrc<Int> = cuMemcpyHtoD_v2(q, raw, raw.len()) as Int
         if (hrc != 0) { println("DEQFAIL htod rc=" + hrc.to_string() + " len=" + raw.len().to_string()); return 0 }
 
