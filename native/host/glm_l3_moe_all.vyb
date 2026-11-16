@@ -350,12 +350,15 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         cuCtxSynchronize()
         # qd was already freed right after the deq launch; fd is the
         # RETURNED weights (out = fd) and must never be freed here.
-        cuMemFree_v2(od)
-        cuMemFree_v2(hd)
-        cuMemFree_v2(td2)
-        cuMemFree_v2(pd)
-        cuMemFree_v2(sud)
-        cuMemFree_v2(svd)
+        fr1<Int> = cuMemFree_v2(od) as Int
+        fr2<Int> = cuMemFree_v2(hd) as Int
+        fr3<Int> = cuMemFree_v2(td2) as Int
+        fr4<Int> = cuMemFree_v2(pd) as Int
+        fr5<Int> = cuMemFree_v2(sud) as Int
+        fr6<Int> = cuMemFree_v2(svd) as Int
+        if (fr1 + fr2 + fr3 + fr4 + fr5 + fr6 != 0) {
+            println("FREEFAIL rcs=" + fr1.to_string() + "," + fr2.to_string() + "," + fr3.to_string() + "," + fr4.to_string() + "," + fr5.to_string() + "," + fr6.to_string())
+        }
         out = fd
     }
     return out

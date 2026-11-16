@@ -1454,7 +1454,14 @@ spare ports) and is not worth pulling.
    the block allocated with no diagnostics. NEXT (first thing next session): capture and print the
    rc of every cuMemFree_v2 in exl3_deq and around the expert loop's dWg/dWu/dWd frees; the first
    non-zero free rc names the block whose free is a no-op. This is a ~10-line change and one 4-min
-   gate run.
+   gate run. RESULT: all six frees return 0 (success) up to the OOM at expert 117 — the frees are
+   NOT the no-op. Combined with memcheck (clean accesses), sane sizes, and a memory-neutral early
+   loop, the holder is OUTSIDE exl3_deq: the remaining suspect is the driver's own device-buffer
+   helpers feeding the loop — `bulk_htod` / `bulk_dtoh` / `alloc_dev` in native/tensor/tensor.vyb
+   (and the gather's per-expert upload). Audit those for alloc/free balance (bulk_dtoh allocates a
+   device staging buffer per call; if it leaks for rows>1 the curve grows only for multi-token
+   experts — matching the observed onset). That is the FIRST thing to check next session; the
+   gate's own accounting is now fully exonerated.
 2. (SUPERSEDED — no host fix needed; keep `generateStructDeepCopy` unmodified.)
 3. Verify: gate 5x → `MOE_ALL_OK` each time; then full suite → the 45-layer acceptance.
    Full-suite/45-layer commands: `glm3all` (`MOE_ALL_OK`) → full suite (`test/run_tests.vyb --vyb build-release/vyb`,
