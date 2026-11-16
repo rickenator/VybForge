@@ -582,6 +582,10 @@ main()<Int> -> {
             # feeding cuMemcpyHtoD, or a dying context, names itself here.
             tsan<Int> = gx_read(ge, 0).len()
             if (tsan <= 0 || tsan > 67108864) { println("LENSAN expert " + e.to_string() + " tb=" + tsan.to_string()) }
+            prefr<Int> = 0
+            pretot<Int> = 0
+            freedom { cuMemGetInfo_v2(loc(prefr), loc(pretot)) }
+            println("GPRE e=" + e.to_string() + " nt=" + nt.to_string() + " used=" + (pretot - prefr).to_string())
             prerc<Int> = 0
             freedom { prerc = cuCtxSynchronize() as Int }
             if (prerc != 0) { println("PRESYNC expert " + e.to_string() + " rc=" + prerc.to_string()) }
