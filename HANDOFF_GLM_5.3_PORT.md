@@ -713,10 +713,18 @@ declaration init and the assignment — **the fraw zeros are FIXED** (the
 fraw census: non-zero data; the stale-buffer class resolved; the binding
 owns a live clone). REMAINING: the kernel output's contents have garbage
 magnitudes (the fraw max=6.3e12 vs the expected ~1e0-1e2) — the embedding
-kernel's output buffer holds uninitialized-looking data: the dispatch/
-launch diagnostic (the kernel's args, the by-value param copies' pointers,
-the launch's success), NOT an ownership issue. Then: the L0 gate, the
-45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
+kernel's output buffer holds uninitialized-looking data: a dispatch/
+launch diagnostic, NOT an ownership issue. The launch surface:
+bindings/cuda/mod.vyb — cuda_launch(hfunc, grid, block, a0) packs ONE
+8-byte arg (the kernelParams void*[] triple-deref from #199), the kernels
+take a packed device args-struct; the flow: the host args -> HtoD ->
+cuLaunchKernel -> cuCtxSynchronize -> the DtoH read-back into the result
+buffer. NEXT: (1) print the launch's CUresult and the sync's rc after the
+embedding launch (the silent-failure check); (2) verify the read-back's
+device pointer/size; (3) if the launch is fine, the args-struct packing
+(the by-value param copies changed WHICH host buffers the args point into
+— the HtoD must copy from the COPIES, not the originals). Then: the L0
+gate, the 45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
