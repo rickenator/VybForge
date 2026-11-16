@@ -820,9 +820,18 @@ DURING the digest's loop ([0] stays correct, [i>0] turns to garbage): an
 allocation reuses or stomps the param buffer mid-loop. NEXT: with
 VYB_STR_TRACE, watch the param buffer's address during the digest's
 execution (the FREE-F/QUAR-ABSORB/VECCOPY lines between DIGESTENTRY x
-and the census line) — the stomping allocation names itself. This is the
-last gap; every other link is verified. Then: the L0 gate, the 45-layer
-run, the suite.
+and the census line) — the stomping allocation names itself. DONE:
+**ZERO events on the param buffer during the loop** — the allocator
+never touches it. THE CORRUPTION IS IN THE DIGEST'S READS: the get path
+or the accumulators, not the buffer. NEXT PROBE (the onset locator):
+inside the digest's loop, print v.get(1) and v.get(2) on the first few
+iterations (the i<3 guard) — if they print garbage immediately, the
+copy's buffer contents beyond [0] are wrong DESPITE the VECCOPY-OK
+verify (the verify's memcmp vs the get's read: different pointers! the
+verify reads newDataPtr; the get reads the header's ptr — if the
+header's ptr differs from newDataPtr, the clone's stored ptr is wrong);
+if they print correct values, the corruption accumulates during the
+loop. Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
