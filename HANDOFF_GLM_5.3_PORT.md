@@ -587,7 +587,19 @@ vec-push (300K), 3 struct-field (300K); the aggregate cannot disambiguate
 which release is missing — NEXT: the per-pointer lifecycle attribution (the
 strand = the pointer whose RET count exceeds REL by the strand) to name the
 exact site. NOTE: the full stage SEGFAULTS with the markers present (open;
-the parse stage is clean). Verify: the microbench stage=full live flat; then the
+the parse stage is clean). RESOLVED + REGRESSION (0bcb3af5): the strand =
+site 8, the return-transfer's borrow-retain (every stranded pointer carried
+exactly one unmatched site-8 retain) — the borrow's +1 assumed the scope
+cleanup releases the returned binding, but the return-path cleanup
+keepAlives the moved binding, so the +1 stranded; the fix skips the retain
+for bare moved identifiers. RESULT: the microbench full stage live=6 FLAT
+over 3 iterations (was 5,942->11,883->17,824) — THE STRAND IS ELIMINATED.
+BUT the 45-layer glm_prefill SEGFAULTS early on the build (one str_stats
+line, live=10, then crash): the moved-identifier return needs a guard
+refinement (some flow still under-counts a ref). NEXT: gdb the prefill
+core, find the freed-then-used string, refine the guard. The suite runner
+still aborts with the pre-existing tcache double free (the runner's own
+documented issue, independent of this fix). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
 effect — depth effects need the full 45-layer run (12+ layer rule applies doubly).
 
