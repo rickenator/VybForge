@@ -682,7 +682,17 @@ the returned identifiers all released; the borrowed reads excluded via
 keepAlive) — the blanket unwind failed before because it did not respect
 that discipline. NEXT SESSION: implement the needsCleanup-disciplined full
 unwind in visit(ReturnStatement), verify the microbench (live flat AND the
-L0 gate green), then the 45-layer acceptance. NOTE: the extraction
+L0 gate green), then the 45-layer acceptance. DONE: the full unwind + THE
+PAIRED RETAIN+RELEASE (the borrow-retain restored; the unwind releases the
+moved identifier: 2 -> 1 for the caller -> 0 at the caller's teardown):
+**L0_FAIL resolve 21 IS GONE — the resolve gate passes** (the failure moved
+downstream: PF_FAIL attention layer 0). REMAINING: (a) the layer-0
+attention's failure (the next diagnostic; the resolve's corruption is
+fixed); (b) the strand at the microbench's iteration 3 (live=5936) — the
+extraction copy's retain balance: the copy's +1/string/iter unmatched by
+its release (audit copyOwnedValueForBinding's release path); (c) the suite
+after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
+RETIRE, VECCOPY, VECCOPY-MISMATCH). NOTE: the extraction
 copy also fires 22.8K times per prefill (every optional payload) — after
 the content fix, check the perf cost and the strand (live=5936 at iter 3).
 The microbench full stage: no abort, but the strand re-emerged at iteration
