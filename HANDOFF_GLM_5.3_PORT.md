@@ -955,6 +955,44 @@ digest IS the historical pin. "L0_FAIL resolve 21" is a resolve COUNT
    runner's healthy span from 4 to ~184 tests. The runner bug lives in
    test/run_tests.vyb's own string handling — separate from the registry.
 
+**FOLLOW-UP (same evening, after the L0 gate went green)**
+
+3. **The suite's 9 real regressions — FIXED (Vyb 4dff29ec)**: e2bab515's
+   return-path cleanup POPPED the compile-time scopeStack at every return;
+   codegen continues after a return inside a match arm (the other arms, the
+   join blocks), so sibling paths registered `__recv_struct_tmp` with no
+   active scope and their cleanups never fired (btreemap's
+   `bt.get(10) else "?"` returned garbage; archive/chain/http/https/closures
+   red). The cleanup now walks the scopes WITHOUT popping and RESTORES
+   needsCleanup so each exit path frees exactly once; the return path frees
+   ONLY the match temps (the blanket all-vars form double-freed the closure
+   escape tests). ALSO: run_tests.vyb's opt() returned the borrowed argv
+   element whose return-transfer freed the caller's binding — the runner's
+   full-run decay at ~180 tests (the malformed `timeout` args); opt() now
+   returns a fresh buffer and takes argv as a const borrow.
+   **RESULT: the suite is 1358/1358 GREEN** (first full pass since the
+   ownership work began); the L0 gate re-verified green on the same build.
+
+4. **THE 45-LAYER RUN IS BLOCKED by a ~30 GB/layer raw-heap leak**, bisected:
+   the Oct 29 binary (build-merge-check) + the current driver completes
+   NLAYERS=2 at 1.56 GB peak, exit 0; f624030c (extraction copy + all free
+   paths routed through the quarantine) peaks at 6.5 GB for 2 layers, and
+   the leak continues at HEAD (~1 GB/s of anonymous arena growth measured
+   live: 17 GB → 78 GB in 70 s during layer 1-2; the kernel OOM-killed the
+   45-layer run at 83.7 GB anon-rss — exit 137, twice). The string registry
+   is SMALL during the growth (live ~43k), so it is NOT the strand — it is
+   raw buffers never freed. The handoff's open suspect stands: a heap
+   corruption from the extraction-copy change (the garbage
+   retained_pool=3.65e17 counter is the tell; generateVecDeepCopy's shape
+   was verified byte-perfect earlier, so the corruption is elsewhere in the
+   free-routing/sizing). The 2-layer run COMPLETES green under a 100 G
+   systemd scope; 45 layers cannot fit. NOTE: session-launched jobs are
+   OOM-killed at the gateway's 4 GiB cgroup — heavy runs need
+   `systemd-run --user --scope -p MemoryMax=80G`.
+   NEXT: instrument __vyb_pool_alloc/free byte counters (or run the 2-layer
+   gate under heaptrack/massif) to name the leaked allocation's call site;
+   the bisect already bounds it to f624030c's two changes.
+
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),
 G9PROBE (the GxLoc field dump before the o_norm read). The suite
