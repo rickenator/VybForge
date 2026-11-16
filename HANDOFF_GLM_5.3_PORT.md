@@ -606,7 +606,20 @@ CORRECT (the microbench live=6 flat). NEXT: either (a) the registry's
 defense-in-depth (the slot generation/ticket so a stale release/pointer
 cannot kill the new string), or (b) the codegen's stale-read guard (the
 return-move set must exclude bindings still read after the return's CFG
-position — currently impossible statically; favors (a)). The suite runner
+position — currently impossible statically; favors (a)). Rick chose (a) — INSTALLED:
+the retired-buffer quarantine (vyb_strq_ring, 4096 entries, retired registry
+buffers held mapped; the eviction frees the oldest) + the pool's
+foreign-branch absorb (a foreign free of a quarantined pointer returns
+without freeing). RESULT: the prefill's crash moved from the site-8 segfault
+to a resolve-enter tcache double free with ZERO QUAR-ABSORB hits — the
+double-freed block is freed by TWO RAW POOL-FOREIGN FREES (both from the
+JIT'd code, gdb bt #9 = the JIT address, no registry involvement): the
+site-8 fix's ref accounting exposed a pre-existing double-free (a buffer
+whose ref was 2 under the borrow-retain is now 1, freed early, then freed
+again by the second site). NEXT: instrument __vyb_pool_free's foreign
+branch (print the pointer + the caller marker per free) and diff the two
+frees of the aborting block to name both codegen sites, then fix whichever
+site double-frees. The microbench remains green (live=6 flat). The suite runner
 still aborts with the pre-existing tcache double free (the runner's own
 documented issue, independent of this fix). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
