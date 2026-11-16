@@ -667,7 +667,22 @@ site-8 fix alone (revert the extraction copy + the quarantine routing
 temporarily), run the L0 gate; (2) if the L0 passes, add the quarantine
 routing and re-test; (3) the first failing step is the culprit. The L0
 PASSED on the pre-session baseline (the e2bab515-era build, the 1308 s run
-with the borrow-retain). NOTE: the extraction
+with the borrow-retain). BISECT VERDICT: **the site-8 fix is the culprit** —
+with the site-8 fix + the quarantine routing (no extraction copy) the L0
+still fails resolve 21; with the site-8 fix alone the tcache abort returns
+(the routing was masking the latent double free). THE COMPLETE MECHANISM:
+the return's surgical unwind pops the scopes WITHOUT releasing the
+non-temp bindings, so exitToFunctionBaseline finds them popped empty — the
+borrow-retain at site 8 (+1 for the caller) is thus never matched by the
+returned identifier's release: pre-site-8 the +1 strands (the drift);
+post-site-8 the ref drops to 0 one release early (the resolve reads
+freed data -> the digest 21). THE CORRECT DESIGN: a full unwind of the
+popped scopes under the needsCleanup discipline (the temps + the locals +
+the returned identifiers all released; the borrowed reads excluded via
+keepAlive) — the blanket unwind failed before because it did not respect
+that discipline. NEXT SESSION: implement the needsCleanup-disciplined full
+unwind in visit(ReturnStatement), verify the microbench (live flat AND the
+L0 gate green), then the 45-layer acceptance. NOTE: the extraction
 copy also fires 22.8K times per prefill (every optional payload) — after
 the content fix, check the perf cost and the strand (live=5936 at iter 3).
 The microbench full stage: no abort, but the strand re-emerged at iteration
