@@ -637,7 +637,18 @@ BOTH are consistent with ONE BUFFER OVERFLOW introduced by this session's
 ref changes — the prime suspect: copyOwnedValueForBinding's sizing at the
 extraction (the copy's buffers under-sized). NEXT: audit
 copyOwnedValueForBinding's per-field sizing (the Vec buffers' byte counts,
-the String copies' len+1), or run the prefill's pre-CUDA stages under ASan.
+the String copies' len+1), or run the prefill's pre-CUDA stages under ASan. SHARPENED (the q4 log):
+the attention failure is DOWNSTREAM — the real failure is **L0_FAIL resolve
+21** (the layer-0 resolve digest is 21 vs the pinned 360448 — the copied ix
+is nearly EMPTY), then "attn len 0 layer 1". The deep copy's sizing LOOKS
+right (generateVecDeepCopy: alloc = cap*elemSize, copy = size elements, the
+cap-preserving fix already in its comment) — so the wrongness is the
+copy's CONTENT or the SIZE fields: instrument generateVecDeepCopy/
+generateStructDeepCopy to print (the src size/cap, the dst size/cap, the
+digest of the copied bytes) at the extraction, run the driver's L0 gate,
+and diff. Suspicion: the JNode/struct-element per-element deep copy inside
+generateVecDeepCopy (line ~1673) returns a value the copy loop stores
+wrongly, or the copy's {ptr,size,cap} triple misorders fields.
 The microbench full stage: no abort, but the strand re-emerged at iteration
 3 (live=5936) — the extraction copy's retains are +1/string/iter unbalanced;
 audit that too. All the instrumentation (FREE-F, FREE-EVICT, QUAR-ABSORB,
