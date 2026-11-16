@@ -1,0 +1,64 @@
+// Repro #3: mirror the MoE expert resolve — st_open() a REAL shard header and
+// copy its fields into a GxLoc-shaped struct, assigned at declaration from a
+// call result, looped 109x. The MoE gate passes without 5520f9de's struct
+// call-result clone and fails with it; this should reproduce that in seconds.
+// @test: struct call-result clone over st_open (the expert resolve shape)
+// @expect-return: 0
+
+import safetensors
+
+share(all)
+struct GxShape {
+    found<Vec<Int>>,
+    off<Vec<Int>>,
+    nbytes<Vec<Int>>,
+    dts<Vec<String>>,
+    paths<Vec<String>>
+}
+
+mk_loc_from_shard(path<String>, tag<Int>)<GxShape> -> {
+    g<GxShape> = GxShape { found = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
+    ix<StIndex> = st_open(path)
+    if (ix.n <= 0) {
+        g.found.push(-1)
+        return g
+    }
+    lim<Int> = 24
+    if (ix.n < lim) { lim = ix.n }
+    i<Int> = 0
+    while (i < lim) {
+        g.found.push(1)
+        g.off.push(ix.data_base + ix.doff.get(i))
+        g.nbytes.push(ix.dlen.get(i))
+        g.dts.push(ix.dtypes.get(i))
+        g.paths.push(ix.path)
+        i = i + 1
+    }
+    return g
+}
+
+digest_loc(g<GxShape>, tag<Int>)<Int> -> {
+    acc<Int> = 0
+    i<Int> = 0
+    while (i < g.off.len()) {
+        if (g.paths.get(i).len() < 10) { return 0 - 1 }
+        if (g.dts.get(i).len() < 2) { return 0 - 2 }
+        if (g.off.get(i) <= 0) { return 0 - 3 }
+        acc = acc + g.off.get(i) % 1000
+        i = i + 1
+    }
+    return acc % 100000 + tag
+}
+
+main()<Int> -> {
+    path<String> = "/usr/export/rick/vybforge/glm53-checkpoint/model-00002-of-00083.safetensors"
+    i<Int> = 0
+    while (i < 109) {
+        g<GxShape> = mk_loc_from_shard(path, i)
+        d<Int> = digest_loc(g, i)
+        if (d < 0) { println("SHARDCORRUPT iter " + i.to_string() + " d=" + d.to_string()); return 1 }
+        i = i + 1
+    }
+    println("SHARDSHAPE_OK")
+    return 0
+}
