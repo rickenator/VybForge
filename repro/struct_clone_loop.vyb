@@ -1,0 +1,58 @@
+// Repro: a function returning a GxLoc-shaped struct (5 Vec<Int> + 2
+// Vec<String> fields) assigned at declaration, inside a loop that mimics the
+// MoE expert resolve (109 iterations). If the struct call-result deep copy
+// (5520f9de) corrupts, the loop's later reads go garbage / the process dies.
+// @test: struct call-result clone across a loop (the MoE expert resolve shape)
+// @expect-return: 0
+
+share(all)
+struct GxShape {
+    found<Vec<Int>>,
+    shard<Vec<Int>>,
+    tix<Vec<Int>>,
+    off<Vec<Int>>,
+    nbytes<Vec<Int>>,
+    dts<Vec<String>>,
+    paths<Vec<String>>
+}
+
+mk_loc(tag<Int>)<GxShape> -> {
+    g<GxShape> = GxShape { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(),
+                           nbytes = Vec(), dts = Vec(), paths = Vec() }
+    i<Int> = 0
+    while (i < 24) {
+        g.found.push(1)
+        g.shard.push((tag + i) % 83 + 1)
+        g.tix.push(i)
+        g.off.push(1646384088 + i * 256)
+        g.nbytes.push(256 + i)
+        g.dts.push("BF16")
+        g.paths.push("/shard/model-00001-of-00083.safetensors")
+        i = i + 1
+    }
+    return g
+}
+
+digest_loc(g<GxShape>, tag<Int>)<Int> -> {
+    acc<Int> = 0
+    i<Int> = 0
+    while (i < g.found.len()) {
+        acc = acc + g.off.get(i) % 1000 + g.nbytes.get(i) % 97
+        if (g.paths.get(i).len() < 10) { return 0 - 1 }
+        if (g.dts.get(i) != "BF16") { return 0 - 2 }
+        i = i + 1
+    }
+    return acc % 100000 + tag
+}
+
+main()<Int> -> {
+    i<Int> = 0
+    while (i < 109) {
+        g<GxShape> = mk_loc(i)
+        d<Int> = digest_loc(g, i)
+        if (d < 0) { println("CORRUPT iter " + i.to_string() + " d=" + d.to_string()); return 1 }
+        i = i + 1
+    }
+    println("MOESHAPE_OK")
+    return 0
+}

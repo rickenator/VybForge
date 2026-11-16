@@ -208,11 +208,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
     chq<Int> = 0
     var<Int> out = 0
     tb = trellis.len()
-    if (tb < ntiles * 128) { return 0 }
+    if (tb < ntiles * 128) { println("GEXL3FAIL site"); return 0 }
     kn = (ntiles / (cw / 16)) * 16 * cw
     krows = kn / cw
-    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { return 0 }
-    if (suh.len() != krows * 2 || svh.len() != cw * 2) { return 0 }
+    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { println("GEXL3FAIL site"); return 0 }
+    if (suh.len() != krows * 2 || svh.len() != cw * 2) { println("GEXL3FAIL site"); return 0 }
     nbc = cw / 128
     nblocks = (kn / cw / 128) * nbc
     mb = 16 + body.len()
@@ -226,18 +226,27 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         var<Int> pd = 0
         var<Int> sud = 0
         var<Int> svd = 0
-        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 0 }
+        grc1<Int> = cuMemAlloc_v2(loc(qd), tb) as Int
+        if (grc1 != 0) { println("GEXL3FAIL alloc rc=" + grc1.to_string()); return 0 }
+        grc2<Int> = cuMemAlloc_v2(loc(td), mb) as Int
+        if (grc2 != 0) { println("GEXL3FAIL alloc rc=" + grc2.to_string()); return 0 }
+        grc3<Int> = cuMemAlloc_v2(loc(od), kn * 8) as Int
+        if (grc3 != 0) { println("GEXL3FAIL alloc rc=" + grc3.to_string()); return 0 }
+        grc4<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
+        if (grc4 != 0) { println("GEXL3FAIL alloc rc=" + grc4.to_string()); return 0 }
+        grc5<Int> = cuMemAlloc_v2(loc(td2), kn * 8) as Int
+        if (grc5 != 0) { println("GEXL3FAIL alloc rc=" + grc5.to_string()); return 0 }
+        grc6<Int> = cuMemAlloc_v2(loc(fd), kn * 8) as Int
+        if (grc6 != 0) { println("GEXL3FAIL alloc rc=" + grc6.to_string()); return 0 }
+        grc7<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
+        if (grc7 != 0) { println("GEXL3FAIL alloc rc=" + grc7.to_string()); return 0 }
+        grc8<Int> = cuMemAlloc_v2(loc(sud), krows * 2) as Int
+        if (grc8 != 0) { println("GEXL3FAIL alloc rc=" + grc8.to_string()); return 0 }
+        grc9<Int> = cuMemAlloc_v2(loc(svd), cw * 2) as Int
+        if (grc9 != 0) { println("GEXL3FAIL alloc rc=" + grc9.to_string()); return 0 }
 
         # trellis: bulk copy straight from the String
-        if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { println("GEXL3FAIL site"); return 0 }
         # map: 16-byte header + the 256-slot body
         var<CInt> rc = 0
         hwide = 0
@@ -246,14 +255,14 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             hwide = hwide | (((cw >> (bq * 8)) & 255) << (bq * 8))
             bq = bq + 1
         }
-        if (cuMemcpyHtoD_v2(td, loc(hwide), 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(td, loc(hwide), 8) != 0) { println("GEXL3FAIL site"); return 0 }
         hwide = 0
         bq = 0
         while (bq < 8) {
             hwide = hwide | (((ntiles >> (bq * 8)) & 255) << (bq * 8))
             bq = bq + 1
         }
-        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { println("GEXL3FAIL site"); return 0 }
         u = 0
         while (u < body.len()) {
             ch = 0

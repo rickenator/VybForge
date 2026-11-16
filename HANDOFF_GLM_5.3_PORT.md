@@ -1121,6 +1121,23 @@ the sizing; test a standalone repro (a function returning a struct
 with Vec<Int>+Vec<String> fields, assigned, looped 100x, digested)
 before re-running glm3all. Interim option: keep the struct clone for
 correctness (the L0 gate needs it) and fix the deep copy.
+   DEVICE ROOT CAUSE CLASS NAMED (kernel log): every failing run logs
+**Xid 31 — GPU MMU fault** (journalctl -k | grep Xid; e.g. 23:42:31
+pid 2779272 "MMU Fault: ENGINE GRAPHICS ... FAULT_PDE
+ACCESS_TYPE_VIRT_WRITE" — mostly VIRT_READ, one WRITE). A kernel
+dereferences an invalid device pointer; the channel dies and the
+primary context resets, which is exactly the observed rc=2
+NOT_INITIALIZED / sticky 700 at the next CUDA call. The faults started
+Nov 15 23:13 (the first post-5520f9de MoE runs). So a kernel in the
+MoE expert path touches a bad device pointer — the top candidates in
+order: (1) the expert-loop gemm over a tiny M (M=3 seen; a grid/bounds
+bug for small M), (2) an exl3_deq staging/output overrun (od=kn*8 vs
+the kernel's actual extent), (3) a stale device pointer in the pd args
+block after the struct-clone change reshuffled host allocations.
+NEXT: correlate one Xid's pid with a single NLAYERS=4 run, then dump
+the launch args (grid + the pd param block's device pointers + sizes)
+for the kernels of the expert right before the fault; compare the
+gemm kernel's small-M grid against the 4B driver's known-good shapes.
    MOE-GATE ISOLATION DONE (make glm3all / gold via ~/venvs/exl3/bin
 python — note the oracle needs `env -i HOME=$HOME PATH=/usr/bin:/bin`
 or the hermes venv's numpy poisons the import): **the standalone MoE
