@@ -800,7 +800,15 @@ traced run — the bdtrace.log shows size=90112 cap=131072 for the x's
 clone: correct); (2) the digest's function entry: print v.len() as the
 first statement — if it prints 180224, the size field was already
 doubled at the binding; if 90112, the doubling happens inside the
-digest. Then: the L0 gate, the 45-layer run, the suite. Also
+digest. DONE: **DIGESTENTRY x len=90112 — the size is NOT doubled.** The
+digest iterates 90112 elements and still reads garbage values (v0=-3.4e8
+vs the verified -0.000312805). So the x binding's BUFFER is freed and
+reused between the clone and the digest — a stale buffer read, the same
+class as before, at the x's clone buffer specifically. NEXT PROBE: with
+VYB_STR_TRACE, print the x clone's buffer address (the VECCOPY's
+new_ptr or a probe at the decl) and grep the FREE-F/RETIRE/QUAR-ABSORB
+lines for that address before the digest — the early free names the
+culprit site directly. Then: the L0 gate, the 45-layer run, the suite. Also
 noted: "L0_FAIL weight deq" appeared in the last run where the attention
 previously reached — likely device-memory exhaustion from the prior
 aborted runs (re-run on a clean GPU state to confirm). The probe edits
