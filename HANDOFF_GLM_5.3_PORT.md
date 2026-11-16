@@ -648,7 +648,16 @@ generateStructDeepCopy to print (the src size/cap, the dst size/cap, the
 digest of the copied bytes) at the extraction, run the driver's L0 gate,
 and diff. Suspicion: the JNode/struct-element per-element deep copy inside
 generateVecDeepCopy (line ~1673) returns a value the copy loop stores
-wrongly, or the copy's {ptr,size,cap} triple misorders fields.
+wrongly, or the copy's {ptr,size,cap} triple misorders fields. PROBED
+(__vyb_vec_copy_probe, committed): the SHAPE IS CORRECT — 22,805 copies,
+sane sizes (the doc's 8,902-elem JNode array at 56B/elem, cap-preserving),
+no size/cap misorder. THE WRONGNESS IS AT THE CONTENT LEVEL. NEXT: extend
+the probe to a verify (memcmp src/dst after the copy loop — a
+__vyb_vec_copy_verify(src,dst,size,elemsz) printing the first mismatching
+byte offset) to localize which field's copy corrupts; then read the
+per-element copy loop (~1673) against the mismatch. NOTE: the extraction
+copy also fires 22.8K times per prefill (every optional payload) — after
+the content fix, check the perf cost and the strand (live=5936 at iter 3).
 The microbench full stage: no abort, but the strand re-emerged at iteration
 3 (live=5936) — the extraction copy's retains are +1/string/iter unbalanced;
 audit that too. All the instrumentation (FREE-F, FREE-EVICT, QUAR-ABSORB,
