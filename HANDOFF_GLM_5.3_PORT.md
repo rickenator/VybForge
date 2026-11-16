@@ -1057,13 +1057,21 @@ glm_prefill): expert 1's deq completes with only 2.57 GB device used,
 then the NEXT expert's qd alloc (cuda1, ~29 MB trellis) fails — NOT
 out-of-memory. So cuda1 is a non-memory CUDA error whose rc is
 discarded by the `!= 0` check. NEXT: capture the rc at each EXL3FAIL
-site (`rc<Int> = cuMemAlloc_v2(...) as Int` + print) — likely a
-context/alignment/invalid-arg class, possibly the stale-pointer class
-hitting the expert resolve's strings (the copied GxLoc/idxtext in the
-expert loop is the same family the struct-clone fix addressed). The
+site (`rc<Int> = cuMemAlloc_v2(...) as Int` + print). DONE — **rc=700 =
+CUDA_ERROR_LAUNCH_FAILED, a STICKY error**: an earlier expert-path
+kernel faulted asynchronously (illegal access — the stale-buffer
+family), poisoning the context; every later CUDA call then returns 700
+(allocs included). The failing expert index (7/22/28/51) is just where
+the poisoned context is first noticed. NEXT: find the faulting kernel —
+the candidates in the expert path are the exl3 kernels (had1/had2/hgen)
+whose params (pd) reference the staging buffers, and the gemm over the
+gathered rows; instrument with cuCtxSynchronize + rc print after EACH
+launch in exl3_deq (the first non-zero sync rc names the kernel), and
+check the expert resolve's Strings for staleness (the copied
+GxLoc/idxtext in the expert loop is the struct-clone family). The
 EXL3FAIL/DEVMEM probes and the dump_to fix are all committed; the
-45-layer run gets through layers 0-2 + layer 3's attention in ~36 s
-per MoE layer with bounded host memory.
+45-layer run gets through layers 0-2 + layer 3's attention with
+bounded host memory.
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),

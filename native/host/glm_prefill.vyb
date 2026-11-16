@@ -786,15 +786,24 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         var<Int> pd = 0
         var<Int> sud = 0
         var<Int> svd = 0
-        if (cuMemAlloc_v2(loc(qd), tb) != 0) { println("EXL3FAIL cuda1"); return 0 }
-        if (cuMemAlloc_v2(loc(td), mb) != 0) { println("EXL3FAIL cuda2"); return 0 }
-        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { println("EXL3FAIL cuda3"); return 0 }
-        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { println("EXL3FAIL cuda4"); return 0 }
-        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { println("EXL3FAIL cuda5"); return 0 }
-        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { println("EXL3FAIL cuda6"); return 0 }
-        if (cuMemAlloc_v2(loc(pd), 64) != 0) { println("EXL3FAIL cuda7"); return 0 }
-        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { println("EXL3FAIL cuda8"); return 0 }
-        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { println("EXL3FAIL cuda9"); return 0 }
+        xrc101<Int> = cuMemAlloc_v2(loc(qd), tb) as Int
+        if (xrc101 != 0) { println("EXL3FAIL cuda1 rc=" + xrc101.to_string()); return 0 }
+        xrc102<Int> = cuMemAlloc_v2(loc(td), mb) as Int
+        if (xrc102 != 0) { println("EXL3FAIL cuda2 rc=" + xrc102.to_string()); return 0 }
+        xrc103<Int> = cuMemAlloc_v2(loc(od), kn * 8) as Int
+        if (xrc103 != 0) { println("EXL3FAIL cuda3 rc=" + xrc103.to_string()); return 0 }
+        xrc104<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
+        if (xrc104 != 0) { println("EXL3FAIL cuda4 rc=" + xrc104.to_string()); return 0 }
+        xrc105<Int> = cuMemAlloc_v2(loc(td2), kn * 8) as Int
+        if (xrc105 != 0) { println("EXL3FAIL cuda5 rc=" + xrc105.to_string()); return 0 }
+        xrc106<Int> = cuMemAlloc_v2(loc(fd), kn * 8) as Int
+        if (xrc106 != 0) { println("EXL3FAIL cuda6 rc=" + xrc106.to_string()); return 0 }
+        xrc107<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
+        if (xrc107 != 0) { println("EXL3FAIL cuda7 rc=" + xrc107.to_string()); return 0 }
+        xrc108<Int> = cuMemAlloc_v2(loc(sud), krows * 2) as Int
+        if (xrc108 != 0) { println("EXL3FAIL cuda8 rc=" + xrc108.to_string()); return 0 }
+        xrc109<Int> = cuMemAlloc_v2(loc(svd), cw * 2) as Int
+        if (xrc109 != 0) { println("EXL3FAIL cuda9 rc=" + xrc109.to_string()); return 0 }
 
         # trellis: bulk copy straight from the String
         if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { return 0 }
