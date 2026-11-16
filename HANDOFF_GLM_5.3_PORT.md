@@ -1040,6 +1040,18 @@ DEQFAIL probes cover deq_bf16 only — instrument exl3_deq's allocs and
 launch rcs the same way). Also verify on a clean GPU (a leftover vyb
 held 17 GB after one run). The 2-layer gate does not reach the MoE
 (dense L0-2) — the MoE gate needs NLAYERS>=4.
+   INSTRUMENTED (EXL3FAIL probes in exl3_deq, glm_prefill.vyb): the
+failure is `cuMemAlloc_v2(loc(fd), kn*8)` then `loc(od), kn*8` —
+DEVICE-MEMORY EXHAUSTION in the MoE expert loop (~17 GB held on a
+24 GB GPU; the failing expert index varies per run: 22/28/51 — it is
+whichever expert hits the exhausted pool). The expert loop frees
+dWg/dWu/dWd per iteration, so something else accumulates device
+buffers across experts/iterations (mm_host's dA/scr? the deq staging?
+an unfreed buffer in the expert path). NEXT: instrument the expert
+loop's device high-water (print cudaMemGetInfo.free per expert) and
+diff the alloc/free sets; the leak is bounded to one layer's expert
+loop (~23 experts × leaked bytes = ~17 GB → ~700 KB-1 MB leaked per
+expert iteration).
 
 Probes left in glm_prefill.vyb: L0_UNFOUND (per-name resolve failures),
 DEQFAIL (deq_bf16's silent CUDA failure paths + `as Int` casts),

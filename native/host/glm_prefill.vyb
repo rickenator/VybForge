@@ -767,11 +767,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
     nbody<Int> = body.len()
     nsuh<Int> = suh.len()
     nsvh<Int> = svh.len()
-    if (tb < ntiles * 128) { return 0 }
+    if (tb < ntiles * 128) { println("EXL3FAIL size tb=" + tb.to_string() + " need=" + (ntiles * 128).to_string() + " cw=" + cw.to_string()); return 0 }
     kn = (ntiles / (cw / 16)) * 16 * cw
     krows = kn / cw
-    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { return 0 }
-    if (suh.len() != krows * 2 || svh.len() != cw * 2) { return 0 }
+    if ((suh.len() % 8) != 0 || (svh.len() % 8) != 0) { println("EXL3FAIL mod suh=" + suh.len().to_string() + " svh=" + svh.len().to_string()); return 0 }
+    if (suh.len() != krows * 2 || svh.len() != cw * 2) { println("EXL3FAIL suh=" + suh.len().to_string() + " krows2=" + (krows * 2).to_string() + " svh=" + svh.len().to_string() + " cw2=" + (cw * 2).to_string()); return 0 }
     nbc = cw / 128
     nblocks = (kn / cw / 128) * nbc
     mb = 16 + body.len()
@@ -785,15 +785,15 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         var<Int> pd = 0
         var<Int> sud = 0
         var<Int> svd = 0
-        if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(td), mb) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(qd), tb) != 0) { println("EXL3FAIL cuda1"); return 0 }
+        if (cuMemAlloc_v2(loc(td), mb) != 0) { println("EXL3FAIL cuda2"); return 0 }
+        if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { println("EXL3FAIL cuda3"); return 0 }
+        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { println("EXL3FAIL cuda4"); return 0 }
+        if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { println("EXL3FAIL cuda5"); return 0 }
+        if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { println("EXL3FAIL cuda6"); return 0 }
+        if (cuMemAlloc_v2(loc(pd), 64) != 0) { println("EXL3FAIL cuda7"); return 0 }
+        if (cuMemAlloc_v2(loc(sud), krows * 2) != 0) { println("EXL3FAIL cuda8"); return 0 }
+        if (cuMemAlloc_v2(loc(svd), cw * 2) != 0) { println("EXL3FAIL cuda9"); return 0 }
 
         # trellis: bulk copy straight from the String
         if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { return 0 }
@@ -812,23 +812,23 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             hwide = hwide | (((ntiles >> (bq * 8)) & 255) << (bq * 8))
             bq = bq + 1
         }
-        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { println("EXL3FAIL cuda11"); return 0 }
         # map body: ONE copy from the String's own buffer (per-8-byte copies cost ~2 us each)
-        if (cuMemcpyHtoD_v2(td + 16, body, nbody) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(td + 16, body, nbody) != 0) { println("EXL3FAIL cuda12"); return 0 }
         # dequant
         if (cuda_launch4i(from<loc<CVoid>>(fdeq), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) != 0) {
-            return 0
+            println("EXL3FAIL cuda13"); return 0
         }
         cuCtxSynchronize()
         cuMemFree_v2(qd)
         cuMemFree_v2(td)
         # scales (fp16) to the device: one copy each, same reason as the map body
-        if (cuMemcpyHtoD_v2(sud, suh, nsuh) != 0) { return 0 }
-        if (cuMemcpyHtoD_v2(svd, svh, nsvh) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(sud, suh, nsuh) != 0) { println("EXL3FAIL cuda14"); return 0 }
+        if (cuMemcpyHtoD_v2(svd, svh, nsvh) != 0) { println("EXL3FAIL cuda15"); return 0 }
         # hgen: H at pd+0
-        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { println("EXL3FAIL cuda16"); return 0 }
         if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
-            return 0
+            println("EXL3FAIL cuda17"); return 0
         }
         cuCtxSynchronize()
         # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
@@ -841,11 +841,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             if (pq == 3) { chq = cw }
             if (pq == 4) { chq = nbc }
             if (pq == 5) { chq = nblocks }
-            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { println("EXL3FAIL cuda18"); return 0 }
             pq = pq + 1
         }
         if (cuda_launch4i(from<loc<CVoid>>(fhad1), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
-            return 0
+            println("EXL3FAIL cuda19"); return 0
         }
         cuCtxSynchronize()
         # had2: tmp=td2, out=fd, H=hd, suh, svh, cw, nbc, nblocks
@@ -860,11 +860,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             if (pq == 5) { chq = cw }
             if (pq == 6) { chq = nbc }
             if (pq == 7) { chq = nblocks }
-            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { return 0 }
+            if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { println("EXL3FAIL cuda20"); return 0 }
             pq = pq + 1
         }
         if (cuda_launch4i(from<loc<CVoid>>(fhad2), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
-            return 0
+            println("EXL3FAIL cuda21"); return 0
         }
         cuCtxSynchronize()
         cuMemFree_v2(od)
