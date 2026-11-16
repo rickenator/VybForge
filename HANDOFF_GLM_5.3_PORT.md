@@ -655,7 +655,19 @@ no size/cap misorder. THE WRONGNESS IS AT THE CONTENT LEVEL. NEXT: extend
 the probe to a verify (memcmp src/dst after the copy loop — a
 __vyb_vec_copy_verify(src,dst,size,elemsz) printing the first mismatching
 byte offset) to localize which field's copy corrupts; then read the
-per-element copy loop (~1673) against the mismatch. NOTE: the extraction
+per-element copy loop (~1673) against the mismatch. DONE: 22,803 copies
+verified, ZERO mismatches — the extraction deep copy is BYTE-PERFECT and
+exonerated. The L0_FAIL resolve 21 cause is among the remaining session
+changes: (i) the site-8 return-transfer fix, (ii) the quarantine free-
+routing (the foreign + the over-cap paths now hold blocks instead of
+freeing — a freed-then-held block's address is NOT reusable, which changes
+the heap layout AND may break code that observed the reuse), (iii) the
+extraction copy (exonerated on contents). BISECT PLAN: (1) build with the
+site-8 fix alone (revert the extraction copy + the quarantine routing
+temporarily), run the L0 gate; (2) if the L0 passes, add the quarantine
+routing and re-test; (3) the first failing step is the culprit. The L0
+PASSED on the pre-session baseline (the e2bab515-era build, the 1308 s run
+with the borrow-retain). NOTE: the extraction
 copy also fires 22.8K times per prefill (every optional payload) — after
 the content fix, check the perf cost and the strand (live=5936 at iter 3).
 The microbench full stage: no abort, but the strand re-emerged at iteration
