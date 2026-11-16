@@ -1549,3 +1549,15 @@ before believing a curve.**
 2. `hyperqwen-abliterated-single-1` is **stopped** (was crash-looping since 11-02). Restarting it on a
    clean card should work; if it OOMs again at engine init it needs its own fix, not a GPU quarantine.
 3. Merge `fix/return-path-cleanup-v2` -> Vyb main (unchanged from the previous session).
+
+## Item 3 (done 2026-11-16): `fix/return-path-cleanup-v2` is MERGED into Vyb main
+- Pushed `4dff29ec` (branch tip was stale at `f6d52171` on origin) and merged via the documented
+  bypass: ruleset `22855500` PUT `enforcement=disabled` -> `POST /repos/rickenator/Vyb/merges`
+  (base `main`, head `fix/return-path-cleanup-v2`) -> ruleset PUT back to `active` (verified
+  `active` via the API afterwards).
+- main is now `3b7f9f73` (merge of `13293775` + `4dff29ec`); verified with `git fetch` +
+  `git log origin/main -1`. Suite 1358/1358 was re-run on exactly this code today.
+- Probes kept as-is: the whole diagnostic set in `glm_l3_moe_all.vyb` (SIZES/PREALLOC/FREEFAIL/
+  FDPTR/GPRE/GDEVMEM/DEQNET/GEDIG/LENSAN/PRESYNC) and `glm_prefill.vyb`
+  (DIGESTENTRY/BDPROBE/DEVMEM/EXL3FAIL/MMSYNC/DEQFAIL/G9PROBE/L0_UNFOUND). They are gate-only
+  diagnostics and cost a print, not a pass; DEQNET is the one that answers "is this a leak?".
