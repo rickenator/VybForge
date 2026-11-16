@@ -27,7 +27,7 @@
 # plus the attn/h_a digests the earlier gates already pinned.
 #
 # Run: make -f native/Makefile glm3full
-import io::{open_read, read_at, read_all, open_write, write_str, close}
+import io::{open_read, read_at, read_all, open_write, open_append, write_str, close}
 import env::{env_get}
 import safetensors
 import gx
@@ -133,7 +133,7 @@ sigmoid(x<Float>)<Float> -> {
 
 # per-row rms over width D, times w when w.len() == D
 
-rms_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
+rms_rows(x<their<Vec<Float> const>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     r<Int> = 0
     i<Int> = 0
@@ -561,10 +561,37 @@ dumps(name<String>, v<Vec<Float>>)<String> -> {
     return out
 }
 
+# The streaming form of dumps: writes the same content in bounded chunks
+# straight to an append-mode file instead of building one String by repeated
+# concat. dumps() on a Vec of 180224 elements is O(n^2) in the concat (~360 GB
+# of churn per call — it WAS the 83 GB RSS / 12 GB/s allocator storm that
+# OOM-killed the 45-layer prefill); this form is O(n). The target file is the
+# driver's PREFILL_OUT (the same file `lines` is written to at the end).
+dump_to(name<String>, v<Vec<Float>>)<Int> -> {
+    path<String> = env_get("VYBFORGE_PREFILL_OUT") else "native/out/prefill_vyb.txt"
+    match (open_append(path)) {
+        f -> {
+            write_str(f, name)
+            i<Int> = 0
+            chunk<String> = ""
+            while (i < v.len()) {
+                chunk = chunk + " " + di(v.get(i)).to_string()
+                if (chunk.len() > 32768) { write_str(f, chunk); chunk = "" }
+                i = i + 1
+            }
+            if (chunk.len() > 0) { write_str(f, chunk) }
+            write_str(f, "\n")
+            close(f)
+            return 0
+        }
+        ? -> { return 1 }
+    }
+}
+
 # ---------------------------------------------------------------- GPU matmul helpers
 # C[M,N] = A[M,K] @ B[K,N] on the device; returns the device pointer (0 on failure).
 
-log_decay(f<Vec<Float>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
+log_decay(f<their<Vec<Float> const>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     r<Int> = 0
     h<Int> = 0
@@ -590,7 +617,7 @@ log_decay(f<Vec<Float>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
 # the KDA delta-rule recurrence (gdn_ref.kda_recurrent): q,k,v [R,HEADS,KD], g [R,HEADS,KD],
 # beta [R,HEADS]; q is already l2-normalised and scaled by 1/sqrt(KD), k l2-normalised.
 
-delta_rule(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>, beta<Vec<Float>>)<Vec<Float>> -> {
+delta_rule(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<Vec<Float> const>>, g<their<Vec<Float> const>>, beta<Vec<Float>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     st<Vec<Float>> = Vec()
     var<Int> n = 0
@@ -994,7 +1021,7 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     if (d_qaln == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
     free_dev(d_qaln)
-    qa_ln<Vec<Float>> = rms_rows(qres, R, Q_LORA, qaln_w)
+    qa_ln<Vec<Float>> = rms_rows(view(qres), R, Q_LORA, qaln_w)
     qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
     println(digest("qb", qfull))
     lines = lines + digest("qb", qfull) + "\n"
@@ -1005,7 +1032,7 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     if (d_kvaln == 0) { return nonev }
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     free_dev(d_kvaln)
-    ckv<Vec<Float>> = rms_rows(ckraw, R, KV_LORA, kvaln_w)
+    ckv<Vec<Float>> = rms_rows(view(ckraw), R, KV_LORA, kvaln_w)
     println(digest("ckv", ckv))
     lines = lines + digest("ckv", ckv) + "\n"
 
@@ -1470,7 +1497,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     d_ln2 = deq_bf16(fbf, gx_read(gt, 3), H, 0)
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
 
-    flat<Vec<Float>> = rms_rows(streams1, R, HC * H, Vec())
+    flat<Vec<Float>> = rms_rows(view(streams1), R, HC * H, Vec())
     d_flat2 = alloc_dev(R * HC * H * 8)
     d_mv2 = alloc_dev(R * 24 * 8)
     d_scr2 = alloc_dev(64)
@@ -1503,7 +1530,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         comb2.push(res2.get(R * H + R * HC + i))
         i = i + 1
     }
-    h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln)
+    h2<Vec<Float>> = rms_rows(view(collapsed2), R, H, post_ln)
     println(digest("h2", h2))
     lines = digest("h2", h2) + "\n"
 
@@ -1766,7 +1793,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
 
 
 share(all)
-kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
     nf<Int> = 0
@@ -1892,7 +1919,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
         flat.push(streams.get(i))
         i = i + 1
     }
-    flat = rms_rows(flat, R, HC * H, Vec())
+    flat = rms_rows(view(flat), R, HC * H, Vec())
     var<Int> d_flat = 0
     var<Int> d_mv = 0
     var<Int> d_scr = 0
@@ -1935,7 +1962,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     lines = lines + digest("post_attn", postA) + "\n"
     println(digest("comb_attn", combA))
     lines = lines + digest("comb_attn", combA) + "\n"
-    lines = lines + dumps("combvals", combA) + "\n"
+    var<Int> dump_rc = dump_to("combvals", combA)
 
     # ---------------------------------------------------------------- input_layernorm
     var<Int> d_ln = 0
@@ -1943,7 +1970,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     if (d_ln == 0) { return nonev }
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     free_dev(d_ln)
-    h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+    h_a<Vec<Float>> = rms_rows(view(collapsed), R, H, in_ln)
     println(digest("h", h_a))
     lines = lines + digest("h", h_a) + "\n"
     # =============================================================== KDA attention
@@ -2000,7 +2027,7 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
 
     println(digest("qn", qn))
     lines = lines + digest("qn", qn) + "\n"
-    lines = lines + dumps("qnvals", qn) + "\n"
+    dump_rc = dump_to("qnvals", qn)
     println(digest("kn", kn))
     lines = lines + digest("kn", kn) + "\n"
     bet<Vec<Float>> = mm_host(h_a, R, H, d_b, HEADS, fgemm)
@@ -2035,11 +2062,11 @@ kda_attn_site(streams<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<
     lines = lines + digest("fraw", fraw) + "\n"
     println(digest("zraw", zraw))
     lines = lines + digest("zraw", zraw) + "\n"
-    gdec<Vec<Float>> = log_decay(fraw, dt, alog)
+    gdec<Vec<Float>> = log_decay(view(fraw), dt, alog)
     println(digest("gdec", gdec))
     lines = lines + digest("gdec", gdec) + "\n"
 
-    att<Vec<Float>> = delta_rule(qn, kn, vc, gdec, bet)
+    att<Vec<Float>> = delta_rule(view(qn), view(kn), view(vc), view(gdec), bet)
     println(digest("delta", att))
     lines = lines + digest("delta", att) + "\n"
 
@@ -2162,7 +2189,7 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
         reflat.push(streams1.get(t2))
         t2 = t2 + 1
     }
-    reflat = rms_rows(reflat, R, HC * H, Vec())
+    reflat = rms_rows(view(reflat), R, HC * H, Vec())
     d_flat2 = alloc_dev(R * HC * H * 8)
     d_mv2 = alloc_dev(R * 24 * 8)
     d_scr2 = alloc_dev(64)
@@ -2195,7 +2222,7 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
         combF.push(res2.get(R * H + R * HC + t2))
         t2 = t2 + 1
     }
-    h2<Vec<Float>> = rms_rows(collapsed2, R, H, post_ln)
+    h2<Vec<Float>> = rms_rows(view(collapsed2), R, H, post_ln)
     println(digest("h2", h2))
     lines = lines + digest("h2", h2) + "\n"
 
@@ -2270,7 +2297,7 @@ dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm
     d_lnA = deq_bf16(fbf, gx_read(g, 3), H, 0)
     in_ln<Vec<Float>> = bulk_dtoh(d_lnA, H)
 
-    flat<Vec<Float>> = rms_rows(streams0, R, HC * H, Vec())
+    flat<Vec<Float>> = rms_rows(view(streams0), R, HC * H, Vec())
     d_flat = alloc_dev(R * HC * H * 8)
     d_mv = alloc_dev(R * 24 * 8)
     d_scr = alloc_dev(64)
@@ -2303,7 +2330,7 @@ dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm
         combA.push(resA.get(R * H + R * HC + i))
         i = i + 1
     }
-    h_a<Vec<Float>> = rms_rows(collapsed, R, H, in_ln)
+    h_a<Vec<Float>> = rms_rows(view(collapsed), R, H, in_ln)
     lines<String> = ""
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
@@ -2457,7 +2484,7 @@ main()<Int> -> {
         if (is_dsa == 1) {
             streams1 = dsa_attn_site(streams, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         } else {
-            streams1 = kda_attn_site(streams, dir, total, lpre, fgemm, fbf)
+            streams1 = kda_attn_site(view(streams), dir, total, lpre, fgemm, fbf)
         }
         println("attn len " + streams1.len().to_string() + " layer " + n.to_string())
         println("MARK attn-done layer " + n.to_string())
@@ -2491,7 +2518,7 @@ main()<Int> -> {
             }
             chainT = chainT + 1
         }
-        lines = lines + dumps("chain" + n.to_string(), chain) + "\n"
+        var<Int> dump_rc = dump_to("chain" + n.to_string(), chain)
         n = n + 1
     }
     match (open_write(out)) {
