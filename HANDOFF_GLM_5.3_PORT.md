@@ -1414,7 +1414,7 @@ spare ports) and is not worth pulling.
 - L0 gate: green at NLAYERS=2 (both layers, attn len 360448, zero FAILs).
 - The 83 GB OOM: **solved** — the driver's `dumps()` was an O(n²) concat (~360 GB churn/call);
   `dump_to()` streams 32 KB chunks. 2-layer gate now 12.6 s / 2.7 GB peak (was 2.5+ min / 83.6 GB).
-- The `builtin` stale-release kill (Vyb `4ae941da`), struct call-result clones (`5520f9de`),
+- The stale-release kill (Vyb `4ae941da`), struct call-result clones (`5520f9de`),
   Vec call-result clones (`50e1f2c6`), the fd dangling-return fix (VybForge `069a2a3`).
 
 ## What is OPEN (the one blocker)
