@@ -881,8 +881,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         srrc876<Int> = cuCtxSynchronize() as Int
         if (srrc876 != 0) { println("EXL3SYNC had2 sync rc=" + srrc876.to_string()); return 0 }
         cuCtxSynchronize()
+        # qd (the trellis staging copy) is the per-call leak — free it.
+        # fd is the RETURNED dequantized weights (out = fd): freeing it here
+        # dangles the caller's dWg/dWu/dWd and the expert gemm faults on
+        # freed device memory (Xid 31 -> context reset -> rc=2/700).
         cuMemFree_v2(qd)
-        cuMemFree_v2(fd)
         cuMemFree_v2(od)
         cuMemFree_v2(hd)
         cuMemFree_v2(td2)

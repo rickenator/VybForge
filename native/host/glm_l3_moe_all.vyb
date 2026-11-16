@@ -543,6 +543,7 @@ main()<Int> -> {
             r = r + 1
         }
         nt = toks.len()
+        println("ROUTE expert " + e.to_string() + " nt=" + nt.to_string())
         if (nt > 0) {
             nex = nex + 1
             epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."

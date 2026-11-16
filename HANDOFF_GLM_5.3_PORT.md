@@ -1138,6 +1138,18 @@ NEXT: correlate one Xid's pid with a single NLAYERS=4 run, then dump
 the launch args (grid + the pd param block's device pointers + sizes)
 for the kernels of the expert right before the fault; compare the
 gemm kernel's small-M grid against the 4B driver's known-good shapes.
+   CORRECTION (my own error, found 00:0x): the qd+fd free added earlier
+FREED THE RETURNED BUFFER — exl3_deq returns `out = fd` (the
+dequantized weights), so freeing fd dangled the caller's dWg/dWu/dWd
+and the expert gemm read freed device memory (Xid 31 WRITE). Fixed:
+free qd only (qd, the trellis staging copy, IS the per-call leak —
+~4 MB x 3 deqs x 109 experts ≈ 1.3 GB/run, which the Oct 30 run
+survived). With the fd fix in, a SECOND device-side accumulation
+remains: rc=2 (context dead) still arrives at layer 3's MoE — the
+DEVMEM per-expert prints (now in glm_prefill.vyb) give the used-curve;
+diff it against the ~1.3 GB qd-leak floor to find the remaining
+holder. The Oct 30 passing run leaked qd too, so the remaining holder
+is new since the session's changes.
    MOE-GATE ISOLATION DONE (make glm3all / gold via ~/venvs/exl3/bin
 python — note the oracle needs `env -i HOME=$HOME PATH=/usr/bin:/bin`
 or the hermes venv's numpy poisons the import): **the standalone MoE
