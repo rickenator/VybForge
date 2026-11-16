@@ -565,6 +565,15 @@ main()<Int> -> {
                 j = j + 1
             }
             if (nfound != w2.len()) { println("ALL_FAIL resolve expert " + e.to_string()); return 9 }
+            # host-shape digest of the resolved GxLoc: a corrupted copy shows
+            # as a wrong len/off/path here BEFORE any device work.
+            gf0<Int> = ge.found.get(0)
+            go0<Int> = ge.off.get(0)
+            gp0<Int> = ge.paths.get(0).len()
+            gd0<Int> = ge.dts.get(0).len()
+            gnn<Int> = ge.found.len()
+            println("GEDIG e=" + e.to_string() + " n=" + gnn.to_string() + " f0=" + gf0.to_string() +
+                    " off0=" + go0.to_string() + " plen=" + gp0.to_string() + " dlen=" + gd0.to_string())
 
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
                                 gx_read(ge, 2), body, EINTER, 32768)
