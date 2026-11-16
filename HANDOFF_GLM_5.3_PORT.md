@@ -897,9 +897,19 @@ of ~1600, matching the x's values being ~1600x too large (the measured
 ~1e-2 vs the implied ~6e-6 from 360448/SCALE40/90112). THE TRAIL: the
 x's values' scale — the deq_bf16's z param (the driver passes z=0 for
 the embedding deq; the other calls pass strides/offsets) or the read's
-region. NEXT: verify the embedding deq's z semantics against the kernel
-(bf16.vyb: the z param's role) and the x's expected value scale. Then:
-the L0 gate, the 45-layer run, the suite.
+region. DONE: the z param EXONERATED (native/kernels/bf16.vyb: z>0
+transposes, z=0 is the direct non-transposed write — correct for the
+embedding deq) and the deq itself is a plain bf16 conversion. THE
+REMAINING SUSPECT: the read's REGION — the raw bytes dequantize to ~1e-2
+but the file's embeddings should be ~6e-6, so the read is hitting the
+wrong file region. THE PRIME SUSPECT: the safetensors HEADER LENGTH —
+the data_offsets in the index are relative to the data segment (after
+the JSON header); if the resolve's off is the raw data_offset and the
+read_at uses it as an absolute file offset, the read lands ~1600 rows
+early/late. NEXT: verify whether gx_resolve's off already includes the
+header length (the resolve's read path vs the embedding's read_at path —
+the other deq calls go through gx_read, the embedding goes through
+read_at directly). Then: the L0 gate, the 45-layer run, the suite.
 NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
 param may be deep-copied TWICE (a double-copy path in the by-value param
 handling); harmless for contents but points at where the size accounting
