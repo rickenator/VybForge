@@ -97,6 +97,7 @@ di(v<Float>)<Int> -> {
 }
 
 digest(name<String>, v<Vec<Float>>)<String> -> {
+    println("DIGESTENTRY " + name + " len=" + v.len().to_string())
     s<Float> = 0.0
     a<Float> = 0.0
     q<Float> = 0.0

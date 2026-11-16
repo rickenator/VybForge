@@ -808,7 +808,16 @@ class as before, at the x's clone buffer specifically. NEXT PROBE: with
 VYB_STR_TRACE, print the x clone's buffer address (the VECCOPY's
 new_ptr or a probe at the decl) and grep the FREE-F/RETIRE/QUAR-ABSORB
 lines for that address before the digest — the early free names the
-culprit site directly. Then: the L0 gate, the 45-layer run, the suite. Also
+culprit site directly. DONE (addrwatch): the x clone's dst
+(0x5fbeb99d4700) has NO free/retire/absorb events — the buffer is never
+freed. THE IMPOSSIBLE TRIANGLE: the clone byte-verified, the buffer never
+freed, the size correct (90112 at the digest's entry), yet the digest
+reads garbage values (v0=-3.4e8 vs the clone's -0.000312805). THE ONLY
+REMAINING SUSPECT: the Vec element-read path itself (v.get(i)'s generated
+load: the index arithmetic, the buffer pointer's load from the header, or
+the get's bounds/stride) — audit the Vec.get codegen next (cgen: the get
+method's element load), or run the digest's loop under ASan. Then: the
+L0 gate, the 45-layer run, the suite. Also
 noted: "L0_FAIL weight deq" appeared in the last run where the attention
 previously reached — likely device-memory exhaustion from the prior
 aborted runs (re-run on a clean GPU state to confirm). The probe edits
