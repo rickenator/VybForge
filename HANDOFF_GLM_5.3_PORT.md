@@ -596,8 +596,17 @@ for bare moved identifiers. RESULT: the microbench full stage live=6 FLAT
 over 3 iterations (was 5,942->11,883->17,824) — THE STRAND IS ELIMINATED.
 BUT the 45-layer glm_prefill SEGFAULTS early on the build (one str_stats
 line, live=10, then crash): the moved-identifier return needs a guard
-refinement (some flow still under-counts a ref). NEXT: gdb the prefill
-core, find the freed-then-used string, refine the guard. The suite runner
+refinement (some flow still under-counts a ref). THE CRASH STRING IDENTIFIED (the RETIRE content print): the raw
+model.safetensors.index.json text ('{\n "metadata": {\n "total_size": 1756...')
+— the site-8 move frees it, then a stale pointer's byte-compare loop reads it
+(the faulting instruction: movzbl (%rax,%rcx,1) at the JIT address; frame #1
+NULL). This is the registry slot-reuse/stale-read class — the same one as the
+documented runner abort (Rick's design territory). The strand fix itself is
+CORRECT (the microbench live=6 flat). NEXT: either (a) the registry's
+defense-in-depth (the slot generation/ticket so a stale release/pointer
+cannot kill the new string), or (b) the codegen's stale-read guard (the
+return-move set must exclude bindings still read after the return's CFG
+position — currently impossible statically; favors (a)). The suite runner
 still aborts with the pre-existing tcache double free (the runner's own
 documented issue, independent of this fix). Verify: the microbench stage=full live flat; then the
 45-layer acceptance ~1308 -> ~950 s. Note the layer-4 gate CANNOT see either
