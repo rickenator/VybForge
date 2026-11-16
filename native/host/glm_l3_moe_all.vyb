@@ -629,7 +629,7 @@ main()<Int> -> {
                 ixL = st_open(gx_shard_path(dir, shq, total))
                 shL = shq
             }
-            ge<GxLoc> = gx_resolve_maybe(view(ixL), shq, idxtext, dir, total, w2, winsub, win0, win1)
+            ge<GxLoc> = gx_resolve_ix2(view(ixL), shq, w2, winsub, dir, total)
             nfound = 0
             j = 0
             while (j < w2.len()) {

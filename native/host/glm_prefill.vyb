@@ -1457,6 +1457,9 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     ee<Int> = 0
     i0<Int> = 0
     acc_res<Int> = 0
+    acc_scan<Int> = 0
+    acc_open<Int> = 0
+    nopen<Int> = 0
     acc_deq<Int> = 0
     acc_mm<Int> = 0
     acc_host<Int> = 0
@@ -1695,12 +1698,20 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
             shq<Int> = gx_shard_for(winsub, w2.get(0))
+            tSc = time_mono_millis()
             if (shq != shL) {
                 ixL = st_open(gx_shard_path(dir, shq, total))
                 shL = shq
+                nopen = nopen + 1
+                println("SHROPEN e=" + e.to_string() + " shq=" + shq.to_string() +
+                        " n=" + ixL.n.to_string() + " path=" + gx_shard_path(dir, shq, total))
             }
-            ge<GxLoc> = gx_resolve_maybe(view(ixL), shq, idxtext, dir, total, w2, winsub, win0, win1)
-            acc_res = acc_res + (time_mono_millis() - tA)
+            tOp = time_mono_millis()
+            ge<GxLoc> = gx_resolve_ix2(view(ixL), shq, w2, winsub, dir, total)
+            tR = time_mono_millis()
+            acc_res = acc_res + (tR - tA)
+            acc_scan = acc_scan + (tSc - tA)
+            acc_open = acc_open + (tOp - tSc)
             nfound = 0
             j = 0
             while (j < w2.len()) {
@@ -1778,6 +1789,8 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
         e = e + 1
     }
     println("routed experts used: " + nex.to_string())
+    println("T_RSLV nopen=" + nopen.to_string() + " scan=" + acc_scan.to_string() + " open=" + acc_open.to_string() +
+            " lookup=" + (acc_res - acc_scan - acc_open).to_string())
     println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string())
     freedom {
     }

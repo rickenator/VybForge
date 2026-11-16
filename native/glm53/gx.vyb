@@ -277,6 +277,37 @@ gx_resolve_maybe(ix<their<StIndex const>>, sh<Int>, index<String>, dir<String>, 
     return gx_resolve_win(index, dir, total, want, ws, we)
 }
 
+# Cached-header resolve; any name the cached header does not hold (the ~2-in-288 experts
+# whose tensors straddle two shards) is looked up by scanning the layer's expert-block
+# window and opening that shard for the lookup. Takes NO full-index parameter: passing
+# the 15.5 MB index text into a per-expert call was 288 deep copies per layer.
+share(all)
+gx_resolve_ix2(ix<their<StIndex const>>, sh<Int>, want<Vec<String>>,
+               win<String>, dir<String>, total<Int>)<GxLoc> -> {
+    g<GxLoc> = gx_resolve_ix(ix, sh, want)
+    w<Int> = 0
+    while (w < want.len()) {
+        if (g.found.get(w) != 1) {
+            sh2<Int> = gx_shard_for(win, want.get(w))
+            if (sh2 > 0) {
+                ix2<StIndex> = st_open(gx_shard_path(dir, sh2, total))
+                t<Int> = st_find(view(ix2), want.get(w))
+                if (t >= 0) {
+                    g.found.set(w, 1)
+                    g.shard.set(w, sh2)
+                    g.tix.set(w, t)
+                    g.off.set(w, ix2.data_base + ix2.doff.get(t))
+                    g.nbytes.set(w, ix2.dlen.get(t))
+                    g.dts.set(w, ix2.dtypes.get(t))
+                    g.paths.set(w, ix2.path)
+                }
+            }
+        }
+        w = w + 1
+    }
+    return g
+}
+
 share(all)
 gx_bytes(g<GxLoc>, i<Int>)<Int> -> {
     if (i < 0 || i >= g.nbytes.len()) { return 0 }
