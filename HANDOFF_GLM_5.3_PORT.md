@@ -724,7 +724,14 @@ embedding launch (the silent-failure check); (2) verify the read-back's
 device pointer/size; (3) if the launch is fine, the args-struct packing
 (the by-value param copies changed WHICH host buffers the args point into
 — the HtoD must copy from the COPIES, not the originals). Then: the L0
-gate, the 45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
+gate, the 45-layer run, the suite. MAPPED: the embed kernel = the token
+gather OUT[s*D+d]=EMB[ids[s]*D+d] (native/kernels/qwen3.vyb:186, the
+params EMB/IDS/OUT/S/D at +0/+8/+16/+24/+32, the grid S*D); the launches:
+cuda_launch4i with the rc CHECKED (glm_prefill.vyb:250 etc.) — the silent
+launch failure is unlikely; PRIME SUSPECT: the IDS buffer's host contents
+(the ids: a call-result Vec<Int>: the same shallow-assignment class just
+fixed — verify the clone covers the ids' path) or the EMB device tensor's
+state (the dequantize chain: the qd/td/od launch at glm_prefill.vyb:784). (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
