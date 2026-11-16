@@ -790,7 +790,17 @@ x's size** — the x's element count doubles somewhere between the clone
 and digest("x", x). NEXT: instrument the digest's param copy (the size
 at entry) and the clone's {ptr,size,cap} triple as stored — find where
 size 90112 becomes 180224 (the clone's size field vs the digest's copy
-sizing). This is now a size-field corruption, not a content corruption. Also
+sizing). This is now a size-field corruption, not a content corruption.
+NOTE: 1441792 = exactly 2 x 720896 (the copy's byte count) — the digest's
+param may be deep-copied TWICE (a double-copy path in the by-value param
+handling); harmless for contents but points at where the size accounting
+doubles. The probes to run: (1) the VECCOPY probe's size/cap for the
+digest's copy specifically (grep the digest's copy's VECCOPY line in a
+traced run — the bdtrace.log shows size=90112 cap=131072 for the x's
+clone: correct); (2) the digest's function entry: print v.len() as the
+first statement — if it prints 180224, the size field was already
+doubled at the binding; if 90112, the doubling happens inside the
+digest. Then: the L0 gate, the 45-layer run, the suite. Also
 noted: "L0_FAIL weight deq" appeared in the last run where the attention
 previously reached — likely device-memory exhaustion from the prior
 aborted runs (re-run on a clean GPU state to confirm). The probe edits
