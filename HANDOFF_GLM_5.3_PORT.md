@@ -741,8 +741,21 @@ values are garbage => THE TOKENIZER'S PARSE READS STALE/FREED STRINGS (the
 same stale-string family: the tokenizer's parse doc/svals hit the early-
 free path). NEXT: VYB_STR_TRACE the tokenizer's parse (the ids' RETIRE
 content prints + the RET/REL around the token strings), find the
-tokenizer's stale-string read, and close the last ownership gap. Then:
-the L0 gate, the 45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
+tokenizer's stale-string read, and close the last ownership gap.
+CORRECTED: there is NO tokenizer — the ids are a deterministic literal
+(VYBFORGE_L0_IDS or the inline default, parsed char-by-char at
+glm_prefill.vyb:2352-2362; the L0_FAIL ids len-check passed). The L0
+chain: ge=gx_resolve -> the rows read via read_at(f, emb_off+ids.get(r)*
+H*2, H*2) -> raw_emb=raw_emb+s concat -> deq_bf16 (the CUDA bf16deq
+kernel: HtoD the raw, launch, the device out) -> bulk_dtoh -> x. The x's
+census: garbage magnitudes (max 5.3e10, v0=-3.4e8). THE SUSPECTS: (a) the
+raw_emb concat's contents (the read_at results: the String? match
+payloads — the extraction's retain covers them), (b) the bf16deq kernel's
+input HtoD (raw's pointer/len) or the kernel's math (bf16.ptx,
+pre-existing), (c) bulk_dtoh's size/pointer. NEXT PROBE: dump the first
+16 bytes of raw_emb after the concat loop (a hex print) and compare
+against the file's bytes at emb_off — that splits (a) from (b)/(c) in one
+run. Then: the L0 gate, the 45-layer run, the suite. (b) the strand at the microbench's iteration 3 (live=5936) — the
 extraction copy's retain balance: the copy's +1/string/iter unmatched by
 its release (audit copyOwnedValueForBinding's release path); (c) the suite
 after (a). The instrumentation set is all live (FREE-F/EVICT, QUAR-ABSORB,
