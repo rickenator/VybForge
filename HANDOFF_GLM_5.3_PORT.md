@@ -1760,3 +1760,21 @@ st_f32n/shfl_idx_f32/ld_shared_f32, so the plan is implementable:
    not by eye), regenerate the 45-layer gold, token/top1 check stays decisive.
 4. Acceptance: full 45-layer run, wall target ~8-10 min.
 Budget a full session; do not start it unless there is time to finish the re-baseline.
+
+### had_hoist mirror status (2026-11-17 ~03:00)
+7 of 9 copies mirrored and gate-green, committed d252242: glm3x, glm3all, glm3exp,
+glm3tail, glm3hc, glm3full, decl3step — all OK. build_decode_chain.py snippets also
+patched so a regen keeps the mirror.
+- glm_decode_chain.vyb: mirror applied (13 exl3_deq callsites + tail_site/moe_tail_step/
+  mtp_layer_step hdg params). Its decchain gate (FULL 45-layer chain — the verifier
+  hard-requires all 45 layers on both sides, no smoke shortcut) was IN FLIGHT in the
+  systemd unit `decchain` when this was written (log native/out/decchain_hoist.log,
+  output native/out/decchain_vyb.txt). glm_decode_chain.vyb is therefore UNCOMMITTED
+  until that gate prints DECODE_CHAIN_MATCH: OK — then `git add native/host/glm_decode_chain.vyb`
+  and commit. If the gate went RED, `git checkout native/host/glm_decode_chain.vyb` reverts
+  cleanly (the other mirrors are independent).
+  NOTE: the chain gate takes 4-9 h because glm_decode_chain still uses the PRE-tab-refactor
+  resolve path (~951 s/layer measured). Porting the table resolver (gx_resolve_tab) to the
+  chain driver is its own worthwhile item and would cut this gate to ~20 min.
+- native/glm53/exl3_load.vyb: NOT mirrored — its exl3_deq copy has no callers and no gate
+  (dead historical copy). Leave or delete in a cleanup pass, don't change blind.
