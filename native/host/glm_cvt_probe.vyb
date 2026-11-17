@@ -325,6 +325,9 @@ main()<Int> -> {
         println("EXL3_FAIL kernels (make exl3)")
         return 5
     }
+    fgemm2<Int> = load_fn("native/build/gemm.ptx", "gemm")
+    fbf2<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    println("MODULES gemm=" + fgemm2.to_string() + " bf16=" + fbf2.to_string())
     hdg<Int> = had_hoist(fhgen)
     if (hdg == 0) { println("EXL3_FAIL had_hoist"); return 5 }
     # arena, same sizes as the glm_prefill integration attempt

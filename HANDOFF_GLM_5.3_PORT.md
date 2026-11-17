@@ -1947,3 +1947,26 @@ logic bug. NEXT: (1) file/check a minimal Vyb repro (probe harness + this matrix
 evidence); (2) interim: fdc stays fresh (1 alloc + 1 free per deq — the committed state,
 deq ~3 s); (3) if the binding fix lands, arena fdc and re-gate. The committed state is
 the acceptance configuration: 13:54, digests <=1.4e-6.
+
+### Bisect round 3 (2026-11-17, later): store width irrelevant, module loads innocent
+Two more discriminations, both measured (NLAYERS=4, ~110 s cycles):
+- exl3cvt32 changed to st_f32 into a 32 MB arena slot: STILL sync=700 in glm_prefill.
+  So the fault is NOT f64-store-specific — ANY kernel store to that arena region faults.
+  (The st_f32 probe run was clean but its digest is meaningless: the harness read the
+  f32 output as f64 — harness artifact, not evidence.)
+- Adding gemm.ptx + bf16.ptx module loads to the probe (no kernel runs): still clean.
+  Module-load order alone does not reproduce.
+- Alignment/overlap ruled out arithmetically: all arena pointers 256B-aligned; F..C are
+  packed 32 MB blocks with ZERO gaps; writes to E/D/C are fine, writes to F fault — F is
+  simply the lowest and the one cvt targets.
+- compute-sanitizer memcheck on the failing driver: the attach times out (Vyb's JIT
+  startup exceeds the sanitizer's attach window) — retry needs --launch-timeout 900 or
+  a slimmer target. Not yet productive.
+NEXT (highest-value bisect, ~15 lines): call exl3_deq32 ONCE AT STARTUP in glm_prefill
+(right after the arena alloc, before layers 0-3), on real layer-3 expert-1 tensors
+(gx_resolve layers.3.mlp.experts.1.gate_proj.{trellis,suh,svh}, cw=2048, ntiles=32768),
+free the result. If it FAULTS at startup on the near-clean context -> deterministic
+(arena placement/module interaction), and the fault is reproducible in a tiny standalone
+program = the minimal Vyb repro. If it is GREEN at startup -> layers 0-3's GPU activity
+(a specific kernel or allocator sequence) poisons the cvt launch; bisect by dropping
+layer 3's attention sub-steps one at a time.
