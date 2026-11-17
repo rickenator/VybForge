@@ -1664,3 +1664,20 @@ the next session should reimplement it knowing:
    concatenation instead.
 With those known, the table builder + resolver are ~100 lines of straightforward Vyb. Expected:
 startup ~60 s (83 shard walks on the clean heap), runtime resolve ~0.3 s/layer, full run ~35-45 min.
+
+### Tab refactor LANDED (2026-11-16 evening, commit 8898deb) — runtime JSON parsing eliminated
+The paused design was reimplemented in one clean pass with all six gotchas pre-applied
+(function-scope locals, no call-exprs in Vec::set, no nested substrings, quote-free needles,
+space-separated records, main-local tables). It works:
+- Startup: one walk over all 83 shard headers (~0.15-0.76 s each, clean heap) buckets every
+  tensor's `name shard off len dtype` record by layer into 45 table strings (main-local
+  Vec<String>; bare Vec globals are unsupported). Non-layer tensors (embed_tokens) go to all
+  buckets.
+- Runtime: every site resolves via gx_resolve_tab(tab, dir, want) — one index_of on the layer's
+  ~300 KB table + a forward char_at walk. NO json_parse, NO st_open at runtime.
+- Verified: NLAYERS=4 PREFILL_OK, layer digests 0-3 byte-identical to the 45-layer gold;
+  T_MOE resolve 1,145,661 -> 1,191 ms (963x); layer 3 total 92 -> 19.7 s; layer 4 (KDA)
+  235 -> 44 s.
+- 45-layer validation run in flight at commit time (prefill45_tab.log, prefill_vyb_45_tab.txt).
+Remaining per-layer costs (layer 4 example): attn ~32 s (hc-mix gemms ~31 s of it — the actual
+kernels are ~1 s), MoE deq ~9 s, ffn ~12 s. Next targets: the hc-mix gemm path and deq kernels.
