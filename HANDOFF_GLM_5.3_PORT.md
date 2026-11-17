@@ -1812,3 +1812,28 @@ NEXT (the integration, one session):
 2. Regenerate the 45-layer gold (new digests, old gold kept as *_f64 for reference),
    run the full acceptance, target ~8-10 min.
 3. Mirror exl3deq32/had132/had232 usage into the other drivers when each is next gated.
+
+### OPTION 1 integration attempt: numerics PROVEN, perf regressed — driver change reverted (2026-11-17)
+The f32 path was wired into glm_prefill (exl3_deq32 host fn: f32 deq -> had132/had232 ->
+exl3cvt32 widen back to f64 -> unchanged host readback; tail_site MoE deqs switched).
+NLAYERS=6 result (native/out/prefill6_f32.log):
+- NUMERICS: PASS. f32 digests vs f64 gold: rel ~1e-7 (dense layers bit-identical, KDA/DSA
+  layers sum rel 5e-8..2e-7). Exactly the predicted f32 noise. The semantics are sound.
+- PERF: REGRESSED on KDA layers — T_MOE deq 60.7 s (was 8.4 s with f64+hoist), while the
+  DSA layer IMPROVED (deq 3.5 s vs 7.7 s). Root cause (measured): exl3_deq32 does 4
+  launches + 4 syncs + 10 allocs/frees per deq and allocates kn*12 device bytes vs kn*8;
+  under the 4.6 GB heap the per-call launch/alloc/sync overhead explodes (~280 ms/deq x
+  216 deqs), swamping the f32 math win. Same under-pressure pattern as st_open/hgen.
+  DSA layers have fewer deqs per layer, so they netted a win.
+- glm_prefill.vyb REVERTED to the f64+hoist state (HEAD). The kernels (exl3deq32/
+  hgen32/had132/had232/cvt32) STAY — they are correct and additive.
+NEXT (the real fix, before re-attempting integration):
+1. Persistent per-size device arena in glm_prefill: allocate od32/td2/fd32/fdc/hd ONCE
+   (max kn across the run is known per shape class), reuse across all deqs — removes
+   ~10 allocs+syncs per deq. This is the same lesson as had_hoist: never alloc/free
+   per-call under heap pressure.
+2. Drop the cvt round-trip: bulk_dtoh f32 variant (host reads raw f32 bytes into a
+   String via one cuMemcpyDtoH_v2, convert on host in the digest loop) or keep cvt but
+   fuse it into had232's epilogue.
+3. Re-measure with T_MOE deq as the metric; gate NLAYERS=6 (digest rel ~1e-7 vs gold is
+   the expected PASS band; byte-identical is NOT expected on MoE layers).

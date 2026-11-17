@@ -241,6 +241,19 @@ exl3deq32(q<Int>, tab<Int>, o<Int>) -> {
     }
 }
 
+// f32->f64 widen: one thread per element. Lets the f32 transform result flow into
+// the unchanged f64 host readback (bulk_dtoh) and downstream mm/digest contract.
+// p: +0 src(f32), +8 dst(f64), +16 n(elements)
+exl3cvt32(p<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    n<Int> = ld_i64(p + 16)
+    if (gid < n) {
+        S<Int> = ld_i64(p + 0)
+        D<Int> = ld_i64(p + 8)
+        st_f64(D + gid * 8, ld_f32n(S + gid * 4) as Float)
+    }
+}
+
 // fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
 // Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
 // Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the
