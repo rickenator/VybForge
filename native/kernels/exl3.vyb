@@ -116,6 +116,91 @@ exl3had2(p<Int>) -> {
     }
 }
 
+// ---- f32 variants (option: f64 is 1/64-rate on GA102; the transform is the
+// remaining MoE-deq cost). Same geometry/params as the f64 kernels, all
+// buffers f32 (4-byte elements). Tolerance vs numpy re-baselines separately —
+// these are NOT drop-in bit-compatible with the f64 path.
+// p: +0 H  (f32, 16384 elements = 64 KB)
+exl3hgen32(p<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < 16384) {
+        i<Int> = gid / 128
+        j<Int> = gid - i * 128
+        t<Int> = i & j
+        acc<Int> = 0
+        k<Int> = 0
+        while (k < 7) {
+            acc = acc + ((t >> k) & 1)
+            k = k + 1
+        }
+        v<Float32> = 0.08838834764831845 as Float32
+        if ((acc % 2) == 1) {
+            neg<Float32> = 0.0 - 1.0 as Float32
+            v = neg * v
+        }
+        H<Int> = ld_i64(p + 0)
+        st_f32(H + gid * 4, v)
+    }
+}
+
+// p: +0 what(f32), +8 tmp(f32), +16 H(f32), +24 cw, +32 nbc, +40 nblocks
+exl3had132(p<Int>) -> {
+    W<Int> = ld_i64(p + 0)
+    T<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    cw<Int> = ld_i64(p + 24)
+    nbc<Int> = ld_i64(p + 32)
+    nblocks<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < nblocks * 16384) {
+        block<Int> = gid / 16384
+        b<Int> = (gid % 16384) / 128
+        d<Int> = gid % 128
+        kbv<Int> = block / nbc
+        nbv<Int> = block - kbv * nbc
+        row<Int> = kbv * 128 + b
+        colbase<Int> = nbv * 128
+        acc<Float32> = 0.0
+        c<Int> = 0
+        while (c < 128) {
+            acc = acc + ld_f32n(W + (row * cw + colbase + c) * 4) * ld_f32n(H + (c * 128 + d) * 4)
+            c = c + 1
+        }
+        st_f32(T + (block * 16384 + b * 128 + d) * 4, acc)
+    }
+}
+
+// p: +0 tmp(f32), +8 out(f32), +16 H(f32), +24 suh, +32 svh, +40 cw, +48 nbc, +56 nblocks
+exl3had232(p<Int>) -> {
+    T<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    SU<Int> = ld_i64(p + 24)
+    SV<Int> = ld_i64(p + 32)
+    cw<Int> = ld_i64(p + 40)
+    nbc<Int> = ld_i64(p + 48)
+    nblocks<Int> = ld_i64(p + 56)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < nblocks * 16384) {
+        block<Int> = gid / 16384
+        a<Int> = (gid % 16384) / 128
+        d<Int> = gid % 128
+        acc<Float32> = 0.0
+        b<Int> = 0
+        while (b < 128) {
+            acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_f32n(T + (block * 16384 + b * 128 + d) * 4)
+            b = b + 1
+        }
+        kbv<Int> = block / nbc
+        nbv<Int> = block - kbv * nbc
+        row<Int> = kbv * 128 + a
+        col<Int> = nbv * 128 + d
+        su<Float32> = ld_f16(SU + row * 2) as Float32
+        sv<Float32> = ld_f16(SV + col * 2) as Float32
+        st_f32(O + (row * cw + col) * 4, acc * su * sv)
+    }
+}
+
 // fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
 // Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
 // Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the
