@@ -898,7 +898,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
 }
 
 share(all)
-attn_site(h_a<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     a<Int> = 0
     acc<Float> = 0.0
@@ -1003,7 +1003,7 @@ attn_site(h_a<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     want.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
     want.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
 
-    g<GxLoc> = gx_resolve_local(win, dir, total, want)
+    g<GxLoc> = gx_resolve_tab(tab, dir, total, want)
     nf = 0
     i = 0
     while (i < want.len()) {
@@ -1395,7 +1395,7 @@ attn_site(h_a<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
 
 
 share(all)
-tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -1492,7 +1492,7 @@ tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     w.push(lpre + "hc_ffn_base")
     w.push(lpre + "hc_ffn_scale")
     w.push(lpre + "post_attention_layernorm.weight")
-    gt<GxLoc> = gx_resolve_local(win, dir, total, w)
+    gt<GxLoc> = gx_resolve_tab(tab, dir, total, w)
     nfound = 0
     j = 0
     while (j < w.len()) {
@@ -1562,7 +1562,7 @@ tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     want<Vec<String>> = Vec()
     want.push(lpre + "mlp.gate.weight")
     want.push(lpre + "mlp.gate.e_score_correction_bias")
-    g<GxLoc> = gx_resolve_local(win, dir, total, want)
+    g<GxLoc> = gx_resolve_tab(tab, dir, total, want)
     d_gw = deq_bf16(fbf, gx_read(g, 0), NE * H, H)
     if (d_gw == 0) { return nonev }
     logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
@@ -1687,21 +1687,9 @@ tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            shq<Int> = gx_shard_for(win, w2.get(0))
-            tSc = time_mono_millis()
-            if (shq != shL) {
-                ixL = st_open(gx_shard_path(dir, shq, total))
-                shL = shq
-                nopen = nopen + 1
-                println("SHROPEN e=" + e.to_string() + " shq=" + shq.to_string() +
-                        " n=" + ixL.n.to_string() + " path=" + gx_shard_path(dir, shq, total))
-            }
-            tOp = time_mono_millis()
-            ge<GxLoc> = gx_resolve_ix2(view(ixL), shq, w2, win, dir, total)
+            ge<GxLoc> = gx_resolve_tab(tab, dir, total, w2)
             tR = time_mono_millis()
             acc_res = acc_res + (tR - tA)
-            acc_scan = acc_scan + (tSc - tA)
-            acc_open = acc_open + (tOp - tSc)
             nfound = 0
             j = 0
             while (j < w2.len()) {
@@ -1792,7 +1780,7 @@ tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     w3.push(lpre + "mlp.shared_experts.gate_proj.weight")
     w3.push(lpre + "mlp.shared_experts.up_proj.weight")
     w3.push(lpre + "mlp.shared_experts.down_proj.weight")
-    gs<GxLoc> = gx_resolve_local(win, dir, total, w3)
+    gs<GxLoc> = gx_resolve_tab(tab, dir, total, w3)
     d_sg = deq_bf16(fbf, gx_read(gs, 0), EINTER * H, H)
     d_su = deq_bf16(fbf, gx_read(gs, 1), EINTER * H, H)
     d_sd = deq_bf16(fbf, gx_read(gs, 2), H * EINTER, EINTER)
@@ -1882,7 +1870,22 @@ pf_layer_win(layer_prefix<String>)<String> -> {
 
 # resolve `want` against the layer window: shard via one window scan per name,
 # header via the memo, offset via st_find. Same GxLoc contract as gx_resolve.
-gx_resolve_local(win<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+# resolve `want` against the layer's precomputed table. Record format (one per
+# tensor): name SP shard SP data_offset SP nbytes SP dtype NEWLINE. Built once at
+# startup by walking every shard header on the clean heap; runtime never parses JSON.
+gx_resolve_tab(tab<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    key<String> = ""
+    p<Int> = 0
+    k<Int> = 0
+    c<Int> = 0
+    fld<Int> = 0
+    shv<Int> = 0
+    ov<Int> = 0
+    lv<Int> = 0
+    done<Int> = 0
+    pth<String> = ""
+    pad<String> = ""
+
     g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
                        dts = Vec(), paths = Vec() }
     i<Int> = 0
@@ -1896,35 +1899,43 @@ gx_resolve_local(win<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc>
         g.paths.push("")
         i = i + 1
     }
-    ksh<Int> = 0
-    kix<StIndex> = st_open("")
     i = 0
     while (i < want.len()) {
-        shq<Int> = gx_shard_for(win, want.get(i))
-        if (shq == 0 && want.get(i) == "model.language_model.embed_tokens.weight") { shq = g_emb_shard }
-        if (shq > 0) {
-            if (shq != ksh) {
-                kix = pf_open(gx_shard_path(dir, shq, total))
-                ksh = shq
+        key = want.get(i) + " "
+        p = tab.index_of(key)
+        if (p >= 0) {
+            k = p
+            fld = 0
+            shv = 0
+            ov = 0
+            lv = 0
+            done = 0
+            while (done == 0) {
+                c = (tab.char_at(k) as Int) & 255
+                if (c == 10) { done = 1 }
+                if (c == 32) { fld = fld + 1 }
+                if (fld == 1 && c >= 48 && c <= 57) { shv = shv * 10 + (c - 48) }
+                if (fld == 2 && c >= 48 && c <= 57) { ov = ov * 10 + (c - 48) }
+                if (fld == 3 && c >= 48 && c <= 57) { lv = lv * 10 + (c - 48) }
+                k = k + 1
             }
-            t<Int> = st_find(view(kix), want.get(i))
-            if (t >= 0) {
-                g.found.set(i, 1)
-                g.shard.set(i, shq)
-                g.tix.set(i, t)
-                g.off.set(i, kix.data_base + kix.doff.get(t))
-                g.nbytes.set(i, kix.dlen.get(t))
-                g.dts.set(i, kix.dtypes.get(t))
-                g.paths.set(i, kix.path)
-            }
+            pad = shv.to_string()
+            while (pad.len() < 5) { pad = "0" + pad }
+            pth = dir + "/model-" + pad + "-of-00083.safetensors"
+            g.found.set(i, 1)
+            g.tix.set(i, 0)
+            g.shard.set(i, shv)
+            g.off.set(i, ov)
+            g.nbytes.set(i, lv)
+            g.dts.set(i, "BF16")
+            g.paths.set(i, pth)
         }
         i = i + 1
     }
     return g
 }
-
 share(all)
-kda_attn_site(streams<their<Vec<Float> const>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
     nf<Int> = 0
@@ -1983,7 +1994,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, win<String>, dir<String>, total<
     want.push(lpre + "self_attn.k_conv1d.weight")
     want.push(lpre + "self_attn.v_conv1d.weight")
 
-    g<GxLoc> = gx_resolve_local(win, dir, total, want)
+    g<GxLoc> = gx_resolve_tab(tab, dir, total, want)
     i = 0
     while (i < want.len()) {
         if (g.found.get(i) == 1) { nf = nf + 1 }
@@ -2232,7 +2243,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, win<String>, dir<String>, total<
 }
 
 share(all)
-ffn_dense_site(streams1<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
     nf<Int> = 0
@@ -2274,7 +2285,7 @@ ffn_dense_site(streams1<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<
     want.push(lpre + "hc_ffn_base")
     want.push(lpre + "hc_ffn_scale")
 
-    g<GxLoc> = gx_resolve_local(win, dir, total, want)
+    g<GxLoc> = gx_resolve_tab(tab, dir, total, want)
     i = 0
     while (i < want.len()) {
         if (g.found.get(i) == 1) { nf = nf + 1 }
@@ -2385,7 +2396,7 @@ ffn_dense_site(streams1<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<
 }
 
 share(all)
-dsa_attn_site(streams0<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
+dsa_attn_site(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     i<Int> = 0
     j<Int> = 0
@@ -2465,7 +2476,7 @@ dsa_attn_site(streams0<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<S
     lines<String> = ""
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
-    attn<Vec<Float>> = attn_site(h_a, win, lpre, fgemm, fbf)
+    attn<Vec<Float>> = attn_site(h_a, tab, lpre, fgemm, fbf)
     println(digest("attn", attn))
     lines = lines + digest("h_a", h_a) + "\n" + digest("attn", attn) + "\n"
 
@@ -2478,16 +2489,55 @@ dsa_attn_site(streams0<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<S
 
 main()<Int> -> {
     dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
-    lposTab<Vec<Int>> = Vec()
-    idxrun<String> = pf_idx_init(dir)
-    g_emb_shard = gx_shard_for(idxrun, "model.language_model.embed_tokens.weight")
+    # ---- one-time shard walk: bucket every tensor record by layer ----
+    # record = name SP shard SP data_offset SP nbytes SP dtype NEWLINE
+    # st_open costs ~0.15-0.76 s per shard on this clean startup heap; at runtime it
+    # degraded to ~5-11 s per parse, so parsing happens HERE only.
+    tabs<Vec<String>> = Vec()
+    nb<String> = ""
+    nb2<String> = ""
+    ln2<Int> = 0
     ln<Int> = 0
-    while (ln < 45) {
-        lq<String> = "model.language_model.layers." + ln.to_string() + "."
-        pp<Int> = idxrun.index_of(lq)
-        if (pp < 32) { pp = 32 }
-        lposTab.push(pp - 32)
-        ln = ln + 1
+    while (ln < 45) { tabs.push(""); ln = ln + 1 }
+    sh<Int> = 1
+    while (sh < 84) {
+        kix<StIndex> = st_open(gx_shard_path(dir, sh, 83))
+        if (kix.n > 0) {
+            k<Int> = 0
+            while (k < kix.n) {
+                nm<String> = kix.names.get(k)
+                lnum<Int> = 0
+                lp<Int> = nm.index_of("layers.")
+                if (lp >= 0) {
+                    d0<Int> = lp + 7
+                    while (d0 < nm.len()) {
+                        cnum<Int> = (nm.char_at(d0) as Int) & 255
+                        if (cnum < 48 || cnum > 57) { break }
+                        lnum = lnum * 10 + (cnum - 48)
+                        d0 = d0 + 1
+                    }
+                }
+                if (lnum > 44) { lnum = 44 }
+                rec<String> = nm + " " + sh.to_string() + " " +
+                        (kix.data_base + kix.doff.get(k)).to_string() + " " +
+                        kix.dlen.get(k).to_string() + " " + kix.dtypes.get(k) + "\n"
+                if (lp >= 0) {
+                    nb = tabs.get(lnum) + rec
+                tabs.set(lnum, nb)
+                } else {
+                    # non-layer tensors (embed_tokens etc.): every layer's site wants them
+                    ln2<Int> = 0
+                    ln2 = 0
+                    while (ln2 < 45) {
+                        nb2 = tabs.get(ln2) + rec
+                        tabs.set(ln2, nb2)
+                        ln2 = ln2 + 1
+                    }
+                }
+                k = k + 1
+            }
+        }
+        sh = sh + 1
     }
     out<String> = env_get("VYBFORGE_PREFILL_OUT") else "native/out/prefill_vyb.txt"
     total<Int> = 83
@@ -2626,16 +2676,13 @@ main()<Int> -> {
         # Layer 45 in the checkpoint is NOT a decoder layer -- it is the multi-token
         # prediction head (eh_proj / enorm / hnorm, its own experts), so the forward
         # stack is 0..44 and the MTP head is driven separately.
+        tab<String> = tabs.get(n)
         lt0 = time_mono_millis()
-        wpos<Int> = lposTab.get(n)
-        wend<Int> = wpos + 780000
-        if (wend > idxrun.len()) { wend = idxrun.len() }
-        win<String> = idxrun.substring(wpos, wend)
         if ((n % 4) == 3) { is_dsa = 1 }
         if (is_dsa == 1) {
-            streams1 = dsa_attn_site(streams, win, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+            streams1 = dsa_attn_site(streams, tab, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         } else {
-            streams1 = kda_attn_site(view(streams), win, dir, total, lpre, fgemm, fbf)
+            streams1 = kda_attn_site(view(streams), tab, dir, total, lpre, fgemm, fbf)
         }
         println("attn len " + streams1.len().to_string() + " layer " + n.to_string())
         println("MARK attn-done layer " + n.to_string())
@@ -2645,9 +2692,9 @@ main()<Int> -> {
         }
         lt1 = time_mono_millis()
         if (n < 3) {
-            streams = ffn_dense_site(streams1, win, dir, total, lpre, fgemm, fbf)
+            streams = ffn_dense_site(streams1, tab, dir, total, lpre, fgemm, fbf)
         } else {
-            streams = tail_site(streams1, win, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+            streams = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         }
         if (streams.len() != R * HC * H) {
             println("PF_FAIL ffn layer " + n.to_string())
