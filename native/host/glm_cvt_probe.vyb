@@ -352,6 +352,16 @@ main()<Int> -> {
         b9<Int> = cuMemAlloc_v2(loc(arI), 64) as Int
         if (b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 != 0) { println("CVTPROBE arena fail") }
     }
+        freedom {
+            t<String> = "OK!"
+            hA<Int> = cuMemcpyHtoD_v2(arA, t, 3) as Int
+            hB<Int> = cuMemcpyHtoD_v2(arB, t, 3) as Int
+            hC<Int> = cuMemcpyHtoD_v2(arC, t, 3) as Int
+            hD<Int> = cuMemcpyHtoD_v2(arD, t, 3) as Int
+            hE<Int> = cuMemcpyHtoD_v2(arE, t, 3) as Int
+            hF<Int> = cuMemcpyHtoD_v2(arF, t, 3) as Int
+            println("ALLOC-TIME htoD A=" + hA.to_string() + " B=" + hB.to_string() + " C=" + hC.to_string() + " D=" + hD.to_string() + " E=" + hE.to_string() + " F=" + hF.to_string())
+        }
 
     # map.bin: 16-byte header + 256*16 body; the body is shape-independent
     mapd<String> = ""
@@ -409,7 +419,17 @@ main()<Int> -> {
         wi = wi + 1
     }
     println(digest("fd32", Wf))
-    println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string())
+
+    println("PTRCHECK dW=" + dW.to_string() + " arF=" + arF.to_string() + " arE=" + arE.to_string() + " arC=" + arC.to_string())
+    freedom {
+        pre<String> = "PREOK!"
+        hpre<Int> = cuMemcpyHtoD_v2(arF, pre, 6) as Int
+        println("PRE-HTODF rc=" + hpre.to_string())
+        hpre2<Int> = cuMemcpyHtoD_v2(arE, pre, 6) as Int
+        println("PRE-HTOD-E rc=" + hpre2.to_string())
+        hpre3<Int> = cuMemcpyHtoD_v2(dW, pre, 6) as Int
+        println("PRE-HTOD-dW rc=" + hpre3.to_string())
+    }    println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string())
 
     # ---- two-write repro: churn with ANOTHER module's kernels, then write arF again ----
     fb<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
@@ -432,6 +452,15 @@ main()<Int> -> {
     }
     println("CHURN done")
     println("CHURN done")
+    # driver-level write to arF after churn: does the mapping survive?
+    freedom {
+        probe2<String> = "PROBE!"
+        hrc2b<Int> = cuMemcpyHtoD_v2(arF, probe2, 6) as Int
+        println("HTODF rc=" + hrc2b.to_string())
+        back<String> = "000000"
+        drc2b<Int> = cuMemcpyDtoH_v2(loc(back), arF, 6) as Int
+        println("DTOHF rc=" + drc2b.to_string() + " back=" + back)
+    }
     dW2<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, trellis, suh, svh, body, 2048, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
     println("SECOND deq dW2=" + dW2.to_string())
     if (dW2 != 0) {

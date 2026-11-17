@@ -1992,7 +1992,31 @@ block at program start, run a loop of unrelated alloc/free churn (other function
 scopes), then launch a kernel writing the held buffer — check for the 700. That is the
 minimal repro for a src/vre codegen (ownership/lifetime of loc-held device pointers)
 investigation. Until then the committed state (fd+fdc fresh, 13:54) is the acceptance
-configuration.
+### ROOT CAUSE FOUND: freedom-block exit auto-frees loc-held pointers born elsewhere (2026-11-17)
+The pointer-validity matrix pinned it exactly (native/out/cvt_probe11.log):
+- dW (returned) == arF; PRE-HTOD-E (32 MB arE) rc=0 — still valid; PRE-HTODF (64 MB arF)
+  rc=1 — INVALIDATED, immediately after the first exl3_deq returns. ALLOC-TIME HtoD to
+  every arena slot rc=0 (all valid at allocation).
+MECHANISM: the generated code auto-frees `loc`-held pointers at `freedom`-block exit.
+exl3_deq's freedom block ASSIGNS `fdc = fdca` (the arena pointer, born in main's freedom
+block) — at block exit the cleanup frees it as if the block had allocated it. The
+allocator is size-thresholded (large-block pool): >= 64 MB goes back to the driver
+(cuMemFree), smaller blocks stay pooled — which is why 32 MB arena buffers (fd/arE)
+survive and the 64 MB fdc dies, why fresh-per-call fd/fdc is green (allocated INSIDE the
+block = legitimately owned, pool reuse makes the next call green), and why the startup
+warm-up did not protect (the warm-up call's OWN freedom exit freed the arena fdc; the
+layer-3 cvt then wrote freed device memory -> sync=700).
+This is a Vyb codegen/runtime OWNERSHIP bug: a freedom block must not free pointers it
+merely ASSIGNED from elsewhere. It sits in the same cleanup machinery the impl agent's
+fix/return-path-cleanup-v2 merge (3b7f9f73, 2026-11-16) just touched — check whether that
+merge introduced or exposed it (the f64 path never held a large foreign pointer in a
+freedom local before the f32 work, which is why it never surfaced).
+FIX DIRECTION: at the freedom-exit cleanup, free only pointers the block ALLOCATED
+(birth-tracking: assigned-from-parameter/outer-scope pointers must be skipped), or mark
+cuMemAlloc-born pointers explicitly. Evidence set: this probe + the 4-way matrix +
+cvt_probe11.log. The 90 s repro stands (glm_cvt_probe.vyb).
+INTERIM (current committed state is correct): fd+fdc fresh per call — the block owns
+them, the auto-free is legitimate, deq ~3 s, 13:54 acceptance.
 
 ### MINIMAL REPRO ACHIEVED (2026-11-17, final): cross-module kernel launch between writes
 The probe (native/host/glm_cvt_probe.vyb, native/out/cvt_probe7.log) now reproduces the
