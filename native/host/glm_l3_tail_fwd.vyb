@@ -632,7 +632,7 @@ hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)
 
 exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
-         cw<Int>, ntiles<Int>)<Int> -> {
+         cw<Int>, ntiles<Int>, hd_pre<Int>)<Int> -> {
     tb<Int> = 0
     kn<Int> = 0
     krows<Int> = 0
@@ -669,7 +669,11 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         if (cuMemAlloc_v2(loc(qd), tb) != 0) { return 0 }
         if (cuMemAlloc_v2(loc(td), mb) != 0) { return 0 }
         if (cuMemAlloc_v2(loc(od), kn * 8) != 0) { return 0 }
-        if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
+        # H is run-constant: hd_pre != 0 means the caller built it once (had_hoist)
+        hd = hd_pre
+        if (hd == 0) {
+            if (cuMemAlloc_v2(loc(hd), 128 * 128 * 8) != 0) { return 0 }
+        }
         if (cuMemAlloc_v2(loc(td2), kn * 8) != 0) { return 0 }
         if (cuMemAlloc_v2(loc(fd), kn * 8) != 0) { return 0 }
         if (cuMemAlloc_v2(loc(pd), 64) != 0) { return 0 }
@@ -736,11 +740,14 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
             u = u + 8
         }
         # hgen: H at pd+0
-        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
-        if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
-            return 0
+        # hgen skipped when H was prebuilt by had_hoist
+        if (hd_pre == 0) {
+            if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { return 0 }
+            if (cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) != 0) {
+                return 0
+            }
+            cuCtxSynchronize()
         }
-        cuCtxSynchronize()
         # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
         pq = 0
         while (pq < 6) {
@@ -778,12 +785,36 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         }
         cuCtxSynchronize()
         cuMemFree_v2(od)
-        cuMemFree_v2(hd)
+        if (hd_pre == 0) { cuMemFree_v2(hd) }
         cuMemFree_v2(td2)
         cuMemFree_v2(pd)
         cuMemFree_v2(sud)
         cuMemFree_v2(svd)
         out = fd
+    }
+    return out
+}
+
+# Build the run-constant 128x128 Sylvester Hadamard/8 matrix ONCE (f64, 128*128*8 bytes).
+# Returns the device pointer, 0 on failure. Keep alive for the whole run — never free it.
+had_hoist(fhgen<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> hd = 0
+        var<Int> pd = 0
+        hrc1<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
+        if (hrc1 == 0) {
+            hrc2<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
+            if (hrc2 == 0) {
+                if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) == 0) {
+                    hlrc<Int> = cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
+                    hsync<Int> = cuCtxSynchronize() as Int
+                    if (hlrc == 0 && hsync == 0) { out = hd }
+                }
+                cuMemFree_v2(pd)
+            }
+            if (out == 0) { cuMemFree_v2(hd) }
+        }
     }
     return out
 }
@@ -838,6 +869,8 @@ main()<Int> -> {
         println("TAIL_FAIL kernels")
         return 4
     }
+    hdg<Int> = had_hoist(fhgen)
+    if (hdg == 0) { println("TAIL_FAIL had_hoist"); return 4 }
     mapd = ""
     match (open_read("native/exl3/map.bin")) {
         f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
@@ -1070,11 +1103,11 @@ main()<Int> -> {
             if (nfound != w2.len()) { println("ALL_FAIL resolve expert " + e.to_string()); return 9 }
 
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
-                                gx_read(ge, 2), body, EINTER, 32768)
+                                gx_read(ge, 2), body, EINTER, 32768, hdg)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
-                                gx_read(ge, 5), body, EINTER, 32768)
+                                gx_read(ge, 5), body, EINTER, 32768, hdg)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 6), gx_read(ge, 7),
-                                gx_read(ge, 8), body, H, 32768)
+                                gx_read(ge, 8), body, H, 32768, hdg)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
                 return 10

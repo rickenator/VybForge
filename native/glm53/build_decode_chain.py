@@ -176,7 +176,7 @@ w('''# dsa_attn_site, passing the cache borrows through to attn_site_c.
 ''')
 das = lines(2204, 2293)
 das = das.replace(
-    'dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {',
+    'dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>)<Vec<Float>> -> {',
     'dsa_attn_site_c(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, '
     'ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, slot<Int>)<Vec<Float>> -> {')
 das = das.replace(
@@ -245,7 +245,7 @@ w('''# ============================================================ phase-2 MoE 
 # GxLoc, KDA-MoE want-list order), the router and shared expert by their own small
 # resolves, and each USED expert lazily by 9 names (the drift-safe per-expert form).
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, dir<String>, total<Int>, idxtext<String>, mapbody<String>,
-              gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>)<Vec<Float>> -> {
+              gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -456,11 +456,11 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, dir<String>, total<Int>, idxte
             if (nfound != w2.len()) { println("CHAIN_FAIL resolve expert " + e.to_string()); return nonev }
 
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
-                                gx_read(ge, 2), body, EINTER, 32768)
+                                gx_read(ge, 2), body, EINTER, 32768, hdg)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
-                                gx_read(ge, 5), body, EINTER, 32768)
+                                gx_read(ge, 5), body, EINTER, 32768, hdg)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 6), gx_read(ge, 7),
-                                gx_read(ge, 8), body, H, 32768)
+                                gx_read(ge, 8), body, H, 32768, hdg)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
                 return nonev
@@ -618,7 +618,7 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, dir<String>, total<Int>,
 mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, dir<String>, total<Int>,
                idxtext<String>, mapbody<String>, mckv<their<Vec<Float>>>,
                mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, fgemm<Int>, fbf<Int>,
-               fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>)<Vec<Float>> -> {
+               fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = vecf()
     i<Int> = 0
     j<Int> = 0
@@ -1099,13 +1099,13 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, dir<String>, total<Int>,
             }
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 0),
                                 gx_read(gexp, 1), gx_read(gexp, 2), body,
-                                EINTER, 32768)
+                                EINTER, 32768, hdg)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 3),
                                 gx_read(gexp, 4), gx_read(gexp, 5), body,
-                                EINTER, 32768)
+                                EINTER, 32768, hdg)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(gexp, 6),
                                 gx_read(gexp, 7), gx_read(gexp, 8), body,
-                                H, 32768)
+                                H, 32768, hdg)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL mtp deq expert " + e.to_string())
                 return nonev
