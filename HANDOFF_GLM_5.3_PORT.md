@@ -1790,3 +1790,25 @@ patched so a regen keeps the mirror.
   mtp_layer_step; the edit was applied once already and is in this file's history at
   commit d252242's neighbours / session log) and gate decchain.
   OPTION 1 (f32 deq+transform) proceeds first — it is independent of the chain driver.
+
+### OPTION 1 PROGRESS: f32 kernels + probe GATE GREEN (2026-11-17 morning)
+Landed (commit 921ef88 + the check32 commit):
+- native/kernels/exl3.vyb: exl3deq32 (f32 store, decode math unchanged), exl3hgen32,
+  exl3had132, exl3had232. PTX-verified: the had132 128-tap MAC loop emits ZERO f64 ops.
+  CRITICAL gotcha: `ld_f32` surfaces as f64 BY DESIGN and silently widens the whole
+  loop to f64 rate — use `ld_f32n` (native-width, returns Float32). Verified by diffing
+  PTX op counts before/after. Also: `loc()` is freedom-only (dtoh32 helper wraps it),
+  and `x as T * y` misparses — bind the cast to a local first.
+- native/host/glm_exl3_check32.vyb + native/glm53/verify_exl3_load32.py: f32 probe on
+  layer-3 expert 0 gate_proj [4096,2048]. EXL3_LOAD_VYB32: OK — f32 spread vs numpy:
+  sum 2.1e-4, abs 5.2e-7, sq 7.9e-7, max 7.8e-5 — statistically IDENTICAL to the f64
+  gate's numbers (error budget is the shared fp16-butterfly noise, NOT f32 rounding).
+  TOLERANCE CONSEQUENCE: the re-baseline band does NOT need to move — the f64 gate's
+  tolerances carry over. This removes the riskiest part of the integration.
+NEXT (the integration, one session):
+1. glm_prefill.vyb: exl3_deq32 host path (f32 buffers kn*4, 32-variant kernels, hdg32),
+   switch tail_site MoE + KDA deqs to it; mm_host gets f32 weights (its digest contract
+   changes — regenerate gold with the SAME tolerance band as above).
+2. Regenerate the 45-layer gold (new digests, old gold kept as *_f64 for reference),
+   run the full acceptance, target ~8-10 min.
+3. Mirror exl3deq32/had132/had232 usage into the other drivers when each is next gated.

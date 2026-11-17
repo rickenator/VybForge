@@ -201,6 +201,46 @@ exl3had232(p<Int>) -> {
     }
 }
 
+// f32-output deq: identical decode math (mcg + fp16 pair, f64 intermediate),
+// the result is narrowed to f32 on store. Buffer is kn*4 bytes. Paired with
+// had132/had232 so the transform runs at f32 rate (see exl3had132 note).
+exl3deq32(q<Int>, tab<Int>, o<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    ntiles<Int> = ld_i64(tab + 8)
+    total<Int> = ntiles * 256
+    if (gid < total) {
+        tile<Int> = gid / 256
+        slot<Int> = gid - tile * 256
+        base<Int> = tab + 16 + slot * 16
+        w16<Int> = 0
+        i<Int> = 0
+        while (i < 4) {
+            nidx<Int> = ld_u16(base + i * 2) as Int
+            p<Int> = (ld_i8(base + 8 + i) as Int) & 255
+            wb<Int> = q + tile * 128 + (nidx / 4) * 2 + (nidx % 4) / 2
+            by<Int> = (ld_i8(wb) as Int) & 255
+            sh<Int> = ((nidx % 4) % 2) * 4
+            nib<Int> = (by >> sh) & 15
+            w16 = w16 | (nib << (p * 4))
+            i = i + 1
+        }
+        prod<Int> = (w16 * 3417055213) & 4294967295
+        y<Int> = (prod & 2415890431) ^ 996162400
+        lo<Float> = fp16_to_f64(y & 65535)
+        hi<Float> = fp16_to_f64((y >> 16) & 65535)
+        val<Float> = lo + hi
+        cw<Int> = ld_i64(tab + 0)
+        nbc<Int> = cw / 16
+        r<Int> = ld_u16(base + 12) as Int
+        c<Int> = ld_u16(base + 14) as Int
+        kbv<Int> = tile / nbc
+        nbv<Int> = tile - kbv * nbc
+        row<Int> = kbv * 16 + r
+        col<Int> = nbv * 16 + c
+        st_f32(o + (row * cw + col) * 4, val as Float32)
+    }
+}
+
 // fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
 // Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
 // Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the
