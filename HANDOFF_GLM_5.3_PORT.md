@@ -1778,3 +1778,15 @@ patched so a regen keeps the mirror.
   chain driver is its own worthwhile item and would cut this gate to ~20 min.
 - native/glm53/exl3_load.vyb: NOT mirrored — its exl3_deq copy has no callers and no gate
   (dead historical copy). Leave or delete in a cleanup pass, don't change blind.
+- RESOLUTION (2026-11-17 03:30): the decchain mirror was REVERTED (file + generator back
+  to HEAD). The 45-layer chain gate is currently UNRUNNABLE for a reason that predates the
+  mirror: glm_decode_chain still uses the pre-tab-refactor resolve path, and it OOM-killed
+  at the 80G cap at phase-1 layer 12 (3h36m CPU, 951 s/layer resolve, unbounded heap from
+  per-expert json_parse/st_open). The mirror itself only removes allocations; it could not
+  be gate-verified on a gate that dies of its own pathology. ORDER OF WORK: port
+  gx_resolve_tab (the table resolver) to the chain driver FIRST — that both fixes the OOM
+  and cuts the gate to ~20 min — then re-apply the had_hoist mirror (recipe: hd_pre param
+  on exl3_deq, had_hoist() once in main, thread hdg through tail_site/moe_tail_step/
+  mtp_layer_step; the edit was applied once already and is in this file's history at
+  commit d252242's neighbours / session log) and gate decchain.
+  OPTION 1 (f32 deq+transform) proceeds first — it is independent of the chain driver.
