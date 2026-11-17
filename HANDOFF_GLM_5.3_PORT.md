@@ -2107,3 +2107,14 @@ no Vyb compiler change is needed. The residual optimization target is the depth-
 deq cost growth (1.8 -> 13 s across the run) — a fresh investigation, separate from the
 closed sync=700 item. The probe harness (glm_cvt_probe.vyb) and all bisect evidence stay
 committed for that follow-up.
+
+### DEQ-GROWTH ITEM CLOSED: the growth dissolves under analysis (2026-11-17, final)
+Analysis of the 13:54 acceptance log's 42 MoE deq timings: the sequence does NOT grow
+with depth — first-10 average 8.2 s, last-10 average 3.9 s (ratio 0.5, FASTER later): an
+early-run effect on the first few MoE layers, then steady ~3-4 s. The earlier "1.8 -> 13 s
+across the run" reading came from min/max outliers, not a trend. No depth-dependent
+mechanism exists to chase; no arena, no compiler change needed. The deq total is ~3.4 min
+of the 13:54 run; the remaining wall time is attention/ffn streaming — genuine math at the
+measured per-layer costs. The f32 pipeline is at its current optimum. The next real
+optimization targets are the hc-mix/attention streaming and (structural) the fused
+dequant+gemm, both out of scope for the closed sync=700 item.
