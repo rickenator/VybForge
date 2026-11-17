@@ -1,0 +1,63 @@
+# Probe: can a module-level struct (with Vec<String> members) be assigned and
+# re-assigned safely on the current runtime? The gx.vyb note says this crashed
+# glibc ("double free or corruption") on the older runtime; the stale-release
+# kill (4ae941da) and the return-path fixes may have closed it. If this passes,
+# st_open can memoize its header per shard and every site stops re-parsing.
+import io::{open_read, read_all, close}
+
+share(all)
+struct ProbeIx {
+    n<Int>,
+    names<Vec<String>>,
+    vals<Vec<Int>>
+}
+
+g_last_ix<ProbeIx> = ProbeIx { n = 0, names = Vec(), vals = Vec() }
+g_last_path<String> = ""
+
+# mimic st_open: build a struct, assign it to the global, return the global
+mk(path<String>, names<Vec<String>>)<ProbeIx> -> {
+    ix<ProbeIx> = ProbeIx { n = names.len(), names = Vec(), vals = Vec() }
+    i<Int> = 0
+    while (i < names.len()) {
+        ix.names.push(names.get(i))
+        ix.vals.push(i * 7)
+        i = i + 1
+    }
+    return ix
+}
+
+set_cache(path<String>, names<Vec<String>>)<ProbeIx> -> {
+    g_last_path = path
+    g_last_ix = mk(path, names)
+    return g_last_ix
+}
+
+main()<Int> -> {
+    a<Vec<String>> = Vec()
+    a.push("alpha")
+    a.push("beta")
+    a.push("gamma")
+    i<Int> = 0
+    r1<ProbeIx> = set_cache("shard3", a)
+    println("pass1 n=" + r1.n.to_string() + " v1=" + r1.vals.get(1).to_string() + " name1=" + r1.names.get(1))
+    # re-assign the global with DIFFERENT content, twice, like back-to-back shards
+    b<Vec<String>> = Vec()
+    b.push("delta")
+    b.push("epsilon")
+    r2<ProbeIx> = set_cache("shard4", b)
+    println("pass2 n=" + r2.n.to_string() + " v0=" + r2.vals.get(0).to_string() + " name0=" + r2.names.get(0))
+    # the old handle r1 must still be intact after the global was re-assigned
+    println("r1-after n=" + r1.n.to_string() + " name2=" + r1.names.get(2) + " v2=" + r1.vals.get(2).to_string())
+    r3<ProbeIx> = set_cache("shard3", a)
+    println("pass3 n=" + r3.n.to_string() + " name2=" + r3.names.get(2))
+    println("PROBE_OK n=" + g_last_ix.n.to_string() + " path=" + g_last_path)
+    i = 0
+    while (i < 200) {
+        r3 = set_cache("shard" + (i % 3).to_string(), a)
+        if (r3.n != 3) { println("PROBE_FAIL iter " + i.to_string()) }
+        i = i + 1
+    }
+    println("PROBE_OK 200 reassignments survived; last path=" + g_last_path)
+    return 0
+}

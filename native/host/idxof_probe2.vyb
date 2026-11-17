@@ -1,0 +1,18 @@
+import io::{open_read, read_all, close}
+main()<Int> -> {
+    match (open_read("/usr/export/rick/vybforge/glm53-checkpoint/model.safetensors.index.json")) {
+    f -> { match (read_all(f)) { idx -> {
+        println("len=" + idx.len().to_string())
+        println("quote-only=" + idx.index_of("\"").to_string())
+        println("q+model=" + idx.index_of("\"model").to_string())
+        println("q+layers=" + idx.index_of("\"model.language_model.layers").to_string())
+        println("q+layers0=" + idx.index_of("\"model.language_model.layers.0").to_string())
+        println("q+layers0dot=" + idx.index_of("\"model.language_model.layers.0.").to_string())
+        println("noq layers0=" + idx.index_of("model.language_model.layers.0.").to_string())
+        println("noq hc=" + idx.index_of("hc_attn_base").to_string())
+        println("q mid=" + idx.index_of("x\"y").to_string())
+        0
+    } ? -> { 1 } } close(f) }
+    ? -> { 2 }
+    }
+}

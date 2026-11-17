@@ -1,0 +1,33 @@
+# Probe: index_of on the real 15.5 MB safetensors index. Why does
+# "model.language_model.layers.0. (quoted, trailing dot) miss, and what do
+# derived strings (function returns, substrings) do to offsets?
+import io::{open_read, read_all, close}
+
+g_idx<String> = ""
+
+load_idx(path<String>)<String> -> {
+    if (g_idx.len() == 0) {
+        match (open_read(path)) { f -> { match (read_all(f)) { s -> { g_idx = s } ? -> { } } close(f) } ? -> { } }
+    }
+    return g_idx
+}
+
+main()<Int> -> {
+    idx<String> = load_idx("/usr/export/rick/vybforge/glm53-checkpoint/model.safetensors.index.json")
+    println("len=" + idx.len().to_string())
+    k0<String> = "\"model.language_model.layers.0.\""
+    println("q0 direct=" + idx.index_of(k0).to_string())
+    k3<String> = "\"model.language_model.layers.3.mlp.experts.\""
+    println("q3exp direct=" + idx.index_of(k3).to_string())
+    # via a returned copy (like pf_idx_init)
+    idx2<String> = load_idx("/usr/export/rick/vybforge/glm53-checkpoint/model.safetensors.index.json")
+    println("q0 via-return=" + idx2.index_of(k0).to_string())
+    # via a substring-derived window: does index_of on a derived string work?
+    win<String> = idx.substring(0, 780000)
+    println("q0 in win[0:780k]=" + win.index_of(k0).to_string())
+    w3<String> = idx.substring(360000, 1140000)
+    println("q3exp in win[360k:1.14M]=" + w3.index_of(k3).to_string())
+    # and a quote-free needle for contrast
+    println("plain needle=" + idx.index_of("hc_attn_base").to_string())
+    return 0
+}

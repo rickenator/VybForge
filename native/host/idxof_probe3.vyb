@@ -1,0 +1,31 @@
+import io::{open_read, read_all, close}
+main()<Int> -> {
+    match (open_read("/usr/export/rick/vybforge/glm53-checkpoint/model.safetensors.index.json")) {
+    f -> { match (read_all(f)) { idx -> {
+        win<String> = idx.substring(187, 798187)
+        println("winlen=" + win.len().to_string())
+        key<String> = "\"model.language_model.layers.0.hc_attn_base\": \"model-"
+        p<Int> = win.index_of(key)
+        println("p=" + p.to_string())
+        # digits after the key: read via char_at on win
+        d0<Int> = p + key.len()
+        s1<String> = ""
+        i<Int> = 0
+        while (i < 5) {
+            s1 = s1 + win.char_at(d0 + i).to_string() + ","
+            i = i + 1
+        }
+        println("chars_after_key(via win)=" + s1)
+        # same via char_at on the PARENT at absolute position
+        s2<String> = ""
+        i = 0
+        while (i < 5) {
+            s2 = s2 + idx.char_at(d0 + i).to_string() + ","
+            i = i + 1
+        }
+        println("chars_after_key(via parent)=" + s2)
+        0
+    } ? -> { 1 } } close(f) }
+    ? -> { 2 }
+    }
+}

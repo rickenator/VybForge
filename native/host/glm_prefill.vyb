@@ -898,7 +898,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
 }
 
 share(all)
-attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+attn_site(h_a<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     a<Int> = 0
     acc<Float> = 0.0
@@ -1003,7 +1003,7 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     want.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
     want.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
 
-    g<GxLoc> = gx_resolve(dir, total, want)
+    g<GxLoc> = gx_resolve_local(win, dir, total, want)
     nf = 0
     i = 0
     while (i < want.len()) {
@@ -1395,7 +1395,7 @@ attn_site(h_a<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
 
 
 share(all)
-tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, win<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -1492,7 +1492,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     w.push(lpre + "hc_ffn_base")
     w.push(lpre + "hc_ffn_scale")
     w.push(lpre + "post_attention_layernorm.weight")
-    gt<GxLoc> = gx_resolve(dir, total, w)
+    gt<GxLoc> = gx_resolve_local(win, dir, total, w)
     nfound = 0
     j = 0
     while (j < w.len()) {
@@ -1562,7 +1562,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     want<Vec<String>> = Vec()
     want.push(lpre + "mlp.gate.weight")
     want.push(lpre + "mlp.gate.e_score_correction_bias")
-    g<GxLoc> = gx_resolve(dir, total, want)
+    g<GxLoc> = gx_resolve_local(win, dir, total, want)
     d_gw = deq_bf16(fbf, gx_read(g, 0), NE * H, H)
     if (d_gw == 0) { return nonev }
     logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
@@ -1653,16 +1653,6 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     # (1.7 -> 9.5 s) from the String churn, so at 45 layers it loses badly. Keep per-expert
     # resolution here; the win came from caching the shard header inside gx_resolve and from
     # reading the 15.5 MB index ONCE per layer instead of once per expert.
-    idxtext<String> = gx_read_index(dir)
-    # The per-expert resolve re-parsed the shard's safetensors header EVERY call (st_open
-    # = ~757 ms measured on this checkpoint), which is what made one MoE layer 19 min
-    # (T_MOE resolve=1145661 ms). Keep ONE open header for the shard the loop is in and
-    # narrow the index scan to this layer's expert block: resolve drops to ~3 ms/expert.
-    winv<Vec<Int>> = gx_expert_window(idxtext, lpre)
-    win0<Int> = winv.get(0)
-    win1<Int> = winv.get(1)
-    winsub<String> = ""
-    if (win1 > win0) { winsub = idxtext.substring(win0, win1) }
     ixL<StIndex> = st_open("")
     shL<Int> = 0
     e = 0
@@ -1697,7 +1687,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            shq<Int> = gx_shard_for(winsub, w2.get(0))
+            shq<Int> = gx_shard_for(win, w2.get(0))
             tSc = time_mono_millis()
             if (shq != shL) {
                 ixL = st_open(gx_shard_path(dir, shq, total))
@@ -1707,7 +1697,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
                         " n=" + ixL.n.to_string() + " path=" + gx_shard_path(dir, shq, total))
             }
             tOp = time_mono_millis()
-            ge<GxLoc> = gx_resolve_ix2(view(ixL), shq, w2, winsub, dir, total)
+            ge<GxLoc> = gx_resolve_ix2(view(ixL), shq, w2, win, dir, total)
             tR = time_mono_millis()
             acc_res = acc_res + (tR - tA)
             acc_scan = acc_scan + (tSc - tA)
@@ -1718,7 +1708,9 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
                 if (ge.found.get(j) == 1) { nfound = nfound + 1 }
                 j = j + 1
             }
-            if (nfound != w2.len()) { println("ALL_FAIL resolve expert " + e.to_string()); return nonev }
+            if (nfound != w2.len()) {
+                return nonev
+            }
 
             tA = time_mono_millis()
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
@@ -1800,7 +1792,7 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
     w3.push(lpre + "mlp.shared_experts.gate_proj.weight")
     w3.push(lpre + "mlp.shared_experts.up_proj.weight")
     w3.push(lpre + "mlp.shared_experts.down_proj.weight")
-    gs<GxLoc> = gx_resolve(dir, total, w3)
+    gs<GxLoc> = gx_resolve_local(win, dir, total, w3)
     d_sg = deq_bf16(fbf, gx_read(gs, 0), EINTER * H, H)
     d_su = deq_bf16(fbf, gx_read(gs, 1), EINTER * H, H)
     d_sd = deq_bf16(fbf, gx_read(gs, 2), H * EINTER, EINTER)
@@ -1848,8 +1840,91 @@ tail_site(streams1<Vec<Float>>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, f
 
 
 
+# ---- per-run index cache ----
+# The 15.5 MB index never changes during a run. Reading it per site per layer cost
+# 2.2 s (layer 2) to 91 s (layer 4) per read as the heap grew — ~74% of the run.
+# g_run_idx is filled ONCE; everything else scans it in place or works on a ~760 KB
+# per-layer window. Program-level globals are safe (native/host/gx_memo_probe.vyb);
+# module-level ones in an IMPORTED module break sibling sema — do not move these.
+g_run_idx<String> = ""
+g_emb_shard<Int> = 0
+g_hpath<String> = ""
+g_hix<StIndex> = StIndex { n = 0, names = Vec(), dtypes = Vec(), shp_off = Vec(), shp_len = Vec(),
+                           shp = Vec(), doff = Vec(), dlen = Vec(), hlen = 0, data_base = 0, path = "" }
+
+pf_idx_init(dir<String>)<String> -> {
+    if (g_run_idx.len() == 0) { g_run_idx = gx_read_index(dir) }
+    return g_run_idx
+}
+
+# shard header memo: st_open costs ~10 s per parse under this heap, 757 ms on a small one
+pf_open(path<String>)<StIndex> -> {
+    if (path == g_hpath && g_hix.n > 0) { return g_hix }
+    ix<StIndex> = st_open(path)
+    if (ix.n > 0) {
+        g_hix = ix
+        g_hpath = path
+    }
+    return ix
+}
+
+# this layer's window: one scan of the cached global, then a ~760 KB substring that
+# contains EVERY layer.N tensor name (site tensors + all 288 experts)
+pf_layer_win(layer_prefix<String>)<String> -> {
+    p<Int> = g_run_idx.index_of("\"" + layer_prefix)
+    we<Int> = g_run_idx.len()
+    if (p >= 0) {
+        we = p + 780000
+        if (we > g_run_idx.len()) { we = g_run_idx.len() }
+    }
+    return g_run_idx.substring(p, we)
+}
+
+# resolve `want` against the layer window: shard via one window scan per name,
+# header via the memo, offset via st_find. Same GxLoc contract as gx_resolve.
+gx_resolve_local(win<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
+    g<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                       dts = Vec(), paths = Vec() }
+    i<Int> = 0
+    while (i < want.len()) {
+        g.found.push(0)
+        g.shard.push(0)
+        g.tix.push(-1)
+        g.off.push(-1)
+        g.nbytes.push(0)
+        g.dts.push("")
+        g.paths.push("")
+        i = i + 1
+    }
+    ksh<Int> = 0
+    kix<StIndex> = st_open("")
+    i = 0
+    while (i < want.len()) {
+        shq<Int> = gx_shard_for(win, want.get(i))
+        if (shq == 0 && want.get(i) == "model.language_model.embed_tokens.weight") { shq = g_emb_shard }
+        if (shq > 0) {
+            if (shq != ksh) {
+                kix = pf_open(gx_shard_path(dir, shq, total))
+                ksh = shq
+            }
+            t<Int> = st_find(view(kix), want.get(i))
+            if (t >= 0) {
+                g.found.set(i, 1)
+                g.shard.set(i, shq)
+                g.tix.set(i, t)
+                g.off.set(i, kix.data_base + kix.doff.get(t))
+                g.nbytes.set(i, kix.dlen.get(t))
+                g.dts.set(i, kix.dtypes.get(t))
+                g.paths.set(i, kix.path)
+            }
+        }
+        i = i + 1
+    }
+    return g
+}
+
 share(all)
-kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+kda_attn_site(streams<their<Vec<Float> const>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
     nf<Int> = 0
@@ -1908,7 +1983,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<St
     want.push(lpre + "self_attn.k_conv1d.weight")
     want.push(lpre + "self_attn.v_conv1d.weight")
 
-    g<GxLoc> = gx_resolve(dir, total, want)
+    g<GxLoc> = gx_resolve_local(win, dir, total, want)
     i = 0
     while (i < want.len()) {
         if (g.found.get(i) == 1) { nf = nf + 1 }
@@ -1934,9 +2009,9 @@ kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<St
     var<Int> d_fnA = 0
     var<Int> d_fnF = 0
     d_fnA = deq_bf16(fbf, gx_read(g, 14), 24 * HC * H, HC * H)
-    if (d_fnA == 0) { return nonev }
+    if (d_fnA == 0) { println("KFAIL fnA rawlen=" + gx_read(g, 14).len().to_string()); return nonev }
     d_fnF = deq_bf16(fbf, gx_read(g, 17), 24 * HC * H, HC * H)
-    if (d_fnF == 0) { return nonev }
+    if (d_fnF == 0) { println("KFAIL fnF rawlen=" + gx_read(g, 17).len().to_string()); return nonev }
     base<Vec<Float>> = Vec()
     raw_base = gx_read(g, 15)
     j = 0
@@ -1984,7 +2059,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<St
     d_scr = alloc_dev(64)
     if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("L0_FAIL alloc"); return nonev }
     bulk_htod(d_flat, view(flat))
-    if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { return nonev }
+    if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { println("KFAIL gemm"); return nonev }
     sync()
     mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
     free_dev(d_flat)
@@ -2157,7 +2232,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, dir<String>, total<Int>, lpre<St
 }
 
 share(all)
-ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+ffn_dense_site(streams1<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
     nf<Int> = 0
@@ -2199,7 +2274,7 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
     want.push(lpre + "hc_ffn_base")
     want.push(lpre + "hc_ffn_scale")
 
-    g<GxLoc> = gx_resolve(dir, total, want)
+    g<GxLoc> = gx_resolve_local(win, dir, total, want)
     i = 0
     while (i < want.len()) {
         if (g.found.get(i) == 1) { nf = nf + 1 }
@@ -2310,7 +2385,7 @@ ffn_dense_site(streams1<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgem
 }
 
 share(all)
-dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
+dsa_attn_site(streams0<Vec<Float>>, win<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     i<Int> = 0
     j<Int> = 0
@@ -2390,7 +2465,7 @@ dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm
     lines<String> = ""
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
-    attn<Vec<Float>> = attn_site(h_a, lpre, fgemm, fbf)
+    attn<Vec<Float>> = attn_site(h_a, win, lpre, fgemm, fbf)
     println(digest("attn", attn))
     lines = lines + digest("h_a", h_a) + "\n" + digest("attn", attn) + "\n"
 
@@ -2403,6 +2478,17 @@ dsa_attn_site(streams0<Vec<Float>>, dir<String>, total<Int>, lpre<String>, fgemm
 
 main()<Int> -> {
     dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    lposTab<Vec<Int>> = Vec()
+    idxrun<String> = pf_idx_init(dir)
+    g_emb_shard = gx_shard_for(idxrun, "model.language_model.embed_tokens.weight")
+    ln<Int> = 0
+    while (ln < 45) {
+        lq<String> = "model.language_model.layers." + ln.to_string() + "."
+        pp<Int> = idxrun.index_of(lq)
+        if (pp < 32) { pp = 32 }
+        lposTab.push(pp - 32)
+        ln = ln + 1
+    }
     out<String> = env_get("VYBFORGE_PREFILL_OUT") else "native/out/prefill_vyb.txt"
     total<Int> = 83
     nlay<Int> = 45
@@ -2541,11 +2627,15 @@ main()<Int> -> {
         # prediction head (eh_proj / enorm / hnorm, its own experts), so the forward
         # stack is 0..44 and the MTP head is driven separately.
         lt0 = time_mono_millis()
+        wpos<Int> = lposTab.get(n)
+        wend<Int> = wpos + 780000
+        if (wend > idxrun.len()) { wend = idxrun.len() }
+        win<String> = idxrun.substring(wpos, wend)
         if ((n % 4) == 3) { is_dsa = 1 }
         if (is_dsa == 1) {
-            streams1 = dsa_attn_site(streams, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+            streams1 = dsa_attn_site(streams, win, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         } else {
-            streams1 = kda_attn_site(view(streams), dir, total, lpre, fgemm, fbf)
+            streams1 = kda_attn_site(view(streams), win, dir, total, lpre, fgemm, fbf)
         }
         println("attn len " + streams1.len().to_string() + " layer " + n.to_string())
         println("MARK attn-done layer " + n.to_string())
@@ -2555,9 +2645,9 @@ main()<Int> -> {
         }
         lt1 = time_mono_millis()
         if (n < 3) {
-            streams = ffn_dense_site(streams1, dir, total, lpre, fgemm, fbf)
+            streams = ffn_dense_site(streams1, win, dir, total, lpre, fgemm, fbf)
         } else {
-            streams = tail_site(streams1, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+            streams = tail_site(streams1, win, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
         }
         if (streams.len() != R * HC * H) {
             println("PF_FAIL ffn layer " + n.to_string())
