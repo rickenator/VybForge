@@ -1612,3 +1612,28 @@ Per-layer cost model: KDA layers ~3.5-4.3 min (34 of them), DSA ~1.9-2.7 min (11
    st_open per layer; a per-layer name->(shard,off,len) table built once would cut it to ~5 s.
 3. deq 17-22 s/layer: exl3hgen (8.7 ms) + exl3had1 (8.9 ms) per deq are the hot kernels.
 4. shared expert + hc_apply ~22 s/layer inside T_TAIL.
+
+### PERF session 2 (2026-11-16 afternoon) — KDA attn profiled: it was resolve too; st_open is the last hog
+Instrumented kda_attn_site (T_KDA deq/mix/core/tail/pre/entry): the GDN core is 0.6 s, the weight
+deqs 0.3 s, the hc-mix gemms ~31 s — the "slow KDA attention" was ~90 s of resolve + header parsing
+in front of the math. Chain of findings, each measured:
+1. `gx_read_index` (15.5 MB read) per site per layer: 2.2 s (layer 2) -> 91 s (layer 4) as the heap
+   grows. Fixed: read once into a main() local at startup.
+2. Any method call on a GLOBAL big String copies the receiver under heap pressure (4.7 s per
+   index_of scan). Fixed: the index is only ever touched through main's local + per-layer windows.
+3. Vyb gotcha: a concat needle with a TRAILING escaped quote (`"...0.\"`) breaks index_of (length/
+   content mismatch -> -1); mid-string escapes are fine. Cost half a session.
+4. Layer windows: per-layer ~760 KB window (g_lpos precomputed at startup on the clean heap),
+   passed to all five sites; every resolve = window scan (~0.3 ms) + memoized header + st_find.
+Verified NLAYERS=4: PREFILL_OK rc=0; layer 3 attn 18.8->11.8 s, layer total 92->71 s.
+REMAINING HOG (measured, T_RSLV): **st_open = ~11 s per shard-header parse under the driver's
+~4.6 GB heap** (757 ms small-heap), and a KDA layer's tensors span ~8-10 shards -> ~90 s/layer of
+parsing, ~100 min of the full run. The pf_open memo only helps when the same shard recurs.
+NEXT (in order):
+1. Make st_open cheap under heap pressure: profile json_parse vs the StIndex walk at 4.6 GB
+   (suspect allocation churn). Or parse all ~83 shard headers ONCE at startup while the heap is
+   small (~83 x 0.76 s) and keep the parsed tables alive for the run.
+2. Then the fused-dequant gemm (f64 -> f32-in-register) — the structural win, ~1 TB/run of f64
+   traffic removed; needs oracle tolerance re-baselining.
+3. hc-mix gemms ~31 s/layer and shared+hc_apply ~22 s/layer are the next host/kernel items after that.
+Full-run projection if (1) lands: ~2h11m -> ~35-45 min.
