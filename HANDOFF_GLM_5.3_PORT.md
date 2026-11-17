@@ -1637,3 +1637,30 @@ NEXT (in order):
    traffic removed; needs oracle tolerance re-baselining.
 3. hc-mix gemms ~31 s/layer and shared+hc_apply ~22 s/layer are the next host/kernel items after that.
 Full-run projection if (1) lands: ~2h11m -> ~35-45 min.
+
+### Tab-refactor attempt (paused 2026-11-16 evening) — design + Vyb gotchas, reverted to a992759
+Goal: eliminate json_parse/st_open from the runtime path entirely (they degrade to ~5-11 s per
+parse as live docs/heap grow — measured: same-header re-parse in a CLEAN program goes 121 ms ->
+610 ms over 4 parses and plateaus; in the driver it grows unboundedly). Design: at startup walk
+all 83 shard headers once (st_open is cheap on the clean heap), bucket every tensor's
+`name shard off len dtype` record by layer into per-layer table strings, and make every site
+resolve by pure table lookup. Implementation got ~80% there (resolver + builder + wiring) but hit
+a wall of Vyb codegen/scoping quirks; REVERTED to the green a992759 state. The design is sound —
+the next session should reimplement it knowing:
+1. **Vyb substring shares the parent buffer**: `index_of` on a substring returns PARENT-buffer
+   offsets, and a second substring built from those offsets is garbage. Never chain derived
+   substrings; scan the original in place.
+2. **A concat needle with a TRAILING escaped quote breaks index_of** (`"...0.\"` -> -1 despite the
+   text existing); mid-string escapes are fine. Build needles without trailing escapes.
+3. `String::index_of` takes exactly ONE argument (no start offset).
+4. `vec.set(i, <call expression>)` fails codegen in program-level functions ("Argument codegen
+   failed") — bind the value to a local first... and locals declared inside a nested if-block are
+   INVISIBLE to the following statements in the same function ("Undefined identifier") — hoist
+   every working local to function scope (declare at the top, assign inside).
+5. Bare `Vec<...>` globals are unsupported ("Undefined Vec variable"); struct globals at PROGRAM
+   level work (gx_memo_probe: 200 reassignments clean), struct globals in an IMPORTED module break
+   sibling-module sema (json_parse fails "Trait JParserOps is not defined").
+6. `gx_shard_path(...)` calls also fail codegen inside such resolvers — inline the path
+   concatenation instead.
+With those known, the table builder + resolver are ~100 lines of straightforward Vyb. Expected:
+startup ~60 s (83 shard walks on the clean heap), runtime resolve ~0.3 s/layer, full run ~35-45 min.
