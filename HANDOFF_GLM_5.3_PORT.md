@@ -1877,3 +1877,18 @@ all equal). Conclusions:
   an interaction with glm_prefill's other device state (suspect: an arena address
   colliding with the driver's own long-lived buffers, or kn*8 fdc vs the probe's
   4096*2048*8 — identical sizes, so more likely address placement).
+
+### Bisect result: arena + cvt is CLEAN in the probe — fault is glm_prefill context state (2026-11-17)
+The probe was converted to arena-style buffers with EXACTLY the glm_prefill sizes/shape
+(native/host/glm_cvt_probe.vyb, native/out/cvt_probe2.log): alloc-once in main, pointers
+passed in, zero per-deq allocs. Result: rc=0, NO sync=700, cvt digest byte-identical to
+the f32 reference again. So arena layout + exl3cvt32 are jointly exonerated.
+The fault therefore lives in the INTERACTION with glm_prefill's context state at the time
+of the first f32 deq: thousands of prior alloc/free cycles, ~4.6 GB live heap, and the
+driver's own long-lived buffers (the f64 path's per-call allocs run through the same
+allocator continuously). NEXT bisect (cheap, in the probe): before the cvt call, stress
+the context the way the driver does — a loop of alloc/free of ~64 MB blocks (say 200
+iterations) plus a couple of large live allocations — and see if the 700 reproduces. If
+it does, the culprit is allocator state (pool fragmentation around the arena); if not,
+port the arena into glm_prefill incrementally (arena for f32 buffers only, f64 path
+untouched) and gate NLAYERS=4 — the failure there was reproducible in ~90 s.
