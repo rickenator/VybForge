@@ -2138,3 +2138,27 @@ STALE vs current state (read before implementing):
    open GLM item is fusing deq+transform, not deq+GEMM.
 3. The doc's f64-oracle pattern is exactly what the GLM side already did (f64 gold
    retained, f32 digests <=1.4e-6) — the tolerance conclusion transfers.
+
+### ARCHITECTURE DIRECTIVE (Rick, 2026-11-17): the production-engine pattern
+All production engines share one shape, and VybForge follows it ultimately:
+- llama.cpp (CUDA): weights stay packed in their GGUF quant; each kernel dequantizes a
+  tile to fp32 IN REGISTERS on the fly, matmul with fp32 accumulate; KV cache f16 by
+  default. Nothing is ever materialized as an expanded weight copy — 63.9 MB packed
+  stays 63.9 MB (vs the 807 MB f64 expansion).
+- vLLM: fp16/bf16 compute throughout, fp32 accumulation inside GEMMs; int4/int8/FP8
+  dequantized to fp16 in registers per-tile (Marlin: int4->fp16 direct). Never f64.
+- TensorRT-LLM: same — fp16/bf16/fp8 compute, weight-only dequant in-kernel, fp8/fp16 KV.
+- ExLlamaV2/V3 (the closest analog: lefty/righty DeepSeek EXL3 2.9 bpw, mixed-quant
+  per-layer dequant): EXL3/QT -> fp16 in registers during the matmul, fp32 accumulate,
+  fp16 KV cache.
+UNIVERSAL PATTERN: packed storage, dequant-to-fp16/fp32 in registers inside the GEMM,
+fp32 accumulation, f64 NOWHERE (f64 is scientific-computing/datacenter only). The
+current VybForge shape (dequant once to an expanded buffer, then dense GEMM) matches
+llama.cpp's CPU strategy, not its GPU one. The fused-dequant kernel (FUSED-DQ-GEMM
+direction, PKD packed-resident) is the architectural step.
+FP64/32 GOLD (prerequisite, already in place and git-tracked):
+- f64 gold: native/out/prefill_vyb_45_tab.txt (f64-compute 45-layer digests)
+- f32 gold: native/out/prefill_vyb_45.txt (13:54 f32 run digests, <=1.4e-6 of f64)
+- element-wise: native/out/gold_l3_streams2.npy (layer-3 streams, f64 reference)
+Any fused kernel gates against these within a measured tolerance (f32 band already
+established: digests <=1.4e-6; element-wise TOL derived from the same run's spread).
