@@ -1970,3 +1970,26 @@ free the result. If it FAULTS at startup on the near-clean context -> determinis
 program = the minimal Vyb repro. If it is GREEN at startup -> layers 0-3's GPU activity
 (a specific kernel or allocator sequence) poisons the cvt launch; bisect by dropping
 layer 3's attention sub-steps one at a time.
+
+### Startup-warm-up experiment: warm-up works, protection does NOT (2026-11-17, final)
+The startup-call bisect ran (NLAYERS=4): exl3_deq32 at startup, BEFORE layers 0-3,
+SUCCEEDS (STARTUP_DEQ dw0=valid, cvt writes the 64 MB arena fdc cleanly) — and then the
+run continued GREEN (PREFILL_OK, deq 2.5 s). BUT a second experiment — startup warm-up
+call + fd/fdc switched to arena for the whole run — FAILED at layer 3: the warm-up cvt
+write to the arena fdc is clean, then layers 0-3 run, then the layer-3 cvt to the SAME
+arena slot faults sync=700. The warm-up does not protect.
+CONCLUSION (sharpened): the fault is not first-use and not deterministic per-buffer —
+the intervening GPU activity (layers 0-3: dense ffn mm_host/dev_alloc churn + DSA
+attention) INVALIDATES the startup-allocated arena mapping for writes. Fresh cuMemAlloc
+buffers at the same moment work. This is a Vyb RUNTIME/codegen-level device-pointer
+LIFETIME question: suspect the generated code or vyb_runtime auto-freeing/reclaiming
+cuMemAlloc'd pointers held in long-lived locals (see the allocator-pool note in the
+vybos-development skill: "generated code also frees pointers born elsewhere") once
+subsequent allocations churn. The evidence set for the compiler investigation: this
+matrix + the probe (clean in every isolated configuration) + the startup warm-up result.
+NEXT: in a Vyb worktree, write a minimal program: alloc a device buffer in a freedom
+block at program start, run a loop of unrelated alloc/free churn (other functions, other
+scopes), then launch a kernel writing the held buffer — check for the 700. That is the
+minimal repro for a src/vre codegen (ownership/lifetime of loc-held device pointers)
+investigation. Until then the committed state (fd+fdc fresh, 13:54) is the acceptance
+configuration.
