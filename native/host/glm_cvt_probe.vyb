@@ -9,6 +9,7 @@
 #
 # Run: make -f native/Makefile glm3x
 import io::{open_read, read_at, read_all, open_write, write_str, close}
+import time::{time_mono_millis}
 import env::{env_get}
 import safetensors
 import gx
@@ -293,6 +294,29 @@ dtoh32(p<Int>)<Float> -> {
     return out
 }
 
+# f32 variant: build the constant Hadamard/8 as f32 once (16384*4 bytes). Never freed.
+had_hoist32(fhgen32<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> hd = 0
+        var<Int> pd = 0
+        hrc1<Int> = cuMemAlloc_v2(loc(hd), 16384 * 4) as Int
+        if (hrc1 == 0) {
+            hrc2<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
+            if (hrc2 == 0) {
+                if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) == 0) {
+                    hlrc<Int> = cuda_launch4i(from<loc<CVoid>>(fhgen32), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
+                    hsync<Int> = cuCtxSynchronize() as Int
+                    if (hlrc == 0 && hsync == 0) { out = hd }
+                }
+                cuMemFree_v2(pd)
+            }
+            if (out == 0) { cuMemFree_v2(hd) }
+        }
+    }
+    return out
+}
+
 main()<Int> -> {
     dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
     out<String> = env_get("VYBFORGE_EXL3_OUT") else "native/out/exl3_load_vyb32.txt"
@@ -433,6 +457,60 @@ main()<Int> -> {
         println("PRE-HTOD-dW rc=" + hpre3.to_string())
     }    println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string())
 
+    t2out<Int> = 0
+    # ---- fused dq1 gate: td2 must be bit-identical to the separate deq32+had132 ----
+    fdq1<Int> = load_fn("native/build/exl3.ptx", "exl3dq1")
+    hdg32<Int> = had_hoist32(fhgen)
+    finv<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    freedom {
+        md<Int> = 0
+        t2<Int> = 0
+        pp<Int> = 0
+        mrc<Int> = cuMemAlloc_v2(loc(md), 8192) as Int
+        trc<Int> = cuMemAlloc_v2(loc(t2), 33554432) as Int
+        prc<Int> = cuMemAlloc_v2(loc(pp), 64) as Int
+        if (mrc == 0 && trc == 0 && prc == 0) {
+            cuMemcpyHtoD_v2(md, mapd, mapd.len())
+            nb<Int> = mapd.len() - 16
+            cuMemcpyHtoD_v2(pp + 0, loc(md), 8)
+            cuMemcpyHtoD_v2(pp + 8, loc(nb), 8)
+            lrcI<Int> = cuda_launch4i(from<loc<CVoid>>(finv), 1, 1, 1, 256, 1, 1, pp, 0, 0, 0) as Int
+            srI<Int> = cuCtxSynchronize() as Int
+            tq<Int> = 0
+            tqrc<Int> = cuMemAlloc_v2(loc(tq), trellis.len()) as Int
+            cuMemcpyHtoD_v2(tq, trellis, trellis.len())
+            cuMemcpyHtoD_v2(pp + 0, loc(tq), 8)
+            cuMemcpyHtoD_v2(pp + 8, loc(md), 8)
+            cuMemcpyHtoD_v2(pp + 16, loc(hdg32), 8)
+            cuMemcpyHtoD_v2(pp + 24, loc(t2), 8)
+            cwv<Int> = 2048
+            cuMemcpyHtoD_v2(pp + 32, loc(cwv), 8)
+            invb<Int> = md + 16 + nb
+            cuMemcpyHtoD_v2(pp + 40, loc(invb), 8)
+            g0<Int> = time_mono_millis()
+            lrcD<Int> = cuda_launch4i(from<loc<CVoid>>(fdq1), 65536, 1, 1, 128, 1, 1, pp, 0, 0, 0) as Int
+            srD<Int> = cuCtxSynchronize() as Int
+            g1<Int> = time_mono_millis()
+            println("FUSED_DQ1 lrc=" + lrcD.to_string() + " sync=" + srD.to_string() + " ms=" + (g1 - g0).to_string())
+            t2out = t2
+            cuMemFree_v2(tq)
+        }
+        cuMemFree_v2(md)
+        cuMemFree_v2(pp)
+    }
+    DQ<Vec<Float>> = Vec()
+    SV<Vec<Float>> = Vec()
+    dq0<Int> = 0
+    while (dq0 < 6) {
+        DQ.push(dtoh(t2out + dq0 * 8))
+        SV.push(dtoh(arD + dq0 * 8))
+        dq0 = dq0 + 1
+    }
+    k0<Int> = 0
+    while (k0 < 6) {
+        println("RAW dq1[" + k0.to_string() + "]=" + DQ.get(k0).to_string() + " sep[" + k0.to_string() + "]=" + SV.get(k0).to_string())
+        k0 = k0 + 1
+    }
     # ---- two-write repro: churn with ANOTHER module's kernels, then write arF again ----
     fb<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
     ci<Int> = 0

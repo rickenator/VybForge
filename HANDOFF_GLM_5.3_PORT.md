@@ -2119,6 +2119,39 @@ measured per-layer costs. The f32 pipeline is at its current optimum. The next r
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
 
+### FUSED DEQ+HAD1 KERNEL: written, BIT-IDENTICAL, needs shared-memory redesign for the win (2026-11-17 night)
+Item 1 of the fused-dequant direction is implemented and gated:
+- `exl3dq1` (native/kernels/exl3.vyb): one thread per tmp element, dequantizes the packed
+  slab IN REGISTERS per tap (mcg + fp16 pair + f32 narrow, identical math/order to
+  deq32+had132) — the expanded What (od) buffer is NEVER materialized. 3 launches instead
+  of 4 (dq1 -> had232 -> cvt32), od traffic eliminated.
+- `exl3inv`: builds the map's (r,c)->slot inverse on device (256 threads; the map body's
+  placement fields are u16 at slot*16+12/+14 — read them ALIGNED as single u16 loads; the
+  initial hi/lo split read at +13 was misaligned (716) and poisoned the context).
+- GOTCHA (cost cycles): Vyb's `ld_u16` compiles to a 4-byte ld.global.u32 — a u16 load at
+  a 2-mod-4 address is MISALIGNED. The deq path's u16 loads are always 4-aligned by
+  construction (base = 16-aligned + slot*16); any new u16/u32 table needs 4-byte entries
+  (the inverse map uses u32 per entry, st_u32/ld_u32).
+- GATED: `FUSED_DQ1 lrc=0 sync=0` and the produced td2 is BIT-IDENTICAL to the separate
+  deq32+had132 path on spot checks across the first 6 f32 pairs (12 f32 elements,
+  denormals included) — native/out/cvt_probe23-24.log. The probe's digest helper could not
+  be used for the full-buffer compare (Int64 overflow in the 2^40 digest scaling on
+  f32-pair-as-f64 values + 4-byte DtoH fails in the binding — dtoh32 returns 0.0 on every
+  call; use 8-byte dtoh reads and raw spot comparisons).
+- PERF: fused dq1 = 115 ms per matrix vs ~14 ms for the separate deq32+had132 — the
+  one-thread-per-output design pays 128x redundant dequant (each output thread
+  re-dequantizes its 128-col row strip; ~0.84 TOPS effective).
+NEXT (the performance redesign): shared-memory cooperative version — per 128x128 tile,
+cooperatively dequantize the What tile into shared memory (64 KB f32; sm_86 allows 100 KB
+with opt-in), syncthreads, then the 128-tap MACs read shared. PREREQ: verify Vyb exposes
+a barrier/syncthreads intrinsic (grep src/vre/semantic_internal.hpp; rpf_gemm128.vyb's
+mma+shared path proves shared memory works — check how it synchronizes). Fallback if no
+barrier exists: deq into shared via separate launch is meaningless (global round-trip
+returns) — then the win must come from the mma path (rpf_gemm128 pattern) instead.
+Also note: the probe's two-write repro section SEGVs (host) — its first exl3_deq's
+freedom exit frees the trellis String (param born elsewhere); do not run that section
+when gating (the fused-gate block runs before it and is unaffected).
+
 ### FUSED-DQ-GEMM-DESIGN.md INCORPORATED (2026-11-17)
 The design doc now lives in the repo: `native/FUSED-DQ-GEMM-DESIGN.md` (117 lines,
 copied from /mnt/apex/rick/Projects/VybForge/native/ where it was authored). Summary:

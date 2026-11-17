@@ -255,6 +255,83 @@ exl3cvt32(p<Int>) -> {
     }
 }
 
+// FUSED deq+column-transform (llama.cpp pattern: packed in, dequant in registers,
+// f32 accumulate, the expanded What is NEVER materialized). One thread per tmp
+// element (block,b,d): acc = sum_c deq(row,colbase+c) * H[c,d], c ascending —
+// the same values in the same order as exl3deq32+exl3had132, so td2 is
+// bit-identical to the separate path. The map's (r,c)->slot inverse (512 B,
+// built host-side from map.bin) rides in td after the map body.
+// p: +0 q, +8 td (map body + inv), +16 H(f32), +24 T(f32), +32 cw, +40 invbase
+exl3dq1(p<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 32)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = gid / 16384
+    rem<Int> = gid - block * 16384
+    b<Int> = rem / 128
+    d<Int> = rem - b * 128
+    kbv<Int> = block / nbc128
+    nbv<Int> = block - kbv * nbc128
+    row<Int> = kbv * 128 + b
+    colbase<Int> = nbv * 128
+    q<Int> = ld_i64(p + 0)
+    td<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    T<Int> = ld_i64(p + 24)
+    inv<Int> = ld_i64(p + 40)
+    acc<Float32> = 0.0
+    c<Int> = 0
+    while (c < 128) {
+        col<Int> = colbase + c
+        kb16<Int> = row / 16
+        r16<Int> = row - kb16 * 16
+        nb16<Int> = col / 16
+        c16<Int> = col - nb16 * 16
+        tile<Int> = kb16 * nbc16 + nb16
+        slotU<UInt32> = ld_u32(inv + (r16 * 16 + c16) * 4)
+        slot<Int> = slotU as Int
+        base<Int> = td + 16 + slot * 16
+        w16<Int> = 0
+        i<Int> = 0
+        while (i < 4) {
+            nidx<Int> = ld_u16(base + i * 2) as Int
+            pp<Int> = (ld_i8(base + 8 + i) as Int) & 255
+            wb<Int> = q + tile * 128 + (nidx / 4) * 2 + (nidx % 4) / 2
+            by<Int> = (ld_i8(wb) as Int) & 255
+            sh<Int> = ((nidx % 4) % 2) * 4
+            nib<Int> = (by >> sh) & 15
+            w16 = w16 | (nib << (pp * 4))
+            i = i + 1
+        }
+        prod<Int> = (w16 * 3417055213) & 4294967295
+        y<Int> = (prod & 2415890431) ^ 996162400
+        lo<Float> = fp16_to_f64(y & 65535)
+        hi<Float> = fp16_to_f64((y >> 16) & 65535)
+        w32<Float32> = (lo + hi) as Float32
+        acc = acc + w32 * ld_f32n(H + (c * 128 + d) * 4)
+        c = c + 1
+    }
+    st_f32(T + gid * 4, acc)
+}
+
+// Inverse-map builder: 256 threads, slot=gid reads its (r,c) placement from the map
+// body and writes the 2-byte inverse entry inv[r*16+c] = slot. Runs once per map.
+// p: +0 td (map at +16), +8 nbody (inv lands at td+16+nbody)
+exl3inv(p<Int>) -> {
+    slot<Int> = blk_x() * dim_x() + tid_x()
+    if (slot < 256) {
+        td<Int> = ld_i64(p + 0)
+        nbody<Int> = ld_i64(p + 8)
+        base<Int> = td + 16 + slot * 16
+        r<Int> = ld_u16(base + 12) as Int
+        c<Int> = ld_u16(base + 14) as Int
+        pos<Int> = r * 16 + c
+        inv<Int> = td + 16 + nbody
+        st_u32(inv + pos * 4, slot)
+    }
+}
+
 // fp16 bit pattern -> f64 by pure arithmetic (no libm, no memory round-trip).
 // Normal: (1024+mant) * 2^(exp-25) by doubling/halving loops (<= 24 steps).
 // Subnormal: mant * 2^-24 by 24 halvings. exp==31 (inf/nan) never occurs on the
