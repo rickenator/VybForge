@@ -12,7 +12,7 @@ import io::{open_read, read_at, read_all, open_write, write_str, close}
 import env::{env_get}
 import safetensors
 import gx
-import tensor::{tensor_init, dtoh_vec, sync}
+import tensor::{tensor_init, dtoh_vec, dtoh, sync}
 
 struct CvtBox {
     p<Int>
@@ -401,7 +401,12 @@ main()<Int> -> {
     dW<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, trellis, suh, svh, body, 2048, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
     if (dW == 0) { println("EXL3_FAIL deq"); return 7 }
     sync()
-    W<Vec<Float>> = dtoh_vec(dW, 4096 * 2048)
+    W<Vec<Float>> = Vec()
+    wi<Int> = 0
+    while (wi < 8) {
+        W.push(dtoh(dW + wi * 8))
+        wi = wi + 1
+    }
     freedom {
         cuMemFree_v2(dW)
     }
@@ -413,10 +418,10 @@ main()<Int> -> {
         ? -> { println("EXL3_FAIL write"); return 8 }
     }
     Wf<Vec<Float>> = Vec()
-    wi<Int> = 0
-    while (wi < 4096 * 2048) {
-        Wf.push(dtoh32(cvtbox.p + wi * 4))
-        wi = wi + 1
+    wj<Int> = 0
+    while (wj < 8) {
+        Wf.push(dtoh32(cvtbox.p + wj * 4))
+        wj = wj + 1
     }
     println(digest("fd32", Wf))
 

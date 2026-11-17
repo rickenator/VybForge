@@ -2049,3 +2049,32 @@ NEXT: Vyb worktree (worktree add -b fix/<name> origin/main, cmake --preset debug
 the repro against the debug binary, then instrument vyb_cuda_launch4i / module handling.
 A fix lands as a PR; VybForge gates: glm_cvt_probe + glm3x + NLAYERS=6 prefill, then the
 fd/fdc arena re-enable + full 45-layer run (~5-6 min target).
+
+### SANITIZER VERDICT: arF is cuMemFree'd DURING the first exl3_deq (2026-11-17, definitive)
+compute-sanitizer memcheck on the slimmed probe (cvt_probe_san2.log, rc=99, 13,033 errors):
+- The faulting accesses are "Invalid __global__ write of size 4 bytes" at exl3cvt32+0x1d0,
+  starting 896 bytes past the end of a 64 MB allocation — and memcheck's nearest-allocation
+  record proves ARF IS NOT IN THE CUDA ALLOCATION TABLE at that moment (the writes land
+  inside arF's printed range, yet memcheck only knows the 64 MB block below it).
+- arF was valid at allocation time (ALLOC-TIME HtoD rc=0 for every slot) and the first
+  cvt's sync returned 0 — so arF was freed DURING the first exl3_deq, implicitly: the
+  probe's exl3_deq contains NO cuMemFree of arena buffers (verified by grep). The freer
+  is the Vyb runtime/codegen: a spurious/deferred cuMemFree of a 64 MB device pointer
+  held in a freedom-block local. The "cross-module launch" framing was WRONG — the
+  bf16deq churn is irrelevant; the first exl3_deq alone invalidates arF (PRE-HTODF rc=1
+  BEFORE the churn, cvt_probe11b.log).
+- The digest garbage (sum=-807, abs=100107, mostly zeros) is the same bug seen from the
+  read side: the 8.4M per-element DtoH readbacks from arF fail with INVALID_VALUE
+  (100+ captured in cvt_probe_san.log) because arF is already freed.
+CORRECTED BUG STATEMENT: a 64 MB cuMemAlloc'd device buffer, allocated in main's freedom
+block and passed as a parameter into a function whose freedom block assigns it to a
+local, gets cuMemFree'd by the runtime/codegen during that function's execution —
+independently of any explicit free. 32 MB buffers in the identical position survive
+(size-dependent path in the allocator or codegen cleanup).
+NEXT (Vyb worktree, ~/Projects/Vyb-cuda-fix debug build has the repro): instrument
+cuMemFree_v2 in the repro (log ptr+size on every free) — the log will show WHO frees
+arF (the call site's backtrace under the sanitizer, or a VYB_CDBG trace in the runtime's
+device-free path). Then fix the ownership rule: a device pointer assigned from a
+parameter must not be freed by the callee's cleanup; only the allocating scope frees.
+Gates: glm_cvt_probe clean (both digests real) + glm3x + NLAYERS=6 + full 45 run with
+the arena re-enabled (~5-6 min target).
