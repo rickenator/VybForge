@@ -1911,3 +1911,21 @@ glm_prefill INCREMENTALLY and bisect inside the driver (NLAYERS=4 reproduces in 
    long-lived buffers (embeddings/streams live across layers).
 Note the probe (glm_cvt_probe.vyb) currently contains the stress/hold scaffolding — keep
 it, it is the bisect harness.
+
+### OPTION 1 LANDED: f32 MoE deq in glm_prefill — 45-layer green at 13:54 (2026-11-17, commit 3673a93)
+The in-driver bisect found the trigger: exl3cvt32 faults (sync=700) ONLY when its fd
+source is an arena buffer. With fd+fdc fresh per-call allocs and the arena for
+qd/td/od/td2/sud/svd/pd, the whole f32 path is green:
+- NLAYERS=6: MoE deq 8.4 -> ~3.0 s, KDA layer 11 -> 5.5 s; digests rel <= 2.1e-7 vs f64 gold.
+- FULL 45-LAYER ACCEPTANCE: PREFILL_OK, 13 min 54 s (09:41:32->09:55:26) vs 15:05 on the
+  f64 path. All 45 digests within 1.4e-6 rel of the f64 gold (dense layers bit-identical;
+  MoE layers carry the f32 noise; no divergence with depth). New gold for future gates:
+  native/out/prefill_vyb_45.txt (f32 run). Session total for the pipeline: 13.5 h -> 15 min
+  -> 13:54; bit-identical is RETIRED for MoE layers — the band is rel <= 1.4e-6.
+- REMAINING (the last f32 win): T_MOE deq grows 1.8 -> 6.2 -> 13.3 s (min/median/max) as
+  the heap grows — the per-deq fresh fd(32 MB)+fdc(64 MB) alloc/free is the residual
+  under-pressure cost. Making fd/fdc arena-able (root-causing the sync=700, mechanism
+  still unknown) would reclaim the full win (projection ~5-6 min). The bisect harness and
+  all findings above are in place; the fd-arena fault reproduces in a 90 s NLAYERS=4 run.
+- The f32 path is currently glm_prefill-only. Mirror to the other drivers when each is
+  next gated (they still run the f64 path — green, just slower).
