@@ -2118,3 +2118,23 @@ of the 13:54 run; the remaining wall time is attention/ffn streaming — genuine
 measured per-layer costs. The f32 pipeline is at its current optimum. The next real
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
+
+### FUSED-DQ-GEMM-DESIGN.md INCORPORATED (2026-11-17)
+The design doc now lives in the repo: `native/FUSED-DQ-GEMM-DESIGN.md` (117 lines,
+copied from /mnt/apex/rick/Projects/VybForge/native/ where it was authored). Summary:
+fused-dequant fp32 GEMM — weights stay packed (q4_K/q6_K/f32-slab, `wty` dispatch),
+dequant happens in registers inside the matmul kernel (`gemm_dq_f32.vyb`, one thread per
+output, reusing the bit-exact q4k/q6k block math), accumulation in f32, packed slabs
+resident instead of 807 MB expanded f64, f64 path retained as the oracle (TOL 2e-3,
+gate on blk.0 + full-layer forward). File plan: kernel in native/kernels/, driver in
+native/host/, oracle compare in native/tools/, Makefile targets.
+STALE vs current state (read before implementing):
+1. Constraint 1 ("no shared memory") is OUT OF DATE — the compiler now exposes
+   `ld_shared_f32`/`st_shared_v4_u32`/`shfl_idx_f32` (verified in
+   src/vre/vre/semantic_internal.hpp of the Nov-16 main), and `rpf_gemm128.vyb` already
+   runs mma.m16n8k16 with shared A/B staging. Tiled/mma designs are back on the table.
+2. The doc targets the Qwen3-4B q4_K/q6_K path; the GLM-5.3 path uses EXL3 — the GLM
+   analog is the f32 transform kernels already landed (exl3had132/had232/deq32), and the
+   open GLM item is fusing deq+transform, not deq+GEMM.
+3. The doc's f64-oracle pattern is exactly what the GLM side already did (f64 gold
+   retained, f32 digests <=1.4e-6) — the tolerance conclusion transfers.
