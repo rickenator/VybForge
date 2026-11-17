@@ -1727,3 +1727,36 @@ Dirty tree committed as b940dd0 (digest churn fix + timers + this recovery secti
 -> **17 min (~48x)**, bit-identical throughout. New gold digest file for future gates:
 native/out/prefill_vyb_45.txt (from this run). Remaining costs are genuine math: MoE deq
 ~9 s/layer (exl3hgen/exl3had1 ~8.8 ms/deq), ffn streaming, T_RSLV now 0.7 s/layer.
+
+### Hadamard hoist LANDED (2026-11-16 23:0x, commit e3a2e77) — MoE deq halved
+exl3hgen's 128x128 Sylvester Hadamard/8 is run-constant, yet was rebuilt (~8.7 ms clean
+heap, ~40 ms under the driver heap) on EVERY exl3_deq — hundreds per MoE layer. New
+`had_hoist()` builds it once at startup (glm_prefill.vyb); the buffer lives for the run and
+is passed as `hd_pre` to exl3_deq, which skips the per-call hgen launch. Gate: NLAYERS=6
+green, digests byte-identical (prefill6_hoist.log). Effects: T_MOE deq 17.6 -> 8.4 s
+(layer 4), 15.5 -> 8.4 s (layer 5); KDA attn deq 2090 -> ~150 ms; KDA layer 22.2/19.1 ->
+10.9/11.4 s. Full 45-layer acceptance: **PREFILL_OK, 15 min 5 s (23:09:14->23:24:19),
+all 45 digests byte-identical to gold** — session total now 13.5 h -> 2h11m -> 35 min ->
+17 min -> **15 min (~54x)**.
+NOTE (mirror rule): glm_decode_chain.vyb, glm_decode_l3.vyb, glm_exl3_check.vyb,
+glm_l3_expert_fwd.vyb, glm_l3_full.vyb, glm_l3_hc_check.vyb, glm_l3_moe_all.vyb,
+glm_l3_tail_fwd.vyb, native/glm53/exl3_load.vyb each carry their OWN exl3_deq copy and
+still rebuild H per call. Mirror the hd_pre + had_hoist pattern to each driver the next
+time that driver is gated — do not change them blind.
+
+### NEXT (option 2, scoped): f32 dequant+transform — the remaining ~8.4 s/layer
+The MoE deq is now the biggest slice (~8.4 s/layer x 43). Root cause: had1/had2 are f64
+MAC loops on a 3090 (f64 = 1/64 rate), and od/td2/fd round-trip kn*8 f64 bytes per matrix.
+Vyb supports a real Float32 surface type (src/vre/llvm/cgen_expr.cpp:50) plus ld_f32n/
+st_f32n/shfl_idx_f32/ld_shared_f32, so the plan is implementable:
+1. f32 kernel variants in native/kernels/exl3.vyb: hgen writes H as f32 (st_f32n,
+   half buffer), a FUSED deq+had1 that computes What via the mcg decode in-register into
+   shared memory (one thread per (b,c), 128 consumers per row read shared), then had2f.
+   Keep the f64 kernels — add new names, do not break the existing gate.
+2. Driver: f32 buffers in a new exl3_deq32 path; consumer contract changes (mm_host gets
+   f32 weights) -> this touches EVERY downstream digest.
+3. Oracle re-baseline: new numpy gold with explicit tolerance (the skill: gate in exact
+   mode only where decisions are decisive; pick tolerance from the numpy-vs-f32 spread,
+   not by eye), regenerate the 45-layer gold, token/top1 check stays decisive.
+4. Acceptance: full 45-layer run, wall target ~8-10 min.
+Budget a full session; do not start it unless there is time to finish the re-baseline.
