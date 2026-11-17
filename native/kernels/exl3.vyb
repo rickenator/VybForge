@@ -250,7 +250,8 @@ exl3cvt32(p<Int>) -> {
     if (gid < n) {
         S<Int> = ld_i64(p + 0)
         D<Int> = ld_i64(p + 8)
-        st_f64(D + gid * 8, ld_f32n(S + gid * 4) as Float)
+        v32<Float32> = ld_f32n(S + gid * 4)
+        st_f64(D + gid * 8, v32)
     }
 }
 

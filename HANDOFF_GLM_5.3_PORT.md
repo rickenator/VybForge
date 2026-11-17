@@ -1858,3 +1858,22 @@ Findings, each measured:
    p+0/p+8/p+16 — maybe launch4i packs params differently than assumed for a
    fresh kernel), or the Float32->Float `as` cast codegen in a kernel.
 glm_prefill.vyb REVERTED to HEAD (f64+hoist green state). Kernels remain committed.
+
+### cvt fault bisected: kernel is bit-exact and clean in isolation (2026-11-17, later)
+Standalone probe (native/host/glm_cvt_probe.vyb, log native/out/cvt_probe.log): the f32
+pipeline + exl3cvt32 on expert 0 gate_proj runs rc=0, NO sync=700, and the cvt-widened
+f64 digest is BYTE-IDENTICAL to the f32-path digest from check32 (gp0 sum/abs/sq/max/v0-v7
+all equal). Conclusions:
+- exl3cvt32 is correct and bit-exact; the Float32->Float cast was NOT the fault (also
+  note: the explicit `x as Float` form compiled fine in the kernel; both forms work).
+- NEW gotcha (confirmed): a struct-field assignment made INSIDE a freedom block does NOT
+  propagate out — cvtbox.p read as 0 in main after being set inside freedom (the same
+  class as the nested-if local gotcha, now for struct fields). Function-RETURN values and
+  plain locals DO propagate. Route cross-block values through returns.
+- Therefore the sync=700 in the glm_prefill arena attempt is specific to the arena layout
+  inside that driver, not the cvt kernel. NEXT (cheap bisect): run the probe with
+  ARENA-style buffers (alloc once in main, pass pointers in) instead of per-call allocs —
+  if the 700 reproduces, shrink the arena set one buffer at a time; if not, the fault is
+  an interaction with glm_prefill's other device state (suspect: an arena address
+  colliding with the driver's own long-lived buffers, or kn*8 fdc vs the probe's
+  4096*2048*8 — identical sizes, so more likely address placement).
