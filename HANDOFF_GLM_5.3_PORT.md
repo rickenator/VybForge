@@ -1992,6 +1992,19 @@ block at program start, run a loop of unrelated alloc/free churn (other function
 scopes), then launch a kernel writing the held buffer — check for the 700. That is the
 minimal repro for a src/vre codegen (ownership/lifetime of loc-held device pointers)
 investigation. Until then the committed state (fd+fdc fresh, 13:54) is the acceptance
+### ROOT CAUSE FOUND — CORRECTED (2026-11-17, final): the frees were EXPLICIT, not compiler-generated
+CORRECTION of the section below: the "freedom-block exit auto-frees loc-held pointers"
+theory was WRONG. The shim + IR dump showed the cuMemFree_v2(arF) came from an EXPLICIT
+call: the probe's own `freedom { cuMemFree_v2(dW) }` after the readback, and in
+glm_prefill the f64-path's per-expert `cuMemFree_v2(dWg/dWu/dWd)` frees (legitimate for
+per-call buffers, fatal for arena-backed ones) plus the warm-up's `cuMemFree_v2(dw0)`.
+No compiler change is needed; the VarDecl ownership path was correctly ruled out.
+The useful durable lesson is only the operational one: when a returned pointer is
+arena-backed, the caller must not run the per-call-buffer teardown on it. (See the ARENA
+VERDICT section — the arena itself then measured WORSE at depth, so fresh-per-call stands
+on performance grounds too.)
+---
+(The section below is the superseded WRONG theory, kept for the record.)
 ### ROOT CAUSE FOUND: freedom-block exit auto-frees loc-held pointers born elsewhere (2026-11-17)
 The pointer-validity matrix pinned it exactly (native/out/cvt_probe11.log):
 - dW (returned) == arF; PRE-HTOD-E (32 MB arE) rc=0 — still valid; PRE-HTODF (64 MB arF)
@@ -2078,3 +2091,19 @@ device-free path). Then fix the ownership rule: a device pointer assigned from a
 parameter must not be freed by the callee's cleanup; only the allocating scope frees.
 Gates: glm_cvt_probe clean (both digests real) + glm3x + NLAYERS=6 + full 45 run with
 the arena re-enabled (~5-6 min target).
+
+### ARENA VERDICT: sync=700 fixed, but the arena REGRESSES at depth — fresh-fd stands (2026-11-17, final)
+With the arena frees removed (the actual sync=700 fix), the full-arena config runs GREEN
+(NLAYERS=6, PREFILL_OK, STARTUP_DEQ warm-up + no arena frees) — the bug is closed. BUT the
+arena does not deliver the projected win: T_MOE deq degrades erratically with depth
+(3.3 s L3 -> 62 s L4 -> 16 s L5) versus a steady ~3 s with fresh-per-call fd/fdc at the
+same depth. Zero per-deq allocations yet 4-20x slower per deq at depth — the per-deq cost
+under a growing heap is NOT allocation-dominated, and the fixed-address arena buffers make
+it worse (mechanism unknown; the fresh mapping per deq somehow behaves better).
+DECISION: glm_prefill REVERTED to the committed fresh-fd configuration (13:54 acceptance,
+digests <=1.4e-6) — it remains the best measured configuration. The sync=700 mystery is
+CLOSED (explicit frees of arena-backed results — an integration bug, not a compiler bug);
+no Vyb compiler change is needed. The residual optimization target is the depth-dependent
+deq cost growth (1.8 -> 13 s across the run) — a fresh investigation, separate from the
+closed sync=700 item. The probe harness (glm_cvt_probe.vyb) and all bisect evidence stay
+committed for that follow-up.

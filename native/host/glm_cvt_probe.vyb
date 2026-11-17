@@ -250,7 +250,6 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, fcvt32<Int>,
         srCvt<Int> = cuCtxSynchronize() as Int
         if (lrcCvt != 0 || srCvt != 0) { println("CVTPROBE launch lrc=" + lrcCvt.to_string() + " sync=" + srCvt.to_string()); return 0 }
         out = fdc
-        cvtbox.p = fd
     }
     return out
 }
@@ -407,9 +406,7 @@ main()<Int> -> {
         W.push(dtoh(dW + wi * 8))
         wi = wi + 1
     }
-    freedom {
-        cuMemFree_v2(dW)
-    }
+# arena-backed result: NOT freed (owned by the arena)
 
     line<String> = digest("gp0", W)
     println(line)
