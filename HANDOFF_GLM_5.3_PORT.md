@@ -1993,3 +1993,25 @@ scopes), then launch a kernel writing the held buffer — check for the 700. Tha
 minimal repro for a src/vre codegen (ownership/lifetime of loc-held device pointers)
 investigation. Until then the committed state (fd+fdc fresh, 13:54) is the acceptance
 configuration.
+
+### MINIMAL REPRO ACHIEVED (2026-11-17, final): cross-module kernel launch between writes
+The probe (native/host/glm_cvt_probe.vyb, native/out/cvt_probe7.log) now reproduces the
+sync=700 in ~60 s OUTSIDE glm_prefill, with three ingredients:
+1. exl3_deq #1: cvt writes the 64 MB arena buffer — OK.
+2. Churn: 10 launches of bf16deq (a kernel from a DIFFERENT PTX module, native/build/
+   bf16.ptx), each with its own 2 MB + 8 MB cuMemAlloc/cuMemFree — all rc=0.
+3. exl3_deq #2: cvt writes the SAME arena buffer — cuda_launch4i returns 0 but
+   cuCtxSynchronize returns 700 (illegal address). Context poisoned afterwards.
+Previously exonerated: pure alloc/free churn (no launches) — clean; module loads without
+execution — clean; store width, alignment, overlap, padding — all ruled out.
+THE BUG SHAPE: launching kernel(s) from a second PTX module between two launches of a
+first module's kernel breaks the first module's subsequent kernel writes to a buffer
+allocated before the second module's kernels ran. Suspects, in order:
+(a) src/main.cpp vyb_cuda_launch4i — the dlsym'd cuLaunchKernel wrapper (shared static
+    CuLaunchFn; param packing); (b) cuModuleLoadData/module-handle handling across
+    modules; (c) stream/context state per module. The repro program is glm_cvt_probe.vyb
+    — run it with the VYBFORGE_GX_DIR env (see cvt_probe7.log command line), ~60 s.
+NEXT: Vyb worktree (worktree add -b fix/<name> origin/main, cmake --preset debug), run
+the repro against the debug binary, then instrument vyb_cuda_launch4i / module handling.
+A fix lands as a PR; VybForge gates: glm_cvt_probe + glm3x + NLAYERS=6 prefill, then the
+fd/fdc arena re-enable + full 45-layer run (~5-6 min target).

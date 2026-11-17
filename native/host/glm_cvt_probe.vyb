@@ -410,5 +410,34 @@ main()<Int> -> {
     }
     println(digest("fd32", Wf))
     println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string())
+
+    # ---- two-write repro: churn with ANOTHER module's kernels, then write arF again ----
+    fb<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    ci<Int> = 0
+    while (ci < 10) {
+        freedom {
+            q2<Int> = 0
+            o2<Int> = 0
+            cq<Int> = cuMemAlloc_v2(loc(q2), 2097152) as Int
+            co<Int> = cuMemAlloc_v2(loc(o2), 8388608) as Int
+            if (cq == 0 && co == 0) {
+                cb<Int> = cuda_launch4i(from<loc<CVoid>>(fb), 4096, 1, 1, 256, 1, 1, q2, o2, 1048576, 0) as Int
+                cs<Int> = cuCtxSynchronize() as Int
+                println("CHURN " + ci.to_string() + " rc=" + cb.to_string() + "/" + cs.to_string())
+            }
+            cuMemFree_v2(q2)
+            cuMemFree_v2(o2)
+        }
+        ci = ci + 1
+    }
+    println("CHURN done")
+    println("CHURN done")
+    dW2<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, trellis, suh, svh, body, 2048, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
+    println("SECOND deq dW2=" + dW2.to_string())
+    if (dW2 != 0) {
+        freedom {
+            cuMemFree_v2(dW2)
+        }
+    }
     return 0
 }
