@@ -2017,6 +2017,16 @@ cuMemAlloc-born pointers explicitly. Evidence set: this probe + the 4-way matrix
 cvt_probe11.log. The 90 s repro stands (glm_cvt_probe.vyb).
 INTERIM (current committed state is correct): fd+fdc fresh per call — the block owns
 them, the auto-free is legitimate, deq ~3 s, 13:54 acceptance.
+WORKTREE READY: ~/Projects/Vyb-cuda-fix (branch fix/cuda-cross-module-launch off
+3b7f9f73, debug build) REPRODUCES the fault identically (cvt_probe_debug.log: dW==arF,
+PRE-HTODF rc=1, PRE-HTOD-E rc=0). This is the investigation binary.
+SEARCH NARROWED: the VarDecl ownership/cleanup path in src/vre/llvm/cgen_decl.cpp
+(needsCleanup, ~L452-530) does NOT cover Int locals — fd<Int> is a plain Int and gets no
+VarDecl cleanup, so the invalidation is NOT that path. Either the freedom-exit reclaim
+emits a device free elsewhere, or arF is not "freed" but its mapping is dropped another
+way (the decisive next probe: after the first exl3_deq, cuMemcpyHtoD to arF fails while
+arE succeeds — check whether the failure is rc=1 INVALID_VALUE persisting, i.e. the
+driver no longer recognizes the pointer, vs a sticky context error).
 
 ### MINIMAL REPRO ACHIEVED (2026-11-17, final): cross-module kernel launch between writes
 The probe (native/host/glm_cvt_probe.vyb, native/out/cvt_probe7.log) now reproduces the
