@@ -362,6 +362,29 @@ main()<Int> -> {
     suh<String> = gx_read(g, 1)
     svh<String> = gx_read(g, 2)
     # gate_proj: [in=4096, out=2048] -> cw (out) 2048, ntiles = (4096/16)*(2048/16)
+    # context stress: mimic the driver's alloc/free churn before the first f32 deq
+    st<Int> = 0
+    freedom {
+        var<Int> tmp = 0
+        si<Int> = 0
+        while (si < 200) {
+            src<Int> = cuMemAlloc_v2(loc(tmp), 67108864) as Int
+            if (src == 0) { cuMemFree_v2(tmp) }
+            si = si + 1
+        }
+        st = tmp
+    }
+    # hold ~4 GB live (mimic the driver's heap at first f32 deq)
+    freedom {
+        hi<Int> = 0
+        while (hi < 60) {
+            hp<Int> = 0
+            hrc<Int> = cuMemAlloc_v2(loc(hp), 67108864) as Int
+            hi = hi + 1
+        }
+    }
+    println("HOLD done")
+    println("STRESS done st=" + st.to_string())
     dW<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, trellis, suh, svh, body, 2048, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
     if (dW == 0) { println("EXL3_FAIL deq"); return 7 }
     sync()

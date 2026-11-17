@@ -1892,3 +1892,22 @@ iterations) plus a couple of large live allocations — and see if the 700 repro
 it does, the culprit is allocator state (pool fragmentation around the arena); if not,
 port the arena into glm_prefill incrementally (arena for f32 buffers only, f64 path
 untouched) and gate NLAYERS=4 — the failure there was reproducible in ~90 s.
+
+### Probe matrix EXHAUSTED — all mimickable factors exonerated (2026-11-17, final)
+Two more probe runs (native/out/cvt_probe3.log, cvt_probe4.log):
+- 200x alloc/free of 64 MB blocks before the cvt call (allocator churn): CLEAN.
+- +60x 64 MB held LIVE (~4 GB resident, mimicking the driver heap): CLEAN, digest
+  byte-identical every time.
+Conclusion: arena + exl3cvt32 + churn + large-live-set are ALL exonerated in isolation.
+The sync=700 depends on something specific to glm_prefill's internal state that the probe
+cannot mimic. STOP probing standalone — the next session should port the arena into
+glm_prefill INCREMENTALLY and bisect inside the driver (NLAYERS=4 reproduces in ~90 s):
+1. Arena the f32 buffers only, keep everything else at HEAD; gate NLAYERS=4.
+2. If cvt faults: try cvt reading fd from a FRESH per-call alloc (only fd non-arena) —
+   this isolates "cvt reading an arena buffer after other kernels wrote it" vs
+   "arena address placement".
+3. If still faulting: dump the arena pointer values in-driver (ARENA print) and compare
+   against cuMemAlloc'd-fresh addresses — check for overlap with the driver's own
+   long-lived buffers (embeddings/streams live across layers).
+Note the probe (glm_cvt_probe.vyb) currently contains the stress/hold scaffolding — keep
+it, it is the bisect harness.
