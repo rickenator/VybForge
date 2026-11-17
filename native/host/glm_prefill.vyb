@@ -751,9 +751,10 @@ hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)
     return dst
 }
 
+share(all)
 exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
-         cw<Int>, ntiles<Int>)<Int> -> {
+         cw<Int>, ntiles<Int>, hd_pre<Int>)<Int> -> {
     tb<Int> = 0
     kn<Int> = 0
     krows<Int> = 0
@@ -796,8 +797,14 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         if (xrc102 != 0) { println("EXL3FAIL cuda2 rc=" + xrc102.to_string()); return 0 }
         xrc103<Int> = cuMemAlloc_v2(loc(od), kn * 8) as Int
         if (xrc103 != 0) { println("EXL3FAIL cuda3 rc=" + xrc103.to_string()); return 0 }
-        xrc104<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
-        if (xrc104 != 0) { println("EXL3FAIL cuda4 rc=" + xrc104.to_string()); return 0 }
+        # H is a run-constant 128x128 Sylvester Hadamard/8: when the caller passes a
+        # prebuilt buffer (hd_pre != 0, built once by had_hoist) skip the per-call
+        # exl3hgen launch entirely (~8.7 ms x hundreds of deqs per layer).
+        hd = hd_pre
+        if (hd == 0) {
+            xrc104<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
+            if (xrc104 != 0) { println("EXL3FAIL cuda4 rc=" + xrc104.to_string()); return 0 }
+        }
         xrc105<Int> = cuMemAlloc_v2(loc(td2), kn * 8) as Int
         if (xrc105 != 0) { println("EXL3FAIL cuda5 rc=" + xrc105.to_string()); return 0 }
         xrc106<Int> = cuMemAlloc_v2(loc(fd), kn * 8) as Int
@@ -839,12 +846,14 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         # scales (fp16) to the device: one copy each, same reason as the map body
         if (cuMemcpyHtoD_v2(sud, suh, nsuh) != 0) { println("EXL3FAIL cuda14"); return 0 }
         if (cuMemcpyHtoD_v2(svd, svh, nsvh) != 0) { println("EXL3FAIL cuda15"); return 0 }
-        # hgen: H at pd+0
-        if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { println("EXL3FAIL cuda16"); return 0 }
-        lrc840<Int> = cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
-        srrc840<Int> = cuCtxSynchronize() as Int
-        if (srrc840 != 0) { println("EXL3SYNC hgen sync rc=" + srrc840.to_string()); return 0 }
-        cuCtxSynchronize()
+        # hgen: H at pd+0 (skipped when H was prebuilt by had_hoist)
+        if (hd_pre == 0) {
+            if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) != 0) { println("EXL3FAIL cuda16"); return 0 }
+            lrc840<Int> = cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
+            srrc840<Int> = cuCtxSynchronize() as Int
+            if (srrc840 != 0) { println("EXL3SYNC hgen sync rc=" + srrc840.to_string()); return 0 }
+            cuCtxSynchronize()
+        }
         # had1: what=od, tmp=td2, H=hd, cw, nbc, nblocks
         pq = 0
         while (pq < 6) {
@@ -887,12 +896,38 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
         # freed device memory (Xid 31 -> context reset -> rc=2/700).
         cuMemFree_v2(qd)
         cuMemFree_v2(od)
-        cuMemFree_v2(hd)
+        if (hd_pre == 0) { cuMemFree_v2(hd) }
         cuMemFree_v2(td2)
         cuMemFree_v2(pd)
         cuMemFree_v2(sud)
         cuMemFree_v2(svd)
         out = fd
+    }
+    return out
+}
+
+# Build the run-constant 128x128 Sylvester Hadamard/8 matrix ONCE (f64, 128*128*8 bytes).
+# Every exl3_deq call used to re-run exl3hgen for the identical matrix (~8.7 ms each,
+# hundreds of deqs per MoE layer). Returns the device pointer, 0 on failure.
+# NOTE: the returned buffer must stay alive for the whole run — never free it.
+had_hoist(fhgen<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> hd = 0
+        var<Int> pd = 0
+        hrc1<Int> = cuMemAlloc_v2(loc(hd), 128 * 128 * 8) as Int
+        if (hrc1 == 0) {
+            hrc2<Int> = cuMemAlloc_v2(loc(pd), 64) as Int
+            if (hrc2 == 0) {
+                if (cuMemcpyHtoD_v2(pd + 0, loc(hd), 8) == 0) {
+                    hlrc<Int> = cuda_launch4i(from<loc<CVoid>>(fhgen), 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
+                    hsync<Int> = cuCtxSynchronize() as Int
+                    if (hlrc == 0 && hsync == 0) { out = hd }
+                }
+                cuMemFree_v2(pd)
+            }
+            if (out == 0) { cuMemFree_v2(hd) }
+        }
     }
     return out
 }
@@ -1406,7 +1441,7 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
 
 
 share(all)
-tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -1714,11 +1749,11 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
 
             tA = time_mono_millis()
             dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 0), gx_read(ge, 1),
-                                gx_read(ge, 2), body, EINTER, 32768)
+                                gx_read(ge, 2), body, EINTER, 32768, hdg)
             dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 3), gx_read(ge, 4),
-                                gx_read(ge, 5), body, EINTER, 32768)
+                                gx_read(ge, 5), body, EINTER, 32768, hdg)
             dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, gx_read(ge, 6), gx_read(ge, 7),
-                                gx_read(ge, 8), body, H, 32768)
+                                gx_read(ge, 8), body, H, 32768, hdg)
             acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
@@ -2684,6 +2719,9 @@ main()<Int> -> {
         println("PF_FAIL kernels")
         return 4
     }
+    # Build the constant Hadamard/8 once; pass to every exl3_deq (see had_hoist).
+    hdg<Int> = had_hoist(fhgen)
+    if (hdg == 0) { println("PF_FAIL had_hoist"); return 6 }
     mapd<String> = ""
     match (open_read("native/exl3/map.bin")) {
         f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
@@ -2808,7 +2846,7 @@ main()<Int> -> {
         if (n < 3) {
             streams = ffn_dense_site(streams1, tab, dir, total, lpre, fgemm, fbf)
         } else {
-            streams = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody)
+            streams = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, hdg)
         }
         if (streams.len() != R * HC * H) {
             println("PF_FAIL ffn layer " + n.to_string())
