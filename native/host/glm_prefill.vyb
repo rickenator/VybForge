@@ -581,7 +581,7 @@ dump_to(name<String>, v<Vec<Float>>)<Int> -> {
             chunk<String> = ""
             while (i < v.len()) {
                 chunk = chunk + " " + di(v.get(i)).to_string()
-                if (chunk.len() > 32768) { write_str(f, chunk); chunk = "" }
+                if (chunk.len() > 2048) { write_str(f, chunk); chunk = "" }
                 i = i + 1
             }
             if (chunk.len() > 0) { write_str(f, chunk) }
@@ -1032,8 +1032,9 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     if (d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 || d_o == 0) { return nonev }
 
     qres<Vec<Float>> = mm_host(h_a, R, H, d_qa, Q_LORA, fgemm)
-    println(digest("qres", qres))
-    lines = lines + digest("qres", qres) + "\n"
+    dg0<String> = digest("qres", qres)
+    println(dg0)
+    lines = lines + dg0 + "\n"
 
     var<Int> d_qaln = 0
     d_qaln = deq_bf16(fbf, gx_read(g, 1), Q_LORA, 0)
@@ -1042,8 +1043,9 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     free_dev(d_qaln)
     qa_ln<Vec<Float>> = rms_rows(view(qres), R, Q_LORA, qaln_w)
     qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
-    println(digest("qb", qfull))
-    lines = lines + digest("qb", qfull) + "\n"
+    dg1<String> = digest("qb", qfull)
+    println(dg1)
+    lines = lines + dg1 + "\n"
 
     ckraw<Vec<Float>> = mm_host(h_a, R, H, d_kva, KV_LORA, fgemm)
     var<Int> d_kvaln = 0
@@ -1052,14 +1054,16 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     free_dev(d_kvaln)
     ckv<Vec<Float>> = rms_rows(view(ckraw), R, KV_LORA, kvaln_w)
-    println(digest("ckv", ckv))
-    lines = lines + digest("ckv", ckv) + "\n"
+    dg2<String> = digest("ckv", ckv)
+    println(dg2)
+    lines = lines + dg2 + "\n"
 
     # ---- per-head absorbed keys/values from kv_b ----
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
     free_dev(d_kvb)
-    println(digest("kvb", kvb))
-    lines = lines + digest("kvb", kvb) + "\n"
+    dg3<String> = digest("kvb", kvb)
+    println(dg3)
+    lines = lines + dg3 + "\n"
 
     # ---- indexer: projections ----
     var<Int> d_wqb = 0
@@ -1086,12 +1090,15 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     kn<Vec<Float>> = ln_rows(kraw, R, IDIM, knw, knb)
     gsc<Vec<Float>> = mm_host(h_a, R, H, d_gate, IDIM, fgemm)
     wproj<Vec<Float>> = mm_host(h_a, R, H, d_wproj, IHEADS, fgemm)
-    println(digest("kidx", kn))
-    lines = lines + digest("kidx", kn) + "\n"
-    println(digest("gsc", gsc))
-    lines = lines + digest("gsc", gsc) + "\n"
-    println(digest("wproj", wproj))
-    lines = lines + digest("wproj", wproj) + "\n"
+    dg4<String> = digest("kidx", kn)
+    println(dg4)
+    lines = lines + dg4 + "\n"
+    dg5<String> = digest("gsc", gsc)
+    println(dg5)
+    lines = lines + dg5 + "\n"
+    dg6<String> = digest("wproj", wproj)
+    println(dg6)
+    lines = lines + dg6 + "\n"
 
     # ---- absorbed per-head keys/values: K = ckv @ [uk_h | ...], V = ckv @ [uv_h | ...] ----
     # kvb holds [heads, nope+v, kv_lora]; uk[h] = kvb[h][:NOPE], uv[h] = kvb[h][NOPE:]
@@ -1130,8 +1137,9 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     V<Vec<Float>> = mm_host(ckv, R, KV_LORA, d_uvm, HEADS * VDIM, fgemm)
     free_dev(d_ukm)
     free_dev(d_uvm)
-    println(digest("K", K))
-    lines = lines + digest("K", K) + "\n"
+    dg7<String> = digest("K", K)
+    println(dg7)
+    lines = lines + dg7 + "\n"
 
     # ---- indexer: gpool pooling + per-query pool scores (dsa_ref.indexer_topk) ----
     ape<Vec<Float>> = Vec()
@@ -1178,8 +1186,9 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
         }
         p = p + 1
     }
-    println(digest("poolk", poolk))
-    lines = lines + digest("poolk", poolk) + "\n"
+    dg8<String> = digest("poolk", poolk)
+    println(dg8)
+    lines = lines + dg8 + "\n"
 
     # index_scores[q][p] = sum_h w[q][h] * relu(dot(q_idx[q,h], poolk[p]) / sqrt(IDIM))
     isc<Vec<Float>> = Vec()
@@ -1384,11 +1393,13 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
         }
         hh = hh + 1
     }
-    println(digest("ao", ao))
-    lines = lines + digest("ao", ao) + "\n"
+    dg9<String> = digest("ao", ao)
+    println(dg9)
+    lines = lines + dg9 + "\n"
     attn<Vec<Float>> = mm_host(ao, R, HEADS * VDIM, d_o, H, fgemm)
-    println(digest("attn", attn))
-    lines = lines + digest("attn", attn) + "\n"
+    dg10<String> = digest("attn", attn)
+    println(dg10)
+    lines = lines + dg10 + "\n"
 
     return attn
 }
@@ -1554,8 +1565,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
         i = i + 1
     }
     h2<Vec<Float>> = rms_rows(view(collapsed2), R, H, post_ln)
-    println(digest("h2", h2))
-    lines = digest("h2", h2) + "\n"
+    dg35<String> = digest("h2", h2)
+    println(dg35)
+    lines = dg35 + "\n"
 
     tt0 = time_mono_millis()
     # ---- router (same code path as L3_MOE_ROUTE_VYB) ----
@@ -1814,8 +1826,10 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
 
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
-    println(digest("streams2", streams2))
-    lines = lines + digest("mlp", mlp) + "\n" + digest("streams2", streams2) + "\n"
+    dg33<String> = digest("mlp", mlp)
+    dg34<String> = digest("streams2", streams2)
+    println(dg34)
+    lines = lines + dg33 + "\n" + dg34 + "\n"
     match (open_write("native/out/l3tail_vyb.txt")) {
         f -> { write_str(f, lines); close(f) }
         ? -> { }
@@ -2017,11 +2031,25 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     if (fbf == 0) { println("L0_FAIL bf16.ptx (make bf16)"); return nonev }
 
 # ---------------------------------------------------------------- hc mix (attn)
+    t0<Int> = time_mono_millis()
+    t1<Int> = 0
+    tr<Int> = 0
+    td<Int> = 0
+    tp<Int> = 0
+    tf<Int> = 0
+    tg<Int> = 0
+    tm<Int> = 0
     var<Int> d_fnA = 0
     var<Int> d_fnF = 0
     d_fnA = deq_bf16(fbf, gx_read(g, 14), 24 * HC * H, HC * H)
+    t1 = time_mono_millis()
+    td = td + (t1 - t0)
+    t0 = t1
     if (d_fnA == 0) { println("KFAIL fnA rawlen=" + gx_read(g, 14).len().to_string()); return nonev }
     d_fnF = deq_bf16(fbf, gx_read(g, 17), 24 * HC * H, HC * H)
+    t1 = time_mono_millis()
+    td = td + (t1 - t0)
+    t0 = t1
     if (d_fnF == 0) { println("KFAIL fnF rawlen=" + gx_read(g, 17).len().to_string()); return nonev }
     base<Vec<Float>> = Vec()
     raw_base = gx_read(g, 15)
@@ -2054,6 +2082,7 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     println("hc attn base0=" + di(base.get(0)).to_string() + " scale0=" + di(scale.get(0)).to_string())
 
     # ---------------------------------------------------------------- hc mix via gemm
+    t0 = time_mono_millis()
     # flat = rms(streams flat) ; mv = flat @ fn^T  ([R,4H] @ [4H,24])
     flat<Vec<Float>> = Vec()
     i = 0
@@ -2061,7 +2090,13 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         flat.push(streams.get(i))
         i = i + 1
     }
+    t1 = time_mono_millis()
+    tp = tp + (t1 - t0)
+    t0 = t1
     flat = rms_rows(view(flat), R, HC * H, Vec())
+    t1 = time_mono_millis()
+    tp = tp + (t1 - t0)
+    t0 = t1
     var<Int> d_flat = 0
     var<Int> d_mv = 0
     var<Int> d_scr = 0
@@ -2070,16 +2105,29 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     d_scr = alloc_dev(64)
     if (d_flat == 0 || d_mv == 0 || d_scr == 0) { println("L0_FAIL alloc"); return nonev }
     bulk_htod(d_flat, view(flat))
+    t1 = time_mono_millis()
+    tf = tf + (t1 - t0)
+    t0 = t1
     if (gemm(fgemm, d_scr, d_flat, d_fnA, d_mv, R, 24, HC * H, 1.0, 0.0) != 0) { println("KFAIL gemm"); return nonev }
     sync()
+    t1 = time_mono_millis()
+    tg = tg + (t1 - t0)
+    t0 = t1
     mv<Vec<Float>> = bulk_dtoh(d_mv, R * 24)
     free_dev(d_flat)
     free_dev(d_mv)
     free_dev(d_scr)
-    println(digest("mv_attn", mv))
-    lines = lines + digest("mv_attn", mv) + "\n"
+    t1 = time_mono_millis()
+    tm = tm + (t1 - t0)
+    t0 = t1
+    dg11<String> = digest("mv_attn", mv)
+    println(dg11)
+    lines = lines + dg11 + "\n"
 
     res<Vec<Float>> = hc_glue(mv, base, scale, streams)
+    t1 = time_mono_millis()
+    tp = tp + (t1 - t0)
+    t0 = t1
     collapsed<Vec<Float>> = Vec()
     i = 0
     while (i < R * H) {
@@ -2098,13 +2146,21 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         combA.push(res.get(R * H + R * HC + i))
         i = i + 1
     }
-    println(digest("collapsed", collapsed))
-    lines = lines + digest("collapsed", collapsed) + "\n"
-    println(digest("post_attn", postA))
-    lines = lines + digest("post_attn", postA) + "\n"
-    println(digest("comb_attn", combA))
-    lines = lines + digest("comb_attn", combA) + "\n"
-    var<Int> dump_rc = dump_to("combvals", combA)
+    dg12<String> = digest("collapsed", collapsed)
+    println(dg12)
+    lines = lines + dg12 + "\n"
+    dg13<String> = digest("post_attn", postA)
+    println(dg13)
+    lines = lines + dg13 + "\n"
+    dg14<String> = digest("comb_attn", combA)
+    println(dg14)
+    lines = lines + dg14 + "\n"
+    var<Int> dump_rc = 0
+    t1 = time_mono_millis()
+    tr = tr + (t1 - t0)
+    println("T_HCA deq=" + td.to_string() + " hostpush+glue=" + tp.to_string() +
+        " htod=" + tf.to_string() + " gemm=" + tg.to_string() + " dtoh+free=" + tm.to_string() +
+        " tail=" + tr.to_string())
 
     # ---------------------------------------------------------------- input_layernorm
     var<Int> d_ln = 0
@@ -2113,9 +2169,16 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     free_dev(d_ln)
     h_a<Vec<Float>> = rms_rows(view(collapsed), R, H, in_ln)
-    println(digest("h", h_a))
-    lines = lines + digest("h", h_a) + "\n"
+    dg15<String> = digest("h", h_a)
+    println(dg15)
+    lines = lines + dg15 + "\n"
     # =============================================================== KDA attention
+    t0 = time_mono_millis()
+    kd1<Int> = 0
+    kd2<Int> = 0
+    kd3<Int> = 0
+    kd4<Int> = 0
+    kd5<Int> = 0
     # projections (host batch [R,H] @ [H,out] on the GPU)
     d_q = deq_bf16(fbf, gx_read(g, 0), H * HEADS * KD, H)
     d_k = deq_bf16(fbf, gx_read(g, 1), H * HEADS * KD, H)
@@ -2130,11 +2193,15 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         println("L0_FAIL weight deq")
         return nonev
     }
+    kd1 = kd1 + (time_mono_millis() - t0)
+    t0 = time_mono_millis()
     qp<Vec<Float>> = mm_host(h_a, R, H, d_q, HEADS * KD, fgemm)
     kp<Vec<Float>> = mm_host(h_a, R, H, d_k, HEADS * KD, fgemm)
     vp<Vec<Float>> = mm_host(h_a, R, H, d_v, HEADS * KD, fgemm)
-    println(digest("qpre", qp))
-    lines = lines + digest("qpre", qp) + "\n"
+    kd2 = kd2 + (time_mono_millis() - t0)
+    dg16<String> = digest("qpre", qp)
+    println(dg16)
+    lines = lines + dg16 + "\n"
 
     # conv+silu over the token axis, then l2-normalise (q also scaled by 1/sqrt(KD))
     # conv1d weights are BF16 (only dt_bias / A_log / hc base+scale are FP32 here)
@@ -2155,10 +2222,17 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     qc<Vec<Float>> = conv_silu(qp, R, HEADS * KD, convq)
     kc<Vec<Float>> = conv_silu(kp, R, HEADS * KD, convk)
     vc<Vec<Float>> = conv_silu(vp, R, HEADS * KD, convv)
-    println(digest("qc", qc))
-    lines = lines + digest("qc", qc) + "\n"
-    println(digest("vc", vc))
-    lines = lines + digest("vc", vc) + "\n"
+    kd3 = kd3 + (time_mono_millis() - t0)
+    t0 = time_mono_millis()
+    tq0<Int> = time_mono_millis()
+    dg17<String> = digest("qc", qc)
+    tq1<Int> = time_mono_millis()
+    println(dg17)
+    lines = lines + dg17 + "\n"
+    dg18<String> = digest("vc", vc)
+    tq2<Int> = time_mono_millis()
+    println(dg18)
+    lines = lines + dg18 + "\n"
     qn<Vec<Float>> = l2_rows(qc, R * HEADS, KD)
     kn<Vec<Float>> = l2_rows(kc, R * HEADS, KD)
     t2 = 0
@@ -2167,11 +2241,22 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         t2 = t2 + 1
     }
 
-    println(digest("qn", qn))
-    lines = lines + digest("qn", qn) + "\n"
-    dump_rc = dump_to("qnvals", qn)
-    println(digest("kn", kn))
-    lines = lines + digest("kn", kn) + "\n"
+    dg19<String> = digest("qn", qn)
+    tq3<Int> = time_mono_millis()
+    println(dg19)
+    lines = lines + dg19 + "\n"
+    tq4<Int> = time_mono_millis()
+    dump_rc = 0
+    tq5<Int> = time_mono_millis()
+    dg20<String> = digest("kn", kn)
+    tq6<Int> = time_mono_millis()
+    println(dg20)
+    lines = lines + dg20 + "\n"
+    kd4 = kd4 + (time_mono_millis() - t0)
+    println("T_KDD qc=" + (tq1 - tq0).to_string() + " vc=" + (tq2 - tq1).to_string() +
+        " qn=" + (tq3 - tq2).to_string() + " dump=" + (tq5 - tq4).to_string() +
+        " kn=" + (tq6 - tq5).to_string())
+    t0 = time_mono_millis()
     bet<Vec<Float>> = mm_host(h_a, R, H, d_b, HEADS, fgemm)
     t2 = 0
     while (t2 < bet.len()) {
@@ -2179,8 +2264,9 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         t2 = t2 + 1
     }
 
-    println(digest("beta", bet))
-    lines = lines + digest("beta", bet) + "\n"
+    dg21<String> = digest("beta", bet)
+    println(dg21)
+    lines = lines + dg21 + "\n"
     fa<Vec<Float>> = mm_host(h_a, R, H, d_fa, 128, fgemm)
     fraw<Vec<Float>> = mm_host(fa, R, 128, d_fb, HEADS * KD, fgemm)
     ga<Vec<Float>> = mm_host(h_a, R, H, d_ga, 128, fgemm)
@@ -2200,17 +2286,27 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         alog.push(f32_at(raw_alog, t2))
         t2 = t2 + 1
     }
-    println(digest("fraw", fraw))
-    lines = lines + digest("fraw", fraw) + "\n"
-    println(digest("zraw", zraw))
-    lines = lines + digest("zraw", zraw) + "\n"
+    dg22<String> = digest("fraw", fraw)
+    println(dg22)
+    lines = lines + dg22 + "\n"
+    dg23<String> = digest("zraw", zraw)
+    println(dg23)
+    lines = lines + dg23 + "\n"
+    kd5 = kd5 + (time_mono_millis() - t0)
+    t0 = time_mono_millis()
     gdec<Vec<Float>> = log_decay(view(fraw), dt, alog)
-    println(digest("gdec", gdec))
-    lines = lines + digest("gdec", gdec) + "\n"
+    dg24<String> = digest("gdec", gdec)
+    println(dg24)
+    lines = lines + dg24 + "\n"
+    kd5 = kd5 + (time_mono_millis() - t0)
+    t0 = time_mono_millis()
 
     att<Vec<Float>> = delta_rule(view(qn), view(kn), view(vc), view(gdec), bet)
-    println(digest("delta", att))
-    lines = lines + digest("delta", att) + "\n"
+    kd6<Int> = time_mono_millis() - t0
+    t0 = time_mono_millis()
+    dg25<String> = digest("delta", att)
+    println(dg25)
+    lines = lines + dg25 + "\n"
 
     println("G9PROBE found=" + g.found.get(9).to_string() + " off=" + g.off.get(9).to_string() +
             " nbytes=" + g.nbytes.get(9).to_string() + " pathlen=" + g.paths.get(9).len().to_string() +
@@ -2221,12 +2317,23 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     free_dev(d_onorm)
     gnorm<Vec<Float>> = gated_norm(att, zraw, onorm)
     attn<Vec<Float>> = mm_host(gnorm, R, HEADS * KD, d_o, H, fgemm)
-    println(digest("attn", attn))
-    lines = lines + digest("attn", attn) + "\n"
+    kd7<Int> = time_mono_millis() - t0
+    println("T_KDB deq=" + kd1.to_string() + " mm_qkv=" + kd2.to_string() +
+        " conv=" + kd3.to_string() + " digests1=" + kd4.to_string() +
+        " mm_bfz+parse=" + kd5.to_string() + " delta=" + kd6.to_string() +
+        " tail=" + kd7.to_string())
+    dg26<String> = digest("attn", attn)
+    println(dg26)
+    lines = lines + dg26 + "\n"
 
     streams1<Vec<Float>> = hc_apply(streams, attn, postA, combA)
-    println(digest("streams1", streams1))
-    lines = lines + digest("streams1", streams1) + "\n"
+    kd8<Int> = time_mono_millis() - t0
+    t0 = time_mono_millis()
+    dg27<String> = digest("streams1", streams1)
+    println(dg27)
+    lines = lines + dg27 + "\n"
+    kd9<Int> = time_mono_millis() - t0
+    println("T_KDC hc_apply=" + kd8.to_string() + " digest_streams1=" + kd9.to_string())
     free_dev(d_q)
     free_dev(d_k)
     free_dev(d_v)
@@ -2365,8 +2472,9 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
         t2 = t2 + 1
     }
     h2<Vec<Float>> = rms_rows(view(collapsed2), R, H, post_ln)
-    println(digest("h2", h2))
-    lines = lines + digest("h2", h2) + "\n"
+    dg28<String> = digest("h2", h2)
+    println(dg28)
+    lines = lines + dg28 + "\n"
 
     d_gate = deq_bf16(fbf, gx_read(g, 0), H * INTER, H)
     d_up = deq_bf16(fbf, gx_read(g, 1), H * INTER, H)
@@ -2381,15 +2489,17 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
         t2 = t2 + 1
     }
     mlp<Vec<Float>> = mm_host(act, R, INTER, d_down, H, fgemm)
-    println(digest("mlp", mlp))
-    lines = lines + digest("mlp", mlp) + "\n"
+    dg29<String> = digest("mlp", mlp)
+    println(dg29)
+    lines = lines + dg29 + "\n"
     free_dev(d_gate)
     free_dev(d_up)
     free_dev(d_down)
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, postF, combF)
-    println(digest("streams2", streams2))
-    lines = lines + digest("streams2", streams2) + "\n"
+    dg30<String> = digest("streams2", streams2)
+    println(dg30)
+    lines = lines + dg30 + "\n"
 
     return streams2
     return streams2
@@ -2477,13 +2587,16 @@ dsa_attn_site(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<S
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
     attn<Vec<Float>> = attn_site(h_a, tab, lpre, fgemm, fbf)
-    println(digest("attn", attn))
-    lines = lines + digest("h_a", h_a) + "\n" + digest("attn", attn) + "\n"
+    dg36<String> = digest("h_a", h_a)
+    dg37<String> = digest("attn", attn)
+    println(dg37)
+    lines = lines + dg36 + "\n" + dg37 + "\n"
 
     # ---- join: hc_apply -> streams1 ----
     streams1<Vec<Float>> = hc_apply(streams0, attn, postA, combA)
-    println(digest("streams1", streams1))
-    lines = lines + digest("streams1", streams1) + "\n"
+    dg31<String> = digest("streams1", streams1)
+    println(dg31)
+    lines = lines + dg31 + "\n"
     return streams1
 }
 
@@ -2647,8 +2760,9 @@ main()<Int> -> {
     println("DV0 " + dv0.get(0).to_string())
     x<Vec<Float>> = bulk_dtoh(d_x, R * H)
     free_dev(d_x)
-    println(digest("x", x))
-    lines = lines + digest("x", x) + "\n"
+    dg32<String> = digest("x", x)
+    println(dg32)
+    lines = lines + dg32 + "\n"
 
     # ---------------------------------------------------------------- streams = 4 copies
     streams<Vec<Float>> = Vec()

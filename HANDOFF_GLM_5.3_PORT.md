@@ -1688,3 +1688,33 @@ Session total for this pipeline: 13.5 h projected -> 2h11m -> **35 min (~24x)**,
 bit-identical outputs at every step. Remaining per-layer costs (KDA layer ~45 s:
 hc-mix gemms ~31 s, MoE deq ~9 s, ffn ~12 s) are genuine math/kernel work — the
 data-path hog hunt is complete.
+
+### Session 3: hc-mix timers built, digest overhead found and killed (2026-11-16 evening, post-glitch)
+Power glitch killed the original session's context between 21:27 and 22:05; everything on
+disk survived (git HEAD f2c0178, dirty tree, all native/out artifacts) — only the six
+hcprof runs' stdout (the fine timers) was lost. This section was reconstructed from the
+surviving artifacts plus one fresh NLAYERS=6 recovery run.
+
+What the dirty glm_prefill.vyb (uncommitted on top of f2c0178) contains — instrumentation
+only, no functional change:
+1. Fine timers: T_HCA (hc-apply deq/hostpush/gemm/dtoh), T_KDD/T_KDB/T_KDC (KDA site
+   deq/mm_qkv/conv/digests/parse/delta/hc_apply, function-scope locals per the gotcha list).
+2. Digest-print churn fix: every digest bound to a local before println/concat (digest()
+   was being called twice per line), and dump_to chunk 32768 -> 2048.
+
+HEADLINE FINDING: the "hc-mix gemms ~31 s/layer" from the 35-min 45-layer run was NOT math —
+it was digest() string building. With digests bound to locals, the KDA layer-4 attention
+drops 32 -> 2.7 s (T_KDB mm_qkv=44 ms, conv=65 ms, digests=31 ms; hc_apply=25 ms) and the
+KDA layer total 44 -> 22.2 s. NLAYERS=6 recovery run (prefill6_hcprof_recov.log):
+```
+n=0-2 dense  total ~0.8 s each
+n=3 DSA      attn=4.1 s  ffn=9.2 s   total=13.3 s
+n=4 KDA      attn=2.7 s  ffn=19.5 s  total=22.2 s   (T_KDB deq=2090 mm_qkv=44 conv=65 digests=31)
+n=5 KDA      attn=1.6 s  ffn=17.5 s  total=19.1 s   (T_KDB deq=926 mm_bfz+parse=439)
+```
+All 6 layer digests byte-identical to the 45-layer gold; also NLAYERS=4 green (prefill4_dirty).
+Full-run projection: ~35 -> ~18-20 min. Remaining per-KDA-layer cost is MoE deq ~9 s +
+ffn streaming; the next real target is the deq kernels (exl3hgen/exl3had1 ~8.8 ms/deq) or
+the fused dequant+gemm (f64 -> f32-in-register).
+NOTE: this dirty tree is green and materially faster — commit it before the next full run.
+Recovery artifacts: native/out/prefill6_hcprof_recov.{log,txt}, prefill4_dirty.{log,txt}.
