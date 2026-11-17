@@ -1929,3 +1929,21 @@ qd/td/od/td2/sud/svd/pd, the whole f32 path is green:
   all findings above are in place; the fd-arena fault reproduces in a 90 s NLAYERS=4 run.
 - The f32 path is currently glm_prefill-only. Mirror to the other drivers when each is
   next gated (they still run the f64 path — green, just slower).
+
+### fd-arena fault: trigger ISOLATED by 4-way matrix (2026-11-17, commit ebf8e8e + these tests)
+Four NLAYERS=4 runs isolated the sync=700 trigger exactly:
+| fd | fdc | result |
+| arena | arena | FAULT (original) |
+| arena | fresh | GREEN — deq 2.85 s |
+| arena | arena+4K pad | FAULT (padding does not help — not a boundary off-by-one) |
+| fresh | arena | FAULT |
+| fresh | fresh | GREEN (committed state) |
+CONCLUSION: the fault follows cvt's f64 st_f64 WRITE to an arena buffer in glm_prefill's
+context — independent of the fd source, not size/boundary related. The identical
+write (st_f64 to an arena buffer) is CLEAN in the probe, even with churn + 4 GB live.
+This points at the Vyb CUDA binding's kernel-store path for st_f64 to long-lived pool
+allocations in a heavily-used context — a COMPILER/BINDING-level issue, not a driver
+logic bug. NEXT: (1) file/check a minimal Vyb repro (probe harness + this matrix is the
+evidence); (2) interim: fdc stays fresh (1 alloc + 1 free per deq — the committed state,
+deq ~3 s); (3) if the binding fix lands, arena fdc and re-gate. The committed state is
+the acceptance configuration: 13:54, digests <=1.4e-6.
