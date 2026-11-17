@@ -1837,3 +1837,24 @@ NEXT (the real fix, before re-attempting integration):
    fuse it into had232's epilogue.
 3. Re-measure with T_MOE deq as the metric; gate NLAYERS=6 (digest rel ~1e-7 vs gold is
    the expected PASS band; byte-identical is NOT expected on MoE layers).
+
+### Arena attempt 2: scales fixed, cvt kernel faults — reverted, standalone probe next (2026-11-17)
+Second integration attempt with a full per-size device arena (kn = ntiles*256 =
+8,388,608 for ALL matrices — shape-independent, one arena set suffices; qd 8 MB,
+td 64 KB, od32/td2/fd32 32 MB each, fdc 64 MB, sud 16 KB, svd 16 KB, pd 64 B).
+Findings, each measured:
+1. Arena pointers DO propagate out of the freedom block fine (ARENA print showed valid
+   handles) — the earlier cross-block suspicion was wrong.
+2. FIRST bug (fixed): the sud/svd arena slots were sized 4 KB/16 KB but nsuh = krows*2
+   = 8192 for cw=2048. cuMemcpyHtoD_v2 FAILS (not overflows) when the count exceeds the
+   allocation's registered size — the runtime validates. Rule: arena slots must be sized
+   to the TRUE max transfer, undersizing surfaces as a mysterious HtoD failure.
+3. SECOND bug (open): after the scales fix, exl3cvt32 faults with CUDA_ERROR_ILLEGAL_ADDRESS
+   (sync=700) on the first expert, despite gid<kn, S=arE (kn*4), D=arF (kn*8) all in
+   bounds. The fault poisons the context (next trellis HtoD fails htod1). Cause unknown —
+   the kernel is 6 lines. NEXT: probe exl3cvt32 STANDALONE (clone glm_exl3_check32.vyb,
+   add the cvt launch after the f32 transform, dump before/after bytes) before touching
+   glm_prefill again. Suspects: a launch4i param-buffer layout mismatch (cvt reads
+   p+0/p+8/p+16 — maybe launch4i packs params differently than assumed for a
+   fresh kernel), or the Float32->Float `as` cast codegen in a kernel.
+glm_prefill.vyb REVERTED to HEAD (f64+hoist green state). Kernels remain committed.
