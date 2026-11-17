@@ -1681,3 +1681,10 @@ space-separated records, main-local tables). It works:
 - 45-layer validation run in flight at commit time (prefill45_tab.log, prefill_vyb_45_tab.txt).
 Remaining per-layer costs (layer 4 example): attn ~32 s (hc-mix gemms ~31 s of it — the actual
 kernels are ~1 s), MoE deq ~9 s, ffn ~12 s. Next targets: the hc-mix gemm path and deq kernels.
+
+**45-LAYER VALIDATION (2026-11-16 21:16): PREFILL_OK layers=45, rc=0, ~35 min wall
+(20:41->21:16) — all 45 layer digests byte-identical to the 2h11m gold run.**
+Session total for this pipeline: 13.5 h projected -> 2h11m -> **35 min (~24x)**, with
+bit-identical outputs at every step. Remaining per-layer costs (KDA layer ~45 s:
+hc-mix gemms ~31 s, MoE deq ~9 s, ffn ~12 s) are genuine math/kernel work — the
+data-path hog hunt is complete.
