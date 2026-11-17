@@ -1718,3 +1718,12 @@ ffn streaming; the next real target is the deq kernels (exl3hgen/exl3had1 ~8.8 m
 the fused dequant+gemm (f64 -> f32-in-register).
 NOTE: this dirty tree is green and materially faster — commit it before the next full run.
 Recovery artifacts: native/out/prefill6_hcprof_recov.{log,txt}, prefill4_dirty.{log,txt}.
+
+### Committed + full acceptance on the digest-fixed tree (2026-11-16 22:38-22:55)
+Dirty tree committed as b940dd0 (digest churn fix + timers + this recovery section).
+45-layer acceptance run on it: **PREFILL_OK layers=45, wall 17 min 2 s (22:38:46->22:55:48)**
+— projection confirmed — and all 45 layer digests byte-identical to the 35-min gold
+(prefill_vyb_45.txt == prefill_vyb_45_tab.txt). Session total: 13.5 h -> 2h11m -> 35 min
+-> **17 min (~48x)**, bit-identical throughout. New gold digest file for future gates:
+native/out/prefill_vyb_45.txt (from this run). Remaining costs are genuine math: MoE deq
+~9 s/layer (exl3hgen/exl3had1 ~8.8 ms/deq), ffn streaming, T_RSLV now 0.7 s/layer.
