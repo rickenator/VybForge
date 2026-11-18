@@ -2419,6 +2419,22 @@ the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write
 vs prefill_vyb_45_tab.txt (expect ~3.4e-8), then the 45-layer acceptance and the
 new gold. The reverted integration diff is in git history (commit a9a06ec era) and
 the probe51 configuration is the reference for the staging pattern.
+45-LAYER ACCEPTANCE (prefill45_fused.log, commit 1659b39 + tmode removal):
+PREFILL_OK layers=45, ALL 45 digests within 1.42e-6 of the f64 gold
+(prefill_vyb_45_tab.txt; worst L35) — the SAME band as the fresh-fd baseline.
+ITEM 1's CORRECTNESS IS COMPLETE AT FULL DEPTH. OPEN: performance. The run's
+layer totals sum to ~36.8 min vs the 13:54 baseline's ~13.9 min — but the
+comparison is UNRESOLVED: the only full-45 log on disk (prefill45.log) shows
+~6.8s deep-layer totals that match NEITHER the 13:54 profile nor the fused run,
+and the fused run's ATTENTION times also grew with depth (attn does not touch the
+fused path at all), so the slowdown may be environmental (the L4-style stall
+recurring) rather than the fused deq. The NLAYERS=6 comparison showed the fused
+deq equal-or-faster (L3 2603 vs 2894, L5 2943 vs 2962). NEXT: (1) identify the
+true 13:54-era log (or rerun the fresh-fd config NLAYERS=6 back-to-back with the
+fused config for a clean A/B); (2) if the fused deq is genuinely slower at depth,
+profile T_MOE deq vs depth — the earlier depth-growth pattern (1.8s -> 13s) may
+interact with the fused path's per-call trellis HtoD. Correctness is not in
+question; only the wall-clock claim awaits a clean measurement.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
