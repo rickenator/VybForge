@@ -2203,6 +2203,14 @@ ntiles*256/256 with per-thread element loop) and BOTH prior A/B verdicts for
 the shared kernel must be redone with full coverage. This also fully explains
 the driver divergence pattern (large-scale wrongness from the first fused layer)
 without any trellis-layout mystery.
+NOTE: cuMemsetD8_v2 does NOT exist in the Vyb CUDA binding (only cuMemcpyDtoH_v2
+and cuMemcpyHtoD_v2 — probe40 failed to compile); the sentinel test must instead
+use a double-launch differential: alloc a second 32MB buffer, run the shared
+launch with the gate trellis, bulk-copy t3 into it (DtoH t3 -> host String ->
+HtoD into the copy; no DtoD binding), relaunch with a DIFFERENT trellis
+(tq3/down already staged), then count pairs that changed — the changed count is
+exactly the number of slots the kernel wrote. 4194304 pairs expected if coverage
+is complete; 131072 if it is grid/32.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
