@@ -1059,11 +1059,16 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     var<Int> d_kva = 0
     var<Int> d_kvb = 0
     var<Int> d_o = 0
-    d_qa = deq_bf16(fbf, gx_read(g, 0), Q_LORA * H, H)
-    d_qb = deq_bf16(fbf, gx_read(g, 2), HEADS * NOPE * Q_LORA, Q_LORA)
-    d_kva = deq_bf16(fbf, gx_read(g, 3), KV_LORA * H, H)
-    d_kvb = deq_bf16(fbf, gx_read(g, 5), HEADS * (NOPE + VDIM) * KV_LORA, 0)
-    d_o = deq_bf16(fbf, gx_read(g, 6), HEADS * VDIM * H, HEADS * VDIM)
+    g_g_0 = gx_read(g, 0)
+    d_qa = deq_bf16(fbf, g_g_0, Q_LORA * H, H)
+    g_g_2 = gx_read(g, 2)
+    d_qb = deq_bf16(fbf, g_g_2, HEADS * NOPE * Q_LORA, Q_LORA)
+    g_g_3 = gx_read(g, 3)
+    d_kva = deq_bf16(fbf, g_g_3, KV_LORA * H, H)
+    g_g_5 = gx_read(g, 5)
+    d_kvb = deq_bf16(fbf, g_g_5, HEADS * (NOPE + VDIM) * KV_LORA, 0)
+    g_g_6 = gx_read(g, 6)
+    d_o = deq_bf16(fbf, g_g_6, HEADS * VDIM * H, HEADS * VDIM)
     if (d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 || d_o == 0) { return nonev }
 
     qres<Vec<Float>> = mm_host(h_a, R, H, d_qa, Q_LORA, fgemm)
@@ -1072,7 +1077,8 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     lines = lines + dg0 + "\n"
 
     var<Int> d_qaln = 0
-    d_qaln = deq_bf16(fbf, gx_read(g, 1), Q_LORA, 0)
+    g_g_1 = gx_read(g, 1)
+    d_qaln = deq_bf16(fbf, g_g_1, Q_LORA, 0)
     if (d_qaln == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
     free_dev(d_qaln)
@@ -1084,7 +1090,8 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
 
     ckraw<Vec<Float>> = mm_host(h_a, R, H, d_kva, KV_LORA, fgemm)
     var<Int> d_kvaln = 0
-    d_kvaln = deq_bf16(fbf, gx_read(g, 4), KV_LORA, 0)
+    g_g_4 = gx_read(g, 4)
+    d_kvaln = deq_bf16(fbf, g_g_4, KV_LORA, 0)
     if (d_kvaln == 0) { return nonev }
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     free_dev(d_kvaln)
@@ -1105,18 +1112,24 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
     var<Int> d_wk = 0
     var<Int> d_wproj = 0
     var<Int> d_gate = 0
-    d_wqb = deq_bf16(fbf, gx_read(g, 7), Q_LORA * IHEADS * IDIM, Q_LORA)
-    d_wk = deq_bf16(fbf, gx_read(g, 8), H * IDIM, H)
-    d_wproj = deq_bf16(fbf, gx_read(g, 11), H * IHEADS, H)
-    d_gate = deq_bf16(fbf, gx_read(g, 13), H * IDIM, H)
+    g_g_7 = gx_read(g, 7)
+    d_wqb = deq_bf16(fbf, g_g_7, Q_LORA * IHEADS * IDIM, Q_LORA)
+    g_g_8 = gx_read(g, 8)
+    d_wk = deq_bf16(fbf, g_g_8, H * IDIM, H)
+    g_g_11 = gx_read(g, 11)
+    d_wproj = deq_bf16(fbf, g_g_11, H * IHEADS, H)
+    g_g_13 = gx_read(g, 13)
+    d_gate = deq_bf16(fbf, g_g_13, H * IDIM, H)
     if (d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gate == 0) { return nonev }
 
     qidx<Vec<Float>> = mm_host(qres, R, Q_LORA, d_wqb, IHEADS * IDIM, fgemm)
     kraw<Vec<Float>> = mm_host(h_a, R, H, d_wk, IDIM, fgemm)
     knw<Vec<Float>> = Vec()
     knb<Vec<Float>> = Vec()
-    d_knw = deq_bf16(fbf, gx_read(g, 9), IDIM, 0)
-    d_knb = deq_bf16(fbf, gx_read(g, 10), IDIM, 0)
+    g_g_9 = gx_read(g, 9)
+    d_knw = deq_bf16(fbf, g_g_9, IDIM, 0)
+    g_g_10 = gx_read(g, 10)
+    d_knb = deq_bf16(fbf, g_g_10, IDIM, 0)
     if (d_knw == 0 || d_knb == 0) { return nonev }
     knw = bulk_dtoh(d_knw, IDIM)
     knb = bulk_dtoh(d_knb, IDIM)
@@ -1547,7 +1560,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     }
     if (nfound != w.len()) { println("TAIL_FAIL resolve " + nfound.to_string()); return nonev }
 
-    d_fnF = deq_bf16(fbf, gx_read(gt, 0), 24 * HC * H, HC * H)
+    g_gt_0 = gx_read(gt, 0)
+    d_fnF = deq_bf16(fbf, g_gt_0, 24 * HC * H, HC * H)
     if (d_fnF == 0) { return nonev }
     baseF<Vec<Float>> = Vec()
     raw_baseF = gx_read(gt, 1)
@@ -1563,7 +1577,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
         scaleF.push(f32_at(raw_scaleF, j))
         j = j + 1
     }
-    d_ln2 = deq_bf16(fbf, gx_read(gt, 3), H, 0)
+    g_gt_3 = gx_read(gt, 3)
+    d_ln2 = deq_bf16(fbf, g_gt_3, H, 0)
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
 
     flat<Vec<Float>> = rms_rows(view(streams1), R, HC * H, Vec())
@@ -1610,7 +1625,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     want.push(lpre + "mlp.gate.weight")
     want.push(lpre + "mlp.gate.e_score_correction_bias")
     g<GxLoc> = gx_resolve_tab(tab, dir, total, want)
-    d_gw = deq_bf16(fbf, gx_read(g, 0), NE * H, H)
+    g_g_0 = gx_read(g, 0)
+    d_gw = deq_bf16(fbf, g_g_0, NE * H, H)
     if (d_gw == 0) { return nonev }
     logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
     freedom {
@@ -1748,12 +1764,21 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             }
 
             tA = time_mono_millis()
-            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 0), gx_read(ge, 1),
-                                gx_read(ge, 2), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
-            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 3), gx_read(ge, 4),
-                                gx_read(ge, 5), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
-            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 6), gx_read(ge, 7),
-                                gx_read(ge, 8), body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            g_ge_2 = gx_read(ge, 2)
+            g_ge_1 = gx_read(ge, 1)
+            g_ge_0 = gx_read(ge, 0)
+            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+                                g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            g_ge_5 = gx_read(ge, 5)
+            g_ge_4 = gx_read(ge, 4)
+            g_ge_3 = gx_read(ge, 3)
+            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+                                g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            g_ge_8 = gx_read(ge, 8)
+            g_ge_7 = gx_read(ge, 7)
+            g_ge_6 = gx_read(ge, 6)
+            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+                                g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
@@ -1828,9 +1853,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     w3.push(lpre + "mlp.shared_experts.up_proj.weight")
     w3.push(lpre + "mlp.shared_experts.down_proj.weight")
     gs<GxLoc> = gx_resolve_tab(tab, dir, total, w3)
-    d_sg = deq_bf16(fbf, gx_read(gs, 0), EINTER * H, H)
-    d_su = deq_bf16(fbf, gx_read(gs, 1), EINTER * H, H)
-    d_sd = deq_bf16(fbf, gx_read(gs, 2), H * EINTER, EINTER)
+    g_gs_0 = gx_read(gs, 0)
+    d_sg = deq_bf16(fbf, g_gs_0, EINTER * H, H)
+    g_gs_1 = gx_read(gs, 1)
+    d_su = deq_bf16(fbf, g_gs_1, EINTER * H, H)
+    g_gs_2 = gx_read(gs, 2)
+    d_sd = deq_bf16(fbf, g_gs_2, H * EINTER, EINTER)
     if (d_sg == 0 || d_su == 0 || d_sd == 0) { return nonev }
     sgate<Vec<Float>> = mm_host(h2, R, H, d_sg, EINTER, fgemm)
     sup<Vec<Float>> = mm_host(h2, R, H, d_su, EINTER, fgemm)
@@ -2076,16 +2104,20 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     tm<Int> = 0
     var<Int> d_fnA = 0
     var<Int> d_fnF = 0
-    d_fnA = deq_bf16(fbf, gx_read(g, 14), 24 * HC * H, HC * H)
+    g_g_14 = gx_read(g, 14)
+    d_fnA = deq_bf16(fbf, g_g_14, 24 * HC * H, HC * H)
     t1 = time_mono_millis()
     td = td + (t1 - t0)
     t0 = t1
-    if (d_fnA == 0) { println("KFAIL fnA rawlen=" + gx_read(g, 14).len().to_string()); return nonev }
-    d_fnF = deq_bf16(fbf, gx_read(g, 17), 24 * HC * H, HC * H)
+    g_g_14 = gx_read(g, 14)
+    if (d_fnA == 0) { println("KFAIL fnA rawlen=" + g_g_14.len().to_string()); return nonev }
+    g_g_17 = gx_read(g, 17)
+    d_fnF = deq_bf16(fbf, g_g_17, 24 * HC * H, HC * H)
     t1 = time_mono_millis()
     td = td + (t1 - t0)
     t0 = t1
-    if (d_fnF == 0) { println("KFAIL fnF rawlen=" + gx_read(g, 17).len().to_string()); return nonev }
+    g_g_17 = gx_read(g, 17)
+    if (d_fnF == 0) { println("KFAIL fnF rawlen=" + g_g_17.len().to_string()); return nonev }
     base<Vec<Float>> = Vec()
     raw_base = gx_read(g, 15)
     j = 0
@@ -2101,14 +2133,16 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
         j = j + 1
     }
     baseF<Vec<Float>> = Vec()
-    raw_baseF<String> = gx_read(g, 18)
+    g_g_18 = gx_read(g, 18)
+    raw_baseF<String> = g_g_18
     j = 0
     while (j < 24) {
         baseF.push(f32_at(raw_baseF, j))
         j = j + 1
     }
     scaleF<Vec<Float>> = Vec()
-    raw_scaleF<String> = gx_read(g, 19)
+    g_g_19 = gx_read(g, 19)
+    raw_scaleF<String> = g_g_19
     j = 0
     while (j < 3) {
         scaleF.push(f32_at(raw_scaleF, j))
@@ -2199,7 +2233,8 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
 
     # ---------------------------------------------------------------- input_layernorm
     var<Int> d_ln = 0
-    d_ln = deq_bf16(fbf, gx_read(g, 12), H, 0)
+    g_g_12 = gx_read(g, 12)
+    d_ln = deq_bf16(fbf, g_g_12, H, 0)
     if (d_ln == 0) { return nonev }
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     free_dev(d_ln)
@@ -2215,15 +2250,24 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     kd4<Int> = 0
     kd5<Int> = 0
     # projections (host batch [R,H] @ [H,out] on the GPU)
-    d_q = deq_bf16(fbf, gx_read(g, 0), H * HEADS * KD, H)
-    d_k = deq_bf16(fbf, gx_read(g, 1), H * HEADS * KD, H)
-    d_v = deq_bf16(fbf, gx_read(g, 2), H * HEADS * KD, H)
-    d_o = deq_bf16(fbf, gx_read(g, 3), HEADS * KD * H, HEADS * KD)
-    d_b = deq_bf16(fbf, gx_read(g, 4), H * HEADS, H)
-    d_fa = deq_bf16(fbf, gx_read(g, 5), H * 128, H)
-    d_fb = deq_bf16(fbf, gx_read(g, 6), 128 * HEADS * KD, 128)
-    d_ga = deq_bf16(fbf, gx_read(g, 7), H * 128, H)
-    d_gb = deq_bf16(fbf, gx_read(g, 8), 128 * HEADS * KD, 128)
+    g_g_0 = gx_read(g, 0)
+    d_q = deq_bf16(fbf, g_g_0, H * HEADS * KD, H)
+    g_g_1 = gx_read(g, 1)
+    d_k = deq_bf16(fbf, g_g_1, H * HEADS * KD, H)
+    g_g_2 = gx_read(g, 2)
+    d_v = deq_bf16(fbf, g_g_2, H * HEADS * KD, H)
+    g_g_3 = gx_read(g, 3)
+    d_o = deq_bf16(fbf, g_g_3, HEADS * KD * H, HEADS * KD)
+    g_g_4 = gx_read(g, 4)
+    d_b = deq_bf16(fbf, g_g_4, H * HEADS, H)
+    g_g_5 = gx_read(g, 5)
+    d_fa = deq_bf16(fbf, g_g_5, H * 128, H)
+    g_g_6 = gx_read(g, 6)
+    d_fb = deq_bf16(fbf, g_g_6, 128 * HEADS * KD, 128)
+    g_g_7 = gx_read(g, 7)
+    d_ga = deq_bf16(fbf, g_g_7, H * 128, H)
+    g_g_8 = gx_read(g, 8)
+    d_gb = deq_bf16(fbf, g_g_8, 128 * HEADS * KD, 128)
     if (d_q == 0 || d_k == 0 || d_v == 0 || d_o == 0 || d_b == 0 || d_fa == 0 || d_fb == 0 || d_ga == 0 || d_gb == 0) {
         println("L0_FAIL weight deq")
         return nonev
@@ -2244,9 +2288,12 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     var<Int> d_cq = 0
     var<Int> d_ck = 0
     var<Int> d_cv = 0
-    d_cq = deq_bf16(fbf, gx_read(g, 21), HEADS * KD * CONV_K, 0)
-    d_ck = deq_bf16(fbf, gx_read(g, 22), HEADS * KD * CONV_K, 0)
-    d_cv = deq_bf16(fbf, gx_read(g, 23), HEADS * KD * CONV_K, 0)
+    g_g_21 = gx_read(g, 21)
+    d_cq = deq_bf16(fbf, g_g_21, HEADS * KD * CONV_K, 0)
+    g_g_22 = gx_read(g, 22)
+    d_ck = deq_bf16(fbf, g_g_22, HEADS * KD * CONV_K, 0)
+    g_g_23 = gx_read(g, 23)
+    d_cv = deq_bf16(fbf, g_g_23, HEADS * KD * CONV_K, 0)
     if (d_cq == 0 || d_ck == 0 || d_cv == 0) { return nonev }
     convq<Vec<Float>> = bulk_dtoh(d_cq, HEADS * KD * CONV_K)
     convk<Vec<Float>> = bulk_dtoh(d_ck, HEADS * KD * CONV_K)
@@ -2346,7 +2393,8 @@ kda_attn_site(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<
     println("G9PROBE found=" + g.found.get(9).to_string() + " off=" + g.off.get(9).to_string() +
             " nbytes=" + g.nbytes.get(9).to_string() + " pathlen=" + g.paths.get(9).len().to_string() +
             " path=" + g.paths.get(9))
-    d_onorm = deq_bf16(fbf, gx_read(g, 9), KD, 0)
+    g_g_9 = gx_read(g, 9)
+    d_onorm = deq_bf16(fbf, g_g_9, KD, 0)
     if (d_onorm == 0) { return nonev }
     onorm<Vec<Float>> = bulk_dtoh(d_onorm, KD)
     free_dev(d_onorm)
@@ -2441,7 +2489,8 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     if (fgemm == 0) { println("L0_FAIL gemm.ptx (make gemm)"); return nonev }
     if (fbf == 0) { println("L0_FAIL bf16.ptx (make bf16)"); return nonev }
 
-    d_fnF<Int> = deq_bf16(fbf, gx_read(g, 4), 24 * HC * H, HC * H)
+    g_g_4 = gx_read(g, 4)
+    d_fnF<Int> = deq_bf16(fbf, g_g_4, 24 * HC * H, HC * H)
     if (d_fnF == 0) { return nonev }
     baseF<Vec<Float>> = Vec()
     raw_baseF = gx_read(g, 5)
@@ -2459,7 +2508,8 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     }
 
     # =============================================================== ffn site + MLP
-    d_ln2 = deq_bf16(fbf, gx_read(g, 3), H, 0)
+    g_g_3 = gx_read(g, 3)
+    d_ln2 = deq_bf16(fbf, g_g_3, H, 0)
     if (d_ln2 == 0) { return nonev }
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
     free_dev(d_ln2)
@@ -2511,9 +2561,12 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     println(dg28)
     lines = lines + dg28 + "\n"
 
-    d_gate = deq_bf16(fbf, gx_read(g, 0), H * INTER, H)
-    d_up = deq_bf16(fbf, gx_read(g, 1), H * INTER, H)
-    d_down = deq_bf16(fbf, gx_read(g, 2), INTER * H, INTER)
+    g_g_0 = gx_read(g, 0)
+    d_gate = deq_bf16(fbf, g_g_0, H * INTER, H)
+    g_g_1 = gx_read(g, 1)
+    d_up = deq_bf16(fbf, g_g_1, H * INTER, H)
+    g_g_2 = gx_read(g, 2)
+    d_down = deq_bf16(fbf, g_g_2, INTER * H, INTER)
     if (d_gate == 0 || d_up == 0 || d_down == 0) { return nonev }
     mg<Vec<Float>> = mm_host(h2, R, H, d_gate, INTER, fgemm)
     mu<Vec<Float>> = mm_host(h2, R, H, d_up, INTER, fgemm)
@@ -2565,7 +2618,8 @@ dsa_attn_site(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<S
     if (nfound != w.len()) { println("FULL_FAIL resolve " + nfound.to_string()); return nonev }
 
 
-    d_fnA = deq_bf16(fbf, gx_read(g, 0), 24 * HC * H, HC * H)
+    g_g_0 = gx_read(g, 0)
+    d_fnA = deq_bf16(fbf, g_g_0, 24 * HC * H, HC * H)
     if (d_fnA == 0) { return nonev }
     baseA<Vec<Float>> = Vec()
     raw_baseA = gx_read(g, 1)
@@ -2581,7 +2635,8 @@ dsa_attn_site(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<S
         scaleA.push(f32_at(raw_scaleA, j))
         j = j + 1
     }
-    d_lnA = deq_bf16(fbf, gx_read(g, 3), H, 0)
+    g_g_3 = gx_read(g, 3)
+    d_lnA = deq_bf16(fbf, g_g_3, H, 0)
     in_ln<Vec<Float>> = bulk_dtoh(d_lnA, H)
 
     flat<Vec<Float>> = rms_rows(view(streams0), R, HC * H, Vec())
@@ -2914,7 +2969,7 @@ main()<Int> -> {
     # ---- embeddings for the prompt -> streams (HC copies) ----
     want<Vec<String>> = Vec()
     want.push("model.language_model.embed_tokens.weight")
-    ge<GxLoc> = gx_resolve_tab(tab, dir, total, want)
+    ge<GxLoc> = gx_resolve_tab(tabs.get(0), dir, total, want)
 
     # ---------------------------------------------------------------- embeddings
     ids<Vec<Int>> = Vec()

@@ -2467,6 +2467,22 @@ Also check the pool retained-counter corruption (the absorb/double-free path's
 `g_vyb_pool_retained -= n->size` — a double-absorb subtracts twice). The probe
 harness: native/host/alloc_probe.vyb (100x4MB alloc+drop -> RSS 71->601MB, trim
 releases nothing — every dropped String leaks at the registry).
+A/B AFTER THE PARTIAL FIX: the bound reads did NOT stop the growth — RSS still
+~1.2GB/layer (L39 55.3GB -> L42 58.4GB, monotonic; str_stats live was 762K at
+L13). The inline-temporary class is fixed (the g_lg_N/g_ge_N bindings reuse their
+slots correctly), but the dominant leak class is elsewhere and grows ~1.2GB/layer
+in BOTH the chain's and the prefill's loops (the prefill's own 45-layer runs only
+fit under the raised 120G cap — the same leak predates the chain port). NEXT
+(first task, in the Vyb runtime per Rick's directive): extend vyb_str_stats in
+runtime/vyb_runtime.c to print the TOTAL BYTES held by live registry entries
+(iterate the table summing usable sizes) — that splits the 55GB RSS between
+registry-live string buffers vs the pool (capped 8GB) vs libc. The leaking class
+then identifies the codegen path (candidates: the per-element to_string temps in
+dumps()/digest() loops — ~4.4M temps per 45-layer run; the per-token substring
+reads; bulk_dtoh Vecs if their scope-exit frees miss). ALSO: the str_stats output
+showed the pool retained counter CORRUPT (4.94e18) — audit the absorb path's
+`g_vyb_pool_retained -= n->size` for a double-subtract. All machinery (RSS probes,
+str_stats wiring, bind_gx_reads.py) is committed and reusable.
 LEAK ROOT-CAUSED (VYB_STR_TRACE=1 on alloc_probe + the chain): the probe's 530MB
 is POOL RETENTION by design (freed 4MB blocks recycle in the pool's buckets, cap
 8GB) — the probe does NOT leak. The CHAIN's leak: ~58K live registry strings per
