@@ -2168,6 +2168,19 @@ trellis, by staging a FRESH tq3 for the down launch. If a fresh trellis buffer
 fixes it, the driver integration must likewise use a per-tensor trellis staging
 (the driver already does); if not, dump raw deq values (pre-had1) for rows 16..31
 at cw=4096 vs deq32's od and diff slots.
+ELIMINATED (cvt_probe38.log): fresh trellis staging (tq3, own alloc, t6 staged,
+p+0 repointed) — DOWN_MISMATCH unchanged (4112384, first=8192). The probe's trellis
+reuse was NOT the cause; the defect is inside exl3dq1s's deq-side indexing for
+cw=4096. Established facts for the next session: gate (cw=2048, stride nbc16=128)
+bit-identical full-buffer; down (cw=4096, nbc16=256) wrong for every kb16>=1 row
+while deq32's tile = kbv*(cw/16)+nbv is green in the driver at the same geometry;
+map is a verified bijection; inv build syncs clean; fp16_to_f64 copies are
+textually identical; T layout now provably matches had132 (fix landed ef66547).
+NEXT EXPERIMENT (cheapest first): parameterise the trellis fast-axis stride
+(p+48, default cw/16) and at cw=4096 try stride 128 and the transposed indexing
+tile = nbv*(rows/16) + kb16 — one probe run per variant, gate+down must both be
+MISMATCH=0. If none of the three variants clears it, dump per-element (row 16,
+col 0..15) values from dq1s vs deq32's od and diff the slot/tile each used.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces

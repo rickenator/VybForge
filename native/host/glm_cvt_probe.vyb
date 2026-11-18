@@ -566,7 +566,12 @@ main()<Int> -> {
             dwD<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, t6, s7, s8, body, 4096, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
             sync()
             println("DOWN_SEP rc=" + dwD.to_string())
-            cuMemcpyHtoD_v2(tq2, t6, t6.len())
+            tq3<Int> = 0
+            tq3c<Int> = cuMemAlloc_v2(loc(tq3), t6.len()) as Int
+            if (tq3c == 0) {
+                cuMemcpyHtoD_v2(tq3, t6, t6.len())
+                cuMemcpyHtoD_v2(pp2 + 0, loc(tq3), 8)
+            }
             cw4<Int> = 4096
             cuMemcpyHtoD_v2(pp2 + 32, loc(cw4), 8)
             lrcD2<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 1024, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
@@ -585,6 +590,7 @@ main()<Int> -> {
                 chk2 = chk2 + 1
             }
             println("DOWN_MISMATCH f32-pairs=" + md2c.to_string() + " of 4194304 first=" + md2f1.to_string())
+            if (tq3c == 0) { cuMemFree_v2(tq3) }
         }
         cuMemFree_v2(md2)
         cuMemFree_v2(t3)
