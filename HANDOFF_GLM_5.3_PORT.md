@@ -2299,6 +2299,26 @@ helper's down staging is broken (find the bug in the helper's HtoD — rc or off
 and THE FUSED KERNELS ARE CORRECT: re-integrate with the grid fix and gate
 NLAYERS=6. If they agree everywhere, the divergence is inside the kernels despite
 identical formulas — dump deq values (pre-had1) per tile next.
+ORACLE ARBITRATION (arb3.py, committed native/glm53/arbitrate_down_deq.py): the
+What-replication snippet is EXACT (max diff 0.0 vs the proven loader
+dequant_exl3_fast on the same tensor). The oracle's down What (layer 3 expert 0,
+trellis shape (128,256,64) -> [2048,4096], confirming the driver's geometry):
+  What[32,0:2] = -0.7734  What[0,1024:1026] = -14.625  (pre-Hadamard, pre-scale)
+The probe's od reads (probe46 ODCHK): od(32,0:2)=1.69754e-4  od(0,1024:1026)=-4.59e-4
+— NO row of the true What matches either pair (searched all 2048 rows at cols 0-1
+and 1024-1025, tol 1e-6). So deq32's od for down does not equal the oracle What at
+the sampled points. CONTRADICTION: L3_MOE_ALL_VYB gated the same deq32 pipeline
+against the numpy gold at 5.6e-8 — so either the gate did not exercise down deq32
+at cw=4096 the way I assume, or the probe's od read is not reading what I think
+(wrong expert/layer in the probe's gx_resolve vs the oracle's HF expert 0; or the
+od arena slot mapping in the helper differs from arC). RESOLUTION SEQUENCE for
+next session: (1) confirm the probe's g resolves to HF layers.3.experts.0 (print
+the resolved names); (2) dump od(0,0:2) and compare against oracle What[0,0:2]
+directly — a single-point ground check; (3) if deq32's od is genuinely wrong at
+cw=4096, the L3_MOE_ALL gate must be re-examined (what exactly did it gate?) and
+the whole driver deq needs the oracle treatment — this would ALSO mean the fused
+kernels were never the (only) problem. Keep arb3.py — it is the gold reference
+for all future deq arbitration (validated bit-exact against the loader).
 CRITICAL REFRAME (end of session): the driver's fresh-fd green CANNOT arbitrate
 deq placement correctness. The f64 gold was produced by the driver's OWN f64
 pipeline, which uses the same nbc = cw/16 tile-placement convention as the f32
