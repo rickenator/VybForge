@@ -608,6 +608,28 @@ main()<Int> -> {
                 chk2 = chk2 + 1
             }
             println("DOWN_MISMATCH f32-pairs=" + md2c.to_string() + " of 4194304 first=" + md2f1.to_string())
+            # arbitration: naive dq1 (independent code path, no shared, standard stride) at cw=4096
+            t2d<Int> = 0
+            t2dc<Int> = cuMemAlloc_v2(loc(t2d), 33554432) as Int
+            if (t2dc == 0) {
+                cuMemcpyHtoD_v2(pp2 + 24, loc(t2d), 8)
+                lrcN<Int> = cuda_launch4i(from<loc<CVoid>>(fdq1), 65536, 1, 1, 128, 1, 1, pp2, 0, 0, 0) as Int
+                srN<Int> = cuCtxSynchronize() as Int
+                nm<Int> = 0
+                nf<Int> = 0
+                nck<Int> = 0
+                while (nck < 4194304) {
+                    n1<Float> = dtoh(t2d + nck * 8)
+                    n2<Float> = dtoh(arD + nck * 8)
+                    if (n1 != n2) {
+                        nm = nm + 1
+                        if (nm == 1) { nf = nck * 8 }
+                    }
+                    nck = nck + 1
+                }
+                println("NAIVE_DOWN_MISMATCH f32-pairs=" + nm.to_string() + " of 4194304 first=" + nf.to_string() + " lrc=" + lrcN.to_string())
+                cuMemFree_v2(t2d)
+            }
             if (tq3c == 0) { cuMemFree_v2(tq3) }
         }
         cuMemFree_v2(md2)

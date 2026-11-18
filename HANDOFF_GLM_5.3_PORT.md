@@ -2235,6 +2235,33 @@ separate path and dq1s and see which one agrees with the oracle; if the separate
 path is the wrong one at cw=4096 the driver's fresh-fd green must be re-examined,
 if dq1s is wrong the defect is a tile>=512 read in the fused path only. The probe's
 down launch currently runs tmode=0 (tmD staged 0 in cvt_probe43 state).
+ARBITRATION RESULT (cvt_probe44): the NAIVE dq1 kernel — a fully independent code
+path (gid-linear writes, no shared memory, no cooperative staging, no T-layout
+translation — only its T index convention matches had132) — produces EXACTLY the
+same down output as the shared kernel: NAIVE_DOWN_MISMATCH 3670016 of 4194304,
+first=8192, identical count and first-offset to the shared kernel's. Two
+independent fused implementations agree with each other bit-for-bit and disagree
+with the separate path (deq32+had132) identically from element 4096 (row 32,
+kb16=2). Since the gate (cw=2048) proves the fused deq math (tile=kb16*nbc16+nb16,
+inv-slot lookup, H read, accumulation) against the separate path across the whole
+buffer, and the only cw-dependent quantities are nbc16 (=cw/16, same formula as
+deq32's nbc) and nbc128 (=cw/128, gate-proven via the T layout), the disagreement
+at cw=4096 kb16>=2 CANNOT be explained by the fused code alone. Two possibilities
+remain, to be settled by the python gold (gold_exl3_deq.py):
+  A) the separate path (or the probe's staging of it) is wrong at cw=4096 rows
+     >= 32 — then the driver's fresh-fd green at 3.4e-8 needs re-examination
+     (it validated the f64 gold through the SEPARATE path, so this would mean the
+     f64 gold comparison never actually exercised the down rows >= 32 correctly —
+     unlikely but checkable);
+  B) both fused kernels share a defect that only manifests at cw=4096 kb16>=2 —
+     the only shared elements left are the trellis staging (tq3/tq2 HtoD of t6)
+     and the inv build; note rows 0..31 (tiles 0..511) are correct, so the trellis
+     staging is correct at least through byte 65535.
+NEXT: python-gold arbitration — compute gold_exl3_deq.py's reference for the down
+tensor (expert group g of the probe), dump both the separate path's fdc/fd and the
+fused td2 for rows 32..47, and compare each against the oracle. Whoever matches
+the gold is right; fix the other. Do NOT re-integrate into glm_prefill until the
+down A/B is 0/4194304 on BOTH cw values.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
