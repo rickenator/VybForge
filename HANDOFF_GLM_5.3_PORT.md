@@ -2283,6 +2283,22 @@ SLOTCHK/ODCHK (cvt_probe46) — the topology is now settled:
   path's od rows >= 32 are polluted and the FUSED KERNELS ARE CORRECT (which
   would flip the whole diagnosis: re-integrate the fused path with the grid fix
   and gate NLAYERS=6 against prefill_vyb_45_tab.txt).
+QUANT CONFIG CHECK: all routed experts (layers 3-25+ per quantization_config.json)
+are uniform 4-bit (bits:4, mcg codebook) — gate/up/down trellises are the SAME
+SIZE (32768 tiles x 128B = 4MB for both [2048,4096] and [4096,2048] geometries).
+The probe helper's tq (sized from the gate tensor's len) is therefore size-safe,
+and the "t6 is a small/wrong tensor" theory is dead. The surviving explanation for
+naive/shared tile-512 content == deq32 tile-64 content (cvt_probe46 SLOTCHK, exact
+f32 equality) is that THE TWO STAGED TRELLIS BUFFERS DIFFER BY A CONSTANT SHIFT
+(65536-8192 = 57344 bytes at those offsets) — i.e. one of the two stagings does
+not contain what it claims. NEXT ACTION (one probe run, no new kernels): print
+t6.len() vs the gate trellis.len(); stage BOTH the helper's tq and tq3 and
+byte-compare them at offsets 0, 8192, and 65536 (DtoH 8 bytes each, equality
+prints). If the two staged buffers differ at 65536 but agree at 0/8192, the
+helper's down staging is broken (find the bug in the helper's HtoD — rc or offset)
+and THE FUSED KERNELS ARE CORRECT: re-integrate with the grid fix and gate
+NLAYERS=6. If they agree everywhere, the divergence is inside the kernels despite
+identical formulas — dump deq values (pre-had1) per tile next.
 CRITICAL REFRAME (end of session): the driver's fresh-fd green CANNOT arbitrate
 deq placement correctness. The f64 gold was produced by the driver's OWN f64
 pipeline, which uses the same nbc = cw/16 tile-placement convention as the f32
