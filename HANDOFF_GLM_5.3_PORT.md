@@ -2466,7 +2466,23 @@ base leak; the base leak predates the pass, run 1 leaked 1.1GB/layer before it).
 Also check the pool retained-counter corruption (the absorb/double-free path's
 `g_vyb_pool_retained -= n->size` — a double-absorb subtracts twice). The probe
 harness: native/host/alloc_probe.vyb (100x4MB alloc+drop -> RSS 71->601MB, trim
-releases nothing — every dropped String leaks at the registry). REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
+releases nothing — every dropped String leaks at the registry).
+LEAK ROOT-CAUSED (VYB_STR_TRACE=1 on alloc_probe + the chain): the probe's 530MB
+is POOL RETENTION by design (freed 4MB blocks recycle in the pool's buckets, cap
+8GB) — the probe does NOT leak. The CHAIN's leak: ~58K live registry strings per
+phase-2 layer — the phase-2 loop passes gx_read(...) tensor/trellis Strings as
+INLINE TEMPORARIES directly into exl3_deq(...)/deq_bf16(...) calls; those
+temporaries register (refs=1) and their release never fires at statement end.
+The OLD chain never reached phase 2 (OOM at phase-1 L12), so this leak was never
+exercised until the resolver port made phase 2 reachable. THE FIX (VybForge-side,
+chain driver): bind every gx_read result to a REUSABLE String variable declared
+once per loop scope (trel0/trel1/... for the 9 per-expert reads; tl0..tlN for the
+~25 per-layer tensor reads) and pass the VARIABLE — the reassignment free path
+(assign.old_string released after the store) is proven correct, so rebinding
+bounds the live set to one buffer per slot. Same treatment for the per-expert
+scales and the per-layer hc/ffn reads. After the fix: RSS per layer must be flat
+(rss_mb probes in both loops); then rerun the gate (120G cap), expect
+DECODE_CHAIN_MATCH OK, commit, and the had_hoist mirror re-application follows. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
 glm_prefill integration (the reverted fused-path edits: fdqs/finv loads, persistent
 mapdev/invbase, exl3_deq32 fused section, tail_site threading) with TWO fixes over
 the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write
