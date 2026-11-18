@@ -2520,6 +2520,23 @@ bindings declared without a type annotation... note the probe4 result decides:
 if concat-born reassignments DO release, the bug is specific to the call-RHS
 transfer path (exprIsStringTransfer true skipping the old-value free); if both
 leak, the stringOverwrite detection itself fails for these bindings.
+EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
+buffer: REG refs=1 (the owned birth ref) + 3 RETs (THREE retains: the optional's
+inner store, the shallow-copy's retain, the s-assignment's retain) = 4 refs;
+releases observed: REL old=4 (the compensating release) + REL old=3 (t's
+scope-exit) = 2 releases in-window -> 1 ref LEAKED per buffer, deterministic,
+32/40 tracked buffers unbalanced (the balanced 8 = the small digest strings).
+THE FIX IS ONE OF (test each by rebuild + probe4 in minutes):
+  (a) drop ONE retain: the shallow-copy's retain in copyOwnedValueForBinding
+      (make the optional payload extraction TRANSFER the birth ref instead of
+      shallow-copy+retain for io-intrinsic scrutinees), or
+  (b) add the missing release: the s binding's own scope-exit or the birth-ref
+      consumption at the first transfer (make the io String wrap consume the
+      birth ref instead of retaining).
+The ledger arithmetic is unambiguous: 1 birth + 3 retains - 2 releases = 1 leak
+per read_at buffer; x 200 iterations x 32 reads = the chain's 80G. The fix that
+makes probe4's live_bytes flat is the correct one; then the suite, the chain
+gate, and the had_hoist mirror.
 LEAK ROOT-CAUSED (VYB_STR_TRACE=1 on alloc_probe + the chain): the probe's 530MB
 is POOL RETENTION by design (freed 4MB blocks recycle in the pool's buckets, cap
 8GB) — the probe does NOT leak. The CHAIN's leak: ~58K live registry strings per
