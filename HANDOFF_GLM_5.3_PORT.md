@@ -2501,6 +2501,25 @@ in every driver leaks its tensor bytes — the prefill's 45-layer runs leak ~54G
 (masked by the raised caps), the chain dies at 80G. Fix in Vyb, rebuild, rerun
 alloc_probe3 (live_bytes must stay flat), then the chain gate ->
 DECODE_CHAIN_MATCH, then the had_hoist mirror.
+REFINEMENT (the REL ledger, VYB_STR_TRACE on the chain): 6406 releases at old=2
+(the match-payload copies' releases — correct) but the g_lg_N REASSIGNMENT
+releases (which would log old=1) NEVER FIRE — only 32 old=1 releases total. The
+leak is the REASSIGNMENT `g_lg_0 = gx_read(lg, 0)`: the old buffer's reference
+is dropped WITHOUT freeing (refs stay 1 forever). MINIMAL REPRO (next session,
+first task — native/host/alloc_probe4.vyb): loop { s<String> = <4MB read_at>;
+s = <fresh 4MB read_at>; } — if RSS grows ~4MB/iter, the reassignment-release
+bug is confirmed on read_at-born Strings; compare with a concat-born String
+reassignment (which the codegen handles correctly — the to_string/concat family
+releases fire, see generateMixedStringConcatenation's freeLeftOwnedTemp logic).
+THE VYB FIX: the assignment codegen's String-overwrite path
+(cgen_expr.cpp ~1095-1290: stringOverwrite/oldStringVal/releaseStringValue)
+must emit the old-value release when the RHS is a String-returning CALL
+(exprIsStringTransfer true) — the current code either skips the release for
+call-RHS assignments or the destPointeeType resolution fails for plain String
+bindings declared without a type annotation... note the probe4 result decides:
+if concat-born reassignments DO release, the bug is specific to the call-RHS
+transfer path (exprIsStringTransfer true skipping the old-value free); if both
+leak, the stringOverwrite detection itself fails for these bindings.
 LEAK ROOT-CAUSED (VYB_STR_TRACE=1 on alloc_probe + the chain): the probe's 530MB
 is POOL RETENTION by design (freed 4MB blocks recycle in the pool's buckets, cap
 8GB) — the probe does NOT leak. The CHAIN's leak: ~58K live registry strings per

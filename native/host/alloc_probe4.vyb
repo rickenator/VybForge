@@ -1,0 +1,72 @@
+# Reassignment-release repro: does `s = <fresh read_at>` free the old buffer?
+# Loop A: read_at-born reassignments. Loop B: concat-born reassignments (the
+# codegen's known-good family). RSS growth in A but not B pins the bug to the
+# call-RHS transfer path.
+import io::{open_read, read_at, read_all, close}
+
+rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v * 4 / 1000
+}
+
+extern "C" {
+    vyb_str_stats()<CInt>
+}
+
+main()<Int> -> {
+    println("RSS start " + rss_mb().to_string() + "MB")
+    freedom { vyb_str_stats() }
+    path<String> = "/home/rick/Projects/VybForge/native/exl3/map.bin"
+    s<String> = ""
+    # ---- loop A: read_at-born reassignments (100 x ~1MB) ----
+    i<Int> = 0
+    while (i < 100) {
+        match (open_read(path)) {
+            f -> {
+                match (read_at(f, 0, 1048576)) {
+                    t -> { s = t }
+                    ? -> { return 2 }
+                }
+                close(f)
+            }
+            ? -> { return 2 }
+        }
+        if (i % 25 == 0) {
+            println("A i=" + i.to_string() + " RSS=" + rss_mb().to_string() + "MB")
+            freedom { vyb_str_stats() }
+        }
+        i = i + 1
+    }
+    println("A done RSS=" + rss_mb().to_string() + "MB")
+    freedom { vyb_str_stats() }
+    # ---- loop B: concat-born reassignments (100 x ~1MB) ----
+    base<String> = "0123456789"
+    i = 0
+    while (i < 100) {
+        blk<String> = base
+        j<Int> = 0
+        while (j < 17) { blk = blk + blk; j = j + 1 }
+        s = blk.substring(0, 1048576)
+        if (i % 25 == 0) {
+            println("B i=" + i.to_string() + " RSS=" + rss_mb().to_string() + "MB")
+            freedom { vyb_str_stats() }
+        }
+        i = i + 1
+    }
+    println("B done RSS=" + rss_mb().to_string() + "MB")
+    freedom { vyb_str_stats() }
+    return 0
+}
