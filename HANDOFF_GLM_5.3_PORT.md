@@ -2181,6 +2181,28 @@ NEXT EXPERIMENT (cheapest first): parameterise the trellis fast-axis stride
 tile = nbv*(rows/16) + kb16 — one probe run per variant, gate+down must both be
 MISMATCH=0. If none of the three variants clears it, dump per-element (row 16,
 col 0..15) values from dq1s vs deq32's od and diff the slot/tile each used.
+ELIMINATED (cvt_probe39.log): transposed tile = nb16*(rows/16)+kb16 at cw=4096 —
+WORSE (4128768 mismatches, first=0). Current-stride and transposed both fail; a
+flat stride of 128 is impossible for cw=4096 (nb16 up to 255 would collide), so
+the tile formula itself is NOT the bug — dq1s and deq32 use textually identical
+tile/slot/deq math, yet disagree at cw=4096 from row 16. STRUCTURAL CONCERN TO
+SETTLE FIRST (cheap, host-side): the kernel's phase-1 comment says "8192 threads
+= 8192 elements" per 64x128 tile, but the launch is 256 threads/block with the
+tile's rows covered by consecutive 256-thread CUDA blocks (each stages a row
+pair into its own shared, phase 2 computes that same row pair) — this is
+self-consistent ONLY if the grid covers (rows/64)*(cw/128) LOGICAL tiles while
+`block = tid/8192` spans grid*256/8192 = grid/32 logical tiles. With grid =
+ntiles/32 = 1024 CUDA blocks, block only reaches 31 -> only 32 logical tiles =
+262,144 of 8,388,608 outputs computed; the rest of T is stale memory. The gate's
+"bit-identical" verdicts rest on 6 spot elements (rows 0..1 — exactly the rows
+the first CUDA blocks compute) and the full-buffer scan was run against the
+NAIVE dq1, never the shared kernel. SETTLE BY: memset t3 to a sentinel before
+the shared launch, count non-sentinel slots after — if coverage is 1/32, the
+kernel needs an inner loop (32 iterations per thread over e2, or grid =
+ntiles*256/256 with per-thread element loop) and BOTH prior A/B verdicts for
+the shared kernel must be redone with full coverage. This also fully explains
+the driver divergence pattern (large-scale wrongness from the first fused layer)
+without any trellis-layout mystery.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
