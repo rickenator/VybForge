@@ -68,13 +68,7 @@ exl3dq1s(p<Int>) -> {
     r16<Int> = row - kb16 * 16
     nb16<Int> = col / 16
     c16<Int> = col - nb16 * 16
-    # p+48 = tmode: 0 -> tile = kb16*nbc16 + nb16 ([rows/16][cols/16], col fast);
-    # tmode>0 -> transposed: tile = nb16*tmode + kb16 (tmode = rows/16, row fast)
-    tmode<Int> = ld_i64(p + 48)
     tile16<Int> = kb16 * nbc16 + nb16
-    if (tmode > 0) {
-        tile16 = nb16 * tmode + kb16
-    }
     slotU<UInt32> = ld_u32(inv + (r16 * 16 + c16) * 4)
     slot<Int> = slotU as Int
     base<Int> = td + 16 + slot * 16

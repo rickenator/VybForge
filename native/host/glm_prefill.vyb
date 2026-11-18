@@ -1441,7 +1441,7 @@ attn_site(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<
 
 
 share(all)
-tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -1748,12 +1748,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             }
 
             tA = time_mono_millis()
-            dWg<Int> = exl3_deq32(fdeq32, fhad132, fhad232, fcvt32, gx_read(ge, 0), gx_read(ge, 1),
-                                gx_read(ge, 2), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI)
-            dWu<Int> = exl3_deq32(fdeq32, fhad132, fhad232, fcvt32, gx_read(ge, 3), gx_read(ge, 4),
-                                gx_read(ge, 5), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI)
-            dWd<Int> = exl3_deq32(fdeq32, fhad132, fhad232, fcvt32, gx_read(ge, 6), gx_read(ge, 7),
-                                gx_read(ge, 8), body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI)
+            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 0), gx_read(ge, 1),
+                                gx_read(ge, 2), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 3), gx_read(ge, 4),
+                                gx_read(ge, 5), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, gx_read(ge, 6), gx_read(ge, 7),
+                                gx_read(ge, 8), body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("ALL_FAIL deq expert " + e.to_string())
@@ -2660,11 +2660,11 @@ had_hoist32(fhgen32<Int>)<Int> -> {
 
 # f32 pipeline, arena-based EXCEPT fd: bisect step 2 — cvt reads a FRESH per-call fd
 # (the probe proved cvt is clean in isolation; this isolates the arena-read factor).
-exl3_deq32(fdeq32<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
+exl3_deq32(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
          cw<Int>, ntiles<Int>, hd_pre32<Int>,
          qda<Int>, tda<Int>, oda<Int>, td2a<Int>,
-         suda<Int>, svda<Int>, pda<Int>)<Int> -> {
+         suda<Int>, svda<Int>, pda<Int>, mda<Int>, ivb<Int>)<Int> -> {
     tb<Int> = 0
     kn<Int> = 0
     krows<Int> = 0
@@ -2706,41 +2706,25 @@ exl3_deq32(fdeq32<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
         frc2<Int> = cuMemAlloc_v2(loc(fdc), kn * 8) as Int
         if (frc1 != 0 || frc2 != 0) { println("EXL3FAIL32 fdalloc"); return 0 }
         if (cuMemcpyHtoD_v2(qd, trellis, tb) != 0) { println("EXL3FAIL32 htod1"); return 0 }
-        hwide = 0
-        bq = 0
-        while (bq < 8) {
-            hwide = hwide | (((cw >> (bq * 8)) & 255) << (bq * 8))
-            bq = bq + 1
-        }
-        if (cuMemcpyHtoD_v2(td, loc(hwide), 8) != 0) { println("EXL3FAIL32 htod2"); return 0 }
-        hwide = 0
-        bq = 0
-        while (bq < 8) {
-            hwide = hwide | (((ntiles >> (bq * 8)) & 255) << (bq * 8))
-            bq = bq + 1
-        }
-        if (cuMemcpyHtoD_v2(td + 8, loc(hwide), 8) != 0) { println("EXL3FAIL32 htod3"); return 0 }
-        if (cuMemcpyHtoD_v2(td + 16, body, nbody) != 0) { println("EXL3FAIL32 htod4"); return 0 }
-        lrcA<Int> = cuda_launch4i(from<loc<CVoid>>(fdeq32), ntiles, 1, 1, 256, 1, 1, qd, td, od, 0) as Int
-        srA<Int> = cuCtxSynchronize() as Int
-        if (lrcA != 0 || srA != 0) { println("EXL3FAIL32 deq"); return 0 }
         if (cuMemcpyHtoD_v2(sud, suh, nsuh) != 0) { println("EXL3FAIL32 htod5"); return 0 }
         if (cuMemcpyHtoD_v2(svd, svh, nsvh) != 0) { println("EXL3FAIL32 htod6"); return 0 }
+        # fused dq1s: dequant-in-registers + had1 in ONE launch (od never materialized)
         pq = 0
         while (pq < 6) {
             chq = 0
-            if (pq == 0) { chq = od }
-            if (pq == 1) { chq = td2 }
+            if (pq == 0) { chq = qd }
+            if (pq == 1) { chq = mda }
             if (pq == 2) { chq = hd_pre32 }
-            if (pq == 3) { chq = cw }
-            if (pq == 4) { chq = nbc }
-            if (pq == 5) { chq = nblocks }
+            if (pq == 3) { chq = td2 }
+            if (pq == 4) { chq = cw }
+            if (pq == 5) { chq = ivb }
             if (cuMemcpyHtoD_v2(pd + pq * 8, loc(chq), 8) != 0) { println("EXL3FAIL32 p1"); return 0 }
             pq = pq + 1
         }
-        lrcB<Int> = cuda_launch4i(from<loc<CVoid>>(fhad132), nblocks * 64, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
+        dqgrid<Int> = ntiles
+        lrcB<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), dqgrid, 1, 1, 256, 1, 1, pd, 0, 0, 0) as Int
         srB<Int> = cuCtxSynchronize() as Int
-        if (lrcB != 0 || srB != 0) { println("EXL3FAIL32 had1"); return 0 }
+        if (lrcB != 0 || srB != 0) { println("EXL3FAIL32 dq1s"); return 0 }
         pq = 0
         while (pq < 8) {
             chq = 0
@@ -2861,6 +2845,8 @@ main()<Int> -> {
     fhad132 = load_fn("native/build/exl3.ptx", "exl3had132")
     fhad232 = load_fn("native/build/exl3.ptx", "exl3had232")
     fcvt32 = load_fn("native/build/exl3.ptx", "exl3cvt32")
+    fdqs = load_fn("native/build/exl3dq.ptx", "exl3dq1s")
+    finv = load_fn("native/build/exl3.ptx", "exl3inv")
     if (fgemm == 0 || fbf == 0 || fdeq == 0 || fhgen == 0 || fhad1 == 0 || fhad2 == 0) {
         println("PF_FAIL kernels")
         return 4
@@ -2869,11 +2855,21 @@ main()<Int> -> {
         println("PF_FAIL kernels32")
         return 4
     }
+    if (fdqs == 0 || finv == 0) {
+        println("PF_FAIL kernelsdq")
+        return 4
+    }
     # Build the constant Hadamard/8 once; pass to every exl3_deq (see had_hoist).
     hdg<Int> = had_hoist(fhgen)
     if (hdg == 0) { println("PF_FAIL had_hoist"); return 6 }
     hdg32<Int> = had_hoist32(fhgen32)
     if (hdg32 == 0) { println("PF_FAIL had_hoist32"); return 6 }
+    # persistent map + inverse map for the fused deq+had1 kernel (built ONCE)
+    mapdev<Int> = 0
+    freedom {
+        mrc0<Int> = cuMemAlloc_v2(loc(mapdev), 8192) as Int
+        if (mrc0 != 0) { println("PF_FAIL mapdev"); }
+    }
     arA<Int> = 0
     arB<Int> = 0
     arC<Int> = 0
@@ -2899,6 +2895,21 @@ main()<Int> -> {
         ? -> { println("PF_FAIL no map.bin"); return 5 }
     }
     mapbody = mapd.substring(16, mapd.len())
+    nbmap<Int> = mapd.len() - 16
+    hp<Int> = 0
+    freedom {
+        cuMemcpyHtoD_v2(mapdev, mapd, mapd.len())
+        hrc3<Int> = cuMemAlloc_v2(loc(hp), 64) as Int
+        if (hrc3 == 0) {
+            cuMemcpyHtoD_v2(hp + 0, loc(mapdev), 8)
+            cuMemcpyHtoD_v2(hp + 8, loc(nbmap), 8)
+            lrcI<Int> = cuda_launch4i(from<loc<CVoid>>(finv), 1, 1, 1, 256, 1, 1, hp, 0, 0, 0) as Int
+            srI<Int> = cuCtxSynchronize() as Int
+            if (lrcI != 0 || srI != 0) { println("PF_FAIL invbuild") }
+            cuMemFree_v2(hp)
+        }
+    }
+    invbase<Int> = mapdev + 16 + nbmap
 
     # ---- embeddings for the prompt -> streams (HC copies) ----
     want<Vec<String>> = Vec()
@@ -3017,7 +3028,7 @@ main()<Int> -> {
         if (n < 3) {
             streams = ffn_dense_site(streams1, tab, dir, total, lpre, fgemm, fbf)
         } else {
-            streams = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, hdg, fdeq32, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI)
+            streams = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, hdg, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
         }
         if (streams.len() != R * HC * H) {
             println("PF_FAIL ffn layer " + n.to_string())
