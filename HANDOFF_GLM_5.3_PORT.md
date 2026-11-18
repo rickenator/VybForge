@@ -2435,6 +2435,21 @@ fused config for a clean A/B); (2) if the fused deq is genuinely slower at depth
 profile T_MOE deq vs depth — the earlier depth-growth pattern (1.8s -> 13s) may
 interact with the fused path's per-call trellis HtoD. Correctness is not in
 question; only the wall-clock claim awaits a clean measurement.
+A/B RESULT (same conditions, back-to-back 45-layer runs, Nov 17 late):
+  fresh-fd: PREFILL_OK 45, layer-total sum 1688.7s (deq 1178.1s, attn 393.9s)
+  fused:    PREFILL_OK 45, layer-total sum 2205.7s (deq 1558.0s, attn 506.4s)
+  -> fused deq ~32% slower, overall ~31% slower, BUT BOTH configs run ~2x slower
+  than the 13:54-era baseline (fresh-fd 28.1 min vs 13.9 min) — the machine is in
+  a degraded state, and the two runs' deep layers diverge wildly (freshfd L36+
+  attn ~1s vs fused ~10s; freshfd L9 ffn 61s vs fused L9 56s) — the noise floor
+  is larger than the effect. VERDICT: correctness of the fused path is PROVEN
+  (1.42e-6, full depth); the performance verdict is INCONCLUSIVE under current
+  conditions. The fused path is committed as HEAD (bit-identical, fewer launches,
+  no od materialization — structurally it should not be slower). Re-measure on a
+  quiet machine before any perf-based revert decision; if the fused deq is
+  confirmed slower at depth on a quiet machine, the likely suspect is the
+  32KB-static-shared/256-thread block shape (1KB used per block -> occupancy
+  cap) — retile to 128 threads x more blocks or shrink the shared reservation.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
