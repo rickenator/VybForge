@@ -2341,6 +2341,24 @@ dump instead of safetensors); compare with the probe's od at (0,0) and (32,0).
     at cw=4096 — a pre-existing correctness bug in the VALIDATED BASELINE, bigger
     than item 1 — escalate to Rick with the evidence before touching anything.
 Either way the arb3.py oracle machinery is the reference; keep it.
+RESOLVED — THE ENTIRE cw=4096 ANOMALY WAS AN EMPTY TENSOR (cvt_probe49):
+GXSIZES t6=0 s7=0 s8=0 gateTrellis=4194304. The probe's gx_resolve `want` list
+only ever contained the three GATE_proj names (trellis/suh/svh); gx_read(g,6/7/8)
+(down_proj) therefore returned EMPTY strings. Every down A/B run since probe37
+staged zero bytes: deq32 read its uninitialized 4MB qd arena, the fused kernels
+read uninitialized/adjacent memory past their zero-length stagings — the
+"factor-8 tile relation", the "row-32 boundary", the "od vs oracle mismatch"
+(1.7e-4 vs -0.773) were ALL artifacts of comparing garbage to garbage. The oracle
+arbitration (arb3.py) was correct machinery pointed at a non-event. What REMAINS
+true and verified: the fused kernel is FULL-BUFFER BIT-IDENTICAL to the separate
+path at cw=2048 (gate, real data, 0/4194304), the grid-coverage fix and T-layout
+fix are real and committed, and the driver's L3 divergence (the original 34%) is
+fully explained by those two bugs. NEXT ACTION (trivial): add the down tensor
+names to the probe's want list (pre + ".down_proj.trellis"/"suh"/"svh" at
+indices 6/7/8), rerun the A/B — the expected result with real data is
+DOWN_MISMATCH 0/4194304, after which item 1 integration resumes: fused path into
+glm_prefill (grid fix + T fix + per-tensor trellis staging), NLAYERS=6 gate vs
+prefill_vyb_45_tab.txt (expect ~3.4e-8), then the 45-layer acceptance.
 CRITICAL REFRAME (end of session): the driver's fresh-fd green CANNOT arbitrate
 deq placement correctness. The f64 gold was produced by the driver's OWN f64
 pipeline, which uses the same nbc = cw/16 tile-placement convention as the f32
@@ -2381,6 +2399,26 @@ the probe's wrong gidp — disregard it.) Candidates that fit an interleave:
     rows 32..47 and 0..15 band 8.
 Whichever side the gold supports, fix the other; do NOT re-integrate until the
 down A/B is 0/4194304 on both cw values.
+VICTORY (cvt_probe51): the down tensors were never resolved — the probe's want
+list had only the three gate_proj names, so gx_read(g,6/7/8) returned EMPTY
+strings (GXSIZES t6=0 in probe49/50 confirmed it); after adding the down names to
+`want` (indices 3/4/5 in the probe's 6-entry group) the A/B with REAL data gives:
+  DOWN_MISMATCH f32-pairs=0 of 4194304   (shared kernel, cw=4096, grid fix + T fix)
+  NAIVE_DOWN_MISMATCH f32-pairs=0 of 4194304  (naive kernel, independent path)
+BOTH FUSED KERNELS ARE BIT-IDENTICAL TO THE SEPARATE PATH AT BOTH GEOMETRIES.
+The factor-8 relation, the row-32 boundary, the od-vs-oracle mismatch and the
+baseline-correctness scare were ALL artifacts of the probe reading empty tensors
+— the driver deq32 was never wrong, the fused kernels were never wrong (after the
+two fixes), and no escalation is needed. ITEM 1's KERNEL IS FULLY VERIFIED:
+bit-identical at cw=2048 AND cw=4096, full buffer, real checkpoint data, both
+implementations. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
+glm_prefill integration (the reverted fused-path edits: fdqs/finv loads, persistent
+mapdev/invbase, exl3_deq32 fused section, tail_site threading) with TWO fixes over
+the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write
+(already in the kernel — the driver only needs the grid fix); then NLAYERS=6 gate
+vs prefill_vyb_45_tab.txt (expect ~3.4e-8), then the 45-layer acceptance and the
+new gold. The reverted integration diff is in git history (commit a9a06ec era) and
+the probe51 configuration is the reference for the staging pattern.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
