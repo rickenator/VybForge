@@ -2450,6 +2450,16 @@ A/B RESULT (same conditions, back-to-back 45-layer runs, Nov 17 late):
   confirmed slower at depth on a quiet machine, the likely suspect is the
   32KB-static-shared/256-thread block shape (1KB used per block -> occupancy
   cap) — retile to 128 threads x more blocks or shrink the shared reservation.
+FINAL A/B ON THE QUIET BOX (after Discord removal + browsers killed, GPU idle
+42C/P8, load 0.3): QUIET FUSED 45-layer layer-sum = 1067.9s (17.8 min) vs QUIET
+FRESH-FD = 1688.7s (28.1 min) — THE FUSED PATH IS ~37% FASTER. The earlier
+"fused is 31% slower" reading was entirely the degraded environment (noisy fused
+run: 2205.7s). Stable layers run at parity (L40/L44: 4.4-5.0s both); the
+scattered 50-72s spikes (quiet-fused L10/L30, freshfd L9/L20) hit both configs
+at random layers — a periodic machine stall (suspect: the idle open-webui/
+ComfyUI/cloudflared services or disk sync) — worth a separate look, not item 1.
+ITEM 1 IS COMPLETE: fused deq+had1 in glm_prefill, bit-identical band at full
+depth (1.42e-6), faster than the separate path under clean conditions.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
