@@ -2262,6 +2262,45 @@ tensor (expert group g of the probe), dump both the separate path's fdc/fd and t
 fused td2 for rows 32..47, and compare each against the oracle. Whoever matches
 the gold is right; fix the other. Do NOT re-integrate into glm_prefill until the
 down A/B is 0/4194304 on BOTH cw values.
+SLOTCHK/ODCHK (cvt_probe46) — the topology is now settled:
+  ODCHK: deq32's od(row 32, col 0) != od(row 0, col 1024) — the separate path's
+  dequantized buffer is plain row-major, NOT interleaved. Consistent with the
+  driver's fresh-fd green; the separate path is almost certainly correct.
+  SLOTCHK: naive td2(32,0) == separate td2(0,1024) EXACTLY (-5.97207e-06), while
+  naive(0,1024) != separate(0,1024). Working the tile algebra: fused-deq
+  tiles 512+k == deq32's tile 64+k — a FACTOR-8 tile-index disagreement between
+  the fused kernels and deq32 at cw=4096, beginning at EXACTLY tile 512
+  (byte 65536); tiles 0..511 agree (which is why rows 0..31 matched everywhere).
+  deq32's tile for (0, 1024+c) is 64 + c/16 (kbv=0, nbv=64 — nbv is 16-wide).
+  PRIME SUSPECT this pins it to: the probe helper's trellis staging for the down
+  tensor — the helper allocates its tq from the GATE tensor's length
+  (cuMemAlloc_v2(loc(tq), trellis.len())) and the down trellis may differ in
+  size/layout; OR the down trellis read (gx_read(g,6)) has a different on-disk
+  tile order that deq32's nbc=256 formula happens to decode correctly only in the
+  first 512 tiles... check FIRST (one print, no GPU): t6.len() vs gate
+  trellis.len(), and the return code of the helper's trellis HtoD for the down
+  call — if the helper's HtoD partially failed or tq is mis-sized, the separate
+  path's od rows >= 32 are polluted and the FUSED KERNELS ARE CORRECT (which
+  would flip the whole diagnosis: re-integrate the fused path with the grid fix
+  and gate NLAYERS=6 against prefill_vyb_45_tab.txt).
+CRITICAL REFRAME (end of session): the driver's fresh-fd green CANNOT arbitrate
+deq placement correctness. The f64 gold was produced by the driver's OWN f64
+pipeline, which uses the same nbc = cw/16 tile-placement convention as the f32
+path — a systematic placement error CANCELS EXACTLY between the f32 candidate and
+the f64 gold, and the gemm consumes the placement consistently, so every
+driver-internal gate passes regardless of whether the placement matches the
+checkpoint's true trellis layout. The ONLY true arbiter for "which trellis tile
+holds which weights" is the python reference decoder (gold_exl3_deq.py). The
+factor-8 relation (fused tile 512+k == deq32 tile 64+k at cw=4096, boundary
+exactly at tile 512) is the fingerprint to test against it: run the gold decoder
+on the down tensor and check which tile index it assigns to true (row 32, col 0)
+— 512 (fused right, driver convention wrong at cw=4096) or something decoding to
+deq32's od row 32 (separate right, fused wrong). If the FUSED side is right, the
+residual 'divergence' was the driver convention all along and item 1's fused path
+may already be correct — the NLAYERS=6 gate against the driver gold would then
+legitimately fail while the fused path matches the TRUE model, and the decision
+about which convention to ship belongs to Rick. DO NOT re-integrate until the
+gold arbitration is done; this is a correctness question, not a performance one.
 PERMUTATION SIGNATURE — CORRECTED (the probe45 gidp formula omitted had132's
 nbc=32 block factor; the raw finding stands, the interpretation changes): the
 probe found fused td2 gid 4096 == arD gid 131072. In had132's true layout

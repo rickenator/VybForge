@@ -608,6 +608,11 @@ main()<Int> -> {
                 chk2 = chk2 + 1
             }
             println("DOWN_MISMATCH f32-pairs=" + md2c.to_string() + " of 4194304 first=" + md2f1.to_string())
+            oa<Float> = dtoh(arC + (32 * 4096 + 0) * 4)
+            ob<Float> = dtoh(arC + (0 * 4096 + 1024) * 4)
+            oc<Float> = dtoh(arC + (33 * 4096 + 0) * 4)
+            od<Float> = dtoh(arC + (1 * 4096 + 1024) * 4)
+            println("ODCHK r32c01=" + oa.to_string() + " r0c1024=" + ob.to_string() + " eq=" + (oa == ob).to_string() + " | r33c01=" + oc.to_string() + " r1c1024=" + od.to_string() + " eq=" + (oc == od).to_string())
             # arbitration: naive dq1 (independent code path, no shared, standard stride) at cw=4096
             t2d<Int> = 0
             t2dc<Int> = cuMemAlloc_v2(loc(t2d), 33554432) as Int
@@ -628,6 +633,11 @@ main()<Int> -> {
                     nck = nck + 1
                 }
                 println("NAIVE_DOWN_MISMATCH f32-pairs=" + nm.to_string() + " of 4194304 first=" + nf.to_string() + " lrc=" + lrcN.to_string())
+                nv1<Float> = dtoh(t2d + 4096 * 8)
+                nv2<Float> = dtoh(arD + 4096 * 8)
+                nv3<Float> = dtoh(t2d + 131072 * 8)
+                nv4<Float> = dtoh(arD + 131072 * 8)
+                println("SLOTCHK naive(32,0)=" + nv1.to_string() + " sep(32,0)=" + nv2.to_string() + " naive(0,1024)=" + nv3.to_string() + " sep(0,1024)=" + nv4.to_string())
                 # permutation probe: which separate-output rows match fused rows 32/33 at col 0?
                 f32v<Float> = dtoh(t3 + (32 * 128) * 8)
                 f33v<Float> = dtoh(t3 + (33 * 128) * 8)
