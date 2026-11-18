@@ -2319,6 +2319,28 @@ cw=4096, the L3_MOE_ALL gate must be re-examined (what exactly did it gate?) and
 the whole driver deq needs the oracle treatment — this would ALSO mean the fused
 kernels were never the (only) problem. Keep arb3.py — it is the gold reference
 for all future deq arbitration (validated bit-exact against the loader).
+GROUND CHECK RESULT (cvt_probe47): GPU od(0,0:2) = -1.14441e-4 vs oracle
+What[0,0:2] = -9.08e-08 — three orders apart at element (0,0), inside the rows
+where ALL kernels agree. The GPU f32 deq32's down od does not match the oracle
+ANYWHERE sampled. WHY THIS IS POSSIBLE DESPITE THE GATES: L3_MOE_ALL_VYB (5.6e-8
+vs numpy gold) gated the F64 deq pipeline (fdeq/fhad1/fhad2 — the f64 kernels),
+not the f32 deq32 path; the f32 path was verified only against the driver's own
+f64 gold (3.4e-8 — self-consistent) plus the 8-element probe check on gate_proj.
+AND the oracle reads SAFETENSORS trellis bytes while the driver reads GX-PACKED
+bytes (gx_read) — if the gx packing reorders tiles relative to safetensors, the
+driver can be green and self-consistent while mis-decoding vs the checkpoint.
+(End-to-end HF/KLD verifications ran through the numpy/oracle path, so they
+validated the oracle decode, not the GPU gx-byte decode.)
+DECIDER (next session, one probe run + one python run): dump gx_read(g,6) (the
+down trellis AS THE DRIVER SEES IT) to a file from the probe; run the validated
+oracle What construction on THOSE bytes (arb3.py with trellis loaded from the
+dump instead of safetensors); compare with the probe's od at (0,0) and (32,0).
+  - oracle(gx-bytes) == od  -> the driver deq is correct FOR THE GX BYTE LAYOUT;
+    the fused kernels have a real tile-index bug at cw=4096 (fix the kernel);
+  - oracle(gx-bytes) != od  -> the driver deq32 itself mis-decodes its own bytes
+    at cw=4096 — a pre-existing correctness bug in the VALIDATED BASELINE, bigger
+    than item 1 — escalate to Rick with the evidence before touching anything.
+Either way the arb3.py oracle machinery is the reference; keep it.
 CRITICAL REFRAME (end of session): the driver's fresh-fd green CANNOT arbitrate
 deq placement correctness. The f64 gold was produced by the driver's OWN f64
 pipeline, which uses the same nbc = cw/16 tile-placement convention as the f32

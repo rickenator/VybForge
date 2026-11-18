@@ -608,6 +608,8 @@ main()<Int> -> {
                 chk2 = chk2 + 1
             }
             println("DOWN_MISMATCH f32-pairs=" + md2c.to_string() + " of 4194304 first=" + md2f1.to_string())
+            o0<Float> = dtoh(arC + 0 * 4)
+            println("OD00 od(0,0:2)=" + o0.to_string())
             oa<Float> = dtoh(arC + (32 * 4096 + 0) * 4)
             ob<Float> = dtoh(arC + (0 * 4096 + 1024) * 4)
             oc<Float> = dtoh(arC + (33 * 4096 + 0) * 4)
