@@ -2520,6 +2520,16 @@ bindings declared without a type annotation... note the probe4 result decides:
 if concat-born reassignments DO release, the bug is specific to the call-RHS
 transfer path (exprIsStringTransfer true skipping the old-value free); if both
 leak, the stringOverwrite detection itself fails for these bindings.
+FIXED (2026-11-18, Vyb fix/return-path-cleanup-v2 df129845): read_at now
+registers OWNED (refs=1) — the borrowed registration was the leak (the
+return-transfer chain never retained it, so the counter went 0 -> -1 on the
+first release and the entry never tombstoned). probe4 RSS FLAT (72->73MB over
+100 iterations). Suite 1358/1358 green. THE CHAIN'S RESIDUAL ~1.2GB/layer is
+localized to the loop-body Vec scope-exit frees (the same missing-release
+class, ~10 x 100MB bulk_dtoh Vecs per layer) — next: a Vec-counterpart probe
+(loop-body 16MB bulk_dtoh Vec churn) to confirm, then the Vec fix in the same
+ownership pass, then the chain gate -> DECODE_CHAIN_MATCH, the prefill
+re-measure, and the had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
 buffer: REG refs=1 (the owned birth ref) + 3 RETs (THREE retains: the optional's
 inner store, the shallow-copy's retain, the s-assignment's retain) = 4 refs;
