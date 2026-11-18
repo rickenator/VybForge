@@ -2262,6 +2262,25 @@ tensor (expert group g of the probe), dump both the separate path's fdc/fd and t
 fused td2 for rows 32..47, and compare each against the oracle. Whoever matches
 the gold is right; fix the other. Do NOT re-integrate into glm_prefill until the
 down A/B is 0/4194304 on BOTH cw values.
+PERMUTATION SIGNATURE FOUND (cvt_probe45): fused td2 row 32 == separate td2 row
+1024, fused row 33 == separate row 1025 (col 0; each fused row matched exactly one
+separate row). Signature: sep_row = (row % 32) + (row / 32) * 1024 — 32-row groups
+placed at stride 1024, identity for rows 0..31 (which is exactly why rows 0..31
+matched in every earlier probe). In deq terms: separate deq32 row 1024 (tile
+16384, kbv 64) holds the same values as fused tile 512 (kb16 2) — a 32x tile-index
+disagreement between the two paths' row-group placement at cw=4096. Note 1024 =
+nbc128(cw=4096) * 32 and 32 = rows/64: the scatter smells like a 128-row-block
+stride vs a 32-row-group stride interacting in ONE of the paths' od/td2 layout.
+Since the driver is green with the separate path, the working hypotheses are:
+  (i) the SEPARATE path scatters at cw=4096 and the driver's green is real because
+      the down GEMM consumes the same scattered layout consistently (the deq, the
+      had chain and the gemm all use the same wrong row stride -> self-consistent
+      wrongness that cancels in the layer digest ONLY IF the gemm reads with the
+      same convention — check how the ffn gemm indexes fdc rows);
+  (ii) the FUSED kernels scatter and the separate path is truly row-major.
+The python gold arbitration (above) settles it; alternatively dump deq32's od
+(pre-had1) rows 32..47 vs 1024..1039 and compare against the fused kernels' deq
+values directly. Do NOT re-integrate until down A/B is 0/4194304 on both cw.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
