@@ -2119,6 +2119,37 @@ measured per-layer costs. The f32 pipeline is at its current optimum. The next r
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
 
+### FUSED-DQ BUG LOCALIZED: correct at cw=2048, WRONG at cw=4096 (down_proj) — the probe's missing case
+The probe now runs BOTH geometries (extended glm_cvt_probe.vyb):
+  gate_proj  cw=2048 (tensors 0/1/2): MISMATCH f32-pairs=0 of 4194304      -> BIT-IDENTICAL
+  down_proj  cw=4096 (tensors 6/7/8): MISMATCH f32-pairs=4192256 of 4194304, first=8192 bytes
+                                      (= element 2048 = row 16, col 0)    -> WRONG
+Rows 0..15 are exact; everything with kb16 = row/16 >= 1 is wrong. That is precisely
+where the 16-row trellis tile index (tile16 = kb16*nbc16 + nb16, nbc16 = cw/16) starts
+varying, so the defect is a trellis-stride / tmp-layout assumption inside exl3dq1s that
+only holds when cw == 2048. The driver's gate and up deqs (EINTER=2048) are therefore
+fine; the down deq (H=4096) is garbage -- which is exactly the full-run divergence
+(L3 onward, abs 3.4e-1) and NOTHING else. The separate path (exl3deq32 + exl3had132)
+with the same cw=4096 is correct (DOWN_SEP rc=0 and the fresh-fd driver gates green),
+so the reference and the trellis layout are not in doubt: the bug is in the fused
+kernel's cw=4096 indexing.
+SUSPECTS, in order:
+  1. tile16 = kb16*nbc16 + nb16 -- verify nbc16 is the trellis's true fast-axis stride
+     by parameterising it (p+48) and testing stride 256 vs 128 at cw=4096; deq32 uses
+     nbc = cw/16 and is green, so if 256 fails the difference is elsewhere in the pair
+     (nb16 derivation vs deq32's tile->(kbv,nbv) direction).
+  2. the T (tmp) block layout: dq1s writes T[block*8192 + b2*128 + d] (64-row blocks),
+     exl3had132 reads T[(row/128)*16384 + (row%128)*128 + d] (128-row blocks). Both
+     linearise to row*128 + d, which is only shape-free while the column-band count
+     matches; at cw=4096 there are 32 column bands instead of 16 -- check whether the
+     tmp is really a flat row-major [rows,128] or a per-(row-band, col-band) blocked
+     buffer, and make dq1s agree with had232's actual convention.
+  3. block ordering rb64 = block/nbc128 vs the row-band-major assumption used by the
+     consumer.
+FIX PROTOCOL: parameterise the disputed stride, probe both cw values until
+MISMATCH=0 for BOTH, then re-integrate in glm_prefill and gate NLAYERS=6 against
+prefill_vyb_45_tab.txt (expect 3.4e-8), then the 45-layer acceptance.
+
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
 deq32+had132; persistent mapdev/invbase built once at startup by exl3inv; 3 launches:
