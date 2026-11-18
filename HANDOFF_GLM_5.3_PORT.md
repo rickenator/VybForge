@@ -2210,7 +2210,31 @@ launch with the gate trellis, bulk-copy t3 into it (DtoH t3 -> host String ->
 HtoD into the copy; no DtoD binding), relaunch with a DIFFERENT trellis
 (tq3/down already staged), then count pairs that changed — the changed count is
 exactly the number of slots the kernel wrote. 4194304 pairs expected if coverage
-is complete; 131072 if it is grid/32.
+is 131072 if it is grid/32.
+RESOLVED (cvt_probe41/42/43): THE COVERAGE BUG IS CONFIRMED AND FIXED. Probe41's
+full-buffer gate scan on the shared kernel: SHARED_MISMATCH 4063232 of 4194304,
+first=1048576 bytes = element 262144 = exactly 32 logical tiles x 8192 — the
+kernel computed 1/32 of the matrix and left stale memory elsewhere; the computed
+1/32 was bit-perfect. CAUSE: grid was ntiles/32 = 1024 CUDA blocks x 256 threads
+= 262144 threads, but each 64x128 tile needs 32 CUDA blocks (one row pair of 256
+threads each; phase 1 stages and phase 2 consumes the same pair within one CUDA
+block, so the design is self-consistent — it just needs the full grid). FIX:
+grid = ntiles (32768 blocks) for the shared launch. RESULTS (cvt_probe43):
+  gate  cw=2048, tmode=0: SHARED_MISMATCH 0 of 4194304  -> FULL-BUFFER BIT-IDENTICAL
+  down  cw=4096, tmode=0: DOWN_MISMATCH 3670016 of 4194304, first=8192 bytes
+        = element 4096 = row 32 (kb16=2) -> rows 0..31 now correct (was 0..15 at
+        grid 1024), kb16>=2 still wrong. Transposed tmode at full grid: all wrong
+        (probe42, first=0) — transposed eliminated for good.
+The grid fix is HOST-SIDE ONLY (no kernel change). The correctness boundary moved
+from row 16 to row 32 with the grid fix because the previously-"correct" rows 0..15
+at grid 1024 were real computations and rows 16..31 were stale-coincidence; at full
+grid rows 16..31 are computed and correct, so the residual cw=4096 defect now
+starts at kb16=2 (tile 512+). REMAINING STEP for item 1: arbitrate the down
+mismatch with the PYTHON GOLD (gold_exl3_deq.py) — dump the down td2 from BOTH the
+separate path and dq1s and see which one agrees with the oracle; if the separate
+path is the wrong one at cw=4096 the driver's fresh-fd green must be re-examined,
+if dq1s is wrong the defect is a tile>=512 read in the fused path only. The probe's
+down launch currently runs tmode=0 (tmD staged 0 in cvt_probe43 state).
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces

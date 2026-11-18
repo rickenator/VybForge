@@ -544,7 +544,7 @@ main()<Int> -> {
             tm0<Int> = 0
             cuMemcpyHtoD_v2(pp2 + 48, loc(tm0), 8)
             g0s<Int> = time_mono_millis()
-            lrcS<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 1024, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
+            lrcS<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 32768, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
             srS<Int> = cuCtxSynchronize() as Int
             g1s<Int> = time_mono_millis()
             println("INVBUILD sync=" + si.to_string())
@@ -560,6 +560,20 @@ main()<Int> -> {
                 println("SHARED dq1s[" + k3.to_string() + "]=" + SHV.get(k3).to_string() + " sep[" + k3.to_string() + "]=" + dtoh(arD + k3 * 8).to_string())
                 k3 = k3 + 1
             }
+            # full-buffer gate scan for the SHARED kernel: coverage + correctness in one number
+            smm<Int> = 0
+            sfi<Int> = 0
+            sck<Int> = 0
+            while (sck < 4194304) {
+                s1<Float> = dtoh(t3 + sck * 8)
+                s2<Float> = dtoh(arD + sck * 8)
+                if (s1 != s2) {
+                    smm = smm + 1
+                    if (smm == 1) { sfi = sck * 8 }
+                }
+                sck = sck + 1
+            }
+            println("SHARED_MISMATCH f32-pairs=" + smm.to_string() + " of 4194304 first=" + sfi.to_string())
             # ---- DOWN matrix A/B: cw=4096 (tensors 6/7/8) — the geometry the driver
             # ---- uses for down_proj, which the gate-only comparison above never covered
             t6<String> = gx_read(g, 6)
@@ -576,9 +590,9 @@ main()<Int> -> {
             }
             cw4<Int> = 4096
             cuMemcpyHtoD_v2(pp2 + 32, loc(cw4), 8)
-            tmD<Int> = 128
+            tmD<Int> = 0
             cuMemcpyHtoD_v2(pp2 + 48, loc(tmD), 8)
-            lrcD2<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 1024, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
+            lrcD2<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 32768, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
             srD2<Int> = cuCtxSynchronize() as Int
             println("DOWN_FUSED lrc=" + lrcD2.to_string() + " sync=" + srD2.to_string())
             md2c<Int> = 0
