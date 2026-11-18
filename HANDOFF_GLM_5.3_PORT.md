@@ -2431,7 +2431,24 @@ fine); a failed decchain.scope unit lingers. NEXT: reset the failed scope
 (systemctl --user reset-failed decchain.scope), re-run the gate, and if the
 SIGTERMs persist, find the killer (ps/eaudit or strace the make) before concluding
 anything about the port. The port itself looks correct — phase 1 ran clean to
-completion for the first time since the tab refactor. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
+completion for the first time since the tab refactor.
+KILLER IDENTIFIED (run 4 death trap + scope inspect): the scope's OOMPolicy=stop +
+MemoryMax=80G — the phase-2 heap STILL grows unboundedly and hits the 80G cap at
+phase-2 L28-L41; systemd SIGTERMs the unit (make: Terminated) — the first run's
+28-min survival and run 4's 28-min death are the same cap, reached at the same
+depth. The resolver DID fix phase 1 (45 layers clean inside the cap, vs the old
+phase-1 L12 OOM death); the residual growth is in PHASE 2. PHASE-2 HEAP HUNT
+(next session, first task): candidates in the phase-2 loop — (a) the per-expert
+gx_read trellis Strings (12MB x 8 experts/layer x 45 x 2 steps ~ 8.6GB cumulative
+if the Vyb heap does not return them despite the per-layer trim_heap); (b) the
+`lines = lines + dumps(...)` quadratic string concat (~160MB final, transient
+copies larger); (c) the per-step mapd/idxtext re-reads. DIAGNOSTIC: rerun with
+VYBFORGE_NSTEPS=1 — if the cap is still hit at the same LAYER, growth is
+per-layer; also watch /sys/fs/cgroup/.../decchain3.scope/memory.peak (the run-4
+trap already logs memory.peak to /tmp/death2_ps.txt — check it). NOTE: the cap
+hit at L28 (run 4) vs L41 (run 1) differs — the growth may be partly
+nondeterministic (GC timing), so a cap raise (MemoryMax=120G, the box has 125G)
+is a valid stopgap to get the gate GREEN while the leak is hunted. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
 glm_prefill integration (the reverted fused-path edits: fdqs/finv loads, persistent
 mapdev/invbase, exl3_deq32 fused section, tail_site threading) with TWO fixes over
 the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write
