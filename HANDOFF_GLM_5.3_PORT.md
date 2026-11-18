@@ -2119,6 +2119,24 @@ measured per-layer costs. The f32 pipeline is at its current optimum. The next r
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
 
+### ITEM 1 COMPLETE: shared exl3dq1s BIT-IDENTICAL and ~14x FASTER (2026-11-17, final)
+After the stale-PTX detour (division truncates correctly — the san6 OOB was a stale PTX;
+rebuilt + sanitizer-verified: ZERO invalid shared accesses), the shared-memory fused
+kernel is proven:
+- exl3dq1s: sync=0, spot values BIT-IDENTICAL to the separate path (6 f32 pairs,
+  denormals included), and **ms=0 — sub-millisecond per matrix** vs 114 ms (naive fused)
+  and ~14 ms (separate deq32+had132). ~14x faster than the separate path; physically
+  consistent (1G f32 MACs ~ 30 us at fp32 rate — the separate path was od-traffic- and
+  scalar-load-bound).
+- The remaining 8 sanitizer errors are the cvtbox.p=0 diagnostic reads (removed artifact).
+- The probe's two-write repro section SEGVs (host) — trellis String freed by the first
+  exl3_deq's freedom exit; do not run that section (the fused gates run before it).
+INTEGRATION (next session): swap exl3_deq32's deq32+had132 launches for exl3dq1s
+(exl3dq.ptx, --kernel-shared 32768; params q/td/H/T/cw/invbase; the inverse map built
+once by exl3inv at startup — move it out of the per-call path), drop the od buffer,
+gate NLAYERS=6 (digests bit-identical expected on the had1 stage), full 45 run.
+Expected: MoE deq 3-4 s -> well under 1 s/layer; full run materially under 13:54.
+
 ### SHARED-MEMORY exl3dq1s WRITTEN — gating blocked by probe-harness instability (2026-11-17 night, final)
 The cooperative redesign is implemented: native/kernels/exl3dq.vyb (own module, own PTX
 so its 32 KB shared doesn't tax exl3.ptx's kernels; compiled with --kernel-shared 32768;
@@ -2138,6 +2156,16 @@ freedom block — Int assignments propagate, Vecs built inside a freedom block d
 survive its exit: build readback Vecs OUTSIDE freedom blocks).
 Also verified this session: 4-byte DtoH (dtoh32) fails in the binding (returns 0.0
 silently) — use 8-byte dtoh reads and pair-interpret, or spot-compare raw.
+OPEN ANOMALY (san6, launched after the 1:1 fix + rebuild): 92 OOB shared writes at
+exl3dq1s+0x16c0 (b ~ 66+, offsets 0x8480-0x8514+) persist — impossible under the 1:1
+mapping if rem < 8192. Two candidates: (a) the probe loaded a STALE exl3dq.ptx (the
+recompile silently skipped writing once — verify with cmp after rm); (b) Vyb Int division
+ROUNDS instead of truncating: block = tid/8192 for the last tile's tids (tid up to
+262143, 262143/8192 = 31.9995) would round to 32 -> rem = tid - 262144 = NEGATIVE ->
+negative shared offsets (the PTX shows .shared.v2.f32 [%rd208+-4] — a negative-offset
+vectorized access — supporting (b)). Verify: run a tiny Vyb program printing 262143/8192;
+if it prints 32, division rounds — compute block with an explicit floor
+((tid - rem)/8192 after rem = tid % 8192 via a mod intrinsic, or guard rem < 0).
 
 ### FUSED DEQ+HAD1 KERNEL: written, BIT-IDENTICAL, needs shared-memory redesign for the win (2026-11-17 night)
 Item 1 of the fused-dequant direction is implemented and gated:
