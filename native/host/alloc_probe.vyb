@@ -1,0 +1,51 @@
+# Minimal allocator probe: allocate and drop 100 x 4MB Strings, then check RSS.
+# If the runtime frees them, RSS stays flat; if it grows ~400MB, the heap never releases.
+import io::{open_read, read_all, close}
+
+rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v * 4 / 1000
+}
+
+malloc_trim(pad<Int>)<CInt>
+extern "C" {
+    malloc_trim(pad<Int>)<CInt>
+}
+
+main()<Int> -> {
+    println("RSS start " + rss_mb().to_string() + "MB")
+    keep<String> = ""
+    i<Int> = 0
+    while (i < 100) {
+        blk<String> = ""
+        match (open_read("/home/rick/Projects/VybForge/native/exl3/map.bin")) {
+            f -> { match (read_all(f)) { s -> { blk = s } ? -> { return 1 } } close(f) }
+            ? -> { return 1 }
+        }
+        # grow blk to ~4MB by self-concatenation (map.bin is 4KB)
+        j<Int> = 0
+        while (j < 10) { blk = blk + blk; j = j + 1 }
+        if (i == 50) { keep = blk }
+        i = i + 1
+    }
+    println("RSS after 100x4MB alloc+drop " + rss_mb().to_string() + "MB")
+    freedom {
+        t<Int> = malloc_trim(0) as Int
+        println("trim ret " + t.to_string() + " RSS " + rss_mb().to_string() + "MB")
+    }
+    println("kept one 4MB block; RSS final " + rss_mb().to_string() + "MB")
+    return 0
+}

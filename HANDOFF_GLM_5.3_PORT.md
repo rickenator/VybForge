@@ -2448,7 +2448,25 @@ per-layer; also watch /sys/fs/cgroup/.../decchain3.scope/memory.peak (the run-4
 trap already logs memory.peak to /tmp/death2_ps.txt — check it). NOTE: the cap
 hit at L28 (run 4) vs L41 (run 1) differs — the growth may be partly
 nondeterministic (GC timing), so a cap raise (MemoryMax=120G, the box has 125G)
-is a valid stopgap to get the gate GREEN while the leak is hunted. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
+is a valid stopgap to get the gate GREEN while the leak is hunted.
+LEAK LOCALIZED (decchain_strstats3, vyb_str_stats wired into the RSS probe):
+str_stats: live=762453 tombs=36049 cap=2097152 retained_pool=4943761165745373450
+— the string REGISTRY holds 762K live entries growing thousands per layer (the
+per-layer tensor reads + concat intermediates register and never release), and
+the pool's retained counter is CORRUPT (4.94e18 — overflowed/double-subtracted,
+which breaks the pool's 8GB retention-cap logic). The prefill's 45-layer loops
+never leaked (2h11m run completes), so the leak is chain-phase-2-specific: some
+phase-2 codegen path registers Strings without emitting the matching release.
+THIS IS A VYB COMPILER BUG (cgen_ownership.cpp / cgen_string.cpp register-release
+pairing) — Rick authorized fixing Vyb. NEXT SESSION (first task): audit the
+register/release pairing for the phase-2 loop's String-producing paths (gx_read
+results, substring, read_all, concat temps, the borrow() pass's retain/release
+pairing — MY borrow() pass may add retain-without-release on top of a pre-existing
+base leak; the base leak predates the pass, run 1 leaked 1.1GB/layer before it).
+Also check the pool retained-counter corruption (the absorb/double-free path's
+`g_vyb_pool_retained -= n->size` — a double-absorb subtracts twice). The probe
+harness: native/host/alloc_probe.vyb (100x4MB alloc+drop -> RSS 71->601MB, trim
+releases nothing — every dropped String leaks at the registry). REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
 glm_prefill integration (the reverted fused-path edits: fdqs/finv loads, persistent
 mapdev/invbase, exl3_deq32 fused section, tail_site threading) with TWO fixes over
 the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write

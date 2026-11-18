@@ -386,6 +386,7 @@ main()<Int> -> {
         while (i < 512) { ckvs.push(ckvAll.get(i)); i = i + 1 }
         lines = lines + dumps("p1ck" + n.to_string(), ckvs) + "\n"
         println("phase1 layer " + n.to_string() + " done")
+        println("RSS n=" + n.to_string() + " " + rss_mb().to_string() + "MB")
         lines = lines + "phase1 layer " + n.to_string() + " " + digest("streams", streams) + "\n"
         n = n + 1
     }
@@ -1438,6 +1439,7 @@ main()<Int> -> {
             lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp) + "\n"
             streams = streams2
             i = trim_heap()
+            println("RSS step" + t.to_string() + " n=" + n.to_string() + " " + rss_mb().to_string() + "MB")
             n = n + 1
         }
 

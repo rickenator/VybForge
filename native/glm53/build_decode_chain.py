@@ -78,6 +78,7 @@ extern "C" {
     cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
     cuCtxSynchronize()<CInt>
     cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
+    vyb_str_stats()<CInt>
     cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
     cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
@@ -138,6 +139,29 @@ vecf()<Vec<Float>> -> {          # a typed empty Vec<Float> (a bare `x = Vec()` 
 ''')
 r0a, r0b = find_fn('di')[0], find_fn('hc_apply')[1]
 w(lines(r0a, r0b))          # di .. hc_apply
+w('')
+rssmb = '''rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    freedom {
+        vyb_str_stats()
+    }
+    return v * 4 / 1000
+}
+'''
+w(rssmb)               # RSS probe in Vyb (reads /proc/self/statm, MB)
 w('')
 ra, rb = find_fn('gx_resolve_tab')
 w(lines(ra, rb))       # gx_resolve_tab: table-driven resolve (no runtime json_parse)
