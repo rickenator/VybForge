@@ -511,6 +511,58 @@ main()<Int> -> {
         println("RAW dq1[" + k0.to_string() + "]=" + DQ.get(k0).to_string() + " sep[" + k0.to_string() + "]=" + SV.get(k0).to_string())
         k0 = k0 + 1
     }
+    # ---- shared-memory fused kernel gate: T3 vs arD, timed ----
+    fdqs<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s")
+    freedom {
+        md2<Int> = 0
+        t3<Int> = 0
+        pp2<Int> = 0
+        tq2<Int> = 0
+        m2<Int> = cuMemAlloc_v2(loc(md2), 8192) as Int
+        t3c<Int> = cuMemAlloc_v2(loc(t3), 33554432) as Int
+        p2c<Int> = cuMemAlloc_v2(loc(pp2), 64) as Int
+        q2c<Int> = cuMemAlloc_v2(loc(tq2), trellis.len()) as Int
+        if (m2 == 0 && t3c == 0 && p2c == 0 && q2c == 0) {
+            cuMemcpyHtoD_v2(md2, mapd, mapd.len())
+            nb2<Int> = mapd.len() - 16
+            cuMemcpyHtoD_v2(tq2, trellis, trellis.len())
+            # inv build staging: p+0 = td(map), p+8 = nbody
+            cuMemcpyHtoD_v2(pp2 + 0, loc(md2), 8)
+            cuMemcpyHtoD_v2(pp2 + 8, loc(nb2), 8)
+            li<Int> = cuda_launch4i(from<loc<CVoid>>(finv), 1, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
+            si<Int> = cuCtxSynchronize() as Int
+            # dqs staging: p+0 q, +8 td, +16 H, +24 T, +32 cw, +40 invbase
+            cuMemcpyHtoD_v2(pp2 + 0, loc(tq2), 8)
+            cuMemcpyHtoD_v2(pp2 + 8, loc(md2), 8)
+            cuMemcpyHtoD_v2(pp2 + 16, loc(hdg32), 8)
+            cuMemcpyHtoD_v2(pp2 + 24, loc(t3), 8)
+            cw3<Int> = 2048
+            cuMemcpyHtoD_v2(pp2 + 32, loc(cw3), 8)
+            invb2<Int> = md2 + 16 + nb2
+            cuMemcpyHtoD_v2(pp2 + 40, loc(invb2), 8)
+            g0s<Int> = time_mono_millis()
+            lrcS<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), 1024, 1, 1, 256, 1, 1, pp2, 0, 0, 0) as Int
+            srS<Int> = cuCtxSynchronize() as Int
+            g1s<Int> = time_mono_millis()
+            println("INVBUILD sync=" + si.to_string())
+            println("FUSED_SHARED lrc=" + lrcS.to_string() + " sync=" + srS.to_string() + " ms=" + (g1s - g0s).to_string())
+            SHV<Vec<Float>> = Vec()
+            sj<Int> = 0
+            while (sj < 6) {
+                SHV.push(dtoh(t3 + sj * 8))
+                sj = sj + 1
+            }
+            k3<Int> = 0
+            while (k3 < 6) {
+                println("SHARED dq1s[" + k3.to_string() + "]=" + SHV.get(k3).to_string() + " sep[" + k3.to_string() + "]=" + SV.get(k3).to_string())
+                k3 = k3 + 1
+            }
+        }
+        cuMemFree_v2(md2)
+        cuMemFree_v2(t3)
+        cuMemFree_v2(pp2)
+        cuMemFree_v2(tq2)
+    }
     # ---- two-write repro: churn with ANOTHER module's kernels, then write arF again ----
     fb<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
     ci<Int> = 0

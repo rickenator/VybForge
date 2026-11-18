@@ -1,0 +1,107 @@
+// Fused EXL3 dequant + column transform, SHARED-MEMORY COOPERATIVE version.
+// Block = one 64-row x 128-col What tile: phase 1 cooperatively dequantizes the
+// packed slab into shared memory (32 KB f32), kernel_barrier, phase 2 runs the
+// 128-tap column transform reading shared — the expanded What is never
+// materialized in global memory and each packed element is dequantized EXACTLY
+// ONCE (the naive per-output variant paid 128x redundant dequant).
+// Bit-exact vs exl3deq32+exl3had132: same f32 values, same c-ascending order.
+// Compile: --kernel-shared 32768. Params (launch4i, all through the p buffer):
+// p: +0 q(trellis dev)  +8 td(map body + inverse map)  +16 H(f32)  +24 T(f32)
+//    +32 cw             +40 invbase (td + 16 + nbody)
+// Grid: (rows/64) * (cw/128) blocks x 256 threads; rows = ntiles*256/cw.
+share(all) fp16_to_f64(b<Int>)<Float> -> {
+    sb<Int> = (b >> 15) & 1
+    eb<Int> = (b >> 10) & 31
+    mb<Int> = b & 1023
+    v<Float> = 0.0
+    if (eb == 0) {
+        v = mb as Float
+        k<Int> = 0
+        while (k < 24) {
+            v = v * 0.5
+            k = k + 1
+        }
+    } else {
+        if (eb == 31) {
+            v = 65504.0
+        } else {
+            v = (1024 + mb) as Float
+            sh<Int> = eb - 25
+            while (sh > 0) {
+                v = v * 2.0
+                sh = sh - 1
+            }
+            while (sh < 0) {
+                v = v * 0.5
+                sh = sh + 1
+            }
+        }
+    }
+    if (sb == 1) {
+        v = 0.0 - v
+    }
+    return v
+}
+
+exl3dq1s(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 32)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 8192
+    rem<Int> = tid - block * 8192
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 0)
+    td<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    T<Int> = ld_i64(p + 24)
+    inv<Int> = ld_i64(p + 40)
+
+    # ---- phase 1: one element per thread (8192 threads = 8192 elements) ----
+    e<Int> = rem
+    b<Int> = e / 128
+    c<Int> = e - b * 128
+    row<Int> = rb64 * 64 + b
+    col<Int> = nb128 * 128 + c
+    kb16<Int> = row / 16
+    r16<Int> = row - kb16 * 16
+    nb16<Int> = col / 16
+    c16<Int> = col - nb16 * 16
+    tile16<Int> = kb16 * nbc16 + nb16
+    slotU<UInt32> = ld_u32(inv + (r16 * 16 + c16) * 4)
+    slot<Int> = slotU as Int
+    base<Int> = td + 16 + slot * 16
+    w16<Int> = 0
+    i<Int> = 0
+    while (i < 4) {
+        nidx<Int> = ld_u16(base + i * 2) as Int
+        pp<Int> = (ld_i8(base + 8 + i) as Int) & 255
+        wb<Int> = q + tile16 * 128 + (nidx / 4) * 2 + (nidx % 4) / 2
+        by<Int> = (ld_i8(wb) as Int) & 255
+        sh<Int> = ((nidx % 4) % 2) * 4
+        nib<Int> = (by >> sh) & 15
+        w16 = w16 | (nib << (pp * 4))
+        i = i + 1
+    }
+    prod<Int> = (w16 * 3417055213) & 4294967295
+    y<Int> = (prod & 2415890431) ^ 996162400
+    lo<Float> = fp16_to_f64(y & 65535)
+    hi<Float> = fp16_to_f64((y >> 16) & 65535)
+    st_shared_f32(b * 512 + c * 4, (lo + hi) as Float32)
+
+    kernel_barrier()
+
+    # ---- phase 2: one output per thread ----
+    e2<Int> = rem
+    b2<Int> = e2 / 128
+    d<Int> = e2 - b2 * 128
+    acc<Float32> = 0.0
+    c2<Int> = 0
+    while (c2 < 128) {
+        acc = acc + ld_shared_f32(b2 * 512 + c2 * 4) * ld_f32n(H + (c2 * 128 + d) * 4)
+        c2 = c2 + 1
+    }
+    st_f32(T + (block * 8192 + e2) * 4, acc)
+}
+

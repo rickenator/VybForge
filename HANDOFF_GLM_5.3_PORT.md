@@ -2119,6 +2119,26 @@ measured per-layer costs. The f32 pipeline is at its current optimum. The next r
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
 
+### SHARED-MEMORY exl3dq1s WRITTEN — gating blocked by probe-harness instability (2026-11-17 night, final)
+The cooperative redesign is implemented: native/kernels/exl3dq.vyb (own module, own PTX
+so its 32 KB shared doesn't tax exl3.ptx's kernels; compiled with --kernel-shared 32768;
+note the flag CAPS at 49152 — the 64 KB f32 tile became a 64-row x 128-col tile = 32 KB).
+Block = one 64x128 tile, 256 threads, ONE element + ONE output per thread (8192 threads
+per tile — the initial per-thread k-loops double-covered the tile and wrote 1 MB past the
+32 KB shared window; caught by memcheck as shared writes at 0x8480/0x8500), kernel_barrier,
+phase 2 reads shared. fp16_to_f64 copied into the module (kernel files don't share fns).
+GATING BLOCKED: the probe SEGVs inside the shared-gate block before FUSED_SHARED prints —
+most likely the first exl3_deq's freedom exit frees the trellis String (born elsewhere —
+the documented hazard) and the shared gate's trellis.len()/HtoD then reads freed host
+memory (nondeterministic; the naive gate's identical read survived by luck). FIX NEXT
+SESSION: in glm_cvt_probe.vyb, re-read trellis/suh/svh via gx_read FRESH inside the shared
+gate block (or capture trellis.len() into an Int BEFORE the first exl3_deq), then gate:
+T3 spot-compare vs arD (the compare code is in place, reading t2out/arD outside the
+freedom block — Int assignments propagate, Vecs built inside a freedom block do NOT
+survive its exit: build readback Vecs OUTSIDE freedom blocks).
+Also verified this session: 4-byte DtoH (dtoh32) fails in the binding (returns 0.0
+silently) — use 8-byte dtoh reads and pair-interpret, or spot-compare raw.
+
 ### FUSED DEQ+HAD1 KERNEL: written, BIT-IDENTICAL, needs shared-memory redesign for the win (2026-11-17 night)
 Item 1 of the fused-dequant direction is implemented and gated:
 - `exl3dq1` (native/kernels/exl3.vyb): one thread per tmp element, dequantizes the packed
