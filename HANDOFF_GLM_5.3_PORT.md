@@ -2411,7 +2411,27 @@ baseline-correctness scare were ALL artifacts of the probe reading empty tensors
 — the driver deq32 was never wrong, the fused kernels were never wrong (after the
 two fixes), and no escalation is needed. ITEM 1's KERNEL IS FULLY VERIFIED:
 bit-identical at cw=2048 AND cw=4096, full buffer, real checkpoint data, both
-implementations. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
+implementations.
+TAB-RESOLVER PORT TO THE CHAIN DRIVER — COMPLETE, COMPILES, GATE PENDING (Nov 18):
+build_decode_chain.py refactored to name-based lifts (find_fn/region helpers — the
+hardcoded line ranges had gone stale against the tab-refactored glm_prefill), lifts
+gx_resolve_tab + exl3_deq + exl3_deq32 + had_hoist/had_hoist32 from the current
+glm_prefill, and post-processes the output with a borrow() pass (the current codegen
+requires explicit borrow() for owned -> their<Vec<Float> const> args; the regex
+excludes defs via a comma lookahead and already-borrowed calls). The snippet gained:
+the tab-build shard walk (renamed locals), tab threading through every resolve and
+site callsite, the f32 loads + hoists + arena + mapdev/invbase setup, and hdg on the
+mtp_layer_step callsites. glm_prefill's last two gx_resolve calls (dsa_attn_site +
+the embeddings) also swapped to gx_resolve_tab. REGENERATED chain compiles clean
+(semantic + codegen). GATE STATUS: two runs SIGTERMed externally — run 1 survived
+28 min through phase 1 (all 45 layers, ZERO failures, no OOM at the 80G cap — the
+resolver fixed the phase-1 heap death) into phase 2 layer 41; run 3 died in ~2 min.
+The killer is external (make reported plain SIGTERM; oomd never fired, memory was
+fine); a failed decchain.scope unit lingers. NEXT: reset the failed scope
+(systemctl --user reset-failed decchain.scope), re-run the gate, and if the
+SIGTERMs persist, find the killer (ps/eaudit or strace the make) before concluding
+anything about the port. The port itself looks correct — phase 1 ran clean to
+completion for the first time since the tab refactor. REMAINING FOR ITEM 1 (mechanical, next session): re-apply the
 glm_prefill integration (the reverted fused-path edits: fdqs/finv loads, persistent
 mapdev/invbase, exl3_deq32 fused section, tail_site threading) with TWO fixes over
 the reverted state: dqgrid = ntiles (NOT ntiles/32) and the T-layout gidT write

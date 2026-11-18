@@ -2556,7 +2556,7 @@ dsa_attn_site(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<S
     w.push(lpre + "hc_attn_base")
     w.push(lpre + "hc_attn_scale")
     w.push(lpre + "input_layernorm.weight")
-    g<GxLoc> = gx_resolve(dir, total, w)
+    g<GxLoc> = gx_resolve_tab(tab, dir, total, w)
     j = 0
     while (j < w.len()) {
         if (g.found.get(j) == 1) { nfound = nfound + 1 }
@@ -2914,7 +2914,7 @@ main()<Int> -> {
     # ---- embeddings for the prompt -> streams (HC copies) ----
     want<Vec<String>> = Vec()
     want.push("model.language_model.embed_tokens.weight")
-    ge<GxLoc> = gx_resolve(dir, total, want)
+    ge<GxLoc> = gx_resolve_tab(tab, dir, total, want)
 
     # ---------------------------------------------------------------- embeddings
     ids<Vec<Int>> = Vec()
