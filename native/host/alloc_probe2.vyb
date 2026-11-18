@@ -1,0 +1,61 @@
+# Small-string churn probe: 20k x ~200B strings created and dropped. If the
+# registry releases them, live stays flat; if live grows by 20k, the leak is in
+# the small-string register/release pairing.
+import io::{open_read, read_all, close}
+
+rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v * 4 / 1000
+}
+
+extern "C" {
+    vyb_str_stats()<CInt>
+}
+
+main()<Int> -> {
+    println("RSS start " + rss_mb().to_string() + "MB")
+    freedom { vyb_str_stats() }
+    acc<Float> = 0.0
+    i<Int> = 0
+    while (i < 20000) {
+        s<String> = "item " + i.to_string() + " payload " + (i * 7).to_string() + " tail " + (i % 13).to_string()
+        acc = acc + s.len() as Float
+        i = i + 1
+    }
+    println("RSS after 20k small strings " + rss_mb().to_string() + "MB acc=" + acc.to_string())
+    freedom { vyb_str_stats() }
+    t<Int> = 0
+    while (t < 20000) {
+        d<String> = dumps_like(t)
+        acc = acc + d.len() as Float
+        t = t + 1
+    }
+    println("RSS after 20k dumps-like " + rss_mb().to_string() + "MB acc=" + acc.to_string())
+    freedom { vyb_str_stats() }
+    return 0
+}
+
+dumps_like(t<Int>)<String> -> {
+    # mimic dumps(): a growing concat of per-element to_string temps
+    out<String> = "d" + t.to_string() + " ["
+    j<Int> = 0
+    while (j < 32) {
+        out = out + (j * t).to_string()
+        if (j < 31) { out = out + "," }
+        j = j + 1
+    }
+    return out + "]"
+}

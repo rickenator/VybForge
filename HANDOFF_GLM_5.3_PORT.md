@@ -2483,6 +2483,24 @@ reads; bulk_dtoh Vecs if their scope-exit frees miss). ALSO: the str_stats outpu
 showed the pool retained counter CORRUPT (4.94e18) — audit the absorb path's
 `g_vyb_pool_retained -= n->size` for a double-subtract. All machinery (RSS probes,
 str_stats wiring, bind_gx_reads.py) is committed and reusable.
+LEAK REPRODUCED AND ISOLATED (alloc_probe3.vyb, committed): 200 x 32 read_at
+drops -> str_stats live grows +32 entries +4.2MB PER ITERATION (live_bytes
+exactly = the dropped read_at buffers), RSS 69 -> 112MB monotonic,
+retained_pool=0 (the pool is not involved). read_all (plain String) recycles
+cleanly; read_at (String? — an OPTIONAL unwrap) leaks EVERY buffer. ROOT CAUSE:
+the ownership pass does not emit the scope-exit release for an optional-unwrapped
+String — the read_at buffer is registered refs=0 (borrowed), the first holder
+retains (refs=1), and the match arm's release never fires, so the buffer pins at
+refs=1 forever. THE VYB FIX (next session, first task): in src/vre/llvm/
+cgen_ownership.cpp (and/or cgen_stmt.cpp's match-arm handling), emit the release
+for a String bound from a String? unwrap (the `s -> { ... }` arm of
+`match (read_at(...))`) at the arm's scope exit — the same release the
+plain-String match arm already emits. Repro: native/host/alloc_probe3.vyb (200
+iters, +4.2MB/iter, live_bytes == dropped bytes exactly). IMPACT: EVERY gx_read
+in every driver leaks its tensor bytes — the prefill's 45-layer runs leak ~54GB
+(masked by the raised caps), the chain dies at 80G. Fix in Vyb, rebuild, rerun
+alloc_probe3 (live_bytes must stay flat), then the chain gate ->
+DECODE_CHAIN_MATCH, then the had_hoist mirror.
 LEAK ROOT-CAUSED (VYB_STR_TRACE=1 on alloc_probe + the chain): the probe's 530MB
 is POOL RETENTION by design (freed 4MB blocks recycle in the pool's buckets, cap
 8GB) — the probe does NOT leak. The CHAIN's leak: ~58K live registry strings per

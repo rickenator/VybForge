@@ -1,0 +1,57 @@
+# read_at churn probe: 200 x 4MB read_at drops (the chain's gx_read pattern).
+import io::{open_read, read_at, read_all, close}
+
+rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v * 4 / 1000
+}
+
+extern "C" {
+    vyb_str_stats()<CInt>
+}
+
+main()<Int> -> {
+    println("RSS start " + rss_mb().to_string() + "MB")
+    freedom { vyb_str_stats() }
+    path<String> = "/home/rick/Projects/VybForge/native/exl3/map.bin"
+    acc<Float> = 0.0
+    i<Int> = 0
+    while (i < 200) {
+        match (open_read(path)) {
+            f -> {
+                # 32 x 128KB read_at drops per iteration = 4MB churned per iter
+                k<Int> = 0
+                while (k < 32) {
+                    match (read_at(f, 0, 131072)) {
+                        s -> { acc = acc + s.len() as Float }
+                        ? -> { return 2 }
+                    }
+                    k = k + 1
+                }
+                close(f)
+            }
+            ? -> { return 2 }
+        }
+        if (i % 50 == 0) {
+            println("RSS i=" + i.to_string() + " " + rss_mb().to_string() + "MB")
+            freedom { vyb_str_stats() }
+        }
+        i = i + 1
+    }
+    println("RSS final " + rss_mb().to_string() + "MB acc=" + acc.to_string())
+    freedom { vyb_str_stats() }
+    return 0
+}
