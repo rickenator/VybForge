@@ -2119,6 +2119,29 @@ measured per-layer costs. The f32 pipeline is at its current optimum. The next r
 optimization targets are the hc-mix/attention streaming and (structural) the fused
 dequant+gemm, both out of scope for the closed sync=700 item.
 
+### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
+The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
+deq32+had132; persistent mapdev/invbase built once at startup by exl3inv; 3 launches:
+dq1s -> had232 -> cvt32; od never materialized). RESULT: NLAYERS=6 PREFILL_OK and MUCH
+faster (L4 total 4.8 s vs 5.7 fresh-fd; deq 2.1-2.4 s vs 2.9-3.1) — BUT the layer digests
+DIVERGE from the f64 gold starting at L3: abs rel 3.4e-1, sq 5.4e-1 (the fresh-fd config:
+3.4e-8/6.3e-8). The divergence starts exactly at the first fused-deq layer.
+CONTRADICTION: the probe proves the fused kernel's td2 output is BIT-IDENTICAL to the
+separate path across the ENTIRE 8.4M-element buffer (MISMATCH f32-pairs=0 of 4194304,
+cvt_probe35.log) for expert-0 gate_proj — yet the full driver run diverges. The map is a
+verified bijection (256 unique (r,c), no duplicates, r/c in 0..15 — scanned map.bin
+directly). The exl3inv build syncs clean. Everything analytically checks out.
+OPEN BUG: the driver context differs from the probe in ways that matter — candidates:
+(1) the probe tested ONE matrix; the driver runs 288 experts x 3 matrices back-to-back
+sharing the arena — a state/race the single-shot probe cannot see; (2) the persistent
+mapdev/invbase interact with later allocations; (3) an interaction with the driver's
+other concurrent state. NEXT: in-driver A/B — dump the fused vs separate td2 for the
+FIRST expert INSIDE glm_prefill (both paths in one run, same expert) and diff; if they
+differ in-driver but not in the probe, the driver's arena/state is the difference; if
+identical, walk experts until the divergence appears. glm_prefill REVERTED to the
+committed fresh-fd green state (13:54, digests <=1.4e-6 verified) — the fused kernels +
+probe + all evidence remain committed for the follow-up.
+
 ### ITEM 1 COMPLETE: shared exl3dq1s BIT-IDENTICAL and ~14x FASTER (2026-11-17, final)
 After the stale-PTX detour (division truncates correctly — the san6 OOB was a stale PTX;
 rebuilt + sanitizer-verified: ZERO invalid shared accesses), the shared-memory fused

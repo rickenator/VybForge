@@ -498,19 +498,20 @@ main()<Int> -> {
         cuMemFree_v2(md)
         cuMemFree_v2(pp)
     }
-    DQ<Vec<Float>> = Vec()
-    SV<Vec<Float>> = Vec()
-    dq0<Int> = 0
-    while (dq0 < 6) {
-        DQ.push(dtoh(t2out + dq0 * 8))
-        SV.push(dtoh(arD + dq0 * 8))
-        dq0 = dq0 + 1
+    mm<Int> = 0
+    first1<Int> = 0
+    first2<Int> = 0
+    chk<Int> = 0
+    while (chk < 4194304) {
+        a1<Float> = dtoh(t2out + chk * 8)
+        a2<Float> = dtoh(arD + chk * 8)
+        if (a1 != a2) {
+            mm = mm + 1
+            if (mm == 1) { first1 = chk * 8; first2 = chk * 8 + 4 }
+        }
+        chk = chk + 1
     }
-    k0<Int> = 0
-    while (k0 < 6) {
-        println("RAW dq1[" + k0.to_string() + "]=" + DQ.get(k0).to_string() + " sep[" + k0.to_string() + "]=" + SV.get(k0).to_string())
-        k0 = k0 + 1
-    }
+    println("MISMATCH f32-pairs=" + mm.to_string() + " of 4194304; first pair idx bytes " + first1.to_string() + "/" + first2.to_string())
     # ---- shared-memory fused kernel gate: T3 vs arD, timed ----
     fdqs<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s")
     freedom {
@@ -554,7 +555,7 @@ main()<Int> -> {
             }
             k3<Int> = 0
             while (k3 < 6) {
-                println("SHARED dq1s[" + k3.to_string() + "]=" + SHV.get(k3).to_string() + " sep[" + k3.to_string() + "]=" + SV.get(k3).to_string())
+                println("SHARED dq1s[" + k3.to_string() + "]=" + SHV.get(k3).to_string() + " sep[" + k3.to_string() + "]=" + dtoh(arD + k3 * 8).to_string())
                 k3 = k3 + 1
             }
         }
@@ -563,42 +564,6 @@ main()<Int> -> {
         cuMemFree_v2(pp2)
         cuMemFree_v2(tq2)
     }
-    # ---- two-write repro: churn with ANOTHER module's kernels, then write arF again ----
-    fb<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
-    ci<Int> = 0
-    while (ci < 10) {
-        freedom {
-            q2<Int> = 0
-            o2<Int> = 0
-            cq<Int> = cuMemAlloc_v2(loc(q2), 2097152) as Int
-            co<Int> = cuMemAlloc_v2(loc(o2), 8388608) as Int
-            if (cq == 0 && co == 0) {
-                cb<Int> = cuda_launch4i(from<loc<CVoid>>(fb), 4096, 1, 1, 256, 1, 1, q2, o2, 1048576, 0) as Int
-                cs<Int> = cuCtxSynchronize() as Int
-                println("CHURN " + ci.to_string() + " rc=" + cb.to_string() + "/" + cs.to_string())
-            }
-            cuMemFree_v2(q2)
-            cuMemFree_v2(o2)
-        }
-        ci = ci + 1
-    }
-    println("CHURN done")
-    println("CHURN done")
-    # driver-level write to arF after churn: does the mapping survive?
-    freedom {
-        probe2<String> = "PROBE!"
-        hrc2b<Int> = cuMemcpyHtoD_v2(arF, probe2, 6) as Int
-        println("HTODF rc=" + hrc2b.to_string())
-        back<String> = "000000"
-        drc2b<Int> = cuMemcpyDtoH_v2(loc(back), arF, 6) as Int
-        println("DTOHF rc=" + drc2b.to_string() + " back=" + back)
-    }
-    dW2<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, fcvt32, trellis, suh, svh, body, 2048, 32768, hdg, arA, arB, arC, arD, arE, arF, arG, arH, arI)
-    println("SECOND deq dW2=" + dW2.to_string())
-    if (dW2 != 0) {
-        freedom {
-            cuMemFree_v2(dW2)
-        }
-    }
+    println("TWO-WRITE repro section removed (SEGV-prone; see handoff)")
     return 0
 }
