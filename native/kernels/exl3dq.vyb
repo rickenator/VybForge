@@ -102,6 +102,13 @@ exl3dq1s(p<Int>) -> {
         acc = acc + ld_shared_f32(b2 * 512 + c2 * 4) * ld_f32n(H + (c2 * 128 + d) * 4)
         c2 = c2 + 1
     }
-    st_f32(T + (block * 8192 + e2) * 4, acc)
+    # T uses the consumer's gid-linear convention (exl3had132/had232):
+    # gid = (kbv*nbc128 + nbv)*16384 + (row%128)*128 + d. The 64-row block
+    # numbering used here for scheduling must NOT leak into the T address.
+    rowT<Int> = rb64 * 64 + b2
+    kbvT<Int> = rowT / 128
+    bT<Int> = rowT - kbvT * 128
+    gidT<Int> = (kbvT * nbc128 + nb128) * 16384 + bT * 128 + d
+    st_f32(T + gidT * 4, acc)
 }
 

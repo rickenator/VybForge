@@ -2149,6 +2149,25 @@ SUSPECTS, in order:
 FIX PROTOCOL: parameterise the disputed stride, probe both cw values until
 MISMATCH=0 for BOTH, then re-integrate in glm_prefill and gate NLAYERS=6 against
 prefill_vyb_45_tab.txt (expect 3.4e-8), then the 45-layer acceptance.
+PROGRESS (cvt_probe37.log): suspect 2 CONFIRMED AND FIXED — exl3had132/had232's T
+index is gid-linear (kbv*nbc128+nbv)*16384 + (row%128)*128 + d; dq1s was writing its
+own 64-row block numbering (block*8192 + e2), which coincides with had132's convention
+only for rows 0..63 of column band 0 — exactly the 6 spot elements the shared-kernel
+gate checked (the earlier full-buffer scan ran on the NAIVE dq1, which is gid-linear
+and was never wrong). Fix: dq1s phase 2 now computes gidT from row/col explicitly
+(kbvT*nbc128 + nb128)*16384 + bT*128 + d. RESULT: gate cw=2048 STILL BIT-IDENTICAL
+(0/4194304); down cw=4096 improved only 4192256 -> 4112384, first mismatch still
+element 2048 (row 16). So a SECOND defect remains on the deq side at cw=4096: rows
+0..15 exact, every kb16 >= 1 row wrong, while deq32 with the same tile formula
+(tile = kbv*(cw/16) + nbv) is green in the driver. The formulas are textually
+identical, so the difference must be in what the fused launch actually reads —
+prime suspect now: the probe's fused launch reuses the pp2 staging and tq2 trellis
+buffer from the gate section (only p+32 cw is overwritten for the down test) —
+verify t6.len() == tq2's allocation and that gx_read(g,6) is really the down
+trellis, by staging a FRESH tq3 for the down launch. If a fresh trellis buffer
+fixes it, the driver integration must likewise use a per-tensor trellis staging
+(the driver already does); if not, dump raw deq values (pre-had1) for rows 16..31
+at cw=4096 vs deq32's od and diff slots.
 
 ### FUSED-DQ INTEGRATION: kernel proven, DRIVER INTEGRATION DIVERGES — reverted, open bug documented (2026-11-17 late)
 The exl3dq1s kernel was integrated into glm_prefill's exl3_deq32 (fused dq1s replaces
