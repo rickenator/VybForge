@@ -2569,14 +2569,38 @@ kill-safe to decchain_vyb.txt): DECODE_CHAIN_MATCH FAIL, worst 33.07 abs at
 layer 44 — IDENTICAL against the stale Nov-15 reference AND the freshly
 regenerated fused reference (prefill_vyb.txt regen green: PREFILL_OK layers=45,
 45 chain<N> dumps landed after the open_write-truncation bug fix 5229592).
-DIAGNOSIS: the divergence is the chain's step-1 DRAFT TOKEN — the chain feeds
-its own step-0 argmax (the MTP draft) as step 1's input; the reference's second
-stream uses the gold prompt token 21. A draft != gold propagates: layer 0
-1.4e-2 -> layer 44 33.07, growing with depth. The gate needs a
-numerical-equivalence mode: VYBFORGE_GOLD_STEP1=1 makes the chain's step 1
-consume the gold token 21 instead of the draft, then the streams must match to
-f32 noise and the gate goes OK. Also log the step-0 argmax vs token 21 once to
-confirm the draft/gold mismatch explicitly (one println in the MTP head).
+DIAGNOSIS (CORRECTED — the earlier draft-token theory is RETRACTED): the chain
+is ALREADY teacher-forced (the CHAIN_OK line says "2 teacher-forced decode
+steps"; the MTP draft token is computed and printed but never fed to the next
+step's input). The identical worst (33.07 @ L44) vs both references therefore
+reflects a real chain-vs-prefill per-layer discrepancy, not a token mismatch.
+The signature: layer 0 max_abs 1.4e-2 (ALREADY far over the 1e-9 tolerance)
+growing to 33.07 by layer 44 — a small systematic per-layer difference
+amplifying through the residual accumulation. PRIME SUSPECT: the decode-step
+attention over the KV cache vs the prefill's batched attention (the reduction
+order / the cache read path), not the deq (both use the same fused deq).
+NEXT LOCALIZATION STEP (cheap, no rerun): diff the verifier's inputs offline —
+the chain's d0l0s2 vs the prefill's chain<0> first half (16384 values, both on
+disk): find WHICH elements differ, the magnitude pattern (uniform noise vs a
+contiguous block vs a single spike), and whether d1l0s2 vs chain<0>'s second
+half differs the same way. That distinguishes the attention-path noise from a
+layout/alignment bug in one step.
+LOCALIZED + CHARACTERIZED (the offline diff, both steps, layer 0): ALL 16384
+elements differ with UNIFORM noise (p50 4.3e-4, p90 2.3e-3, max 1.45e-2
+absolute; step 1 the same shape) — the f32 reduction-order noise of the
+decode-step attention over the KV cache vs the batched prefill attention. The
+noise amplifies ~1.15x/layer through the residual accumulation: by layer 43
+the worst absolute diff (~72) EXCEEDS the layer's own value scale (~52) — the
+two f32 evaluations are fully decorrelated at the deep layers. THIS IS
+EXPECTED f32 BEHAVIOR for a 45-layer residual network, not a chain bug — but
+it means the gate's element-wise f32-vs-f32 design cannot verify deep-layer
+equivalence at all. THE HONEST GATE FORM (next session): (i) the layers 0-5
+element-wise tight (the noise <= ~2e-2 absolute), (ii) the functional check:
+the chain's final logits' argmax (the draft) vs the prefill's next-token
+prediction — the FUNCTIONAL equivalence the gate actually cares about, and
+(iii) optionally the late-layer digest-band comparison (the relative band
+~10%). The verifier's metric now computes the layer-scale relative
+(worst_abs_diff / max|ref|) — kept for the diagnostics.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
