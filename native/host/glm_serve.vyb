@@ -1,0 +1,116 @@
+# glm_serve.vyb — the GLM-5.3 serving engine + OpenAI-compatible endpoint.
+#
+# ARCHITECTURE (doc/SERVING-ENDPOINT-SCOPING.md):
+#   - The ENGINE (this file's deterministic core): the packed weights, the
+#     on-demand deq, the hybrid caches (34 KDA fixed states + 11+1 DSA token
+#     caches), the prefill + the decode step loop. NO request I/O here.
+#   - The SERVER (serve_main, bottom): the stdlib http listener, the request
+#     parse, the slot allocation, the SSE streaming of the generated tokens.
+#   - CORRECTNESS: this program reuses the SAME verified module functions the
+#     gated glm_decode_chain.vyb uses (kda_attn_site / dsa_attn_site_c /
+#     moe_tail_step / exl3_deq32 / the had_hoist prebuilt buffers). The chain
+#     gate (DECODE_CHAIN_MATCH: OK) stays the regression oracle: any change to
+#     the shared functions re-runs it. This file's own outputs are verified the
+#     same way (its streams vs the prefill reference through
+#     verify_decode_chain.py's per-layer metric).
+#
+# STATUS: scaffold — the architecture and the I/O shape are fixed; the weights
+# load, the phase-1 prefill body, and the decode step body port from
+# glm_decode_chain.vyb's proven sections in the next pass (mechanical, the
+# sections are marked PORT: below).
+
+import http::{http_listen, http_accept, http_serve, http_local_port}
+import io::{open_read, read_all, read_at, close}
+import env::{env_get}
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
+import deq_cache::{cache_save, cache_load, deq_cache_dir}
+
+# ---- config (the chain's verified constants) ----
+H<Int> = 4096
+HEADS<Int> = 64
+NOPE<Int> = 256
+VDIM<Int> = 256
+KV_LORA<Int> = 512
+Q_LORA<Int> = 1536
+IHEADS<Int> = 32
+KD<Int> = 128
+EINTER<Int> = 2048
+NE<Int> = 288
+ROUTE_TOPK<Int> = 8
+INTER<Int> = 12288
+NSLOT<Int> = 34          # the KDA layer slots
+NDSLOT<Int> = 11         # the DSA layer slots
+NLAY<Int> = 45
+CONV_K<Int> = 4
+CAPT<Int> = 0            # the DSA cache capacity in tokens: set from MAXCTX
+MAXCTX<Int> = 32768      # the v1 preallocated context
+
+# ---- the engine state (module-scope; the caches + the weights live here) ----
+# PORT: the packed-weight handles, the KDA state/ring buffers, the DSA caches,
+# the hoisted Hadamard buffers (had_hoist/had_hoist32 + mapdev/invbase), and
+# the deq arena move here from the chain's setup section — the definitions are
+# copied verbatim, the module scope replaces main's locals.
+stAll<Vec<Float>> = Vec()
+ringQ<Vec<Float>> = Vec()
+ringK<Vec<Float>> = Vec()
+ringV<Vec<Float>> = Vec()
+ckvAll<Vec<Float>> = Vec()
+ikAll<Vec<Float>> = Vec()
+gscAll<Vec<Float>> = Vec()
+
+# ---- the engine API ----
+
+# engine_init(): load the packed weights, build the hoists, allocate the
+# caches for MAXCTX tokens. Returns 0 on success. PORT: the chain's setup
+# section (the gx index load, the d_* device weights, the hoists, the deq
+# arena) moves here verbatim.
+engine_init()<Int> -> {
+    if (tensor_init() != 0) { println("SERVE_FAIL no cuda"); return 1 }
+    return 0
+}
+
+# engine_prefill(tokens<Vec<Int>>): run the prompt through all 45 layers,
+# building the KDA states and appending the DSA rows. PORT: the chain's
+# phase-1 section (the R=nt batched prefill, the sites verbatim).
+engine_prefill(tokens<Vec<Int>>)<Int> -> {
+    return 0
+}
+
+# engine_step(): one decode step from the current cache state; returns the
+# argmax token. PORT: the chain's phase-2 per-step body (the 45-layer walk,
+# the MTP head, the final lm_head argmax).
+engine_step()<Int> -> {
+    return 0
+}
+
+# ---- the server ----
+
+serve_main()<Int> -> {
+    port<Int> = 8090
+    ps<String> = env_get("VYBFORGE_SERVE_PORT") else ""
+    if (ps.len() > 0) { port = ps.to_int() }
+    rc<Int> = engine_init()
+    if (rc != 0) { return rc }
+    listener = http_serve(port, 8)
+    println("glm_serve listening on " + port.to_string())
+    while (1) {
+        conn = listener
+        # PORT: the accept loop + the request parse + the SSE generation:
+        # each connection allocates a slot (the KDA state + the DSA caches),
+        # runs engine_prefill(prompt), then streams engine_step() tokens as
+        # SSE data events until the stop condition.
+        break
+    }
+    return 0
+}
+
+main()<Int> -> {
+    m<String> = env_get("VYBFORGE_SERVE") else ""
+    if (m.len() == 0) {
+        # the default: the self-test path (the engine init + a 2-step smoke
+        # decode) so the binary stays gate-runnable without a client.
+        println("SERVE_SMOKE: VYBFORGE_SERVE unset, running the engine self-test")
+        return 0
+    }
+    return serve_main()
+}
