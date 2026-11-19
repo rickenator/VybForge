@@ -3114,7 +3114,10 @@ main()<Int> -> {
         var<Int> dump_rc = dump_to("chain" + n.to_string(), chain)
         n = n + 1
     }
-    match (open_write(out)) {
+    # open_append: the chain<N> dumps above were appended to the same file
+    # during the run — an open_write here truncates them away (the regen run's
+    # reference file was 11KB of summaries with zero chain dumps).
+    match (open_append(out)) {
         f -> { write_str(f, lines); close(f) }
         ? -> { return 20 }
     }
