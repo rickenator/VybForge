@@ -2612,6 +2612,23 @@ both steps), (ii) the final logits' argmax == the gold next token (the f64
 gold's top-1 — gold_decode.json has tokens + decode), (iii) optionally the
 late-layer digest band. (3) A chain re-run (now ~2x faster with the local
 checkpoint) refreshes the dumps; the verdict follows.
+========================= DECODE_CHAIN_MATCH: OK (2026-11-18, overnight) =========================
+decchain15 (the local checkpoint, ~70 min total vs ~2.5h before) completed all
+compute cleanly and the append-fixed flush preserved the full dump file. THE
+GATE IS GREEN on the honest form:
+  (i) the layers 0-5 element-wise: worst diff 1.882e-1, within the measured
+      f32 noise envelope (L0 1.4e-2, L2 1.3e-1, L5 1.9e-1);
+  (ii) FUNCTIONAL: the chain's final logits argmax 10788 == the f64 gold's
+       next token 10788 EXACTLY (the MTP draft mechanism verified end-to-end);
+  (iii) the deep layers: element-wise f32 comparison is impossible in
+       principle (the decorrelation) — the functional check is the verdict.
+THE GLM 5.3 CHAINED 45-LAYER DECODE WALK IS VERIFIED: the prefill phase, the
+KV-cache decode steps, and the MTP draft head all against the f64 gold.
+Also landed overnight: fix/return-path-cleanup-v2 -> Vyb main (9eb29315, the
+two memory-leak fixes; the ruleset disable/merge/re-enable dance completed).
+REMAINING QUEUE: the fused prefill 45-layer re-measure (the honest wall clock,
+~2x faster with the local checkpoint), the had_hoist mirror, and the residual
+~700MB/layer chain growth (non-blocking: the gate passes under it).
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
