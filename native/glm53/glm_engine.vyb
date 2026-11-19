@@ -4016,53 +4016,100 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 # the chain's main) — only the scalars live here; the Vec module globals hit a
 # type-inference gap in the current semantic (the member calls on the module
 # Vec globals cannot be typed), so the Vecs stay in the caller. ----
+share(all)
 dir<String> = ""
+share(all)
 out<String> = ""
+share(all)
 total<Int> = 0
+share(all)
 mapbody<String> = ""
+share(all)
 idxtext<String> = ""
+share(all)
 nlay<Int> = 45
+share(all)
 lpre<String> = ""
+share(all)
 tab<String> = ""
+share(all)
 mrow<Int> = 0
 shn_w<Vec<Float>> = Vec()
+share(all)
 finv<Int> = 0
+share(all)
 lmraw<String> = ""
+share(all)
 lmpath<String> = ""
+share(all)
 lmoff<Int> = 0
+share(all)
 crows<Int> = 0
+share(all)
 cbase<Int> = 0
+share(all)
 cn<Int> = 0
+share(all)
 cbestv<Float> = 0.0
+share(all)
 cbesti<Int> = 0
+share(all)
 lmg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
+share(all)
 lg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
 baseF<Vec<Float>> = Vec()
 scaleF<Vec<Float>> = Vec()
+share(all)
 kslot<Int> = 0
+share(all)
 dslot<Int> = 0
+share(all)
 nckv<Int> = 0
+share(all)
 fgemm<Int> = 0
+share(all)
 fbf<Int> = 0
+share(all)
 fdeq<Int> = 0
+share(all)
 fhgen<Int> = 0
+share(all)
 fhad1<Int> = 0
+share(all)
 fhad2<Int> = 0
+share(all)
 fdeq32<Int> = 0
+share(all)
 fhad132<Int> = 0
+share(all)
 fhad232<Int> = 0
+share(all)
 fcvt32<Int> = 0
+share(all)
 fdqs<Int> = 0
+share(all)
 mapd<String> = ""
+share(all)
 hdg<Int> = 0
+share(all)
 hdg32<Int> = 0
+share(all)
 mapdev<Int> = 0
+share(all)
 invbase<Int> = 0
+share(all)
 arA<Int> = 0
+share(all)
 arB<Int> = 0
+share(all)
 arC<Int> = 0
+share(all)
 arD<Int> = 0
+share(all)
 arG<Int> = 0
+share(all)
 arH<Int> = 0
+share(all)
 arI<Int> = 0
+
 
