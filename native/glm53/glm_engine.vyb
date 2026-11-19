@@ -49,36 +49,66 @@ extern "C" {
 
 # phase 1 runs R = 20 prompt tokens (the decode steps re-walk tokens 20 and 21, so
 # the caches must NOT contain them); phase 2 runs with R = 1 (set in main).
+share(all)
 R<Int> = 20
+share(all)
 CAPT<Int> = 22          # DSA cache rows per layer slot: 20 prefill + 2 decode
+share(all)
 NLAY<Int> = 45
+share(all)
 NSLOT<Int> = 34         # KDA layer slots
+share(all)
 NDSLOT<Int> = 11        # DSA layer slots
+share(all)
 H<Int> = 4096
+share(all)
 HC<Int> = 4
+share(all)
 HEADS<Int> = 64
+share(all)
 KD<Int> = 128
+share(all)
 NOPE<Int> = 256
+share(all)
 VDIM<Int> = 256
+share(all)
 KV_LORA<Int> = 512
+share(all)
 Q_LORA<Int> = 1536
+share(all)
 IHEADS<Int> = 32
+share(all)
 IDIM<Int> = 128
+share(all)
 KPOOL<Int> = 4
+share(all)
 TOPK<Int> = 2048        # indexer: top-k pool columns
+share(all)
 ROUTE_TOPK<Int> = 8     # MoE: experts per token -- the attn site's TOPK is 2048, and
                         # shadowing it here silently made the router pick 288 experts
+share(all)
 INTER<Int> = 12288
+share(all)
 NE<Int> = 288
+share(all)
 EINTER<Int> = 2048
+share(all)
 EPS<Float> = 1e-5
+share(all)
 LN_EPS<Float> = 1e-6
+share(all)
 HC_EPS<Float> = 1e-6
+share(all)
 L2_EPS<Float> = 1e-6
+share(all)
 GATE_LB<Float> = -5.0
+share(all)
 CONV_K<Int> = 4
+share(all)
 SCALE40<Float> = 1099511627776.0
+share(all)
 SWIGLU_LIMIT<Float> = 10.0
+share(all)
 ROUTED_SCALE<Float> = 2.5
 
 # ============================================================ prefill helpers (verbatim)
@@ -4017,99 +4047,146 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 # type-inference gap in the current semantic (the member calls on the module
 # Vec globals cannot be typed), so the Vecs stay in the caller. ----
 share(all)
+share(all)
 dir<String> = ""
+share(all)
 share(all)
 out<String> = ""
 share(all)
+share(all)
 total<Int> = 0
+share(all)
 share(all)
 mapbody<String> = ""
 share(all)
+share(all)
 idxtext<String> = ""
+share(all)
 share(all)
 nlay<Int> = 45
 share(all)
+share(all)
 lpre<String> = ""
 share(all)
+share(all)
 tab<String> = ""
+share(all)
 share(all)
 mrow<Int> = 0
 shn_w<Vec<Float>> = Vec()
 share(all)
+share(all)
 finv<Int> = 0
+share(all)
 share(all)
 lmraw<String> = ""
 share(all)
+share(all)
 lmpath<String> = ""
+share(all)
 share(all)
 lmoff<Int> = 0
 share(all)
+share(all)
 crows<Int> = 0
+share(all)
 share(all)
 cbase<Int> = 0
 share(all)
+share(all)
 cn<Int> = 0
+share(all)
 share(all)
 cbestv<Float> = 0.0
 share(all)
+share(all)
 cbesti<Int> = 0
 share(all)
+share(all)
 lmg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
+share(all)
 share(all)
 lg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
 baseF<Vec<Float>> = Vec()
 scaleF<Vec<Float>> = Vec()
 share(all)
+share(all)
 kslot<Int> = 0
+share(all)
 share(all)
 dslot<Int> = 0
 share(all)
+share(all)
 nckv<Int> = 0
+share(all)
 share(all)
 fgemm<Int> = 0
 share(all)
+share(all)
 fbf<Int> = 0
+share(all)
 share(all)
 fdeq<Int> = 0
 share(all)
+share(all)
 fhgen<Int> = 0
+share(all)
 share(all)
 fhad1<Int> = 0
 share(all)
+share(all)
 fhad2<Int> = 0
+share(all)
 share(all)
 fdeq32<Int> = 0
 share(all)
+share(all)
 fhad132<Int> = 0
+share(all)
 share(all)
 fhad232<Int> = 0
 share(all)
+share(all)
 fcvt32<Int> = 0
+share(all)
 share(all)
 fdqs<Int> = 0
 share(all)
+share(all)
 mapd<String> = ""
+share(all)
 share(all)
 hdg<Int> = 0
 share(all)
+share(all)
 hdg32<Int> = 0
+share(all)
 share(all)
 mapdev<Int> = 0
 share(all)
+share(all)
 invbase<Int> = 0
+share(all)
 share(all)
 arA<Int> = 0
 share(all)
+share(all)
 arB<Int> = 0
+share(all)
 share(all)
 arC<Int> = 0
 share(all)
+share(all)
 arD<Int> = 0
+share(all)
 share(all)
 arG<Int> = 0
 share(all)
+share(all)
 arH<Int> = 0
 share(all)
+share(all)
 arI<Int> = 0
+
 
 

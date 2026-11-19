@@ -2858,6 +2858,25 @@ glm_serve.vyb (the constants as the local typed defs with the literal values;
 cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
 from the engine — the divergence risk is tiny for the constants).
 The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
+=================== CONSTANTS FIXED; FNS' NESTED VISIBILITY REMAINS ==================
+THE UPPERCASE SHARE BUG (found + fixed): my share pass matched only
+lowercase-starting names — ALL the UPPERCASE constants (NSLOT, HC, H, HEADS,
+KD, EINTER, CONV_K, NDSLOT, CAPT, KV_LORA, IDIM, R, ...) were never shared.
+After the case fix: EVERY constant error resolved (the NSLOT/HEADS/KD/HC/
+CONV_K/NDSLOT/CAPT/KV_LORA/IDIM/R all visible inside main's nested scopes).
+THE SHARE'D FUNCTIONS still fail inside the nested scopes (dsa_attn_site_c,
+kda_attn_site_c, ffn_dense_site: Undefined identifier at the call sites) while
+the same-share constants work. THE DIFFERENCE: the constants are the VARIABLE
+declarations (the scope insertion on visit ✓) — the functions resolve through
+the functionRegistry + the scope insertion during the Module visit's
+per-statement walk, and the spliced fns' scope insertion inside the importer's
+nested scopes does not happen. THE NEXT SESSION'S INVESTIGATION: why the
+spliced share'd FunctionDeclarations do not enter the scope chain visible to
+main's nested blocks — the Module::visit's per-statement walk (the spliced
+fns precede main after the spliced-first reorder ✓ the registry pass sees
+them ✓) vs the scope insertion path. THE PRIZE: glm_serve.vyb is otherwise
+COMPLETE (the config shim works, the full body inlined, the http transport
+done) — the fn visibility is the LAST blocker for the serving endpoint.
 =================== THE GAP IS UNIVERSAL: NESTED-SCOPE IMPORTED SYMBOLS ==================
 The shim proved it: the constants shim (NSLOT/HEADS/KD) resolved those three,
 then the NEXT constants surfaced (CONV_K/NDSLOT/CAPT/KV_LORA/IDIM/R/HC), and
