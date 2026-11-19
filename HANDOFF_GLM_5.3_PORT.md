@@ -2858,6 +2858,29 @@ glm_serve.vyb (the constants as the local typed defs with the literal values;
 cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
 from the engine — the divergence risk is tiny for the constants).
 The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
+=================== THE SERVE'S HTTP LAYER WORKS; THE INLINE COMPUTE RETURNS ZEROS ==================
+THE RETURN-0 BUG (found + fixed): the serve's main inlined the engine_init's
+body VERBATIM including its trailing `return 0` — main exited before the http
+listener started (the silent exit, the 2-byte log). After removing it: THE
+LISTENER COMES UP, THE REQUEST IS ACCEPTED, THE ENGINE'S COMPUTE RUNS
+(45-layer prefill + the decode steps, the digests flowing, RSS flat ~1.07GB).
+THE COMPUTE'S OUTPUT: ALL ZEROS — the layers' streams are zero from layer 1
+(the digests: v0=0, sum=0, abs=0) while NO CHAIN_FAIL fired (the d_* handles
+non-zero). THE INLINE PORT'S BUG: the serve's main's inlined copy (the setup +
+the per-request body from the chain's main) computes zeros where the chain
+computes real values — the port's subtle divergence (the copy is the
+chain's main body with the annotations dropped and the http loop wrapped
+around the per-request section). THE NEXT SESSION'S DEBUG: diff the serve's
+inlined setup/body against the chain's main line by line (the transform was
+scripted — the transform's output vs the chain's main: the diff IS the bug);
+the prime suspects: the dropped annotations changed a binding's scoping, or a
+block-scoped def in the chain became a function-local in the serve with
+different initialization order. THE SERVE'S HTTP LAYER: VERIFIED WORKING
+(the listener, the accept, the parse, the response path) — the engine's
+compute correctness is the remaining piece. THE ALTERNATIVE (if the inline
+diff stalls): the serve calls the chain's engine_run per request (the v0's
+proven path) and eats the per-request setup cost until the engine's
+init/prompt split is ported properly.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

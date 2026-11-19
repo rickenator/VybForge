@@ -407,7 +407,6 @@ main()<Int> -> {
     invbase = mapdev + 16 + nbmap
     idxtext = gx_read_index(dir)
 
-    return 0
     # ---- the http endpoint: the setup is done; serve the decode requests ----
     match (http_listen(port, 8)) {
         listener -> {
@@ -1835,3 +1834,4 @@ main()<Int> -> {
     }
     return 0
 }
+
