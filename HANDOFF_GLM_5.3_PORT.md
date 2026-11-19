@@ -2732,6 +2732,17 @@ PREFILL_OK layers=45 green, the local checkpoint, /usr/bin/time -v:
   startup/load. The ffn per layer ~3.8-3.9s in the late layers (more distinct
   routed experts than the early layers' ~850ms — the routing warms up).
 THE GLM 5.3 FUSED PREFILL: 45 layers, digests green, 9:14 wall, 6.4GB RSS.
+=================== HAD_HOIST MIRROR: COMPLETE (2026-11-18) ===================
+The last gated mirror's condition is satisfied: glm_decode_chain.vyb carries
+the full hoist (had_hoist + had_hoist32 + mapdev/invbase + hdg32 threaded
+through tail_site/moe_tail_step/mtp_layer_step/exl3_deq32) and its gate — the
+hard 45-layer DECODE_CHAIN_MATCH — went OK this session. Tally: 8 of 9 copies
+mirrored and gate-green (glm3x, glm3all, glm3exp, glm3tail, glm3hc, glm3full,
+decl3step, glm_decode_chain). The 9th, native/glm53/exl3_load.vyb, is DEAD and
+UNGATED — per the mirror rule ("do not change them blind"; mirror only when
+gated) it stays as-is. THE ORIGINAL ITEM SEQUENCE IS COMPLETE: the gate OK,
+the honest wall clock (9:14 / 6.4GB), the leaks closed (the live set 42MB
+flat), the hoist mirrored everywhere it is exercised.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
