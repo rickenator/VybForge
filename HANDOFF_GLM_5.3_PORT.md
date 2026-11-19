@@ -2720,6 +2720,18 @@ VYB_STR_DUMP=1 live-set size histogram in vyb_str_stats (a leaking class
 names itself), and the prefill calls vyb_str_stats at PREFILL_OK. Vyb landed
 to main (81bab23c). The chain's RSS should now be flat-ish modulo the legit
 caches — worth one confirming look at the next chain run.
+=================== 45-LAYER RE-MEASURE (2026-11-18, option 1) ===================
+PREFILL_OK layers=45 green, the local checkpoint, /usr/bin/time -v:
+  WALL CLOCK 9:14 (was 13:54 pre-fused -> 35 min -> ~40-55 min regens) — a
+  ~4-6x improvement over the prior fused runs.
+  PEAK RSS 6.37GB (was 55-87GB) — the leak fixes at scale.
+  The final live set 42MB FLAT (780,839 entries: 780K <1K loader strings
+  28MB one-time + 44 legit <1M buffers) — the 45-layer run added ~3MB over
+  the 3-layer run's 39.8MB: the leak is DEAD at 45-layer scale.
+  The T_LAYER compute sum 243s (~4 min) of the 9:14 wall — the rest is the
+  startup/load. The ffn per layer ~3.8-3.9s in the late layers (more distinct
+  routed experts than the early layers' ~850ms — the routing warms up).
+THE GLM 5.3 FUSED PREFILL: 45 layers, digests green, 9:14 wall, 6.4GB RSS.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
