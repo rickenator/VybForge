@@ -2877,6 +2877,26 @@ names). The likely fix: the same module-NS fallback as the identifier
 resolution, applied in the ownership/codegen passes — or the reference-side
 dedup: the semantic's resolution of the cu* names to the FIRST contributor's
 binding for ALL the passes consistently.
+=================== THE #432 EXEMPTION LANDED; THE FN-SCOPE INSERT DEBUG NEXT ==================
+The extern exemption is LANDED (the __extern_C namespace statements skip the
+#432 per-module identity + the mangleBareStmt — the foreign C symbols keep
+their exact names). THE REMAINING ERRORS (2): dsa_attn_site_c and
+kda_attn_site_c undefined at the serve's nested callsites. THE STATE OF THE
+ANALYSIS: the engine's fns are share'd (the exports ✓), granted into the
+root's effectiveScope ✓, spliced-first (the reorder ✓ so they precede main in
+the resolved body), and the #432 identity does NOT fire for them (the
+privateMangled lacks their names — no cross-module collision). The plain-name
+resolution SHOULD work at every step, yet main's nested callsites fail while
+the same calls at main's TOP LEVEL work (probe9's a = f1() ✓ vs the nested
+b = f1() ✓ — WAIT: probe9's NESTED call WORKED (b=42 ✓)! THE DIFFERENCE
+BETWEEN probe9 AND the serve: the probe's module is tiny (1 fn); the engine is
+5883 lines with 177 module-scope state declarations + 36 share'd fns + the
+extern block. THE NEXT DEBUG: instrument the semantic's FunctionDeclaration
+visit (the scope-insert site: the fn name + the scope address) and main's
+visit — the diff between probe9 and the serve reveals which mechanism (the
+scope-gate's hides on the fn, the module-NS fallback, or the visit order)
+differs at scale. The instrumentation pattern: the [fnpresert]/[splice] trace
+(VYB_TRACE_MANGLE) is already in place.
 =================== THE FINAL MECHANISM: THE SPLICE SKIPS THE ENGINE'S FNS ==================
 The pass-1 pre-insert (the constants + the top-level fns into the global scope
 before the statement visits) FIXED ALL THE CONSTANT ERRORS — and the debug
