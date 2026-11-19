@@ -2619,7 +2619,16 @@ of network reads), not the deq kernels. THE THREE REAL OPTIONS:
 RECOMMENDED: (a) first (free), then (b) if the deq compute matters. The
 deq_cache module as built supports (c) as-is and (b) with the same functions
 (the trellis Strings need a String<->bytes shim — the gx_read returns String;
-write_bytes takes Vec<UInt8> — a small conversion or a String-bytes io call). (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
+write_bytes takes Vec<UInt8> — a small conversion or a String-bytes io call).
+OPTION (a) DONE (2026-11-18): the checkpoint rsynced to
+/home/rick/vybforge-glm53-checkpoint (164G, 108 files, byte-identical: the
+file lists and the totals match exactly). VALIDATED: the 3-layer prefill with
+VYBFORGE_GX_DIR=/home/rick/vybforge-glm53-checkpoint -> PREFILL_OK green, and
+the T_LAYER ffn (the staging+deq) dropped ~4x: 3298ms -> ~850-1020ms/layer;
+the layer total 4039 -> ~1750ms. ALL FUTURE RUNS: use
+VYBFORGE_GX_DIR=/home/rick/vybforge-glm53-checkpoint (the local NVMe). The
+local disk is 92% full — 155G free after the copy; the apex master stays the
+source of truth. (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
 (3) Land fix/return-path-cleanup-v2 into main. (4) The fused prefill re-measure
 (the honest wall clock). (5) The had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
