@@ -122,6 +122,7 @@ trim_heap()<Int> -> {
     return r
 }
 
+share(all)
 vecf()<Vec<Float>> -> {          # a typed empty Vec<Float> (a bare `x = Vec()` infers Vec<Int>)
     e<Vec<Float>> = Vec()
     return e
@@ -172,6 +173,7 @@ sigmoid(x<Float>)<Float> -> {
 
 # per-row rms over width D, times w when w.len() == D
 
+share(all)
 rms_rows(x<their<Vec<Float> const>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     r<Int> = 0
@@ -200,6 +202,7 @@ rms_rows(x<their<Vec<Float> const>>, rows<Int>, D<Int>, w<Vec<Float>>)<Vec<Float
 
 # LayerNorm (mean/variance, weight + bias) — the indexer's k_norm is a real LayerNorm
 
+share(all)
 ln_rows(x<Vec<Float>>, rows<Int>, D<Int>, w<Vec<Float>>, b<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     r<Int> = 0
@@ -343,6 +346,7 @@ mm_dev(A<Int>, B<Int>, M<Int>, N<Int>, K<Int>, faddr<Int>)<Int> -> {
     return C
 }
 
+share(all)
 mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     var<Int> dA = 0
@@ -363,6 +367,7 @@ silu(x<Float>)<Float> -> {
     return x * (1.0 / (1.0 + vexp(0.0 - x)))
 }
 
+share(all)
 l2_rows(x<Vec<Float>>, rows<Int>, D<Int>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     r<Int> = 0
@@ -390,6 +395,7 @@ l2_rows(x<Vec<Float>>, rows<Int>, D<Int>)<Vec<Float>> -> {
 # row-major (t*C + c) order — iterating channels outside tokens silently produced a
 # transposed result whose digests (sum/abs/sq/max) still matched.
 
+share(all)
 conv_silu(x<Vec<Float>>, rows<Int>, C<Int>, w<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     c<Int> = 0
@@ -427,6 +433,7 @@ up_bytes(raw<String>, dst<Int>)<Int> -> {
 # bf16 -> f64 on the device; z > 0 means the stored layout is (out,in) with in = z,
 # so bf16deq writes the transpose [in,out]. Returns the device pointer (0 = failure).
 
+share(all)
 hc_glue(mv<Vec<Float>>, base<Vec<Float>>, scale<Vec<Float>>, streams<Vec<Float>>)<Vec<Float>> -> {
     pre<Vec<Float>> = Vec()
     post<Vec<Float>> = Vec()
@@ -644,6 +651,7 @@ dump_to(name<String>, v<Vec<Float>>)<Int> -> {
 # ---------------------------------------------------------------- GPU matmul helpers
 # C[M,N] = A[M,K] @ B[K,N] on the device; returns the device pointer (0 on failure).
 
+share(all)
 log_decay(f<their<Vec<Float> const>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     r<Int> = 0
@@ -670,6 +678,7 @@ log_decay(f<their<Vec<Float> const>>, dt<Vec<Float>>, alog<Vec<Float>>)<Vec<Floa
 # the KDA delta-rule recurrence (gdn_ref.kda_recurrent): q,k,v [R,HEADS,KD], g [R,HEADS,KD],
 # beta [R,HEADS]; q is already l2-normalised and scaled by 1/sqrt(KD), k l2-normalised.
 
+share(all)
 delta_rule(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<Vec<Float> const>>, g<their<Vec<Float> const>>, beta<Vec<Float>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     st<Vec<Float>> = Vec()
@@ -736,6 +745,7 @@ delta_rule(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<Vec<F
 
 # gated RMSNorm with the sigmoid (KDA) activation, per (token, head) row of KD, times w
 
+share(all)
 gated_norm(x<Vec<Float>>, z<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     r<Int> = 0
@@ -767,6 +777,7 @@ gated_norm(x<Vec<Float>>, z<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
 
 # hyper-connection apply: dst = post ⊗ y + comb^T streams
 
+share(all)
 hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)<Vec<Float>> -> {
     dst<Vec<Float>> = Vec()
     r<Int> = 0
@@ -885,6 +896,7 @@ gx_resolve_tab(tab<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -
     return g
 }
 
+share(all)
 exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
          cw<Int>, ntiles<Int>, hd_pre<Int>)<Int> -> {
@@ -1039,6 +1051,7 @@ exl3_deq(fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>,
     return out
 }
 
+share(all)
 exl3_deq32(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
          cw<Int>, ntiles<Int>, hd_pre32<Int>,
@@ -1192,6 +1205,7 @@ had_hoist32(fhgen32<Int>)<Int> -> {
 # delta_rule + the final recurrence state copied to st_out at slot offset
 # slot * HEADS * KD * KD (the state after the LAST token of the batch).
 
+share(all)
 delta_rule_cap(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<Vec<Float> const>>, g<their<Vec<Float> const>>, beta<Vec<Float>>, st_out<their<Vec<Float>>>, capslot<Int>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
     st<Vec<Float>> = Vec()
@@ -1263,6 +1277,7 @@ delta_rule_cap(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<V
 
 # attn_site + the DSA cache rows (ckv / indexer k / gsc) copied to the layer slot.
 
+share(all)
 attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, capslot<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     a<Int> = 0
@@ -1796,6 +1811,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
 
 # dsa_attn_site, passing the cache borrows through to attn_site_c.
 
+share(all)
 dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, slot<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     i<Int> = 0
@@ -1895,6 +1911,7 @@ dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre
 # kda_attn_site + conv-ring capture (the last 3 PRE-conv rows, oldest first) and the
 # recurrence-state capture through delta_rule_cap.
 
+share(all)
 kda_attn_site_c(streams<their<Vec<Float> const>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, st_out<their<Vec<Float>>>, capslot<Int>, rq_out<their<Vec<Float>>>, rk_out<their<Vec<Float>>>, rv_out<their<Vec<Float>>>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
@@ -2333,6 +2350,7 @@ kda_attn_site_c(streams<their<Vec<Float> const>>, tab<String>, dir<String>, tota
 
 # ffn_dense_site / tail_site: verbatim (no carried state).
 
+share(all)
 ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     lines<String> = ""
@@ -2492,6 +2510,7 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     return streams2
     return streams2
 }
+share(all)
 tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
@@ -2950,6 +2969,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
 # x is the current token's PRE-conv vector [C]; ring is [CONV_K-1, C], oldest first.
 # weight[c*CONV_K + j], j = CONV_K-1 applies to the current token (pinned by the gold).
 # Returns out [C] followed by the new ring [CONV_K-1, C].
+share(all)
 conv1_step(x<Vec<Float>>, ring<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
     res<Vec<Float>> = Vec()
     c<Int> = 0
@@ -2984,6 +3004,7 @@ conv1_step(x<Vec<Float>>, ring<Vec<Float>>, w<Vec<Float>>)<Vec<Float>> -> {
 # the KDA delta-rule recurrence for ONE token, taking the carried state in and returning it.
 # q,k,v,g [R,HEADS,KD] (R=1), beta [R,HEADS]; st0 [HEADS,KD,KD] row-major.
 # Returns out [R*HEADS*KD] followed by the updated state [HEADS*KD*KD].
+share(all)
 delta_rule_step(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>,
                 beta<Vec<Float>>, st0<their<Vec<Float> const>>)<Vec<Float>> -> {
     out<Vec<Float>> = Vec()
@@ -3059,6 +3080,7 @@ delta_rule_step(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>,
 # no file writes. Resolves the hc_ffn triple + post LN from `gt` (the caller's layer
 # GxLoc, KDA-MoE want-list order), the router and shared expert by their own small
 # resolves, and each USED expert lazily by 9 names (the drift-safe per-expert form).
+share(all)
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, total<Int>, mapbody<String>,
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
@@ -3393,6 +3415,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
 # hnorm/enorm are PLAIN RMSNorms (scale = x_norm * w): the shipped GLM-5.3 MTP passes
 # constant_bias=0.0 (architecture/glm5_next_mtp.py), overriding the rmsnorm.py default
 # of 1.0 the older handoff note quoted.
+share(all)
 mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<Int>,
               fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
     i<Int> = 0
@@ -3449,6 +3472,7 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<I
 # -> DSA attention (no rope, own ckv/indexer-k/gsc cache appended at `row`) -> residual
 # -> post_attention_layernorm -> dots-router MoE (sigmoid + noaux_tc bias, top-8,
 # renorm * 2.5, lazy per-expert EXL3 resolve) -> residual. Returns the post-block hidden.
+share(all)
 mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>, total<Int>,
                mapbody<String>, mckv<their<Vec<Float>>>,
                mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, fgemm<Int>, fbf<Int>,
@@ -4047,146 +4071,105 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 # type-inference gap in the current semantic (the member calls on the module
 # Vec globals cannot be typed), so the Vecs stay in the caller. ----
 share(all)
-share(all)
 dir<String> = ""
-share(all)
 share(all)
 out<String> = ""
 share(all)
-share(all)
 total<Int> = 0
-share(all)
 share(all)
 mapbody<String> = ""
 share(all)
-share(all)
 idxtext<String> = ""
-share(all)
 share(all)
 nlay<Int> = 45
 share(all)
-share(all)
 lpre<String> = ""
-share(all)
 share(all)
 tab<String> = ""
 share(all)
-share(all)
 mrow<Int> = 0
-shn_w<Vec<Float>> = Vec()
 share(all)
+shn_w<Vec<Float>> = Vec()
 share(all)
 finv<Int> = 0
 share(all)
-share(all)
 lmraw<String> = ""
-share(all)
 share(all)
 lmpath<String> = ""
 share(all)
-share(all)
 lmoff<Int> = 0
-share(all)
 share(all)
 crows<Int> = 0
 share(all)
-share(all)
 cbase<Int> = 0
-share(all)
 share(all)
 cn<Int> = 0
 share(all)
-share(all)
 cbestv<Float> = 0.0
-share(all)
 share(all)
 cbesti<Int> = 0
 share(all)
-share(all)
 lmg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
 share(all)
-share(all)
 lg<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(), dts = Vec(), paths = Vec() }
-baseF<Vec<Float>> = Vec()
-scaleF<Vec<Float>> = Vec()
 share(all)
+baseF<Vec<Float>> = Vec()
+share(all)
+scaleF<Vec<Float>> = Vec()
 share(all)
 kslot<Int> = 0
 share(all)
-share(all)
 dslot<Int> = 0
-share(all)
 share(all)
 nckv<Int> = 0
 share(all)
-share(all)
 fgemm<Int> = 0
-share(all)
 share(all)
 fbf<Int> = 0
 share(all)
-share(all)
 fdeq<Int> = 0
-share(all)
 share(all)
 fhgen<Int> = 0
 share(all)
-share(all)
 fhad1<Int> = 0
-share(all)
 share(all)
 fhad2<Int> = 0
 share(all)
-share(all)
 fdeq32<Int> = 0
-share(all)
 share(all)
 fhad132<Int> = 0
 share(all)
-share(all)
 fhad232<Int> = 0
-share(all)
 share(all)
 fcvt32<Int> = 0
 share(all)
-share(all)
 fdqs<Int> = 0
-share(all)
 share(all)
 mapd<String> = ""
 share(all)
-share(all)
 hdg<Int> = 0
-share(all)
 share(all)
 hdg32<Int> = 0
 share(all)
-share(all)
 mapdev<Int> = 0
-share(all)
 share(all)
 invbase<Int> = 0
 share(all)
-share(all)
 arA<Int> = 0
-share(all)
 share(all)
 arB<Int> = 0
 share(all)
-share(all)
 arC<Int> = 0
-share(all)
 share(all)
 arD<Int> = 0
 share(all)
-share(all)
 arG<Int> = 0
-share(all)
 share(all)
 arH<Int> = 0
 share(all)
-share(all)
 arI<Int> = 0
+
+
 
 
 

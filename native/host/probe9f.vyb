@@ -1,0 +1,27 @@
+# probe9f: the bisect — the serve's FULL import list + the tiny module.
+# If f1's nested use fails here, the imports are the trigger; if it works,
+# the trigger is the engine module's size/content.
+import io::{open_read, read_all, read_at, open_write, open_append, write_str, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
+import vmath::{vexp, vsqrt}
+import time::{time_mono_millis}
+import json_parse
+import deq_cache::{cache_save, cache_load, deq_cache_dir}
+import cuda_binding::{cuMemFree_v2, cuMemAlloc_v2, cuMemcpyHtoD_v2, cuMemcpyDtoH_v2, cuCtxSynchronize, cuModuleLoadData, cuModuleGetFunction}
+import glm_engine
+import probe9cmod
+
+main()<Int> -> {
+    a<Int> = f1()
+    i<Int> = 0
+    while (i < 2) {
+        b<Int> = f1()
+        println("b=" + b.to_string())
+        i = i + 1
+    }
+    println("a=" + a.to_string())
+    return 0
+}
