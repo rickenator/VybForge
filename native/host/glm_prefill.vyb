@@ -54,6 +54,7 @@ extern "C" {
 # 46-layer pass then holds tens of GB that nothing is using.
 # Registry/heap diagnostics: __vyb_str_stats in the runtime (VYB_STR_STATS=1 gates the print).
 extern "C" {
+    vyb_str_stats()
 }
 
 trim_heap()<Int> -> {
@@ -3120,6 +3121,9 @@ main()<Int> -> {
     match (open_append(out)) {
         f -> { write_str(f, lines); close(f) }
         ? -> { return 20 }
+    }
+    freedom {
+        vyb_str_stats()
     }
     println("PREFILL_OK layers=" + nlay.to_string())
     return 0
