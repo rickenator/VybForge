@@ -2629,6 +2629,18 @@ two memory-leak fixes; the ruleset disable/merge/re-enable dance completed).
 REMAINING QUEUE: the fused prefill 45-layer re-measure (the honest wall clock,
 ~2x faster with the local checkpoint), the had_hoist mirror, and the residual
 ~700MB/layer chain growth (non-blocking: the gate passes under it).
+RESIDUAL GROWTH MEASURED (decchain16, VYB_STR_STATS, the phase-1 L1-L21
+window): the registry live 751785 -> 757647 (+~1000/layer) and live_bytes
+658MB -> 6.66GB (~300MB/layer), with the BIG entries (the trellis-sized 4MB
+strings) +50-150/layer — the growth IS registry strings in the expert loop,
+NOT the device tensors or the host Vecs. The by-value String params look
+correct in the codegen (the entry retainStringValue + the scope-exit release
+via registerVariable stringParam — cgen_decl.cpp ~1184), so the leak is
+partially missing releases on SOME path in the per-expert flow. NEXT: the
+VYB_STR_TRACE on the 3-layer prefill (the same expert loop, ~5 min) — follow
+one trellis string's REG/RET/REL ledger through one gx_read -> g_ge_N
+reassignment -> exl3_deq32 call to find the unbalanced retain. The magnitude
+(~300MB/layer x 45 = 13GB/run) is non-blocking but worth closing.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
