@@ -2743,6 +2743,30 @@ UNGATED — per the mirror rule ("do not change them blind"; mirror only when
 gated) it stays as-is. THE ORIGINAL ITEM SEQUENCE IS COMPLETE: the gate OK,
 the honest wall clock (9:14 / 6.4GB), the leaks closed (the live set 42MB
 flat), the hoist mirrored everywhere it is exercised.
+=================== SERVING PHASE 1+2: SCOPED, EXECUTION PREPPED ===================
+Phase 1 (the dtype migration) and phase 2 (the engine split) are DESIGNED but
+not executed — the remaining session context was too small for a 1150-line
+mechanical refactor. THE STATE:
+- Phase 2 design (the engine split): the phase-2 decode loop is
+  glm_decode_chain.vyb lines 4517-5668 (1151 lines, `while (t < nsteps)`).
+  A plain function extraction is IMPRACTICAL: 287 main-scope identifiers
+  cross the boundary (the inventory is in this session's log). THE RIGHT
+  SHAPE: an engine MODULE (native/glm53/engine.vyb) with MODULE-SCOPE state
+  (Vyb module globals work — deq_cache.vyb proves it) holding the caches
+  (stAll/ringQ/K/V, ckvAll/ikAll/gscAll, the MTP caches) + the weights
+  (d_* handles, the raws) + the config constants, exporting init(...) and
+  step(t) -> logits. The loop-LOCAL temporaries (~200 of the 287: i, mv,
+  res2, ...) stay local. The procedure: cut the loop body into the module,
+  move the ~60-80 genuinely-cross-boundary defs (the caches, the weights,
+  the raws, tabs, the constants) into the module scope, keep the gate as the
+  regression (DECODE_CHAIN_MATCH must stay OK — the full decchain re-run).
+- Phase 1 design (the dtype): the DSA caches + the deq'd tensors + the gemms
+  to bf16/f32 (the KV scoping doc's recommendation); the noise envelope
+  re-measured via the verifier's per-layer metric after the switch. ORDER
+  MATTERS: phase 2 FIRST (the gate protects the split), then phase 1 inside
+  the engine boundary.
+- Phase 3+4 (the batching B=2->4 + the http endpoint): after 1+2, per
+  doc/SERVING-ENDPOINT-SCOPING.md's plan and risks.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
