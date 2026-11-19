@@ -5555,10 +5555,10 @@ main()<Int> -> {
             lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "attn", attn) + "\n"
             lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "mlp", mlp) + "\n"
             lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "s2", streams2) + "\n"
-            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "s2", streams2) + "\n"
-            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "s1", streams1) + "\n"
-            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "attn", attn) + "\n"
-            lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp) + "\n"
+            dd<Int> = dump_to("d" + t.to_string() + "l" + n.to_string() + "s2", streams2)
+            dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "s1", streams1)
+            dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "attn", attn)
+            dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp)
             streams = streams2
             i = trim_heap()
             println("RSS step" + t.to_string() + " n=" + n.to_string() + " " + rss_mb().to_string() + "MB")
