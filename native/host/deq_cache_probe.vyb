@@ -1,0 +1,49 @@
+# Round-trip probe for deq_cache.vyb: a device buffer with known byte values
+# -> cache_save -> cache_load -> compare the raw bytes. Run with
+# VYBFORGE_DEQ_CACHE set to a scratch dir.
+
+import cuda_binding::{cuMemcpyHtoD_v2, cuMemcpyDtoH_v2}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh}
+import deq_cache::{cache_save, cache_load, dev_bytes, bytes_dev, deq_cache_dir}
+
+main()<Int> -> {
+    if (tensor_init() != 0) { println("FAIL no cuda"); return 9 }
+    dir<String> = deq_cache_dir()
+    println("cache dir: '" + dir + "'")
+    if (dir == "") { println("SKIP: VYBFORGE_DEQ_CACHE not set"); return 0 }
+    # 1024 f64 slots with known values
+    n<Int> = 1024
+    src<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < n) {
+        src.push((i * 37 % 1000) as Float / 8.0 - 60.0)
+        i = i + 1
+    }
+    d<Int> = dev_alloc(n * 8)
+    bulk_htod(d, view(src))
+    rc<Int> = cache_save("probe6.t0", d, n * 8)
+    println("save rc=" + rc.to_string())
+    if (rc != 0) { return 1 }
+    d2<Int> = cache_load("probe6.t0", n * 8)
+    println("load handle=" + d2.to_string())
+    if (d2 == 0) { println("FAIL: cache miss"); return 2 }
+    back<Vec<Float>> = bulk_dtoh(d2, n)
+    bad<Int> = 0
+    i = 0
+    while (i < n) {
+        diff<Float> = (src.get(i) - back.get(i)) as Float
+        if (diff < 0.0) { diff = 0.0 - diff }
+        if (diff > 0.0) { bad = bad + 1 }
+        i = i + 1
+    }
+    println("mismatches=" + bad.to_string() + " of " + n.to_string())
+    if (bad != 0) { return 3 }
+    # a miss on a wrong size must return 0, not a bad buffer
+    d3<Int> = cache_load("probe6.t0", n * 4)
+    println("wrong-size load handle=" + d3.to_string() + " (want 0)")
+    if (d3 != 0) { return 4 }
+    dt<Int> = dev_alloc(8192)
+    println("main-scope dev_alloc(8192)=" + dt.to_string())
+    println("PROBE6_OK")
+    return 0
+}

@@ -1,0 +1,93 @@
+# deq_cache.vyb — disk cache for dequantized device weight tensors.
+#
+# The GLM drivers re-run the full trellis dequantization staging on every run
+# (~90% of the wall: ~36s/layer vs ~4s of compute). This module saves each
+# deq'd device tensor's raw bytes to disk on first dequantization and bulk-
+# loads them on later runs — bit-exact (raw byte round-trip, no repacking).
+#
+# Enabled by VYBFORGE_DEQ_CACHE=<dir>; absent/empty = the cache is off and the
+# callers fall through to the normal deq path.
+
+import env::{env_get}
+import cuda_binding::{cuMemcpyHtoD_v2, cuMemcpyDtoH_v2}
+import io::{open_read, open_write, read_bytes, write_bytes, close}
+import tensor::{dev_alloc}
+
+share(all)
+deq_cache_dir()<String> -> {
+    d<String> = env_get("VYBFORGE_DEQ_CACHE") else ""
+    return d
+}
+
+# Raw device -> Vec<UInt8>: grow a byte Vec to nbytes, then memcpy the device
+# buffer's bytes straight into it (the same freedom/addr pattern bulk_dtoh
+# uses, but no per-element host conversion).
+share(all)
+dev_bytes(d<Int>, nbytes<Int>)<Vec<UInt8>> -> {
+    b<Vec<UInt8>> = Vec()
+    i<Int> = 0
+    while (i < nbytes) { b.push(0); i = i + 1 }
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(b))
+        dp<Int> = at(hdr)
+        if (dp != 0) { cuMemcpyDtoH_v2(from<loc<CVoid>>(dp), d, nbytes) }
+    }
+    return b
+}
+
+# Vec<UInt8> -> fresh device buffer: dev_alloc + raw HtoD of the byte buffer.
+share(all)
+bytes_dev(b<Vec<UInt8>>)<Int> -> {
+    d<Int> = dev_alloc(b.len())
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(b))
+        dp<Int> = at(hdr)
+        if (dp != 0) { cuMemcpyHtoD_v2(d, from<loc<CVoid>>(dp), b.len()) }
+    }
+    println("bytes_dev alloc=" + d.to_string() + " len=" + b.len().to_string())
+    return d
+}
+
+# Save a deq'd device tensor's raw bytes to <dir>/<name>.bin. Returns 0 on
+# success, nonzero on any failure (the caller ignores it — the cache is best-
+# effort).
+share(all)
+cache_save(name<String>, d<Int>, nbytes<Int>)<Int> -> {
+    dir<String> = deq_cache_dir()
+    if (dir == "") { return 1 }
+    path<String> = dir + "/" + name + ".bin"
+    b<Vec<UInt8>> = dev_bytes(d, nbytes)
+    if (b.len() != nbytes) { return 2 }
+    match (open_write(path)) {
+        f -> {
+            w<Int?> = write_bytes(f, b)
+            close(f)
+            match (w) { n -> { if (n != nbytes) { return 3 } } ? -> { return 4 } }
+            return 0
+        }
+        ? -> { return 5 }
+    }
+}
+
+# Load a deq'd device tensor from the cache. Returns the device handle, or 0
+# on any miss/failure (the caller then runs the normal deq path).
+share(all)
+cache_load(name<String>, nbytes<Int>)<Int> -> {
+    dir<String> = deq_cache_dir()
+    if (dir == "") { return 0 }
+    path<String> = dir + "/" + name + ".bin"
+    match (open_read(path)) {
+        f -> {
+            match (read_bytes(f)) {
+                b -> {
+                    close(f)
+                    println("cache_load " + name + " file_len=" + b.len().to_string() + " want=" + nbytes.to_string())
+                    if (b.len() != nbytes) { return 0 }
+                    return bytes_dev(b)
+                }
+                ? -> { close(f); println("cache_load " + name + " read_bytes ABSENT"); return 0 }
+            }
+        }
+        ? -> { println("cache_load " + name + " open ABSENT"); return 0 }
+    }
+}
