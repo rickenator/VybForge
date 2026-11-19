@@ -2858,6 +2858,25 @@ glm_serve.vyb (the constants as the local typed defs with the literal values;
 cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
 from the engine — the divergence risk is tiny for the constants).
 The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
+=================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
+The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
+are deduped by name (the first module to declare a foreign symbol carries it;
+the later blocks carry only their new members) — glm_serve.vyb is SEMANTIC-
+CLEAN with the state-in-main architecture. THE REMAINING: the JIT link fails
+on 5 mangled cu* symbols (__pv_9554c5f9_cuCtxSynchronize, cuMemAlloc_v2,
+cuMemcpyHtoD_v2, cuModuleLoadData, cuModuleGetFunction): the semantic binds
+the serve's main's cu* references to MANGLED names while the carried extern
+declarations are PLAIN — the declarations and the references disagree. THE
+NEXT SESSION'S TASK: find which pass mangles the references (the ownership
+pass or the codegen's module-qualified handling — the trace:
+VYB_TRACE_MANGLE=1 on the serve shows the extern-carry entries for the cu*
+from MULTIPLE modules: tensor, gx, glm_engine — the dedup filters the later
+blocks' duplicates, so the mangle's source is the REFERENCE side: the
+semantic/codegen binding of the serve's main's cu* calls to the mangled
+names). The likely fix: the same module-NS fallback as the identifier
+resolution, applied in the ownership/codegen passes — or the reference-side
+dedup: the semantic's resolution of the cu* names to the FIRST contributor's
+binding for ALL the passes consistently.
 =================== THE FINAL MECHANISM: THE SPLICE SKIPS THE ENGINE'S FNS ==================
 The pass-1 pre-insert (the constants + the top-level fns into the global scope
 before the statement visits) FIXED ALL THE CONSTANT ERRORS — and the debug

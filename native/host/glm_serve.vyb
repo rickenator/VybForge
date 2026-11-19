@@ -20,7 +20,7 @@
 # sections are marked PORT: below).
 
 import http::{http_listen, http_accept, http_read_head, http_request_path, http_send_all, http_close, http_response}
-import io::{open_read, read_all, read_at, close}
+import io::{open_read, read_all, read_at, open_write, open_append, write_str, close}
 import env::{env_get}
 import safetensors
 import gx
