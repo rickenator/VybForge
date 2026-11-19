@@ -2544,6 +2544,26 @@ exprProducesOwnedVecTemp covers user calls returning Vec<Float>); (2) a
 loop-body Vec declaration must be registered for its iteration's scope-exit
 free. VALIDATION: alloc_probe5's A and B loops must go flat (RSS ~120MB
 steady), then the suite, then the chain gate -> DECODE_CHAIN_MATCH.
+VEC LEAK FIXED (2026-11-18, Vyb fix/return-path-cleanup-v2 e0bfc4db): a
+call-result Vec is deep-copied into the binding, but the TEMPORARY's payload had
+no owner — the comment's "the callee's cleanup will free" never holds for a
+statement-level call result. Fixed in BOTH paths: cgen_expr.cpp (assignment:
+capture the pre-clone RHS, free its data ptr after the clone + old-vec release)
+and cgen_decl.cpp (declaration: same, after the decl-path deep copy). probe5
+BOTH loops flat: A 2190 -> 634MB steady, B 3394 -> 651MB steady (the residual =
+the pool's 16MB-bucket high-water, bounded). Suite 1358/1358 green.
+CHAIN STATUS: decchain12 running (native/out/decchain_fixed4.log) — the chain
+now grows ~700MB/layer (down from 1.2GB); at n=4 RSS hit 8918 then fell to
+6531 (the pool reclaiming — the first non-monotonic curve). If it completes:
+DECODE_CHAIN_MATCH (the big milestone). The residual ~700MB/layer prime suspect:
+the expert-loop trellis reads (24 experts x 3 tensors x 4MB = 288MB/layer if
+leaked) — probe next with a per-expert-read churn if the gate still grows.
+LEAK-HUNT ARC COMPLETE THIS SESSION: (1) the read_at String? unwrap borrowed-
+registration bug (probe4 flat, df129845); (2) the Vec call-result temporary
+(probe5 flat, e0bfc4db); both committed on fix/return-path-cleanup-v2, suite
+1358/1358 green after each. Next session: poll decchain12, then the residual
+700MB/layer if needed, then land the branch to main (the ruleset procedure),
+the fused prefill re-measure, and the had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
 buffer: REG refs=1 (the owned birth ref) + 3 RETs (THREE retains: the optional's
 inner store, the shallow-copy's retain, the s-assignment's retain) = 4 refs;
