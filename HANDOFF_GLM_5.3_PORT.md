@@ -2694,6 +2694,16 @@ inspect the generated IR for wrap_void's scope exit vs main's (the
 armRetainedStringBindings releases + the function-body exitScope cleanup) —
 the missing release emission is visible by diffing which release calls exist
 in each; then fix the ownership pass for the function-body scope.
+IR DIFF DONE (--emit-llvm on probe7d): FOUND THE SMOKING GUN — wrap_void
+emits TWO __vyb_string_retain calls on the SAME %opt.payload extractvalue at
+the SAME debug location (the s = t bind site, dbg !83), plus a retain of a
+global (@0, the "" literal init) and one of %sdc.field2. Main's flat shape
+emits ONE payload retain. The double retain = one ref with no release. NEXT:
+find which codegen path emits the second payload retain in the callee context
+(the stringOverwrite retainStringValue(RHS) at cgen_expr.cpp ~1112 AND the
+optional-payload bind's retain both fire for `s = t` inside a callee arm,
+while in main one of them is skipped by the scrutineeIsIoIntrinsic transfer
+check) — make the two paths agree on who owns the payload ref.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
