@@ -1,0 +1,54 @@
+# Vec scope-exit free probe: does a Vec<Float> declared in a loop body (assigned
+# from a call result) get freed at the iteration's end? Loop A: 100 x 16MB
+# loop-body declarations. Loop B: 100 x 16MB reassignments of an outer binding.
+# If RSS grows ~1.6GB in A, the loop-body Vec scope-exit free misses (the chain's
+# residual leak); B isolates reassignment vs declaration.
+
+import io::{open_read, read_all, close}
+
+mk()<Vec<Float>> -> {
+    v<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 2000000) { v.push(0.1); i = i + 1 }
+    return v
+}
+
+rss_mb()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/self/statm")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    fld<Int> = 0
+    v<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 32) { fld = fld + 1 }
+        if (fld == 1 && c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v * 4 / 1000
+}
+
+main()<Int> -> {
+    println("RSS start " + rss_mb().to_string() + "MB")
+    v<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 100) {
+        nv<Vec<Float>> = mk()
+        if (nv.len() != 2000000) { return 1 }
+        if (i % 25 == 0) { println("A i=" + i.to_string() + " RSS=" + rss_mb().to_string() + "MB") }
+        i = i + 1
+    }
+    println("A done (loop-body decl) RSS=" + rss_mb().to_string() + "MB")
+    i = 0
+    while (i < 100) {
+        v = mk()
+        if (v.len() != 2000000) { return 2 }
+        if (i % 25 == 0) { println("B i=" + i.to_string() + " RSS=" + rss_mb().to_string() + "MB") }
+        i = i + 1
+    }
+    println("B done (reassignment) RSS=" + rss_mb().to_string() + "MB")
+    return 0
+}

@@ -2530,6 +2530,20 @@ class, ~10 x 100MB bulk_dtoh Vecs per layer) — next: a Vec-counterpart probe
 (loop-body 16MB bulk_dtoh Vec churn) to confirm, then the Vec fix in the same
 ownership pass, then the chain gate -> DECODE_CHAIN_MATCH, the prefill
 re-measure, and the had_hoist mirror.
+VEC LEAK CONFIRMED (alloc_probe5.vyb, committed): 100 x 16MB Vec<Float> from a
+call result — loop-body declarations: RSS 119 -> 2190MB (~20MB/Vec, ~100% of
+each payload leaked); reassignments of an outer binding: also leaking
+(~16MB/Vec). Total ~3.5GB over 200 Vecs — exactly the chain's ~1.2GB/layer
+(its ~10 bulk_dtoh Vecs/layer). THE VEC COUNTERPART of the read_at String bug:
+a Vec returned by a call (an owned transfer) never gets its scope-exit /
+reassignment release. THE FIX (in Vyb, src/vre/llvm/cgen_expr.cpp's
+vecOverwrite path + the block-scope cleanup for loop-body Vec declarations —
+the same ownership-pass treatment the String fix received): (1) the
+vecOverwrite old-value release must fire for call-result RHS (verify
+exprProducesOwnedVecTemp covers user calls returning Vec<Float>); (2) a
+loop-body Vec declaration must be registered for its iteration's scope-exit
+free. VALIDATION: alloc_probe5's A and B loops must go flat (RSS ~120MB
+steady), then the suite, then the chain gate -> DECODE_CHAIN_MATCH.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
 buffer: REG refs=1 (the owned birth ref) + 3 RETs (THREE retains: the optional's
 inner store, the shallow-copy's retain, the s-assignment's retain) = 4 refs;
