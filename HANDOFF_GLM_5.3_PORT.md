@@ -2704,6 +2704,22 @@ find which codegen path emits the second payload retain in the callee context
 optional-payload bind's retain both fire for `s = t` inside a callee arm,
 while in main one of them is skipped by the scrutineeIsIoIntrinsic transfer
 check) — make the two paths agree on who owns the payload ref.
+=================== RESIDUAL LEAK CLOSED (2026-11-18, overnight) ===================
+ROOT CAUSE: the scrutineeIsIoIntrinsic check matched only the vyb_io_ runtime
+symbol prefix — the imported io names (read_at/read_all/read_bytes*) never
+fired the payload transfer in callees, so the callee's `s = t` kept BOTH the
+stringOverwrite retain AND the payload-bind retain; AND the io path had
+dropped the optional's inner-store compensating release. THE FIX (two edits in
+cgen_stmt.cpp): (1) the check also matches the imported io names; (2) the io
+path restores releaseStringValue(originalOptPayload). VALIDATED: probe7d 6/6
+BALANCED (RET=2 REL=3 RETIRE=1 — was 3/2/0 leaking), the suite 1358/1358
+green, AND the 3-layer prefill's final live set is FLAT 39.8MB (751,566 <1K
+loader strings = 25.8MB one-time bounded + 44 legit <1M buffers) with ZERO
+trellis-sized or ~296KB leaks — the ~300MB/layer growth is GONE. Also: the
+VYB_STR_DUMP=1 live-set size histogram in vyb_str_stats (a leaking class
+names itself), and the prefill calls vyb_str_stats at PREFILL_OK. Vyb landed
+to main (81bab23c). The chain's RSS should now be flat-ish modulo the legit
+caches — worth one confirming look at the next chain run.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
