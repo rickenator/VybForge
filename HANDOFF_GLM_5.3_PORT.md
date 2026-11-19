@@ -2601,6 +2601,17 @@ prediction — the FUNCTIONAL equivalence the gate actually cares about, and
 (iii) optionally the late-layer digest-band comparison (the relative band
 ~10%). The verifier's metric now computes the layer-scale relative
 (worst_abs_diff / max|ref|) — kept for the diagnostics.
+GATE IMPLEMENTATION STATE: the functional check needs the chain's FINAL LOGITS
+dumped — the current log only has the single probe value (BDPROBE r0=-2.09509
+n=7424, deterministic across decchain12/13) because the mtplogits dumps line
+still routes through the non-streamed `lines` accumulator (lost in the kill —
+the same bug the d-lines had). NEXT: (1) route the mtplogits dumps through
+dump_to like the d-lines (one line in the MTP head block); (2) the gate then
+checks: (i) the layers 0-5 element-wise <= ~2e-2 absolute (the noise band,
+both steps), (ii) the final logits' argmax == the gold next token (the f64
+gold's top-1 — gold_decode.json has tokens + decode), (iii) optionally the
+late-layer digest band. (3) A chain re-run (now ~2x faster with the local
+checkpoint) refreshes the dumps; the verdict follows.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
