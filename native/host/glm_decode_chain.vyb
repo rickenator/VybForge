@@ -5661,7 +5661,7 @@ main()<Int> -> {
                     }
                     cbase = cbase + cn
                 }
-                lines = lines + dumps("mtplogits" + t.to_string(), logv) + "\n"
+                md<Int> = dump_to("mtplogits" + t.to_string(), logv)
                 println("MTP draft token: " + cbesti.to_string() + " (logit " + cbestv.to_string() + ")")
             }
         }
