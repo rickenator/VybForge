@@ -1,0 +1,21 @@
+# probe9c: the serve's exact nesting shape — 4 levels deep (match -> while ->
+# match -> body), the calls to multiple module fns + the constants at the
+# innermost level, the constants used at the outer levels too.
+share(all)
+c1<Int> = 111
+c2<Int> = 222
+
+share(all)
+f1()<Int> -> {
+    return 42
+}
+
+share(all)
+f2(x<Int>)<Int> -> {
+    return x * 2
+}
+
+share(all)
+f3(x<Int>, y<Int>)<Int> -> {
+    return x + y
+}

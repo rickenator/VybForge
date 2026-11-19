@@ -1,0 +1,30 @@
+# probe9e: the depth gradient — the module constant c2 read at the nesting
+# depths 1..5, one probe line per depth. The first failing depth pinpoints the
+# scope-chain break.
+import probe9cmod
+
+main()<Int> -> {
+    d1<Int> = c2
+    i1<Int> = 0
+    while (i1 < 1) {
+        d2<Int> = c2
+        i2<Int> = 0
+        while (i2 < 1) {
+            d3<Int> = c2
+            i3<Int> = 0
+            while (i3 < 1) {
+                d4<Int> = c2
+                i4<Int> = 0
+                while (i4 < 1) {
+                    d5<Int> = c2
+                    i4 = i4 + 1
+                }
+                i3 = i3 + 1
+            }
+            i2 = i2 + 1
+        }
+        i1 = i1 + 1
+    }
+    println("d1=" + d1.to_string() + " d2=" + d2.to_string() + " d3=" + d3.to_string() + " d4=" + d4.to_string() + " d5=" + d5.to_string())
+    return 0
+}

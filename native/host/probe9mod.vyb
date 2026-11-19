@@ -1,0 +1,5 @@
+# probe9 module: a share'd function.
+share(all)
+f1()<Int> -> {
+    return 42
+}

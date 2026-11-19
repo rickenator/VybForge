@@ -2858,6 +2858,23 @@ glm_serve.vyb (the constants as the local typed defs with the literal values;
 cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
 from the engine — the divergence risk is tiny for the constants).
 The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
+=================== THE FINAL MECHANISM: THE SPLICE SKIPS THE ENGINE'S FNS ==================
+The pass-1 pre-insert (the constants + the top-level fns into the global scope
+before the statement visits) FIXED ALL THE CONSTANT ERRORS — and the debug
+trace exposed the fn case: the engine's share'd functions (dsa_attn_site_c,
+kda_attn_site_c, tail_site, ffn_dense_site) NEVER APPEAR in the root module's
+body — the splice's carry path skips them for the whole-module import, while
+the OTHER modules' functions (the io's hash_chars, the http's socket_open...)
+pre-insert fine. THE NEXT SESSION'S EXACT TASK: in module_registry.cpp's
+splice loop (the `for (auto& importedStmt : importedRecord.module->body)`
+walk), trace why the engine's FunctionDeclarations are skipped — the suspects:
+the closureComputed/carryNames gate for the whole-module imports, or the
+declarationVisible call for the functions vs the variables. The constants
+(the VariableDeclarations) pass the same walk — diff their treatment. Once the
+fns splice, the pre-insert (already landed) makes them resolve in the serve's
+nested scopes, and the smoke test (the curl -> {"draft_token": 10788})
+completes phase 2. The debug print ([fnpresert]) is in place in
+semantic_module.cpp's pass 1 for the verification.
 =================== CONSTANTS FIXED; FNS' NESTED VISIBILITY REMAINS ==================
 THE UPPERCASE SHARE BUG (found + fixed): my share pass matched only
 lowercase-starting names — ALL the UPPERCASE constants (NSLOT, HC, H, HEADS,

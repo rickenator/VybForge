@@ -1,0 +1,32 @@
+# probe9d: the pure nesting-depth test — the module constant c2 read at
+# increasing depths (5 levels of while), the module fn f1 too.
+import probe9cmod
+
+main()<Int> -> {
+    total<Int> = 0
+    i1<Int> = 0
+    while (i1 < 2) {
+        i2<Int> = 0
+        while (i2 < 1) {
+            i3<Int> = 0
+            while (i3 < 1) {
+                i4<Int> = 0
+                while (i4 < 1) {
+                    i5<Int> = 0
+                    while (i5 < 1) {
+                        a<Int> = f1()
+                        total = total + a + c2
+                        i5 = i5 + 1
+                    }
+                    i4 = i4 + 1
+                }
+                i3 = i3 + 1
+            }
+            i2 = i2 + 1
+        }
+        i1 = i1 + 1
+    }
+    println("total=" + total.to_string() + " (want 2*(42+222))")
+    if (total == 528) { println("PROBE9D_OK"); return 0 }
+    return 1
+}

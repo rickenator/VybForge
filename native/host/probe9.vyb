@@ -1,0 +1,15 @@
+# probe9: the importer — the share'd f1 called (a) at main's top level and
+# (b) inside a nested while. The minimal repro for the nested-scope visibility.
+import probe9mod
+
+main()<Int> -> {
+    a<Int> = f1()
+    i<Int> = 0
+    while (i < 2) {
+        b<Int> = f1()
+        println("b=" + b.to_string())
+        i = i + 1
+    }
+    println("a=" + a.to_string())
+    return 0
+}
