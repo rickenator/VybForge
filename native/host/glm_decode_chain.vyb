@@ -5668,7 +5668,10 @@ main()<Int> -> {
         t = t + 1
     }
 
-    match (open_write(out)) {
+    # open_append: the per-layer d-lines were streamed to the same file during
+    # the run — an open_write here truncates them away (the decchain14 run's
+    # file was cut to the summaries + 66 stragglers).
+    match (open_append(out)) {
         f -> { write_str(f, lines); close(f) }
         ? -> { println("CHAIN_FAIL write"); return 26 }
     }
