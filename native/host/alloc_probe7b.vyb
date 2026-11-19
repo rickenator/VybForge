@@ -1,0 +1,32 @@
+# probe7b: the bisect variant — the wrapper assigns to an OUR-scope binding
+# instead of returning. If this is FLAT, the leak is the return path; if it
+# leaks, the leak is inside the wrapper's match/bind itself. VYB_STR_TRACE=1.
+
+import io::{open_read, read_at, close}
+
+g<String> = ""
+
+wrap_assign(f<File>) -> {
+    s<String> = ""
+    match (read_at(f, 0, 4194304)) {
+        t -> { s = t }
+        ? -> { return }
+    }
+    g = s
+}
+
+main()<Int> -> {
+    match (open_read("/home/rick/vybforge-glm53-checkpoint/model.safetensors.index.json")) {
+        f -> {
+            i<Int> = 0
+            while (i < 6) {
+                wrap_assign(f)
+                i = i + 1
+            }
+            close(f)
+        }
+        ? -> { println("open failed"); return 1 }
+    }
+    println("PROBE7B_DONE")
+    return 0
+}

@@ -2682,6 +2682,18 @@ shape — the delta names the layer; then mirror the Vec call-result fix in the
 ownership pass (the String return-copy's retain must pair with a release on
 the path that consumes it). The 2MB-class cost is bounded (~4MB per full run)
 but the SAME return-path shape likely underlies part of the ~296KB class.
+BISECT DONE (probe7b/7c/7d, all committed): the RETURN path exonerated
+(probe7b — the outer-binding assign leaks the same), the global assign
+exonerated, the s.len() method call exonerated (probe7d — 3 RETs / 2 RELs
+unchanged). THE LEAK LIVES IN THE CALLED-FUNCTION MATCH/BIND ITSELF: the same
+match(read_at){t -> s = t} shape is FLAT in main (probe4) and leaks 1 ref per
+buffer inside any called function — the function-scope cleanup for the
+io-intrinsic match locals (the match scrutinee temp's arm-exit release /
+the s binding's scope-exit release) does not fully fire in a callee. NEXT:
+inspect the generated IR for wrap_void's scope exit vs main's (the
+armRetainedStringBindings releases + the function-body exitScope cleanup) —
+the missing release emission is visible by diffing which release calls exist
+in each; then fix the ownership pass for the function-body scope.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device

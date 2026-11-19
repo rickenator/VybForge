@@ -1,0 +1,30 @@
+# probe7c: the match in a called function, NO global assignment — isolates
+# whether the called-function match/bind itself leaks vs the g = s assign.
+
+import io::{open_read, read_at, close}
+
+wrap_void(f<File>)<Int> -> {
+    s<String> = ""
+    match (read_at(f, 0, 4194304)) {
+        t -> { s = t }
+        ? -> { return 1 }
+    }
+    if (s.len() < 1000) { }
+    return 0
+}
+
+main()<Int> -> {
+    match (open_read("/home/rick/vybforge-glm53-checkpoint/model.safetensors.index.json")) {
+        f -> {
+            i<Int> = 0
+            while (i < 6) {
+                rr<Int> = wrap_void(f)
+                i = i + 1
+            }
+            close(f)
+        }
+        ? -> { println("open failed"); return 1 }
+    }
+    println("PROBE7C_DONE")
+    return 0
+}
