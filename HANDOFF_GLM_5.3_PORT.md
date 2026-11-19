@@ -2583,7 +2583,23 @@ deq'd weights cached to disk instead of recalculated every run: the staging is
 tensors per tensor name+layer (~35GB, apex NFS or local), save on first deq,
 bulk-load on later runs — applies to BOTH glm_prefill and glm_decode_chain (a
 shared Vyb cache module, native/glm53/deq_cache.vyb); this also cuts the RSS
-pressure. (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
+pressure.
+DEQ-CACHE DESIGN (scoped this session, ready to implement): the deq'd tensors
+are raw device byte buffers copied by bulk_dtoh via cuMemcpyDtoH_v2 (the n*8
+raw copy — see tensor.vyb ~146) — NO per-element host loop needed. Pieces:
+(a) the io module (C): add vyb_io_write_raw / vyb_io_read_raw (the fd, ptr,
+len) — trivial; (b) deq_cache.vyb: cache_save(name<String>, d<Int>, n<Int>):
+v = bulk_dtoh(d, n) -> the raw buffer bytes via the from<loc<Int>>(addr(r)) /
+at(hdr) pattern (bulk_dtoh's own body shows it) -> write_raw to
+/mnt/apex/rick/vybforge/deq_cache/<name>.bin (apex NFS, Rick's landing zone);
+cache_load(name, n): read_raw -> the Vec -> dev_alloc + bulk_htod -> the
+device handle, else return 0; (c) the wiring: the 72 expert deq sites (the
+dWg/dWu/dWd exl3_deq32 calls in glm_prefill ~1770 + the chain's counterpart)
++ the attention deq sites: d = cache_load(name, n); if (d == 0) { d =
+exl3_deq32(...); cache_save(name, d, n) } — the names: <layer>.<expert>.<wugd>
+— the cache is BIT-EXACT (the raw bytes round-trip, no f32<->bf16 repacking);
+(d) the env knob VYBFORGE_DEQ_CACHE=/mnt/apex/rick/vybforge/deq_cache (the
+absent/empty = the cache off, the old behavior). (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
 (3) Land fix/return-path-cleanup-v2 into main. (4) The fused prefill re-measure
 (the honest wall clock). (5) The had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
