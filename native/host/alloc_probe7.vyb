@@ -1,0 +1,32 @@
+# probe7: the gx_read-shaped read_at leak — a wrapper fn returns the unwrapped
+# read_at String, the caller binds and reassigns. The 2MB buffers showed
+# REG refs=1 -> 5 RETs -> 4 RELs (one retain unreleased). This probe isolates
+# the wrapper-return layer probe4 did not cover. Run with VYB_STR_TRACE=1.
+
+import io::{open_read, read_at, close}
+
+wrap_read(f<File>)<String> -> {
+    s<String> = ""
+    match (read_at(f, 0, 4194304)) {
+        t -> { s = t }
+        ? -> { return "" }
+    }
+    return s
+}
+
+main()<Int> -> {
+    match (open_read("/home/rick/vybforge-glm53-checkpoint/model.safetensors.index.json")) {
+        f -> {
+            i<Int> = 0
+            while (i < 6) {
+                s<String> = wrap_read(f)
+                if (s.len() < 1000) { println("short read at i=" + i.to_string()) }
+                i = i + 1
+            }
+            close(f)
+        }
+        ? -> { println("open failed"); return 1 }
+    }
+    println("PROBE7_DONE")
+    return 0
+}

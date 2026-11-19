@@ -2668,6 +2668,20 @@ ownership-pass pattern); (b) dump the live SET at exit (a VYB_STR_DUMP=1
 runtime knob printing the live entries' sizes histogram at exit) to identify
 the ~296KB strings' owner — the likely site is the dumps()/digest() results
 held by the `lines` accumulator or the dg bindings' release path.
+PROBE7: THE LEAK REPRODUCED MINIMALLY AND DETERMINISTICALLY
+(native/host/alloc_probe7.vyb): a wrapper fn does match(read_at(f,0,4MB))
+{ t -> s = t } and RETURNS s; the caller binds s<String> = wrap_read(f) and
+reassigns 6x. ALL 6 buffers: REG refs=1 -> 4 RETs -> 3 RELs (old=4,4,3) ->
+refs=1 stuck, no RETIRE — one retain per buffer never gets its release. The
+direct unwrap-to-binding shape (probe4) is FLAT; the WRAPPER-RETURN layer adds
+the unbalanced retain (the return of a shared binding retains the return copy;
+somewhere in that return->transfer->bind chain one retain lacks its release).
+THE FIX PATH (next session): bisect with two probe variants — (a) the wrapper
+assigning to an `our`/outer binding instead of returning, (b) probe4's direct
+shape — the delta names the layer; then mirror the Vec call-result fix in the
+ownership pass (the String return-copy's retain must pair with a release on
+the path that consumes it). The 2MB-class cost is bounded (~4MB per full run)
+but the SAME return-path shape likely underlies part of the ~296KB class.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
