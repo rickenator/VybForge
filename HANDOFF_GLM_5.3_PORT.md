@@ -2652,6 +2652,22 @@ definitive): add the buffer SIZE to the REG trace line in vyb_runtime.c, then
 rerun the 3-layer prefill with VYB_STR_TRACE=1 and grep the 4MB REGs' ledgers
 (REG->RET->REL->RETIRE) — the one that never tombstones is the leaker; its
 RET count vs the REL count names the exact unbalanced site.
+SIZE-TAGGED TRACE DONE (the REG line now prints malloc_usable_size; the
+3-layer prefill trace in /tmp/pt3s.log): TWO findings: (1) the 2MB read_at
+buffers (size=2097160, only 2 distinct in 3 layers — the pool recycles them)
+leak EXACTLY 1 ref per lifetime: REG refs=1 -> 5 RETs -> 4 RELs (old=4,4,4,3)
+-> refs=1, no RETIRE — the probe4 pattern in a different call shape; BOUNDED
+(~4MB total, not the 300MB/layer). (2) THE REAL per-layer growth: the ~296KB
+string class (size~296536, ~270 allocations in 3 layers = ~90/layer — the
+dump/digest-string size class: the 16384-int dumps lines are ~296KB) plus a
+large population of smaller live entries — the live_bytes' ~300MB/layer lives
+there. NEXT: (a) fix the 2MB read_at ledger (one retain has no release — the
+5 RETs are: the optional's inner store, the payload copy, the binding assign,
+the exl3_deq32 param entry, +1 more; the fix follows the probe4/read_at
+ownership-pass pattern); (b) dump the live SET at exit (a VYB_STR_DUMP=1
+runtime knob printing the live entries' sizes histogram at exit) to identify
+the ~296KB strings' owner — the likely site is the dumps()/digest() results
+held by the `lines` accumulator or the dg bindings' release path.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
