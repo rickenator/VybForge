@@ -2599,7 +2599,27 @@ dWg/dWu/dWd exl3_deq32 calls in glm_prefill ~1770 + the chain's counterpart)
 exl3_deq32(...); cache_save(name, d, n) } — the names: <layer>.<expert>.<wugd>
 — the cache is BIT-EXACT (the raw bytes round-trip, no f32<->bf16 repacking);
 (d) the env knob VYBFORGE_DEQ_CACHE=/mnt/apex/rick/vybforge/deq_cache (the
-absent/empty = the cache off, the old behavior). (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
+absent/empty = the cache off, the old behavior).
+DEQ-CACHE STATUS: BUILT AND VALIDATED (4bd0f53) — deq_cache.vyb + probe6
+(PROBE6_OK: save/load round-trip 0/1024 mismatches, the wrong-size load
+rejected, the raw cuMemcpy byte path bit-exact). GOTCHA FOUND DURING WIRING:
+the deq'd tensors are f64 (8 B/elem — alloc_dev(rows*K*8)) and the expert pool
+is NE=288 with ~130-160 DISTINCT (layer, expert) pairs hit per prefill — a full
+deq'd cache is ~1.1-1.4 TB. THE STAGING TIME IS MOSTLY THE TRELLIS READS
+(3 x 4MB gx_read per expert off the apex NFS, ~130 experts/layer = ~1.6GB/layer
+of network reads), not the deq kernels. THE THREE REAL OPTIONS:
+  (a) rsync the checkpoint to the local NVMe once (155GB packed, 319G free —
+      tight but fits) and point VYBFORGE_GX_DIR at it: ZERO code, the reads go
+      from network to local NVMe, the staging drops ~5-10x;
+  (b) cache the PACKED trellises with deq_cache.vyb instead of the deq'd
+      tensors: 12MB/expert x the distinct pairs ~ 70-155GB — the deq compute
+      stays (~3s/layer), the reads go local;
+  (c) the full deq'd cache as built: 1.1-1.4TB on the apex NFS (2.8T free) —
+      the fastest runs (no deq, no reads, the pure h2d) but a huge footprint.
+RECOMMENDED: (a) first (free), then (b) if the deq compute matters. The
+deq_cache module as built supports (c) as-is and (b) with the same functions
+(the trellis Strings need a String<->bytes shim — the gx_read returns String;
+write_bytes takes Vec<UInt8> — a small conversion or a String-bytes io call). (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
 (3) Land fix/return-path-cleanup-v2 into main. (4) The fused prefill re-measure
 (the honest wall clock). (5) The had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
