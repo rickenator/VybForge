@@ -2789,11 +2789,47 @@ branch; (b) a PRE-EXISTING bug the cross-module strict checking exposed: the
 chain's moe_tail_step call was missing the hdg argument (benign at runtime —
 the f32 decode path never touches the f16 hoist — and invisible to the
 monolithic semantic check); fixed in the engine. (c) THE LEAK FIXES AT CHAIN
-SCALE CONFIRMED: decchain20's RSS is FLAT ~1.5GB through both steps (was
+scale (CONFIRMED: decchain20's RSS is FLAT ~1.5GB through both steps (was
 70-87GB) and the run is dramatically faster (~25 min total vs ~70). REMAINING:
 phase 1 (the dtype migration inside the engine boundary) per the plan; the
 serve's PORT sections (the weights load -> engine_init, the prefill body ->
 engine_prefill, the http accept loop + SSE).
+=================== THE SERVE'S STATE- IN-MAIN REFACTOR (2026-11-18) ==================
+The module-global Vec type gap is CONFIRMED as a Vyb limitation (the member
+calls on the module-global Vecs cannot be typed in the function bodies —
+probe8/8b verified the Int globals + the local shadowing work, the Vec globals
+do not). THE ARCHITECTURE THAT WORKS: glm_serve.vyb's main() holds ALL the
+state as ITS OWN locals (the setup + the caches + the phases inlined from the
+chain's main body), importing the engine's share(all)'d site functions. THE
+STATE: glm_serve.vyb is 1837 lines, semantic-clean EXCEPT these enumerated
+errors (the fix list, in order):
+  1. The stale scaffold handle_generate() fn (with an engine_run ref) must be
+     deleted — the inlined main supersedes it.
+  2. The setup's `tk = 0` (the serve's line 187): the original chain defines
+     tk with a typed def INSIDE an if-block (the 8-indent); the inlined copy's
+     un-annotated assignment cannot infer the type — restore the typed def
+     form at the inlined site.
+  3. The serve's body calls the cu* (cuMemAlloc_v2 etc.) directly: add the
+     chain's extern "C" block (cuMemFree_v2, cuMemAlloc_v2, cuMemcpyHtoD_v2,
+     cuCtxSynchronize, cuMemGetInfo_v2, vyb_str_stats, cuModuleLoadData,
+     cuModuleGetFunction, cuda_launch4i, malloc_trim) to glm_serve.vyb.
+  4. The imports are synced to the chain's (io/env/safetensors/gx/tensor/
+     vmath/time/json_parse/deq_cache/glm_engine) — the json module has no
+     mod.vyb; import json_parse (the file stem) not json.
+  5. glm_engine.vyb is rebuilt clean (4050 lines: the constants, the scalar
+     module state, 18 share(all)'d site fns — NO engine_init/engine_prompt:
+     the module-global Vec gap killed them; the bodies live in the serve's
+     main and the restored chain monolith). glm_decode_chain.vyb is restored
+     to the 7ba7a05 monolith (the gate binary, unchanged behavior).
+  6. glm_serve's transport: http_listen (NOT http_serve — it races its own
+     demo handler), the query-string GET (the POST body needs the
+     Content-Length framing), the conn.fd accessors.
+THE SMOKE TEST (after the fixes): VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=8091
++ the curl GET /v1/generate?ids=<the gold csv>&nsteps=2 -> {"draft_token":
+10788} — the full engine_run compute per request (~20 min: the setup is not
+yet hoisted out of the loop — the init/prompt split inside the serve's main
+is the following increment, now unblocked by the working single-function
+baseline).
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device

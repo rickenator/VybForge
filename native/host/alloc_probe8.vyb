@@ -1,0 +1,15 @@
+# probe8: can a function assign a module-scope binding (a global write)?
+g<Int> = 5
+
+bump()<Int> -> {
+    g = g + 1
+    return g
+}
+
+main()<Int> -> {
+    a<Int> = bump()
+    b<Int> = bump()
+    println("g after two bumps: " + g.to_string() + " (want 7)")
+    if (g == 7) { println("PROBE8_OK") ; return 0 }
+    return 1
+}

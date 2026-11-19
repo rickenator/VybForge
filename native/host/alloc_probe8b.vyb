@@ -1,0 +1,19 @@
+# probe8b: does a function-local typed def shadow a module global of the same
+# name without a redefinition error? The engine's loop bodies redefine i/j/mv
+# etc. that the split would promote to module scope.
+i<Int> = 99
+mv<Int> = 42
+
+use_shadows()<Int> -> {
+    i<Int> = 0
+    mv<Int> = 7
+    while (i < 3) { mv = mv + i; i = i + 1 }
+    return mv
+}
+
+main()<Int> -> {
+    r<Int> = use_shadows()
+    println("fn-local mv=" + r.to_string() + " (want 10); module mv=" + mv.to_string() + " (want 42); module i=" + i.to_string() + " (want 99)")
+    if (r == 10 && mv == 42 && i == 99) { println("PROBE8B_OK"); return 0 }
+    return 1
+}
