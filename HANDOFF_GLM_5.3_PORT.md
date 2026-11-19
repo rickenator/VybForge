@@ -2767,6 +2767,33 @@ mechanical refactor. THE STATE:
   the engine boundary.
 - Phase 3+4 (the batching B=2->4 + the http endpoint): after 1+2, per
   doc/SERVING-ENDPOINT-SCOPING.md's plan and risks.
+=================== PHASE 2 EXECUTED: THE ENGINE SPLIT IS DONE (2026-11-18) ==================
+The engine/API split landed DIFFERENTLY than the 287-identifier function
+extraction feared — better: (1) glm_decode_chain.vyb's main() became the
+EXPORTED engine_run(ids_csv<String>, nsteps_in<Int>) (the ids from the param,
+not the env; the nsteps param with the VYBFORGE_NSTEPS env override kept; the
+ids-count check relaxed 22 -> >= 4 for the arbitrary prompts); (2) the Vyb
+"imported module must not define main()" rule forced the clean split:
+native/glm53/glm_engine.vyb (205KB, importable, no main — the constants, all
+the site fns, the hoists, engine_run) + glm_decode_chain.vyb as the THIN GATE
+BINARY (main -> engine_run(gold csv, 0)) + glm_serve.vyb importing
+glm_engine::{engine_run}. THE GATE IS GREEN THROUGH THE IMPORT:
+DECODE_CHAIN_MATCH: OK, the draft 10788, rc=0 (decchain_engine.log). BONUS
+FINDINGS ON THE WAY: (a) a Vyb compiler fix — the imported modules' extern "C"
+blocks were dropped by the dependency-closure carry (the externs are leaves:
+no definition in the module), so the spliced engine body lost the cu*
+declarations; the fix in module_registry.cpp carries the __extern_C namespace
+blocks always (the plain AstCloner clone — NOT cloneSplicedStmt, whose mangle
+pass rewrote the foreign C symbols and broke the JIT link), landed on the fix
+branch; (b) a PRE-EXISTING bug the cross-module strict checking exposed: the
+chain's moe_tail_step call was missing the hdg argument (benign at runtime —
+the f32 decode path never touches the f16 hoist — and invisible to the
+monolithic semantic check); fixed in the engine. (c) THE LEAK FIXES AT CHAIN
+SCALE CONFIRMED: decchain20's RSS is FLAT ~1.5GB through both steps (was
+70-87GB) and the run is dramatically faster (~25 min total vs ~70). REMAINING:
+phase 1 (the dtype migration inside the engine boundary) per the plan; the
+serve's PORT sections (the weights load -> engine_init, the prefill body ->
+engine_prefill, the http accept loop + SSE).
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device

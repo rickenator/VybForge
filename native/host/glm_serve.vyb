@@ -24,26 +24,9 @@ import io::{open_read, read_all, read_at, close}
 import env::{env_get}
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
 import deq_cache::{cache_save, cache_load, deq_cache_dir}
+import glm_engine::{engine_run}
 
-# ---- config (the chain's verified constants) ----
-H<Int> = 4096
-HEADS<Int> = 64
-NOPE<Int> = 256
-VDIM<Int> = 256
-KV_LORA<Int> = 512
-Q_LORA<Int> = 1536
-IHEADS<Int> = 32
-KD<Int> = 128
-EINTER<Int> = 2048
-NE<Int> = 288
-ROUTE_TOPK<Int> = 8
-INTER<Int> = 12288
-NSLOT<Int> = 34          # the KDA layer slots
-NDSLOT<Int> = 11         # the DSA layer slots
-NLAY<Int> = 45
-CONV_K<Int> = 4
-CAPT<Int> = 0            # the DSA cache capacity in tokens: set from MAXCTX
-MAXCTX<Int> = 32768      # the v1 preallocated context
+# ---- the config constants come from the glm_engine module exports ----
 
 # ---- the engine state (module-scope; the caches + the weights live here) ----
 # PORT: the packed-weight handles, the KDA state/ring buffers, the DSA caches,
@@ -107,10 +90,15 @@ serve_main()<Int> -> {
 main()<Int> -> {
     m<String> = env_get("VYBFORGE_SERVE") else ""
     if (m.len() == 0) {
-        # the default: the self-test path (the engine init + a 2-step smoke
-        # decode) so the binary stays gate-runnable without a client.
-        println("SERVE_SMOKE: VYBFORGE_SERVE unset, running the engine self-test")
-        return 0
+        # the default: the engine self-test — the gold prompt through
+        # engine_run (the gated chain's engine, imported): the returned draft
+        # must be 10788 (the f64 gold's next token, DECODE_CHAIN_MATCH's
+        # functional check).
+        println("SERVE_SMOKE: running the engine self-test")
+        draft<Int> = engine_run("785,6722,315,9621,374,12089,11,323,279,7772,3283,304,9851,374,19808,11,892,572,17753,369,10788,13", 2)
+        println("SERVE_SMOKE draft=" + draft.to_string() + " (want 10788)")
+        if (draft == 10788) { println("SERVE_SMOKE_OK"); return 0 }
+        return 5
     }
     return serve_main()
 }
