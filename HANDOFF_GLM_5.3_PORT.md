@@ -2564,6 +2564,28 @@ registration bug (probe4 flat, df129845); (2) the Vec call-result temporary
 1358/1358 green after each. Next session: poll decchain12, then the residual
 700MB/layer if needed, then land the branch to main (the ruleset procedure),
 the fused prefill re-measure, and the had_hoist mirror.
+DECCHAIN13 VERDICT (all compute complete, both steps 45/45, digests streamed
+kill-safe to decchain_vyb.txt): DECODE_CHAIN_MATCH FAIL, worst 33.07 abs at
+layer 44 — IDENTICAL against the stale Nov-15 reference AND the freshly
+regenerated fused reference (prefill_vyb.txt regen green: PREFILL_OK layers=45,
+45 chain<N> dumps landed after the open_write-truncation bug fix 5229592).
+DIAGNOSIS: the divergence is the chain's step-1 DRAFT TOKEN — the chain feeds
+its own step-0 argmax (the MTP draft) as step 1's input; the reference's second
+stream uses the gold prompt token 21. A draft != gold propagates: layer 0
+1.4e-2 -> layer 44 33.07, growing with depth. The gate needs a
+numerical-equivalence mode: VYBFORGE_GOLD_STEP1=1 makes the chain's step 1
+consume the gold token 21 instead of the draft, then the streams must match to
+f32 noise and the gate goes OK. Also log the step-0 argmax vs token 21 once to
+confirm the draft/gold mismatch explicitly (one println in the MTP head).
+NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
+deq'd weights cached to disk instead of recalculated every run: the staging is
+~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
+tensors per tensor name+layer (~35GB, apex NFS or local), save on first deq,
+bulk-load on later runs — applies to BOTH glm_prefill and glm_decode_chain (a
+shared Vyb cache module, native/glm53/deq_cache.vyb); this also cuts the RSS
+pressure. (2) The GOLD_STEP1 fix + the argmax log, re-run the chain verdict.
+(3) Land fix/return-path-cleanup-v2 into main. (4) The fused prefill re-measure
+(the honest wall clock). (5) The had_hoist mirror.
 EXACT LEDGER (VYB_STR_TRACE, the A-loop buffers, address-tracked): each read_at
 buffer: REG refs=1 (the owned birth ref) + 3 RETs (THREE retains: the optional's
 inner store, the shallow-copy's retain, the s-assignment's retain) = 4 refs;
