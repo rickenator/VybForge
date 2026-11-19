@@ -2641,6 +2641,17 @@ VYB_STR_TRACE on the 3-layer prefill (the same expert loop, ~5 min) — follow
 one trellis string's REG/RET/REL ledger through one gx_read -> g_ge_N
 reassignment -> exl3_deq32 call to find the unbalanced retain. The magnitude
 (~300MB/layer x 45 = 13GB/run) is non-blocking but worth closing.
+TRACE RUN + NARROWED (the 3-layer prefill, VYB_STR_TRACE, 21.8M events):
+per-address accounting is invalid (malloc reuse conflates allocations), but
+the arithmetic nails the SHAPE: the base 751K live entries (658MB) accumulate
+during the model LOAD (the torchpickle/safetensors parse temps — a one-time
+bounded loader leak, tolerable), and the per-layer growth is ~+7.7 live
+entries and ~3.8MB per expert = EXACTLY ONE trellis-sized (4MB) string leaks
+per expert (not all three). NEXT (a 2-line runtime change makes it
+definitive): add the buffer SIZE to the REG trace line in vyb_runtime.c, then
+rerun the 3-layer prefill with VYB_STR_TRACE=1 and grep the 4MB REGs' ledgers
+(REG->RET->REL->RETIRE) — the one that never tombstones is the leaker; its
+RET count vs the REL count names the exact unbalanced site.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
