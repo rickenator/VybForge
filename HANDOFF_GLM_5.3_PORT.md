@@ -2858,6 +2858,26 @@ glm_serve.vyb (the constants as the local typed defs with the literal values;
 cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
 from the engine — the divergence risk is tiny for the constants).
 The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
+=================== THE GAP IS UNIVERSAL: NESTED-SCOPE IMPORTED SYMBOLS ==================
+The shim proved it: the constants shim (NSLOT/HEADS/KD) resolved those three,
+then the NEXT constants surfaced (CONV_K/NDSLOT/CAPT/KV_LORA/IDIM/R/HC), and
+worse — the ENGINE'S SHARE'D FUNCTIONS (dsa_attn_site_c, kda_attn_site_c) are
+ALSO undefined inside main's nested scopes. THE RULE: imported-module symbols
+(the constants, the externs, AND the share'd functions) are visible at the
+importer's TOP-LEVEL statements but INVISIBLE inside the importer's NESTED
+scopes (the while/match bodies — exactly where the http serve loop lives).
+THE COMPILER FIX (the real one, next session): semantic.cpp's identifier
+resolution — when the scope-stack lookup fails, fall back to the module
+namespace maps (setModuleScoping's ownerByName/effectiveScope carry the
+name -> mangled-name mapping) and resolve to the mangled identifier. The
+site: semantic.cpp:654 (the Undefined identifier error path). The mechanism
+is already proven: the top-level statements resolve the imported symbols
+(the H collision proved the binding), so the maps exist — only the nested
+scope chain's fallback is missing. THE SERVE'S SHIM: keep the config shim
+(it works and isolates the serve from the engine's constant changes); the
+function calls wait for the compiler fix. glm_serve.vyb is committed with
+the config shim + the full inlined body — it needs ONLY the compiler fix to
+be semantic-clean.
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device

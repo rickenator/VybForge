@@ -60,6 +60,34 @@ gscAll<Vec<Float>> = Vec()
 # clients send the token ids (the gold ids round-trip is the smoke test).
 
 main()<Int> -> {
+    # the local shim: the engine's constants/externs are not visible inside
+    # main's nested scopes (the imported-symbol visibility gap) — the values
+    # duplicated from glm_engine.vyb until the compiler fix lands.
+    H<Int> = 4096
+    HEADS<Int> = 64
+    NOPE<Int> = 256
+    VDIM<Int> = 256
+    KV_LORA<Int> = 512
+    Q_LORA<Int> = 1536
+    IHEADS<Int> = 32
+    KD<Int> = 128
+    EINTER<Int> = 2048
+    NE<Int> = 288
+    ROUTE_TOPK<Int> = 8
+    INTER<Int> = 12288
+    NSLOT<Int> = 34
+    NDSLOT<Int> = 11
+    NLAY<Int> = 45
+    CONV_K<Int> = 4
+    CAPT<Int> = 22
+    MAXCTX<Int> = 32768
+    IDIM<Int> = 128
+    R<Int> = 20
+    extern "C" {
+        cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                      blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                      a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+    }
     port<Int> = 8091
     ps<String> = env_get("VYBFORGE_SERVE_PORT") else ""
     if (ps.len() > 0) { port = ps.to_int() }
