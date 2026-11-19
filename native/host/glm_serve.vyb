@@ -30,6 +30,9 @@ import time::{time_mono_millis}
 import json_parse
 import deq_cache::{cache_save, cache_load, deq_cache_dir}
 import glm_engine
+import cuda_binding::{cuMemFree_v2, cuMemAlloc_v2, cuMemcpyHtoD_v2, cuMemcpyDtoH_v2, cuCtxSynchronize, cuModuleLoadData, cuModuleGetFunction}
+
+
 
 # ---- the config constants come from the glm_engine module exports ----
 
@@ -55,40 +58,6 @@ gscAll<Vec<Float>> = Vec()
 # The ids-based v1 API: the GLM BPE tokenizer port is its own phase (the
 # tokenizer is a big deterministic program in its own right); until then the
 # clients send the token ids (the gold ids round-trip is the smoke test).
-handle_generate(query<String>)<String> -> {
-    tok<String> = env_get("VYBFORGE_SERVE_TOKEN") else ""
-    # extract prompt_ids (the comma list inside the JSON) without a full JSON
-    # dependency: find the "prompt_ids" key, then the [ ... ] span.
-    k<Int> = query.index_of("ids=")
-    if (k < 0) { return http_response(400, "{\"error\": \"ids missing\"}") }
-    amp<Int> = query.substring(k, query.len()).index_of("&")
-    endq<Int> = query.len()
-    if (amp > 0) { endq = k + amp }
-    csv<String> = query.substring(k + 4, endq)
-    # strip the spaces
-    clean<String> = ""
-    i<Int> = 0
-    while (i < csv.len()) {
-        ch<String> = csv.substring(i, i + 1)
-        if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { clean = clean + ch }
-        i = i + 1
-    }
-    ns<Int> = 2
-    nk<Int> = query.index_of("nsteps=")
-    if (nk >= 0) {
-        d<String> = ""
-        j<Int> = nk + 7
-        while (j < query.len()) {
-            ch<String> = query.substring(j, j + 1)
-            if (ch >= "0" && ch <= "9") { d = d + ch }
-            else { if (d.len() > 0) { j = query.len() } }
-            j = j + 1
-        }
-        if (d.len() > 0) { ns = d.to_int() }
-    }
-    draft<Int> = engine_run(clean, ns)
-    return http_response(200, "{\"draft_token\": " + draft.to_string() + "}")
-}
 
 main()<Int> -> {
     port<Int> = 8091
@@ -184,7 +153,7 @@ main()<Int> -> {
     cv = 0.0
     i0 = 0
     nt = 0
-    tk = 0
+    tk<Int> = 0
     n = 0
     npools = 0
     select_k = 0
@@ -433,7 +402,28 @@ main()<Int> -> {
                     # the prefill's default id list (22 tokens); phase 1 prefills ids[0..19], the two
                     # decode steps re-walk ids[20] and ids[21] teacher-forced.
                     ids<Vec<Int>> = Vec()
-                    idtxt<String> = q_ids
+                    k<Int> = q.index_of("ids=")
+    q_ids<String> = ""
+    if (k >= 0) {
+        amp<Int> = q.substring(k, q.len()).index_of("&")
+        endq<Int> = q.len()
+        if (amp > 0) { endq = k + amp }
+        q_ids = q.substring(k + 4, endq)
+    }
+    ns<Int> = 2
+    nk<Int> = q.index_of("nsteps=")
+    if (nk >= 0) {
+        d<String> = ""
+        j<Int> = nk + 7
+        while (j < q.len()) {
+            ch<String> = q.substring(j, j + 1)
+            if (ch >= "0" && ch <= "9") { d = d + ch }
+            else { if (d.len() > 0) { j = q.len() } }
+            j = j + 1
+        }
+        if (d.len() > 0) { ns = d.to_int() }
+    }
+    idtxt<String> = q_ids
                     cur<String> = ""
                     i = 0
                     while (i <= idtxt.len()) {
@@ -451,7 +441,7 @@ main()<Int> -> {
                     if (ids.len() < 4) { println("CHAIN_FAIL ids " + ids.len().to_string()); return 8 }
                     nl2<String> = env_get("VYBFORGE_NLAYERS") else ""
                     if (nl2.len() > 0) { nlay = nl2.to_int() }
-                    nsteps<Int> = nsteps_in
+                    nsteps<Int> = ns
                     if (nsteps <= 0) {
                         ns<String> = env_get("VYBFORGE_NSTEPS") else ""
                         nsteps = 2

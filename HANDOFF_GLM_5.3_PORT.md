@@ -2830,6 +2830,34 @@ THE SMOKE TEST (after the fixes): VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=8091
 yet hoisted out of the loop — the init/prompt split inside the serve's main
 is the following increment, now unblocked by the working single-function
 baseline).
+=================== SERVE STRUCTURE COMPLETE; 4 SYMBOL-VISIBILITY ERRORS LEFT ==================
+The serve's architecture is BUILT and correct: glm_serve.vyb's main() holds
+the state as its own locals (the setup + the caches + the phases inlined from
+the chain), imports glm_engine (18 share'd site fns + the constants) and
+cuda_binding, the http_listen accept loop wraps the per-request body, the
+query-string transport, the draft response. THE REMAINING SEMANTIC ERRORS
+(4, all the same class — the imported module's constants/externs are not
+visible inside the importer's NESTED function scopes, while the share'd
+functions are):
+  1. cuda_launch4i (the serve's line 373) — the engine's carried extern block
+     covers it at the top level but not inside main's nested scopes; a local
+     extern block for it collides with the carried block (the redefinition
+     detection skips the carry entirely — all-or-nothing).
+  2-4. NSLOT, HEADS, KD (the serve's line 462) — the engine's constants: the
+     same nested-scope visibility gap. NOTably the earlier top-level collision
+     (the serve's own H<Int> vs the engine's H) proved the constants ARE bound
+     at the module scope — the gap is the NESTED function scope's lookup.
+THE FIX (next session, the compiler): the semantic's identifier resolution for
+the function bodies must include the imported modules' top-level constants and
+the carried extern declarations — the same mechanism the share'd functions use.
+The likely site: semantic.cpp's identifier resolution + setModuleScoping's
+ownerByName/effectiveScope (the module-qualified names are mangled; the
+function-body lookup path for the imported constants/externs is missing).
+WORKAROUND if the compiler fix is unwanted: declare the 4 symbols locally in
+glm_serve.vyb (the constants as the local typed defs with the literal values;
+cuda_launch4i as a local extern block — a 4-line shim, the values duplicated
+from the engine — the divergence risk is tiny for the constants).
+The chain gate is UNAFFECTED (the restored monolith, gate-green at 7ba7a05).
 NEXT SESSION'S QUEUE (Rick-directed): (1) DEQ-WEIGHT CACHE — Rick wants the
 deq'd weights cached to disk instead of recalculated every run: the staging is
 ~90% of each run's wall (~36s/layer compute 4s); cache the deq'd bf16 device
