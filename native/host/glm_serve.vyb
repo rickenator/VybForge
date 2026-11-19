@@ -19,7 +19,7 @@
 # glm_decode_chain.vyb's proven sections in the next pass (mechanical, the
 # sections are marked PORT: below).
 
-import http::{http_listen, http_accept, http_serve, http_local_port}
+import http::{http_listen, http_accept, http_read_head, http_request_path, http_send_all, http_close, http_response}
 import io::{open_read, read_all, read_at, close}
 import env::{env_get}
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
@@ -68,21 +68,84 @@ engine_step()<Int> -> {
 
 # ---- the server ----
 
+# POST /v1/generate  {"prompt_ids": [785, ...], "nsteps": 2}
+#   -> {"draft_token": 10788}
+# The ids-based v1 API: the GLM BPE tokenizer port is its own phase (the
+# tokenizer is a big deterministic program in its own right); until then the
+# clients send the token ids (the gold ids round-trip is the smoke test).
+handle_generate(query<String>)<String> -> {
+    tok<String> = env_get("VYBFORGE_SERVE_TOKEN") else ""
+    # extract prompt_ids (the comma list inside the JSON) without a full JSON
+    # dependency: find the "prompt_ids" key, then the [ ... ] span.
+    k<Int> = query.index_of("ids=")
+    if (k < 0) { return http_response(400, "{\"error\": \"ids missing\"}") }
+    amp<Int> = query.substring(k, query.len()).index_of("&")
+    endq<Int> = query.len()
+    if (amp > 0) { endq = k + amp }
+    csv<String> = query.substring(k + 4, endq)
+    # strip the spaces
+    clean<String> = ""
+    i<Int> = 0
+    while (i < csv.len()) {
+        ch<String> = csv.substring(i, i + 1)
+        if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { clean = clean + ch }
+        i = i + 1
+    }
+    ns<Int> = 2
+    nk<Int> = query.index_of("nsteps=")
+    if (nk >= 0) {
+        d<String> = ""
+        j<Int> = nk + 7
+        while (j < query.len()) {
+            ch<String> = query.substring(j, j + 1)
+            if (ch >= "0" && ch <= "9") { d = d + ch }
+            else { if (d.len() > 0) { j = query.len() } }
+            j = j + 1
+        }
+        if (d.len() > 0) { ns = d.to_int() }
+    }
+    draft<Int> = engine_run(clean, ns)
+    return http_response(200, "{\"draft_token\": " + draft.to_string() + "}")
+}
+
 serve_main()<Int> -> {
     port<Int> = 8090
     ps<String> = env_get("VYBFORGE_SERVE_PORT") else ""
     if (ps.len() > 0) { port = ps.to_int() }
     rc<Int> = engine_init()
     if (rc != 0) { return rc }
-    listener = http_serve(port, 8)
-    println("glm_serve listening on " + port.to_string())
-    while (1) {
-        conn = listener
-        # PORT: the accept loop + the request parse + the SSE generation:
-        # each connection allocates a slot (the KDA state + the DSA caches),
-        # runs engine_prefill(prompt), then streams engine_step() tokens as
-        # SSE data events until the stop condition.
-        break
+    match (http_listen(port, 8)) {
+        listener -> {
+        println("glm_serve listening on " + port.to_string())
+        while (1) {
+        match (http_accept(listener)) {
+            conn -> {
+                head<String> = http_read_head(conn.fd, 65536)
+                pth<String> = http_request_path(head)
+                # the body: after CRLFCRLF; the engine_run is deterministic and
+                # the caches are per-call, so serial handling is correct v1.
+                resp<String> = ""
+                # the query: everything after "?" in the path
+                qp<Int> = pth.index_of("?")
+                q<String> = ""
+                route<String> = pth
+                if (qp >= 0) {
+                    route = pth.substring(0, qp)
+                    q = pth.substring(qp + 1, pth.len())
+                }
+                if (route == "/v1/generate") {
+                    resp = handle_generate(q)
+                } else {
+                    resp = http_response(404, "{\"error\": \"not found\"}")
+                }
+                http_send_all(conn.fd, resp)
+                http_close(conn.fd)
+            }
+            ? -> { println("SERVE accept failed"); return 7 }
+        }
+        }
+        }
+        ? -> { println("SERVE_FAIL listen"); return 6 }
     }
     return 0
 }
