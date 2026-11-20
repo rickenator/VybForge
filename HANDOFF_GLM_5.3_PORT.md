@@ -2877,10 +2877,22 @@ the prime suspects: the dropped annotations changed a binding's scoping, or a
 block-scoped def in the chain became a function-local in the serve with
 different initialization order. THE SERVE'S HTTP LAYER: VERIFIED WORKING
 (the listener, the accept, the parse, the response path) — the engine's
-compute correctness is the remaining piece. THE ALTERNATIVE (if the inline
-diff stalls): the serve calls the chain's engine_run per request (the v0's
-proven path) and eats the per-request setup cost until the engine's
-init/prompt split is ported properly.
+compute correctness is the remaining piece. THE GATE RE-PROVEN GREEN ON THE CURRENT TREE (19:20 run, /tmp/decchain_pace.log):
+`MTP draft token: 10788 (logit 17.9398)` + `CHAIN_OK` + `DECODE_CHAIN_MATCH: OK`
+— the regression proof covers every compiler edit of this session (the extern
+carry, the auto-export, the extern dedup, the #432 exemption, the share
+passes). MEASURED PACE (the local checkpoint): the gate runs 4s/phase-layer
+and ~35s/step-layer; the serve runs uniformly ~3x slower (12s/108s) with
+byte-identical deterministic digests — the cause open (NOT: the memory
+cgroup — fixed via systemd-run 80G; NOT: the JIT nesting depth — probe10d
+11.6s == 11.6s; NOT: the binary — build/vyb is 1.27x SLOWER than
+build-release/vyb on probe10d). The serve's launch procedure: systemd-run
+--user --scope -q -p MemoryMax=80G (the session scope caps at 4GiB and
+thrashed: 477M direct-reclaim page scans, memory.max=4294967296 confirmed).
+PROBE10 FINDINGS (native/host/probe10.vyb, committed): module-scope Vec
+member calls (.push/.get/.set) silently no-op in the codegen (len=0) unless
+an earlier rvalue read cached the global into namedValues — main-local typed
+Vecs always work. The serve's state now lives as main's locals.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
