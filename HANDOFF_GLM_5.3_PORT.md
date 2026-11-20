@@ -2971,6 +2971,28 @@ prompt tokens through the trunk; (2) the shard walk 81s — 83 st_opens + the
 per-record string parsing (a persistent index file would cut it to ~0). The
 remaining step-layer cost is ~50ms (the stageS deqs ~20ms + the mlpmoe ~20ms
 + the misc) — the endpoint is now compute-bound, not overhead-bound.
+=================== THE PHASE-1B ATTACK: MEASURED, THE HOIST TRIED AND REVERTED ==================
+The phase-1b's 84s = the per-token cost x 20: mtp_build_row ~925ms/token +
+mtp_layer_step ~1000ms/token. THE CAUSE: both fns re-stage the layer-45
+weights PER TOKEN — mtp_layer_step runs 19 deq_bf16 calls (d_ln..d_sd, the
+whole gm45 weight set) + mtp_build_row 4 more (d_tn/d_hn/d_en/d_eh), each
+~60ms (the gx_read + the H2D + the decode kernel + the sync), and frees them
+at the token's end. 20 tokens x 23 deqs x ~60ms + the frees = the 84s. THE
+GATE HAS THE SAME COST (the shared fns) — this is not a serve divergence.
+THE HOIST ATTEMPT (stage once into the sd_* module globals, the aliases, the
+frees removed): the build_row staged fine (976 -> 24ms) but the layer_step
+CRASHED at the token 2: `CHAIN_FAIL mtp deq expert 15` — the MoE tail's lazy
+per-expert deq (the routed experts differ per token; the expert 15's first
+resolve/deq at the token 2) returned 0 with NO DEQFAIL detail — the
+interaction between the persisted sd_* handles and the expert lifecycle is
+not understood (the GPU had ~14GB free; the silent 0 suggests the expert's
+gx_read/resolve returned empty, but the deq of an empty raw should print
+DEQFAIL). REVERTED (the engine back to 73964c6's state). THE NEXT ATTEMPT'S
+NOTES: (a) stage ONLY the non-expert weights and keep the experts lazy; (b)
+check whether the expert deq's raw input was empty (print raw.len() at the
+CHAIN_FAIL); (c) the expert frees (d_ukm/d_uvm) stayed intact in the attempt
+— verify they were not colliding with the staged set. The 84s is shared with
+the gate, so the fix belongs in the ENGINE's fns and helps both.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

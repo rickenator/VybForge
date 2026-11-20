@@ -659,11 +659,15 @@ main()<Int> -> {
                                 }
                                 ? -> { return 9 }
                             }
+                            secT = now_ms()
                             hin = mtp_build_row(tvec, raw_e, tab, dir, total, fgemm, fbf)
                             if (hin.len() != sv_H) { println("CHAIN_FAIL mtp build row " + r.to_string()); return 40 }
                             lines = lines + dumps("mtphin" + r.to_string(), hin) + "\n"
+                            println("SEC P1bbuild " + (now_ms() - secT).to_string())
+                            secT = now_ms()
                             x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer row " + r.to_string()); return 41 }
+                            println("SEC P1bstep " + (now_ms() - secT).to_string())
                             lines = lines + dumps("mtpx" + r.to_string(), x2) + "\n"
                             println("mtp row " + r.to_string() + " done")
                             i = trim_heap()
@@ -1910,6 +1914,7 @@ main()<Int> -> {
     }
     return 0
 }
+
 
 
 
