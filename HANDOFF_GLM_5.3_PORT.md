@@ -2942,6 +2942,24 @@ cross-module fn calls (probe10e: free); cross-module borrows of 100MB Vecs
 local constants vs module constants (no pace change); the state-in-main move
 (no pace change — but correct per probe10a). The real cause was semantic
 (the R split-brain), not mechanical.
+=================== THE PHASE-1 "3X": A MEASUREMENT ARTIFACT; THE DUMPS GATED ==================
+The serve's phase-1 is FAST (~65ms/layer steady-state by the SEC timings —
+the sections sum to seconds for all 45 layers). The earlier "13s/phase-1
+layer" was coarse-poll bracketing: the 9.5-min polls folded the request's
+setup tail + phase-1b into the phase-1 window. The real per-request cost
+after the R fix was the per-step-layer d-dumps: 4 dump_to calls x ~3s of
+format+concat churn on real data (~12s/step-layer, ~18 min/request) — the
+gets are free (slowget: 16384 gets in ~0ms) but the format/concat churn is
+not. THE FIX: the d-dumps are gated behind VYBFORGE_SERVE_DUMP (default on —
+the gate's reference dumps unchanged; the serve passes =0... actually the
+serve simply runs without the flag set to 1 — no: the flag defaults ON and
+the SERVE LAUNCH adds nothing — the gating check is dsFlag == "0" skips, so
+the serve must set VYBFORGE_SERVE_DUMP=0 to skip. NOTE FOR THE NEXT RUN:
+launch the serve with VYBFORGE_SERVE_DUMP=0.) VERIFIED: the request
+end-to-end ~30 min (was 3.5h -> 45-75 -> ~30), the draft 10788 HTTP 200, the
+digests gate-identical. THE REMAINING REQUEST COST: the setup (~15 min: the
+shard walk + the deq arena + the tabs — the gate's is ~2-5 min, the next
+perf item) + the steps at the gate pace.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

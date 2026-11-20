@@ -814,6 +814,15 @@ hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)
 
 share(all)
 share(all)
+slowget(v<their<Vec<Float> const>>, n<Int>)<Float> -> {
+    # the diagnostic: n plain .get calls, no formatting — isolates the get cost
+    s<Float> = 0.0
+    i<Int> = 0
+    while (i < n) { s = s + v.get(i); i = i + 1 }
+    return s
+}
+
+share(all)
 set_engine_R(n<Int>)<Int> -> {
     # rebind THIS module's R (the decode steps run R=1; the prefill R=20).
     # The importer's `R = 1` only shadows — the engine's fns read their own

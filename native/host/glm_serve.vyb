@@ -78,6 +78,14 @@ sv_ROUTED_SCALE<Float> = 2.5
 sv_TOPK<Int> = 2048
 
 main()<Int> -> {
+    secP<Int> = 0
+    # the per-layer d-dumps are offline-verification artifacts; in serve mode
+    # they cost ~12s/step-layer (the format+concat churn on real data) with no
+    # product value — VYBFORGE_SERVE_DUMP=0 skips them (the gate keeps its
+    # dumps: the flag defaults to on).
+    dump_on<Int> = 1
+    dsFlag = env_get("VYBFORGE_SERVE_DUMP") else ""
+    if (dsFlag == "0") { dump_on = 0 }
     secT<Int> = 0
     # the engine state lives as MAIN-LOCAL Vecs: module-scope Vec member
     # calls hit the codegen gap (probe10a: .push silently no-ops) — the
@@ -559,6 +567,7 @@ main()<Int> -> {
                     tab = tabs.get(n)
                         is_dsa = 0
                         if ((n % 4) == 3) { is_dsa = 1 }
+                        secP = now_ms()
                         if (is_dsa == 1) {
                             dslot = (n - 3) / 4
                             streams1 = dsa_attn_site_c(streams, tab, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, borrow(ckvAll), borrow(ikAll), borrow(gscAll), dslot)
@@ -570,6 +579,8 @@ main()<Int> -> {
                             println("CHAIN_FAIL attention layer " + n.to_string())
                             return 30
                         }
+                        println("SEC P1attn " + (now_ms() - secP).to_string())
+                        secP = now_ms()
                         if (n < 3) {
                             streams2 = ffn_dense_site(streams1, tab, dir, total, lpre, fgemm, fbf)
                         } else {
@@ -579,6 +590,8 @@ main()<Int> -> {
                             println("CHAIN_FAIL ffn layer " + n.to_string())
                             return 31
                         }
+                        println("SEC P1ffn " + (now_ms() - secP).to_string())
+                        secP = now_ms()
                         streams = streams2
                         i = trim_heap()
                         ckvs<Vec<Float>> = Vec()
@@ -586,6 +599,7 @@ main()<Int> -> {
                         while (i < 512) { ckvs.push(ckvAll.get(i)); i = i + 1 }
                         lines = lines + dumps("p1ck" + n.to_string(), ckvs) + "\n"
                         println("phase1 layer " + n.to_string() + " done")
+                        println("SEC P1tail " + (now_ms() - secP).to_string())
                         println("RSS n=" + n.to_string() + " " + rss_mb().to_string() + "MB")
                         lines = lines + "phase1 layer " + n.to_string() + " " + digest("streams", streams) + "\n"
                         n = n + 1
@@ -1727,10 +1741,15 @@ main()<Int> -> {
                             lines = lines + digest("l" + n.to_string() + "s" + t.to_string() + "mlp", mlp) + "\n"
                             println("SEC ioF1 " + (now_ms() - secT).to_string())
                             secT = now_ms()
-                            dd<Int> = dump_to("d" + t.to_string() + "l" + n.to_string() + "s2", streams2)
+                            gs<Float> = slowget(borrow(streams2), 16384)
+                            println("SLOWGET streams2 " + (now_ms() - secT).to_string())
+                            secT = now_ms()
+                            if (dump_on == 1) {
+                                dd<Int> = dump_to("d" + t.to_string() + "l" + n.to_string() + "s2", streams2)
                             dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "s1", streams1)
                             dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "attn", attn)
-                            dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp)
+                            dd = dump_to("d" + t.to_string() + "l" + n.to_string() + "mlp", mlp)                            }
+
                             streams = streams2
                             println("SEC ioF2 " + (now_ms() - secT).to_string())
                             secT = now_ms()
@@ -1874,6 +1893,9 @@ main()<Int> -> {
     }
     return 0
 }
+
+
+
 
 
 
