@@ -2957,9 +2957,20 @@ the SERVE LAUNCH adds nothing — the gating check is dsFlag == "0" skips, so
 the serve must set VYBFORGE_SERVE_DUMP=0 to skip. NOTE FOR THE NEXT RUN:
 launch the serve with VYBFORGE_SERVE_DUMP=0.) VERIFIED: the request
 end-to-end ~30 min (was 3.5h -> 45-75 -> ~30), the draft 10788 HTTP 200, the
-digests gate-identical. THE REMAINING REQUEST COST: the setup (~15 min: the
-shard walk + the deq arena + the tabs — the gate's is ~2-5 min, the next
-perf item) + the steps at the gate pace.
+digests gate-identical.
+=================== THE SETUP ATTACK: THE TRUE REQUEST BREAKDOWN ==================
+The "15-minute setup" was ALSO bracketing. The measured request (the
+SETUP/SEC timings, the dumps gated): the setup 81s (the shard walk: 83
+st_opens + the record bucketing; the tab assembly 12ms, the deq arena 0ms),
+the phase-1 ~5s, the phase-1b (the MTP head priming) 84s, the decode steps
+~50ms/layer = ~5s total (the gating worked: ioF2=0; the mlpmoe dropped
+992->20ms post-R-fix). TOTAL ~3 minutes per request (3.5h -> 30 min -> ~3
+min). The draft 10788 HTTP 200 re-verified. THE NEXT PERF TARGETS (both now
+precisely measured): (1) the phase-1b 84s — the MTP priming walks the 20
+prompt tokens through the trunk; (2) the shard walk 81s — 83 st_opens + the
+per-record string parsing (a persistent index file would cut it to ~0). The
+remaining step-layer cost is ~50ms (the stageS deqs ~20ms + the mlpmoe ~20ms
++ the misc) — the endpoint is now compute-bound, not overhead-bound.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

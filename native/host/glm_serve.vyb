@@ -78,6 +78,7 @@ sv_ROUTED_SCALE<Float> = 2.5
 sv_TOPK<Int> = 2048
 
 main()<Int> -> {
+    setupT<Int> = 0
     secP<Int> = 0
     # the per-layer d-dumps are offline-verification artifacts; in serve mode
     # they cost ~12s/step-layer (the format+concat churn on real data) with no
@@ -85,7 +86,8 @@ main()<Int> -> {
     # dumps: the flag defaults to on).
     dump_on<Int> = 1
     dsFlag = env_get("VYBFORGE_SERVE_DUMP") else ""
-    if (dsFlag == "0") { dump_on = 0 }
+    srv = env_get("VYBFORGE_SERVE") else ""
+    if (srv == "1" && dsFlag != "1") { dump_on = 0 }
     secT<Int> = 0
     # the engine state lives as MAIN-LOCAL Vecs: module-scope Vec member
     # calls hit the codegen gap (probe10a: .push silently no-ops) — the
@@ -111,6 +113,8 @@ main()<Int> -> {
     dir = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
     out = env_get("VYBFORGE_CHAIN_OUT") else "native/out/decchain_vyb.txt"
     total = 83
+    println("SETUP S0walk " + (now_ms() - setupT).to_string())
+    setupT = now_ms()
     # ---- one-time shard walk: bucket every tensor record by layer (the tab) ----
     # record = name SP shard SP data_offset SP nbytes SP dtype NEWLINE; runtime never parses JSON.
     tabs<Vec<String>> = Vec()
@@ -209,6 +213,8 @@ main()<Int> -> {
     tid = 0
     nlay = 45
     is_dsa = 0
+    println("SETUP S1tab " + (now_ms() - setupT).to_string())
+    setupT = now_ms()
     lpre = ""
     tab = ""
     g_g_0<String> = ""
@@ -378,6 +384,8 @@ main()<Int> -> {
         ? -> { println("CHAIN_FAIL no map.bin"); return 5 }
     }
     mapbody = mapd.substring(16, mapd.len())
+    println("SETUP S2arena " + (now_ms() - setupT).to_string())
+    setupT = now_ms()
     # ---- f32 deq setup: constant-sv_H hoists, persistent map+inv, the deq arena ----
     hdg = had_hoist(fhgen)
     if (hdg == 0) { println("CHAIN_FAIL had_hoist"); return 6 }
@@ -421,10 +429,14 @@ main()<Int> -> {
             cuMemFree_v2(hp)
         }
     }
+    println("SETUP S3listen " + (now_ms() - setupT).to_string())
+    setupT = now_ms()
     invbase = mapdev + 16 + nbmap
     idxtext = gx_read_index(dir)
 
     # ---- the http endpoint: the setup is done; serve the decode requests ----
+    println("SETUP S3listen " + (now_ms() - setupT).to_string())
+    setupT = now_ms()
     match (http_listen(port, 8)) {
         listener -> {
         println("glm_serve listening on " + port.to_string())
@@ -611,6 +623,7 @@ main()<Int> -> {
                     # e = enorm(embed(token)); the per-row MTP input + post-layer hidden are dumped
                     # full precision for the gold oracle (gate A / gate B inputs).
                     if (nlay == 45) {
+                    secT = now_ms()
                         println("CHAIN phase 1b: MTP head over " + sv_R.to_string() + " prompt tokens")
                         # fresh index/map strings: phase 1's 45 layers of String churn corrupt a buffer
                         # held across it (the phase-2 refresh below brackets the same window)
@@ -727,7 +740,10 @@ main()<Int> -> {
                         }
 
                         n = 0
+                        println("SEC P1b " + (now_ms() - secT).to_string())
+                        secT = now_ms()
                         while (n < nlay) {
+                            secT = now_ms()
                             lpre = "model.language_model.layers." + n.to_string() + "."
                     tab = tabs.get(n)
                             is_dsa = 0
@@ -1461,6 +1477,7 @@ main()<Int> -> {
                                 j = 0
                                 while (j < 3) { scale.push(f32_at(raw_scale, j)); j = j + 1 }
 
+                                println("SEC preS " + (now_ms() - secT).to_string())
                                 secT = now_ms()
                                 g_lg_0 = gx_read(lg, 0)
                                 d_q = deq_bf16(fbf, g_lg_0, sv_H * sv_HEADS * sv_KD, sv_H)
@@ -1893,6 +1910,10 @@ main()<Int> -> {
     }
     return 0
 }
+
+
+
+
 
 
 
