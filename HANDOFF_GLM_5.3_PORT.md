@@ -2889,10 +2889,24 @@ cgroup — fixed via systemd-run 80G; NOT: the JIT nesting depth — probe10d
 build-release/vyb on probe10d). The serve's launch procedure: systemd-run
 --user --scope -q -p MemoryMax=80G (the session scope caps at 4GiB and
 thrashed: 477M direct-reclaim page scans, memory.max=4294967296 confirmed).
-PROBE10 FINDINGS (native/host/probe10.vyb, committed): module-scope Vec
-member calls (.push/.get/.set) silently no-op in the codegen (len=0) unless
-an earlier rvalue read cached the global into namedValues — main-local typed
-Vecs always work. The serve's state now lives as main's locals.
+=================== THE SERVING ENDPOINT IS VERIFIED END-TO-END ==================
+THE SMOKE TEST (the 13th run, /tmp/serve_resp13.txt): curl →
+`{"draft_token": 10788}` + `HTTP 200`. The full chain: the 80G-scope launch,
+the setup, the listener, the request parse, the 45-layer prefill, the 2
+teacher-forced decode steps, the MTP head, the draft (the logit 17.9398,
+byte-identical to the gate's across three runs), the properly-framed HTTP
+response. THE LAST TWO RESPONSE BUGS: (1) the handler returned from main
+after the first request — the hard exit RST'd the connection (fixed: send +
+graceful close + break, the accept loop exits cleanly); (2) the success path
+sent the raw body with NO HTTP status line — curl discards such HTTP/0.9
+replies (fixed: http_response(200, ...) like the 404 path). The 404 plumbing
+round-trips in seconds (the fast regression check for the request/response
+path). OPEN ITEMS: the serve is uniformly ~3x slower per layer than the gate
+(12s/108s vs 4s/35s — the cause open after eliminating the memory cgroup,
+the JIT nesting depth (probe10d), and the binary); the GLM BPE tokenizer
+port (its own phase); the ~296KB string class leak (~90/layer, the owner
+unidentified); the wrapper-shape read_at 1-ref leak (bounded); the external
+SIGTERM at the chain's exit point (moot). PHASE 2 IS COMPLETE.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

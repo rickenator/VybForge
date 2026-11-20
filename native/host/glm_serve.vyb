@@ -1823,7 +1823,8 @@ main()<Int> -> {
                         ? -> { println("CHAIN_FAIL write"); return 26 }
                     }
                     println("CHAIN_OK 45 layers x 2 teacher-forced decode steps, all caches carried")
-                                http_send_all(conn.fd, "{\"draft_token\": " + cbesti.to_string() + "}")
+                                resp = http_response(200, "{\"draft_token\": " + cbesti.to_string() + "}")
+                                http_send_all(conn.fd, resp)
                                 http_close(conn.fd)
                                 # the graceful close lets the client read the body; a
                                 # return here would hard-exit main mid-connection (the
