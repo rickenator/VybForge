@@ -2904,9 +2904,44 @@ round-trips in seconds (the fast regression check for the request/response
 path). OPEN ITEMS: the serve is uniformly ~3x slower per layer than the gate
 (12s/108s vs 4s/35s — the cause open after eliminating the memory cgroup,
 the JIT nesting depth (probe10d), and the binary); the GLM BPE tokenizer
-port (its own phase); the ~296KB string class leak (~90/layer, the owner
-unidentified); the wrapper-shape read_at 1-ref leak (bounded); the external
-SIGTERM at the chain's exit point (moot). PHASE 2 IS COMPLETE.
+port (its own phase). THE LEAK CLASSES LISTED EARLIER ARE CLOSED: the
+overnight cgen_stmt.cpp fix (Vyb 81bab23c) killed the ~300MB/layer growth —
+the 45-layer live set is FLAT 42MB (780K <1K loader strings one-time + 44
+legit buffers), probe7d 6/6 BALANCED, the suite 1358/1358; VYB_STR_DUMP=1
+implemented in vyb_str_stats. PHASE 2 IS COMPLETE.
+=================== THE 3X PERF MYSTERY: SOLVED (the R split-brain) ==================
+THE SERVE'S DECODE STEPS RAN THE ENGINE'S FN CALLS WITH R=20 WHILE THE SERVE'S
+INTERMEDIATES WERE R=1-SIZED. `sv_R = 1` rebinds only the SERVE's module
+global; the engine's site fns (hc_apply/moe_tail_step/attn_site_c) read the
+ENGINE's own module-global R (still 20) — every decode-step fn call indexed
+R=20 loops over the R=1 intermediates: out-of-bounds gets returning 0.0 down
+a slow path (85us/call) at 20x the iterations = the 108s step layers and the
+all-zero s2 digests (the phase 1 was R=20 on both sides — consistent — which
+is why it matched the gate and masked the bug; the earlier draft 10788 was
+computed from the R=20 mis-indexed state and was CORRECT ONLY BY THE
+TEACHER-FORCED ARGMAX LUCK of the deterministic gate path — treat the
+pre-fix serve outputs as untrusted). THE FIX: set_engine_R(n) in the engine
+(an assignment inside the engine's own module scope) + the serve calls
+set_engine_R(1) before the steps. VERIFIED: the step digests BYTE-IDENTICAL
+to the gate's reference (l0s0 s2 n=16384 sum=-928573974546 v0=-7890726791,
+exact), the dumps 55s -> 3s, the step layers ~25s (the gate's 9-35s range),
+the full request ~45-75 min (was ~3.5h), the draft 10788 HTTP 200.
+DIAGNOSIS TOOLING (committed): now_ms() in the engine (pure-Vyb /proc/uptime
+parse, the rss_mb pattern) + the SEC * section timings in the serve's step
+body + the DUMPTIME lines in the engine's dump_to. THE RESIDUAL: the phase-1
+runs ~3x slower than the gate's phase-1 (13s vs 4s/layer, R=20 consistent on
+both sides — a different, smaller cause; the next perf item). THE LESSON:
+module-global config that fns read implicitly (R) must be rebound through the
+OWNING module — an importer's assignment shadows.
+=================== THE PERF HUNT: ELIMINATED CAUSES (for the record) ==================
+NOT the cause: the memory cgroup (fixed: systemd-run 80G); the JIT nesting
+depth (probe10d: 11.6s == 11.6s); the binary (build/vyb is 1.27x SLOWER);
+cross-module fn calls (probe10e: free); cross-module borrows of 100MB Vecs
+(probe10g: 5us/call); the dump/digest formatting (probe10h/10k: 0.65s per
+327680-element dump); the append file size (554MB target: 0.64s); the shim
+local constants vs module constants (no pace change); the state-in-main move
+(no pace change — but correct per probe10a). The real cause was semantic
+(the R split-brain), not mechanical.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;

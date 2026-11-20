@@ -629,6 +629,7 @@ dumps(name<String>, v<Vec<Float>>)<String> -> {
 share(all)
 dump_to(name<String>, v<Vec<Float>>)<Int> -> {
     path<String> = env_get("VYBFORGE_PREFILL_OUT") else "native/out/prefill_vyb.txt"
+    dt0<Int> = now_ms()
     match (open_append(path)) {
         f -> {
             write_str(f, name)
@@ -642,6 +643,7 @@ dump_to(name<String>, v<Vec<Float>>)<Int> -> {
             if (chunk.len() > 0) { write_str(f, chunk) }
             write_str(f, "\n")
             close(f)
+            println("DUMPTIME " + name + " " + v.len().to_string() + " " + (now_ms() - dt0).to_string())
             return 0
         }
         ? -> { return 1 }
@@ -808,6 +810,43 @@ hc_apply(streams<Vec<Float>>, y<Vec<Float>>, post<Vec<Float>>, comb<Vec<Float>>)
         r = r + 1
     }
     return dst
+}
+
+share(all)
+share(all)
+set_engine_R(n<Int>)<Int> -> {
+    # rebind THIS module's R (the decode steps run R=1; the prefill R=20).
+    # The importer's `R = 1` only shadows — the engine's fns read their own
+    # module global, so the rebinding must happen here.
+    R = n
+    return 0
+}
+
+share(all)
+now_ms()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/uptime")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    # "12345.67 0.00" -> ms
+    v<Int> = 0
+    ms<Int> = 0
+    seenDot<Int> = 0
+    digits<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 46) { seenDot = 1; digits = 0 }
+        if (c >= 48 && c <= 57) {
+            if (seenDot == 0) { v = v * 10 + (c - 48) }
+            if (seenDot == 1 && digits < 2) { ms = ms * 10 + (c - 48); digits = digits + 1 }
+        }
+        if (c == 32) { break }
+        i = i + 1
+    }
+    while (digits < 2) { ms = ms * 10; digits = digits + 1 }
+    return v * 1000 + ms
 }
 
 share(all)

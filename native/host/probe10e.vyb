@@ -1,0 +1,23 @@
+# probe10e: same hot loop twice — once via the imported module fn, once via a
+# local fn with an IDENTICAL body. The wall-time gap = the cross-module cost.
+import probe10emod::{hotloop}
+import env.mod::{env_get}
+
+LOCAL_K<Int> = 7
+
+locloop(n<Int>)<Int> -> {
+    acc<Int> = 0
+    i<Int> = 0
+    while (i < n) { acc = acc + i * LOCAL_K - acc / 3; i = i + 1 }
+    return acc
+}
+
+main()<Int> -> {
+    nStr = env_get("PROBE_N") else "20000000"
+    n<Int> = nStr.to_int()
+    a<Int> = hotloop(n)
+    println("cross " + a.to_string())
+    b<Int> = locloop(n)
+    println("local " + b.to_string())
+    return 0
+}

@@ -1,0 +1,15 @@
+# probe10g: cross-module borrow of a large Vec — per-call cost reveals copies.
+import probe10emod::{veclen_borrow}
+import env.mod::{env_get}
+
+main()<Int> -> {
+    big<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 25000000) { big.push(1.0); i = i + 1 }   # ~100MB
+    println("built " + big.len().to_string())
+    s<Int> = 0
+    k<Int> = 0
+    while (k < 20) { s = s + veclen_borrow(borrow(big)); k = k + 1 }
+    println("borrowed " + s.to_string())
+    return 0
+}

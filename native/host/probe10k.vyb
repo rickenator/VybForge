@@ -1,0 +1,31 @@
+# probe10k: the engine's exact dump_to loop with realistic hidden-state values
+import io::{open_append, write_str, close}
+
+SCALE40<Float> = 1099511627776.0
+
+di(v<Float>)<Int> -> {
+    return (v * SCALE40) as Int
+}
+
+main()<Int> -> {
+    v<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 327680) { v.push((i % 97) * 0.13 - 6.0); i = i + 1 }
+    println("built")
+    match (open_append("/tmp/probe10k.txt")) {
+        f -> {
+            i = 0
+            chunk<String> = ""
+            while (i < v.len()) {
+                chunk = chunk + " " + di(v.get(i)).to_string()
+                if (chunk.len() > 2048) { write_str(f, chunk); chunk = "" }
+                i = i + 1
+            }
+            write_str(f, chunk)
+            close(f)
+        }
+        ? -> { println("fail") }
+    }
+    println("dumped")
+    return 0
+}

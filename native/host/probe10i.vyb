@@ -1,0 +1,11 @@
+# probe10i: does an assignment inside an if-arm update the outer binding?
+x<Int> = 0
+
+main()<Int> -> {
+    y<Int> = 0
+    if (1 == 1) { y = 5 }
+    println("y=" + y.to_string())
+    while (1 == 1) { y = 7; break }
+    println("y=" + y.to_string())
+    return 0
+}

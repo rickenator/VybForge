@@ -1,0 +1,28 @@
+# probe10h: the cost of formatting a 327680-float Vec the way dump_to/digest do
+import env::{env_get}
+import io::{open_append, write_str, close}
+
+main()<Int> -> {
+    v<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 327680) { v.push(0.123456); i = i + 1 }
+    println("built")
+    # dump_to-style: per-element di().to_string() with 2048-char chunking
+    path<String> = "/tmp/probe10h_dump.txt"
+    match (open_append(path)) {
+        f -> {
+            i<Int> = 0
+            chunk<String> = ""
+            while (i < v.len()) {
+                chunk = chunk + " " + v.get(i).to_string()
+                if (chunk.len() > 2048) { write_str(f, chunk); chunk = "" }
+                i = i + 1
+            }
+            write_str(f, chunk)
+            close(f)
+        }
+        ? -> { println("open fail") }
+    }
+    println("dumped")
+    return 0
+}
