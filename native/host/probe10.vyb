@@ -1,0 +1,27 @@
+# probe10: which module-scope/main-local Vec patterns survive member calls?
+gvA<Vec<Float>> = Vec()
+gvB<Vec<Float>> = Vec()
+
+mkf()<Vec<Float>> -> {
+    v<Vec<Float>> = Vec()
+    return v
+}
+
+main()<Int> -> {
+    # A: module-scope, push only (the stAll pattern)
+    i = 0
+    while (i < 3) { gvA.push(1.0); i = i + 1 }
+    println("A len=" + gvA.len().to_string())
+    # B: module-scope, reassigned from a fn, then push
+    gvB = mkf()
+    j = 0
+    while (j < 3) { gvB.push(2.0); j = j + 1 }
+    println("B len=" + gvB.len().to_string())
+    # C: main-local typed, reassigned, then push (the original serve pattern)
+    gvC<Vec<Float>> = Vec()
+    gvC = mkf()
+    k = 0
+    while (k < 3) { gvC.push(3.0); k = k + 1 }
+    println("C len=" + gvC.len().to_string())
+    return 0
+}

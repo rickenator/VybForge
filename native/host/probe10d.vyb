@@ -1,0 +1,59 @@
+# probe10d: is deeply-nested compute slower than shallow-nested compute?
+# shallow: the hot loop at nesting depth 3; deep: the same loop at depth 10.
+hot(tag<Int>)<Int> -> {
+    acc<Int> = 0
+    i<Int> = 0
+    while (i < 30000000) { acc = acc + i.to_string().len(); i = i + 1 }
+    return acc
+}
+
+main()<Int> -> {
+    t0<Int> = 0
+    a<Int> = 0
+    # shallow: depth 3
+    while (t0 < 1) {
+        a = hot(0)
+        t0 = t0 + 1
+    }
+    println("shallow " + a.to_string())
+    # deep: depth 10
+    w1<Int> = 0
+    while (w1 < 1) {
+     w2<Int> = 0
+     while (w2 < 1) {
+      w3<Int> = 0
+      while (w3 < 1) {
+       w4<Int> = 0
+       while (w4 < 1) {
+        w5<Int> = 0
+        while (w5 < 1) {
+         w6<Int> = 0
+         while (w6 < 1) {
+          w7<Int> = 0
+          while (w7 < 1) {
+           w8<Int> = 0
+           while (w8 < 1) {
+            w9<Int> = 0
+            while (w9 < 1) {
+             a = hot(1)
+             w9 = 1
+            }
+            w8 = 1
+           }
+           w7 = 1
+          }
+          w6 = 1
+         }
+         w5 = 1
+        }
+        w4 = 1
+       }
+       w3 = 1
+      }
+      w2 = 1
+     }
+     w1 = 1
+    }
+    println("deep " + a.to_string())
+    return 0
+}
