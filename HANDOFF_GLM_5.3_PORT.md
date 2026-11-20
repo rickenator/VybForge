@@ -2993,6 +2993,24 @@ check whether the expert deq's raw input was empty (print raw.len() at the
 CHAIN_FAIL); (c) the expert frees (d_ukm/d_uvm) stayed intact in the attempt
 — verify they were not colliding with the staged set. The 84s is shared with
 the gate, so the fix belongs in the ENGINE's fns and helps both.
+=================== THE SECOND HOIST ATTEMPT: TWO COMPILER-LEVEL FINDINGS ==================
+The hoist re-applied (the in-place transform, no pops) + the full diagnostics
+(the silent H2D paths instrumented, the trellis lens + the dWg/dWu/dWd values
+at the expert failure). RESULTS: (1) the build_row's staging FLAG DID NOT
+PERSIST across tokens — the token-2's build re-ran the deqs (939ms) despite
+`mtpBStaged = 1` set inside the fn at the token 1: **a function's assignment
+to a module-global name creates a fn-local shadow, not an update** — the
+module-global write path from inside fns needs a compiler decision (the
+engine's own fns DO mutate module state successfully elsewhere — the kslot/
+dslot cache slots — so the precise rule is subtler; the compiler session
+should characterize it). (2) the token-2's expert 15: dWg=0 dWu=0 dWd=0 with
+VALID inputs (the trellis 4194304 bytes, the suh/svh present) and ZERO
+failure prints — every exl3_deq return-0 path now prints (the 2 formerly
+silent H2Ds instrumented: hrc1/hrc2), so the exl3_deq either was not called
+or returned 0 off-book. REVERTED again (the engine at 73964c6). THE ENDPOINT
+STANDS AT ~3 MIN/REQUEST. The phase-1b's 84s stays until the compiler's
+module-global write semantics are characterized — the fix is mechanical once
+a setter (or a true global write) works.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
