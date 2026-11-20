@@ -1825,7 +1825,10 @@ main()<Int> -> {
                     println("CHAIN_OK 45 layers x 2 teacher-forced decode steps, all caches carried")
                                 http_send_all(conn.fd, "{\"draft_token\": " + cbesti.to_string() + "}")
                                 http_close(conn.fd)
-                    return cbesti
+                                # the graceful close lets the client read the body; a
+                                # return here would hard-exit main mid-connection (the
+                                # kernel sends RST and curl discards the response).
+                                break
                 } else {
                     resp = http_response(404, "{\"error\": \"not found\"}")
                 }
@@ -1842,6 +1845,7 @@ main()<Int> -> {
     }
     return 0
 }
+
 
 
 
