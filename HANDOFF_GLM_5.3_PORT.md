@@ -3642,3 +3642,27 @@ the deq ~2.6x when active — the comparisons must run on an idle GPU):
 KEPT FROM THIS SESSION: the check32 gate now covers BOTH geometries (gp0 =
 gate_proj cw=2048 AND dp0 = down_proj cw=4096, both vs the gold dequant digest) —
 the cw=4096 path was previously untested by any gate. gold_exl3_deq.py emits dp0.
+=================== THE DEQ-TO-GLOBAL REDESIGN: IMPLEMENTED, MEASURED, REVERTED ==================
+The documented redesign was fully implemented and measured (the working tree, not
+committed): the dq1s deq-only (the raw f32 straight to the td2 arena at the
+gid-linear address, no shared/barrier), a new exl3had1x4 kernel (the 128-tap
+transform, FOUR rows per thread, four independent global loads per c2 + one tap
+load — the MLP preserved, the H traffic /4), the chain dq1s -> had1x4 -> had232
+(fd->od) -> cvt32 (od->fdc) with all four param buffers pre-built and the kernels
+launched back-to-back (one sync). RESULT: GREEN and bit-identical (the draft 576,
+the digests unchanged) but deq 41.0s vs the 1-row's 36.2-36.4s — a ~13% REGRESSION,
+reproduced 2x on an idle GPU. The per-stage timers: dq~1ms + had1x4~1ms +
+had232+cvt~1ms per call. THE H/4 IS REAL (the had1x4's H reads ~1.07GB vs 4.3GB)
+but the td2 round-trip (+67MB/call), the extra kernel stage, and the lost fusion
+eat it. ALSO LEARNED: the intermediate cuCtxSynchronize calls are CHEAP (~us) —
+the sync count was never the problem; the pipeline is work-bound.
+VYB COMPILER QUIRKS found on the way (all worked around): a 5-term || chain fails
+type inference; a 4-term string + chain fails; from<loc<CVoid>>(expr) mid-argument-
+list breaks the parser's recovery (hoist to a typed var first — but ONLY the fn-
+handle arg needs from<>; the param-buffer arg passes as the raw Int); the param
+arena was 64B (enlarged to 256B for the 4 launch param sets).
+CONCLUSION: the deq32 has NO easy win. The 1-row fused kernel stands as the best
+known form (36.2-36.4s of the ~100s phase-1). The remaining ideas (the all-4-row
+pipeline: the deq ALSO 4 rows/thread with 4 independent gather chains, the had232
+4-row too) are documented but project to only ~1.5-2x with substantial complexity —
+the deq32 optimization is CLOSED as diminishing returns unless a fresh angle appears.
