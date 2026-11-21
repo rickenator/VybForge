@@ -1,5 +1,8 @@
 # probe11: the module-global write/read semantics across the boundaries
-import probe11mod::{inc, getcount, setval, getval, inc2, inc3, inc4}
+import probe11mod::{inc, getcount, setval, getval, inc2, inc3, inc4, flagtest, getflag}
+
+gk1<Int> = 0
+gl1<Int> = 0
 
 gval<Int> = 0
 
@@ -46,5 +49,81 @@ main()<Int> -> {
     println("I inc4: " + i1.to_string())
     # J: the final getter state
     println("J final: " + getcount().to_string())
+    # K: the inc calls at the DEEP nesting (8 levels of while)
+    w1<Int> = 0
+    while (w1 < 1) {
+     w2<Int> = 0
+     while (w2 < 1) {
+      w3<Int> = 0
+      while (w3 < 1) {
+       w4<Int> = 0
+       while (w4 < 1) {
+        w5<Int> = 0
+        while (w5 < 1) {
+         w6<Int> = 0
+         while (w6 < 1) {
+          w7<Int> = 0
+          while (w7 < 1) {
+           w8<Int> = 0
+           while (w8 < 1) {
+            gk1 = inc()
+            w8 = 1
+           }
+           w7 = 1
+          }
+          w6 = 1
+         }
+         w5 = 1
+        }
+        w4 = 1
+       }
+       w3 = 1
+      }
+      w2 = 1
+     }
+     w1 = 1
+    }
+    println("K deep inc: " + gk1.to_string())
+    println("K get after: " + getcount().to_string())
+    # L: the inc calls at the deep nesting with the params'd fn
+    m1<Int> = 0
+    while (m1 < 1) {
+     m2<Int> = 0
+     while (m2 < 1) {
+      m3<Int> = 0
+      while (m3 < 1) {
+       m4<Int> = 0
+       while (m4 < 1) {
+        m5<Int> = 0
+        while (m5 < 1) {
+         m6<Int> = 0
+         while (m6 < 1) {
+          m7<Int> = 0
+          while (m7 < 1) {
+           m8<Int> = 0
+           while (m8 < 1) {
+            gl1 = setval(55)
+            m8 = 1
+           }
+           m7 = 1
+          }
+          m6 = 1
+         }
+         m5 = 1
+        }
+        m4 = 1
+       }
+       m3 = 1
+      }
+      m2 = 1
+     }
+     m1 = 1
+    }
+    println("L deep setval: " + gl1.to_string())
+    println("L getval after: " + getval().to_string())
+    ft1<Int> = flagtest()
+    ft2<Int> = flagtest()
+    fg<Int> = getflag()
+    println("M flagtest,flagtest,getflag: " + ft1.to_string() + "," + ft2.to_string() + "," + fg.to_string())
     return 0
 }

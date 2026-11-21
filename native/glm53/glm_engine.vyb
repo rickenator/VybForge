@@ -822,6 +822,43 @@ slowget(v<their<Vec<Float> const>>, n<Int>)<Float> -> {
     return s
 }
 
+# the MTP weight staging: deq'd once per process, reused across the 20
+# phase-1b tokens. THE TOKEN LOOP MUST SYNC PER TOKEN: the staged handles
+# persist and the token kernels overlap without an explicit sync (the async
+# race that produced the sticky CUDA_ERROR_ILLEGAL_ADDRESS rc=700).
+mtpStaged<Int> = 0
+mtpBStaged<Int> = 0
+sd_ln<Int> = 0
+sd_ln2<Int> = 0
+sd_qa<Int> = 0
+sd_qb<Int> = 0
+sd_kva<Int> = 0
+sd_kvb<Int> = 0
+sd_o<Int> = 0
+sd_wqb<Int> = 0
+sd_wk<Int> = 0
+sd_wproj<Int> = 0
+sd_gatei<Int> = 0
+sd_gw<Int> = 0
+sd_qaln<Int> = 0
+sd_kvaln<Int> = 0
+sd_knw<Int> = 0
+sd_knb<Int> = 0
+sd_sg<Int> = 0
+sd_su<Int> = 0
+sd_sd<Int> = 0
+sd_tn<Int> = 0
+sd_hn<Int> = 0
+sd_en<Int> = 0
+sd_eh<Int> = 0
+
+# the hoisted GxLoc resolves: the MTP fns resolve the same tensors every
+# token (~900ms per gx_resolve_tab) — resolve once, reuse the GxLoc.
+mtpGMResolved<Int> = 0
+mtpGM45Resolved<Int> = 0
+mtpGM<GxLoc>
+mtpGM45<GxLoc>
+
 share(all)
 set_engine_R(n<Int>)<Int> -> {
     # rebind THIS module's R (the decode steps run R=1; the prefill R=20).
@@ -1474,7 +1511,6 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     d_qaln = deq_bf16(fbf, g_g_1, Q_LORA, 0)
     if (d_qaln == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
-    free_dev(d_qaln)
     qa_ln<Vec<Float>> = rms_rows(view(qres), R, Q_LORA, qaln_w)
     qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
     dg1<String> = digest("qb", qfull)
@@ -1487,7 +1523,6 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     d_kvaln = deq_bf16(fbf, g_g_4, KV_LORA, 0)
     if (d_kvaln == 0) { return nonev }
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
-    free_dev(d_kvaln)
     ckv<Vec<Float>> = rms_rows(view(ckraw), R, KV_LORA, kvaln_w)
     dg2<String> = digest("ckv", ckv)
     println(dg2)
@@ -1495,7 +1530,6 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
 
     # ---- per-head absorbed keys/values from kv_b ----
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
-    free_dev(d_kvb)
     dg3<String> = digest("kvb", kvb)
     println(dg3)
     lines = lines + dg3 + "\n"
@@ -1526,8 +1560,6 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     if (d_knw == 0 || d_knb == 0) { return nonev }
     knw = bulk_dtoh(d_knw, IDIM)
     knb = bulk_dtoh(d_knb, IDIM)
-    free_dev(d_knw)
-    free_dev(d_knb)
     kn<Vec<Float>> = ln_rows(borrow(kraw), R, IDIM, knw, knb)
     gsc<Vec<Float>> = mm_host(h_a, R, H, d_gate, IDIM, fgemm)
     # chained-decode capture: this layer's cache rows for the phase-2 walk
@@ -2185,7 +2217,6 @@ kda_attn_site_c(streams<their<Vec<Float> const>>, tab<String>, dir<String>, tota
     d_ln = deq_bf16(fbf, g_g_12, H, 0)
     if (d_ln == 0) { return nonev }
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
-    free_dev(d_ln)
     h_a<Vec<Float>> = rms_rows(view(collapsed), R, H, in_ln)
     dg15<String> = digest("h", h_a)
     println(dg15)
@@ -2384,7 +2415,6 @@ kda_attn_site_c(streams<their<Vec<Float> const>>, tab<String>, dir<String>, tota
     free_dev(d_q)
     free_dev(d_k)
     free_dev(d_v)
-    free_dev(d_o)
     free_dev(d_b)
     free_dev(d_fa)
     free_dev(d_fb)
@@ -2478,7 +2508,6 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     d_ln2 = deq_bf16(fbf, g_g_3, H, 0)
     if (d_ln2 == 0) { return nonev }
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
-    free_dev(d_ln2)
 
     var<Int> d_flat2 = 0
     var<Int> d_mv2 = 0
@@ -3185,7 +3214,6 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     d_ln2 = deq_bf16(fbf, g_gt_13, H, 0)
     if (d_ln2 == 0) { return nonev }
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
-    free_dev(d_ln2)
 
     flat<Vec<Float>> = rms_rows(borrow(streams1), R, HC * H, vecf())
     d_flat2 = alloc_dev(R * HC * H * 8)
@@ -3466,6 +3494,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
 share(all)
 mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<Int>,
               fgemm<Int>, fbf<Int>)<Vec<Float>> -> {
+              bsecT<Int> = 0
     i<Int> = 0
     nf<Int> = 0
     wantM<Vec<String>> = Vec()
@@ -3473,7 +3502,17 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<I
     wantM.push("model.language_model.layers.45.hnorm.weight")
     wantM.push("model.language_model.layers.45.enorm.weight")
     wantM.push("model.language_model.layers.45.eh_proj.weight")
-    gm<GxLoc> = gx_resolve_tab(tab, dir, total, wantM)
+    if (mtpGMResolved == 0) {
+        wantM.push("model.language_model.norm.weight")
+        wantM.push("model.language_model.layers.45.hnorm.weight")
+        wantM.push("model.language_model.layers.45.enorm.weight")
+        wantM.push("model.language_model.layers.45.eh_proj.weight")
+        mtpGM = gx_resolve_tab(tab, dir, total, wantM)
+        mtpGMResolved = 1
+    }
+    gm<GxLoc> = mtpGM
+    println("SEC Bres " + (now_ms() - bsecT).to_string())
+    bsecT = now_ms()
     nf = 0
     i = 0
     while (i < 4) {
@@ -3481,14 +3520,15 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<I
         i = i + 1
     }
     if (nf != 4) { println("CHAIN_FAIL mtp resolve input"); return vecf() }
-    g_gm_0 = gx_read(gm, 0)
-    d_tn<Int> = deq_bf16(fbf, g_gm_0, H, 0)
-    g_gm_1 = gx_read(gm, 1)
-    d_hn<Int> = deq_bf16(fbf, g_gm_1, H, 0)
-    g_gm_2 = gx_read(gm, 2)
-    d_en<Int> = deq_bf16(fbf, g_gm_2, H, 0)
-    g_gm_3 = gx_read(gm, 3)
-    d_eh<Int> = deq_bf16(fbf, g_gm_3, H * 2 * H, 2 * H)
+    if (mtpBStaged == 0) { g_gm_0 = gx_read(gm, 0); sd_tn = deq_bf16(fbf, g_gm_0, H, 0) }
+    d_tn<Int> = sd_tn
+    if (mtpBStaged == 0) { g_gm_1 = gx_read(gm, 1); sd_hn = deq_bf16(fbf, g_gm_1, H, 0) }
+    d_hn<Int> = sd_hn
+    if (mtpBStaged == 0) { g_gm_2 = gx_read(gm, 2); sd_en = deq_bf16(fbf, g_gm_2, H, 0) }
+    d_en<Int> = sd_en
+    if (mtpBStaged == 0) { g_gm_3 = gx_read(gm, 3); sd_eh = deq_bf16(fbf, g_gm_3, H * 2 * H, 2 * H) }
+    mtpBStaged = 1
+    d_eh<Int> = sd_eh
     if (d_tn == 0 || d_hn == 0 || d_en == 0 || d_eh == 0) {
         println("CHAIN_FAIL mtp deq input")
         return vecf()
@@ -3496,23 +3536,27 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<I
     tn_w<Vec<Float>> = bulk_dtoh(d_tn, H)
     hn_w<Vec<Float>> = bulk_dtoh(d_hn, H)
     en_w<Vec<Float>> = bulk_dtoh(d_en, H)
-    free_dev(d_tn)
-    free_dev(d_hn)
-    free_dev(d_en)
     d_ex<Int> = deq_bf16(fbf, raw_e, H, 0)
     if (d_ex == 0) { println("CHAIN_FAIL mtp emb deq"); return vecf() }
     ev<Vec<Float>> = bulk_dtoh(d_ex, H)
+    println("SEC Bdeq " + (now_ms() - bsecT).to_string())
+    bsecT = now_ms()
     free_dev(d_ex)
     hn1<Vec<Float>> = rms_rows(borrow(tvec), 1, H, tn_w)     # trunk final norm over the mean
     hp<Vec<Float>> = rms_rows(borrow(hn1), 1, H, hn_w)       # hnorm (plain scale)
     en<Vec<Float>> = rms_rows(borrow(ev), 1, H, en_w)        # enorm(embed) (plain scale)
+    println("SEC Brms " + (now_ms() - bsecT).to_string())
+    bsecT = now_ms()
     cat<Vec<Float>> = vecf()
     i = 0
     while (i < H) { cat.push(en.get(i)); i = i + 1 }
     i = 0
     while (i < H) { cat.push(hp.get(i)); i = i + 1 }
     hin<Vec<Float>> = mm_host(cat, 1, 2 * H, d_eh, H, fgemm)
-    free_dev(d_eh)
+    println("SEC Bend " + (now_ms() - bsecT).to_string())
+    bsecT = now_ms()
+    println("SEC Bmm " + (now_ms() - bsecT).to_string())
+    bsecT = now_ms()
     return hin
 }
 
@@ -3594,7 +3638,32 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     wantL45.push(lpre + "mlp.shared_experts.gate_proj.weight")
     wantL45.push(lpre + "mlp.shared_experts.up_proj.weight")
     wantL45.push(lpre + "mlp.shared_experts.down_proj.weight")
-    gm45<GxLoc> = gx_resolve_tab(tab, dir, total, wantL45)
+    if (mtpGM45Resolved == 0) {
+        wantL45.push(lpre + "input_layernorm.weight")
+        wantL45.push(lpre + "post_attention_layernorm.weight")
+        wantL45.push(lpre + "self_attn.q_a_proj.weight")
+        wantL45.push(lpre + "self_attn.q_a_layernorm.weight")
+        wantL45.push(lpre + "self_attn.q_b_proj.weight")
+        wantL45.push(lpre + "self_attn.kv_a_proj_with_mqa.weight")
+        wantL45.push(lpre + "self_attn.kv_a_layernorm.weight")
+        wantL45.push(lpre + "self_attn.kv_b_proj.weight")
+        wantL45.push(lpre + "self_attn.o_proj.weight")
+        wantL45.push(lpre + "self_attn.indexer.wq_b.weight")
+        wantL45.push(lpre + "self_attn.indexer.wk.weight")
+        wantL45.push(lpre + "self_attn.indexer.k_norm.weight")
+        wantL45.push(lpre + "self_attn.indexer.k_norm.bias")
+        wantL45.push(lpre + "self_attn.indexer.weights_proj.weight")
+        wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
+        wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
+        wantL45.push(lpre + "mlp.gate.weight")
+        wantL45.push(lpre + "mlp.gate.e_score_correction_bias")
+        wantL45.push(lpre + "mlp.shared_experts.gate_proj.weight")
+        wantL45.push(lpre + "mlp.shared_experts.up_proj.weight")
+        wantL45.push(lpre + "mlp.shared_experts.down_proj.weight")
+        mtpGM45 = gx_resolve_tab(tab, dir, total, wantL45)
+        mtpGM45Resolved = 1
+    }
+    gm45<GxLoc> = mtpGM45
     nf = 0
     i = 0
     while (i < wantL45.len()) {
@@ -3603,30 +3672,30 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     }
     if (nf != wantL45.len()) { println("CHAIN_FAIL mtp resolve layer"); return nonev }
 
-    g_gm45_0 = gx_read(gm45, 0)
-    d_ln<Int> = deq_bf16(fbf, g_gm45_0, H, 0)
-    g_gm45_1 = gx_read(gm45, 1)
-    d_ln2<Int> = deq_bf16(fbf, g_gm45_1, H, 0)
-    g_gm45_2 = gx_read(gm45, 2)
-    d_qa<Int> = deq_bf16(fbf, g_gm45_2, Q_LORA * H, H)
-    g_gm45_4 = gx_read(gm45, 4)
-    d_qb<Int> = deq_bf16(fbf, g_gm45_4, HEADS * NOPE * Q_LORA, Q_LORA)
-    g_gm45_5 = gx_read(gm45, 5)
-    d_kva<Int> = deq_bf16(fbf, g_gm45_5, KV_LORA * H, H)
-    g_gm45_7 = gx_read(gm45, 7)
-    d_kvb<Int> = deq_bf16(fbf, g_gm45_7, HEADS * (NOPE + VDIM) * KV_LORA, 0)
-    g_gm45_8 = gx_read(gm45, 8)
-    d_o<Int> = deq_bf16(fbf, g_gm45_8, HEADS * VDIM * H, HEADS * VDIM)
-    g_gm45_9 = gx_read(gm45, 9)
-    d_wqb<Int> = deq_bf16(fbf, g_gm45_9, Q_LORA * IHEADS * IDIM, Q_LORA)
-    g_gm45_10 = gx_read(gm45, 10)
-    d_wk<Int> = deq_bf16(fbf, g_gm45_10, H * IDIM, H)
-    g_gm45_13 = gx_read(gm45, 13)
-    d_wproj<Int> = deq_bf16(fbf, g_gm45_13, H * IHEADS, H)
-    g_gm45_15 = gx_read(gm45, 15)
-    d_gatei<Int> = deq_bf16(fbf, g_gm45_15, H * IDIM, H)
-    g_gm45_16 = gx_read(gm45, 16)
-    d_gw<Int> = deq_bf16(fbf, g_gm45_16, NE * H, H)
+    if (mtpStaged == 0) { g_gm45_0 = gx_read(gm45, 0); sd_ln = deq_bf16(fbf, g_gm45_0, H, 0) }
+    d_ln<Int> = sd_ln
+    if (mtpStaged == 0) { g_gm45_1 = gx_read(gm45, 1); sd_ln2 = deq_bf16(fbf, g_gm45_1, H, 0) }
+    d_ln2<Int> = sd_ln2
+    if (mtpStaged == 0) { g_gm45_2 = gx_read(gm45, 2); sd_qa = deq_bf16(fbf, g_gm45_2, Q_LORA * H, H) }
+    d_qa<Int> = sd_qa
+    if (mtpStaged == 0) { g_gm45_4 = gx_read(gm45, 4); sd_qb = deq_bf16(fbf, g_gm45_4, HEADS * NOPE * Q_LORA, Q_LORA) }
+    d_qb<Int> = sd_qb
+    if (mtpStaged == 0) { g_gm45_5 = gx_read(gm45, 5); sd_kva = deq_bf16(fbf, g_gm45_5, KV_LORA * H, H) }
+    d_kva<Int> = sd_kva
+    if (mtpStaged == 0) { g_gm45_7 = gx_read(gm45, 7); sd_kvb = deq_bf16(fbf, g_gm45_7, HEADS * (NOPE + VDIM) * KV_LORA, 0) }
+    d_kvb<Int> = sd_kvb
+    if (mtpStaged == 0) { g_gm45_8 = gx_read(gm45, 8); sd_o = deq_bf16(fbf, g_gm45_8, HEADS * VDIM * H, HEADS * VDIM) }
+    d_o<Int> = sd_o
+    if (mtpStaged == 0) { g_gm45_9 = gx_read(gm45, 9); sd_wqb = deq_bf16(fbf, g_gm45_9, Q_LORA * IHEADS * IDIM, Q_LORA) }
+    d_wqb<Int> = sd_wqb
+    if (mtpStaged == 0) { g_gm45_10 = gx_read(gm45, 10); sd_wk = deq_bf16(fbf, g_gm45_10, H * IDIM, H) }
+    d_wk<Int> = sd_wk
+    if (mtpStaged == 0) { g_gm45_13 = gx_read(gm45, 13); sd_wproj = deq_bf16(fbf, g_gm45_13, H * IHEADS, H) }
+    d_wproj<Int> = sd_wproj
+    if (mtpStaged == 0) { g_gm45_15 = gx_read(gm45, 15); sd_gatei = deq_bf16(fbf, g_gm45_15, H * IDIM, H) }
+    d_gatei<Int> = sd_gatei
+    if (mtpStaged == 0) { g_gm45_16 = gx_read(gm45, 16); sd_gw = deq_bf16(fbf, g_gm45_16, NE * H, H) }
+    d_gw<Int> = sd_gw
     if (d_ln == 0 || d_ln2 == 0 || d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 ||
         d_o == 0 || d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gatei == 0 || d_gw == 0) {
         println("CHAIN_FAIL mtp weight deq")
@@ -3634,25 +3703,19 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     }
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
-    free_dev(d_ln)
-    free_dev(d_ln2)
-    g_gm45_3 = gx_read(gm45, 3)
-    d_qaln<Int> = deq_bf16(fbf, g_gm45_3, Q_LORA, 0)
-    g_gm45_6 = gx_read(gm45, 6)
-    d_kvaln<Int> = deq_bf16(fbf, g_gm45_6, KV_LORA, 0)
-    g_gm45_11 = gx_read(gm45, 11)
-    d_knw<Int> = deq_bf16(fbf, g_gm45_11, IDIM, 0)
-    g_gm45_12 = gx_read(gm45, 12)
-    d_knb<Int> = deq_bf16(fbf, g_gm45_12, IDIM, 0)
+    if (mtpStaged == 0) { g_gm45_3 = gx_read(gm45, 3); sd_qaln = deq_bf16(fbf, g_gm45_3, Q_LORA, 0) }
+    d_qaln<Int> = sd_qaln
+    if (mtpStaged == 0) { g_gm45_6 = gx_read(gm45, 6); sd_kvaln = deq_bf16(fbf, g_gm45_6, KV_LORA, 0) }
+    d_kvaln<Int> = sd_kvaln
+    if (mtpStaged == 0) { g_gm45_11 = gx_read(gm45, 11); sd_knw = deq_bf16(fbf, g_gm45_11, IDIM, 0) }
+    d_knw<Int> = sd_knw
+    if (mtpStaged == 0) { g_gm45_12 = gx_read(gm45, 12); sd_knb = deq_bf16(fbf, g_gm45_12, IDIM, 0) }
+    d_knb<Int> = sd_knb
     if (d_qaln == 0 || d_kvaln == 0 || d_knw == 0 || d_knb == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     knw<Vec<Float>> = bulk_dtoh(d_knw, IDIM)
     knb<Vec<Float>> = bulk_dtoh(d_knb, IDIM)
-    free_dev(d_qaln)
-    free_dev(d_kvaln)
-    free_dev(d_knw)
-    free_dev(d_knb)
     ape<Vec<Float>> = Vec()
     g_gm45_14 = gx_read(gm45, 14)
     raw_ape<String> = g_gm45_14
@@ -3666,7 +3729,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 
     # absorbed per-head keys/values from kv_b (same as the trunk DSA step)
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
-    free_dev(d_kvb)
     ukm<Vec<Float>> = Vec()
     uvm<Vec<Float>> = Vec()
     d2 = 0
@@ -3921,14 +3983,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     attn45<Vec<Float>> = mm_host(ao, 1, HEADS * VDIM, d_o, H, fgemm)
     free_dev(d_ukm)
     free_dev(d_uvm)
-    free_dev(d_qa)
-    free_dev(d_qb)
-    free_dev(d_kva)
-    free_dev(d_o)
-    free_dev(d_wqb)
-    free_dev(d_wk)
-    free_dev(d_wproj)
-    free_dev(d_gatei)
 
     # ---- plain residual, post_attention_layernorm
     x1<Vec<Float>> = vecf()
@@ -4078,12 +4132,13 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     }
 
     # ---- shared expert
-    g_gm45_18 = gx_read(gm45, 18)
-    d_sg<Int> = deq_bf16(fbf, g_gm45_18, EINTER * H, H)
-    g_gm45_19 = gx_read(gm45, 19)
-    d_su<Int> = deq_bf16(fbf, g_gm45_19, EINTER * H, H)
-    g_gm45_20 = gx_read(gm45, 20)
-    d_sd<Int> = deq_bf16(fbf, g_gm45_20, H * EINTER, EINTER)
+    if (mtpStaged == 0) { g_gm45_18 = gx_read(gm45, 18); sd_sg = deq_bf16(fbf, g_gm45_18, EINTER * H, H) }
+    d_sg<Int> = sd_sg
+    if (mtpStaged == 0) { g_gm45_19 = gx_read(gm45, 19); sd_su = deq_bf16(fbf, g_gm45_19, EINTER * H, H) }
+    d_su<Int> = sd_su
+    if (mtpStaged == 0) { g_gm45_20 = gx_read(gm45, 20); sd_sd = deq_bf16(fbf, g_gm45_20, H * EINTER, EINTER) }
+    mtpStaged = 1
+    d_sd<Int> = sd_sd
     if (d_sg == 0 || d_su == 0 || d_sd == 0) { return nonev }
     sgate<Vec<Float>> = mm_host(h2, 1, H, d_sg, EINTER, fgemm)
     sup<Vec<Float>> = mm_host(h2, 1, H, d_su, EINTER, fgemm)
@@ -4099,9 +4154,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
         i = i + 1
     }
     shared45<Vec<Float>> = mm_host(sact, 1, EINTER, d_sd, H, fgemm)
-    free_dev(d_sg)
-    free_dev(d_su)
-    free_dev(d_sd)
 
     mlp45<Vec<Float>> = vecf()
     i = 0
@@ -4216,6 +4268,9 @@ share(all)
 arH<Int> = 0
 share(all)
 arI<Int> = 0
+
+
+
 
 
 

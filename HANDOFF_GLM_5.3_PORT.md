@@ -2971,6 +2971,25 @@ prompt tokens through the trunk; (2) the shard walk 81s — 83 st_opens + the
 per-record string parsing (a persistent index file would cut it to ~0). The
 remaining step-layer cost is ~50ms (the stageS deqs ~20ms + the mlpmoe ~20ms
 + the misc) — the endpoint is now compute-bound, not overhead-bound.
+=================== THE PHASE-1B: THE RESOLVES HOISTED; THE COST DECOMPOSED ==================
+THE PHASE-1B's 84s DECOMPOSED: the build_row ~930-970ms/token + the
+layer_step ~1000-1900ms/token x 20. THE DOMINANT SUSPECT: the per-token
+gx_resolve_tab calls (~900ms each, 2-3 per token — the resolves are now
+HOISTED to the module globals (mtpGM/mtpGM45 + the resolved flags) — the
+resolve hoist applied, semantic-clean, but the build's wall time did NOT
+change (971-978ms) — either the resolves are cheaper than estimated or the
+hoist needs the per-section verification (the build's internals are now
+instrumented: Bres/Bdeq/Brms/Bmm/Bend). THE DEQ HOIST (the 23 handles):
+blocked by the sticky-700 (see the previous section) — THE SETTER WORKAROUND
+IS THE PROVEN PATH: the set_engine_R pattern (the fn-level assignment inside
+a single-purpose setter fn) WORKS — wrap the 23 staged-handle deq assigns in
+one-line setters + the getters and re-run. NOTE: the bsecT "non-persistence"
+in the build diagnostics was a diagnostic bug (the bsecT is a fn-local —
+trivially expected). THE MICRO-TEST (probe11's flagtest): the fn-level
+module-global write with the fillers/if-blocks/params PERSISTS — the
+build_row's failure is environment-specific (the engine's module scale or
+the fn complexity), not a general semantic rule. THE PROBE11 SUITE (the 14
+cases A-M) is committed as the semantics reference.
 =================== THE PHASE-1B ATTACK: MEASURED, THE HOIST TRIED AND REVERTED ==================
 The phase-1b's 84s = the per-token cost x 20: mtp_build_row ~925ms/token +
 mtp_layer_step ~1000ms/token. THE CAUSE: both fns re-stage the layer-45
