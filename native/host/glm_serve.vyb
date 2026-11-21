@@ -77,6 +77,25 @@ sv_SWIGLU_LIMIT<Float> = 10.0
 sv_ROUTED_SCALE<Float> = 2.5
 sv_TOPK<Int> = 2048
 
+# find the first occurrence of needle at/after start, or -1 (the two-arg
+# index_of does not exist; this is the cache loader's scanner).
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Bool> = true
+        j<Int> = 0
+        while (ok && j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = false }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
 main()<Int> -> {
     setupT<Int> = 0
     secP<Int> = 0
@@ -117,14 +136,60 @@ main()<Int> -> {
     setupT = now_ms()
     # ---- one-time shard walk: bucket every tensor record by layer (the tab) ----
     # record = name SP shard SP data_offset SP nbytes SP dtype NEWLINE; runtime never parses JSON.
+    # The walk costs ~83 s (83 x st_open); cache the buckets to a file and reload
+    # (the stamp embeds the checkpoint dir; delete the cache or point
+    # VYBFORGE_TAB_CACHE elsewhere to force a re-walk).
     tabs<Vec<String>> = Vec()
     tnb<String> = ""
     tnb2<String> = ""
     tln<Int> = 0
     tln2<Int> = 0
     while (tln < 45) { tabs.push(""); tln = tln + 1 }
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cache_sig<String> = "GXTAB1 " + dir
+    loaded<Int> = 0
+    match (open_read(cache_path)) {
+        f -> {
+            match (read_all(f)) { cs -> {
+                if (find_from(cs, cache_sig, 0) == 0) {
+                    nl0<Int> = find_from(cs, "\n", 0)
+                    if (nl0 > 0) {
+                        # parse into a temp list: the failed load must not pollute
+                        # the real tabs (the walk would append onto stale payloads)
+                        ttmp<Vec<String>> = Vec()
+                        ti<Int> = 0
+                        while (ti < 45) { ttmp.push(""); ti = ti + 1 }
+                        pos<Int> = nl0 + 1
+                        ti = 0
+                        ok<Int> = 1
+                        while (ti < 45 && ok == 1) {
+                            nl<Int> = find_from(cs, "\n", pos)
+                            if (nl < 0) { ok = 0 }
+                            if (ok == 1) {
+                                plen<Int> = cs.substring(pos, nl).to_int()
+                                if (plen <= 0 || nl + 1 + plen > cs.len()) { ok = 0 }
+                                if (ok == 1) {
+                                    ttmp.set(ti, cs.substring(nl + 1, nl + 1 + plen))
+                                    pos = nl + 1 + plen
+                                }
+                            }
+                            ti = ti + 1
+                        }
+                        if (ok == 1 && pos == cs.len()) {
+                            ti = 0
+                            while (ti < 45) { tabs.set(ti, ttmp.get(ti)); ti = ti + 1 }
+                            loaded = 1
+                            println("SETUP S0cache hit")
+                        }
+                    }
+                }
+            } ? -> { } }
+            close(f)
+        }
+        ? -> { }
+    }
     tsh<Int> = 1
-    while (tsh < 84) {
+    while (loaded == 0 && tsh < 84) {
         tkix<StIndex> = st_open(gx_shard_path(dir, tsh, 83))
         if (tkix.n > 0) {
             tk<Int> = 0
@@ -160,6 +225,25 @@ main()<Int> -> {
             }
         }
         tsh = tsh + 1
+    }
+    if (loaded == 0) {
+        # per-tab writes: a single 13 MB write_str drops a byte at the chunk
+        # boundary (the cache came back shifted); 45 small writes are exact.
+        match (open_write(cache_path)) {
+            f -> {
+                write_str(f, cache_sig + "\n")
+                ti<Int> = 0
+                while (ti < 45) {
+                    tp<String> = tabs.get(ti)
+                    write_str(f, tp.len().to_string() + "\n")
+                    write_str(f, tp)
+                    ti = ti + 1
+                }
+                close(f)
+            }
+            ? -> { }
+        }
+        println("SETUP S0cache saved")
     }
     lines = ""
     mapbody = ""

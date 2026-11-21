@@ -3515,3 +3515,17 @@ HTTP 200, 20 rows, the P1bstep 20.2s, the digests identical, CHAIN_OK) —
 pre-hoist padded baseline). THE ENDPOINT: ~2.4 min/request, verified
 reliable. The remaining: the shard walk 81s (the persistent index file),
 the gemm kernel's N-tile guard in the compiler, the tokenizer port.
+=================== THE SHARD-WALK CACHE: 79s -> 1ms ==================
+The setup's shard walk (83 x st_open, ~79-83 s) now caches to
+native/out/gx_tabs.cache (VYBFORGE_TAB_CACHE overrides; delete the file to
+force a re-walk; the stamp embeds the checkpoint dir). THE SETUP: ~80 s ->
+~1 s (S0cache hit, S1tab 1ms). GREEN end-to-end, the digests identical.
+THREE runtime lessons landed with it: (1) a giant single write_str of ~13 MB
+produced a byte-shifted file once (the per-tab small writes are exact;
+write_str verified byte-exact at 1.14 MB and 10.26 MB in probes); (2) THE
+LEN-PREFIX PARSER BUG: the advance must be nl+1+plen, NOT pos+1+plen (the
+len-line width forgotten — the parse drifted ~5 bytes per tab and every
+load failed); (3) a failed cache load MUST NOT mutate the live state
+in-place — the partial tabs.set polluted the tabs and the subsequent walk
+APPENDED onto the stale payloads (the doubled cache file). Parse into a
+temp list; commit only when pos == the file length exactly.
