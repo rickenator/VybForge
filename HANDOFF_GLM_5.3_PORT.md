@@ -3119,6 +3119,17 @@ phase-1b's deq hoist can be re-attempted on top (the staging proven safe
 modulo the padding). The router's gemm N=288: the only non-128-multiple N
 in the pipeline — the gemm kernel's N-tile handling (the partial tile's OOB
 read/write) is the likely fault.
+=================== THE PADDING CONFIRMED: 3/3 GREEN ==================
+The repeat runs #2 and #3: BOTH GREEN end-to-end ({"draft_token": 10788}
+HTTP 200, all 20 phase-1b tokens, no EXL3FAIL, no CHAIN_FAIL, the digests
+gate-identical) — 3/3 consecutive green vs the intermittent pre-padding
+crashes. **THE PADDING IS THE FIX.** PHASE 1+2: COMPLETE — the endpoint:
+~3 min/request, verified reliable, the digests gate-identical. THE
+REMAINING (perf/feature, not correctness): the phase-1b's deq hoist
+re-attempt on the now-proven-safe staging (84s -> ~25-40s, the padding in
+place); the shard walk 81s (the persistent index file); the gemm kernel's
+N-tile guard fix in the compiler (the proper fix for any non-128-multiple
+N); the tokenizer port (the feature).
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
