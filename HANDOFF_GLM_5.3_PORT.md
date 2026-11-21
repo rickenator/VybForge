@@ -3548,3 +3548,31 @@ infeasible; only the shared-expert + the router weights are cache-sized);
 (c) the resolve 5.5s -> ~0 via the same persistent-index treatment as the
 tabs cache (the 15.5 MB index parsed once per process). The attention
 (P1attn 15.2s) and the phase-1b (12.5-20s) are secondary.
+=================== THE DEQ32 KERNEL OPTIMIZATION: 28x FOUND, 1 BUG LEFT ==================
+The exl3deq32 kernel (native/kernels/exl3dq.vyb, the fused deq+column-transform,
+32768 blocks x 256 threads, one output per thread): the phase-2 re-reads the
+128-tap transform vector from the L2 PER OUTPUT — ~4.3 GB of L2 traffic per
+8.4M-output call — the dominant cost (the kernel at ~30x off bandwidth).
+THE 4-ROWS-PER-THREAD VARIANT (the tap loaded once per c2 serving the rows
+b2, b2+16, b2+32, b2+48; the per-output c2-ascending order preserved):
+**deq 36.3s -> 1.3s (28x)**, mm 7.2 -> 0.8s — BUT the DECODE_MTP gate went
+RED (max_abs exactly 8388608 = kn at the gate A; the serve's draft 0 with
+the logit -1e308 while ALL the digest lines stayed bit-identical — the MTP
+layer's own output x2 is dump-file-only, never digest-gated). REVERTED to
+the one-row phase 2; the serve is green again (the draft 10788, the digests
+bit-identical). THE KEPT FIX: fp16_to_f64's exponent normalization — the
+<=24-step multiply loops replaced with the one-multiply subnormal path and
+the <=5-step binary exponentiation (the powers of two are exact in f64, so
+the values are bit-identical) — verified: the digests unchanged.
+*** THE PRE-EXISTING RED DISCOVERED: DECODE_MTP_MATCH FAILS at the gate C ***
+The gate A/B (the hidden states) PASS; the gate C (the logits) fails at
+worst 1.701e+01 (tol 1e-02) and the draft top-1: the driver 10788 vs the
+oracle 576. The gate's green record (d85808a): the draft 576, the driver ==
+the oracle. THE LOGITS WERE NEVER DIGEST-GATED (the mtplogits is a file
+dump, not a digest line) — so the draft's change 576 -> 10788 somewhere in
+the serve's perf evolution (the R split-brain fix, the dump gating, the
+deq hoist) went unnoticed by every digest-gate verification. THE OPEN
+QUESTION: is the driver's 10788 wrong (the semantics drifted) or the
+oracle's 576 (the stale gold)? The next session: run gold_mtp.py fresh,
+diff the logits per element, and pin which side moved. DO NOT trust the
+endpoint's draft token until this gate is green.

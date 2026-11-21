@@ -15,25 +15,31 @@ share(all) fp16_to_f64(b<Int>)<Float> -> {
     mb<Int> = b & 1023
     v<Float> = 0.0
     if (eb == 0) {
-        v = mb as Float
-        k<Int> = 0
-        while (k < 24) {
-            v = v * 0.5
-            k = k + 1
-        }
+        # subnormal: mb * 2^-24 in ONE multiply (was a 24-step halving loop);
+        # the product is exact, so the value is bit-identical
+        v = (mb as Float) * 0.000000059604644775390625
     } else {
         if (eb == 31) {
             v = 65504.0
         } else {
             v = (1024 + mb) as Float
-            sh<Int> = eb - 25
-            while (sh > 0) {
-                v = v * 2.0
-                sh = sh - 1
+            e<Int> = eb - 25
+            # 2^e exactly via binary exponentiation (<=5 squarings): every
+            # intermediate is a power of two, so the result is bit-identical
+            # to the old stepwise doubling/halving loops (<=24 iterations)
+            k<Int> = e
+            if (k < 0) { k = 0 - k }
+            r<Float> = 1.0
+            b2<Float> = 2.0
+            while (k > 0) {
+                if ((k - ((k >> 1) * 2)) == 1) { r = r * b2 }
+                b2 = b2 * b2
+                k = k >> 1
             }
-            while (sh < 0) {
-                v = v * 0.5
-                sh = sh + 1
+            if (e < 0) {
+                v = v / r
+            } else {
+                v = v * r
             }
         }
     }
@@ -93,6 +99,10 @@ exl3dq1s(p<Int>) -> {
     kernel_barrier()
 
     # ---- phase 2: one output per thread ----
+    # (A 4-rows-per-thread variant — loading the 128-tap vector once per c2
+    # for four rows — measured a 28x deq speedup but broke the DECODE_MTP gate
+    # with max_abs exactly 8388608 = kn; reverted pending a fresh debugging
+    # session. The fp16_to_f64 exponentiation fix above is kept: bit-identical.)
     e2<Int> = rem
     b2<Int> = e2 / 128
     d<Int> = e2 - b2 * 128
