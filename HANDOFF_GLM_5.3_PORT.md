@@ -3104,6 +3104,21 @@ illegal-access locator — it names the exact kernel and address). The router's
 gemm (N=288, the only non-128-multiple) remains the prime suspect: the
 baseline + the padded router (N=384 + the padded deq + the NE-bounded
 routing) is the untested combination.
+=================== THE PADDED ROUTER: GREEN END-TO-END (first run) ==================
+CRITICAL ARCHAEOLOGY: the earlier "reverts" were working-tree-only — the
+hoisted forms kept getting committed (the commits carried the staged/hoisted
+engines). 73964c6's tree is the TRUE per-token-deq baseline. THE TRUE
+BASELINE + THE ROUTER PADS (the gemm N=288 -> 384, the per-token deq
+n=NE*H -> 384*H, the routing bounded to NE): **GREEN END-TO-END** — all 20
+phase-1b tokens completed, NO EXL3FAIL, NO CHAIN_FAIL, {"draft_token":
+10788} HTTP 200, the digests gate-identical. THE N=288 GEMM: THE PRIME
+SUSPECT CONFIRMED operationally (the first green padded run) — the
+reliability needs 2-3 green repeats (the race was intermittent). THE NEXT
+SESSION: 2-3 repeat runs; if all green, the padding is the fix and the
+phase-1b's deq hoist can be re-attempted on top (the staging proven safe
+modulo the padding). The router's gemm N=288: the only non-128-multiple N
+in the pipeline — the gemm kernel's N-tile handling (the partial tile's OOB
+read/write) is the likely fault.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
