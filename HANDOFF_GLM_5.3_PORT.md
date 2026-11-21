@@ -3529,3 +3529,22 @@ load failed); (3) a failed cache load MUST NOT mutate the live state
 in-place — the partial tabs.set polluted the tabs and the subsequent walk
 APPENDED onto the stale payloads (the doubled cache file). Parse into a
 temp list; commit only when pos == the file length exactly.
+=================== THE PHASE-1 PROFILE: deq32 IS THE LEVER ==================
+The per-request SEC totals (cache6, green): the phase-1 ffn (the tail_site
+MoE) 61.8s of the ~100s phase-1. The existing T_MOE timers split it across
+the 42 MoE layers (~101-106 unique routed experts/layer): **deq=36.8s
+(60%)**, mm=7.2s, resolve=5.5s. The deq = ~12,700 exl3deq32 calls (~3 per
+hit expert x ~101 experts x 42 layers) at ~2.85 ms each; each deq writes
+EINTER(2048) x H f64 (~84 MB) => ~29 GB/s effective on a ~900 GB/s part —
+**the deq32 kernel is ~30x off memory bandwidth** (the trellis LUT +
+hadamard decode is compute/latency-bound, the generated native/build/
+exl3.ptx from native/exl3/ tooling). THE POTENTIAL: 36.8s -> ~2-4s at even
+300 GB/s => the endpoint -> ~1.5-2 min. THE PATHS: (a) the deq32 kernel
+optimization (the vectorized LUT fetches, the wider tiles, the f32 output
+halving the writes if the f32 digest band is acceptable — the gate has both
+the f64 and the f32 references); (b) the expert-deq LRU across the requests
+if the serve goes multi-request (~101 experts x 3 x 84 MB = 25 GB/layer —
+infeasible; only the shared-expert + the router weights are cache-sized);
+(c) the resolve 5.5s -> ~0 via the same persistent-index treatment as the
+tabs cache (the 15.5 MB index parsed once per process). The attention
+(P1attn 15.2s) and the phase-1b (12.5-20s) are secondary.
