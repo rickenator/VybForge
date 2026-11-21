@@ -325,6 +325,23 @@ main()<Int> -> {
     trellis<String> = gx_read(g, 0)
     suh<String> = gx_read(g, 1)
     svh<String> = gx_read(g, 2)
+    # down_proj's own trellis/suh/svh
+    pred<String> = "model.language_model.layers.3.mlp.experts." + expert + ".down_proj."
+    wantd<Vec<String>> = Vec()
+    wantd.push(pred + "trellis")
+    wantd.push(pred + "suh")
+    wantd.push(pred + "svh")
+    gd<GxLoc> = gx_resolve(dir, total, wantd)
+    nfd<Int> = 0
+    i = 0
+    while (i < wantd.len()) {
+        if (gd.found.get(i) == 1) { nfd = nfd + 1 }
+        i = i + 1
+    }
+    if (nfd != wantd.len()) { println("EXL3_FAIL resolve dp " + nfd.to_string()); return 3 }
+    trellisd<String> = gx_read(gd, 0)
+    suh2<String> = gx_read(gd, 1)
+    svh2<String> = gx_read(gd, 2)
     # gate_proj: [in=4096, out=2048] -> cw (out) 2048, ntiles = (4096/16)*(2048/16)
     dW<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, trellis, suh, svh, body, 2048, 32768, hdg)
     if (dW == 0) { println("EXL3_FAIL deq"); return 7 }
@@ -341,10 +358,25 @@ main()<Int> -> {
 
     line<String> = digest("gp0", W)
     println(line)
-    match (open_write(out)) {
-        f -> { write_str(f, line + "\n"); close(f) }
-        ? -> { println("EXL3_FAIL write"); return 8 }
+    # down_proj: [in=2048, out=4096] -> cw (out) 4096, ntiles = (2048/16)*(4096/16)
+    dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, trellisd, suh2, svh2, body, 4096, 32768, hdg)
+    if (dWd == 0) { println("EXL3_FAIL deq dp"); return 7 }
+    sync()
+    Wd<Vec<Float>> = Vec()
+    wi = 0
+    while (wi < 2048 * 4096) {
+        Wd.push(dtoh32(dWd + wi * 4))
+        wi = wi + 1
     }
-    println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string())
+    freedom {
+        cuMemFree_v2(dWd)
+    }
+    lined<String> = digest("dp0", Wd)
+    println(lined)
+    match (open_write(out)) {
+        f -> { write_str(f, line + "\n" + lined + "\n"); close(f) }
+        ? -> { println("EXL3_FAIL write dp"); return 8 }
+    }
+    println("EXL3_LOAD32_OK expert=" + expert + " elements=" + W.len().to_string() + "+" + Wd.len().to_string())
     return 0
 }

@@ -3606,3 +3606,39 @@ the hoist7 reference. NOTE: the DECODE_CHAIN gate's reference is the CURRENT
 prefill driver's dumps, and nothing anchors today's runs to the d85808a era —
 the step-layer digests were verified bit-identical against the Nov-19
 decchain_engine.log, which is the deepest anchor that exists.
+=================== THE 4-ROW DEQ32: ROOT-CAUSED (CROSS-BLOCK SHARED) ==================
+The 4-rows-per-thread variant was IMPOSSIBLE in the current kernel structure, and
+the "28x speedup" was a mirage — the broken kernel read UNWRITTEN shared memory
+instead of doing real work. THE MECHANISM: __syncthreads and shared memory are PER
+LAUNCH-BLOCK (256 threads), and each launch-block stages ONLY its own 2 rows
+(rem/128 = b2, b2+1) into its private 32KB shared window. A 4-row phase-2 reading
+b2+16k reads rows OTHER blocks staged in THEIR shared — unreadable, so the
+accumulators consumed unwritten shared garbage (NaN/huge f32s; the dumps showed
+di() overflowing to INT64_MIN; DECODE_MTP max_abs = exactly 8388608 = 2^23).
+Debug trail that cracked it: the check32 gate NEVER tested the fused dq1s (it
+launches the old non-fused exl3deq32 directly) — both "check32 passes" were
+meaningless for the dq1s; the serve-side T-buffer dumps (bulk_dtoh of the returned
+fdc, tagged with the expert id) showed garbage from call #0; the wrapper chain
+(dq1s->fd, had232->fdc, cvt32->od, return fdc) was verified launch-by-launch with
+syncs passing, then a 3-way fd/fdc/od dump pinned the dq1s itself.
+ALSO LEARNED (all measured, the GPU contention caveat: the ComfyUI process inflates
+the deq ~2.6x when active — the comparisons must run on an idle GPU):
+- A 2-rows-per-thread variant (rows b2, b2+1 = the block's own staged pair; the
+  tap load serves two accumulators) IS CORRECT (the digests bit-identical) but
+  NEUTRAL on speed: the phase-2 is MEMORY-LEVEL-PARALLELISM-latency-bound, not
+  load-count-bound — halving the active warps halves the MLP and eats the saving.
+  Both the if{while} wrapper AND the c2=128 zero-iteration trick failed to speed
+  it up: the compiler branches correctly (the PTX even vectorizes the pair into
+  ld.shared.v2) but the MLP is the limit.
+- THE REAL 4-ROW REDESIGN (the next session, the expected ~2-4x, not 28x):
+  (1) dq1s phase-1 deqs straight to GLOBAL memory (st_global.f32 to the T arena,
+  gid-linear — the address math is identical to the current phase-2 stores), no
+  shared staging, no barrier; (2) a NEW separate transform kernel, one thread per
+  (row-group, d), reads FOUR fd rows per thread — four INDEPENDENT global loads
+  per c2 iteration restore the MLP the thread-count reduction would otherwise
+  lose — plus one ld_f32n tap per c2 (the H traffic /4); (3) it writes the fdc
+  (f64) directly, the cvt32 retires. The chain becomes dq1s-deq-only -> had4x ->
+  return fdc.
+KEPT FROM THIS SESSION: the check32 gate now covers BOTH geometries (gp0 =
+gate_proj cw=2048 AND dp0 = down_proj cw=4096, both vs the gold dequant digest) —
+the cw=4096 path was previously untested by any gate. gold_exl3_deq.py emits dp0.

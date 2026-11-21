@@ -30,6 +30,14 @@ def main():
     open(f"{OUT}/gold_exl3_deq.txt", "w").write("gp0 " + line + "\n")
     np.save(f"{OUT}/gold_exl3_gp0.npy", w)
     print("gold_gp0 n=%d sum=%d sq=%d max=%d" % (d["n"], d["sum"], d["sq"], d["max"]))
+    # down_proj [in=2048, out=4096]: cw (out) 4096, ntiles = (2048/16)*(4096/16)
+    wd = B.read_expert_exl3(0, "down_proj", idx).astype(np.float64)
+    print(f"down_proj expert0 shape {wd.shape}")
+    dd = dig(wd)
+    dline = " ".join(f"{k}={v}" for k, v in dd.items())
+    open(f"{OUT}/gold_exl3_deq.txt", "a").write("dp0 " + dline + "\n")
+    np.save(f"{OUT}/gold_exl3_dp0.npy", wd)
+    print("gold_dp0 n=%d sum=%d sq=%d max=%d" % (dd["n"], dd["sum"], dd["sq"], dd["max"]))
     return 0
 
 
