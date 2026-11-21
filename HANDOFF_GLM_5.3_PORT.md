@@ -3060,6 +3060,31 @@ multiples and bisect; (c) or route the phase-1b's CUDA ops through a
 CUDA_LAUNCH_BLOCKING=1 serve run (the slow but pinpointing mode). The
 endpoint: ~3 min/request at 73964c6 — the phase-1b's 84s optimization stays
 blocked until the sticky-700 origin is found.
+=================== THE SETTER-BASED HOIST (v3): THE ALTERNATING-SETTER ANOMALY ==================
+The setter-based hoist (v3): the 50 one-line setters/getters generated, the
+23 staged guards rewired (getMtpStaged()/setSd_ln(deq(...))), the flag sets
+via setMtpStaged(1)/setMtpBStaged(1). RESULT: the build's timings ALTERNATE
+78ms/972ms/76ms/976ms per token — THE STAGING FLAG TOGGLES 1->0->1->0 across
+the build_row calls: the setter's write persists for ONE call then reverts.
+THE IDENTICAL PATTERN WORKS: (a) the probe11's flagtest (1,1,1 — persists);
+(b) set_engine_R (the R=1 persisted across all 90 step layers). THE
+DIFFERENCE: the engine's build_row vs those — the module scale (4000
+lines/177 decls), the fn's size (60 lines/7 params), or the call-site
+context. THE COMPILER FINDING #3: the module-global writes through the
+setters are INCONSISTENT across calls in the big modules — the probe11
+semantics do not transfer to the engine's scale. THE PER-TOKEN SYNC (the
+race fix candidate): did NOT fix the expert crash (the rc=700 persisted with
+the syncs in place) — the crash is NOT an async race either. REVERTED to
+73964c6 (the per-token deqs, 84s, the endpoint ~3 min, WORKING). THE
+PHASE-1B OPTIMIZATION: BLOCKED ON THREE STACKED ANOMALIES: (1) the sticky
+rc=700 (the async illegal access, the origin unidentified — the
+CUDA_LAUNCH_BLOCKING run: NO crash in the baseline, so the crash is
+hoist-specific); (2) the setter writes inconsistent at the engine's scale;
+(3) the probe11 semantics do not transfer. THE NEXT SESSION'S PATH: the
+compiler-level debugging (the module-global write codegen at the engine's
+scale: a minimal repro from the engine's build_row shape) — the 84s is a
+shared cost (the gate too) and the endpoint at ~3 min is the shipping
+state.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
