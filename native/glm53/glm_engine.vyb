@@ -3521,9 +3521,94 @@ mtp_build_row(tvec<Vec<Float>>, raw_e<String>, tab<String>, dir<String>, total<I
 # -> post_attention_layernorm -> dots-router MoE (sigmoid + noaux_tc bias, top-8,
 # renorm * 2.5, lazy per-expert EXL3 resolve) -> residual. Returns the post-block hidden.
 share(all)
+mtp_stage_deqs(lpre<String>, tab<String>, dir<String>, total<Int>, fbf<Int>)<Vec<Int>> -> {
+    novec<Vec<Int>> = Vec()
+    wantL45<Vec<String>> = Vec()
+    wantL45.push(lpre + "input_layernorm.weight")
+    wantL45.push(lpre + "post_attention_layernorm.weight")
+    wantL45.push(lpre + "self_attn.q_a_proj.weight")
+    wantL45.push(lpre + "self_attn.q_a_layernorm.weight")
+    wantL45.push(lpre + "self_attn.q_b_proj.weight")
+    wantL45.push(lpre + "self_attn.kv_a_proj_with_mqa.weight")
+    wantL45.push(lpre + "self_attn.kv_a_layernorm.weight")
+    wantL45.push(lpre + "self_attn.kv_b_proj.weight")
+    wantL45.push(lpre + "self_attn.o_proj.weight")
+    wantL45.push(lpre + "self_attn.indexer.wq_b.weight")
+    wantL45.push(lpre + "self_attn.indexer.wk.weight")
+    wantL45.push(lpre + "self_attn.indexer.k_norm.weight")
+    wantL45.push(lpre + "self_attn.indexer.k_norm.bias")
+    wantL45.push(lpre + "self_attn.indexer.weights_proj.weight")
+    wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_ape")
+    wantL45.push(lpre + "self_attn.indexer.index_kpool_compress_gate")
+    wantL45.push(lpre + "mlp.gate.weight")
+    wantL45.push(lpre + "mlp.gate.e_score_correction_bias")
+    wantL45.push(lpre + "mlp.shared_experts.gate_proj.weight")
+    wantL45.push(lpre + "mlp.shared_experts.up_proj.weight")
+    wantL45.push(lpre + "mlp.shared_experts.down_proj.weight")
+    gm45<GxLoc> = gx_resolve_tab(tab, dir, total, wantL45)
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < wantL45.len()) {
+        if (gm45.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != wantL45.len()) { println("CHAIN_FAIL mtp stage resolve"); return novec }
+    g<String> = ""
+    s0<Int> = 0
+    s1<Int> = 0
+    s2<Int> = 0
+    s3<Int> = 0
+    s4<Int> = 0
+    s5<Int> = 0
+    s6<Int> = 0
+    s7<Int> = 0
+    s8<Int> = 0
+    s9<Int> = 0
+    s10<Int> = 0
+    s11<Int> = 0
+    s12<Int> = 0
+    s13<Int> = 0
+    s14<Int> = 0
+    s15<Int> = 0
+    s16<Int> = 0
+    s17<Int> = 0
+    s18<Int> = 0
+    g = gx_read(gm45, 0); s0 = deq_bf16(fbf, g, H, 0)
+    g = gx_read(gm45, 1); s1 = deq_bf16(fbf, g, H, 0)
+    g = gx_read(gm45, 2); s2 = deq_bf16(fbf, g, Q_LORA * H, H)
+    g = gx_read(gm45, 3); s3 = deq_bf16(fbf, g, Q_LORA, 0)
+    g = gx_read(gm45, 4); s4 = deq_bf16(fbf, g, HEADS * NOPE * Q_LORA, Q_LORA)
+    g = gx_read(gm45, 5); s5 = deq_bf16(fbf, g, KV_LORA * H, H)
+    g = gx_read(gm45, 6); s6 = deq_bf16(fbf, g, KV_LORA, 0)
+    g = gx_read(gm45, 7); s7 = deq_bf16(fbf, g, HEADS * (NOPE + VDIM) * KV_LORA, 0)
+    g = gx_read(gm45, 8); s8 = deq_bf16(fbf, g, HEADS * VDIM * H, HEADS * VDIM)
+    g = gx_read(gm45, 9); s9 = deq_bf16(fbf, g, Q_LORA * IHEADS * IDIM, Q_LORA)
+    g = gx_read(gm45, 10); s10 = deq_bf16(fbf, g, H * IDIM, H)
+    g = gx_read(gm45, 11); s11 = deq_bf16(fbf, g, IDIM, 0)
+    g = gx_read(gm45, 12); s12 = deq_bf16(fbf, g, IDIM, 0)
+    g = gx_read(gm45, 13); s13 = deq_bf16(fbf, g, H * IHEADS, H)
+    g = gx_read(gm45, 15); s14 = deq_bf16(fbf, g, H * IDIM, H)
+    g = gx_read(gm45, 16); s15 = deq_bf16(fbf, g, 384 * H, H)
+    g = gx_read(gm45, 18); s16 = deq_bf16(fbf, g, EINTER * H, H)
+    g = gx_read(gm45, 19); s17 = deq_bf16(fbf, g, EINTER * H, H)
+    g = gx_read(gm45, 20); s18 = deq_bf16(fbf, g, H * EINTER, EINTER)
+    if (s0 == 0 || s1 == 0 || s2 == 0 || s3 == 0 || s4 == 0 || s5 == 0 || s6 == 0 ||
+        s7 == 0 || s8 == 0 || s9 == 0 || s10 == 0 || s11 == 0 || s12 == 0 || s13 == 0 ||
+        s14 == 0 || s15 == 0 || s16 == 0 || s17 == 0 || s18 == 0) {
+        println("CHAIN_FAIL mtp stage deq")
+        return novec
+    }
+    out<Vec<Int>> = Vec()
+    out.push(s0); out.push(s1); out.push(s2); out.push(s3); out.push(s4)
+    out.push(s5); out.push(s6); out.push(s7); out.push(s8); out.push(s9)
+    out.push(s10); out.push(s11); out.push(s12); out.push(s13); out.push(s14)
+    out.push(s15); out.push(s16); out.push(s17); out.push(s18)
+    return out
+}
+share(all)
 mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>, total<Int>,
                mapbody<String>, mckv<their<Vec<Float>>>,
-               mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, fgemm<Int>, fbf<Int>,
+               mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, dw<Vec<Int>>, fgemm<Int>, fbf<Int>,
                fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = vecf()
     i<Int> = 0
@@ -3603,56 +3688,34 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     }
     if (nf != wantL45.len()) { println("CHAIN_FAIL mtp resolve layer"); return nonev }
 
-    g_gm45_0 = gx_read(gm45, 0)
-    d_ln<Int> = deq_bf16(fbf, g_gm45_0, H, 0)
-    g_gm45_1 = gx_read(gm45, 1)
-    d_ln2<Int> = deq_bf16(fbf, g_gm45_1, H, 0)
-    g_gm45_2 = gx_read(gm45, 2)
-    d_qa<Int> = deq_bf16(fbf, g_gm45_2, Q_LORA * H, H)
-    g_gm45_4 = gx_read(gm45, 4)
-    d_qb<Int> = deq_bf16(fbf, g_gm45_4, HEADS * NOPE * Q_LORA, Q_LORA)
-    g_gm45_5 = gx_read(gm45, 5)
-    d_kva<Int> = deq_bf16(fbf, g_gm45_5, KV_LORA * H, H)
-    g_gm45_7 = gx_read(gm45, 7)
-    d_kvb<Int> = deq_bf16(fbf, g_gm45_7, HEADS * (NOPE + VDIM) * KV_LORA, 0)
-    g_gm45_8 = gx_read(gm45, 8)
-    d_o<Int> = deq_bf16(fbf, g_gm45_8, HEADS * VDIM * H, HEADS * VDIM)
-    g_gm45_9 = gx_read(gm45, 9)
-    d_wqb<Int> = deq_bf16(fbf, g_gm45_9, Q_LORA * IHEADS * IDIM, Q_LORA)
-    g_gm45_10 = gx_read(gm45, 10)
-    d_wk<Int> = deq_bf16(fbf, g_gm45_10, H * IDIM, H)
-    g_gm45_13 = gx_read(gm45, 13)
-    d_wproj<Int> = deq_bf16(fbf, g_gm45_13, H * IHEADS, H)
-    g_gm45_15 = gx_read(gm45, 15)
-    d_gatei<Int> = deq_bf16(fbf, g_gm45_15, H * IDIM, H)
-    g_gm45_16 = gx_read(gm45, 16)
-    d_gw<Int> = deq_bf16(fbf, g_gm45_16, 384 * H, H)
+    d_ln<Int> = dw.get(0)
+    d_ln2<Int> = dw.get(1)
+    d_qa<Int> = dw.get(2)
+    d_qaln<Int> = dw.get(3)
+    d_qb<Int> = dw.get(4)
+    d_kva<Int> = dw.get(5)
+    d_kvaln<Int> = dw.get(6)
+    d_kvb<Int> = dw.get(7)
+    d_o<Int> = dw.get(8)
+    d_wqb<Int> = dw.get(9)
+    d_wk<Int> = dw.get(10)
+    d_knw<Int> = dw.get(11)
+    d_knb<Int> = dw.get(12)
+    d_wproj<Int> = dw.get(13)
+    d_gatei<Int> = dw.get(14)
+    d_gw<Int> = dw.get(15)
     if (d_ln == 0 || d_ln2 == 0 || d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 ||
-        d_o == 0 || d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gatei == 0 || d_gw == 0) {
-        println("CHAIN_FAIL mtp weight deq")
+        d_o == 0 || d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gatei == 0 || d_gw == 0 ||
+        d_qaln == 0 || d_kvaln == 0 || d_knw == 0 || d_knb == 0) {
+        println("CHAIN_FAIL mtp staged weights")
         return nonev
     }
     in_ln<Vec<Float>> = bulk_dtoh(d_ln, H)
     post_ln<Vec<Float>> = bulk_dtoh(d_ln2, H)
-    free_dev(d_ln)
-    free_dev(d_ln2)
-    g_gm45_3 = gx_read(gm45, 3)
-    d_qaln<Int> = deq_bf16(fbf, g_gm45_3, Q_LORA, 0)
-    g_gm45_6 = gx_read(gm45, 6)
-    d_kvaln<Int> = deq_bf16(fbf, g_gm45_6, KV_LORA, 0)
-    g_gm45_11 = gx_read(gm45, 11)
-    d_knw<Int> = deq_bf16(fbf, g_gm45_11, IDIM, 0)
-    g_gm45_12 = gx_read(gm45, 12)
-    d_knb<Int> = deq_bf16(fbf, g_gm45_12, IDIM, 0)
-    if (d_qaln == 0 || d_kvaln == 0 || d_knw == 0 || d_knb == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
     knw<Vec<Float>> = bulk_dtoh(d_knw, IDIM)
     knb<Vec<Float>> = bulk_dtoh(d_knb, IDIM)
-    free_dev(d_qaln)
-    free_dev(d_kvaln)
-    free_dev(d_knw)
-    free_dev(d_knb)
     ape<Vec<Float>> = Vec()
     g_gm45_14 = gx_read(gm45, 14)
     raw_ape<String> = g_gm45_14
@@ -3666,7 +3729,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 
     # absorbed per-head keys/values from kv_b (same as the trunk DSA step)
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
-    free_dev(d_kvb)
     ukm<Vec<Float>> = Vec()
     uvm<Vec<Float>> = Vec()
     d2 = 0
@@ -3921,14 +3983,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     attn45<Vec<Float>> = mm_host(ao, 1, HEADS * VDIM, d_o, H, fgemm)
     free_dev(d_ukm)
     free_dev(d_uvm)
-    free_dev(d_qa)
-    free_dev(d_qb)
-    free_dev(d_kva)
-    free_dev(d_o)
-    free_dev(d_wqb)
-    free_dev(d_wk)
-    free_dev(d_wproj)
-    free_dev(d_gatei)
 
     # ---- plain residual, post_attention_layernorm
     x1<Vec<Float>> = vecf()
@@ -3938,9 +3992,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
 
     # ---- router: sigmoid + noaux_tc bias + top-8 + renorm * 2.5
     logits45<Vec<Float>> = mm_host(h2, 1, H, d_gw, 384, fgemm)
-    freedom {
-        cuMemFree_v2(d_gw)
-    }
     scores45<Vec<Float>> = Vec()
     i = 0
     while (i < logits45.len()) {
@@ -4078,12 +4129,9 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
     }
 
     # ---- shared expert
-    g_gm45_18 = gx_read(gm45, 18)
-    d_sg<Int> = deq_bf16(fbf, g_gm45_18, EINTER * H, H)
-    g_gm45_19 = gx_read(gm45, 19)
-    d_su<Int> = deq_bf16(fbf, g_gm45_19, EINTER * H, H)
-    g_gm45_20 = gx_read(gm45, 20)
-    d_sd<Int> = deq_bf16(fbf, g_gm45_20, H * EINTER, EINTER)
+    d_sg<Int> = dw.get(16)
+    d_su<Int> = dw.get(17)
+    d_sd<Int> = dw.get(18)
     if (d_sg == 0 || d_su == 0 || d_sd == 0) { return nonev }
     sgate<Vec<Float>> = mm_host(h2, 1, H, d_sg, EINTER, fgemm)
     sup<Vec<Float>> = mm_host(h2, 1, H, d_su, EINTER, fgemm)
@@ -4099,9 +4147,6 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
         i = i + 1
     }
     shared45<Vec<Float>> = mm_host(sact, 1, EINTER, d_sd, H, fgemm)
-    free_dev(d_sg)
-    free_dev(d_su)
-    free_dev(d_sd)
 
     mlp45<Vec<Float>> = vecf()
     i = 0

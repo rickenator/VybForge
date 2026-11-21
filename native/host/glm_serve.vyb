@@ -276,6 +276,7 @@ main()<Int> -> {
     g_lg_9 = ""
     g_lmg_0 = ""
     lpre45 = "model.language_model.layers.45."
+    mdw<Vec<Int>> = Vec()
     tab = tabs.get(44)
     tvec<Vec<Float>> = Vec()
     hin<Vec<Float>> = Vec()
@@ -378,6 +379,9 @@ main()<Int> -> {
         println("CHAIN_FAIL kernels")
         return 4
     }
+    mdw = mtp_stage_deqs(lpre45, tab, dir, total, fbf)
+    if (mdw.len() != 19) { println("CHAIN_FAIL mtp stage"); return 39 }
+    println("SETUP S3stage " + mdw.len().to_string())
     mapd = ""
     match (open_read("native/exl3/map.bin")) {
         f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
@@ -665,7 +669,7 @@ main()<Int> -> {
                             lines = lines + dumps("mtphin" + r.to_string(), hin) + "\n"
                             println("SEC P1bbuild " + (now_ms() - secT).to_string())
                             secT = now_ms()
-                            x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                            x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer row " + r.to_string()); return 41 }
                             # the per-token sync: the token kernels and the next token's
                             # deqs overlap without it (the intermittent sticky
@@ -1828,7 +1832,7 @@ main()<Int> -> {
                             hin = mtp_build_row(tvec, raw_e, tab, dir, total, fgemm, fbf)
                             if (hin.len() != sv_H) { println("CHAIN_FAIL mtp build step " + t.to_string()); return 42 }
                             lines = lines + dumps("mtphin" + mrow.to_string(), hin) + "\n"
-                            mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                            mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer step " + t.to_string()); return 43 }
                             lines = lines + dumps("mtpx" + mrow.to_string(), x2) + "\n"
                             println("mtp step" + t.to_string() + " done")
