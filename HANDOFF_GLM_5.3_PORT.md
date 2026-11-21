@@ -3508,3 +3508,10 @@ FP64/32 GOLD (prerequisite, already in place and git-tracked):
 - element-wise: native/out/gold_l3_streams2.npy (layer-3 streams, f64 reference)
 Any fused kernel gates against these within a measured tolerance (f32 band already
 established: digests <=1.4e-6; element-wise TOL derived from the same run's spread).
+=================== THE HOIST CONFIRMED: 2/2 GREEN ==================
+The repeat run #2 of the hoisted serve: GREEN end-to-end (the draft 10788
+HTTP 200, 20 rows, the P1bstep 20.2s, the digests identical, CHAIN_OK) —
+2/2 green for the hoisted serve on the padded base (plus 3/3 for the
+pre-hoist padded baseline). THE ENDPOINT: ~2.4 min/request, verified
+reliable. The remaining: the shard walk 81s (the persistent index file),
+the gemm kernel's N-tile guard in the compiler, the tokenizer port.
