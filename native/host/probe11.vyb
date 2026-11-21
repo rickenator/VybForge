@@ -1,0 +1,50 @@
+# probe11: the module-global write/read semantics across the boundaries
+import probe11mod::{inc, getcount, setval, getval, inc2, inc3, inc4}
+
+gval<Int> = 0
+
+bump()<Int> -> {
+    gval = gval + 1
+    return gval
+}
+
+getg()<Int> -> {
+    return gval
+}
+
+main()<Int> -> {
+    # A: the module fn increments its own module global; the module getter reads it
+    a1<Int> = inc()
+    a2<Int> = inc()
+    a3<Int> = getcount()
+    println("A inc,inc,get: " + a1.to_string() + "," + a2.to_string() + "," + a3.to_string())
+    # B: main re-reads the module global via the getter after the incs
+    println("B get again: " + getcount().to_string())
+    # C: the module fn writes mval via setval; the module getter reads it
+    c1<Int> = setval(42)
+    c2<Int> = getval()
+    println("C set,get: " + c1.to_string() + "," + c2.to_string())
+    # D: the main-file fn increments the MAIN's module global; the main-file getter reads it
+    d1<Int> = bump()
+    d2<Int> = bump()
+    d3<Int> = getg()
+    println("D bump,bump,getg: " + d1.to_string() + "," + d2.to_string() + "," + d3.to_string())
+    # E: main assigns the MAIN's module global directly, then the getter reads it
+    gval = 99
+    println("E direct-assign then getg: " + getg().to_string())
+    # F: main assigns the IMPORTED module global, then the module getter reads it
+    mval = 77
+    println("F import-assign then getval: " + getval().to_string())
+    # G: the nested multi-line if-block assignment in the module fn
+    g1<Int> = inc2()
+    println("G inc2: " + g1.to_string())
+    # H: the nested one-liner if-block assignment
+    h1<Int> = inc3()
+    println("H inc3: " + h1.to_string())
+    # I: the nested while-block assignment
+    i1<Int> = inc4()
+    println("I inc4: " + i1.to_string())
+    # J: the final getter state
+    println("J final: " + getcount().to_string())
+    return 0
+}

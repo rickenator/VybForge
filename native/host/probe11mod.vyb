@@ -1,0 +1,49 @@
+# probe11 module: the module-global write semantics
+mcount<Int> = 0
+mval<Int> = 5
+
+share(all)
+inc()<Int> -> {
+    mcount = mcount + 1
+    return mcount
+}
+
+share(all)
+getcount()<Int> -> {
+    return mcount
+}
+
+share(all)
+setval(n<Int>)<Int> -> {
+    mval = n
+    return mval
+}
+
+share(all)
+getval()<Int> -> {
+    return mval
+}
+
+share(all)
+inc2()<Int> -> {
+    # the nested multi-line if-block assignment
+    if (1 == 1) {
+        mcount = mcount + 10
+    }
+    return mcount
+}
+
+share(all)
+inc3()<Int> -> {
+    # the nested one-liner if-block assignment
+    if (1 == 1) { mcount = mcount + 100 }
+    return mcount
+}
+
+share(all)
+inc4()<Int> -> {
+    # the nested while-block assignment
+    i2<Int> = 0
+    while (i2 < 2) { mcount = mcount + 1000; i2 = i2 + 1 }
+    return mcount
+}

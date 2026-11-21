@@ -3011,6 +3011,36 @@ or returned 0 off-book. REVERTED again (the engine at 73964c6). THE ENDPOINT
 STANDS AT ~3 MIN/REQUEST. The phase-1b's 84s stays until the compiler's
 module-global write semantics are characterized — the fix is mechanical once
 a setter (or a true global write) works.
+=================== THE PHASE-1B HOIST: THE STICKY-700 WALL (reverted again) ==================
+The third attempt: the hoist re-applied with the CORRECT flag placement (the
+probe11 characterization first: ALL the module-global write variants work —
+the fn-level, the nested if, the nested one-liner, the nested while — the
+second attempt's flag failure was ITS placement bug, not a semantic rule).
+THE BUILD'S STAGING WORKS (the P1bbuild 976 -> 38-42ms). THE EXPERT CRASH
+PERSISTS INDEPENDENTLY: the token-2's first expert: EXL3FAIL cuda1 rc=700
+x3 (dWg=dWu=dWd=0, the trellis lens all valid: 4194304/8192/4096/...).
+rc=700 = CUDA_ERROR_ILLEGAL_ADDRESS — the STICKY context poisoning: some
+async kernel committed an illegal access before the exl3_deq, and every
+subsequent CUDA call returns 700. THE BRACKETING: the checked syncs pin it
+EXACTLY between the token-2's healthy post-MLA sync (0) and its first expert
+deq (700): the only CUDA op in that window is the ROUTER's gemm
+(mm_host(h2, 1, H, d_gw, NE=288, fgemm)) — the ONLY non-128-multiple N in
+the whole pipeline. THE PAD ATTEMPT (N=288 -> 384, the staged deq padded to
+match, the routing bounded to NE): THE 700 PERSISTS — the padded gemm is
+provably in-bounds (the B 12.6MB, the C 3KB, the A 32KB), so either the
+kernel's N-tile handling has a deeper fault or the sticky error originates
+elsewhere and the sync-reporting model is wrong. THE mm_host's internal
+sync is UNCHECKED (the illegal accesses silently swallowed — the diagnostics
+added: the MMHOST mmdev-zero/dtoh-empty prints; they did NOT fire, meaning
+the gemm outputs copied fine and the error surfaced only at the next
+explicit sync). REVERTED to 73964c6 (the per-token deqs, 84s, WORKING).
+THE NEXT SESSION'S PATH: (a) a compute-sanitizer (or CUDA_LAUNCH_BLOCKING=1)
+run of the phase-1b to catch the illegal access AT ITS KERNEL — the env var
+alone may pin it; (b) or pad EVERY gemm N in the mtp path to the 128
+multiples and bisect; (c) or route the phase-1b's CUDA ops through a
+CUDA_LAUNCH_BLOCKING=1 serve run (the slow but pinpointing mode). The
+endpoint: ~3 min/request at 73964c6 — the phase-1b's 84s optimization stays
+blocked until the sticky-700 origin is found.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
