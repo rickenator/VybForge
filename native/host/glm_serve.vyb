@@ -667,6 +667,11 @@ main()<Int> -> {
                             secT = now_ms()
                             x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer row " + r.to_string()); return 41 }
+                            # the per-token sync: the token kernels and the next token's
+                            # deqs overlap without it (the intermittent sticky
+                            # CUDA_ERROR_ILLEGAL_ADDRESS rc=700 at the expert deqs).
+                            nsy<Int> = sync() as Int
+                            if (nsy != 0) { println("CHAIN_FAIL phase1b sync rc=" + nsy.to_string()); return 42 }
                         # the per-token sync: the staged handles persist across the
                         # tokens and the async kernels overlap without it (the
                         # sticky CUDA_ERROR_ILLEGAL_ADDRESS rc=700 race)

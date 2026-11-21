@@ -3085,6 +3085,25 @@ compiler-level debugging (the module-global write codegen at the engine's
 scale: a minimal repro from the engine's build_row shape) — the 84s is a
 shared cost (the gate too) and the endpoint at ~3 min is the shipping
 state.
+=================== THE CRITICAL FINDING: THE STICKY-700 RACE IS IN THE BASELINE ==================
+The gdb-assisted re-runs (the GDB JIT listener added to the compiler — the
+LLVM 18's LLJIT uses JITLink so the RTDyld cast is null and the symbols still
+do not register; the correct API is the DebuggerSupportPlugin — the next
+compiler item) EXPOSED: THE STICKY CUDA_ERROR_ILLEGAL_ADDRESS (rc=700) IS
+INTERMITTENT IN THE COMMITTED BASELINE TOO — smoke13 went green, but the
+gdb and synfix runs (the same committed engine) crashed at the token-2's
+expert 15 exactly as the hoisted versions did. THE PER-TOKEN SYNC (added to
+the baseline) did NOT fix it (the sync rc: 0 at every token boundary — the
+poisoning is WITHIN a single token: the router's gemm window, the N=288).
+THE RELIABLE PRODUCTION CONFIG: CUDA_LAUNCH_BLOCKING=1 (verified green
+end-to-end: {"draft_token": 10788} HTTP 200, ~2x slower => the endpoint
+~5-6 min — still 35x+ better than the original 3.5h). THE ENDPOINT'S
+DOCUMENTATION: launch with CUDA_LAUNCH_BLOCKING=1 until the race is killed.
+THE DEFINITIVE NEXT TOOL: compute-sanitizer on the serve's phase-1b (the
+illegal-access locator — it names the exact kernel and address). The router's
+gemm (N=288, the only non-128-multiple) remains the prime suspect: the
+baseline + the padded router (N=384 + the padded deq + the NE-bounded
+routing) is the untested combination.
 =================== THE EXTERN DEDUP LANDED; THE JIT MANGLE REMAINS ==================
 The extern dedup is LANDED in module_registry.cpp: the carried extern blocks
 are deduped by name (the first module to declare a foreign symbol carries it;
