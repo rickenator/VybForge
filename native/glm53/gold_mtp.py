@@ -198,6 +198,8 @@ def main():
     ik_cache = np.zeros((0, INDEX_DIM))
     gsc_cache = np.zeros((0, INDEX_DIM))
     x_out = np.zeros((nrows, H))
+    X1_ALL = np.zeros((nrows, H))
+    Y_ALL = np.zeros((nrows, H))
     route_sel = []
     for r in range(nrows):
         hin = hin_g[r:r + 1]
@@ -244,6 +246,8 @@ def main():
                                                    ew["down_proj"])
             del ew
         y += moe_ref.ffn(h2, *shared)
+        X1_ALL[r] = x1[0]
+        Y_ALL[r] = y
         x_out[r] = (x1 + y)[0]
         print(f"  row {r} token={row_tids[r]} cache_rows={n} n_sel={len(sel)} "
               f"route={route_sel[-1]}", flush=True)
@@ -256,6 +260,8 @@ def main():
 
     np.save(f"{OUT}/gold_mtp_hin.npy", hin_g)
     np.save(f"{OUT}/gold_mtp_x.npy", x_out)
+    np.save(f"{OUT}/gold_mtp_x1.npy", X1_ALL)
+    np.save(f"{OUT}/gold_mtp_y.npy", Y_ALL)
     np.save(f"{OUT}/gold_mtp_hidden.npy", x_out[-1])
     np.save(f"{OUT}/gold_mtp_logits.npy", logits)
     meta = {"nrows": nrows, "nsteps": nsteps, "row_tids": row_tids,

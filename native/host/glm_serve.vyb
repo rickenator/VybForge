@@ -854,7 +854,12 @@ main()<Int> -> {
                             # GxLoc paths did not survive the surrounding String churn)
                             wantL<Vec<String>> = Vec()
                             streams1<Vec<Float>> = Vec()
-                            streams2<Vec<Float>> = Vec()
+                            # NOTE: streams2 is intentionally NOT re-declared here. Declaring
+                            # it shadows the main-level variable, so the layer assignments
+                            # below would write the shadow while the MTP block (a sibling
+                            # scope) reads the stale main-level phase-1 value — the root
+                            # cause of the DECODE_MTP red (the steps built their rows from
+                            # the phase-1 trunk state instead of their own layer-44 output).
                             attn<Vec<Float>> = Vec()
                             mlp<Vec<Float>> = Vec()
                             if (is_dsa == 1) {
@@ -1916,7 +1921,7 @@ main()<Int> -> {
                             hin = mtp_build_row(tvec, raw_e, tab, dir, total, fgemm, fbf)
                             if (hin.len() != sv_H) { println("CHAIN_FAIL mtp build step " + t.to_string()); return 42 }
                             lines = lines + dumps("mtphin" + mrow.to_string(), hin) + "\n"
-                            mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                            x2 = mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer step " + t.to_string()); return 43 }
                             lines = lines + dumps("mtpx" + mrow.to_string(), x2) + "\n"
                             println("mtp step" + t.to_string() + " done")
@@ -1974,7 +1979,7 @@ main()<Int> -> {
                                     }
                                     cbase = cbase + cn
                                 }
-                                md<Int> = dump_to("mtplogits" + t.to_string(), logv)
+                                lines = lines + dumps("mtplogits" + t.to_string(), logv) + "\n"
                                 println("MTP draft token: " + cbesti.to_string() + " (logit " + cbestv.to_string() + ")")
                             }
                         }

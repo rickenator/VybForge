@@ -3576,3 +3576,33 @@ QUESTION: is the driver's 10788 wrong (the semantics drifted) or the
 oracle's 576 (the stale gold)? The next session: run gold_mtp.py fresh,
 diff the logits per element, and pin which side moved. DO NOT trust the
 endpoint's draft token until this gate is green.
+=================== THE DECODE_MTP RED: ROOT-CAUSED AND GREEN ==================
+*** THE DRAFT TOKEN CHANGED: 10788 -> 576 (the oracle's value). The endpoint's
+headline output was WRONG; it is now oracle-verified. Three stacked stale-scope
+bugs, all the nested-block shadow/stale-handle class, introduced across the
+engine split and the serve refactor:
+1. THE STEP TRUNKS: the phase-2's layer walk re-declared streams2<Vec<Float>>
+   (glm_serve.vyb ~857), shadowing the main-level variable; the MTP block (the
+   sibling scope) read the STALE main-level phase-1 trunk for the decode steps'
+   rows. The shadowing declaration removed; the steps now build their rows from
+   their own layer-44 output. GATE A: 6.7 -> 2.8e-12.
+2. THE STEP X2: the serve's step loop called mtp_layer_step WITHOUT assigning
+   the result; the final head ran on the stale phase-1b row-19 hidden. Fixed:
+   x2 = mtp_layer_step(...). This alone flipped the draft 10788 -> 576.
+3. THE MTPLOGITS DUMP: the serve dumped the final logits via dump_to (which
+   lands in VYBFORGE_PREFILL_OUT/prefill_vyb.txt), so decchain_vyb.txt's
+   mtplogits lines were STALE leftovers — the DECODE_MTP gate C compared the
+   fresh gold against a frozen logit array (13.9 diff, unchanging across runs —
+   the tell). Fixed: dumps() into the lines the verify reads.
+Also: gold_mtp.py now saves gold_mtp_x1.npy/gold_mtp_y.npy (the per-row
+attention-residual and MoE outputs) — the decomposition that proved the
+mtp_layer_step's attention AND MoE match the oracle for ALL rows including the
+decode steps (~1e-9 attn, ~1e-3 MoE = the EXL3 fp16 noise class).
+FINAL GATE STATE: DECODE_MTP_MATCH OK (A 2.8e-12, B 3.1e-3 abs / 1.2e-4
+row-scale vs tol 2e-4, C 9.7e-4 vs tol 1e-2, draft driver 576 == oracle 576);
+DECODE_CHAIN_MATCH OK (the trunk's f64 next token 10788 — a different question
+from the MTP draft; both verified); the 45-layer digest lines bit-identical to
+the hoist7 reference. NOTE: the DECODE_CHAIN gate's reference is the CURRENT
+prefill driver's dumps, and nothing anchors today's runs to the d85808a era —
+the step-layer digests were verified bit-identical against the Nov-19
+decchain_engine.log, which is the deepest anchor that exists.
