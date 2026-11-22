@@ -4078,3 +4078,11 @@ LESSON (bit-exactness is a three-layer property): format, parse, AND compute mus
 The compute layer was already bit-identical across the two GB10s; the wire was not.
 NEXT: increment 3 — the full layer (attention + this MoE) with rank 1 running the tail, then
 TP2_VYB_MATCH against the single-node P4 layer numerics; experts per rank scale to 144 each.
+
+=== COMPETITIVE BAR (Rick, standing): vLLM runs this same model at ~45-50 tps on the TensorFold rig ===
+The Vyb/TensorFold path MUST BEAT ~50 tok/s decode on the same model or the port has no purpose.
+That is 20-22 ms/token end to end, i.e. the whole 45-layer forward at 20 ms — every layer
+(attention + MoE dequant + routed experts) must average under ~440 us. For scale: the current
+single-node Vyb serve measures its decode step in SECONDS (35 s deq + gemm at the last profile),
+so the gap is ~100x and the work is architectural (streaming/fusion/parallelism), not tuning.
+Track every future timing against this number and state it plainly: ms/token vs the 20 ms bar.
