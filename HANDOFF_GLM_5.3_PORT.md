@@ -4301,3 +4301,21 @@ HOW TO FINISH THIS (a focused kernel session, ~2-3 h, no new concept needed):
   3. then scale to the 8-expert FFN and re-measure.
 STATUS OF THE PROGRAM: the fused path is NOT production-usable yet. The GREEN deliverables stand
 unchanged: two-node correctness (increments 1-3), the tab-cache 37x, the buffer-cache 16%.
+=== ROUND 27: THE DECODE IS PROVEN BIT-IDENTICAL — the bug is in the dots or yhat ===
+Built exl3dqdbg1s4 = the VERIFIED deq kernel's phase 1 (verbatim nibble/slot walk, the exact
+fp16_to_f64 copied from exl3dq.vyb) writing the raw decode to T[input 4096][output 2048], plus a
+dump path in exl3mv1s4 and a GPU compare kernel (cmp32: count of |diff|>1e-4 + sum |diff|).
+RESULT over all 8,388,608 elements:
+    DECODE_DIFF count_over_1e-4=0   sum_absdiff=0
+So exl3mv1s4's slab/decode is BIT-IDENTICAL to the green kernel's. Combined with round 25 (xhat ==
+su.H.x to f32) and round 24 (layout = W^T), everything is verified EXCEPT:
+  (a) exl3mv1s4's phase 2 (the down-column dots + shared reduction + atomics), and
+  (b) exl3yhat (the H_out output transform).
+TOOLING SNAG (blocks the next test): a reference matvec kernel (refmatvec) ptxas-validates
+("Validated by ptxas (sm_86)") and its .entry IS present in the deployed PTX, yet cuModuleGetFunction
+returns 0 for it while cmp32/f32t64 from the SAME module resolve fine. Renaming did not help.
+Suspects: the JIT refusing that specific function under sm_121, or load_fn's module being cached
+across loads in-process (it calls cuModuleLoadData per call, so a fresh module each time).
+NEXT: either (i) inline the reference matvec INTO the fused kernel behind a param switch (avoids
+the load path entirely), or (ii) investigate the load_fn failure — it is a real tooling defect
+worth understanding since every probe depends on it.

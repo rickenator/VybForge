@@ -165,19 +165,22 @@ exl3mv1s4(p<Int>) -> {
             acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + (inbase + j) * 4)
             j = j + 1
         }
-        # sv scales the OUTPUT column; su was folded into xp by exl3xhat
+        # NOTE: sv must NOT be applied here. y = sv . (H u): the scale and the
+        # Hadamard act on the SAME output axis and do not commute, so sv belongs
+        # AFTER exl3yhat (applying it here gave a self-consistent but wrong
+        # result: yraw matched a reference that made the same mistake).
         cb<Int> = nb128 * 128 + d
-        sv<Float32> = ld_f16(SU + cb * 2) as Float32
-        if (cb < cw) { atomic_add_f32(T + cb * 4, acc * sv) }
+        if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
     }
 }
 
-// p: +0 yraw(f32, cw), +8 y(f32), +16 H(f32 128x128), +24 cw
+// p: +0 yraw(f32, cw), +8 y(f32), +16 H(f32 128x128), +24 cw, +32 sv(f16, cw)
 exl3yhat(p<Int>) -> {
     YR<Int> = ld_i64(p + 0)
     Y<Int> = ld_i64(p + 8)
     H<Int> = ld_i64(p + 16)
     cw<Int> = ld_i64(p + 24)
+    SV<Int> = ld_i64(p + 32)
     nb<Int> = blk_x()
     a<Int> = tid_x()
     base<Int> = nb * 128
@@ -188,6 +191,55 @@ exl3yhat(p<Int>) -> {
             acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_f32n(YR + (base + b) * 4)
             b = b + 1
         }
-        st_f64(Y + (base + a) * 8, acc)
+        svy<Float32> = ld_f16(SV + (base + a) * 2) as Float32
+        st_f64(Y + (base + a) * 8, acc * svy)
+    }
+}
+
+// exl3refu — the plainest reference matvec over the raw decode T:
+//   u[n] = sv[n] * sum_{k < nin} T[k][n] * xp[k]
+// Lives in THIS module deliberately: dbg_sh.ptx validated a kernel with the same
+// body but cuModuleGetFunction refused it while siblings resolved, and every
+// diagnostic depends on the load path. One thread per output, no tiling.
+// p: +0 T(f32 [nin][cw]), +8 xp(f32 nin), +16 cw, +24 nin, +32 out(f32), +40 sv(f16)
+exl3refu(p<Int>) -> {
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    cw<Int> = ld_i64(p + 16)
+    nin<Int> = ld_i64(p + 24)
+    O<Int> = ld_i64(p + 32)
+    SV<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < cw) {
+        acc<Float32> = 0.0
+        k<Int> = 0
+        while (k < nin) {
+            acc = acc + ld_f32n(T + (k * cw + gid) * 4) * ld_f32n(X + k * 4)
+            k = k + 1
+        }
+        svv<Float32> = ld_f16(SV + gid * 2) as Float32
+        st_f32(O + gid * 4, acc * svv)
+    }
+}
+
+// exl3refy — the plainest reference output transform:
+//   y[n] = sum_{m in the 128-block of n} H[n%128][m%128] * u[m]
+// p: +0 H(f32 128x128), +8 u(f32), +16 y(f32), +24 cw
+exl3refy(p<Int>) -> {
+    H<Int> = ld_i64(p + 0)
+    U<Int> = ld_i64(p + 8)
+    Y<Int> = ld_i64(p + 16)
+    cw<Int> = ld_i64(p + 24)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < cw) {
+        a<Int> = gid % 128
+        base<Int> = gid - a
+        acc<Float32> = 0.0
+        m<Int> = 0
+        while (m < 128) {
+            acc = acc + ld_f32n(H + (a * 128 + m) * 4) * ld_f32n(U + (base + m) * 4)
+            m = m + 1
+        }
+        st_f32(Y + gid * 4, acc)
     }
 }

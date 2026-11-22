@@ -293,9 +293,101 @@ main()<Int> -> {
         cv2<Vec<Float>> = bulk_dtoh(cnt, 1)
         sv2<Vec<Float>> = bulk_dtoh(sm, 1)
         println("P6T DECODE_DIFF count_over_1e-4=" + (cv2.get(0) as Int).to_string() + " sum_absdiff=" + sv2.get(0).to_string_precise())
+        // ---- HOST-SIDE reference (no kernel loads at all) ----
+        if ((env_get("P6_HC") else "0") == "1") {
+            fcv<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+            th<Int> = time_mono_millis()
+            t64<Int> = dev_alloc(67108864)
+            pbcv<Int> = dev_alloc(24)
+            wr_pdev(pbcv, 0, bTe)
+            wr_pdev(pbcv, 8, t64)
+            wr_pdev(pbcv, 16, 8388608)
+            launch_kernel(fcv, 32768, pbcv)
+            cuCtxSynchronize()
+            T64<Vec<Float>> = bulk_dtoh(t64, 8388608)
+            println("P6HC T cast+copy ms=" + (time_mono_millis() - th).to_string() + " n=" + T64.len().to_string())
+            // xp (4096 f32 -> f64)
+            xp64<Int> = dev_alloc(32768)
+            wr_pdev(pbcv, 0, bxp)
+            wr_pdev(pbcv, 8, xp64)
+            wr_pdev(pbcv, 16, 4096)
+            launch_kernel(fcv, 16, pbcv)
+            cuCtxSynchronize()
+            XP64<Vec<Float>> = bulk_dtoh(xp64, 4096)
+            // sv from the host string g2 (f16, one per output column)
+            // the fused yraw (2048 f32)
+            yr64<Int> = dev_alloc(16384)
+            wr_pdev(pbcv, 0, byr)
+            wr_pdev(pbcv, 8, yr64)
+            wr_pdev(pbcv, 16, 2048)
+            launch_kernel(fcv, 1, pbcv)
+            cuCtxSynchronize()
+            YR64<Vec<Float>> = bulk_dtoh(yr64, 2048)
+            // H to the host as f64 (16384 values)
+            h64<Int> = dev_alloc(131072)
+            wr_pdev(pbcv, 0, hd_pre32)
+            wr_pdev(pbcv, 8, h64)
+            wr_pdev(pbcv, 16, 16384)
+            launch_kernel(fcv, 64, pbcv)
+            cuCtxSynchronize()
+            H64<Vec<Float>> = bulk_dtoh(h64, 16384)
+            U<Vec<Float>> = Vec()
+            // reference u
+            th = time_mono_millis()
+            ndh<Int> = 0
+            nsum<Float> = 0.0
+            n2<Int> = 0
+            while (n2 < 2048) {
+                acc<Float> = 0.0
+                k2<Int> = 0
+                while (k2 < 4096) {
+                    acc = acc + T64.get(k2 * 2048 + n2) * XP64.get(k2)
+                    k2 = k2 + 1
+                }
+                svv<Float> = f16_host(g2, n2)
+                u<Float> = acc * svv
+                U.push(u)
+                dd<Float> = u - YR64.get(n2)
+                ad<Float> = dd
+                if (ad < 0.0) { ad = 0.0 - ad }
+                if (ad > 1e-4) { ndh = ndh + 1 }
+                nsum = nsum + ad
+                n2 = n2 + 1
+            }
+            println("P6HC U_DIFF count_over_1e-4=" + ndh.to_string() + " sum_absdiff=" + nsum.to_string_precise() + " ms=" + (time_mono_millis() - th).to_string())
+            // the fused y (by) for the same input
+            y64<Int> = dev_alloc(16384)
+            wr_pdev(pbcv, 0, by)
+            wr_pdev(pbcv, 8, y64)
+            wr_pdev(pbcv, 16, 2048)
+            launch_kernel(fcv, 1, pbcv)
+            cuCtxSynchronize()
+            Y64<Vec<Float>> = bulk_dtoh(y64, 2048)
+            ndy<Int> = 0
+            nsy<Float> = 0.0
+            n3<Int> = 0
+            while (n3 < 2048) {
+                a3<Int> = n3 % 128
+                b3<Int> = n3 - a3
+                acc3<Float> = 0.0
+                m3<Int> = 0
+                while (m3 < 128) {
+                    acc3 = acc3 + H64.get(a3 * 128 + m3) * U.get(b3 + m3)
+                    m3 = m3 + 1
+                }
+                dd3<Float> = acc3 - Y64.get(n3)
+                ad3<Float> = dd3
+                if (ad3 < 0.0) { ad3 = 0.0 - ad3 }
+                if (ad3 > 1e-4) { ndy = ndy + 1 }
+                nsy = nsy + ad3
+                n3 = n3 + 1
+            }
+            println("P6HC Y_DIFF count_over_1e-4=" + ndy.to_string() + " sum_absdiff=" + nsy.to_string_precise())
+            return 0
+        }
         // ---- the dot: reference yraw from the PROVEN T, vs the fused yraw ----
-        fru<Int> = load_fn("native/build/dbg_sh.ptx", "refmatvec")
-        fry<Int> = 1
+        fru<Int> = load_fn("native/build/exl3mv.ptx", "exl3refu")
+        fry<Int> = load_fn("native/build/exl3mv.ptx", "exl3refy")
         println("P6T loads refu=" + fru.to_string() + " refy=" + fry.to_string())
         if (fru == 0) { println("P6_FAIL refu"); return 2 }
         bUref<Int> = dev_alloc(8192)
@@ -318,6 +410,26 @@ main()<Int> -> {
         cv3<Vec<Float>> = bulk_dtoh(cnt, 1)
         sv3<Vec<Float>> = bulk_dtoh(sm, 1)
         println("P6T DOT_DIFF count_over_1e-4=" + (cv3.get(0) as Int).to_string() + " sum_absdiff=" + sv3.get(0).to_string_precise())
+        // ---- yhat vs the plain reference output transform (on the reference u) ----
+        bYref<Int> = dev_alloc(8192)
+        pbyr<Int> = dev_alloc(32)
+        wr_pdev(pbyr, 0, hd_pre32)
+        wr_pdev(pbyr, 8, bUref)
+        wr_pdev(pbyr, 16, bYref)
+        wr_pdev(pbyr, 24, 2048)
+        launch_kernel(fry, 8, pbyr)
+        cuCtxSynchronize()
+        wr_pdev(pbcmp, 0, bYref)
+        wr_pdev(pbcmp, 8, by)
+        wr_pdev(pbcmp, 16, 2048)
+        wr_pdev(cnt, 0, 0)
+        wr_pdev(sm, 0, 0)
+        launch_kernel(fcm, 1, pbcmp)
+        cuCtxSynchronize()
+        cv4<Vec<Float>> = bulk_dtoh(cnt, 1)
+        sv4<Vec<Float>> = bulk_dtoh(sm, 1)
+        println("P6T YHAT_DIFF count_over_1e-4=" + (cv4.get(0) as Int).to_string() + " sum_absdiff=" + sv4.get(0).to_string_precise())
+        // and the reference y against the verified B row (x-dependent)
         return 0
     }
     rcx<Int> = launch_kernel(fxh, 32, pbx)
@@ -408,6 +520,27 @@ main()<Int> -> {
     }
     if (rel <= 1e-5) { println("P6R5_DONE FUSED_OK") } else { println("P6R5_DONE FUSED_FAIL") }
     return 0
+}
+
+f16_host(s<String>, i<Int>)<Float> -> {
+    // f16 at byte offset i*2, little-endian, normal values only (scales)
+    b0<Int> = (s.char_at(i * 2) as Int) & 255
+    b1<Int> = (s.char_at(i * 2 + 1) as Int) & 255
+    u<Int> = b0 + b1 * 256
+    sgn<Int> = (u >> 15) & 1
+    e<Int> = (u >> 10) & 31
+    m<Int> = u & 1023
+    v<Float> = 0.0
+    if (e == 0) {
+        v = (m as Float) * 5.960464477539063e-08
+    } else {
+        v = 1.0 + (m as Float) / 1024.0
+        k<Int> = 0
+        while (k < e - 15) { v = v * 2.0 ; k = k + 1 }
+        while (k < 15 - e) { v = v * 0.5 ; k = k + 1 }
+    }
+    if (sgn == 1) { return 0.0 - v }
+    return v
 }
 
 zero_bytes(n<Int>)<String> -> {
