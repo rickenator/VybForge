@@ -4250,3 +4250,18 @@ difference identifies the stride. Do that BEFORE touching any transform code aga
 have now been spent assuming a layout.
 LESSON: for a re-associated kernel the FIRST gate must be an index-to-index identity (one-hot),
 not an aggregate. Every aggregate metric hid a layout error behind cancellation.
+=== ROUND 24: LAYOUT PINNED — B IS W^T ([input 4096][output 2048], stride 2048) ===
+Index-identity probe (x = e_i via the mm path, buffer elements dumped directly):
+    y(e0)_0 = -0.01945076 == B[0]        y(e0)_1 = 0.01580474 == B[1]
+    y(e1)_0 =  0.01615867 == B[2048]     (B[2048] = the next INPUT's output 0)
+So B[k][n] with k = input (stride 2048), n = output. The old path is correct and consistent.
+THE ROUND-23 "CONTRADICTION" WAS MY BUG: the one-shot x built x[0] from the ramp (-0.5) instead of
+1.0, and 0.00973 = -0.5 x -0.01945 exactly. Lesson recorded: check the test vector itself.
+FUSED STATE with the confirmed layout: the structure (xp = su.(H_in x); u = down-column dots over
+the tile; y = H_out u per 128 output block; sv on u) is the algebraically correct chain. Measured
+against the same one-hot: fused y0 = -0.00294 vs true 0.00973 (ratio -0.302) — still wrong, so an
+implementation detail remains (candidates: an H applied on the wrong axis in xhat/yhat, a scale
+applied twice, or the slab row/col mapping in phase 2).
+NEXT (one run): with x = e_0 and a single input tile, dump (a) xp[0..3] and (b) the 8x128 slab
+values for CTA 0, and compare xp against a host-computed H_in x with su — the vector pass is
+checkable exactly, which splits "vector passes wrong" from "tile/decode wrong" for good.
