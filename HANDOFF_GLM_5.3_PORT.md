@@ -4086,3 +4086,18 @@ That is 20-22 ms/token end to end, i.e. the whole 45-layer forward at 20 ms — 
 single-node Vyb serve measures its decode step in SECONDS (35 s deq + gemm at the last profile),
 so the gap is ~100x and the work is architectural (streaming/fusion/parallelism), not tuning.
 Track every future timing against this number and state it plainly: ms/token vs the 20 ms bar.
+=== ROUND 15: P6 INCREMENT 3 GREEN — REAL ROUTER, LANE-SPLIT MoE TAIL, BIT-EXACT ===
+The engine's own routing rules (moe_tail_step): logits = x @ gate.weight^T (288 experts, bf16),
+sigma, selection score = sigma + e_score_correction_bias, greedy top-8, weight = sigma/sum x 2.5.
+Both nodes compute the router (cheap, ~0.3 s) and agree exactly: picks 153 130 115 182 | 156 184
+14 195. THE SPLIT IS BY RANKING LANE (0..3 rank 0, 4..7 rank 1), not by expert id range — the picks
+are spread over all 288, so any static range split would be load-imbalanced and shard-hostile.
+Each rank deqs its 4 lane experts, folds weighted, ships 88,436 B exact text; rank 0 adds, adds the
+bf16 shared expert, gates vs local recompute of all 8 lanes: ndiff=0 max_abs=0 BIT-EXACT. MIX digest
+-1.0366555427207755. NOTE the 179,535 ms total in that run is WALL TIME INCLUDING a manual ~3 min
+gap before rank 1 was launched — NOT a benchmark number. Real timing needs a synchronized launch.
+STORAGE: rank 1 now holds shards 3+4+5 (layer 3's gate/bias/shared + the lane experts live across
+them). Righty 385 GB free.
+NEXT (throughput, against the 45-50 tok/s vLLM bar): synchronized-launch timing of this split; then
+fold the split into moe_tail_step itself (env-gated expert-lane range + the exchange at the end of
+the tail) so the SERVE runs it; then attention across nodes.
