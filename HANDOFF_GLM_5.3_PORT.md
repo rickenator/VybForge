@@ -4022,3 +4022,16 @@ blocks allocate (godzilla's identical sources + binary resolve it). Note the GB1
 symbol-mangling discrepancy on the rebuilt Spark toolchain, not a GPU or kernel issue.
 Suspects: the pulled cuda_binding/tensor stdlib vs godzilla's, the extern-decl visibility path
 when both tensor and glm_engine are imported together, or a build flag difference in build2.
+--- LEFTEE JIT SYMBOL BLOCKER: EVIDENCE SO FAR ---
+Minimal repro (imports tensor + a local `extern "C" { cuMemAlloc_v2 }`, one freedom alloc) RUNS
+ON BOTH NODES ("MIN_OK") — so libcuda resolution and plain freedom FFI are fine on lefty.
+The failing unit is specifically glm_engine's compile unit on lefty's build2 binary:
+"Symbols not found: [ __pv_<hash>_cuMemAlloc_v2 ]" at MODULE LOAD. The <hash> is a mangling id
+that differs from the plain symbol the runtime exports. godzilla's build-release binary resolves
+the SAME unit fine. So it is a binary-level difference between the two builds of the same commit,
+most likely the JIT symbol-registration/dlopen hook or a build flag (both "0.7.7 Release" but
+different cmake caches: godzilla's build-release cache vs lefty's build2). NEXT STEP: diff the two
+cmake caches for VYB_* flags, and compare `nm -D vyb | grep -c cuda` / a tiny --dump of the
+registered runtime symbols; if the flag diff is found, rebuild lefty identically.
+WORKAROUND if needed: allocate only through tensor's dev_alloc (proven on lefty) — the engine's
+~20 direct cuMemAlloc sites would need routing through it.
