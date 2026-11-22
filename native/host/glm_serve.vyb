@@ -1822,11 +1822,11 @@ main()<Int> -> {
                                         d_fnF = deq_bf16(fbf, g_lg_20, 24 * sv_HC * sv_H, sv_HC * sv_H)
                                         if (d_fnF == 0) { return 18 }
                                         g_lg_12 = gx_read(lg, 12)
-                                        d_gate = deq_bf16(fbf, g_lg_12, sv_H * sv_INTER, sv_H)
+                                        d_gate = deq_bf16f(fbf32, g_lg_12, sv_H * sv_INTER, sv_H)
                                         g_lg_13 = gx_read(lg, 13)
-                                        d_up = deq_bf16(fbf, g_lg_13, sv_H * sv_INTER, sv_H)
+                                        d_up = deq_bf16f(fbf32, g_lg_13, sv_H * sv_INTER, sv_H)
                                         g_lg_14 = gx_read(lg, 14)
-                                        d_down = deq_bf16(fbf, g_lg_14, sv_INTER * sv_H, sv_INTER)
+                                        d_down = deq_bf16f(fbf32, g_lg_14, sv_INTER * sv_H, sv_INTER)
                                         if (d_gate == 0 || d_up == 0 || d_down == 0) { return 19 }
                                         dcacheF.set(n, d_fnF)
                                         dcacheG.set(n, d_gate)
@@ -1865,15 +1865,15 @@ main()<Int> -> {
                                     while (i < sv_R * sv_HC * sv_HC) { comb2.push(res2.get(sv_R * sv_H + sv_R * sv_HC + i)); i = i + 1 }
                                     h2<Vec<Float>> = rms_rows(borrow(collapsed2), sv_R, sv_H, post_ln3)
 
-                                    mg<Vec<Float>> = mm_host(h2, sv_R, sv_H, d_gate, sv_INTER, fgemm)
-                                    mu<Vec<Float>> = mm_host(h2, sv_R, sv_H, d_up, sv_INTER, fgemm)
+                                    mg<Vec<Float>> = mm_host32(h2, sv_R, sv_H, d_gate, sv_INTER, fcast32, fgp, fgr, pb32)
+                                    mu<Vec<Float>> = mm_host32(h2, sv_R, sv_H, d_up, sv_INTER, fcast32, fgp, fgr, pb32)
                                     act<Vec<Float>> = Vec()
                                     i = 0
                                     while (i < mg.len()) {
                                         act.push(silu(mg.get(i)) * mu.get(i))
                                         i = i + 1
                                     }
-                                    mlp = mm_host(act, sv_R, sv_INTER, d_down, sv_H, fgemm)
+                                    mlp = mm_host32(act, sv_R, sv_INTER, d_down, sv_H, fcast32, fgp, fgr, pb32)
                                     streams2 = hc_apply(streams1, mlp, post2, comb2)
                                 } else {
                                     # ---- MoE tail (tail_site's body, sv_R = 1)
