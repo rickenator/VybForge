@@ -3818,3 +3818,14 @@ Perf of this increment alone: mm 7248 -> ~6768 ms (-0.5s), deq ~flat — it is t
 plumbing enabler. Increments 2+: gate/up on f32 (needs the 4-byte DtoH binding question answered
 for the host silu inputs), stageS (the attention staging halves), the dense branch, moe_tail_step,
 then the full-pipeline f32 for the 24GB Flash play. Plan: skill references/f32-output-path.md.
+=================== ROUND 7b: THE F32 OUTPUT PATH — INCREMENT 2 (973e4f6) ==================
+The phase-1 experts' gate/up projections joined the down-proj on the f32 split-K gemm (all three
+expert deqs exl3_deq32f, all three mms mm_host32). No DtoH32 binding work needed: gemm32_r stores
+f64, so the host silu path is untouched — the earlier "4-byte DtoH gap" concern applied only to a
+hypothetical f32 gemm OUTPUT, which the split-K triple does not produce.
+GATES: DECODE_MTP x2 IDENTICAL GREEN (gate A 2.983e-6 vs tol 1e-5 — the band absorbed all three
+gemms; gate B 1.203e-4 unchanged; draft 576 = oracle); digests 2944b0612cc7 x2.
+PERF: mm 6761 -> 3389/3363 ms (-3.4s vs increment 1, -3.9s vs the f64 baseline), deq 37408 ->
+35139/34878 (-2.3s). Cumulative f32 win: -5.7s/request. NEXT: stageS (the attention staging, the
+biggest remaining f32 win — the deq_bf16 f32-output variant halves the dtoh/htod round trips),
+then the dense branch, moe_tail_step, the inline loop, and the full-pipeline f32 for 24GB Flash.
