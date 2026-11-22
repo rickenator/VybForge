@@ -4233,3 +4233,20 @@ of {su into xp, sv into yraw, H axes, W^T layout} becomes individually checkable
 KERNEL FACTS WORTH KEEPING: constant shared offsets get scalarised (never use them for a slab);
 the PTX -1024 fold is base selection, not a bias; the tile slab can be REUSED for a reduction only
 after a barrier that follows the last tile read.
+=== ROUND 23: ONE-HOT GATE — THE LAYOUT ASSUMPTION IS WRONG, AND THE OLD PATH SAYS SO ===
+With x = e_0 the arithmetic must collapse to y[i] = W[i][0] = B[i][0] for ANY reasonable B layout
+(y[n] = sum_k A[k] B[..] with A = e_0 keeps exactly one term). Measured:
+    old_y0  =  0.00972538
+    Wcol0_0 = -0.01945076   (first f32 of the deq buffer)
+These DISAGREE, so neither the "B = W (out x in)" nor the "B = W^T (in x out)" model explains the
+buffer: the one-hot value is not B[0][0] under either. Something in the low-level contract
+(gemm32's B interpretation, the cast32 A-padding, or the deq's store order) is still unmodelled —
+this is now a LAYOUT question, not a transform question.
+STATE: fused path y0 = -0.00294 vs old 0.00973 (one-hot) — same scale, both wrong vs the raw
+buffer. mv kernel 2 ms; stage 15 ms on first touch.
+NEXT PROBE (one run, definitive): dump B[0], B[1], B[2048], B[4096] and y0, y1 with x = e_0 and
+x = e_1. Whichever buffer index equals y0 identifies the true element order; whichever equals the
+difference identifies the stride. Do that BEFORE touching any transform code again — two rounds
+have now been spent assuming a layout.
+LESSON: for a re-associated kernel the FIRST gate must be an index-to-index identity (one-hot),
+not an aggregate. Every aggregate metric hid a layout error behind cancellation.
