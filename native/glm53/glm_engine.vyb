@@ -340,6 +340,45 @@ deq_bf16f(faddr32<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     return outf
 }
 
+// mapdev_build — the serve's map setup, exported for drivers: allocates the
+// 8 KB map buffer, copies the map.bin bytes, and runs exl3inv to build the
+// inverse map at mapdev + 16 + nbody. Returns the mapdev handle (0 on failure)
+// -- the caller computes invbase = mapdev + 16 + (mapd.len() - 16).
+share(all)
+mapdev_build(finvk<Int>, mapd<String>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        md<Int> = 0
+        if (cuMemAlloc_v2(loc(md), 8192) == 0) {
+            if (cuMemcpyHtoD_v2(md, mapd, mapd.len()) == 0) {
+                nb<Int> = mapd.len() - 16
+                hp<Int> = 0
+                if (cuMemAlloc_v2(loc(hp), 64) == 0) {
+                    cuMemcpyHtoD_v2(hp + 0, loc(md), 8)
+                    cuMemcpyHtoD_v2(hp + 8, loc(nb), 8)
+                    lrc<Int> = cuda_launch4i(from<loc<CVoid>>(finvk), 1, 1, 1, 256, 1, 1, hp, 0, 0, 0) as Int
+                    srl<Int> = cuCtxSynchronize() as Int
+                    if (lrc == 0 && srl == 0) { out = md }
+                    cuMemFree_v2(hp)
+                }
+            }
+            if (out == 0) { cuMemFree_v2(md) }
+        }
+    }
+    return out
+}
+
+// launch_kernel — a single-params-buffer launch for callers outside the engine
+// (the engine's own sites inline cuda_launch4i; the FFI decl is file-private).
+share(all)
+launch_kernel(faddr<Int>, grid<Int>, pb<Int>)<Int> -> {
+    freedom {
+        rc<Int> = cuda_launch4i(from<loc<CVoid>>(faddr), grid, 1, 1, 256, 1, 1, pb, 0, 0, 0) as Int
+        return rc
+    }
+    return 1
+}
+
 share(all)
 load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
     ptx<String> = ""
