@@ -4101,3 +4101,20 @@ them). Righty 385 GB free.
 NEXT (throughput, against the 45-50 tok/s vLLM bar): synchronized-launch timing of this split; then
 fold the split into moe_tail_step itself (env-gated expert-lane range + the exchange at the end of
 the tail) so the SERVE runs it; then attention across nodes.
+=== ROUND 16: SYNCHRONIZED TWO-NODE TIMING (first honest numbers vs the 45-50 tok/s bar) ===
+Layer-3 MoE tail, 8 routed experts + bf16 shared, real router, synchronized launch:
+  solo one node   : 7,036 ms (6,317 experts + 719 shared)
+  two-node rank 0 : 3,453 ms own 4 experts; +755 ms shared (serial) = 4,208; peer 88 KB at 6,147
+  gate reference  : +2,971 ms (4 more experts, gate-only, not part of a served step)
+Expert compute scales 1.8x (6.3 -> 3.5 s). WALL is 6.1 s only because rank 1 JIT-compiles at
+launch (~2 s, once per process, not per step) -> steady-state ~4.3 s vs 7.0 s solo (1.6x).
+THE BAR: 45-50 tok/s = 20-22 ms/token for the ENTIRE 45-layer forward. One layer's MoE tail at
+4.3 s is ~4,000x off. The fabric is NOT the problem (88 KB in ms). ~860 ms/expert is: the deq+gemm
+chain by itself. Reaching the bar needs ~50 us/expert => dequant fused into tensor-core MMA
+(Blackwell sm_121: FP4/FP6/FP8 + tcgen05) with all routed experts batched into ONE launch.
+The current per-expert serial deq->gemm path is a corrrectness harness, not a performance base.
+Also: solo and split digests differ at 1e-13 relative (-1.0366555427207942 vs -1.0366555427207755)
+because they fold in different association order ((0..7) vs (0..3)+(4..7)); the split's own gate
+(ndiff=0 vs a recompute in matching order) is the correctness proof, not digest equality.
+NEXT: (a) move the shared expert off rank 0 (idle-rank work), (b) batch the 8 expert FFNs into one
+launch per rank, (c) measure deq-equivalent bytes/s to size the fused-MMA target.

@@ -13,9 +13,9 @@ import time::{time_mono_millis}
 import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send_bytes, socket_recv_bytes, socket_set_timeout}
 import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
 import gx::{gx_resolve, gx_read}
-import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, mm_host32, silu, deq_bf16f, sigmoid, f32_at, H, NE, ROUTE_TOPK, EINTER, ROUTED_SCALE}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, mm_host32, silu, deq_bf16f, sigmoid, f32_at, gx_resolve_tab, H, NE, ROUTE_TOPK, EINTER, ROUTED_SCALE}
 
-expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<Int>,
+expert_y(x<Vec<Float>>, dir<String>, tab3<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<Int>,
          mapbody<String>, mapdev<Int>, invbase<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>,
          arG<Int>, arH<Int>, arI<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
     epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
@@ -29,7 +29,9 @@ expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<
     w2.push(epre + "down_proj.trellis")
     w2.push(epre + "down_proj.suh")
     w2.push(epre + "down_proj.svh")
-    ge<GxLoc> = gx_resolve(dir, 83, w2)
+    tra<Int> = time_mono_millis()
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w2)
+    trb<Int> = time_mono_millis()
     nf<Int> = 0
     j<Int> = 0
     while (j < ge.found.len()) {
@@ -46,6 +48,9 @@ expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<
     g6<String> = gx_read(ge, 6)
     g7<String> = gx_read(ge, 7)
     g8<String> = gx_read(ge, 8)
+    trc<Int> = time_mono_millis()
+    println("P6R3 exp " + e.to_string() + " resolve_ms=" + (trb - tra).to_string() + " read_ms=" + (trc - trb).to_string())
+    tm0<Int> = time_mono_millis()
     dWg<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
                            arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
     dWu<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g3, g4, g5, mapbody, 2048, 32768, hd_pre32,
@@ -53,6 +58,7 @@ expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<
     dWd<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g6, g7, g8, mapbody, 4096, 32768, hd_pre32,
                            arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
     if (dWg == 0 || dWu == 0 || dWd == 0) { println("P6_FAIL deq exp=" + e.to_string()); return Vec() }
+    tm1<Int> = time_mono_millis()
     gv<Vec<Float>> = mm_host32(x, 1, 4096, dWg, 2048, fcast32, fgp, fgr, pb32)
     uv<Vec<Float>> = mm_host32(x, 1, 4096, dWu, 2048, fcast32, fgp, fgr, pb32)
     act<Vec<Float>> = Vec()
@@ -61,7 +67,9 @@ expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<
         act.push(silu(gv.get(i)) * uv.get(i))
         i = i + 1
     }
-    return mm_host32(act, 1, 2048, dWd, 4096, fcast32, fgp, fgr, pb32)
+    yv<Vec<Float>> = mm_host32(act, 1, 2048, dWd, 4096, fcast32, fgp, fgr, pb32)
+    println("P6R3 exp " + e.to_string() + " deq_ms=" + (tm1 - tm0).to_string() + " mm_ms=" + (time_mono_millis() - tm1).to_string() + " read_bytes=" + (g0.len() + g1.len() + g2.len() + g3.len() + g4.len() + g5.len() + g6.len() + g7.len() + g8.len()).to_string())
+    return yv
 }
 
 fold_acc(acc<their<Vec<Float>>>, y<Vec<Float>>, w<Float>) -> {
@@ -111,6 +119,31 @@ main()<Int> -> {
     mapdev<Int> = mapdev_build(finvk, mapd)
     if (mapdev == 0) { println("P6_FAIL mapdev"); return 5 }
     invbase<Int> = mapdev + 16 + nbmap
+    // The per-layer TAB (the production lookup table): gx_resolve(dir,...) costs
+    // 700 ms/name because it re-opens and re-parses a 2 GB shard header per call.
+    // The tab cache holds, per layer, a "name shard off len ..." table; the serve
+    // loads it the same way. Cache format: "GXTAB1 <dir>\n" then 45 x "<len>\n<tab>".
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cs<String> = ""
+    match (open_read(cache_path)) {
+        f -> { match (read_all(f)) { s -> { cs = s } ? -> { println("P6_FAIL tabcache"); return 4 } } close(f) }
+        ? -> { println("P6_FAIL tabcache"); return 4 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    if (nl0 < 0) { println("P6_FAIL tabcache_fmt"); return 5 }
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    ti<Int> = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("P6_FAIL tabcache_trunc"); return 5 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+    if (tab3.len() == 0) { println("P6_FAIL tab3"); return 5 }
+    println("P6R3 tab3 bytes=" + tab3.len().to_string())
     arA<Int> = dev_alloc(8388608)
     arB<Int> = dev_alloc(65536)
     arC<Int> = dev_alloc(33554432)
@@ -146,7 +179,7 @@ main()<Int> -> {
     want<Vec<String>> = Vec()
     want.push(lpre3 + "mlp.gate.weight")
     want.push(lpre3 + "mlp.gate.e_score_correction_bias")
-    g<GxLoc> = gx_resolve(dir, 83, want)
+    g<GxLoc> = gx_resolve_tab(tab3, dir, 83, want)
     g_g_0<String> = gx_read(g, 0)
     g_g_1<String> = gx_read(g, 1)
     dGw<Int> = deq_bf16f(fbf, g_g_0, NE * H, H)
@@ -221,7 +254,7 @@ main()<Int> -> {
     myp<Vec<Float>> = zeros4096()
     lane = lo
     while (lane < hi) {
-        y<Vec<Float>> = expert_y(x, dir, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
+        y<Vec<Float>> = expert_y(x, dir, tab3, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
                                  arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
         if (y.len() != 4096) { println("P6_FAIL ylen lane=" + lane.to_string()); return 9 }
         fold_acc(borrow(myp), y, wt.get(lane))
@@ -235,7 +268,7 @@ main()<Int> -> {
     ws.push(sp + "gate_proj.weight")
     ws.push(sp + "up_proj.weight")
     ws.push(sp + "down_proj.weight")
-    gs<GxLoc> = gx_resolve(dir, 83, ws)
+    gs<GxLoc> = gx_resolve_tab(tab3, dir, 83, ws)
     s0<String> = gx_read(gs, 0)
     s1<String> = gx_read(gs, 1)
     s2<String> = gx_read(gs, 2)
@@ -266,6 +299,13 @@ main()<Int> -> {
         return 0
     }
     if (!is0) {
+        // the idle-rank shared expert: rank 1 adds it to its own half so rank 0's
+        // critical path is just its 4 experts
+        i = 0
+        while (i < 4096) {
+            myp.set(i, myp.get(i) + shy.get(i))
+            i = i + 1
+        }
         csv<String> = ""
         i = 0
         while (i < myp.len()) {
@@ -338,11 +378,16 @@ main()<Int> -> {
     refp<Vec<Float>> = zeros4096()
     lane = 4
     while (lane < ROUTE_TOPK) {
-        y2<Vec<Float>> = expert_y(x, dir, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
+        y2<Vec<Float>> = expert_y(x, dir, tab3, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
                                   arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
         if (y2.len() != 4096) { println("P6_FAIL refylen"); return 9 }
         fold_acc(borrow(refp), y2, wt.get(lane))
         lane = lane + 1
+    }
+    i = 0
+    while (i < 4096) {
+        refp.set(i, refp.get(i) + shy.get(i))
+        i = i + 1
     }
     println("P6R3 ref half done ms=" + (time_mono_millis() - t0).to_string())
     ndiff<Int> = 0
@@ -366,8 +411,7 @@ main()<Int> -> {
     dgf<Float> = 0.0
     i = 0
     while (i < 4096) {
-        fv<Float> = tot.get(i) + shy.get(i)
-        dgf = dgf + fv * ((i % 7) as Float + 1.0)
+        dgf = dgf + tot.get(i) * ((i % 7) as Float + 1.0)
         i = i + 1
     }
     println("P6R3_MIX_DIGEST=" + dgf.to_string_precise())
@@ -378,6 +422,23 @@ main()<Int> -> {
     socket_close(lfd)
     if (ndiff == 0) { println("P6R3_RANK0_DONE XCHG_EXACT GATE_OK") } else { println("P6R3_RANK0_DONE XCHG_DIFFS=" + ndiff.to_string() + " GATE_FAIL") }
     return 0
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Bool> = true
+        j<Int> = 0
+        while (ok && j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = false }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    return -1
 }
 
 okbytes()<Vec<UInt8>> -> {
