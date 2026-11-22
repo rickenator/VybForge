@@ -3891,7 +3891,8 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
                mapbody<String>, mckv<their<Vec<Float>>>,
                mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, dw<Vec<Int>>, fgemm<Int>, fbf<Int>,
                fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
-               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
+               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>,
+               fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = vecf()
     i<Int> = 0
     j<Int> = 0
@@ -4357,27 +4358,27 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
             g_gexp_2 = gx_read(gexp, 2)
             g_gexp_1 = gx_read(gexp, 1)
             g_gexp_0 = gx_read(gexp, 0)
-            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_0,
+            dWg<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_gexp_0,
                                 g_gexp_1, g_gexp_2, body,
                                 EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_gexp_5 = gx_read(gexp, 5)
             g_gexp_4 = gx_read(gexp, 4)
             g_gexp_3 = gx_read(gexp, 3)
-            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_3,
+            dWu<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_gexp_3,
                                 g_gexp_4, g_gexp_5, body,
                                 EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_gexp_8 = gx_read(gexp, 8)
             g_gexp_7 = gx_read(gexp, 7)
             g_gexp_6 = gx_read(gexp, 6)
-            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_6,
+            dWd<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_gexp_6,
                                 g_gexp_7, g_gexp_8, body,
                                 H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL mtp deq expert " + e.to_string())
                 return nonev
             }
-            gv<Vec<Float>> = mm_host(h2, 1, H, dWg, EINTER, fgemm)
-            uv45<Vec<Float>> = mm_host(h2, 1, H, dWu, EINTER, fgemm)
+            gv<Vec<Float>> = mm_host32(h2, 1, H, dWg, EINTER, fcast32, fgp, fgr, pb32)
+            uv45<Vec<Float>> = mm_host32(h2, 1, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
             act45<Vec<Float>> = Vec()
             j = 0
             while (j < gv.len()) {
@@ -4389,7 +4390,7 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
                 act45.push(silu(g1) * u1)
                 j = j + 1
             }
-            yv<Vec<Float>> = mm_host(act45, 1, EINTER, dWd, H, fgemm)
+            yv<Vec<Float>> = mm_host32(act45, 1, EINTER, dWd, H, fcast32, fgp, fgr, pb32)
             wt = 0.0
             lane = 0
             while (lane < ROUTE_TOPK) {
