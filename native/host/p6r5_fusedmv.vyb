@@ -1,0 +1,235 @@
+// p6r5_fusedmv — the fused decode+matvec prototype, gated against the current
+// materialise-W path on ONE expert's gate_proj (2048x4096).
+//   old:  deq W (33.5 MB to HBM)  ->  mm_host32(x, W)
+//   new:  xp = sv . (H x)  ->  yraw = T xp (W never stored)  ->  y = H yraw
+// Gate: rel error <= 1e-5 vs the old path (re-associated f32 sums, not bit-exact).
+// env: P6_DIR, P6_EXP
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f_into, exl3_deq32f, mm_host32, gx_resolve_tab, launch_kernel, wr_pdev, alloc_dev, H}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    expS<String> = env_get("P6_EXP") else "153"
+    e<Int> = 0
+    i<Int> = 0
+    while (i < expS.len()) {
+        c<Int> = (expS.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { e = e * 10 + (c - 48) }
+        i = i + 1
+    }
+    if (tensor_init() != 0) { println("P6_FAIL cuda"); return 1 }
+    fdqs4<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
+    fhad232<Int> = load_fn("native/build/exl3.ptx", "exl3had232")
+    fhgen32<Int> = load_fn("native/build/exl3.ptx", "exl3hgen32")
+    finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    fcast32<Int> = load_fn("native/build/layer.ptx", "cast32")
+    fgp<Int> = load_fn("native/build/layer.ptx", "gemm32_p")
+    fgr<Int> = load_fn("native/build/layer.ptx", "gemm32_r")
+    fxh<Int> = load_fn("native/build/exl3mv.ptx", "exl3xhat")
+    fmv<Int> = load_fn("native/build/exl3mv.ptx", "exl3mv1s4")
+    fyh<Int> = load_fn("native/build/exl3mv.ptx", "exl3yhat")
+    if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0 || fcast32 == 0 || fgp == 0 || fgr == 0) { println("P6_FAIL kernels"); return 2 }
+    if (fxh == 0 || fmv == 0 || fyh == 0) { println("P6_FAIL mvkernels"); return 2 }
+    hd_pre32<Int> = had_hoist32(fhgen32)
+    if (hd_pre32 == 0) { println("P6_FAIL hadhoist"); return 3 }
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL map.bin"); return 4 }
+    }
+    mapbody<String> = mapd.substring(16, mapd.len())
+    nbmap<Int> = mapd.len() - 16
+    mapdev<Int> = mapdev_build(finvk, mapd)
+    if (mapdev == 0) { println("P6_FAIL mapdev"); return 5 }
+    invbase<Int> = mapdev + 16 + nbmap
+    arA<Int> = dev_alloc(8388608)
+    arB<Int> = dev_alloc(65536)
+    arC<Int> = dev_alloc(33554432)
+    arD<Int> = dev_alloc(33554432)
+    arG<Int> = dev_alloc(16384)
+    arH<Int> = dev_alloc(16384)
+    arI<Int> = dev_alloc(64)
+    pb32<Int> = dev_alloc(192)
+    pbx<Int> = dev_alloc(64)
+    pbm<Int> = dev_alloc(96)
+    pby<Int> = dev_alloc(48)
+    if (arA == 0 || arB == 0 || arC == 0 || arD == 0 || arG == 0 || arH == 0 || arI == 0 || pb32 == 0) { println("P6_FAIL arena"); return 6 }
+    // fusion work buffers: xp (4096 f32), yraw (2048 f32), y (2048 f32)
+    bxp<Int> = dev_alloc(16384)
+    byr<Int> = dev_alloc(8192)
+    by<Int> = dev_alloc(8192)
+    bx<Int> = dev_alloc(16384)
+    if (bxp == 0 || byr == 0 || by == 0 || bx == 0) { println("P6_FAIL fbufs"); return 6 }
+    // tab
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cs<String> = ""
+    match (open_read(cache_path)) {
+        f -> { match (read_all(f)) { s -> { cs = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL tabcache"); return 4 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    ti<Int> = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("P6_FAIL tabcache_trunc"); return 5 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+    epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + ".gate_proj."
+    w2<Vec<String>> = Vec()
+    w2.push(epre + "trellis")
+    w2.push(epre + "suh")
+    w2.push(epre + "svh")
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w2)
+    g0<String> = gx_read(ge, 0)
+    g1<String> = gx_read(ge, 1)
+    g2<String> = gx_read(ge, 2)
+    println("P6R5 trellis=" + g0.len().to_string() + " suh=" + g1.len().to_string() + " svh=" + g2.len().to_string())
+    // x
+    x<Vec<Float>> = Vec()
+    i = 0
+    while (i < 4096) {
+        x.push((((i * 37) % 251) as Float - 125.0) / 250.0)
+        i = i + 1
+    }
+    xb<Vec<UInt8>> = Vec()
+    // ---- OLD path: materialise W then matvec ----
+    ta<Int> = time_mono_millis()
+    dW<Int> = exl3_deq32f_into(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                               arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, arC)
+    if (dW == 0) { println("P6_FAIL deq"); return 7 }
+    tdeq<Int> = time_mono_millis()
+    yold<Vec<Float>> = mm_host32(x, 1, 4096, dW, 2048, fcast32, fgp, fgr, pb32)
+    told<Int> = time_mono_millis()
+    println("P6R5 OLD deq_ms=" + (tdeq - ta).to_string() + " mm_ms=" + (told - tdeq).to_string() + " total=" + (told - ta).to_string() + " ylen=" + yold.len().to_string())
+    // ---- NEW path: xp -> yraw -> y ----
+    tb<Int> = time_mono_millis()
+    // stage x (bulk_htod f64 -> cast32 f32), the trellis, su/sv, and zero yraw
+    dA64x<Int> = alloc_dev(32768)
+    bulk_htod(dA64x, view(x))
+    wr_pdev(pb32, 0, dA64x)
+    wr_pdev(pb32, 8, bx)
+    wr_pdev(pb32, 16, 4096)
+    launch_kernel(fcast32, 16, pb32)
+    cuCtxSynchronize()
+    free_dev(dA64x)
+    cuMemcpyHtoD_v2(arA, g0, g0.len())
+    cuMemcpyHtoD_v2(arG, g1, g1.len())
+    cuMemcpyHtoD_v2(arH, g2, g2.len())
+    cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+    tup<Int> = time_mono_millis()
+    // p: +0 x, +8 out(xp), +16 H, +24 sv, +32 cw
+    var<Int> v1 = bx
+    var<Int> v2 = bxp
+    var<Int> v3 = hd_pre32
+    var<Int> v4 = arH
+    var<Int> v5 = 4096
+    wr_pdev(pbx, 0, v1)
+    wr_pdev(pbx, 8, v2)
+    wr_pdev(pbx, 16, v3)
+    wr_pdev(pbx, 24, v4)
+    wr_pdev(pbx, 32, v5)
+    rcx<Int> = launch_kernel(fxh, 32, pbx)
+    println("P6R5 DBG xh_launch_rc=" + rcx.to_string())
+    cuCtxSynchronize()
+    txh<Int> = time_mono_millis()
+    // p: +0 yraw, +8 xp, +16 su, +24 cw, +40 q(trellis), +48 td(mapdev), +56 inv
+    var<Int> m1 = byr
+    var<Int> m2 = bxp
+    var<Int> m3 = arG
+    var<Int> m4 = 4096
+    var<Int> m5 = 0
+    var<Int> m6 = arA
+    var<Int> m7 = mapdev
+    var<Int> m8 = invbase
+    wr_pdev(pbm, 0, m1)
+    wr_pdev(pbm, 8, m2)
+    wr_pdev(pbm, 16, m3)
+    wr_pdev(pbm, 24, m4)
+    wr_pdev(pbm, 32, m5)
+    wr_pdev(pbm, 40, m6)
+    wr_pdev(pbm, 48, m7)
+    wr_pdev(pbm, 56, m8)
+    rcm<Int> = launch_kernel(fmv, 8192, pbm)
+    println("P6R5 DBG mv_launch_rc=" + rcm.to_string())
+    cuCtxSynchronize()
+    tmv<Int> = time_mono_millis()
+    // p: +0 yraw, +8 y, +16 H, +24 cw
+    var<Int> h1 = byr
+    var<Int> h2 = by
+    var<Int> h3 = hd_pre32
+    var<Int> h4 = 2048
+    wr_pdev(pby, 0, h1)
+    wr_pdev(pby, 8, h2)
+    wr_pdev(pby, 16, h3)
+    wr_pdev(pby, 24, h4)
+    rcy<Int> = launch_kernel(fyh, 16, pby)
+    println("P6R5 DBG yh_launch_rc=" + rcy.to_string())
+    cuCtxSynchronize()
+    tyh<Int> = time_mono_millis()
+    ynew<Vec<Float>> = bulk_dtoh(by, 2048)
+    println("P6R5 NEW stage_ms=" + (tup - tb).to_string() + " xhat_ms=" + (txh - tup).to_string() + " mv_ms=" + (tmv - txh).to_string() + " yhat_ms=" + (tyh - tmv).to_string() + " total=" + (tyh - tb).to_string() + " ylen=" + ynew.len().to_string())
+    // dump the first few values of each stage
+    yrd<Vec<Float>> = bulk_dtoh(by, 8)
+    xpd<Vec<Float>> = bulk_dtoh(bxp, 4)
+    println("P6R5 DBG yraw0=" + yrd.get(0).to_string_precise() + " yraw1=" + yrd.get(1).to_string_precise())
+    println("P6R5 DBG xp0=" + xpd.get(0).to_string_precise() + " xp1=" + xpd.get(1).to_string_precise())
+    println("P6R5 DBG ynew0=" + ynew.get(0).to_string_precise() + " yold0=" + yold.get(0).to_string_precise())
+    // ---- the gate ----
+    nd<Int> = 0
+    mx<Float> = 0.0
+    i = 0
+    while (i < 2048) {
+        d<Float> = ynew.get(i) - yold.get(i)
+        ad<Float> = d
+        if (ad < 0.0) { ad = 0.0 - ad }
+        if (ad > mx) { mx = ad }
+        if (ad > 1e-3) { nd = nd + 1 }
+        i = i + 1
+    }
+    // relative scale of the old output
+    nn<Float> = 0.0
+    i = 0
+    while (i < 2048) {
+        av<Float> = yold.get(i)
+        if (av < 0.0) { av = 0.0 - av }
+        if (av > nn) { nn = av }
+        i = i + 1
+    }
+    rel<Float> = mx / (nn + 1e-30)
+    println("P6R5_GATE max_abs=" + mx.to_string_precise() + " over_max=" + nn.to_string_precise() + " rel=" + rel.to_string_precise() + " over1e-3=" + nd.to_string())
+    if (rel <= 1e-5) { println("P6R5_DONE FUSED_OK") } else { println("P6R5_DONE FUSED_FAIL") }
+    return 0
+}
+
+zero_bytes(n<Int>)<String> -> {
+    s<String> = ""
+    k<Int> = 0
+    while (k < n) { s = s + " " ; k = k + 1 }
+    return s
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Bool> = true
+        j<Int> = 0
+        while (ok && j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = false }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    return -1
+}

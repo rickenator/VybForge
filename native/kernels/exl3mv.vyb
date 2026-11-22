@@ -1,0 +1,203 @@
+// exl3mv — the FUSED decode+matvec (prototype) as its own module.
+//
+// The current path materialises W (2048x4096 f32 = 33.5 MB per projection) and
+// then reads it back for the matvec: ~100 MB of traffic per expert for nothing.
+// For decode (M=1) W is never reusable, so W should never exist. The EXL3
+// composition is blockwise  W = H_left @ T @ H_right  (T = the raw decoded
+// tile, H = the 128x128 Hadamard, with su per row and sv per column), hence
+//     y = W x = H_left @ (T @ (H_right @ x)).
+// So:  xp = sv . (H_right x)           one tiny pass over x       (exl3xhat)
+//      yraw = T xp                    decode + dot, W never stored (exl3mv1s4)
+//      y = H_left yraw                one tiny pass over y        (exl3yhat)
+// Per projection that is the 4.2 MB packed read + tiny vector passes.
+//
+// Compile: --kernel-shared 40960 (32 KB tile slab + 4 KB reduction).
+
+share(all) fp16_to_f64(b<Int>)<Float> -> {
+    sb<Int> = (b >> 15) & 1
+    eb<Int> = (b >> 10) & 31
+    mb<Int> = b & 1023
+    v<Float> = 0.0
+    if (eb == 0) {
+        # subnormal: mb * 2^-24 in ONE multiply (was a 24-step halving loop);
+        # the product is exact, so the value is bit-identical
+        v = (mb as Float) * 0.000000059604644775390625
+    } else {
+        if (eb == 31) {
+            v = 65504.0
+        } else {
+            v = (1024 + mb) as Float
+            e<Int> = eb - 25
+            # 2^e exactly via binary exponentiation (<=5 squarings): every
+            # intermediate is a power of two, so the result is bit-identical
+            # to the old stepwise doubling/halving loops (<=24 iterations)
+            k<Int> = e
+            if (k < 0) { k = 0 - k }
+            r<Float> = 1.0
+            b2<Float> = 2.0
+            while (k > 0) {
+                if ((k - ((k >> 1) * 2)) == 1) { r = r * b2 }
+                b2 = b2 * b2
+                k = k >> 1
+            }
+            if (e < 0) {
+                v = v / r
+            } else {
+                v = v * r
+            }
+        }
+    }
+    if (sb == 1) {
+        v = 0.0 - v
+    }
+    return v
+}
+
+// p: +0 x(f32), +8 out(f32), +16 H(f32 128x128), +24 sv(f16), +32 cw
+exl3xhat(p<Int>) -> {
+    x<Int> = ld_i64(p + 0)
+    o<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    SV<Int> = ld_i64(p + 24)
+    cw<Int> = ld_i64(p + 32)
+    nb<Int> = blk_x()
+    d<Int> = tid_x()
+    base<Int> = nb * 128
+    if (base < cw) {
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 128) {
+            acc = acc + ld_f32n(H + (d * 128 + j) * 4) * ld_f32n(x + (base + j) * 4)
+            j = j + 1
+        }
+        sv<Float32> = ld_f16(SV + (base + d) * 2) as Float32
+        st_f32(o + (base + d) * 4, acc * sv)
+    }
+}
+
+// p: +0 out(f32 yraw, cw rows), +8 xp(f32, cw cols), +16 su(f16 per row)
+//    +24 cw, +32 yrow-base is implicit through blk
+// The decode is exl3dq1s4's phase 1 verbatim (the oracle-verified nibble/slot
+// walk into the shared slab); phase 2 replaces "apply H and store W" with
+// "dot the row against xp" -> one f32 per row, accumulated with atomics.
+exl3mv1s4(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 40)
+    td<Int> = ld_i64(p + 48)
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    SU<Int> = ld_i64(p + 16)
+    inv<Int> = ld_i64(p + 56)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    d0<Int> = within - (within / 128) * 128
+
+    # ---- phase 1: decode this CTA's 8 rows x 128 cols into the shared slab ----
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = fp16_to_f64(yK & 65535)
+        hiK<Float> = fp16_to_f64((yK >> 16) & 65535)
+        st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
+        k = k + 1
+    }
+
+    kernel_barrier()
+
+    # ---- phase 2: 4 row-dots against xp, then reduce across d ----
+    b2<Int> = cta * 8 + (within / 128) * 4
+    rl<Int> = (within / 128) * 4
+    d<Int> = d0
+    acc0<Float32> = 0.0
+    acc1<Float32> = 0.0
+    acc2<Float32> = 0.0
+    acc3<Float32> = 0.0
+    c2<Int> = 0
+    xbase<Int> = nb128 * 128
+    while (c2 < 128) {
+        xv<Float32> = ld_f32n(X + (xbase + c2) * 4)
+        acc0 = acc0 + ld_shared_f32(rl * 512 + c2 * 4) * xv
+        acc1 = acc1 + ld_shared_f32((rl + 1) * 512 + c2 * 4) * xv
+        acc2 = acc2 + ld_shared_f32((rl + 2) * 512 + c2 * 4) * xv
+        acc3 = acc3 + ld_shared_f32((rl + 3) * 512 + c2 * 4) * xv
+        c2 = c2 + 1
+    }
+    # scale by su (per W row) and park in the reduction slab at [32768, 36864)
+    # layout: red[row_local * 128 + d], row_local 0..7
+    r0<Int> = b2 - cta * 8
+    su0<Float32> = ld_f16(SU + (rb64 * 64 + b2) * 2) as Float32
+    su1<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 1) * 2) as Float32
+    su2<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 2) * 2) as Float32
+    su3<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 3) * 2) as Float32
+    st_shared_f32(4096 + r0 * 512 + d * 4, acc0 * su0)
+    st_shared_f32(4096 + (r0 + 1) * 512 + d * 4, acc1 * su1)
+    st_shared_f32(4096 + (r0 + 2) * 512 + d * 4, acc2 * su2)
+    st_shared_f32(4096 + (r0 + 3) * 512 + d * 4, acc3 * su3)
+
+    kernel_barrier()
+
+    # 8 rows per CTA: thread tid < 8 sums the 128 partials and adds to yraw
+    if (within < 8) {
+        rr<Int> = within
+        s<Float32> = 0.0
+        j<Int> = 0
+        while (j < 128) {
+            s = s + ld_shared_f32(4096 + rr * 512 + j * 4)
+            j = j + 1
+        }
+        gidr<Int> = rb64 * 64 + cta * 8 + rr
+        if (gidr < cw) { atomic_add_f32(T + gidr * 4, s) }
+    }
+}
+
+// p: +0 yraw(f32, cw), +8 y(f32), +16 H(f32 128x128), +24 cw
+exl3yhat(p<Int>) -> {
+    YR<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    cw<Int> = ld_i64(p + 24)
+    nb<Int> = blk_x()
+    a<Int> = tid_x()
+    base<Int> = nb * 128
+    if (base < cw) {
+        acc<Float32> = 0.0
+        b<Int> = 0
+        while (b < 128) {
+            acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_f32n(YR + (base + b) * 4)
+            b = b + 1
+        }
+        st_f32(Y + (base + a) * 4, acc)
+    }
+}
