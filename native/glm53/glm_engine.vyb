@@ -3403,7 +3403,8 @@ delta_rule_step(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>,
 share(all)
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, total<Int>, mapbody<String>,
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
-              arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
+              arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>,
+              fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
     ms0<Int> = time_mono_millis()
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
@@ -3624,17 +3625,17 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+            dWg<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_0, g_ge_1,
                                 g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_5 = gx_read(ge, 5)
             g_ge_4 = gx_read(ge, 4)
             g_ge_3 = gx_read(ge, 3)
-            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+            dWu<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_3, g_ge_4,
                                 g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
             g_ge_6 = gx_read(ge, 6)
-            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+            dWd<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_6, g_ge_7,
                                 g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
@@ -3652,8 +3653,8 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 }
                 j = j + 1
             }
-            gv<Vec<Float>> = mm_host(sub, nt, H, dWg, EINTER, fgemm)
-            uv<Vec<Float>> = mm_host(sub, nt, H, dWu, EINTER, fgemm)
+            gv<Vec<Float>> = mm_host32(sub, nt, H, dWg, EINTER, fcast32, fgp, fgr, pb32)
+            uv<Vec<Float>> = mm_host32(sub, nt, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
             act<Vec<Float>> = Vec()
             j = 0
             while (j < gv.len()) {
@@ -3665,7 +3666,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 act.push(silu(g1) * u1)
                 j = j + 1
             }
-            yv<Vec<Float>> = mm_host(act, nt, EINTER, dWd, H, fgemm)
+            yv<Vec<Float>> = mm_host32(act, nt, EINTER, dWd, H, fcast32, fgp, fgr, pb32)
             j = 0
             while (j < nt) {
                 tk = toks.get(j)
