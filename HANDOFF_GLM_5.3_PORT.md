@@ -4006,3 +4006,19 @@ expert outputs; the GATE is that same-node single-process computation of both ex
 f64 compare) — self-contained, no godzilla reference needed. Then widen: the routed mix (8 experts
 split 4/4, top-k weights applied per rank), the shared expert + attention on one rank (or TP), and
 finally TP2_VYB_MATCH against the P4 layer output.
+=== ROUND 12: P6 INCREMENT 1 — THE RANK PROBE (f58ffd7) ==================
+native/host/p6_rank_probe.vyb: a self-contained expert-partition driver. gx_resolve via the
+index.json (131 ms, NO shard walk — far better than the serve's tab build), exl3_deq32f +
+mm_host32 for one expert's FFN at layer 3 with a deterministic x, digest exchange over the
+proven transport, and the gate is rank 0 recomputing the PEER expert locally (rel <= 1e-12).
+Engine gains two exported helpers so drivers need ZERO direct FFI: launch_kernel(f,g,pb) and
+mapdev_build(finvk, mapd) (the serve's inline map setup, exported verbatim).
+VERIFIED SOLO ON GODZILLA with real weights: 9/9 tensors resolved (4 MB trellis + 8 KB scales
+per matrix), deq ok, expert-0 FFN in 1 ms, digest -40.3734.
+BLOCKER on lefty (to diagnose next): its rebuilt build2 binary's JIT fails at MODULE LOAD with
+"Symbols not found: [ __pv_<hash>_cuMemAlloc_v2 ]" for any compile unit whose engine freedom
+blocks allocate (godzilla's identical sources + binary resolve it). Note the GB10 itself is fine
+(gemm32_real ran bit-identical, and tensor's dev_alloc works there) — this is a binary/JIT
+symbol-mangling discrepancy on the rebuilt Spark toolchain, not a GPU or kernel issue.
+Suspects: the pulled cuda_binding/tensor stdlib vs godzilla's, the extern-decl visibility path
+when both tensor and glm_engine are imported together, or a build flag difference in build2.
