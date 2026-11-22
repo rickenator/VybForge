@@ -13,3 +13,14 @@ dbg_sh(p<Int>) -> {
         st_f32(O + 32 + t * 4, ld_f32n(X + t * 4))
     }
 }
+
+// f32t64 — copy n f32 elements to an f64 buffer (so bulk_dtoh can read them
+// honestly; the earlier "values are zero" readings were f32 read as f64).
+// p: +0 src(f32), +8 dst(f64), +16 n
+f32t64(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    D<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) { st_f64(D + gid * 8, ld_f32n(S + gid * 4)) }
+}

@@ -94,10 +94,11 @@ main()<Int> -> {
     g2<String> = gx_read(ge, 2)
     println("P6R5 trellis=" + g0.len().to_string() + " suh=" + g1.len().to_string() + " svh=" + g2.len().to_string())
     // x
+    oneshot<Bool> = (env_get("P6_ONESHOT") else "0") == "1"
     x<Vec<Float>> = Vec()
     i = 0
     while (i < 4096) {
-        x.push((((i * 37) % 251) as Float - 125.0) / 250.0)
+        if (oneshot && i != 0) { x.push(0.0) } else { x.push((((i * 37) % 251) as Float - 125.0) / 250.0) }
         i = i + 1
     }
     xb<Vec<UInt8>> = Vec()
@@ -110,6 +111,16 @@ main()<Int> -> {
     yold<Vec<Float>> = mm_host32(x, 1, 4096, dW, 2048, fcast32, fgp, fgr, pb32)
     told<Int> = time_mono_millis()
     println("P6R5 OLD deq_ms=" + (tdeq - ta).to_string() + " mm_ms=" + (told - tdeq).to_string() + " total=" + (told - ta).to_string() + " ylen=" + yold.len().to_string())
+    // W^T row 0 = column 0 of W = exactly what a one-hot x must produce
+    fcast64<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    wrow<Int> = dev_alloc(16384)
+    pbc<Int> = dev_alloc(24)
+    wr_pdev(pbc, 0, dW)
+    wr_pdev(pbc, 8, wrow)
+    wr_pdev(pbc, 16, 2048)
+    launch_kernel(fcast64, 8, pbc)
+    cuCtxSynchronize()
+    wcol<Vec<Float>> = bulk_dtoh(wrow, 2048)
     // ---- NEW path: xp -> yraw -> y ----
     tb<Int> = time_mono_millis()
     // stage x (bulk_htod f64 -> cast32 f32), the trellis, su/sv, and zero yraw
@@ -221,6 +232,7 @@ main()<Int> -> {
     }
     rel<Float> = mx / (nn + 1e-30)
     println("P6R5_GATE max_abs=" + mx.to_string_precise() + " over_max=" + nn.to_string_precise() + " rel=" + rel.to_string_precise() + " over1e-3=" + nd.to_string())
+    println("P6R5 DBG new_y0=" + ynew.get(0).to_string_precise() + " old_y0=" + yold.get(0).to_string_precise() + " Wcol0_0=" + wcol.get(0).to_string_precise() + " Wcol0_1=" + wcol.get(1).to_string_precise() + " new_y1=" + ynew.get(1).to_string_precise())
     if (rel <= 1e-5) { println("P6R5_DONE FUSED_OK") } else { println("P6R5_DONE FUSED_FAIL") }
     return 0
 }

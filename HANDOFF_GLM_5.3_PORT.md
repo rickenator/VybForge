@@ -4214,3 +4214,22 @@ the compact slab re-index), not in the vector passes.
 NEXT (precise): gate the decode half ALONE — have exl3mv1s4 also write its slab tile to global for
 CTA 0 and diff it element-for-element against the same tile from the known-good exl3dq1s4 (which
 materialises W). That isolates decode vs matvec in one run instead of three compound guesses.
+=== ROUND 22: THE GATE WAS LYING — f32 buffers read as f64 ===
+bulk_dtoh reads f64; every fused-path buffer (xp, yraw, y) is f32, so every "value ~ 1e-28 / 0"
+diagnostic in rounds 20-21 was a FORMAT ARTIFACT, not a numeric failure. yhat now writes f64
+(st_f64) so the comparison is real.
+CURRENT REAL STATE (expert 153, gate_proj, x = the deterministic ramp):
+  OLD (materialise W + mm):  y0 = -0.40728, deq 5 ms
+  NEW (fused xp/T/yhat):     y0 = -0.02777, mv 2 ms, total 17 ms (stage 15 = first-touch)
+  gate: max_abs 1.45 vs old max 1.28 -> same scale, wrong values.
+So the pipeline runs end to end at the right magnitude; one of the three transforms is
+mis-assigned. Prime suspect confirmed this round: the EXL3 buffer is W^T (rows = input dim, su
+per input, sv per output), so su must fold into xp and sv into yraw — the kernel now does that,
+and phase 2 dots DOWN slab columns. The residual (ynew ~ 7-20x small, wrong sign pattern) points
+at a transform applied on the wrong axis or a second/dropped Hadamard.
+NEXT (cheap, decisive): x = one-hot e_0. Then y must equal column 0 of W, which the OLD path has
+materialised — an element-wise compare with no summation cancellations to hide behind, and each
+of {su into xp, sv into yraw, H axes, W^T layout} becomes individually checkable.
+KERNEL FACTS WORTH KEEPING: constant shared offsets get scalarised (never use them for a slab);
+the PTX -1024 fold is base selection, not a bias; the tile slab can be REUSED for a reduction only
+after a barrier that follows the last tile read.
