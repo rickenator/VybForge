@@ -753,7 +753,7 @@ main()<Int> -> {
                             lines = lines + dumps("mtphin" + r.to_string(), hin) + "\n"
                             println("SEC P1bbuild " + (now_ms() - secT).to_string())
                             secT = now_ms()
-                            x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                            x2 = mtp_layer_step(hin, r, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer row " + r.to_string()); return 41 }
                             # the per-token sync: the token kernels and the next token's
                             # deqs overlap without it (the intermittent sticky
@@ -1471,15 +1471,15 @@ main()<Int> -> {
                                         g_gexp_2 = gx_read(gexp, 2)
                                         g_gexp_1 = gx_read(gexp, 1)
                                         g_gexp_0 = gx_read(gexp, 0)
-                                        dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_0, g_gexp_1, g_gexp_2, mapbody, sv_EINTER, 32768, hdg)
+                                        dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_0, g_gexp_1, g_gexp_2, mapbody, sv_EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                                         g_gexp_5 = gx_read(gexp, 5)
                                         g_gexp_4 = gx_read(gexp, 4)
                                         g_gexp_3 = gx_read(gexp, 3)
-                                        dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_3, g_gexp_4, g_gexp_5, mapbody, sv_EINTER, 32768, hdg)
+                                        dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_3, g_gexp_4, g_gexp_5, mapbody, sv_EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                                         g_gexp_8 = gx_read(gexp, 8)
                                         g_gexp_7 = gx_read(gexp, 7)
                                         g_gexp_6 = gx_read(gexp, 6)
-                                        dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_6, g_gexp_7, g_gexp_8, mapbody, sv_H, 32768, hdg)
+                                        dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_6, g_gexp_7, g_gexp_8, mapbody, sv_H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                                         if (dWg == 0 || dWu == 0 || dWd == 0) {
                                             println("CHAIN_FAIL deq expert " + e.to_string())
                                             return 24
@@ -1922,7 +1922,7 @@ main()<Int> -> {
                             hin = mtp_build_row(tvec, raw_e, tab, dir, total, fgemm, fbf)
                             if (hin.len() != sv_H) { println("CHAIN_FAIL mtp build step " + t.to_string()); return 42 }
                             lines = lines + dumps("mtphin" + mrow.to_string(), hin) + "\n"
-                            x2 = mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                            x2 = mtp_layer_step(hin, mrow, lpre45, tab, dir, total, mapbody, borrow(mckv), borrow(mik), borrow(migsc), mdw, fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                             if (x2.len() != sv_H) { println("CHAIN_FAIL mtp layer step " + t.to_string()); return 43 }
                             lines = lines + dumps("mtpx" + mrow.to_string(), x2) + "\n"
                             println("mtp step" + t.to_string() + " done")

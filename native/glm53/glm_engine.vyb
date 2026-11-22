@@ -3326,7 +3326,6 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         nt = toks.len()
         if (nt > 0) {
             nex = nex + 1
-            msA<Int> = time_mono_millis()
             epre = lpre + "mlp.experts." + e.to_string() + "."
             w2<Vec<String>> = Vec()
             w2.push(epre + "gate_proj.trellis")
@@ -3611,7 +3610,8 @@ share(all)
 mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>, total<Int>,
                mapbody<String>, mckv<their<Vec<Float>>>,
                mik<their<Vec<Float>>>, migsc<their<Vec<Float>>>, dw<Vec<Int>>, fgemm<Int>, fbf<Int>,
-               fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
+               fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
+               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = vecf()
     i<Int> = 0
     j<Int> = 0
@@ -4077,21 +4077,21 @@ mtp_layer_step(hin<Vec<Float>>, row<Int>, lpre<String>, tab<String>, dir<String>
             g_gexp_2 = gx_read(gexp, 2)
             g_gexp_1 = gx_read(gexp, 1)
             g_gexp_0 = gx_read(gexp, 0)
-            dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_0,
+            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_0,
                                 g_gexp_1, g_gexp_2, body,
-                                EINTER, 32768, hdg)
+                                EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_gexp_5 = gx_read(gexp, 5)
             g_gexp_4 = gx_read(gexp, 4)
             g_gexp_3 = gx_read(gexp, 3)
-            dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_3,
+            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_3,
                                 g_gexp_4, g_gexp_5, body,
-                                EINTER, 32768, hdg)
+                                EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_gexp_8 = gx_read(gexp, 8)
             g_gexp_7 = gx_read(gexp, 7)
             g_gexp_6 = gx_read(gexp, 6)
-            dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_gexp_6,
+            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_gexp_6,
                                 g_gexp_7, g_gexp_8, body,
-                                H, 32768, hdg)
+                                H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL mtp deq expert " + e.to_string())
                 return nonev
