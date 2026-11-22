@@ -1,0 +1,110 @@
+// transport_probe — the P6 foundation: Vyb-native TCP over the CX7 fabric.
+// Uses the String socket API (socket_send/socket_recv) so it runs on the
+// Sparks' 0.7.7 binaries as well as godzilla's build.
+// server: bind <ip>:9123, drain N MB, then an RTT echo loop.
+// client: connect, push N MB in 64 KB chunks, then 200 rounds of 64 B echo.
+// mode via TP_MODE=server|client, TP_IP=<peer ip>; TP_MB fixed at 256.
+import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_set_timeout}
+import time::{time_mono_millis}
+import env::{env_get}
+
+main()<Int> -> {
+    mode<String> = env_get("TP_MODE") else "client"
+    ip<String> = env_get("TP_IP") else "192.168.192.1"
+    mb<Int> = 256
+    port<Int> = 9143
+    println("PROBE mode=" + mode + " ip=" + ip + " mb=" + mb.to_string())
+    if (mode == "server") {
+        fd<Int> = socket_open(2, 1, 0) else 0
+        if (fd == 0) { println("PROBE_FAIL open"); return 1 }
+        b<Bool> = socket_bind(fd, ip, port) else false
+        if (!b) { println("PROBE_FAIL bind"); return 2 }
+        l<Bool> = socket_listen(fd, 1) else false
+        if (!l) { println("PROBE_FAIL listen"); return 3 }
+        println("PROBE_LISTENING " + ip + ":" + port.to_string())
+        cf<Int> = socket_accept(fd) else 0
+        if (cf == 0) { println("PROBE_FAIL accept"); return 4 }
+        socket_set_timeout(cf, 120000)
+        println("PROBE_ACCEPTED")
+        want<Int> = mb * 1048576
+        got<Int> = 0
+        t0<Int> = time_mono_millis()
+        while (got < want) {
+            chunk<String> = socket_recv(cf, 65536) else ""
+            if (chunk.len() == 0) {
+                println("PROBE_FAIL recv got=" + got.to_string())
+                socket_close(cf)
+                socket_close(fd)
+                return 5
+            }
+            got = got + chunk.len()
+        }
+        t1<Int> = time_mono_millis()
+        ms<Int> = t1 - t0
+        if (ms < 1) { ms = 1 }
+        println("PROBE_RX_MB=" + (want / 1048576).to_string() + " ms=" + ms.to_string() + " mbps=" + (mb * 1000 / ms).to_string())
+        ackrc<Int> = socket_send(cf, "OK") else 0
+        if (ackrc <= 0) { println("PROBE_FAIL ack") }
+        i<Int> = 0
+        t2<Int> = time_mono_millis()
+        while (i < 200) {
+            p<String> = socket_recv(cf, 64) else ""
+            if (p.len() == 0) { break }
+            sentp<Int> = socket_send(cf, p) else 0
+            if (sentp <= 0) { break }
+            i = i + 1
+        }
+        t3<Int> = time_mono_millis()
+        println("PROBE_RTT_ROUNDS=" + i.to_string() + " total_ms=" + (t3 - t2).to_string())
+        socket_close(cf)
+        socket_close(fd)
+        println("PROBE_SERVER_DONE")
+        return 0
+    }
+    fd<Int> = socket_open(2, 1, 0) else 0
+    if (fd == 0) { println("PROBE_FAIL open"); return 1 }
+    c<Bool> = socket_connect(fd, ip, port) else false
+    if (!c) { println("PROBE_FAIL connect"); return 2 }
+    socket_set_timeout(fd, 120000)
+    println("PROBE_CONNECTED")
+    payload<String> = "abcdefgh"
+    while (payload.len() < 65536) {
+        payload = payload + payload
+    }
+    t0<Int> = time_mono_millis()
+    k<Int> = 0
+    while (k < mb) {
+        sent<Int> = socket_send(fd, payload) else 0
+        if (sent <= 0) {
+            println("PROBE_FAIL send k=" + k.to_string())
+            socket_close(fd)
+            return 3
+        }
+        k = k + 1
+    }
+    t1<Int> = time_mono_millis()
+    ms<Int> = t1 - t0
+    if (ms < 1) { ms = 1 }
+    println("PROBE_TX_MB=" + mb.to_string() + " ms=" + ms.to_string() + " mbps=" + (mb * 1000 / ms).to_string())
+    ack<String> = socket_recv(fd, 2) else ""
+    println("PROBE_ACK=" + ack)
+    tiny<String> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    t2<Int> = time_mono_millis()
+    r<Int> = 0
+    while (r < 200) {
+        sent2<Int> = socket_send(fd, tiny) else 0
+        if (sent2 <= 0) { break }
+        e<String> = socket_recv(fd, 64) else ""
+        if (e.len() == 0) { break }
+        r = r + 1
+    }
+    t3<Int> = time_mono_millis()
+    if (r > 0) {
+        println("PROBE_RTT_ROUNDS=" + r.to_string() + " avg_us=" + ((t3 - t2) * 1000 / r).to_string())
+    } else {
+        println("PROBE_RTT_FAIL")
+    }
+    socket_close(fd)
+    println("PROBE_CLIENT_DONE")
+    return 0
+}

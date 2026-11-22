@@ -3931,3 +3931,38 @@ re-pack is offline; the kernel slots into exl3_deq32f's dq1s launch).
 PER RICK'S DECISION FRAME: continue development on the Spark cluster; switch the model to an
 online provider for the testing duration. The 24GB streaming serve remains correct-and-green
 (draft 576, gates green) at ~3-5min/request for offline/batch use.
+=================== ROUND 10: THE SPARKS ARE THE PATH (TOOLCHAIN + P6 TRANSPORT) ==================
+DIRECTION (Rick): the Flash-on-24GB verdict stands (round 9); continue VybForge development on
+the Spark cluster. GLM serving suspended cleanly (stop.sh both ranks, logs saved; stack-watchdog
+cron line commented out of lefty's crontab — RESTORE IT when GLM comes back; nic-alert left on).
+Both Sparks: 117 GB MemAvailable, zero compute apps.
+ROADMAP PHASE: P6 — TP=2 over RoCE in Vyb (P4 done; the two Sparks' 242 GB is what makes the
+175.6 GB packed model resident). P5 (tokenizer) is not Spark-specific.
+TOOLCHAIN PROVENED (no OS/kernel update needed — userspace gaps only; the DGX OS + GB10/CUDA
+stack is vendor-pinned and working):
+  * lefty + righty git pull -> main 13293775 (the network bytes API 1d000a31 rides this).
+  * LLVM 18.1.3: runtime lib already installed; the DEV package was missing -> rootless
+    apt-get download llvm-18-dev llvm-18 + dpkg-deb -x into ~/vybdeps/llvm18; symlink the
+    system /usr/lib/llvm-18/lib/* files the prefix lacks (libLTO.so.18.1 etc.).
+  * Ubuntu's llvm-18-dev expects CMake >= 4 (FindTerminfo) but ships no module -> CMake 4.0.2
+    tarball into ~/vybdeps/cmake4 PLUS two stub modules in ~/vybdeps/cmake-modules
+    (FindTerminfo, FindFFI -> the versioned .so files; no -dev symlinks on the box).
+    ORDER MATTERS: CMAKE_MODULE_PATH="$HOME/vybdeps/cmake-modules;$LLVM_CMAKE_DIR" (mine first —
+    the LLVM dir's own FindTerminfo wants Terminfo_LINKABLE and shadows the stub otherwise).
+  * Catch2: NOT tests-only — include/vyb/parser/parser.hpp includes catch2 unconditionally, so
+    the stub config builds a broken compiler. Built Catch2 v3.7.1 rootless into
+    ~/vybdeps/catch2 (Catch2_DIR=.../lib/cmake/Catch2).
+  * configure: -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=$HOME/vybdeps/llvm18/usr/lib/llvm-18/lib/cmake/llvm
+    -DCMAKE_MODULE_PATH="$HOME/vybdeps/cmake-modules;$LLVM_DIR" -DCatch2_DIR=$HOME/vybdeps/catch2/lib/cmake/Catch2
+    -DBUILD_TESTING=OFF -DVYB_BINDGEN_LIBCLANG=OFF -DVYB_USE_QT5=OFF -DVYB_USE_OPENSSL=OFF
+    (OpenSSL: the Oct-11 build's ~/vybdeps/root bundle is gone -> tls module OFF for now; re-bundle
+    or apt-download libssl-dev if the tls module is needed).
+  * RESULT: build2/vyb = Vyb 0.7.7 Release on BOTH Sparks (verify: build2/vyb --version).
+TRANSPORT (native/host/transport_probe.vyb): Vyb-native TCP over the CX7 fabric, lefty
+192.168.192.1:9143 <-> righty 192.168.192.2. Loopback 7.5 GB/s / 15 us RTT. FABRIC: burst
+~9.1 GB/s (9142 MB/s) but the transfer TRUNCATES at the 16 MiB socket-buffer boundary — the
+stdlib's socket_send returns the BUFFERED count and silently drops the remainder (server drains
+16,777,280 B then EOF; the client's ack-wait gets "" and RTT fails). FIX BEFORE P6 ALL-GATHER:
+socket_send must loop on partial writes (or the caller must chunk by SO_SNDBUF), and socket_close
+needs a linger policy so a close racing unsent data cannot RST the stream. This is a STDLIB bug
+worth fixing upstream (Vyb), not a fabric limit — the burst shows the link is fine.
