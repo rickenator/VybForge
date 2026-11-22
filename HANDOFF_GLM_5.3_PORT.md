@@ -3854,3 +3854,15 @@ drift is not monotonic; the watch stands), gate B 1.203e-4 unchanged, draft 576 
 ebaa31aadb52 x2. Cumulative f32 win: ~-10.5s/request (the dense branch is only 3 layers).
 REMAINING: moe_tail_step + the inline loop (the decode mirrors — these feed the gates directly,
 pair with a fresh gate read), then the full-pipeline f32 for the 24GB Flash play.
+=================== ROUND 7e: THE F32 OUTPUT PATH — INCREMENT 5 (89706cf) ==================
+The decode mirrors: moe_tail_step (signature grows fcast32/fgp/fgr/pb32; the three expert deqs
+exl3_deq32f, the three mms mm_host32) and the serve's inline routed-expert loop likewise. Every
+expert-weight site in the serve path is now f32 EXCEPT mtp_layer_step (layer 45) which is
+DELIBERATELY f64 — it is gate B's direct input and gets its own increment with a dedicated gate
+read. DECODE_MTP x2 IDENTICAL GREEN: gate A 3.397e-6 (down again — the decode mirrors barely move
+it; gate A's input is the prefill hidden), gate B 1.203e-4 EXACTLY unchanged across ALL five f32
+increments — confirming gate B measures the EXL3 dequant noise, not the gemm precision, so the
+layer-45 conversion's risk to gate B is lower than feared. Draft 576 = oracle, digests
+7640fda783fa x2. Cumulative f32 win: ~-11s/request (mm 7248->~2900s-class, deq, stageS).
+NEXT: mtp_layer_step on f32 (the last expert site; watch gate A/B on a fresh read), then the
+full-pipeline f32 for the 24GB Flash play (skill references/f32-output-path.md).
