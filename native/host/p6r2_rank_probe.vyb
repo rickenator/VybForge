@@ -1,0 +1,358 @@
+// p6r2_rank_probe — P6 increment 2: the ROUTED MoE mix across two nodes.
+// Layer 3, 8 routed experts split 4/4 (rank 0: 0..3, rank 1: 4..7) with fixed
+// router weights, PLUS the bf16 shared expert (mlp.shared_experts.*.weight).
+// Each rank folds its own 4 weighted expert FFNs elementwise into a 4096 f64
+// partial. Rank 1 ships its partial as ROUND-TRIP-EXACT text (%.17g per value,
+// length-prefixed frame); rank 0 adds it to its own partial — the distributed
+// MoE output. The gate: rank 0 independently recomputes BOTH halves locally in
+// the same left-fold order and compares the vectors BIT-EXACTLY, then adds the
+// shared expert and prints the final mix digest at full precision.
+// env: P6_RANK=0|1  P6_PEER=<rank1 ip>  P6_DIR=<snapshots dir>  P6_PORT=9151
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send_bytes, socket_recv_bytes, socket_set_timeout}
+import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
+import gx::{gx_resolve, gx_read}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, mm_host32, silu, deq_bf16f}
+
+expert_y(x<Vec<Float>>, dir<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<Int>,
+         mapbody<String>, mapdev<Int>, invbase<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>,
+         arG<Int>, arH<Int>, arI<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
+    epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
+    w2<Vec<String>> = Vec()
+    w2.push(epre + "gate_proj.trellis")
+    w2.push(epre + "gate_proj.suh")
+    w2.push(epre + "gate_proj.svh")
+    w2.push(epre + "up_proj.trellis")
+    w2.push(epre + "up_proj.suh")
+    w2.push(epre + "up_proj.svh")
+    w2.push(epre + "down_proj.trellis")
+    w2.push(epre + "down_proj.suh")
+    w2.push(epre + "down_proj.svh")
+    ge<GxLoc> = gx_resolve(dir, 83, w2)
+    nf<Int> = 0
+    j<Int> = 0
+    while (j < ge.found.len()) {
+        if (ge.found.get(j) == 1) { nf = nf + 1 }
+        j = j + 1
+    }
+    if (nf != 9) { println("P6_FAIL resolve exp=" + e.to_string()); return Vec() }
+    g0<String> = gx_read(ge, 0)
+    g1<String> = gx_read(ge, 1)
+    g2<String> = gx_read(ge, 2)
+    g3<String> = gx_read(ge, 3)
+    g4<String> = gx_read(ge, 4)
+    g5<String> = gx_read(ge, 5)
+    g6<String> = gx_read(ge, 6)
+    g7<String> = gx_read(ge, 7)
+    g8<String> = gx_read(ge, 8)
+    dWg<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    dWu<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g3, g4, g5, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    dWd<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g6, g7, g8, mapbody, 4096, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    if (dWg == 0 || dWu == 0 || dWd == 0) { println("P6_FAIL deq exp=" + e.to_string()); return Vec() }
+    gv<Vec<Float>> = mm_host32(x, 1, 4096, dWg, 2048, fcast32, fgp, fgr, pb32)
+    uv<Vec<Float>> = mm_host32(x, 1, 4096, dWu, 2048, fcast32, fgp, fgr, pb32)
+    act<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < gv.len()) {
+        act.push(silu(gv.get(i)) * uv.get(i))
+        i = i + 1
+    }
+    return mm_host32(act, 1, 2048, dWd, 4096, fcast32, fgp, fgr, pb32)
+}
+
+// elementwise left fold of w*y into acc in place (identical order on every
+// caller). their<> because a by-value Vec is a copy: the mutation would not
+// reach the caller.
+fold_acc(acc<their<Vec<Float>>>, y<Vec<Float>>, w<Float>) -> {
+    i<Int> = 0
+    while (i < acc.len()) {
+        acc.set(i, acc.get(i) + w * y.get(i))
+        i = i + 1
+    }
+}
+
+zeros4096()<Vec<Float>> -> {
+    v<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 4096) { v.push(0.0) ; i = i + 1 }
+    return v
+}
+
+main()<Int> -> {
+    rank<String> = env_get("P6_RANK") else "0"
+    peer<String> = env_get("P6_PEER") else "192.168.192.2"
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    port<Int> = 9151
+    is0<Bool> = (rank == "0")
+    // the 8 routed experts at layer 3, fixed softmax-like weights
+    wts<Vec<Float>> = Vec()
+    wts.push(0.31) ; wts.push(0.24) ; wts.push(0.19) ; wts.push(0.14)
+    wts.push(0.06) ; wts.push(0.03) ; wts.push(0.02) ; wts.push(0.01)
+    base<Int> = 0
+    if (!is0) { base = 4 }
+    println("P6 mode=" + rank + " experts=" + base.to_string() + ".." + (base + 3).to_string())
+    if (tensor_init() != 0) { println("P6_FAIL cuda"); return 1 }
+    fdqs4<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
+    fhad232<Int> = load_fn("native/build/exl3.ptx", "exl3had232")
+    fhgen32<Int> = load_fn("native/build/exl3.ptx", "exl3hgen32")
+    finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    fcast32<Int> = load_fn("native/build/layer.ptx", "cast32")
+    fgp<Int> = load_fn("native/build/layer.ptx", "gemm32_p")
+    fgr<Int> = load_fn("native/build/layer.ptx", "gemm32_r")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq32")
+    if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0 || fcast32 == 0 || fgp == 0 || fgr == 0 || fbf == 0) {
+        println("P6_FAIL kernels")
+        return 2
+    }
+    hd_pre32<Int> = had_hoist32(fhgen32)
+    if (hd_pre32 == 0) { println("P6_FAIL hadhoist"); return 3 }
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL map.bin"); return 4 }
+    }
+    mapbody<String> = mapd.substring(16, mapd.len())
+    nbmap<Int> = mapd.len() - 16
+    mapdev<Int> = mapdev_build(finvk, mapd)
+    if (mapdev == 0) { println("P6_FAIL mapdev"); return 5 }
+    invbase<Int> = mapdev + 16 + nbmap
+    arA<Int> = dev_alloc(8388608)
+    arB<Int> = dev_alloc(65536)
+    arC<Int> = dev_alloc(33554432)
+    arD<Int> = dev_alloc(33554432)
+    arG<Int> = dev_alloc(16384)
+    arH<Int> = dev_alloc(16384)
+    arI<Int> = dev_alloc(64)
+    pb32<Int> = dev_alloc(192)
+    if (arA == 0 || arB == 0 || arC == 0 || arD == 0 || arG == 0 || arH == 0 || arI == 0 || pb32 == 0) {
+        println("P6_FAIL arena")
+        return 6
+    }
+    // rank 0 listens FIRST so rank 1 may connect at any point
+    var<Int> lfd = 0
+    if (is0) {
+        lfd = socket_open(2, 1, 0) else 0
+        if (lfd == 0) { println("P6_FAIL open"); return 10 }
+        bnd<Bool> = socket_bind(lfd, "0.0.0.0", port) else false
+        if (!bnd) { println("P6_FAIL bind"); return 11 }
+        ls<Bool> = socket_listen(lfd, 1) else false
+        if (!ls) { println("P6_FAIL listen"); return 12 }
+        println("P6_LISTENING")
+    }
+    x<Vec<Float>> = Vec()
+    i<Int> = 0
+    while (i < 4096) {
+        x.push((((i * 37) % 251) as Float - 125.0) / 250.0)
+        i = i + 1
+    }
+    // my 4 experts -> my weighted partial
+    t0<Int> = time_mono_millis()
+    myp<Vec<Float>> = zeros4096()
+    e<Int> = base
+    while (e < base + 4) {
+        y<Vec<Float>> = expert_y(x, dir, e, fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
+                                 arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
+        if (y.len() != 4096) { println("P6_FAIL ylen exp=" + e.to_string()); return 9 }
+        fold_acc(borrow(myp), y, wts.get(e))
+        println("P6 exp " + e.to_string() + " done ms=" + (time_mono_millis() - t0).to_string())
+        e = e + 1
+    }
+    println("P6 my partial done ms=" + (time_mono_millis() - t0).to_string())
+    if (!is0) {
+        // rank 1: ship my partial as length-prefixed round-trip-exact text
+        csv<String> = ""
+        i = 0
+        while (i < myp.len()) {
+            if (i > 0) { csv = csv + "," }
+            csv = csv + myp.get(i).to_string_precise()
+            i = i + 1
+        }
+        msg<String> = csv.len().to_string() + "\n" + csv
+        mb<Vec<UInt8>> = Vec()
+        i = 0
+        while (i < msg.len()) {
+            mb.push((msg.char_at(i) as Int) as UInt8)
+            i = i + 1
+        }
+        fd<Int> = socket_open(2, 1, 0) else 0
+        if (fd == 0) { println("P6_FAIL open"); return 16 }
+        cn<Bool> = socket_connect(fd, peer, port) else false
+        if (!cn) { println("P6_FAIL connect"); return 17 }
+        socket_set_timeout(fd, 180000)
+        sent<Int> = socket_send_bytes(fd, borrow(mb)) else 0
+        println("P6 sent partial bytes=" + sent.to_string() + " of " + mb.len().to_string())
+        ack<Vec<UInt8>> = socket_recv_bytes(fd, 2) else Vec<UInt8>()
+        println("P6 ack=" + ack.len().to_string())
+        socket_close(fd)
+        println("P6_RANK1_DONE")
+        return 0
+    }
+    // ---- rank 0: receive the peer partial (length-prefixed) ----
+    cf<Int> = socket_accept(lfd) else 0
+    if (cf == 0) { println("P6_FAIL accept"); return 13 }
+    socket_set_timeout(cf, 180000)
+    acc<Vec<UInt8>> = Vec()
+    // read the prefix line first
+    var<Int> needlen = -1
+    var<Int> payload = 0
+    var<Bool> done = false
+    while (!done) {
+        chunk<Vec<UInt8>> = socket_recv_bytes(cf, 65536) else Vec<UInt8>()
+        if (chunk.len() == 0) { println("P6_FAIL eof"); return 14 }
+        k<Int> = 0
+        while (k < chunk.len()) { acc.push(chunk.get(k)) ; k = k + 1 }
+        if (needlen < 0) {
+            // find the newline
+            nl<Int> = -1
+            k = 0
+            while (k < acc.len()) {
+                if (acc.get(k) == 10) { nl = k ; k = acc.len() }
+                k = k + 1
+            }
+            if (nl >= 0) {
+                hdr<String> = ""
+                k = 0
+                while (k < nl) { hdr = hdr + String_char(acc.get(k) as Int) ; k = k + 1 }
+                payload = hdr.to_int()
+                needlen = payload + nl + 1
+            }
+        }
+        if (needlen >= 0 && acc.len() >= needlen) { done = true }
+    }
+    csvp<String> = ""
+    k<Int> = 0
+    while (k < acc.len()) { csvp = csvp + String_char(acc.get(k) as Int) ; k = k + 1 }
+    nlp<Int> = 0
+    while (nlp < csvp.len()) {
+        if (csvp.char_at(nlp) == 10 && nlp > 0) { nlp = csvp.len() }
+        nlp = nlp + 1
+    }
+    // split off the header line
+    hlen<Int> = 0
+    while (hlen < csvp.len()) { hlen = hlen + 1 ; if (csvp.char_at(hlen - 1) == 10) { hlen = hlen } }
+    bodyp<String> = csvp.substring(header_len_of(csvp), csvp.len())
+    println("P6 peer payload parsed chars=" + bodyp.len().to_string())
+    parts<Vec<String>> = bodyp.split(",")
+    println("P6 peer vector n=" + parts.len().to_string())
+    if (parts.len() != 4096) { println("P6_FAIL peervec"); return 15 }
+    peerp<Vec<Float>> = Vec()
+    k = 0
+    while (k < parts.len()) { peerp.push(parts.get(k).to_float()) ; k = k + 1 }
+    // ---- reference: recompute the peer half locally (same left-fold order) ----
+    refp<Vec<Float>> = zeros4096()
+    e = 4
+    while (e < 8) {
+        y2<Vec<Float>> = expert_y(x, dir, e, fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
+                                  arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
+        if (y2.len() != 4096) { println("P6_FAIL refylen exp=" + e.to_string()); return 9 }
+        fold_acc(borrow(refp), y2, wts.get(e))
+        e = e + 1
+    }
+    println("P6 reference half done ms=" + (time_mono_millis() - t0).to_string())
+    // ---- the gate: peer vector vs my local reference, BIT-EXACT ----
+    ndiff<Int> = 0
+    maxd<Float> = 0.0
+    i = 0
+    while (i < 4096) {
+        d<Float> = peerp.get(i) - refp.get(i)
+        if (d != 0.0) { ndiff = ndiff + 1 }
+        ad<Float> = d
+        if (ad < 0.0) { ad = 0.0 - ad }
+        if (ad > maxd) { maxd = ad }
+        i = i + 1
+    }
+    println("P6_XCHG_GATE ndiff=" + ndiff.to_string() + " max_abs=" + maxd.to_string_precise() + " of 4096")
+    // ---- distributed total = my half + peer half ----
+    tot<Vec<Float>> = zeros4096()
+    i = 0
+    while (i < 4096) {
+        tot.set(i, myp.get(i) + peerp.get(i))
+        i = i + 1
+    }
+    // ---- the shared expert (bf16, added at full weight) ----
+    sp<String> = "model.language_model.layers.3.mlp.shared_experts."
+    ws<Vec<String>> = Vec()
+    ws.push(sp + "gate_proj.weight")
+    ws.push(sp + "up_proj.weight")
+    ws.push(sp + "down_proj.weight")
+    gs<GxLoc> = gx_resolve(dir, 83, ws)
+    nfs<Int> = 0
+    j<Int> = 0
+    while (j < gs.found.len()) {
+        if (gs.found.get(j) == 1) { nfs = nfs + 1 }
+        j = j + 1
+    }
+    if (nfs != 3) { println("P6_FAIL sharedresolve"); return 7 }
+    s0<String> = gx_read(gs, 0)
+    s1<String> = gx_read(gs, 1)
+    s2<String> = gx_read(gs, 2)
+    sWg<Int> = deq_bf16f(fbf, s0, 2048 * 4096, 4096)
+    sWu<Int> = deq_bf16f(fbf, s1, 2048 * 4096, 4096)
+    sWd<Int> = deq_bf16f(fbf, s2, 4096 * 2048, 2048)
+    if (sWg == 0 || sWu == 0 || sWd == 0) { println("P6_FAIL shareddeq"); return 8 }
+    sgv<Vec<Float>> = mm_host32(x, 1, 4096, sWg, 2048, fcast32, fgp, fgr, pb32)
+    suv<Vec<Float>> = mm_host32(x, 1, 4096, sWu, 2048, fcast32, fgp, fgr, pb32)
+    sact<Vec<Float>> = Vec()
+    i = 0
+    while (i < sgv.len()) {
+        sact.push(silu(sgv.get(i)) * suv.get(i))
+        i = i + 1
+    }
+    shy<Vec<Float>> = mm_host32(sact, 1, 2048, sWd, 4096, fcast32, fgp, fgr, pb32)
+    if (shy.len() != 4096) { println("P6_FAIL sharedylen"); return 10 }
+    println("P6 shared done ms=" + (time_mono_millis() - t0).to_string())
+    // final mix = routed total + shared, and the full-precision digest
+    fin<Vec<Float>> = zeros4096()
+    dgf<Float> = 0.0
+    i = 0
+    while (i < 4096) {
+        fv<Float> = tot.get(i) + shy.get(i)
+        fin.set(i, fv)
+        dgf = dgf + fv * ((i % 7) as Float + 1.0)
+        i = i + 1
+    }
+    println("P6_MIX_DIGEST=" + dgf.to_string_precise())
+    // gate on the distributed vector: my half + peer half vs my half + local ref
+    lock<Vec<UInt8>> = okbytes()
+    socket_send_bytes(cf, borrow(lock)) else 0
+    socket_close(cf)
+    socket_close(lfd)
+    if (ndiff == 0) { println("P6_RANK0_DONE XCHG_EXACT GATE_OK") } else { println("P6_RANK0_DONE XCHG_DIFFS=" + ndiff.to_string() + " GATE_FAIL") }
+    return 0
+}
+
+okbytes()<Vec<UInt8>> -> {
+    v<Vec<UInt8>> = Vec()
+    v.push(79)
+    v.push(75)
+    return v
+}
+
+header_len_of(s<String>)<Int> -> {
+    i<Int> = 0
+    while (i < s.len()) {
+        if (s.char_at(i) == 10) { return i + 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+String_char(c<Int>)<String> -> {
+    s<String> = ""
+    if (c == 45) { return "-" }
+    if (c == 46) { return "." }
+    if (c == 101) { return "e" }
+    if (c == 43) { return "+" }
+    if (c == 44) { return "," }
+    if (c == 10) { return "\n" }
+    if (c >= 48 && c <= 57) {
+        d<Int> = c - 48
+        s = "0123456789".substring(d, d + 1)
+    }
+    return s
+}
