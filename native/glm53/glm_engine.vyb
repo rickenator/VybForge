@@ -28,6 +28,7 @@ import io::{open_read, read_at, read_all, open_write, open_append, write_str, cl
 import env::{env_get}
 import safetensors
 import gx
+import collections::{HashMap}
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
 import vmath::{vexp, vsqrt}
 import time::{time_mono_millis}
@@ -2821,6 +2822,52 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     # (1.7 -> 9.5 s) from the String churn, so at 45 layers it loses badly. Keep per-expert
     # resolution here; the win came from caching the shard header inside gx_resolve and from
     # reading the 15.5 MB index ONCE per layer instead of once per expert.
+            # ---- the fast resolve: build the local name map from this layer's
+            # tab ONCE per layer (~17ms; ~1185 entries stays cache-hot), then
+            # O(1) HashMap lookups per expert instead of ~9 full-tab index_of
+            # scans (~130ms) each. Measured FASTER than a process-wide map
+            # (0.7s vs 1.5s per request — the small map stays hot) and leak-
+            # free, unlike the setup-built map passed by borrow (which balloons
+            # phase 2 by ~60GB — mechanism unknown; the borrow call path itself
+            # probes clean, so the leak is in the runtime's long-lived-map
+            # interaction with the phase-2 String churn). Any miss falls back
+            # to the legacy resolve; the fallback ASSIGNS (no redeclare).
+            nm<HashMap<String, String>> = HashMap<String, String>(2048)
+            nmP<Int> = 0
+            while (nmP < tab.len()) {
+                nmLE<Int> = nmP
+                nmSP<Int> = 0 - 1
+                nmC<Int> = 0
+                nmD<Int> = 0
+                while (nmLE < tab.len() && nmD == 0) {
+                    nmC = (tab.char_at(nmLE) as Int) & 255
+                    if (nmC == 10) { nmD = 1 } else {
+                        if (nmSP < 0 && nmC == 32) { nmSP = nmLE }
+                        nmLE = nmLE + 1
+                    }
+                }
+                if (nmSP > nmP && nmLE > nmSP) {
+                    nmTN<String> = tab.substring(nmP, nmSP)
+                    nmS1<Int> = 0
+                    nmS2<Int> = 0
+                    nmS3<Int> = 0
+                    nmF<Int> = 0
+                    nmK<Int> = nmSP + 1
+                    while (nmK < nmLE) {
+                        nmC = (tab.char_at(nmK) as Int) & 255
+                        if (nmC == 32) { nmF = nmF + 1 }
+                        if (nmF == 0 && nmC >= 48 && nmC <= 57) { nmS1 = nmS1 * 10 + (nmC - 48) }
+                        if (nmF == 1 && nmC >= 48 && nmC <= 57) { nmS2 = nmS2 * 10 + (nmC - 48) }
+                        if (nmF == 2 && nmC >= 48 && nmC <= 57) { nmS3 = nmS3 * 10 + (nmC - 48) }
+                        nmK = nmK + 1
+                    }
+                    if (nmF >= 2) {
+                        dummyB<Bool> = nm.put(nmTN, nmS1.to_string() + " " + nmS2.to_string() + " " + nmS3.to_string())
+                    }
+                }
+                nmP = nmLE + 1
+            }
+    # (the fast-path map is built here, at LAYER scope: one build per layer, not per expert)
     ixL<StIndex> = st_open("")
     shL<Int> = 0
     e = 0
@@ -2855,7 +2902,50 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             w2.push(epre + "down_proj.trellis")
             w2.push(epre + "down_proj.suh")
             w2.push(epre + "down_proj.svh")
-            ge<GxLoc> = gx_resolve_tab(tab, dir, total, w2)
+            ge<GxLoc> = GxLoc { found = Vec(), shard = Vec(), tix = Vec(), off = Vec(), nbytes = Vec(),
+                               dts = Vec(), paths = Vec() }
+            fastR<Int> = 1
+            j2<Int> = 0
+            nkR<String> = ""
+            e0R<String> = ""
+            while (j2 < w2.len()) {
+                nkR = w2.get(j2)
+                e0R = nm.get(nkR) else ""
+                if (e0R.len() == 0) { fastR = 0 }
+                j2 = j2 + 1
+            }
+            if (fastR == 1) {
+                j2 = 0
+                while (j2 < w2.len()) {
+                    nkR = w2.get(j2)
+                    e0R = nm.get(nkR) else ""
+                    shv<Int> = 0
+                    ov<Int> = 0
+                    lv<Int> = 0
+                    fld<Int> = 0
+                    k4<Int> = 0
+                    while (k4 < e0R.len()) {
+                        c4<Int> = (e0R.char_at(k4) as Int) & 255
+                        if (c4 == 32) { fld = fld + 1 }
+                        if (fld == 0 && c4 >= 48 && c4 <= 57) { shv = shv * 10 + (c4 - 48) }
+                        if (fld == 1 && c4 >= 48 && c4 <= 57) { ov = ov * 10 + (c4 - 48) }
+                        if (fld == 2 && c4 >= 48 && c4 <= 57) { lv = lv * 10 + (c4 - 48) }
+                        k4 = k4 + 1
+                    }
+                    padR<String> = shv.to_string()
+                    while (padR.len() < 5) { padR = "0" + padR }
+                    ge.found.push(1)
+                    ge.tix.push(0)
+                    ge.shard.push(shv)
+                    ge.off.push(ov)
+                    ge.nbytes.push(lv)
+                    ge.dts.push("BF16")
+                    ge.paths.push(dir + "/model-" + padR + "-of-00083.safetensors")
+                    j2 = j2 + 1
+                }
+            } else {
+                ge = gx_resolve_tab(tab, dir, total, w2)
+            }
             tR = time_mono_millis()
             acc_res = acc_res + (tR - tA)
             nfound = 0
