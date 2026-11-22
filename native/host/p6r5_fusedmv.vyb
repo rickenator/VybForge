@@ -453,6 +453,7 @@ main()<Int> -> {
     wr_pdev(pbm, 40, m6)
     wr_pdev(pbm, 48, m7)
     wr_pdev(pbm, 56, m8)
+    wr_pdev(pbm, 64, 0)
     rcm<Int> = launch_kernel(fmv, 8192, pbm)
     println("P6R5 DBG mv_launch_rc=" + rcm.to_string())
     cuCtxSynchronize()
@@ -501,6 +502,17 @@ main()<Int> -> {
     }
     rel<Float> = mx / (nn + 1e-30)
     println("P6R5_GATE max_abs=" + mx.to_string_precise() + " over_max=" + nn.to_string_precise() + " rel=" + rel.to_string_precise() + " over1e-3=" + nd.to_string())
+    // what is zero: yraw or sv?
+    fcv2<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    yrd2<Int> = dev_alloc(64)
+    pbcv2<Int> = dev_alloc(24)
+    wr_pdev(pbcv2, 0, byr)
+    wr_pdev(pbcv2, 8, yrd2)
+    wr_pdev(pbcv2, 16, 4)
+    launch_kernel(fcv2, 1, pbcv2)
+    cuCtxSynchronize()
+    yrv<Vec<Float>> = bulk_dtoh(yrd2, 4)
+    println("P6R5 DBG yraw0=" + yrv.get(0).to_string_precise() + " yraw1=" + yrv.get(1).to_string_precise() + " sv0=" + f16_host(g2, 0).to_string_precise() + " sv1=" + f16_host(g2, 1).to_string_precise())
     println("P6R5 DBG new_y0=" + ynew.get(0).to_string_precise() + " new_y1=" + ynew.get(1).to_string_precise() + " new_y2=" + ynew.get(2).to_string_precise())
     println("P6R5 DBG B0_0=" + wcol.get(0).to_string_precise() + " B0_1=" + wcol.get(1).to_string_precise() + " B0_2=" + wcol.get(2).to_string_precise())
     if (oneshot) {

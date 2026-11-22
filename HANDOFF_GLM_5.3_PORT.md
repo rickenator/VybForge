@@ -4319,3 +4319,19 @@ across loads in-process (it calls cuModuleLoadData per call, so a fresh module e
 NEXT: either (i) inline the reference matvec INTO the fused kernel behind a param switch (avoids
 the load path entirely), or (ii) investigate the load_fn failure — it is a real tooling defect
 worth understanding since every probe depends on it.
+=== ROUND 28: THE ALGEBRAIC BUG FOUND (sv ordering) — and a new symptom ===
+Host-side reference (no kernel loads; T cast to f64 on the device, compared in Vyb host code):
+    U_DIFF count_over_1e-4=0 sum_absdiff=0     (fused yraw == sv.(T^T xp) over 2048 outputs)
+    Y_DIFF count_over_1e-4=0 sum_absdiff=0     (fused y == H_out(u))
+i.e. the whole fused chain is SELF-consistent against a reference built from the proven decode.
+But it disagreed with the VERIFIED B, and expanding B's definition shows why:
+    y[n] = sv[n] . sum_j H[n][j] . u[j]        <-- sv scales AFTER the Hadamard
+Both sv (a diagonal on the output axis) and H act on the SAME axis and do NOT commute. The
+kernel applied sv to u BEFORE yhat (phase 2), so it was consistently computing H(sv.u) instead of
+sv.(H u). FIX APPLIED: phase 2 accumulates the raw u; exl3yhat takes sv (+32) and scales after.
+NEW SYMPTOM: with the fix, the one-shot run returns y = 0 exactly and yraw appears 0 too — a
+different failure than before, so the fix is not fully wired (suspect: the yhat param block or the
+staging that zeroes yraw, or the dump path interfering). This is the first thing to check next.
+DEBUGGING SPEND: rounds 20-28 on this kernel. Everything except the sv wiring is now PROVEN
+(layout, decode bit-identical, vector pass, dots, H transform). The remaining work is small but
+mechanical.
