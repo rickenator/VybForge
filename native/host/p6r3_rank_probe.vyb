@@ -13,11 +13,11 @@ import time::{time_mono_millis}
 import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send_bytes, socket_recv_bytes, socket_set_timeout}
 import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
 import gx::{gx_resolve, gx_read}
-import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, mm_host32, silu, deq_bf16f, sigmoid, f32_at, gx_resolve_tab, H, NE, ROUTE_TOPK, EINTER, ROUTED_SCALE}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, exl3_deq32f_into, exl3_deq32f_into_h, mm_host32, silu, deq_bf16f, sigmoid, f32_at, gx_resolve_tab, H, NE, ROUTE_TOPK, EINTER, ROUTED_SCALE}
 
 expert_y(x<Vec<Float>>, dir<String>, tab3<String>, e<Int>, fdqs4<Int>, fhad232<Int>, hd_pre32<Int>,
          mapbody<String>, mapdev<Int>, invbase<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>,
-         arG<Int>, arH<Int>, arI<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
+         arG<Int>, arH<Int>, arI<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>, b0<Int>, b1<Int>, b2<Int>, fhadh<Int>, useh<Bool>)<Vec<Float>> -> {
     epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
     w2<Vec<String>> = Vec()
     w2.push(epre + "gate_proj.trellis")
@@ -51,12 +51,24 @@ expert_y(x<Vec<Float>>, dir<String>, tab3<String>, e<Int>, fdqs4<Int>, fhad232<I
     trc<Int> = time_mono_millis()
     println("P6R3 exp " + e.to_string() + " resolve_ms=" + (trb - tra).to_string() + " read_ms=" + (trc - trb).to_string())
     tm0<Int> = time_mono_millis()
-    dWg<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
-                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
-    dWu<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g3, g4, g5, mapbody, 2048, 32768, hd_pre32,
-                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
-    dWd<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g6, g7, g8, mapbody, 4096, 32768, hd_pre32,
-                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    var<Int> dWg = 0
+    var<Int> dWu = 0
+    var<Int> dWd = 0
+    if (useh) {
+        dWg = exl3_deq32f_into_h(0, 0, fdqs4, 0, fhadh, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b0)
+        dWu = exl3_deq32f_into_h(0, 0, fdqs4, 0, fhadh, g3, g4, g5, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b1)
+        dWd = exl3_deq32f_into_h(0, 0, fdqs4, 0, fhadh, g6, g7, g8, mapbody, 4096, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b2)
+    } else {
+        dWg = exl3_deq32f_into(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b0)
+        dWu = exl3_deq32f_into(0, 0, fdqs4, 0, fhad232, g3, g4, g5, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b1)
+        dWd = exl3_deq32f_into(0, 0, fdqs4, 0, fhad232, g6, g7, g8, mapbody, 4096, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, b2)
+    }
     if (dWg == 0 || dWu == 0 || dWd == 0) { println("P6_FAIL deq exp=" + e.to_string()); return Vec() }
     tm1<Int> = time_mono_millis()
     gv<Vec<Float>> = mm_host32(x, 1, 4096, dWg, 2048, fcast32, fgp, fgr, pb32)
@@ -103,6 +115,11 @@ main()<Int> -> {
     fgp<Int> = load_fn("native/build/layer.ptx", "gemm32_p")
     fgr<Int> = load_fn("native/build/layer.ptx", "gemm32_r")
     fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq32")
+    fhadh<Int> = load_fn("native/build/exl3h.ptx", "exl3had232h")
+    // P6_HADH=1 switches the epilogue to the staged-shared kernel (bit-identical)
+    useh<Bool> = (env_get("P6_HADH") else "0") == "1"
+    if (useh && fhadh == 0) { println("P6_FAIL hadh"); return 2 }
+    println("P6R3 had epilogue=" + (if (useh) { "staged" } else { "plain" }))
     if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0 || fcast32 == 0 || fgp == 0 || fgr == 0 || fbf == 0) {
         println("P6_FAIL kernels")
         return 2
@@ -156,6 +173,12 @@ main()<Int> -> {
         println("P6_FAIL arena")
         return 6
     }
+    // three persistent 33.5 MB f32 deq outputs (gate/up/down are deq'd before the
+    // three gemms consume them, so they must not share one buffer)
+    fb0<Int> = dev_alloc(33554432)
+    fb1<Int> = dev_alloc(33554432)
+    fb2<Int> = dev_alloc(33554432)
+    if (fb0 == 0 || fb1 == 0 || fb2 == 0) { println("P6_FAIL f32bufs"); return 6 }
     var<Int> lfd = 0
     if (is0) {
         lfd = socket_open(2, 1, 0) else 0
@@ -255,7 +278,7 @@ main()<Int> -> {
     lane = lo
     while (lane < hi) {
         y<Vec<Float>> = expert_y(x, dir, tab3, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
-                                 arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
+                                 arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32, fb0, fb1, fb2, fhadh, useh)
         if (y.len() != 4096) { println("P6_FAIL ylen lane=" + lane.to_string()); return 9 }
         fold_acc(borrow(myp), y, wt.get(lane))
         println("P6R3 lane " + lane.to_string() + " exp " + sel.get(lane).to_string() + " done ms=" + (time_mono_millis() - t0).to_string())
@@ -379,7 +402,7 @@ main()<Int> -> {
     lane = 4
     while (lane < ROUTE_TOPK) {
         y2<Vec<Float>> = expert_y(x, dir, tab3, sel.get(lane), fdqs4, fhad232, hd_pre32, mapbody, mapdev, invbase,
-                                  arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32)
+                                  arA, arB, arC, arD, arG, arH, arI, fcast32, fgp, fgr, pb32, fb0, fb1, fb2, fhadh, useh)
         if (y2.len() != 4096) { println("P6_FAIL refylen"); return 9 }
         fold_acc(borrow(refp), y2, wt.get(lane))
         lane = lane + 1

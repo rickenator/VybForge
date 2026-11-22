@@ -4136,3 +4136,20 @@ dequant fused into tensor-core MMA (Blackwell FP4/FP8 + tcgen05), all routed exp
 NEXT STEPS: (a) profile the deq kernel itself (ALWAYS from a clean GPU), (b) prototype a fused
 deq+MMA kernel on one expert and compare against 13+2 ms, (c) synchronous-launch timing harness so
 benchmarks never include JIT startup.
+=== ROUND 18: DEQ KERNEL PROFILE (clean GPU, lefty) — where 13 ms/expert goes ===
+Per deq call (gate_proj, 4.2 MB packed -> 8.4M f32 = 33.5 MB out, exl3dq1s4 grid 8192,
+exl3had232 grid 32768):
+  htod trellis+suh+svh : 0 ms (async, overlapped)
+  exl3dq1s4 + sync     : 1 ms
+  exl3had232 + sync    : 2 ms   <- the largest single stage (the Hadamard epilogue)
+  alloc + param htod   : ~1 ms  (cuMemAlloc of the 33.5 MB f32 buffer PER CALL + 14 tiny htod)
+  full call            : 4 ms  -> x3 (gate/up/down) = 12-13 ms/expert, matching the loop timers
+PER EXPERT: deq 13 + gemm 1-2 + tensor read 4-5 = ~20 ms; 8 experts + shared = 188 ms (solo).
+TWO CHEAP WINS: (a) the per-call 33.5 MB alloc + param htod is ~15% of the deq (cache the f32
+buffers and the 6+8 param words once per expert shape); (b) fold had232 into the dq kernel's
+epilogue (it already has the tile in registers) — it is a pure elementwise Hadamard on the same
+output the dq just wrote, so it is currently a full 33.5 MB extra read+write round trip.
+THE BAR: 50 us/expert needs ~80x on this 4 ms. SIMT gather-deq cannot get there; the fused
+deq+MMA path (Blackwell FP4/FP8 tensor cores, tcgen05, all routed experts in one launch) is the
+only route. Estimate: TC matmul at these shapes is ~10-30 us; the dequant must be an epilogue,
+not a separate pass.

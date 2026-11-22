@@ -1422,7 +1422,146 @@ exl3_deq32f(fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int>,
     return outf
 }
 
+// exl3_deq32f_into — the caller owns the f32 output buffer. Same math, same
+// kernels, same order; the only difference is that the 33.5 MB f32 output is
+// NOT allocated per call (the per-call cuMemAlloc measured ~1 ms of a 4 ms
+// deq, ~15% of the expert's dequant). The CALLER must not hold the buffer
+// across two deqs: the next call overwrites it. Sequential deq->consume loops
+// (deq, gemm, deq, gemm...) are the intended use.
 share(all)
+exl3_deq32f_into(fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int>,
+         trellis<String>, suh<String>, svh<String>, body<String>,
+         cw<Int>, ntiles<Int>, hd_pre32<Int>,
+         qda<Int>, tda<Int>, oda<Int>, td2a<Int>,
+         suda<Int>, svda<Int>, pda<Int>, mda<Int>, ivb<Int>, outb<Int>)<Int> -> {
+    tb2<Int> = trellis.len()
+    nsuh2<Int> = suh.len()
+    nsvh2<Int> = svh.len()
+    if (tb2 < ntiles * 128) { println("EXL3FAIL32F size"); return 0 }
+    if (tb2 > 8388608) { println("EXL3FAIL32F trellis arena"); return 0 }
+    kn2<Int> = (ntiles / (cw / 16)) * 16 * cw
+    krows2<Int> = kn2 / cw
+    if ((nsuh2 % 8) != 0 || (nsvh2 % 8) != 0) { println("EXL3FAIL32F mod"); return 0 }
+    if (nsuh2 != krows2 * 2 || nsvh2 != cw * 2) { println("EXL3FAIL32F scales"); return 0 }
+    nbc2<Int> = cw / 128
+    nblocks2<Int> = (kn2 / cw / 128) * nbc2
+    freedom {
+        qd2<Int> = qda
+        td2f<Int> = tda
+        td2x<Int> = td2a
+        pd2<Int> = pda
+        sud2<Int> = suda
+        svd2<Int> = svda
+        fdx<Int> = outb
+        if (cuMemcpyHtoD_v2(qd2, trellis, tb2) != 0) { println("EXL3FAIL32F htod1"); return 0 }
+        if (cuMemcpyHtoD_v2(sud2, suh, nsuh2) != 0) { println("EXL3FAIL32F htod5"); return 0 }
+        if (cuMemcpyHtoD_v2(svd2, svh, nsvh2) != 0) { println("EXL3FAIL32F htod6"); return 0 }
+        pqf<Int> = 0
+        chqf<Int> = 0
+        while (pqf < 6) {
+            chqf = 0
+            if (pqf == 0) { chqf = qd2 }
+            if (pqf == 1) { chqf = mda }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = td2x }
+            if (pqf == 4) { chqf = cw }
+            if (pqf == 5) { chqf = ivb }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p1"); return 0 }
+            pqf = pqf + 1
+        }
+        lrcBf<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs4), ntiles / 4, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srBf<Int> = cuCtxSynchronize() as Int
+        if (lrcBf != 0 || srBf != 0) { println("EXL3FAIL32F dq1s"); return 0 }
+        pqf = 0
+        while (pqf < 8) {
+            chqf = 0
+            if (pqf == 0) { chqf = td2x }
+            if (pqf == 1) { chqf = fdx }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = sud2 }
+            if (pqf == 4) { chqf = svd2 }
+            if (pqf == 5) { chqf = cw }
+            if (pqf == 6) { chqf = nbc2 }
+            if (pqf == 7) { chqf = nblocks2 }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p2"); return 0 }
+            pqf = pqf + 1
+        }
+        lrcCf<Int> = cuda_launch4i(from<loc<CVoid>>(fhad232), nblocks2 * 64, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srCf<Int> = cuCtxSynchronize() as Int
+        if (lrcCf != 0 || srCf != 0) { println("EXL3FAIL32F had2"); return 0 }
+    }
+    return outb
+}
+
+// exl3_deq32f_into_h — same as exl3_deq32f_into but the Hadamard epilogue is
+// exl3had232h (exl3h.ptx): the 128x128 T tile is staged in shared by two CTAs
+// per block instead of being re-read from L2 128 times. Bit-identical math;
+// pass the exl3had232h function handle in the fhad232 slot.
+share(all)
+exl3_deq32f_into_h(fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int>,
+         trellis<String>, suh<String>, svh<String>, body<String>,
+         cw<Int>, ntiles<Int>, hd_pre32<Int>,
+         qda<Int>, tda<Int>, oda<Int>, td2a<Int>,
+         suda<Int>, svda<Int>, pda<Int>, mda<Int>, ivb<Int>, outb<Int>)<Int> -> {
+    tb2<Int> = trellis.len()
+    nsuh2<Int> = suh.len()
+    nsvh2<Int> = svh.len()
+    if (tb2 < ntiles * 128) { println("EXL3FAIL32F size"); return 0 }
+    if (tb2 > 8388608) { println("EXL3FAIL32F trellis arena"); return 0 }
+    kn2<Int> = (ntiles / (cw / 16)) * 16 * cw
+    krows2<Int> = kn2 / cw
+    if ((nsuh2 % 8) != 0 || (nsvh2 % 8) != 0) { println("EXL3FAIL32F mod"); return 0 }
+    if (nsuh2 != krows2 * 2 || nsvh2 != cw * 2) { println("EXL3FAIL32F scales"); return 0 }
+    nbc2<Int> = cw / 128
+    nblocks2<Int> = (kn2 / cw / 128) * nbc2
+    freedom {
+        qd2<Int> = qda
+        td2f<Int> = tda
+        td2x<Int> = td2a
+        pd2<Int> = pda
+        sud2<Int> = suda
+        svd2<Int> = svda
+        fdx<Int> = outb
+        if (cuMemcpyHtoD_v2(qd2, trellis, tb2) != 0) { println("EXL3FAIL32F htod1"); return 0 }
+        if (cuMemcpyHtoD_v2(sud2, suh, nsuh2) != 0) { println("EXL3FAIL32F htod5"); return 0 }
+        if (cuMemcpyHtoD_v2(svd2, svh, nsvh2) != 0) { println("EXL3FAIL32F htod6"); return 0 }
+        pqf<Int> = 0
+        chqf<Int> = 0
+        while (pqf < 6) {
+            chqf = 0
+            if (pqf == 0) { chqf = qd2 }
+            if (pqf == 1) { chqf = mda }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = td2x }
+            if (pqf == 4) { chqf = cw }
+            if (pqf == 5) { chqf = ivb }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p1"); return 0 }
+            pqf = pqf + 1
+        }
+        lrcBf<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs4), ntiles / 4, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srBf<Int> = cuCtxSynchronize() as Int
+        if (lrcBf != 0 || srBf != 0) { println("EXL3FAIL32F dq1s"); return 0 }
+        pqf = 0
+        while (pqf < 8) {
+            chqf = 0
+            if (pqf == 0) { chqf = td2x }
+            if (pqf == 1) { chqf = fdx }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = sud2 }
+            if (pqf == 4) { chqf = svd2 }
+            if (pqf == 5) { chqf = cw }
+            if (pqf == 6) { chqf = nbc2 }
+            if (pqf == 7) { chqf = nblocks2 }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p2"); return 0 }
+            pqf = pqf + 1
+        }
+        # the staged-shared had: TWO CTAs per 128x128 block (32 KB tile half each)
+        lrcCf<Int> = cuda_launch4i(from<loc<CVoid>>(fhad232), nblocks2 * 2, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srCf<Int> = cuCtxSynchronize() as Int
+        if (lrcCf != 0 || srCf != 0) { println("EXL3FAIL32F had2"); return 0 }
+    }
+    return outb
+}
 had_hoist(fhgen<Int>)<Int> -> {
     var<Int> out = 0
     freedom {

@@ -1,0 +1,63 @@
+// exl3h — the staged-shared Hadamard epilogue as its OWN module.
+// The plain exl3had232 re-reads each 64 KB T block ~128 times from L2 (one
+// 128-long dot per output; ~1.07G L2 loads per 2048x4096 dequant, ~2 ms).
+// Static shared is CAPPED AT 48 KB by the compiler (--kernel-shared 16..49152),
+// so a full 128x128 f32 tile (64 KB) does not fit: the tile is staged in TWO
+// CTAs per block instead, each owning a 64-column half (128 b-rows x 64 cols =
+// 8192 f32 = 32 KB). Every output then dots H against SHARED, and the block's
+// T traffic drops from 128x to 2x.
+// Bit-identical to exl3had232: same b-ascending f32 accumulation, same su*sv
+// epilogue, same store layout.
+// Launch: grid = nblocks * 2, 256 threads. Compile --kernel-shared 32768.
+// p: +0 tmp(f32), +8 out(f32), +16 H(f32), +24 suh, +32 svh, +40 cw, +48 nbc, +56 nblocks
+exl3had232h(p<Int>) -> {
+    T<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    SU<Int> = ld_i64(p + 24)
+    SV<Int> = ld_i64(p + 32)
+    cw<Int> = ld_i64(p + 40)
+    nbc<Int> = ld_i64(p + 48)
+    nblocks<Int> = ld_i64(p + 56)
+    tid<Int> = tid_x()
+    # CTA id: the grid is 1-D (grid.x = nblocks*2), so the block index IS blk_x().
+    # (blk_x()*dim_x() + tid_x() would be the THREAD id — the first attempt made
+    # that mistake and every CTA addressed a 256x-too-large block.)
+    ctid<Int> = blk_x()
+    block<Int> = ctid / 2
+    half<Int> = ctid - block * 2
+    dbase<Int> = half * 64
+    if (block < nblocks) {
+        # stage T[block][.., dbase..dbase+64): 8192 f32 = 32 KB, 256 threads x 32
+        k<Int> = 0
+        while (k < 32) {
+            e<Int> = tid + k * 256
+            b<Int> = e / 64
+            d<Int> = e - b * 64
+            st_shared_f32((b * 64 + d) * 4, ld_f32n(T + (block * 16384 + b * 128 + dbase + d) * 4))
+            k = k + 1
+        }
+        kernel_barrier()
+        # 32 outputs per thread: idx = tid + j*256 over (a, d) with d in [0,64)
+        j<Int> = 0
+        while (j < 32) {
+            idx<Int> = tid + j * 256
+            a<Int> = idx / 64
+            d<Int> = idx - a * 64
+            acc<Float32> = 0.0
+            b<Int> = 0
+            while (b < 128) {
+                acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_shared_f32((b * 64 + d) * 4)
+                b = b + 1
+            }
+            kbv<Int> = block / nbc
+            nbv<Int> = block - kbv * nbc
+            row<Int> = kbv * 128 + a
+            col<Int> = nbv * 128 + dbase + d
+            su<Float32> = ld_f16(SU + row * 2) as Float32
+            sv<Float32> = ld_f16(SV + col * 2) as Float32
+            st_f32(O + (row * cw + col) * 4, acc * su * sv)
+            j = j + 1
+        }
+    }
+}
