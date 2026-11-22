@@ -4061,3 +4061,20 @@ OPEN QUESTION for Rick: something is replicating the checkpoint to the Sparks (l
 or stray? If intended it IS the weights distribution; if stray it is 247 G of duplicates.
 BENCHMARK NOTE: righty's partition over a share distorts timing; algorithmic benchmarks run
 BOTH ranks on lefty, the two-node run is for the distributed correctness gate only.
+=== ROUND 14: P6 INCREMENT 2 GREEN — THE ROUTED MoE MIX, BIT-EXACT ACROSS THE SPARKS (Vyb 34eae310 / VybForge next) ===
+8 routed experts at layer 3 split 4/4 across lefty (rank 0) and righty (rank 1) with fixed
+router weights [.31 .24 .19 .14 .06 .03 .02 .01] + the bf16 shared expert. Each rank folds its
+own 4 weighted expert FFNs into a 4096 f64 partial; rank 1 ships its partial as %.17g
+length-prefixed text; rank 0 adds it to its own and gates against a local recompute of BOTH
+halves in the same left-fold order: ndiff=0 max_abs=0 of 4096 — BIT-EXACT. MIX digest
+-20.218431346918848 (full precision). Partial fold on each side ~1.4 s warm; rank-0 reference +
+shared expert add ~37 s (5 more expert deqs + the bf16 shared).
+COMPILER (Vyb 34eae310): .to_string_precise() formats %.17g (round-trip exact; %g lost ~6 digits
+on every text wire) and .to_float() now binds the C library strtod — the stdlib aspect's
+hand-rolled digit accumulator was 1 ULP off on 25% of f64 inputs (979/4096 measured) which is
+what the first exchange exposed as ndiff=1048 max_abs=1.7e-18. Fast path intercepts in cgen
+before generic aspect-method resolution, String receivers only. Verified 4096/4096 round-trip.
+LESSON (bit-exactness is a three-layer property): format, parse, AND compute must all be exact.
+The compute layer was already bit-identical across the two GB10s; the wire was not.
+NEXT: increment 3 — the full layer (attention + this MoE) with rank 1 running the tail, then
+TP2_VYB_MATCH against the single-node P4 layer numerics; experts per rank scale to 144 each.
