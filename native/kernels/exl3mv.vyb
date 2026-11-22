@@ -134,53 +134,28 @@ exl3mv1s4(p<Int>) -> {
         k = k + 1
     }
 
-    kernel_barrier()
-
-    # ---- phase 2: 4 row-dots against xp, then reduce across d ----
-    b2<Int> = cta * 8 + (within / 128) * 4
-    rl<Int> = (within / 128) * 4
-    d<Int> = d0
-    acc0<Float32> = 0.0
-    acc1<Float32> = 0.0
-    acc2<Float32> = 0.0
-    acc3<Float32> = 0.0
-    c2<Int> = 0
-    xbase<Int> = nb128 * 128
-    while (c2 < 128) {
-        xv<Float32> = ld_f32n(X + (xbase + c2) * 4)
-        acc0 = acc0 + ld_shared_f32(rl * 512 + c2 * 4) * xv
-        acc1 = acc1 + ld_shared_f32((rl + 1) * 512 + c2 * 4) * xv
-        acc2 = acc2 + ld_shared_f32((rl + 2) * 512 + c2 * 4) * xv
-        acc3 = acc3 + ld_shared_f32((rl + 3) * 512 + c2 * 4) * xv
-        c2 = c2 + 1
-    }
-    # The tile slab (4 KB) is dead once every thread has finished its dot, so
-    # the reduction REUSES it: no second shared region, no extra shared budget,
-    # no cross-region address convention to get wrong.
-    kernel_barrier()
-    r0<Int> = b2 - cta * 8
-    su0<Float32> = ld_f16(SU + (rb64 * 64 + b2) * 2) as Float32
-    su1<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 1) * 2) as Float32
-    su2<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 2) * 2) as Float32
-    su3<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 3) * 2) as Float32
-    st_shared_f32((r0 * 128 + d) * 4, acc0 * su0)
-    st_shared_f32(((r0 + 1) * 128 + d) * 4, acc1 * su1)
-    st_shared_f32(((r0 + 2) * 128 + d) * 4, acc2 * su2)
-    st_shared_f32(((r0 + 3) * 128 + d) * 4, acc3 * su3)
+    inbase<Int> = rb64 * 64 + cta * 8
 
     kernel_barrier()
 
-    # 8 rows per CTA: thread tid < 8 sums the 128 partials and adds to yraw
-    if (within < 8) {
-        rr<Int> = within
-        s<Float32> = 0.0
+    # ---- phase 2: per-OUTPUT dot down the slab columns ----
+    # The EXL3 buffer is W^T: slab ROWS are the input dim (su scales them), slab
+    # COLS are the output dim (sv scales them). y_i = sum_j W^T[j][i] x_j, so the
+    # dot runs DOWN a slab column for a fixed output column i. This CTA owns 8
+    # input rows and all 128 output columns of its tile, so it contributes a
+    # partial sum over its 8 inputs to each of the 128 outputs.
+    if (within < 128) {
+        d<Int> = within
+        acc<Float32> = 0.0
         j<Int> = 0
-        while (j < 128) {
-            s = s + ld_shared_f32((rr * 128 + j) * 4)
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + (inbase + j) * 4)
             j = j + 1
         }
-        gidr<Int> = rb64 * 64 + cta * 8 + rr
-        if (gidr < cw) { atomic_add_f32(T + gidr * 4, s) }
+        # sv scales the OUTPUT column; su was folded into xp by exl3xhat
+        cb<Int> = nb128 * 128 + d
+        sv<Float32> = ld_f16(SU + cb * 2) as Float32
+        if (cb < cw) { atomic_add_f32(T + cb * 4, acc * sv) }
     }
 }
 
@@ -200,6 +175,6 @@ exl3yhat(p<Int>) -> {
             acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_f32n(YR + (base + b) * 4)
             b = b + 1
         }
-        st_f32(Y + (base + a) * 4, acc)
+        st_f64(Y + (base + a) * 8, acc)
     }
 }

@@ -61,7 +61,7 @@ main()<Int> -> {
     // fusion work buffers: xp (4096 f32), yraw (2048 f32), y (2048 f32)
     bxp<Int> = dev_alloc(16384)
     byr<Int> = dev_alloc(8192)
-    by<Int> = dev_alloc(8192)
+    by<Int> = dev_alloc(16384)
     bx<Int> = dev_alloc(16384)
     if (bxp == 0 || byr == 0 || by == 0 || bx == 0) { println("P6_FAIL fbufs"); return 6 }
     // tab
@@ -130,13 +130,28 @@ main()<Int> -> {
     var<Int> v1 = bx
     var<Int> v2 = bxp
     var<Int> v3 = hd_pre32
-    var<Int> v4 = arH
+    var<Int> v4 = arG
     var<Int> v5 = 4096
     wr_pdev(pbx, 0, v1)
     wr_pdev(pbx, 8, v2)
     wr_pdev(pbx, 16, v3)
     wr_pdev(pbx, 24, v4)
     wr_pdev(pbx, 32, v5)
+    fdbg<Int> = load_fn("native/build/dbg_sh.ptx", "dbg_sh")
+    if (fdbg != 0) {
+        pbd<Int> = dev_alloc(48)
+        bdb<Int> = dev_alloc(48)
+        wr_pdev(pbd, 0, bdb)
+        wr_pdev(pbd, 8, hd_pre32)
+        wr_pdev(pbd, 16, arG)
+        wr_pdev(pbd, 24, bx)
+        launch_kernel(fdbg, 1, pbd)
+        cuCtxSynchronize()
+        dbg<Vec<Float>> = bulk_dtoh(bdb, 12)
+        println("P6R5 DBG H0=" + dbg.get(0).to_string_precise() + " H1=" + dbg.get(1).to_string_precise() + " H2=" + dbg.get(2).to_string_precise())
+        println("P6R5 DBG su0=" + dbg.get(4).to_string_precise() + " su1=" + dbg.get(5).to_string_precise() + " su2=" + dbg.get(6).to_string_precise())
+        println("P6R5 DBG x0=" + dbg.get(8).to_string_precise() + " x1=" + dbg.get(9).to_string_precise() + " x2=" + dbg.get(10).to_string_precise())
+    }
     rcx<Int> = launch_kernel(fxh, 32, pbx)
     println("P6R5 DBG xh_launch_rc=" + rcx.to_string())
     cuCtxSynchronize()
@@ -144,8 +159,8 @@ main()<Int> -> {
     // p: +0 yraw, +8 xp, +16 su, +24 cw, +40 q(trellis), +48 td(mapdev), +56 inv
     var<Int> m1 = byr
     var<Int> m2 = bxp
-    var<Int> m3 = arG
-    var<Int> m4 = 4096
+    var<Int> m3 = arH
+    var<Int> m4 = 2048
     var<Int> m5 = 0
     var<Int> m6 = arA
     var<Int> m7 = mapdev

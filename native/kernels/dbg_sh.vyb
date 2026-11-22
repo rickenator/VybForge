@@ -1,0 +1,15 @@
+// dbg_sh — dump device-side inputs the fused path consumes, as f32.
+// p: +0 out(f32 x 12), +8 H(f32 128x128), +16 su(f16), +24 x(f32)
+// out[0..3] = H[0..3], out[4..7] = su[0..3], out[8..11] = x[0..3]
+dbg_sh(p<Int>) -> {
+    O<Int> = ld_i64(p + 0)
+    H<Int> = ld_i64(p + 8)
+    SU<Int> = ld_i64(p + 16)
+    X<Int> = ld_i64(p + 24)
+    t<Int> = tid_x()
+    if (t < 4) {
+        st_f32(O + t * 4, ld_f32n(H + t * 4))
+        st_f32(O + 16 + t * 4, ld_f16(SU + t * 2) as Float32)
+        st_f32(O + 32 + t * 4, ld_f32n(X + t * 4))
+    }
+}

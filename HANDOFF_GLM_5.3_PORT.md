@@ -4198,3 +4198,19 @@ pipeline must warm/relocate that (in the deq path it is amortised away by reuse)
 NEXT: (1) a minimal two-kernel shared-memory probe (store a sentinel at offset X, read it back)
 to pin the convention, then fix exl3mv1s4's slab indexing; (2) once the gate is <=1e-5, measure
 the real per-projection total; (3) only then scale to the 8-expert expert FFN.
+=== ROUND 21: SHARED-CONVENTION PROBE RESULTS + FUSED-MV STILL WRONG ===
+FINDING 1 (compiler, real): the working exl3dq.ptx uses store [%rd174] and load [%rd240+-1024]
+with different base registers — the -1024 is BASE SELECTION, not a bias. Store/load offsets do
+agree in a correct kernel. The earlier suspicion was wrong.
+FINDING 2 (compiler, real): CONSTANT shared offsets get scalarised into separate variables
+(__vyb_kernel_shared_$_0/_1/_3, and ld returns garbage) — so a literal-offset shared access does
+NOT alias the computed-offset slab. exl3mv now uses only computed offsets and reuses the (dead)
+4 KB tile slab for the reduction, so no second shared region exists at all. It STILL returns
+garbage, so the shared region was not the (only) fault.
+STATE OF THE FUSED MV: launches rc=0; mv kernel 2 ms vs 4-5 ms for deq+mm on gate_proj; yraw is
+~1e8 (wrong scale, non-deterministic) while xp is ~1e-14 for this input — those two are mutually
+inconsistent, so the defect is in the mv kernel's DECODE half (the trellis/map/inverse pointers or
+the compact slab re-index), not in the vector passes.
+NEXT (precise): gate the decode half ALONE — have exl3mv1s4 also write its slab tile to global for
+CTA 0 and diff it element-for-element against the same tile from the known-good exl3dq1s4 (which
+materialises W). That isolates decode vs matvec in one run instead of three compound guesses.
