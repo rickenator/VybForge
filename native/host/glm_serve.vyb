@@ -462,6 +462,7 @@ main()<Int> -> {
     fhad232 = load_fn("native/build/exl3.ptx", "exl3had232")
     fcvt32 = load_fn("native/build/exl3.ptx", "exl3cvt32")
     fdqs = load_fn("native/build/exl3dq.ptx", "exl3dq1s")
+    fdqs4 = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
     finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
     # the f32-path gemm triple (the experts' down-proj): cast32 + gemm32_p/r from layer.ptx
     fcast32 = load_fn("native/build/layer.ptx", "cast32")
@@ -474,7 +475,7 @@ main()<Int> -> {
     }
     pb32 = dev_alloc(192)
     if (pb32 == 0) { println("CHAIN_FAIL pb32"); return 4 }
-    if (fdqs == 0 || finvk == 0 || fdeq32 == 0 || fhgen32 == 0 || fhad132 == 0 || fhad232 == 0 || fcvt32 == 0) {
+    if (fdqs == 0 || fdqs4 == 0 || finvk == 0 || fdeq32 == 0 || fhgen32 == 0 || fhad132 == 0 || fhad232 == 0 || fcvt32 == 0) {
         println("CHAIN_FAIL kernels32")
         return 4
     }
@@ -703,7 +704,7 @@ main()<Int> -> {
                         if (n < 3) {
                             streams2 = ffn_dense_site(streams1, tab, dir, total, lpre, fgemm, fbf)
                         } else {
-                            streams2 = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, hdg, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, fcast32, fgp, fgr, pb32)
+                            streams2 = tail_site(streams1, tab, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, hdg, fdeq32, fdqs, fdqs4, fhad132, fhad232, fcvt32, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, fcast32, fgp, fgr, pb32)
                         }
                         if (streams2.len() != sv_R * sv_HC * sv_H) {
                             println("CHAIN_FAIL ffn layer " + n.to_string())

@@ -1,0 +1,141 @@
+// dq1s4_probe — bit-exact + timing gate for the 4-row deq variant (exl3dq1s4).
+// Synthesizes a packed expert tensor at the REAL down-proj shape (cw=4096,
+// ntiles=32768, kn=2048x4096) on device, runs exl3dq1s (grid=ntiles, the
+// reference) and exl3dq1s4 (grid=ntiles/4), compares the T outputs (must be
+// bit-identical: exact Float ==) and times both, 5 reps each.
+import io::{open_read, read_all, close}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+launch1(hf<Int>, g<Int>, p<Int>)<Int> -> {
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(hf), g, 1, 1, 256, 1, 1, p, 0, 0, 0)
+        return rc
+    }
+    return 1
+}
+wr(p<Int>, off<Int>, v<Int>)<Int> -> { freedom { cuMemcpyHtoD_v2(p + off, loc(v), 8) } return 0 }
+
+
+init_cuda()<Int> -> {
+    freedom {
+        if (cuInit(0) != 0) { return 1 }
+        dev<CInt> = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 2 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 3 }
+        return 0
+    }
+    return 9
+}
+allocb(bytes<Int>)<Int> -> {
+    freedom {
+        p<Int> = 0
+        rc<Int> = cuMemAlloc_v2(loc(p), bytes) as Int
+        if (rc != 0) { return 0 }
+        return p
+    }
+    return 0
+}
+read64(src<Int>)<Float> -> { freedom { v<Float> = 0.0; cuMemcpyDtoH_v2(loc(v), src, 8); return v } return 0.0 }
+
+loadmod(path<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 0 } } } ? -> { return 0 } }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        return addr(m)
+    }
+    return 0
+}
+mfunc(hmod<Int>, name<String>)<Int> -> {
+    freedom {
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), from<loc<CVoid>>(hmod), name) != 0) { return 0 }
+        return addr(f)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    println("PROBE4 begin")
+    e0<Int> = init_cuda()
+    if (e0 != 0) { println("PROBE4_FAIL init " + e0.to_string()); return 1 }
+    mL<Int> = loadmod("native/build/exl3dq.ptx")
+    mF<Int> = loadmod("native/build/dq1s4_fill.ptx")
+    if (mL == 0 || mF == 0) { println("PROBE4_FAIL module"); return 2 }
+    fRef<Int> = mfunc(mL, "exl3dq1s")
+    fVar<Int> = mfunc(mL, "exl3dq1s4")
+    fFQ<Int> = mfunc(mF, "fill_bytes")
+    fFH<Int> = mfunc(mF, "fill_h")
+    fFI<Int> = mfunc(mF, "fill_inv")
+    fCmp<Int> = mfunc(mF, "dq1s4_cmp")
+    if (fRef == 0 || fVar == 0 || fFQ == 0 || fFH == 0 || fFI == 0 || fCmp == 0) { println("PROBE4_FAIL func"); return 2 }
+    cw<Int> = 4096
+    ntiles<Int> = 32768
+    kn<Int> = (ntiles / (cw / 16)) * 16 * cw
+    nbody<Int> = 1048576
+    tdlen<Int> = 16 + nbody + 256 * 4
+    println("PROBE4 kn=" + kn.to_string())
+    qD<Int> = allocb(ntiles * 128)
+    tdD<Int> = allocb(tdlen)
+    hD<Int> = allocb(128 * 128 * 4)
+    t1D<Int> = allocb(kn * 4)
+    t2D<Int> = allocb(kn * 4)
+    pD<Int> = allocb(64)
+    if (qD == 0 || tdD == 0 || hD == 0 || t1D == 0 || t2D == 0 || pD == 0) { println("PROBE4_FAIL alloc"); return 3 }
+    println("PROBE4_FILLQ rc=" + launch1(fFQ, (ntiles * 128 + 255) / 256, qD).to_string())
+    println("PROBE4_FILLTD rc=" + launch1(fFQ, (nbody + 255) / 256, tdD + 16).to_string())
+    println("PROBE4_FILLH rc=" + launch1(fFH, (128 * 128 + 255) / 256, hD).to_string())
+    println("PROBE4_FILLINV rc=" + launch1(fFI, 1, tdD + 16 + nbody).to_string())
+    freedom { cuCtxSynchronize() }
+    wr(pD, 0, qD); wr(pD, 8, tdD); wr(pD, 16, hD); wr(pD, 32, cw); wr(pD, 40, tdD + 16 + nbody)
+    wr(pD, 24, t1D)
+    println("PROBE4 ref rc=" + launch1(fRef, ntiles, pD).to_string())
+    freedom { cuCtxSynchronize() }
+    t0<Int> = time_mono_millis()
+    rr<Int> = 0
+    while (rr < 5) {
+        launch1(fRef, ntiles, pD)
+        rr = rr + 1
+    }
+    freedom { cuCtxSynchronize() }
+    t1<Int> = time_mono_millis()
+    println("PROBE4_REF_MS=" + ((t1 - t0) / 5).to_string())
+    wr(pD, 24, t2D)
+    println("PROBE4 var rc=" + launch1(fVar, ntiles / 4, pD).to_string())
+    freedom { cuCtxSynchronize() }
+    t0 = time_mono_millis()
+    rr = 0
+    while (rr < 5) {
+        launch1(fVar, ntiles / 4, pD)
+        rr = rr + 1
+    }
+    freedom { cuCtxSynchronize() }
+    t1 = time_mono_millis()
+    println("PROBE4_VAR_MS=" + ((t1 - t0) / 5).to_string())
+    outD<Int> = allocb(8)
+    freedom {
+        rcC<Int> = cuda_launch4i(from<loc<CVoid>>(fCmp), 1, 1, 1, 1, 1, 1, t1D, t2D, kn, outD) as Int
+        cuCtxSynchronize()
+    }
+    badF<Float> = read64(outD)
+    println("PROBE4_BITDIFF=" + badF.to_string() + " of " + kn.to_string())
+    println("PROBE4_DONE")
+    return 0
+}

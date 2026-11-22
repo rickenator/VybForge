@@ -1,0 +1,45 @@
+// dq1s4_fill — device-side synthesis for the dq1s4 probe: LCG byte fills for
+// the trellis and map body (values < 16 so the nibble gathers stay in-tile),
+// the inv table (256 u32 slots < nbody/16), and the 128x128 f32 hadamard H.
+fill_bytes(dst<Int>, n<Int>, seed<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        s<Int> = seed + gid * 2654435761
+        s = (s * 1103515245 + 12345) & 2147483647
+        st_u8(dst + gid, ((s >> 16) & 15) as UInt32)
+    }
+}
+fill_h(dst<Int>, n<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f32(dst + gid * 4, ((gid % 7) + 1) as Float32)
+    }
+}
+fill_inv(dst<Int>, n<Int>, seed<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        s<Int> = seed + gid * 40503
+        s = (s * 1103515245 + 12345) & 2147483647
+        v<Int> = ((s >> 8) & 65535) * 16
+        while (v >= 65536) { v = v / 2 }
+        st_u32(dst + gid * 4, v as UInt32)
+    }
+}
+
+// dq1s4_cmp — count elements where two f32 buffers differ bitwise; out[0] = count (i32 via st_i32? use f64 slot: out is 8B, store the count as f64).
+dq1s4_cmp(a<Int>, b<Int>, n<Int>, out<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid == 0) {
+        c<Int> = 0
+        i<Int> = 0
+        while (i < n) {
+            x<Float32> = ld_f32(a + i * 4)
+            y<Float32> = ld_f32(b + i * 4)
+            xa<Int> = 0
+            ya<Int> = 0
+            if (x != y) { c = c + 1 }
+            i = i + 1
+        }
+        st_f64(out, c as Float)
+    }
+}

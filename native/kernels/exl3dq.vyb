@@ -49,6 +49,115 @@ share(all) fp16_to_f64(b<Int>)<Float> -> {
     return v
 }
 
+// exl3dq1s4 — the 4-row phase-2 variant with the COVERAGE FIX. The reverted
+// attempt broke because its phase 2 read shared rows its own phase 1 never
+// wrote (max_abs exactly kn = whole-tile garbage). Mapping here: grid =
+// ntiles/4 CTAs x 256 threads; 8 CTAs per 64x128 What tile (2048 tids); each
+// CTA owns 8 rows x 128 cols: phase 1 decodes 4 elements per thread (1024
+// slots, each packed element decoded EXACTLY ONCE), phase 2 computes 4
+// outputs per thread (4 rows, same d column) loading the global 128-tap H
+// value ONCE per c2 for all four accumulators (4x fewer global H loads).
+// Launch with dqgrid = ntiles / 4. Everything else identical to exl3dq1s.
+exl3dq1s4(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 32)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 0)
+    td<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    T<Int> = ld_i64(p + 24)
+    inv<Int> = ld_i64(p + 40)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    d0<Int> = within - (within / 128) * 128
+
+    # ---- phase 1: FOUR elements per thread (1024 slots = 8 rows x 128 cols) ----
+    # element k covers tile-linear slot within + k*256: rows (within+k*256)/128
+    # = cta*8 + within/128 + k*2 ... iterate k = 0..3, rows come out as
+    # cta*8 + {0,1} + {0,2} = cta*8 + 0..3 and cta*8 + 4..7 via k=1,3? NO:
+    # (within + k*256)/128 = within/128 + k*2 -> rows cta*8 + r0 + {0,2,4,6}
+    # with r0 = within/128 in {0,1}. That covers only 4 of the 8 rows. Use
+    # slot order (half = k>>1, rowoff = k&1): slot = half*256 + within? The
+    # simplest correct coverage: k-th element slot = cta*1024-linear
+    # within*4 is wrong too. Use: slot_k = within + (k % 2) * 128 * 2 + (k / 2) * 128
+    # -> rows cta*8 + within/128*... too clever; do it EXPLICITLY instead:
+    # this CTA's rows are r[8] = cta*8 .. cta*8+7; thread within covers
+    # row pair (cta*8 + (within/128)*4 + {0,1}) hmm. EXPLICIT LOOP below:
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = fp16_to_f64(yK & 65535)
+        hiK<Float> = fp16_to_f64((yK >> 16) & 65535)
+        st_shared_f32((cta * 8 + bK) * 512 + cK * 4, (loK + hiK) as Float32)
+        k = k + 1
+    }
+
+    kernel_barrier()
+
+    # ---- phase 2: FOUR outputs per thread (rows cta*8+within/128*4 .. +3) ----
+    b2<Int> = cta * 8 + (within / 128) * 4
+    d<Int> = d0
+    acc0<Float32> = 0.0
+    acc1<Float32> = 0.0
+    acc2<Float32> = 0.0
+    acc3<Float32> = 0.0
+    c2<Int> = 0
+    while (c2 < 128) {
+        w<Float32> = ld_f32n(H + (c2 * 128 + d) * 4)
+        acc0 = acc0 + ld_shared_f32(b2 * 512 + c2 * 4) * w
+        acc1 = acc1 + ld_shared_f32((b2 + 1) * 512 + c2 * 4) * w
+        acc2 = acc2 + ld_shared_f32((b2 + 2) * 512 + c2 * 4) * w
+        acc3 = acc3 + ld_shared_f32((b2 + 3) * 512 + c2 * 4) * w
+        c2 = c2 + 1
+    }
+    kbvT<Int> = (rb64 * 64 + b2) / 128
+    bT<Int> = rb64 * 64 + b2 - kbvT * 128
+    gidT<Int> = (kbvT * nbc128 + nb128) * 16384 + bT * 128 + d
+    st_f32(T + gidT * 4, acc0)
+    kbvT1<Int> = (rb64 * 64 + b2 + 1) / 128
+    bT1<Int> = rb64 * 64 + b2 + 1 - kbvT1 * 128
+    gidT1<Int> = (kbvT1 * nbc128 + nb128) * 16384 + bT1 * 128 + d
+    st_f32(T + gidT1 * 4, acc1)
+    kbvT2<Int> = (rb64 * 64 + b2 + 2) / 128
+    bT2<Int> = rb64 * 64 + b2 + 2 - kbvT2 * 128
+    gidT2<Int> = (kbvT2 * nbc128 + nb128) * 16384 + bT2 * 128 + d
+    st_f32(T + gidT2 * 4, acc2)
+    kbvT3<Int> = (rb64 * 64 + b2 + 3) / 128
+    bT3<Int> = rb64 * 64 + b2 + 3 - kbvT3 * 128
+    gidT3<Int> = (kbvT3 * nbc128 + nb128) * 16384 + bT3 * 128 + d
+    st_f32(T + gidT3 * 4, acc3)
+}
+
 exl3dq1s(p<Int>) -> {
     tid<Int> = blk_x() * dim_x() + tid_x()
     cw<Int> = ld_i64(p + 32)

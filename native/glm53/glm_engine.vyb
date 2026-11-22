@@ -1313,7 +1313,7 @@ exl3_deq32(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
 // is returned directly (the caller frees it). Halves the deq write traffic and
 // drops the cvt kernel; the consumer must be an f32 gemm (gemm32_p/gemm32_r).
 share(all)
-exl3_deq32f(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>,
+exl3_deq32f(fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int>,
          trellis<String>, suh<String>, svh<String>, body<String>,
          cw<Int>, ntiles<Int>, hd_pre32<Int>,
          qda<Int>, tda<Int>, oda<Int>, td2a<Int>,
@@ -1358,7 +1358,7 @@ exl3_deq32f(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>,
             if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p1"); return 0 }
             pqf = pqf + 1
         }
-        lrcBf<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), ntiles, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        lrcBf<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs4), ntiles / 4, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
         srBf<Int> = cuCtxSynchronize() as Int
         if (lrcBf != 0 || srBf != 0) { println("EXL3FAIL32F dq1s"); return 0 }
         pqf = 0
@@ -2742,7 +2742,7 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     return streams2
 }
 share(all)
-tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -3144,17 +3144,17 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            dWg<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_0, g_ge_1,
+            dWg<Int> = exl3_deq32f(fdeq32, fdqs, fdqs4, fhad132, fhad232, g_ge_0, g_ge_1,
                                 g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_5 = gx_read(ge, 5)
             g_ge_4 = gx_read(ge, 4)
             g_ge_3 = gx_read(ge, 3)
-            dWu<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_3, g_ge_4,
+            dWu<Int> = exl3_deq32f(fdeq32, fdqs, fdqs4, fhad132, fhad232, g_ge_3, g_ge_4,
                                 g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
             g_ge_6 = gx_read(ge, 6)
-            dWd<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_6, g_ge_7,
+            dWd<Int> = exl3_deq32f(fdeq32, fdqs, fdqs4, fhad132, fhad232, g_ge_6, g_ge_7,
                                 g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
