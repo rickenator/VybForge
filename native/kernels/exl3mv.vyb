@@ -97,7 +97,6 @@ exl3mv1s4(p<Int>) -> {
     T<Int> = ld_i64(p + 0)
     X<Int> = ld_i64(p + 8)
     SU<Int> = ld_i64(p + 16)
-    DMP<Int> = ld_i64(p + 64)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -139,18 +138,6 @@ exl3mv1s4(p<Int>) -> {
     }
 
     inbase<Int> = rb64 * 64 + cta * 8
-
-    if (DMP != 0) {
-        # dump this CTA's decoded tile into the full raw-T layout (for the oracle diff)
-        kk<Int> = 0
-        while (kk < 4) {
-            eD<Int> = within + kk * 256
-            bD<Int> = eD / 128
-            cD<Int> = eD - bD * 128
-            st_f32(DMP + (inbase + bD) * cw * 4 + (nb128 * 128 + cD) * 4, ld_shared_f32(bD * 512 + cD * 4))
-            kk = kk + 1
-        }
-    }
 
     kernel_barrier()
 

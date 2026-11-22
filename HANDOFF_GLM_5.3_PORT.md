@@ -4381,3 +4381,20 @@ NEXT (small): rebuild the end-to-end check as a minimal driver in the P6_MIN sty
 run xhat, run mv, run yhat, compare y against B's one-hot row — roughly 40 lines inside the
 existing setup, no old path and no mode soup. Then the sv-after-yhat fix is validated end-to-end.
 STANDING: fused kernel proven; two-node stack green; nothing regressed.
+=== ROUND 32: MINIMAL E2E DRIVER — two real fixes, and a razor-sharp remaining clue ===
+Built p6r8_e2e.vyb (a lean driver, no modes, no old paths): x = e_0 -> xhat -> mv -> yhat,
+gated against the one-hot row of the verified deq buffer (y[n] = B[0][n], proven in round 24).
+FIX 1 (algebra, real): su is a DIAGONAL on the input axis and does NOT commute with H either — it
+must scale x BEFORE the Hadamard, not the result after. exl3xhat now computes
+xp[i] = sum_k H[i][k].(su[k].x[k]). After this, y0 matches B to 1.9e-9 RELATIVE and y1 matches
+EXACTLY (both digits identical).
+REMAINING: first_mismatch_index = 256 — outputs 0..255 are correct, everything from 256 on is
+wrong (count 1772/2048, max_abs 0.0686). 256 = exactly two 128-blocks, so the fault is at a
+block boundary in either yhat's 128-block walk (base = n - n%128, H[a][m], U[base+m]) or in yraw's
+accumulation for nb128 >= 2 (cb = nb128*128 + d, nbc128 = cw/128 = 16).
+THE SHARPEST NEXT TEST: dump yraw and compute sv.(H u) on the HOST from that same yraw — if the
+host value matches the fused y, yhat is exonerated and the fault is in the accumulation; if not,
+yhat's block walk is wrong. One run either way.
+STATE: fused kernel is 90% right (first two output blocks are exact); the driver is now lean and
+trustworthy (p6r8_e2e); everything is committed. Two-node stack and all green deliverables
+untouched.
