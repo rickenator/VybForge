@@ -4035,3 +4035,29 @@ cmake caches for VYB_* flags, and compare `nm -D vyb | grep -c cuda` / a tiny --
 registered runtime symbols; if the flag diff is found, rebuild lefty identically.
 WORKAROUND if needed: allocate only through tensor's dev_alloc (proven on lefty) — the engine's
 ~20 direct cuMemAlloc sites would need routing through it.
+=== ROUND 13: P6 INCREMENT 1 GREEN — DISTRIBUTED EXPERT PARTITION ACROSS THE SPARKS (f66956f) ===
+THE MILESTONE: a two-rank Vyb program runs on lefty (rank 0) + righty (rank 1): each deqs and
+computes ITS expert's FFN at layer 3 from the checkpoint (lefty: /srv/models/hf hub snapshot;
+righty: ~/glm53snap = shard 3 + index, 2 GB), rank 1 sends its result over CX7, rank 0 recomputes
+the peer expert locally and gates: rel 1.15e-08 (the TEXT wire precision), routed partial-sum
+digest -12.6349. Digests: exp 0 = -40.3734 (lefty), exp 1 = 27.7385 (righty). Both nodes on the
+fixed compiler 29f7c679 (aarch64 JIT fix) with identical kernels.
+COMPILER FIX (29f7c679, Vyb): extern "C" foreign names are exempt from the #432 private mangle —
+the collision dedup was hash-order dependent and on aarch64 mangled glm_engine's cuMemAlloc_v2
+into an undefined __pv_ symbol, failing the whole module at JIT load.
+INFRA DONE THIS ROUND: GLM suspended (watchdog paused); both Sparks on Vyb 0.7.7 Release
+(build2, rootless LLVM/CMake/Catch2 recipe); checkpoints: lefty full 164 GB hub snapshot, plus a
+2 GB single-shard replica on righty for increment 1; ALL ComfyUI trees (lefty 134 GB + righty
+91 GB) MOVED to lefty's external /srv/models/comfyui/{lefty,righty}-* with the service + drop-in
+repointed (the drop-in's stale ExecStart was the hidden breakage; RequiresMountsFor=/srv/models
+added); renderer smoke-tested HTTP 200 then stopped for GPU-free P6 work.
+INCREMENT 2 (next): (a) byte-exact vector exchange (the H-vector must cross as raw f64 bytes, not
+text — needs a float-bits path through the socket); (b) rank 1's full expert partition — measured
+shard map: 80/83 shards carry experts INTERLEAVED, so expert-parallel needs ~all shards (~160 GB,
+more than righty's disk) -> either the /srv/models share from lefty or an offline per-rank repack;
+(c) the routed 8-expert mix (4/4) + shared expert, then TP2_VYB_MATCH against the P4 layer.
+OPEN QUESTION for Rick: something is replicating the checkpoint to the Sparks (lefty
+/srv/models/vybforge/glm53-checkpoint 164 G, righty ~/vybforge/glm53-checkpoint 83 G) — intended
+or stray? If intended it IS the weights distribution; if stray it is 247 G of duplicates.
+BENCHMARK NOTE: righty's partition over a share distorts timing; algorithmic benchmarks run
+BOTH ranks on lefty, the two-node run is for the distributed correctness gate only.
