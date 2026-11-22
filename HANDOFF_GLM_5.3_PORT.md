@@ -3785,3 +3785,19 @@ of that scale is the f32 deq output path (halves the deq writes, the gemm traffi
 staging) with its full digest-band re-lock. The dense-branch step-2 cache (d125f70) stays:
 it is small (3 layers) but free. Endpoint stands ~3.2min; per-request: deq 41.8s, decode MoE
 54-58s (of which the expert loop 11s), P1ffn ~60s, stageS 17s, P1attn 18s, P1bstep 20s.
+=================== ROUND 6: THE FAST RESOLVE RE-LANDED AT ITS BEST FORM (2fd5a5e) ==================
+The borrow mechanism is EXONERATED: probes (single-module AND cross-module share'd fn) pass a
+~15MB HashMap by borrow 300x in 1-2ms with no copy and no leak. The earlier "borrow deep-copies
+and leaks" attribution was WRONG. The setup-built-map + borrow variant still balloons phase 2 by
+~60GB (measured 2x: RSS 6GB flat through the prefill, then 48->73GB in phase 2) — the mechanism
+is NOT the call path; it is the LONG-LIVED map interacting with the phase-2 String churn
+(unknown runtime detail — a real Vyb runtime item if anyone wants the ~0.8s back).
+THE LANDED FORM: a LOCAL HashMap built once per LAYER inside tail_site (~1185 entries, built at
+LAYER scope — NEVER inside the expert loop: 96x more builds = the 83GB OOM and 135-228s/layer
+degeneration) + O(1) lookups + the legacy fallback on any miss (the fallback ASSIGNS, no
+redeclare). Measured FASTER than the process-wide map (0.71-0.72s vs 1.53s — the small map stays
+cache-hot), draft 576, CHAIN_OK x2, digests identical, RSS flat ~2GB. Net vs the legacy resolve:
+-4.7s per request with no regression.
+DEPLOYMENT CHECKLIST for any HashMap-in-loop change: (1) the build at the WIDEST loop scope,
+(2) never pass a HashMap across a call boundary in a long-running process until the long-lived-
+map balloon is understood, (3) the fallback branch must ASSIGN, not redeclare.
