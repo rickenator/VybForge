@@ -3766,3 +3766,13 @@ documented above), mlpmoe 54-58s (the decode MoE: gx_read re-reads + the legacy 
 rows — mtp_layer_step STILL uses the old exl3_deq at ~line 4080: the next swap candidate),
 stageS ~17s (attention weight staging: deq_bf16 + dtoh/htod round trips + f32_at parse
 loops), P1attn ~18s, parseA ~4s. Endpoint wall ~3.2min (from ~4min).
+=================== PERF HUNT ROUND 3: EVERY DEQ ON THE FUSED KERNEL (843f2b5) ==================
+The phase-2 walk had a THIRD old-deq site: an INLINE routed-expert loop in the serve
+(glm_serve.vyb ~line 1474, 11 layers x 2 steps per request — found by an SEC-inl
+instrumentation probe; its cost hides outside the mlpmoe timer which only wraps
+moe_tail_step), plus mtp_layer_step's own three deqs (~line 4080, the MTP head rows +
+the phase-2 MTP steps). All swapped to exl3_deq32; NO exl3_deq call sites remain (the
+standalone exl3_deq fn is now dead in the serve path). Wall 4m14s -> 3m34s (-40s/request),
+draft 576, CHAIN_OK x2, digests identical to the deq32-decode run. NOTE: mlpmoe varies
+54-77s run-to-run with the page-cache/ComfyUI state — only wall clock and the digest
+identity are trustworthy comparators; run A/B back-to-back on an idle GPU.
