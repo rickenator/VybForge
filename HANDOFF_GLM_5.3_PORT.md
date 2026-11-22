@@ -3877,3 +3877,37 @@ upstream of layer 45; gate B is the only trace of the change). Cumulative f32 wi
 REMAINING (the 24GB Flash play): the full-pipeline f32 — the element chain (rmsnorm/rope/silu/
 hc_apply) f32 locals audit, the attention small weights, the device-to-device gemms (the routers),
 and the activation side end to end. Skill references/f32-output-path.md has the full sequence.
+=================== ROUND 8: THE FLASH-ON-24GB FEASIBILITY VERDICT + THE MEASUREMENT CORRECTION (6c7ef99) ==================
+FLASH FEASIBILITY (the checkpoint IS Flash: Glm5Next, 175.6GB packed — routed experts 156.3GB/89%,
+attn+dense 13.5GB, embed 2.5GB, shared 2.2GB; per-expert packed 12.6MB; per decode step one token
+touches 8x42x12.6MB = 4.2GB packed):
+- FULL RESIDENCY: NO. 156GB of packed experts vs 24GB — even a quality-destroying 2bpw re-quant
+  (39GB) does not fit. The "no-go" is correct for resident-weights designs.
+- THE STREAMING DESIGN ALREADY FITS: 3-12GB GPU measured (DEVMEM over 2882 samples). Speed is the
+  constraint, not the card: each expert visit deqs 12.6MB packed -> ~100MB f32 materialized (8-10x
+  traffic multiplier).
+- THE FEASIBLE PLAY: YES, CONDITIONALLY. Resident attn/dense/embed (~16GB bf16, or ~10GB int8
+  attention) + experts streamed PACKED from the host page cache (125GB RAM; 4.2GB/step touched)
+  into a FUSED DEQUANT-GEMM (dequant in registers, no f32 materialization): expert traffic/step
+  ~70GB -> ~8.5GB -> decode step ~10-15s -> endpoint ~1-1.5min. THE LINCHPIN IS THE KERNEL: a
+  fused dequant-gemm over the .mcg/EXL3 trellis format. CRITICAL SUBSIDY: the exl3dq1s phase-2
+  4-rows-per-thread variant measured a 28x DEQ speedup and was reverted with a KNOWN bug signature
+  (max_abs exactly 8388608 = kn; the comment in exl3dq.vyb) — fixing it is the highest-value
+  known optimization INDEPENDENT of the fusion, and the fusion builds on it.
+- HOST-SIDE NOTE: the checkpoint (175.6GB) exceeds the 125GB RAM — the page cache cannot hold it
+  all; the hot expert set per request (~dozens of GB) fits, cold experts hit disk. NFS/disk speed
+  becomes the tail latency term for cold experts.
+MEASUREMENT CORRECTION (honesty): the SEC instrumentation spans vary ~9s run-to-run on IDENTICAL
+numeric state (best2's DIGESTENTRY digest exactly equals increment-2's 2944b0612c, yet its SEC sum
+differed +8.7s from the same code measured hours earlier). The per-increment "-11s cumulative"
+claims of rounds 7b-7f are RETRACTED as unmeasurable. VERIFIED ONLY: the phase-1 expert f32 win in
+the T_MOE same-position timers (deq 36.7->34.8s, mm 3.5->3.3s, consistent across many samples)
+and the round-3 deq-fusion win (-40s, measured back-to-back in a quiet era). The f32 arc's
+attention/dense/decode-side increments were reverted to f64 (their effects sit inside the noise
+band); the landed state = expert-f32 in tail_site only + the fast resolve + the dense step-2
+cache. Gates green: A 3.665e-6, B 1.204e-4, draft 576 = oracle.
+THE DECISION FRAME RICK SET: feasibility proven conditionally -> the go/no-go gate is the fused-
+dequant kernel microbench (one expert shape, 12.6MB packed -> nt x 4096, vs the 80us gemm32
+reference). If the microbench passes -> implement (resident attn + the fused kernel per shape +
+serve rewiring, multi-session). If not -> the Spark cluster continues + an online provider for
+the testing duration.
