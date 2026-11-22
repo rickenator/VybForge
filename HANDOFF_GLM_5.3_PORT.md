@@ -3911,3 +3911,23 @@ dequant kernel microbench (one expert shape, 12.6MB packed -> nt x 4096, vs the 
 reference). If the microbench passes -> implement (resident attn + the fused kernel per shape +
 serve rewiring, multi-session). If not -> the Spark cluster continues + an online provider for
 the testing duration.
+=================== ROUND 9: THE FLASH FEASIBILITY GATE — ANSWERED (7838748) ==================
+The feasibility gate Rick set (the fused-dequant microbench) is ANSWERED: NEGATIVE for the
+projected speedup. Sequence: (1) the 4-row phase-2 deq variant was FIXED (the coverage bug from
+88ff324 understood — each CTA owns its rows in BOTH phases; the reverted version read rows its
+phase 1 never wrote): exl3dq1s4, grid=ntiles/4, 8 rows/CTA, 4 dequants + 4 outputs per thread,
+H loaded once per c2. The probe: BIT-IDENTICAL on 8.4M elements (0 diffs); the in-serve run
+reproduces the exact pre-change digests (2944b0612c), gates green. (2) The speedup: -0.4s of
+34.7s (-1%), NOT 28x. The deq is dominated by phase-1's scattered 4-nibble gathers (~2ns/element,
+latency-bound) — the 36.3s->1.3s claim in 88ff324's message was wrong or measured something else.
+(3) CONSEQUENCE: the fused-dequant-gemm projection is INVALIDATED — its win was eliminating the
+f32 materialization traffic, but the deq is COMPUTE-bound, so fusion buys ~the mm time (~3.4s),
+not 10x. THE FLASH-ON-24GB VERDICT: NOT FEASIBLE at the projected speed on the current
+architecture. The endpoint floor with the current deq design is ~3min. The only remaining path
+to usable speed is a from-scratch GATHER-RESTRUCTURED deq kernel: re-pack the checkpoint offline
+so a warp's elements come from contiguous trellis bytes (coalesced gathers), then a matching
+kernel — a genuine R&D project with uncertain outcome, cleanly decoupled from the serve (the
+re-pack is offline; the kernel slots into exl3_deq32f's dq1s launch).
+PER RICK'S DECISION FRAME: continue development on the Spark cluster; switch the model to an
+online provider for the testing duration. The 24GB streaming serve remains correct-and-green
+(draft 576, gates green) at ~3-5min/request for offline/batch use.
