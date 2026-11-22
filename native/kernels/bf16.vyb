@@ -23,3 +23,20 @@ bf16deq(q<Int>, o<Int>, n<Int>, z<Int>) -> {
         }
     }
 }
+
+# bf16deq32 — the f32-output twin (VybForge f32-output path): identical layout
+# math, but 4-byte f32 stores (half the write traffic; the consumer must be an
+# f32 gemm — gemm32_p/gemm32_r — or a cast32 back to f64).
+bf16deq32(q<Int>, o<Int>, n<Int>, z<Int>) -> {
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        val<Float> = ld_bf16(q + gid * 2)
+        if (z > 0) {
+            rr<Int> = gid / z
+            cc<Int> = gid % z
+            st_f32(o + cc * n / z * 4 + rr * 4, val)
+        } else {
+            st_f32(o + gid * 4, val)
+        }
+    }
+}

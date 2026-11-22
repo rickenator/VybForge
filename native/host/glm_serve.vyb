@@ -467,7 +467,8 @@ main()<Int> -> {
     fcast32 = load_fn("native/build/layer.ptx", "cast32")
     fgp = load_fn("native/build/layer.ptx", "gemm32_p")
     fgr = load_fn("native/build/layer.ptx", "gemm32_r")
-    if (fcast32 == 0 || fgp == 0 || fgr == 0) {
+    fbf32 = load_fn("native/build/bf16.ptx", "bf16deq32")
+    if (fcast32 == 0 || fgp == 0 || fgr == 0 || fbf32 == 0) {
         println("CHAIN_FAIL kernels32gemm")
         return 4
     }
@@ -1605,13 +1606,13 @@ main()<Int> -> {
                                 println("SEC preS " + (now_ms() - secT).to_string())
                                 secT = now_ms()
                                 g_lg_0 = gx_read(lg, 0)
-                                d_q = deq_bf16(fbf, g_lg_0, sv_H * sv_HEADS * sv_KD, sv_H)
+                                d_q = deq_bf16f(fbf32, g_lg_0, sv_H * sv_HEADS * sv_KD, sv_H)
                                 g_lg_1 = gx_read(lg, 1)
-                                d_k = deq_bf16(fbf, g_lg_1, sv_H * sv_HEADS * sv_KD, sv_H)
+                                d_k = deq_bf16f(fbf32, g_lg_1, sv_H * sv_HEADS * sv_KD, sv_H)
                                 g_lg_2 = gx_read(lg, 2)
-                                d_v = deq_bf16(fbf, g_lg_2, sv_H * sv_HEADS * sv_KD, sv_H)
+                                d_v = deq_bf16f(fbf32, g_lg_2, sv_H * sv_HEADS * sv_KD, sv_H)
                                 g_lg_3 = gx_read(lg, 3)
-                                d_o = deq_bf16(fbf, g_lg_3, sv_HEADS * sv_KD * sv_H, sv_HEADS * sv_KD)
+                                d_o = deq_bf16f(fbf32, g_lg_3, sv_HEADS * sv_KD * sv_H, sv_HEADS * sv_KD)
                                 g_lg_4 = gx_read(lg, 4)
                                 d_b = deq_bf16(fbf, g_lg_4, sv_H * sv_HEADS, sv_H)
                                 g_lg_5 = gx_read(lg, 5)
@@ -1707,9 +1708,9 @@ main()<Int> -> {
 
                                 println("SEC parseA " + (now_ms() - secT).to_string())
                                 secT = now_ms()
-                                qp<Vec<Float>> = mm_host(h_a, sv_R, sv_H, d_q, sv_HEADS * sv_KD, fgemm)
-                                kp<Vec<Float>> = mm_host(h_a, sv_R, sv_H, d_k, sv_HEADS * sv_KD, fgemm)
-                                vp<Vec<Float>> = mm_host(h_a, sv_R, sv_H, d_v, sv_HEADS * sv_KD, fgemm)
+                                qp<Vec<Float>> = mm_host32(h_a, sv_R, sv_H, d_q, sv_HEADS * sv_KD, fcast32, fgp, fgr, pb32)
+                                kp<Vec<Float>> = mm_host32(h_a, sv_R, sv_H, d_k, sv_HEADS * sv_KD, fcast32, fgp, fgr, pb32)
+                                vp<Vec<Float>> = mm_host32(h_a, sv_R, sv_H, d_v, sv_HEADS * sv_KD, fcast32, fgp, fgr, pb32)
 
                                 # conv step against this layer's carried ring (copy in, rotate, copy out)
                                 ringq<Vec<Float>> = Vec()
@@ -1789,7 +1790,7 @@ main()<Int> -> {
                                 gnorm<Vec<Float>> = gated_norm(att0, zraw, onorm)
                                 println("SEC qkvB " + (now_ms() - secT).to_string())
                                 secT = now_ms()
-                                attn = mm_host(gnorm, sv_R, sv_HEADS * sv_KD, d_o, sv_H, fgemm)
+                                attn = mm_host32(gnorm, sv_R, sv_HEADS * sv_KD, d_o, sv_H, fcast32, fgp, fgr, pb32)
                                 free_dev(d_q)
                                 free_dev(d_k)
                                 free_dev(d_v)

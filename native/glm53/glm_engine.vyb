@@ -312,6 +312,34 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     return out
 }
 
+// deq_bf16f — the f32-output twin of deq_bf16: same bf16 raw htod + launch,
+// but the output is n*4 bytes of f32 (bf16deq32) and the caller must consume
+// it with an f32 gemm (mm_host32 / gemm32_p) or cast32 it back to f64.
+share(all)
+deq_bf16f(faddr32<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> outf = 0
+    freedom {
+        var<Int> qf = 0
+        var<Int> of = 0
+        qrcf<Int> = cuMemAlloc_v2(loc(qf), raw.len()) as Int
+        if (qrcf != 0) { println("DEQFAILF alloc q rc=" + qrcf.to_string()); return 0 }
+        orcf<Int> = cuMemAlloc_v2(loc(of), n * 4) as Int
+        if (orcf != 0) { println("DEQFAILF alloc o rc=" + orcf.to_string()); return 0 }
+        hrcf<Int> = cuMemcpyHtoD_v2(qf, raw, raw.len()) as Int
+        if (hrcf != 0) { println("DEQFAILF htod rc=" + hrcf.to_string()); return 0 }
+        blocksf<Int> = (n + 255) / 256
+        lrcf<Int> = cuda_launch4i(from<loc<CVoid>>(faddr32), blocksf, 1, 1, 256, 1, 1, qf, of, n, z) as Int
+        if (lrcf != 0) {
+            println("DEQFAILF launch rc=" + lrcf.to_string())
+            return 0
+        }
+        cuCtxSynchronize()
+        cuMemFree_v2(qf)
+        outf = of
+    }
+    return outf
+}
+
 share(all)
 load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
     ptx<String> = ""
