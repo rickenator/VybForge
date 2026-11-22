@@ -3717,3 +3717,28 @@ PARKED. The remaining path: a persistent per-shard SORTED name index
 HashMap, no parser hostility, ~17 string compares per lookup (80x less scanning).
 Or: fix the Vyb parser (the fn-decl vs member-call/statement ambiguity, the >>
 lexer split in the type positions) — the compiler item.
+=================== THE RESOLVE FAST-PATH: LANDED (779a47d) + THE PARSER FIX (Vyb d74284ca) ==================
+The Vyb parser "hostility" from the parked note dissolved under a correct diagnosis: module
+level only takes DECLARATIONS (all code lives in main()/fns) — most of the six repros were
+probes violating that convention. The ONE real compiler bug: the aspect/bind receiver path
+unwrapped ownership wrappers (their<>/my<>/our<>/view<>/borrow<>) for Vec inners only, so a
+their<HashMap<K,V>> receiver dispatched its MapOps bind through the name-only Vec builtin path
+("Vec::get index must be an integer"). Fixed in cgen_expr_call.cpp: the unwrap generalizes to
+any non-primitive inner type (the wrapper alloca holds a T* view for structs, same as Vec).
+Committed d74284ca on fix/return-path-cleanup-v2.
+
+The fast path that finally landed (779a47d): tail_site builds a LOCAL HashMap (name ->
+"shard off len") from its layer tab ONCE PER LAYER (~17ms) at layer scope — NOT per expert —
+and each expert's nine-name resolve does O(1) lookups with a gx_resolve_tab fallback on any
+miss. resolve 5.4s -> 0.68-0.70s per request (7.7x); deq/mm untouched; digests bit-identical;
+draft 576; CHAIN_OK twice; serve RSS flat ~2GB. Two expensive lessons:
+(1) a HashMap passed across a call boundary (borrow(nmap) into tail_site) DEEP-COPIES per
+call — and the copies leaked: phase 2 ballooned 6GB -> 83GB and the serve was OOM-killed;
+(2) a map built PER EXPERT (96x too often, inside the expert loop) also ballooned phase 2.
+The map build must sit at LAYER scope and never cross a call boundary until the Vyb
+their<>/borrow deep-copy semantics (and the leak) are fixed in the compiler.
+Tab lines carry FOUR fields (name shard off len DTYPE) — the parser must accept nmF >= 2.
+Gate status post-landing: exl3 P1 OK, check32 (gp0+dp0, run the script directly — no make
+target) OK, glm0 OK, decstep OK 1.883e-12, decl3step OK 6.749e-6, DECODE_MTP_MATCH OK
+(verify against the standing gold; the gold regen still gets rc=137 near expert 258 — the
+verify passes with the existing gold npy), decchain still stale (pre-existing).
