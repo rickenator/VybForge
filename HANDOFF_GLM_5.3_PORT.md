@@ -3666,3 +3666,27 @@ known form (36.2-36.4s of the ~100s phase-1). The remaining ideas (the all-4-row
 pipeline: the deq ALSO 4 rows/thread with 4 independent gather chains, the had232
 4-row too) are documented but project to only ~1.5-2x with substantial complexity —
 the deq32 optimization is CLOSED as diminishing returns unless a fresh angle appears.
+=================== FULL 45-LAYER VALIDATION RE-LOCK: GREEN (post fp16-fix + draft-576) ==================
+Ran after the fp16_to_f64 exponentiation fix, the DECODE_MTP corrections (the draft
+10788 -> 576), and the deq32 redesign attempt/revert. ALL GATES:
+- exl3 (the P1 oracle: gen_map + driver + verify): OK — the fp16 fix verified at the
+  oracle level. THE MAKEFILE TARGET WAS BROKEN (no module paths; the system python for
+  the verify) — fixed: --module-path native/glm53,torchload,json + the bindings/cuda +
+  stdlib/collections + the PYORACLE for the verify.
+- check32 both geometries (gp0 cw=2048 + dp0 cw=4096): OK.
+- glm0: OK (1.9e-11). decstep: OK (1.9e-12). decl3step: OK (6.7e-6).
+- DECODE_CHAIN: OK. decmtp: OK (A 2.8e-12, B 1.2e-4 rel, C 9.7e-4, the draft 576 == the
+  oracle 576; the gold regenerated from the current dumps).
+- THE 45-LAYER PREFILL DIGEST RE-LOCK: all 45 layer digests within 1.416e-6 rel of the
+  f64 gold reference (prefill_vyb_45_tab.txt), worst L35 — the IDENTICAL band and
+  worst-layer as the historical acceptance (1.42e-6, L35). The fp16 fix and every
+  serve-era change are digest-clean at full depth.
+- The serve: the digest chain bit-identical to the hoist7 reference, the draft 576,
+  DECODE_MTP OK, CHAIN_OK.
+KNOWN-BLOCKED (pre-existing, NOT today's regressions): gx/gxload SEGFAULT at the
+st_open walk (the Vyb str_stats bug class, documented since the 45-layer build era;
+the serve avoids it via the gx_tabs.cache); the decchain monolith driver is STALE
+(the generated call sites predate the engine split: the moe_tail_step hdg arg, the
+mtp_layer_step dw staging) — regenerating it needs the _chain_main_snippet.txt
+rework; the serve's digest chain covers that ground. The exl3/decchain Makefile
+target fixes are committed here.
