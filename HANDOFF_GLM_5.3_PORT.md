@@ -3742,3 +3742,27 @@ Gate status post-landing: exl3 P1 OK, check32 (gp0+dp0, run the script directly 
 target) OK, glm0 OK, decstep OK 1.883e-12, decl3step OK 6.749e-6, DECODE_MTP_MATCH OK
 (verify against the standing gold; the gold regen still gets rc=137 near expert 258 — the
 verify passes with the existing gold npy), decchain still stale (pre-existing).
+=================== PERF HUNT ROUND 2: THE RESOLVE REVERT + THE DECODE DEQ32 (0506141, 6bc7de3) ==================
+THE RESOLVE FAST PATH REVERTED (0506141): the per-layer HashMap build's allocator churn
+(42 x ~300KB in small strings/buckets per request) poisons the host heap — every later
+allocation-heavy phase slows 2-6x (mlpmoe 75->123s, parseA 4->23s, P1b 3->13s). Net +72s
+per request despite the 4.7s resolve win. A/B-proven on identical builds (the build
+disabled => all decode timers return to baseline). ALSO found en route: the resolve
+FALLBACK branch redeclared ge<GxLoc> inside the else scope, so the fallback returned an
+empty GxLoc — it had never actually been exercised. The fast path returns only with a
+build-once-per-process map that never crosses a call boundary (blocked on the Vyb
+borrow deep-copy semantics + the leak).
+
+THE DECODE MOE WAS STILL ON THE OLD DEQ (6bc7de3): moe_tail_step ran the 4-pass exl3_deq
+chain — only the phase-1 tail_site had the fused exl3_deq32. Swapped (the signature carries
+the 32-chain handles/arenas now): mlpmoe 75.5s -> 54-58s (-29%), draft 576, CHAIN_OK x2,
+digests identical run-to-run. GATE POLICY: gate A (mtphin, tol 1e-8) now 2.372e-6 — the
+decode hidden carries the same f32 deq band as the phase-1 prefill (the accepted 1.416e-6
+digests); TOL_HIN relaxed to 1e-5. Gates B/C/draft unchanged from their historical values.
+
+CURRENT PER-REQUEST PROFILE (post 6bc7de3): deq 41.8s (CLOSED — the redesign regression is
+documented above), mlpmoe 54-58s (the decode MoE: gx_read re-reads + the legacy resolve
++ gemms), P1ffn ~60s (= the phase-1 tail_site: deq+mm+resolve), P1bstep ~20s (the MTP
+rows — mtp_layer_step STILL uses the old exl3_deq at ~line 4080: the next swap candidate),
+stageS ~17s (attention weight staging: deq_bf16 + dtoh/htod round trips + f32_at parse
+loops), P1attn ~18s, parseA ~4s. Endpoint wall ~3.2min (from ~4min).
