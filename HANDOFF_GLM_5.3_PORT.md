@@ -3966,3 +3966,20 @@ stdlib's socket_send returns the BUFFERED count and silently drops the remainder
 socket_send must loop on partial writes (or the caller must chunk by SO_SNDBUF), and socket_close
 needs a linger policy so a close racing unsent data cannot RST the stream. This is a STDLIB bug
 worth fixing upstream (Vyb), not a fabric limit — the burst shows the link is fine.
+=== ROUND 10 ADDENDUM: P6 TRANSPORT GREEN ON THE FABRIC (correction + numbers) ===
+CORRECTION TO ROUND 10: the "16 MiB truncation" was the PROBE's arithmetic (the client sent
+mb x 64 KiB while the server waited for mb MiB), not a fabric limit. The time was not wasted: it
+exposed a REAL runtime bug — __vyb_net_send (the String socket path) did a single send() and
+returned the short count, where the Vec/bytes path always looped. FIXED in
+runtime/vyb_runtime.c (loop over short writes + EINTR, MSG_NOSIGNAL define hoisted) and pushed on
+Vyb branch fix/net-send-short-writes (54f3d0c0; main is ruleset-protected — PR to land).
+PROVEN WITH THE BYTES API (socket_send_bytes has always looped; view(buf) borrow, no copies):
+  loopback godzilla: 256 MiB in 32 ms = 8.0 GB/s, ack 2 B, RTT 200 rounds avg 10 us.
+  FABRIC lefty 192.168.192.1 -> righty 192.168.192.2 (one CX7 rail, plain TCP): 256 MiB in
+  53 ms = 4.8 GB/s (~38 Gbps), RX matches at 54 ms, ack OK, RTT 50 us, 200/200 rounds.
+=> THE DISTRIBUTED-INFERENCE TRANSPORT IS GREEN. Next P6 work: (a) rebuild both Sparks' compilers
+so they carry the runtime fix (the bytes API works without it; the String path needs it);
+(b) the all-gather itself (per-layer activation exchange: tiny payloads — H x R x f64 = 229 KB per
+layer per rank, so 45 x 2 x ~50us RTT + 0.5 ms transfer per step — latency-dominated, so the
+transport's job is done once the RTT is 50 us); (c) split the model (layer/TP or expert-parallel)
+and gate TP2_VYB_MATCH against the P4 single-layer output.

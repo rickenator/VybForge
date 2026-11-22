@@ -4,7 +4,7 @@
 // server: bind <ip>:9123, drain N MB, then an RTT echo loop.
 // client: connect, push N MB in 64 KB chunks, then 200 rounds of 64 B echo.
 // mode via TP_MODE=server|client, TP_IP=<peer ip>; TP_MB fixed at 256.
-import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_set_timeout}
+import network::{socket_open, socket_close, socket_bind, socket_listen, socket_accept, socket_connect, socket_send_bytes, socket_recv_bytes, socket_set_timeout}
 import time::{time_mono_millis}
 import env::{env_get}
 
@@ -30,7 +30,7 @@ main()<Int> -> {
         got<Int> = 0
         t0<Int> = time_mono_millis()
         while (got < want) {
-            chunk<String> = socket_recv(cf, 65536) else ""
+            chunk<Vec<UInt8>> = socket_recv_bytes(cf, 1048576) else Vec<UInt8>()
             if (chunk.len() == 0) {
                 println("PROBE_FAIL recv got=" + got.to_string())
                 socket_close(cf)
@@ -43,14 +43,17 @@ main()<Int> -> {
         ms<Int> = t1 - t0
         if (ms < 1) { ms = 1 }
         println("PROBE_RX_MB=" + (want / 1048576).to_string() + " ms=" + ms.to_string() + " mbps=" + (mb * 1000 / ms).to_string())
-        ackrc<Int> = socket_send(cf, "OK") else 0
+        ackb<Vec<UInt8>> = Vec<UInt8>()
+        ackb.push(79)
+        ackb.push(75)
+        ackrc<Int> = socket_send_bytes(cf, borrow(ackb)) else 0
         if (ackrc <= 0) { println("PROBE_FAIL ack") }
         i<Int> = 0
         t2<Int> = time_mono_millis()
         while (i < 200) {
-            p<String> = socket_recv(cf, 64) else ""
-            if (p.len() == 0) { break }
-            sentp<Int> = socket_send(cf, p) else 0
+            prx<Vec<UInt8>> = socket_recv_bytes(cf, 64) else Vec<UInt8>()
+            if (prx.len() == 0) { break }
+            sentp<Int> = socket_send_bytes(cf, borrow(prx)) else 0
             if (sentp <= 0) { break }
             i = i + 1
         }
@@ -67,14 +70,16 @@ main()<Int> -> {
     if (!c) { println("PROBE_FAIL connect"); return 2 }
     socket_set_timeout(fd, 120000)
     println("PROBE_CONNECTED")
-    payload<String> = "abcdefgh"
-    while (payload.len() < 65536) {
-        payload = payload + payload
+    payload<Vec<UInt8>> = Vec<UInt8>()
+    i<Int> = 0
+    while (i < 1048576) {
+        payload.push((i % 251) as UInt8)
+        i = i + 1
     }
     t0<Int> = time_mono_millis()
     k<Int> = 0
     while (k < mb) {
-        sent<Int> = socket_send(fd, payload) else 0
+        sent<Int> = socket_send_bytes(fd, borrow(payload)) else 0
         if (sent <= 0) {
             println("PROBE_FAIL send k=" + k.to_string())
             socket_close(fd)
@@ -86,16 +91,21 @@ main()<Int> -> {
     ms<Int> = t1 - t0
     if (ms < 1) { ms = 1 }
     println("PROBE_TX_MB=" + mb.to_string() + " ms=" + ms.to_string() + " mbps=" + (mb * 1000 / ms).to_string())
-    ack<String> = socket_recv(fd, 2) else ""
-    println("PROBE_ACK=" + ack)
-    tiny<String> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ackr<Vec<UInt8>> = socket_recv_bytes(fd, 2) else Vec<UInt8>()
+    println("PROBE_ACK_LEN=" + ackr.len().to_string())
+    tiny<Vec<UInt8>> = Vec<UInt8>()
+    i = 0
+    while (i < 64) {
+        tiny.push((i % 251) as UInt8)
+        i = i + 1
+    }
     t2<Int> = time_mono_millis()
     r<Int> = 0
     while (r < 200) {
-        sent2<Int> = socket_send(fd, tiny) else 0
+        sent2<Int> = socket_send_bytes(fd, borrow(tiny)) else 0
         if (sent2 <= 0) { break }
-        e<String> = socket_recv(fd, 64) else ""
-        if (e.len() == 0) { break }
+        erx<Vec<UInt8>> = socket_recv_bytes(fd, 64) else Vec<UInt8>()
+        if (erx.len() == 0) { break }
         r = r + 1
     }
     t3<Int> = time_mono_millis()
