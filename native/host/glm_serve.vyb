@@ -140,6 +140,14 @@ main()<Int> -> {
     # (the stamp embeds the checkpoint dir; delete the cache or point
     # VYBFORGE_TAB_CACHE elsewhere to force a re-walk).
     tabs<Vec<String>> = Vec()
+    # ---- the decode fixed-weight cache: the dense layers' dequed weights are
+    # identical across the two steps; deq once and keep the device handles
+    # (saves the per-call ~300MB reads + deq_bf16 in the phase-2 dense branch).
+    dcacheF<Vec<Int>> = Vec()
+    dcacheG<Vec<Int>> = Vec()
+    dcacheU<Vec<Int>> = Vec()
+    dcacheD<Vec<Int>> = Vec()
+    dcacheOK<Vec<Int>> = Vec()
     tnb<String> = ""
     tnb2<String> = ""
     tln<Int> = 0
@@ -1789,8 +1797,6 @@ main()<Int> -> {
                                 if (n < 3) {
                                     # ---- dense SwiGLU MLP tail (glm_decode_step.vyb's step body)
                                     g_lg_20 = gx_read(lg, 20)
-                                    d_fnF = deq_bf16(fbf, g_lg_20, 24 * sv_HC * sv_H, sv_HC * sv_H)
-                                    if (d_fnF == 0) { return 18 }
                                     sv_baseF = vecf()
                                     g_lg_21 = gx_read(lg, 21)
                                     raw_baseF<String> = g_lg_21
@@ -1801,13 +1807,27 @@ main()<Int> -> {
                                     raw_scaleF<String> = g_lg_22
                                     j = 0
                                     while (j < 3) { sv_scaleF.push(f32_at(raw_scaleF, j)); j = j + 1 }
-                                    g_lg_12 = gx_read(lg, 12)
-                                    d_gate = deq_bf16(fbf, g_lg_12, sv_H * sv_INTER, sv_H)
-                                    g_lg_13 = gx_read(lg, 13)
-                                    d_up = deq_bf16(fbf, g_lg_13, sv_H * sv_INTER, sv_H)
-                                    g_lg_14 = gx_read(lg, 14)
-                                    d_down = deq_bf16(fbf, g_lg_14, sv_INTER * sv_H, sv_INTER)
-                                    if (d_gate == 0 || d_up == 0 || d_down == 0) { return 19 }
+                                    if (dcacheOK.get(n) == 0) {
+                                        d_fnF = deq_bf16(fbf, g_lg_20, 24 * sv_HC * sv_H, sv_HC * sv_H)
+                                        if (d_fnF == 0) { return 18 }
+                                        g_lg_12 = gx_read(lg, 12)
+                                        d_gate = deq_bf16(fbf, g_lg_12, sv_H * sv_INTER, sv_H)
+                                        g_lg_13 = gx_read(lg, 13)
+                                        d_up = deq_bf16(fbf, g_lg_13, sv_H * sv_INTER, sv_H)
+                                        g_lg_14 = gx_read(lg, 14)
+                                        d_down = deq_bf16(fbf, g_lg_14, sv_INTER * sv_H, sv_INTER)
+                                        if (d_gate == 0 || d_up == 0 || d_down == 0) { return 19 }
+                                        dcacheF.set(n, d_fnF)
+                                        dcacheG.set(n, d_gate)
+                                        dcacheU.set(n, d_up)
+                                        dcacheD.set(n, d_down)
+                                        dcacheOK.set(n, 1)
+                                    } else {
+                                        d_fnF = dcacheF.get(n)
+                                        d_gate = dcacheG.get(n)
+                                        d_up = dcacheU.get(n)
+                                        d_down = dcacheD.get(n)
+                                    }
 
                                     reflat<Vec<Float>> = rms_rows(borrow(streams1), sv_R, sv_HC * sv_H, Vec())
                                     d_flat2 = alloc_dev(sv_R * sv_HC * sv_H * 8)
@@ -1821,7 +1841,6 @@ main()<Int> -> {
                                     free_dev(d_flat2)
                                     free_dev(d_mv2)
                                     free_dev(d_scr2)
-                                    free_dev(d_fnF)
 
                                     res2<Vec<Float>> = hc_glue(mv2, sv_baseF, sv_scaleF, streams1)
                                     collapsed2<Vec<Float>> = Vec()
@@ -1844,9 +1863,6 @@ main()<Int> -> {
                                         i = i + 1
                                     }
                                     mlp = mm_host(act, sv_R, sv_INTER, d_down, sv_H, fgemm)
-                                    free_dev(d_gate)
-                                    free_dev(d_up)
-                                    free_dev(d_down)
                                     streams2 = hc_apply(streams1, mlp, post2, comb2)
                                 } else {
                                     # ---- MoE tail (tail_site's body, sv_R = 1)

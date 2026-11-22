@@ -3132,6 +3132,7 @@ share(all)
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, total<Int>, mapbody<String>,
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
+    ms0<Int> = time_mono_millis()
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -3307,6 +3308,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         i = i + 1
     }
     nex = 0
+    msT<Int> = time_mono_millis()
     e = 0
     while (e < NE) {
         toks<Vec<Int>> = Vec()
@@ -3326,6 +3328,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         nt = toks.len()
         if (nt > 0) {
             nex = nex + 1
+            msA<Int> = time_mono_millis()
             epre = lpre + "mlp.experts." + e.to_string() + "."
             w2<Vec<String>> = Vec()
             w2.push(epre + "gate_proj.trellis")
@@ -3407,9 +3410,12 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 cuMemFree_v2(dWu)
                 cuMemFree_v2(dWd)
             }
+            println("SEC moexpert ms=" + (time_mono_millis() - msA).to_string() + " e=" + e.to_string())
         }
         e = e + 1
     }
+    println("SEC moestage loop=" + (time_mono_millis() - msT).to_string() + " pre=" + (msT - ms0).to_string())
+    msS<Int> = time_mono_millis()
     println("  routed experts used: " + nex.to_string())
 
     # ---- shared expert ----
@@ -3453,6 +3459,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     }
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
+    println("SEC moestage share=" + (time_mono_millis() - msS).to_string())
     return streams2
 }
 
