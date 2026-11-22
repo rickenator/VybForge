@@ -213,9 +213,11 @@ main()<Int> -> {
     }
     println("P6R3 router ms=" + (time_mono_millis() - t0).to_string())
     // ---- my half: lanes 0..3 on rank 0, 4..7 on rank 1 ----
+    solo<Bool> = (rank == "solo")
     var<Int> lo = 0
     var<Int> hi = 4
     if (!is0) { lo = 4 ; hi = 8 }
+    if (solo) { lo = 0 ; hi = 8 }
     myp<Vec<Float>> = zeros4096()
     lane = lo
     while (lane < hi) {
@@ -227,6 +229,42 @@ main()<Int> -> {
         lane = lane + 1
     }
     println("P6R3 my half done ms=" + (time_mono_millis() - t0).to_string())
+    // shared expert first: overlaps the peer's compute on the other node
+    sp<String> = lpre3 + "mlp.shared_experts."
+    ws<Vec<String>> = Vec()
+    ws.push(sp + "gate_proj.weight")
+    ws.push(sp + "up_proj.weight")
+    ws.push(sp + "down_proj.weight")
+    gs<GxLoc> = gx_resolve(dir, 83, ws)
+    s0<String> = gx_read(gs, 0)
+    s1<String> = gx_read(gs, 1)
+    s2<String> = gx_read(gs, 2)
+    sWg<Int> = deq_bf16f(fbf, s0, EINTER * H, H)
+    sWu<Int> = deq_bf16f(fbf, s1, EINTER * H, H)
+    sWd<Int> = deq_bf16f(fbf, s2, H * EINTER, EINTER)
+    if (sWg == 0 || sWu == 0 || sWd == 0) { println("P6_FAIL shareddeq"); return 8 }
+    sgv<Vec<Float>> = mm_host32(x, 1, 4096, sWg, EINTER, fcast32, fgp, fgr, pb32)
+    suv<Vec<Float>> = mm_host32(x, 1, 4096, sWu, EINTER, fcast32, fgp, fgr, pb32)
+    sact<Vec<Float>> = Vec()
+    i = 0
+    while (i < sgv.len()) {
+        sact.push(silu(sgv.get(i)) * suv.get(i))
+        i = i + 1
+    }
+    shy<Vec<Float>> = mm_host32(sact, 1, EINTER, sWd, H, fcast32, fgp, fgr, pb32)
+    println("P6R3 shared done ms=" + (time_mono_millis() - t0).to_string())
+    if (solo) {
+        dgs<Float> = 0.0
+        i = 0
+        while (i < 4096) {
+            fv<Float> = myp.get(i) + shy.get(i)
+            dgs = dgs + fv * ((i % 7) as Float + 1.0)
+            i = i + 1
+        }
+        println("P6R3_SOLO_DIGEST=" + dgs.to_string_precise())
+        println("P6R3_SOLO_TOTAL_MS=" + (time_mono_millis() - t0).to_string())
+        return 0
+    }
     if (!is0) {
         csv<String> = ""
         i = 0
@@ -291,7 +329,7 @@ main()<Int> -> {
     while (kx < acc.len()) { csvp = csvp + String_char(acc.get(kx) as Int) ; kx = kx + 1 }
     bodyp<String> = csvp.substring(header_len_of(csvp), csvp.len())
     parts<Vec<String>> = bodyp.split(",")
-    println("P6R3 peer n=" + parts.len().to_string())
+    println("P6R3 recv+parse ms=" + (time_mono_millis() - t0).to_string() + " peer n=" + parts.len().to_string())
     if (parts.len() != 4096) { println("P6_FAIL peervec"); return 15 }
     peerp<Vec<Float>> = Vec()
     kx = 0
@@ -306,6 +344,7 @@ main()<Int> -> {
         fold_acc(borrow(refp), y2, wt.get(lane))
         lane = lane + 1
     }
+    println("P6R3 ref half done ms=" + (time_mono_millis() - t0).to_string())
     ndiff<Int> = 0
     maxd<Float> = 0.0
     i = 0
@@ -324,29 +363,6 @@ main()<Int> -> {
         tot.set(i, myp.get(i) + peerp.get(i))
         i = i + 1
     }
-    // ---- shared expert ----
-    sp<String> = lpre3 + "mlp.shared_experts."
-    ws<Vec<String>> = Vec()
-    ws.push(sp + "gate_proj.weight")
-    ws.push(sp + "up_proj.weight")
-    ws.push(sp + "down_proj.weight")
-    gs<GxLoc> = gx_resolve(dir, 83, ws)
-    s0<String> = gx_read(gs, 0)
-    s1<String> = gx_read(gs, 1)
-    s2<String> = gx_read(gs, 2)
-    sWg<Int> = deq_bf16f(fbf, s0, EINTER * H, H)
-    sWu<Int> = deq_bf16f(fbf, s1, EINTER * H, H)
-    sWd<Int> = deq_bf16f(fbf, s2, H * EINTER, EINTER)
-    if (sWg == 0 || sWu == 0 || sWd == 0) { println("P6_FAIL shareddeq"); return 8 }
-    sgv<Vec<Float>> = mm_host32(x, 1, 4096, sWg, EINTER, fcast32, fgp, fgr, pb32)
-    suv<Vec<Float>> = mm_host32(x, 1, 4096, sWu, EINTER, fcast32, fgp, fgr, pb32)
-    sact<Vec<Float>> = Vec()
-    i = 0
-    while (i < sgv.len()) {
-        sact.push(silu(sgv.get(i)) * suv.get(i))
-        i = i + 1
-    }
-    shy<Vec<Float>> = mm_host32(sact, 1, EINTER, sWd, H, fcast32, fgp, fgr, pb32)
     dgf<Float> = 0.0
     i = 0
     while (i < 4096) {
