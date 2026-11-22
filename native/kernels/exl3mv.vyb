@@ -154,17 +154,19 @@ exl3mv1s4(p<Int>) -> {
         acc3 = acc3 + ld_shared_f32((rl + 3) * 512 + c2 * 4) * xv
         c2 = c2 + 1
     }
-    # scale by su (per W row) and park in the reduction slab at [32768, 36864)
-    # layout: red[row_local * 128 + d], row_local 0..7
+    # The tile slab (4 KB) is dead once every thread has finished its dot, so
+    # the reduction REUSES it: no second shared region, no extra shared budget,
+    # no cross-region address convention to get wrong.
+    kernel_barrier()
     r0<Int> = b2 - cta * 8
     su0<Float32> = ld_f16(SU + (rb64 * 64 + b2) * 2) as Float32
     su1<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 1) * 2) as Float32
     su2<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 2) * 2) as Float32
     su3<Float32> = ld_f16(SU + (rb64 * 64 + b2 + 3) * 2) as Float32
-    st_shared_f32(4096 + r0 * 512 + d * 4, acc0 * su0)
-    st_shared_f32(4096 + (r0 + 1) * 512 + d * 4, acc1 * su1)
-    st_shared_f32(4096 + (r0 + 2) * 512 + d * 4, acc2 * su2)
-    st_shared_f32(4096 + (r0 + 3) * 512 + d * 4, acc3 * su3)
+    st_shared_f32((r0 * 128 + d) * 4, acc0 * su0)
+    st_shared_f32(((r0 + 1) * 128 + d) * 4, acc1 * su1)
+    st_shared_f32(((r0 + 2) * 128 + d) * 4, acc2 * su2)
+    st_shared_f32(((r0 + 3) * 128 + d) * 4, acc3 * su3)
 
     kernel_barrier()
 
@@ -174,7 +176,7 @@ exl3mv1s4(p<Int>) -> {
         s<Float32> = 0.0
         j<Int> = 0
         while (j < 128) {
-            s = s + ld_shared_f32(4096 + rr * 512 + j * 4)
+            s = s + ld_shared_f32((rr * 128 + j) * 4)
             j = j + 1
         }
         gidr<Int> = rb64 * 64 + cta * 8 + rr

@@ -1,0 +1,20 @@
+// p6r6_shprobe — run the shared-memory convention kernel and print the result.
+import env::{env_get}
+import tensor::{tensor_init, dev_alloc, bulk_dtoh}
+import glm_engine::{load_fn, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    if (tensor_init() != 0) { println("P6_FAIL cuda"); return 1 }
+    fsh<Int> = load_fn("native/build/shprobe.ptx", "shprobe")
+    if (fsh == 0) { println("P6_FAIL kernel"); return 2 }
+    buf<Int> = dev_alloc(64)
+    pb<Int> = dev_alloc(16)
+    if (buf == 0 || pb == 0) { println("P6_FAIL alloc"); return 3 }
+    wr_pdev(pb, 0, buf)
+    rc<Int> = launch_kernel(fsh, 1, pb)
+    println("P6R6 launch_rc=" + rc.to_string())
+    v<Vec<Float>> = bulk_dtoh(buf, 6)
+    println("P6R6 ld(0)=" + v.get(0).to_string() + " ld(1024)=" + v.get(1).to_string() + " ld(4096)=" + v.get(2).to_string())
+    println("P6R6 ld(2048)=" + v.get(3).to_string() + " ld(5120)=" + v.get(4).to_string() + " ld(8192)=" + v.get(5).to_string())
+    return 0
+}

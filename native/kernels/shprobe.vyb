@@ -1,0 +1,25 @@
+// shprobe — pin the kernel-shared ADDRESS CONVENTION.
+// The emitted PTX for a working kernel shows ld.shared.f32 [addr+-1024] while
+// its stores carry no fold. This kernel stores three sentinels at user offsets
+// 0, 1024, 4096 and reads each back at the SAME offsets; the output tells us
+// exactly how store and load addresses relate.
+// Launch: 1 block x 32 threads. p: +0 out (f32 x 6)
+shprobe(p<Int>) -> {
+    O<Int> = ld_i64(p + 0)
+    t<Int> = tid_x()
+    if (t == 0) {
+        st_shared_f32(0, 111.0)
+        st_shared_f32(1024, 222.0)
+        st_shared_f32(4096, 333.0)
+    }
+    kernel_barrier()
+    if (t == 1) {
+        st_f32(O + 0, ld_shared_f32(0))
+        st_f32(O + 4, ld_shared_f32(1024))
+        st_f32(O + 8, ld_shared_f32(4096))
+        # cross-checks: read at +- 1024 around each sentinel
+        st_f32(O + 12, ld_shared_f32(2048))
+        st_f32(O + 16, ld_shared_f32(5120))
+        st_f32(O + 20, ld_shared_f32(8192))
+    }
+}

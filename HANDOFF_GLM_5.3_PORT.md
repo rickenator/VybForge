@@ -4175,3 +4175,26 @@ CONCLUSION: exactness-preserving micro-optimisation of this SIMT path is done �
 the remaining 158 ms cannot reach the 20-22 ms/token bar. The next real move is a
 tensor-core fused deq+MMA path, which CHANGES NUMERICS (f16/tf32 operands) and so
 needs its own tolerance gate (not bit-exactness) plus a gold re-baseline.
+=== ROUND 20: FUSED DECODE+MATVEC PROTOTYPE — BUILT, FAST, NOT YET CORRECT ===
+THE ALGEBRA (the reason to bother): EXL3's blockwise composition is W = H_left @ T @ H_right
+(H = the 128x128 Hadamard; su per row, sv per column). For decode (M=1) W must never exist:
+  y = W x = H_left @ (T @ (H_right x))
+so the Hadamard cost collapses from 1.07 GFLOP per projection (applied to the 2048x4096 matrix)
+to 262K MACs (applied to two 128-blocks of a VECTOR), and the 33.5 MB W materialisation (plus its
+33.5 MB read back) disappears. Per projection only the 4.2 MB packed read remains.
+SHIPPED IN THIS ROUND: native/kernels/exl3mv.vyb (exl3xhat = sv.(H x); exl3mv1s4 = decode +
+row-dot against xp with a shared reduction + atomic accumulate; exl3yhat = H yraw) and
+native/host/p6r5_fusedmv.vyb (the gated prototype: old path deq-W -> mm vs new path, one
+expert's gate_proj). All three kernels launch rc=0 and the mv kernel runs in 2 ms vs 4-5 ms for
+the old deq+mm on the SAME projection.
+STATUS: NUMERICS WRONG (yraw garbage, non-deterministic run to run; yhat output all zero).
+The launch path is confirmed good (rc=0 everywhere); the suspect is the kernel-shared ADDRESS
+CONVENTION: the emitted PTX shows ld.shared.f32 with a -1024 byte fold that my st_shared_f32
+calls do NOT carry, so phase 2 reads a shifted slab. The existing exl3dq1s4 works because its
+store and load offsets carry the same convention; my extra 4 KB reduction region and the
+compact re-indexing broke that alignment. Harness time also shows FIRST-TOUCH cost: staging the
+4.2 MB trellis on a freshly allocated buffer costs ~14 ms (unified-memory page faults) — a real
+pipeline must warm/relocate that (in the deq path it is amortised away by reuse).
+NEXT: (1) a minimal two-kernel shared-memory probe (store a sentinel at offset X, read it back)
+to pin the convention, then fix exl3mv1s4's slab indexing; (2) once the gate is <=1e-5, measure
+the real per-projection total; (3) only then scale to the 8-expert expert FFN.
