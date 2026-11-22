@@ -3801,3 +3801,20 @@ cache-hot), draft 576, CHAIN_OK x2, digests identical, RSS flat ~2GB. Net vs the
 DEPLOYMENT CHECKLIST for any HashMap-in-loop change: (1) the build at the WIDEST loop scope,
 (2) never pass a HashMap across a call boundary in a long-running process until the long-lived-
 map balloon is understood, (3) the fallback branch must ASSIGN, not redeclare.
+=================== ROUND 7: THE F32 OUTPUT PATH — INCREMENT 1 (552e297) ==================
+The phase-1 experts' down-proj now runs the f32 split-K gemm: exl3_deq32f (the deq32 chain minus
+the final f32->f64 cvt, returning the f32 buffer) + mm_host32 (htod f64 act -> cast32 ->
+gemm32_p/gemm32_r with f64 output) — a drop-in mm_host twin. GATED: the new real-shape probe
+(native/host/gemm32_real.vyb, M=7/K=2048/N=4096, rel <= 1.3e-5 vs the f64 gold) and the standing
+DECODE_MTP battery x2 IDENTICAL GREEN (gate A 2.571e-6 vs tol 1e-5 — the f32 band absorbed the
+down-proj; gate B 1.202e-4 unchanged; draft 576 = oracle). The DIGESTENTRY digest set moved to a
+new deterministic f32-era set; NOTE the old hex-grep digest compare is VACUOUS on current logs
+(no ^[0-9a-f]{16} lines) — compare DIGESTENTRY lines or the gold-graded gates.
+GEMM32 PARAM GOTCHA: gemm32_r takes KSP at +48, NOT +32 (+32/+40 are legacy alpha/beta) — KSP at
++32 feeds garbage into the reduce -> CUDA 700 illegal address, which POISONS the context (every
+later cuMemAlloc fails — looks like an OOM, it is not). gemm32_p: (A,B,SK,M,N,K,NBLK,KSP)@+0..56,
+grid NBLK*KSP x 256 threads; A needs (M+4)*K*4 (padded rows read, never stored); SK = KSP*M*N*4.
+Perf of this increment alone: mm 7248 -> ~6768 ms (-0.5s), deq ~flat — it is the correctness +
+plumbing enabler. Increments 2+: gate/up on f32 (needs the 4-byte DtoH binding question answered
+for the host silu inputs), stageS (the attention staging halves), the dense branch, moe_tail_step,
+then the full-pipeline f32 for the 24GB Flash play. Plan: skill references/f32-output-path.md.
