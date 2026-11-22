@@ -3776,3 +3776,12 @@ standalone exl3_deq fn is now dead in the serve path). Wall 4m14s -> 3m34s (-40s
 draft 576, CHAIN_OK x2, digests identical to the deq32-decode run. NOTE: mlpmoe varies
 54-77s run-to-run with the page-cache/ComfyUI state — only wall clock and the digest
 identity are trustworthy comparators; run A/B back-to-back on an idle GPU.
+=================== ROUND 5: THE ATTENTION STAGING CACHE — INFEASIBLE AT f64 ==================
+The proposed attention staging cache does not fit: deq_bf16 outputs are f64 and the four big
+attention weights (q/k/v/o at 4096 x 64 x 128) alone are ~1.07GB per layer; caching all 45
+layers needs ~48GB on the 24GB card. The 17.4s stageS + 5s parseA per request are the price
+of re-staging f64 weights per decode step — structural at f64 precision. The remaining lever
+of that scale is the f32 deq output path (halves the deq writes, the gemm traffic AND the
+staging) with its full digest-band re-lock. The dense-branch step-2 cache (d125f70) stays:
+it is small (3 layers) but free. Endpoint stands ~3.2min; per-request: deq 41.8s, decode MoE
+54-58s (of which the expert loop 11s), P1ffn ~60s, stageS 17s, P1attn 18s, P1bstep 20s.
