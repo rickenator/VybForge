@@ -3866,3 +3866,14 @@ layer-45 conversion's risk to gate B is lower than feared. Draft 576 = oracle, d
 7640fda783fa x2. Cumulative f32 win: ~-11s/request (mm 7248->~2900s-class, deq, stageS).
 NEXT: mtp_layer_step on f32 (the last expert site; watch gate A/B on a fresh read), then the
 full-pipeline f32 for the 24GB Flash play (skill references/f32-output-path.md).
+=================== ROUND 7f: THE F32 OUTPUT PATH — INCREMENT 6 (82ddbb8) ==================
+mtp_layer_step (layer 45, the last expert site) goes f32 — expert coverage COMPLETE: every
+expert-weight site in the serve path (phase-1 tail_site, the dense branch, moe_tail_step, the
+inline loop, mtp_layer_step) runs the f32 split-K gemm. DECODE_MTP x2 IDENTICAL GREEN: gate A
+3.397e-6 unchanged (layer 45 is downstream of gate A's input), gate B 1.203e-4 -> 1.204e-4
+(+1e-7 — the f32 gemm contribution to B is negligible vs the EXL3 dequant noise, exactly as the
+increment-5 finding predicted), draft 576 = oracle, digests 7640fda783fa x2 (the digest taps sit
+upstream of layer 45; gate B is the only trace of the change). Cumulative f32 win: ~-11s/request.
+REMAINING (the 24GB Flash play): the full-pipeline f32 — the element chain (rmsnorm/rope/silu/
+hc_apply) f32 locals audit, the attention small weights, the device-to-device gemms (the routers),
+and the activation side end to end. Skill references/f32-output-path.md has the full sequence.
