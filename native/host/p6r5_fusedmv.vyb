@@ -98,7 +98,11 @@ main()<Int> -> {
     x<Vec<Float>> = Vec()
     i = 0
     while (i < 4096) {
-        if (oneshot && i != 0) { x.push(0.0) } else { x.push((((i * 37) % 251) as Float - 125.0) / 250.0) }
+        if (oneshot) {
+            if (i == 0) { x.push(1.0) } else { x.push(0.0) }
+        } else {
+            x.push((((i * 37) % 251) as Float - 125.0) / 250.0)
+        }
         i = i + 1
     }
     xb<Vec<UInt8>> = Vec()
@@ -318,7 +322,23 @@ main()<Int> -> {
     }
     rel<Float> = mx / (nn + 1e-30)
     println("P6R5_GATE max_abs=" + mx.to_string_precise() + " over_max=" + nn.to_string_precise() + " rel=" + rel.to_string_precise() + " over1e-3=" + nd.to_string())
-    println("P6R5 DBG new_y0=" + ynew.get(0).to_string_precise() + " old_y0=" + yold.get(0).to_string_precise() + " Wcol0_0=" + wcol.get(0).to_string_precise() + " Wcol0_1=" + wcol.get(1).to_string_precise() + " new_y1=" + ynew.get(1).to_string_precise())
+    println("P6R5 DBG new_y0=" + ynew.get(0).to_string_precise() + " new_y1=" + ynew.get(1).to_string_precise() + " new_y2=" + ynew.get(2).to_string_precise())
+    println("P6R5 DBG B0_0=" + wcol.get(0).to_string_precise() + " B0_1=" + wcol.get(1).to_string_precise() + " B0_2=" + wcol.get(2).to_string_precise())
+    if (oneshot) {
+        // x = e_0: y[n] must equal B[0][n] exactly (one term survives)
+        nd2<Int> = 0
+        mx2<Float> = 0.0
+        i = 0
+        while (i < 2048) {
+            dd<Float> = ynew.get(i) - wcol.get(i)
+            ad2<Float> = dd
+            if (ad2 < 0.0) { ad2 = 0.0 - ad2 }
+            if (ad2 > mx2) { mx2 = ad2 }
+            if (ad2 > 1e-4) { nd2 = nd2 + 1 }
+            i = i + 1
+        }
+        println("P6R5 ONESHOT_GATE max_abs=" + mx2.to_string_precise() + " over1e-4=" + nd2.to_string())
+    }
     if (rel <= 1e-5) { println("P6R5_DONE FUSED_OK") } else { println("P6R5_DONE FUSED_FAIL") }
     return 0
 }

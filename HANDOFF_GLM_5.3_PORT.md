@@ -4265,3 +4265,18 @@ applied twice, or the slab row/col mapping in phase 2).
 NEXT (one run): with x = e_0 and a single input tile, dump (a) xp[0..3] and (b) the 8x128 slab
 values for CTA 0, and compare xp against a host-computed H_in x with su — the vector pass is
 checkable exactly, which splits "vector passes wrong" from "tile/decode wrong" for good.
+=== ROUND 25: THE VECTOR PASSES ARE CORRECT — the defect is in the tile decode or yhat ===
+x = e_0, dumped device-side and compared against the closed form xp[i] = su[i].H[i][0]:
+    i=0  H=0.08838834  su=0.01782227  xp=0.0015752805629  expected=0.0015752805829
+    i=1  H=0.08838834  su=0.01770020  xp=0.0015644909581  expected=0.0015644909899
+    i=2, i=3 likewise (f32-level agreement on all four)
+H = 1/sqrt(128) as expected. So exl3xhat (H_in on the input axis, su folded in) is RIGHT, and the
+layout is W^T ([input][output]). The remaining error is therefore confined to:
+  (a) exl3mv1s4's slab/decode or its down-column dots, or
+  (b) exl3yhat (H_out on the output axis) / the sv application.
+NEXT (one run, isolates (a) from (b)): run the fused path with xp REPLACED by a synthetic one-hot
+input (xp = e_0) — exl3xhat skipped. Then u[n] = T[0][n] (the raw decoded tile row 0) and, with
+sv folded, y = H_out(sv . T[0][:]). Compare those against the same quantity computed from the
+VERIFIED buffer: T[0][n] can be recovered from B because B[k][n] = sum_c H[k][c] T[c][n] su[k] sv[n]
+and H is orthogonal, so T = H^T (B / (su.sv)) row-wise — i.e. the fusion's own intermediate is
+recoverable from the known-good W. That closes the loop without needing the python oracle.
