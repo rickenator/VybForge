@@ -4335,3 +4335,15 @@ staging that zeroes yraw, or the dump path interfering). This is the first thing
 DEBUGGING SPEND: rounds 20-28 on this kernel. Everything except the sv wiring is now PROVEN
 (layout, decode bit-identical, vector pass, dots, H transform). The remaining work is small but
 mechanical.
+=== ROUND 29: ZEROS TRACED TO yraw IN THE ONE-SHOT PATH (not the sv fix) ===
+After the sv-after-yhat fix: sv reads fine on the host (0.9836, 1.0078) but yraw[0]=yraw[1]=0, so
+the zeros come from the DOTS, not from yhat. The same kernel produced a CORRECT yraw in the P6_T
+path (U_DIFF=0 vs the host reference), so the difference between the two paths is in the PROBE's
+staging, not in the kernel: candidates are (a) xp is empty on this path (the xhat launch at the
+normal path's line ~435 uses pbx set in the staging block — verify bx really received the cast),
+or (b) the mv launch's param block is stale (pbm +64 is now cleared, ruled out).
+NOTE: before the sv edit the same one-shot path produced NONZERO y (0.00588), so something in the
+last two edits interacts — the isolated thing to check is whether bxp holds the cast x at mv time
+(dump bxp[0..3] on this path; the P6_T path already proves the kernel consumes xp correctly).
+STATE: kernel-side everything proven except sv wiring; probe-side staging has an unexplained
+regression. Commit is complete; the next session should start by dumping bxp on the one-shot path.

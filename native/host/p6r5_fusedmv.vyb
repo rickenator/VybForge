@@ -221,6 +221,17 @@ main()<Int> -> {
     wr_pdev(pb32, 16, 4096)
     launch_kernel(fcast32, 16, pb32)
     cuCtxSynchronize()
+    // is the cast x actually in bx before anything consumes it?
+    fcvx<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    bxd<Int> = dev_alloc(64)
+    pbcvx<Int> = dev_alloc(24)
+    wr_pdev(pbcvx, 0, bx)
+    wr_pdev(pbcvx, 8, bxd)
+    wr_pdev(pbcvx, 16, 4)
+    launch_kernel(fcvx, 1, pbcvx)
+    cuCtxSynchronize()
+    bxv<Vec<Float>> = bulk_dtoh(bxd, 4)
+    println("P6R5 DBG bx0=" + bxv.get(0).to_string_precise() + " bx1=" + bxv.get(1).to_string_precise() + " bx2=" + bxv.get(2).to_string_precise())
     free_dev(dA64x)
     cuMemcpyHtoD_v2(arA, g0, g0.len())
     cuMemcpyHtoD_v2(arG, g1, g1.len())
@@ -436,6 +447,17 @@ main()<Int> -> {
     println("P6R5 DBG xh_launch_rc=" + rcx.to_string())
     cuCtxSynchronize()
     txh<Int> = time_mono_millis()
+    // is xp actually populated before the mv runs?
+    fcv3<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    xpd2<Int> = dev_alloc(64)
+    pbcv3<Int> = dev_alloc(24)
+    wr_pdev(pbcv3, 0, bxp)
+    wr_pdev(pbcv3, 8, xpd2)
+    wr_pdev(pbcv3, 16, 4)
+    launch_kernel(fcv3, 1, pbcv3)
+    cuCtxSynchronize()
+    xpv<Vec<Float>> = bulk_dtoh(xpd2, 4)
+    println("P6R5 DBG xp0=" + xpv.get(0).to_string_precise() + " xp1=" + xpv.get(1).to_string_precise() + " xp2=" + xpv.get(2).to_string_precise())
     // p: +0 yraw, +8 xp, +16 su, +24 cw, +40 q(trellis), +48 td(mapdev), +56 inv
     var<Int> m1 = byr
     var<Int> m2 = bxp
@@ -453,7 +475,12 @@ main()<Int> -> {
     wr_pdev(pbm, 40, m6)
     wr_pdev(pbm, 48, m7)
     wr_pdev(pbm, 56, m8)
-    wr_pdev(pbm, 64, 0)
+    // NOTE: passing 0 here (skip the dump) reproducibly yields yraw == 0 while the
+    // identical launch with a real dump pointer is correct, i.e. the `if (DMP != 0)`
+    // guard around a shared-slab read/write changes codegen badly. Always hand the
+    // kernel a real scratch buffer and ignore its contents.
+    dscratch<Int> = dev_alloc(33554432)
+    wr_pdev(pbm, 64, dscratch)
     rcm<Int> = launch_kernel(fmv, 8192, pbm)
     println("P6R5 DBG mv_launch_rc=" + rcm.to_string())
     cuCtxSynchronize()
