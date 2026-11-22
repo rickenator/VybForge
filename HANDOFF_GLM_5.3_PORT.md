@@ -3690,3 +3690,30 @@ the serve avoids it via the gx_tabs.cache); the decchain monolith driver is STAL
 mtp_layer_step dw staging) — regenerating it needs the _chain_main_snippet.txt
 rework; the serve's digest chain covers that ground. The exl3/decchain Makefile
 target fixes are committed here.
+=================== THE RESOLVE FAST-PATH: PARKED (VYB PARSER HOSTILE TO HashMap) ==================
+The 5.5s resolve = ~4242 lazy nine-name expert resolves x ~1.3ms; the cost is
+gx_resolve_tab's tab.index_of(key) — a naive ~120KB substring scan per name
+(the per-layer shard tab). The fix attempt: a HashMap<String,String> name ->
+"shard off len" map with O(1) lookups, built per-layer from the tail_site's own
+~120KB tab (~10ms build) with a legacy-resolve fallback on any miss.
+BLOCKED BY THE VYB PARSER — six syntax forms each hit a DIFFERENT misparse:
+(1) module-global HashMap: member calls untypeable (the known Vec-global gap);
+(2) their<HashMap<String,String>> param + statement-level nm.put(...): parsed as
+a fn DECLARATION (dotted name + untyped params = "Expected parameter declaration");
+(3) dummyB<Bool> = nm.put(...): the <Bool> typed-var triggers the generic-fn-decl
+path, which then eats the FOLLOWING statements (the cascade);
+(4) untyped dummyB = ...: "unexpected token IDENTIFIER" (a new var needs a type);
+(5) if (m.put(...)) { }: "unexpected token KEYWORD_IF" right after a
+HashMap<String, String>> declaration — the >> in the assignment LHS type is
+lexer-ambiguous with shift, and the parser state corrupts the NEXT statement
+(even though gx_plan.vyb's identical-looking HashMap<String, Int>> line works —
+the difference is unresolved);
+(6) untyped m = HashMap<String, String>(64): "unexpected token IDENTIFIER".
+The working reference: gx_plan.vyb's LOCAL map with pos.put(ix.names.get(i), i)
+statement form and pos.get(nm) else -1 — the exact same shapes fail once the map
+crosses a share(all) boundary or a their<> param.
+PARKED. The remaining path: a persistent per-shard SORTED name index
+(gx_idx_<n>.cache, the tabs-cache pattern) + binary search in the tail_site — no
+HashMap, no parser hostility, ~17 string compares per lookup (80x less scanning).
+Or: fix the Vyb parser (the fn-decl vs member-call/statement ambiguity, the >>
+lexer split in the type positions) — the compiler item.
