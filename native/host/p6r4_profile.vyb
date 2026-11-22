@@ -1,0 +1,174 @@
+// p6r4_profile — where does one expert's dequant time go?
+// Replicates exl3_deq32f's steps inline with host timers + a device sync after
+// each stage, for ONE expert's gate_proj (4.2 MB packed -> 2048x4096 f32):
+//   htod (trellis + suh + svh) | exl3dq1s4 + sync | exl3had232 + sync
+// plus a full-call comparison. Run on a CLEAN GPU (check nvidia-smi first).
+// env: P6_DIR, P6_EXP
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, gx_resolve_tab, launch_kernel, free_dev, H}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    expS<String> = env_get("P6_EXP") else "153"
+    e<Int> = 0
+    i<Int> = 0
+    while (i < expS.len()) {
+        c<Int> = (expS.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { e = e * 10 + (c - 48) }
+        i = i + 1
+    }
+    if (tensor_init() != 0) { println("P6_FAIL cuda"); return 1 }
+    fdqs4<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
+    fhad232<Int> = load_fn("native/build/exl3.ptx", "exl3had232")
+    fhgen32<Int> = load_fn("native/build/exl3.ptx", "exl3hgen32")
+    finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0) { println("P6_FAIL kernels"); return 2 }
+    hd_pre32<Int> = had_hoist32(fhgen32)
+    if (hd_pre32 == 0) { println("P6_FAIL hadhoist"); return 3 }
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL map.bin"); return 4 }
+    }
+    mapbody<String> = mapd.substring(16, mapd.len())
+    nbmap<Int> = mapd.len() - 16
+    mapdev<Int> = mapdev_build(finvk, mapd)
+    if (mapdev == 0) { println("P6_FAIL mapdev"); return 5 }
+    invbase<Int> = mapdev + 16 + nbmap
+    arA<Int> = dev_alloc(8388608)
+    arB<Int> = dev_alloc(65536)
+    arC<Int> = dev_alloc(33554432)
+    arD<Int> = dev_alloc(33554432)
+    arG<Int> = dev_alloc(16384)
+    arH<Int> = dev_alloc(16384)
+    arI<Int> = dev_alloc(64)
+    pb32<Int> = dev_alloc(192)
+    if (arA == 0 || arB == 0 || arC == 0 || arD == 0 || arG == 0 || arH == 0 || arI == 0 || pb32 == 0) { println("P6_FAIL arena"); return 6 }
+    // the tab
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cs<String> = ""
+    match (open_read(cache_path)) {
+        f -> { match (read_all(f)) { s -> { cs = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL tabcache"); return 4 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    ti<Int> = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("P6_FAIL tabcache_trunc"); return 5 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+    epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
+    w2<Vec<String>> = Vec()
+    w2.push(epre + "gate_proj.trellis")
+    w2.push(epre + "gate_proj.suh")
+    w2.push(epre + "gate_proj.svh")
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w2)
+    g0<String> = gx_read(ge, 0)
+    g1<String> = gx_read(ge, 1)
+    g2<String> = gx_read(ge, 2)
+    println("P6R4 expert=" + e.to_string() + " trellis=" + g0.len().to_string() + " suh=" + g1.len().to_string() + " svh=" + g2.len().to_string())
+    cw<Int> = 2048
+    ntiles<Int> = cw * 16
+    kn2<Int> = (ntiles / (cw / 16)) * 16 * cw
+    println("P6R4 kn2=" + kn2.to_string() + " out_bytes=" + (kn2 * 4).to_string())
+    // ---- warm-up call (allocations, context) ----
+    dW0<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                           arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    if (dW0 == 0) { println("P6_FAIL deq"); return 7 }
+    // ---- same steps inline, timed ----
+    tb2<Int> = g0.len()
+    nbody2<Int> = mapbody.len()
+    nsuh2<Int> = g1.len()
+    nsvh2<Int> = g2.len()
+    kns<Int> = (ntiles / (cw / 16)) * 16 * cw
+    var<Int> fdx = 0
+    freedom {
+        var<Int> tim = 0
+        var<Int> arc = 0
+        arc = cuMemAlloc_v2(loc(tim), kns * 4) as Int
+        fdx = tim
+        if (arc != 0) { println("P6_FAIL fdalloc rc=" + arc.to_string() + " bytes=" + (kns * 4).to_string()); return 8 }
+        t0<Int> = time_mono_millis()
+        cuMemcpyHtoD_v2(arA, g0, tb2)
+        cuMemcpyHtoD_v2(arG, g1, nsuh2)
+        cuMemcpyHtoD_v2(arH, g2, nsvh2)
+        cuCtxSynchronize()
+        t1<Int> = time_mono_millis()
+        var<Int> qv = arA
+        var<Int> mvv = mapdev
+        var<Int> hvv = hd_pre32
+        var<Int> txv = arC
+        var<Int> cwv = cw
+        var<Int> ivv = invbase
+        cuMemcpyHtoD_v2(pb32 + 0, loc(qv), 8)
+        cuMemcpyHtoD_v2(pb32 + 8, loc(mvv), 8)
+        cuMemcpyHtoD_v2(pb32 + 16, loc(hvv), 8)
+        cuMemcpyHtoD_v2(pb32 + 24, loc(txv), 8)
+        cuMemcpyHtoD_v2(pb32 + 32, loc(cwv), 8)
+        cuMemcpyHtoD_v2(pb32 + 40, loc(ivv), 8)
+        launch_kernel(fdqs4, ntiles / 4, pb32)
+        cuCtxSynchronize()
+        t2<Int> = time_mono_millis()
+        var<Int> tvx = arC
+        var<Int> fv2 = fdx
+        var<Int> hv2 = hd_pre32
+        var<Int> suv2 = arG
+        var<Int> svv2 = arH
+        var<Int> cw2 = cw
+        var<Int> nbc2 = cw / 128
+        var<Int> nbl2 = (kns / cw / 128) * nbc2
+        cuMemcpyHtoD_v2(pb32 + 0, loc(tvx), 8)
+        cuMemcpyHtoD_v2(pb32 + 8, loc(fv2), 8)
+        cuMemcpyHtoD_v2(pb32 + 16, loc(hv2), 8)
+        cuMemcpyHtoD_v2(pb32 + 24, loc(suv2), 8)
+        cuMemcpyHtoD_v2(pb32 + 32, loc(svv2), 8)
+        cuMemcpyHtoD_v2(pb32 + 40, loc(cw2), 8)
+        cuMemcpyHtoD_v2(pb32 + 48, loc(nbc2), 8)
+        cuMemcpyHtoD_v2(pb32 + 56, loc(nbl2), 8)
+        launch_kernel(fhad232, nbl2 * 64, pb32)
+        cuCtxSynchronize()
+        t3<Int> = time_mono_millis()
+        println("P6R4 STAGE htod_ms=" + (t1 - t0).to_string() + " dq_ms=" + (t2 - t1).to_string() + " had_ms=" + (t3 - t2).to_string() + " total=" + (t3 - t0).to_string())
+        println("P6R4 blocks_dq=" + (ntiles / 4).to_string() + " blocks_had=" + (nbl2 * 64).to_string())
+        free_dev(fdx)
+    }
+    // full-call timing x3
+    r<Int> = 0
+    while (r < 3) {
+        ta<Int> = time_mono_millis()
+        dW1<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                               arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+        tb<Int> = time_mono_millis()
+        println("P6R4 full_call r=" + r.to_string() + " ms=" + (tb - ta).to_string())
+        r = r + 1
+    }
+    println("P6R4_DONE")
+    return 0
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Bool> = true
+        j<Int> = 0
+        while (ok && j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = false }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    return -1
+}

@@ -4118,3 +4118,21 @@ because they fold in different association order ((0..7) vs (0..3)+(4..7)); the 
 (ndiff=0 vs a recompute in matching order) is the correctness proof, not digest equality.
 NEXT: (a) move the shared expert off rank 0 (idle-rank work), (b) batch the 8 expert FFNs into one
 launch per rank, (c) measure deq-equivalent bytes/s to size the fused-MMA target.
+=== ROUND 17: THE 700 ms/EXPERT MYSTERY — gx_resolve, not the GPU (37x) ===
+Instrumented the r3 probe per phase. Per expert: deq 13-14 ms, gemm 1-2 ms, tensor read 4-5 ms
+-- but the loop advanced ~800 ms/expert. The cost was gx_resolve(dir,...): it re-opens and
+re-parses a 2 GB shard header for EVERY call (710-798 ms/name). Fix: use the production TAB
+(gx_resolve_tab + the prebuilt per-layer table in native/out/gx_tabs.cache, built by the serve;
+also copied to both Sparks; righty needs its own copy because its checkpoint dir differs, and
+the tab is path-independent). Result: resolve 700 -> 1 ms; SOLO 8 experts + shared = 7044 -> 188 ms
+(37x), digest IDENTICAL. Two-node: rank0 half 81 ms (+32 shared), rank1 85+34 ms, wall 2.1 s only
+because rank 1 JIT-compiles at launch (~2 s, once per process). Steady-state step ~125 ms = 1.5x
+vs solo 188 ms. Gate EXACT.
+LESSON: measure the phases before optimising the kernel. Per-expert resolve through gx_resolve is a
+2 GB-header parse; only gx_resolve_tab / the window path are viable in any hot loop.
+REMAINING: 13 ms/expert deq (12.6 MB => ~0.9 GB/s effective vs ~270 GB/s HBM) is now the dominant
+term: 8 experts x 45 layers = 4.7 s/token. The bar (20-22 ms/token) needs ~50 us/expert, i.e. the
+dequant fused into tensor-core MMA (Blackwell FP4/FP8 + tcgen05), all routed experts in one launch.
+NEXT STEPS: (a) profile the deq kernel itself (ALWAYS from a clean GPU), (b) prototype a fused
+deq+MMA kernel on one expert and compare against 13+2 ms, (c) synchronous-launch timing harness so
+benchmarks never include JIT startup.
