@@ -24,3 +24,45 @@ f32t64(p<Int>) -> {
     gid<Int> = blk_x() * dim_x() + tid_x()
     if (gid < N) { st_f64(D + gid * 8, ld_f32n(S + gid * 4)) }
 }
+
+// cmp32 — elementwise |a-b| over n f32: count of diffs > 1e-4 plus the sum of
+// |diff| (atomic_max_f32 does not exist in the dialect; a sum is enough to tell
+// "identical" from "shifted").
+// p: +0 a(f32), +8 b(f32), +16 n, +24 cnt(i32), +32 sum(f64)
+cmp32(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    C<Int> = ld_i64(p + 24)
+    M<Int> = ld_i64(p + 32)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        d<Float32> = ld_f32n(A + gid * 4) - ld_f32n(B + gid * 4)
+        ad<Float32> = d
+        if (ad < 0.0) { ad = 0.0 - ad }
+        if (ad > 0.0001) { atomic_add_i32(C, 1) }
+        atomic_add_f64(M, ad as Float)
+    }
+}
+
+// refu — the plainest reference matvec: u[n] = sum_k T[k][n] xp[k], then x sv.
+refmatvec(p<Int>) -> {
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    cw<Int> = ld_i64(p + 16)
+    nin<Int> = ld_i64(p + 24)
+    O<Int> = ld_i64(p + 32)
+    SV<Int> = ld_i64(p + 40)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < cw) {
+        acc<Float32> = 0.0
+        k<Int> = 0
+        while (k < nin) {
+            acc = acc + ld_f32n(T + (k * cw + gid) * 4) * ld_f32n(X + k * 4)
+            k = k + 1
+        }
+        sv<Float32> = ld_f16(SV + gid * 2) as Float32
+        st_f32(O + gid * 4, acc * sv)
+    }
+}
+

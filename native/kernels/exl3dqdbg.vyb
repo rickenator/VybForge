@@ -1,0 +1,96 @@
+// exl3dqdbg — the VERIFIED deq kernel's phase 1, plus a dump of the decoded
+// slab into the full raw-T layout T[input 4096][output 2048] (stride 2048).
+// This is the oracle for the fused kernel's decode: same nibble/slot walk as
+// exl3dq1s4 (which is gated green), only the downstream differs.
+// p: +0 q(trellis), +8 td(mapdev), +16 H(unused), +24 T(out f32 = raw decode),
+//    +32 cw, +40 inv
+exl3dqdbg1s4(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 32)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 0)
+    td<Int> = ld_i64(p + 8)
+    T<Int> = ld_i64(p + 24)
+    inv<Int> = ld_i64(p + 40)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = fp16_to_f64(yK & 65535)
+        hiK<Float> = fp16_to_f64((yK >> 16) & 65535)
+        # raw decode straight to global, in T[row][col] (input x output) layout
+        st_f32(T + (rowK * cw + colK) * 4, (loK + hiK) as Float32)
+        k = k + 1
+    }
+}
+
+share(all) fp16_to_f64(b<Int>)<Float> -> {
+    sb<Int> = (b >> 15) & 1
+    eb<Int> = (b >> 10) & 31
+    mb<Int> = b & 1023
+    v<Float> = 0.0
+    if (eb == 0) {
+        # subnormal: mb * 2^-24 in ONE multiply (was a 24-step halving loop);
+        # the product is exact, so the value is bit-identical
+        v = (mb as Float) * 0.000000059604644775390625
+    } else {
+        if (eb == 31) {
+            v = 65504.0
+        } else {
+            v = (1024 + mb) as Float
+            e<Int> = eb - 25
+            # 2^e exactly via binary exponentiation (<=5 squarings): every
+            # intermediate is a power of two, so the result is bit-identical
+            # to the old stepwise doubling/halving loops (<=24 iterations)
+            k<Int> = e
+            if (k < 0) { k = 0 - k }
+            r<Float> = 1.0
+            b2<Float> = 2.0
+            while (k > 0) {
+                if ((k - ((k >> 1) * 2)) == 1) { r = r * b2 }
+                b2 = b2 * b2
+                k = k >> 1
+            }
+            if (e < 0) {
+                v = v / r
+            } else {
+                v = v * r
+            }
+        }
+    }
+    if (sb == 1) {
+        v = 0.0 - v
+    }
+    return v
+}

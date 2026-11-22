@@ -4280,3 +4280,24 @@ sv folded, y = H_out(sv . T[0][:]). Compare those against the same quantity comp
 VERIFIED buffer: T[0][n] can be recovered from B because B[k][n] = sum_c H[k][c] T[c][n] su[k] sv[n]
 and H is orthogonal, so T = H^T (B / (su.sv)) row-wise — i.e. the fusion's own intermediate is
 recoverable from the known-good W. That closes the loop without needing the python oracle.
+=== ROUND 26: TRUE ONE-HOT — THE FUSED PATH IS DEFINITIVELY WRONG; WHERE IT IS NARROWED ===
+With a CORRECT x = e_0 (the round-23 vector bug fixed: x[0] = 1.0, not the ramp):
+    fused y[0] =  0.00588   B[0][0] = -0.01945
+    fused y[1] =  0.00358   B[0][1] =  0.01580
+    fused y[2] =  0.00353   B[0][2] = -0.02862
+    ONESHOT_GATE max_abs 0.0938 over 2044 of 2048 elements.
+VERIFIED AND TRUSTWORTHY: the layout (B = W^T, [input 4096][output 2048], stride 2048); the old
+path (y = B row for a one-hot); exl3xhat (xp == su.H.x to f32 on four elements); H = 1/sqrt(128).
+NOT VERIFIED AND WRONG: the end-to-end fused matvec. The defect is therefore inside exl3mv1s4's
+slab/decode/down-column dots or exl3yhat's output transform — the two pieces with no independent
+check yet.
+HOW TO FINISH THIS (a focused kernel session, ~2-3 h, no new concept needed):
+  1. dump CTA 0's decoded slab (8 input rows x 128 output cols) to global and compare against
+     native/exl3/exl3_ref.py's T for the same tile — the decode is then either proven or the bug
+     is obviously there (it is one element-mapping: slot/tile16/nibble walk copied from a kernel
+     that works, so suspect the ROW mapping rb64*64+cta*8 vs the sample's own).
+  2. with the decode proven, yhat is a 128x128 matvec whose input (u) can be dumped directly and
+     compared against sv . T^T xp computed on the host from the dumped slab.
+  3. then scale to the 8-expert FFN and re-measure.
+STATUS OF THE PROGRAM: the fused path is NOT production-usable yet. The GREEN deliverables stand
+unchanged: two-node correctness (increments 1-3), the tab-cache 37x, the buffer-cache 16%.
