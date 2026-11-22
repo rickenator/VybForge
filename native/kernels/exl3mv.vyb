@@ -64,14 +64,17 @@ exl3xhat(p<Int>) -> {
     d<Int> = tid_x()
     base<Int> = nb * 128
     if (base < cw) {
+        # xp[i] = sum_k H[i][k] * (su[k] * x[k]): su is a DIAGONAL on the input
+        # axis and does NOT commute with H, so it must scale x BEFORE the
+        # transform (the same mistake as sv, which belongs AFTER exl3yhat).
         acc<Float32> = 0.0
         j<Int> = 0
         while (j < 128) {
-            acc = acc + ld_f32n(H + (d * 128 + j) * 4) * ld_f32n(x + (base + j) * 4)
+            suj<Float32> = ld_f16(SV + (base + j) * 2) as Float32
+            acc = acc + ld_f32n(H + (d * 128 + j) * 4) * ld_f32n(x + (base + j) * 4) * suj
             j = j + 1
         }
-        sv<Float32> = ld_f16(SV + (base + d) * 2) as Float32
-        st_f32(o + (base + d) * 4, acc * sv)
+        st_f32(o + (base + d) * 4, acc)
     }
 }
 

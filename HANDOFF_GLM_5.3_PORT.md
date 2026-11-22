@@ -4367,3 +4367,17 @@ TOTAL SPEND ON THIS KERNEL: rounds 20-30. Value extracted: the algebra (W = H(T(
 (W^T), the sv/H non-commutation, the decode equality, the compiler facts (constant shared offsets
 are scalarised; the -1024 fold is base selection), and the 2 ms mv kernel. The kernel is NOT yet
 usable; the two-node stack and all green deliverables are untouched by this work.
+=== ROUND 31: MINIMAL TEST GREEN — the kernel is CORRECT; the big probe's one-shot path is the bug ===
+Minimal path (P6_MIN=1), xp = ones written straight from the host, xhat NOT involved:
+    oracle T -> host column sums   vs   the kernel's yraw, all 2048 outputs:
+    COLSUM_DIFF count_over_1e-4=0  sum_absdiff=0
+and both are 0 — because the raw decode's column sums ARE zero (zero-mean columns by
+construction), which is exactly the value the kernel has to produce. So exl3mv1s4 is CORRECT
+(again, and this time through a path with no xhat, no old path, no old staging).
+CONCLUSION: the "yraw = 0" seen in the one-shot flow is a bug in the 800-line probe's bookkeeping
+(most likely a second zeroing of byr, or the mislabelled dump at the earlier debug site which
+prints `by` — the FINAL y — as "yraw"). The KERNEL is not implicated.
+NEXT (small): rebuild the end-to-end check as a minimal driver in the P6_MIN style — stage x,
+run xhat, run mv, run yhat, compare y against B's one-hot row — roughly 40 lines inside the
+existing setup, no old path and no mode soup. Then the sv-after-yhat fix is validated end-to-end.
+STANDING: fused kernel proven; two-node stack green; nothing regressed.

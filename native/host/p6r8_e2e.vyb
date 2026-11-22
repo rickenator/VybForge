@@ -1,0 +1,210 @@
+// p6r8_e2e — the MINIMAL end-to-end check of the fused matvec, no modes, no
+// old paths: x = e_0  ->  xp = su.(H x)  ->  yraw = T xp  ->  y = sv.(H yraw)
+// compared against the ONE-HOT ROW of the verified deq buffer (y[n] = B[0][n]).
+// Everything else in the fused debugging lives in p6r5; this file exists so the
+// question has exactly one answer.
+// env: P6_DIR, P6_EXP
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh}
+import gx::{gx_read}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f_into, gx_resolve_tab, launch_kernel, wr_pdev, alloc_dev, free_dev, H}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    expS<String> = env_get("P6_EXP") else "153"
+    e<Int> = 0
+    i<Int> = 0
+    while (i < expS.len()) {
+        c<Int> = (expS.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { e = e * 10 + (c - 48) }
+        i = i + 1
+    }
+    if (tensor_init() != 0) { println("E2E_FAIL cuda"); return 1 }
+    fdqs4<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
+    fhad232<Int> = load_fn("native/build/exl3.ptx", "exl3had232")
+    fhgen32<Int> = load_fn("native/build/exl3.ptx", "exl3hgen32")
+    finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    fcast32<Int> = load_fn("native/build/layer.ptx", "cast32")
+    fxh<Int> = load_fn("native/build/exl3mv.ptx", "exl3xhat")
+    fmv<Int> = load_fn("native/build/exl3mv.ptx", "exl3mv1s4")
+    fyh<Int> = load_fn("native/build/exl3mv.ptx", "exl3yhat")
+    fcv<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0 || fcast32 == 0) { println("E2E_FAIL kernels"); return 2 }
+    if (fxh == 0 || fmv == 0 || fyh == 0 || fcv == 0) { println("E2E_FAIL mvkernels"); return 2 }
+    hd_pre32<Int> = had_hoist32(fhgen32)
+    if (hd_pre32 == 0) { println("E2E_FAIL hadhoist"); return 3 }
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 4 } } close(f) }
+        ? -> { println("E2E_FAIL map.bin"); return 4 }
+    }
+    mapbody<String> = mapd.substring(16, mapd.len())
+    nbmap<Int> = mapd.len() - 16
+    mapdev<Int> = mapdev_build(finvk, mapd)
+    if (mapdev == 0) { println("E2E_FAIL mapdev"); return 5 }
+    invbase<Int> = mapdev + 16 + nbmap
+    arA<Int> = dev_alloc(8388608)     // trellis
+    arB<Int> = dev_alloc(65536)
+    arC<Int> = dev_alloc(33554432)    // deq output W
+    arD<Int> = dev_alloc(33554432)
+    arG<Int> = dev_alloc(16384)       // su
+    arH<Int> = dev_alloc(16384)       // sv
+    arI<Int> = dev_alloc(64)
+    pb32<Int> = dev_alloc(192)
+    pbx<Int> = dev_alloc(64)
+    pbm<Int> = dev_alloc(96)
+    pby<Int> = dev_alloc(48)
+    bx<Int> = dev_alloc(16384)
+    bxp<Int> = dev_alloc(16384)
+    byr<Int> = dev_alloc(8192)
+    by<Int> = dev_alloc(16384)
+    dscr<Int> = dev_alloc(33554432)   // the mv dump target (never read)
+    if (arA == 0 || arC == 0 || arG == 0 || arH == 0 || pb32 == 0 || bx == 0 || bxp == 0 || byr == 0 || by == 0 || dscr == 0) {
+        println("E2E_FAIL arena")
+        return 6
+    }
+    // tab (layer 3)
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cs<String> = ""
+    match (open_read(cache_path)) {
+        f -> { match (read_all(f)) { s -> { cs = s } ? -> { return 4 } } close(f) }
+        ? -> { println("E2E_FAIL tabcache"); return 4 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    ti<Int> = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("E2E_FAIL tab_trunc"); return 5 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+    epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + ".gate_proj."
+    w2<Vec<String>> = Vec()
+    w2.push(epre + "trellis")
+    w2.push(epre + "suh")
+    w2.push(epre + "svh")
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w2)
+    g0<String> = gx_read(ge, 0)
+    g1<String> = gx_read(ge, 1)
+    g2<String> = gx_read(ge, 2)
+    println("E2E tensors trellis=" + g0.len().to_string() + " suh=" + g1.len().to_string() + " svh=" + g2.len().to_string())
+    cuMemcpyHtoD_v2(arA, g0, g0.len())
+    cuMemcpyHtoD_v2(arG, g1, g1.len())
+    cuMemcpyHtoD_v2(arH, g2, g2.len())
+    // x = e_0 -> f32 device
+    x<Vec<Float>> = Vec()
+    i = 0
+    while (i < 4096) {
+        if (i == 0) { x.push(1.0) } else { x.push(0.0) }
+        i = i + 1
+    }
+    d64<Int> = alloc_dev(32768)
+    bulk_htod(d64, view(x))
+    wr_pdev(pb32, 0, d64)
+    wr_pdev(pb32, 8, bx)
+    wr_pdev(pb32, 16, 4096)
+    launch_kernel(fcast32, 16, pb32)
+    cuCtxSynchronize()
+    free_dev(d64)
+    // ---- fused path ----
+    t0<Int> = time_mono_millis()
+    wr_pdev(pbx, 0, bx)
+    wr_pdev(pbx, 8, bxp)
+    wr_pdev(pbx, 16, hd_pre32)
+    wr_pdev(pbx, 24, arG)
+    wr_pdev(pbx, 32, 4096)
+    r1<Int> = launch_kernel(fxh, 32, pbx)
+    cuCtxSynchronize()
+    t1<Int> = time_mono_millis()
+    cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+    wr_pdev(pbm, 0, byr)
+    wr_pdev(pbm, 8, bxp)
+    wr_pdev(pbm, 16, arH)
+    wr_pdev(pbm, 24, 2048)
+    wr_pdev(pbm, 32, 0)
+    wr_pdev(pbm, 40, arA)
+    wr_pdev(pbm, 48, mapdev)
+    wr_pdev(pbm, 56, invbase)
+    wr_pdev(pbm, 64, dscr)
+    r2<Int> = launch_kernel(fmv, 8192, pbm)
+    cuCtxSynchronize()
+    t2<Int> = time_mono_millis()
+    wr_pdev(pby, 0, byr)
+    wr_pdev(pby, 8, by)
+    wr_pdev(pby, 16, hd_pre32)
+    wr_pdev(pby, 24, 2048)
+    wr_pdev(pby, 32, arH)
+    r3<Int> = launch_kernel(fyh, 16, pby)
+    cuCtxSynchronize()
+    t3<Int> = time_mono_millis()
+    ynew<Vec<Float>> = bulk_dtoh(by, 2048)
+    println("E2E fused rc=" + r1.to_string() + "/" + r2.to_string() + "/" + r3.to_string() + " xhat=" + (t1 - t0).to_string() + "mv=" + (t2 - t1).to_string() + "yhat=" + (t3 - t2).to_string() + "ms")
+    // ---- reference: the one-hot row of the verified deq buffer ----
+    dW<Int> = exl3_deq32f_into(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                               arA, arB, arC, arD, arG, arH, arI, mapdev, invbase, arD)
+    if (dW == 0) { println("E2E_FAIL deq"); return 7 }
+    w64<Int> = dev_alloc(16384)
+    wr_pdev(pb32, 0, dW)
+    wr_pdev(pb32, 8, w64)
+    wr_pdev(pb32, 16, 2048)
+    launch_kernel(fcv, 8, pb32)
+    cuCtxSynchronize()
+    bref<Vec<Float>> = bulk_dtoh(w64, 2048)
+    println("E2E onehot fused y0=" + ynew.get(0).to_string_precise() + " y1=" + ynew.get(1).to_string_precise())
+    println("E2E onehot B[0]  y0=" + bref.get(0).to_string_precise() + " y1=" + bref.get(1).to_string_precise())
+    nd<Int> = 0
+    mx<Float> = 0.0
+    i = 0
+    while (i < 2048) {
+        d<Float> = ynew.get(i) - bref.get(i)
+        ad<Float> = d
+        if (ad < 0.0) { ad = 0.0 - ad }
+        if (ad > mx) { mx = ad }
+        if (ad > 1e-4) { nd = nd + 1 }
+        i = i + 1
+    }
+    println("E2E_GATE count_over_1e-4=" + nd.to_string() + " max_abs=" + mx.to_string_precise())
+    // where does it start to diverge?
+    var<Int> firstbad = -1
+    i = 0
+    while (i < 2048) {
+        d2<Float> = ynew.get(i) - bref.get(i)
+        ad2<Float> = d2
+        if (ad2 < 0.0) { ad2 = 0.0 - ad2 }
+        if (ad2 > 1e-4 && firstbad < 0) { firstbad = i }
+        i = i + 1
+    }
+    println("E2E first_mismatch_index=" + firstbad.to_string())
+    if (nd == 0) { println("E2E_DONE FUSED_OK") } else { println("E2E_DONE FUSED_FAIL") }
+    return 0
+}
+
+zero_bytes(n<Int>)<String> -> {
+    s<String> = ""
+    k<Int> = 0
+    while (k < n) { s = s + " " ; k = k + 1 }
+    return s
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Bool> = true
+        j<Int> = 0
+        while (ok && j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = false }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    return -1
+}
