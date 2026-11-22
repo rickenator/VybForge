@@ -3844,3 +3844,13 @@ loop) should watch it; if it approaches 1e-5 the tolerance conversation with the
 revisiting before the digest re-lock.
 NEXT: the dense branch (3 layers, self-contained), moe_tail_step + the inline loop (the decode
 mirrors), then the full-pipeline f32 for the 24GB Flash play (skill references/f32-output-path.md).
+=================== ROUND 7d: THE F32 OUTPUT PATH — INCREMENT 4 (84bcb3f) ==================
+The dense-branch FFN (3 layers) goes f32: d_gate/d_up/d_down (100MB each bf16) via deq_bf16f into
+the step-cached handles (the dcache now stores f32 handles — transparent, they are Int handles),
+the gate/up/down mms via mm_host32. The router d_fnF stays f64: its DEVICE gemm feeds hc_glue
+directly (mm_host32 is a host-roundtrip path — do not use it for device-to-device gemms).
+DECODE_MTP x2 IDENTICAL GREEN: gate A 4.171e-6 (tol 1e-5 — DOWN from increment 3's 5.101e-6, the
+drift is not monotonic; the watch stands), gate B 1.203e-4 unchanged, draft 576 = oracle, digests
+ebaa31aadb52 x2. Cumulative f32 win: ~-10.5s/request (the dense branch is only 3 layers).
+REMAINING: moe_tail_step + the inline loop (the decode mirrors — these feed the gates directly,
+pair with a fresh gate read), then the full-pipeline f32 for the 24GB Flash play.
