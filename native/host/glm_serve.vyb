@@ -24,7 +24,6 @@ import io::{open_read, read_all, read_at, open_write, open_append, write_str, cl
 import env::{env_get}
 import safetensors
 import gx
-import collections::{HashMap}
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
 import vmath::{vexp, vsqrt}
 import time::{time_mono_millis}
