@@ -4153,3 +4153,25 @@ THE BAR: 50 us/expert needs ~80x on this 4 ms. SIMT gather-deq cannot get there;
 deq+MMA path (Blackwell FP4/FP8 tensor cores, tcgen05, all routed experts in one launch) is the
 only route. Estimate: TC matmul at these shapes is ~10-30 us; the dequant must be an epilogue,
 not a separate pass.
+=== ROUND 19: THE TWO CHEAP WINS — one real (16%), one marginal (10%) ===
+(a) BUFFER CACHING — REAL. exl3_deq32f_into / _into_h take a caller-owned f32
+output buffer instead of cuMemAlloc-ing 33.5 MB per deq. deq 13 -> 10 ms/expert,
+solo 8 experts + shared 188 -> 158 ms, digest BIT-IDENTICAL. NOTE the three deqs
+(gate/up/down) run BEFORE their three gemms consume them, so they need THREE
+distinct buffers — one shared buffer silently clobbers (caught before it shipped).
+The serve's dense cache must keep the allocating path (it holds deq'd weights
+across steps); _into is opt-in for sequential deq->consume loops.
+(b) STAGED-SHARED HAD — MARGINAL. exl3had232h (exl3h.vyb, own module because
+--kernel-shared is capped at 49152 and per-module; the 128x128 f32 tile is 64 KB
+so it is split over TWO CTAs at 32 KB each): deq 10 -> 9 ms/expert. The plain
+had's 2 ms is NOT L2 re-read bound — it is the 1.07 GFLOP of f32 SIMT dot at
+~0.5 TFLOPS, i.e. the math itself. Kept as a bit-identical option (P6_HADH=1).
+BUG WORTH REMEMBERING: the first version used blk_x()*dim_x()+tid_x() as the CTA
+id (that is the THREAD id) — every CTA addressed block 256x too large, digest
+-15.14 instead of -1.04. In a 1-D grid the CTA index is just blk_x().
+STATE: solo MoE tail = 158 ms (8 experts + shared); per expert ~19 ms (deq 10,
+gemm 1, read 4-5, resolve ~1). Two-node steady state ~1.2-1.5x faster on the split.
+CONCLUSION: exactness-preserving micro-optimisation of this SIMT path is done —
+the remaining 158 ms cannot reach the 20-22 ms/token bar. The next real move is a
+tensor-core fused deq+MMA path, which CHANGES NUMERICS (f16/tf32 operands) and so
+needs its own tolerance gate (not bit-exactness) plus a gold re-baseline.
