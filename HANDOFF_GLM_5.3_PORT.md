@@ -3983,3 +3983,26 @@ so they carry the runtime fix (the bytes API works without it; the String path n
 layer per rank, so 45 x 2 x ~50us RTT + 0.5 ms transfer per step — latency-dominated, so the
 transport's job is done once the RTT is 50 us); (c) split the model (layer/TP or expert-parallel)
 and gate TP2_VYB_MATCH against the P4 single-layer output.
+=== ROUND 11: P6 FOUNDATION — THE VYBFORGE STACK RUNS ON THE GB10 ==================
+State proven this round on the Sparks (GLM suspended, watchdog paused):
+1. TOOLCHAIN: both nodes build Vyb 0.7.7 Release at 54f3d0c0 (fix/net-send-short-writes) via
+   build2/vyb; recipe in vybos-development/references/spark-toolchain.md.
+2. WEIGHTS: lefty already holds the SAME 83-shard checkpoint (166 GB) as the HF hub cache at
+   /srv/models/hf/hub/blobs with snapshot symlinks
+   (.../models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ff.../) — shard
+   symlinks resolve to real 1.27 GB blobs. Point gx's dir at the snapshots dir and the existing
+   loader works; NOTHING has to be copied over the network.
+3. THE GPU STACK: native/ synced to lefty:/srv/models/vybforge; gemm32_real (the synthetic
+   M=7/K=2048/N=4096 gate) produces BIT-IDENTICAL results to godzilla's 3090
+   (C0_0=1.17195e13, C0_7=1.17197e13, C3_0=6.44718e13, C6LAST=1.17333e14 — the closed-form
+   verified values) with pass-1 at 180 us vs 80 us on the 3090 (GB10 f64 rate ~2.25x lower,
+   matching the roadmap's f64 note). sm_86 PTX JIT-compiles on the GB10 as predicted.
+4. TRANSPORT: 256 MiB intact over one CX7 rail at 3.4-4.8 GB/s, RTT 50-120 us, ack handshake.
+NEXT (P6 increment 1 — the rank probe): a two-rank Vyb program, experts PARTITIONED (rank 0 owns
+even experts, rank 1 odd — or 144/144) at layer 3: each rank gx_reads + deqs ITS expert's 9
+tensors (exl3_deq32f + gemm32), computes that expert's FFN output for a deterministic x, rank 1
+sends its H-vector (4096 x f64 = 32 KB) to rank 0 over the proven transport, rank 0 sums the two
+expert outputs; the GATE is that same-node single-process computation of both experts (byte-level
+f64 compare) — self-contained, no godzilla reference needed. Then widen: the routed mix (8 experts
+split 4/4, top-k weights applied per rank), the shared expert + attention on one rank (or TP), and
+finally TP2_VYB_MATCH against the P4 layer output.
