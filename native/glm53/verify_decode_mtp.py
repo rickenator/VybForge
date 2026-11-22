@@ -21,7 +21,10 @@ import sys
 import numpy as np
 
 SCALE = 2.0 ** 40
-TOL_HIN = 1e-8
+TOL_HIN = 1e-5        # the decode MoE now runs the fused exl3_deq32 (f32 intermediates),
+                      # so the decode hidden carries the same f32 band as the phase-1
+                      # prefill (the digests' accepted 1.416e-6); the f64-exact 1e-8
+                      # guard applied only while the decode used the all-f64 exl3_deq
 TOL_X_REL = 2e-4      # gate B: per-row max_abs graded against the row's own magnitude
                       # (the L3 gate convention -- the EXL3 fp16 dequant residue scales
                       # with the activation, and layer 45's hidden runs ~10-30x larger

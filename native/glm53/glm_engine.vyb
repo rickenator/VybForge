@@ -3130,7 +3130,8 @@ delta_rule_step(q<Vec<Float>>, k<Vec<Float>>, v<Vec<Float>>, g<Vec<Float>>,
 # resolves, and each USED expert lazily by 9 names (the drift-safe per-expert form).
 share(all)
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, total<Int>, mapbody<String>,
-              gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, hdg<Int>)<Vec<Float>> -> {
+              gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
+              arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -3325,6 +3326,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         nt = toks.len()
         if (nt > 0) {
             nex = nex + 1
+            msA<Int> = time_mono_millis()
             epre = lpre + "mlp.experts." + e.to_string() + "."
             w2<Vec<String>> = Vec()
             w2.push(epre + "gate_proj.trellis")
@@ -3348,18 +3350,18 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            dWg<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_ge_0, g_ge_1,
-                                g_ge_2, body, EINTER, 32768, hdg)
+            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+                                g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_5 = gx_read(ge, 5)
             g_ge_4 = gx_read(ge, 4)
             g_ge_3 = gx_read(ge, 3)
-            dWu<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_ge_3, g_ge_4,
-                                g_ge_5, body, EINTER, 32768, hdg)
+            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+                                g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
             g_ge_6 = gx_read(ge, 6)
-            dWd<Int> = exl3_deq(fdeq, fhgen, fhad1, fhad2, g_ge_6, g_ge_7,
-                                g_ge_8, body, H, 32768, hdg)
+            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+                                g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
                 return nonev

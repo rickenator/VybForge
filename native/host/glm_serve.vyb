@@ -1851,7 +1851,8 @@ main()<Int> -> {
                                 } else {
                                     # ---- MoE tail (tail_site's body, sv_R = 1)
                                     streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
-                                                             fgemm, fbf, fdeq, fhgen, fhad1, fhad2, hdg)
+                                                             fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
+                                                             arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
                                 }
                             }
 
