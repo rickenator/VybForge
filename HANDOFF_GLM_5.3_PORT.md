@@ -3829,3 +3829,18 @@ PERF: mm 6761 -> 3389/3363 ms (-3.4s vs increment 1, -3.9s vs the f64 baseline),
 35139/34878 (-2.3s). Cumulative f32 win: -5.7s/request. NEXT: stageS (the attention staging, the
 biggest remaining f32 win — the deq_bf16 f32-output variant halves the dtoh/htod round trips),
 then the dense branch, moe_tail_step, the inline loop, and the full-pipeline f32 for 24GB Flash.
+=================== ROUND 7c: THE F32 OUTPUT PATH — INCREMENT 3 (4767c5d) ==================
+The four big attention projections (q/k/v/o, 33.5M elements each — the bulk of the 1.07GB/layer
+that ruled out the attention cache) go f32 in the phase-2 staging: bf16deq32 (the bf16deq kernel
+with 4-byte f32 stores, same transpose math — the bf16 gate PASSes with both kernels in the PTX)
++ deq_bf16f (the deq_bf16 twin, n*4 output; MUST be share(all) — the serve calls it cross-module
+and the first build failed semantic on the missing marker) + the q/k/v and o-proj mms on mm_host32.
+stageS 17.4s -> 12.3-14.1s per request. DECODE_MTP x2 IDENTICAL GREEN: gate A 5.101e-6 (tol 1e-5 —
+the q/k/v/o f32 band roughly doubled gate A vs increment 2, comfortably inside), gate B 1.203e-4
+unchanged, draft 576 = oracle, digests 057dc0ff59ca x2. Cumulative f32 win: ~-10s/request.
+NOTE: gate A is drifting up with each f32 increment (2.37 -> 2.57 -> 2.98 -> 5.10 e-6) — still 2x
+inside the 1e-5 tolerance, but the remaining increments (dense branch, moe_tail_step, the inline
+loop) should watch it; if it approaches 1e-5 the tolerance conversation with the band model needs
+revisiting before the digest re-lock.
+NEXT: the dense branch (3 layers, self-contained), moe_tail_step + the inline loop (the decode
+mirrors), then the full-pipeline f32 for the 24GB Flash play (skill references/f32-output-path.md).
