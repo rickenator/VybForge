@@ -3116,12 +3116,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+            dWg<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_0, g_ge_1,
                                 g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_5 = gx_read(ge, 5)
             g_ge_4 = gx_read(ge, 4)
             g_ge_3 = gx_read(ge, 3)
-            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+            dWu<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_3, g_ge_4,
                                 g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
@@ -3151,8 +3151,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                 j = j + 1
             }
             tA = time_mono_millis()
-            gv<Vec<Float>> = mm_host(sub, nt, H, dWg, EINTER, fgemm)
-            uv<Vec<Float>> = mm_host(sub, nt, H, dWu, EINTER, fgemm)
+            gv<Vec<Float>> = mm_host32(sub, nt, H, dWg, EINTER, fcast32, fgp, fgr, pb32)
+            uv<Vec<Float>> = mm_host32(sub, nt, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
             act<Vec<Float>> = Vec()
             j = 0
             while (j < gv.len()) {
