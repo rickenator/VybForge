@@ -264,6 +264,78 @@ main()<Int> -> {
         println("P6R5 DBG su0=" + dbg.get(4).to_string_precise() + " su1=" + dbg.get(5).to_string_precise() + " su2=" + dbg.get(6).to_string_precise())
         println("P6R5 DBG x0=" + dbg.get(8).to_string_precise() + " x1=" + dbg.get(9).to_string_precise() + " x2=" + dbg.get(10).to_string_precise())
     }
+    // ---- MINIMAL DOT TEST (P6_MIN=1) ----
+    // xp = ones (written directly, xhat not involved), so the correct yraw is the
+    // COLUMN SUM of the proven decode T. T comes from the oracle kernel, sums on
+    // the host. This is the smallest possible question: does the mv kernel
+    // accumulate anything at all, and is the value right?
+    if ((env_get("P6_MIN") else "0") == "1") {
+        fo2<Int> = load_fn("native/build/exl3dqdbg.ptx", "exl3dqdbg1s4")
+        fcv4<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+        if (fo2 == 0 || fcv4 == 0) { println("P6_FAIL kernels_min"); return 2 }
+        bTe2<Int> = dev_alloc(33554432)
+        pbo2<Int> = dev_alloc(64)
+        wr_pdev(pbo2, 0, arA)
+        wr_pdev(pbo2, 8, mapdev)
+        wr_pdev(pbo2, 16, 0)
+        wr_pdev(pbo2, 24, bTe2)
+        wr_pdev(pbo2, 32, 2048)
+        wr_pdev(pbo2, 40, invbase)
+        launch_kernel(fo2, 8192, pbo2)
+        cuCtxSynchronize()
+        println("P6MIN oracle done")
+        // xp = ones
+        ones<Vec<Float>> = Vec()
+        i = 0
+        while (i < 4096) { ones.push(1.0) ; i = i + 1 }
+        d64o<Int> = alloc_dev(32768)
+        bulk_htod(d64o, view(ones))
+        pbcv4<Int> = dev_alloc(24)
+        wr_pdev(pbcv4, 0, d64o)
+        wr_pdev(pbcv4, 8, bxp)
+        wr_pdev(pbcv4, 16, 4096)
+        launch_kernel(fcast32, 16, pbcv4)
+        cuCtxSynchronize()
+        free_dev(d64o)
+        // zero yraw, run the mv with a real scratch dump pointer
+        cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+        dscr2<Int> = dev_alloc(33554432)
+        wr_pdev(pbm, 64, dscr2)
+        launch_kernel(fmv, 8192, pbm)
+        cuCtxSynchronize()
+        // yraw -> f64 -> host
+        yr2<Int> = dev_alloc(16384)
+        wr_pdev(pbcv4, 0, byr)
+        wr_pdev(pbcv4, 8, yr2)
+        wr_pdev(pbcv4, 16, 2048)
+        launch_kernel(fcv4, 1, pbcv4)
+        cuCtxSynchronize()
+        YR2<Vec<Float>> = bulk_dtoh(yr2, 2048)
+        println("P6MIN yraw0=" + YR2.get(0).to_string_precise() + " yraw1=" + YR2.get(1).to_string_precise())
+        // T -> host and column-sum
+        t64b<Int> = dev_alloc(67108864)
+        wr_pdev(pbcv4, 0, bTe2)
+        wr_pdev(pbcv4, 8, t64b)
+        wr_pdev(pbcv4, 16, 8388608)
+        launch_kernel(fcv4, 32768, pbcv4)
+        cuCtxSynchronize()
+        T2<Vec<Float>> = bulk_dtoh(t64b, 8388608)
+        n4<Int> = 0
+        nd4<Int> = 0
+        s4<Float> = 0.0
+        println("P6MIN colsum0=" + colsum_of(T2, 0).to_string_precise() + " colsum1=" + colsum_of(T2, 1).to_string_precise())
+        while (n4 < 2048) {
+            cs<Float> = colsum_of(T2, n4)
+            dd4<Float> = cs - YR2.get(n4)
+            ad4<Float> = dd4
+            if (ad4 < 0.0) { ad4 = 0.0 - ad4 }
+            if (ad4 > 1e-4) { nd4 = nd4 + 1 }
+            s4 = s4 + ad4
+            n4 = n4 + 1
+        }
+        println("P6MIN COLSUM_DIFF count_over_1e-4=" + nd4.to_string() + " sum_absdiff=" + s4.to_string_precise())
+        return 0
+    }
     // ---- DECODE ORACLE (P6_T=1): fused slab vs the verified kernel's own decode ----
     if ((env_get("P6_T") else "0") == "1") {
         # xp must exist before the fused mv runs (it feeds the dots)
@@ -559,6 +631,16 @@ main()<Int> -> {
     }
     if (rel <= 1e-5) { println("P6R5_DONE FUSED_OK") } else { println("P6R5_DONE FUSED_FAIL") }
     return 0
+}
+
+colsum_of(T<Vec<Float>>, n<Int>)<Float> -> {
+    s<Float> = 0.0
+    k<Int> = 0
+    while (k < 4096) {
+        s = s + T.get(k * 2048 + n)
+        k = k + 1
+    }
+    return s
 }
 
 f16_host(s<String>, i<Int>)<Float> -> {

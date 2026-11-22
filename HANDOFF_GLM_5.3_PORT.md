@@ -4347,3 +4347,23 @@ last two edits interacts — the isolated thing to check is whether bxp holds th
 (dump bxp[0..3] on this path; the P6_T path already proves the kernel consumes xp correctly).
 STATE: kernel-side everything proven except sv wiring; probe-side staging has an unexplained
 regression. Commit is complete; the next session should start by dumping bxp on the one-shot path.
+=== ROUND 30: FUSED-MV DEBUGGING PLATEAU — do not keep poking the big probe ===
+Verified THIS round (from the full unfiltered run):
+    bx0 = 1                     (x staged correctly for the one-hot)
+    xp0 = 0.00157528056...      (xhat output == the independently verified value)
+    xhat_rc = mv_rc = yhat_rc = 0
+    yraw0 = yraw1 = 0           (the DOT contributes nothing on this path)
+    y = 0
+The same kernel, launched from the P6_T path WITH a dump pointer, produced a yraw that matched a
+host reference to 0 diffs. Passing a scratch dump buffer instead of 0 did NOT fix the one-shot
+path. So there are two different broken things here and the big probe now conflates them:
+  (1) a genuine question about the mv kernel's behaviour when the dump branch is compiled in, and
+  (2) one-shot-path state (arA/arG/arH/byr staging) that differs from the P6_T path.
+STOP POKING THE BIG PROBE. The next step is a MINIMAL standalone test: one kernel, one launch,
+fixed inputs written by the host, yraw dumped — no old path, no modes, no 800-line driver. If the
+minimal kernel is correct (likely, since P6_T proved it), bisect the driver by deleting paths
+rather than adding prints.
+TOTAL SPEND ON THIS KERNEL: rounds 20-30. Value extracted: the algebra (W = H(T(Hx))), the layout
+(W^T), the sv/H non-commutation, the decode equality, the compiler facts (constant shared offsets
+are scalarised; the -1024 fold is base selection), and the 2 ms mv kernel. The kernel is NOT yet
+usable; the two-node stack and all green deliverables are untouched by this work.
