@@ -1,0 +1,176 @@
+// gemm32_harness — standalone tiny-dims check of the f32 split-K triple (VybForge#23).
+// Runs pass 1 (f32 MACs) -> pass 2 (f32 reduce) -> pass 3 (widen to f64) on M=2,N=4,K=8,KSP=2 with
+// A=1.0 and B=2.0, so every output element must be K*2.0 = 16.0 and the sum over M*N must be 128.0.
+// One HARNESS_* line per step pins a CUDA failure to the exact launch. All FFI lives in
+// freedom-wrapped helpers that traffic only in Int (a loc<CVoid> cannot be returned past a block).
+import io::{open_read, read_all, close}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGetCount(count<loc<CInt>>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuMemcpyDtoH_v2(dstHost<loc<CVoid>>, srcDevice<Int>, ByteCount<Int>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+read_bin(path<String>)<String> -> {
+    r<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { s -> { r = s } ? -> { r = "" } } close(f) } ? -> { r = "" } }
+    return r
+}
+
+init_cuda()<Int> -> {
+    freedom {
+        if (cuInit(0) != 0) { return 1 }
+        dev<CInt> = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 2 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 3 }
+        return 0
+    }
+    return 9
+}
+
+// load the PTX, resolve the kernel, launch it: 90/91 = load/get failed, else the launch's rc.
+runk(ptx<String>, nm<String>, g<Int>, p<Int>, a1<Int>, a2<Int>, a3<Int>)<Int> -> {
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 90 }
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, nm) != 0) { return 91 }
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(addr(f)), g, 1, 1, 256, 1, 1, p, a1, a2, a3)
+        return rc as Int
+    }
+    return 99
+}
+
+// TIMED LOOP WITHOUT THE PER-CALL MODULE LOAD. `runk()` calls cuModuleLoadData + cuModuleGetFunction on
+// EVERY call, so each "launch" it performs includes a PTX JIT compile -- a fixed ~65-75 ms per 300
+// calls regardless of grid, K, M or bytes. That is why every sweep taken with it looked work-
+// INDEPENDENT (M=1 vs M=5, K x4, KSP x4 all ~64-74 ms) and why the diagnosis "the gemm is
+// latency-bound, not bandwidth-bound" was WRONG. This loads the module ONCE and then launches reps
+// times, so the timing measures the kernels.
+bench_n(ptx<String>, nm<String>, g<Int>, p<Int>, reps<Int>)<Int> -> {
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 90 }
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), m, nm) != 0) { return 91 }
+        rr<Int> = 0
+        for (rr in 0..reps - 1) {
+            cuda_launch4i(from<loc<CVoid>>(addr(f)), g, 1, 1, 256, 1, 1, p, 0, 0, 0)
+        }
+        return cuCtxSynchronize() as Int
+    }
+    return 99
+}
+
+allocb(bytes<Int>)<Int> -> {
+    freedom {
+        p<Int> = 0
+        if (cuMemAlloc_v2(loc(p), bytes) != 0) { return 0 }
+        return p
+    }
+    return 0
+}
+
+sync_code()<Int> -> {
+    freedom { return cuCtxSynchronize() as Int }
+    return -1
+}
+
+wr(p<Int>, off<Int>, v<Int>)<Int> -> {
+    freedom {
+        if (cuMemcpyHtoD_v2(p + off, loc(v), 8) != 0) { return 1 }
+        return 0
+    }
+    return 1
+}
+
+read64(src<Int>)<Float> -> {
+    freedom {
+        v<Float> = 0.0
+        cuMemcpyDtoH_v2(loc(v), src, 8)
+        return v
+    }
+    return 0.0
+}
+
+main()<Int> -> {
+    // REAL GLM expert down-proj shape: M=nt=7, K=EINTER=2048, N=H=4096.
+    // A[i][k] = i*K + k (index values), B[k][j] = k*N + j -> any indexing error
+    // breaks the closed-form element checks. Digest set printed for the numpy gold.
+    M<Int> = 7; N<Int> = 4096; K<Int> = 2048; KSP<Int> = 32
+    NBLK<Int> = ((M + 3) / 4 * N + 255) / 256
+    R<Int> = 50
+    println("REAL M=" + M.to_string() + " N=" + N.to_string() + " K=" + K.to_string() + " KSP=" + KSP.to_string() + " NBLK=" + NBLK.to_string())
+    e<Int> = init_cuda()
+    if (e != 0) { println("REAL_FAIL init code=" + e.to_string()); return 1 }
+    lp<String> = read_bin("native/build/layer.ptx")
+    pp<String> = read_bin("native/build/gemm32_probe.ptx")
+    if (lp.len() == 0 || pp.len() == 0) { println("REAL_FAIL ptx missing"); return 2 }
+    A<Int> = allocb((M + 4) * K * 4)
+    B<Int> = allocb(K * N * 4)
+    SK<Int> = allocb(KSP * M * N * 4)
+    SCR<Int> = allocb(M * N * 4)
+    CC<Int> = allocb(M * N * 8)
+    OUT<Int> = allocb(8)
+    GPB<Int> = allocb(192)
+    CPB<Int> = allocb(24)
+    S64<Int> = allocb((M + 4) * K * 8)
+    B64<Int> = allocb(K * N * 8)
+    P2<Int> = allocb(24)
+    println("REAL_ALLOC A=" + A.to_string() + " B=" + B.to_string() + " SK=" + SK.to_string() + " CC=" + CC.to_string())
+    if (A == 0 || B == 0 || SK == 0 || SCR == 0 || CC == 0 || OUT == 0 || GPB == 0 || CPB == 0 || S64 == 0 || B64 == 0) { println("REAL_FAIL alloc"); return 3 }
+    // A: index values via t_fill64 -> cast32 (the same cast path the layer uses for
+    // activations). B: index values too. gemm32_p reads A's padded rows (4-row slack).
+    println("REAL_FILLA rc=" + runk(pp, "t_fill64", ((M + 4) * K + 255) / 256, S64, (M + 4) * K, 2, 0).to_string())
+    wr(P2, 0, S64); wr(P2, 8, A); wr(P2, 16, (M + 4) * K)
+    println("REAL_CASTA rc=" + runk(lp, "cast32", ((M + 4) * K + 255) / 256, P2, 0, 0, 0).to_string())
+    println("REAL_FILLB rc=" + runk(pp, "t_fill64", (K * N + 255) / 256, B64, K * N, 2, 0).to_string())
+    wr(P2, 0, B64); wr(P2, 8, B); wr(P2, 16, K * N)
+    println("REAL_CASTB rc=" + runk(lp, "cast32", (K * N + 255) / 256, P2, 0, 0, 0).to_string())
+    // zero the split-K partials so stale garbage cannot leak into pass 2
+    println("REAL_ZEROSK rc=" + runk(pp, "t_fill32", (KSP * M * N + 255) / 256, SK, KSP * M * N, 0, 0).to_string())
+    println("REAL_SYNC0 code=" + sync_code().to_string())
+    wr(GPB, 0, A); wr(GPB, 8, B); wr(GPB, 16, SK); wr(GPB, 24, M); wr(GPB, 32, N); wr(GPB, 40, K); wr(GPB, 48, NBLK); wr(GPB, 56, KSP)
+    println("REAL_P1 rc=" + runk(lp, "gemm32_p", NBLK * KSP, GPB, 0, 0, 0).to_string())
+    println("REAL_SYNC1 code=" + sync_code().to_string())
+    t0<Int> = time_mono_millis()
+    bench = bench_n(lp, "gemm32_p", NBLK * KSP, GPB, R)
+    t1<Int> = time_mono_millis()
+    println("REAL_P1_PER_US=" + ((t1 - t0) * 1000 / R).to_string())
+    wr(GPB + 64, 0, SK); wr(GPB + 64, 8, CC); wr(GPB + 64, 16, M); wr(GPB + 64, 24, N); wr(GPB + 64, 48, KSP)
+    println("REAL_P2 rc=" + runk(lp, "gemm32_r", (M * N + 255) / 256, GPB + 64, 0, 0, 0).to_string())
+    println("REAL_SYNC2 code=" + sync_code().to_string())
+    // closed-form checks: C[i][j] = sum_k (i*K+k)*(k*N+j)
+    // spot elements + row sums via t_sum64 on the row segment is overkill; print elements.
+    i<Int> = 0
+    while (i < 8) {
+        runk(pp, "t_peek", 1, CC, i * 8, OUT, 0)
+        sync_code()
+        println("C0_" + i.to_string() + "=" + read64(OUT).to_string())
+        i = i + 1
+    }
+    i = 0
+    while (i < 8) {
+        runk(pp, "t_peek", 1, CC, 3 * N + 100 + i, OUT, 0)
+        sync_code()
+        println("C3_" + i.to_string() + "=" + read64(OUT).to_string())
+        i = i + 1
+    }
+    runk(pp, "t_peek", 1, CC, 6 * N + N - 1, OUT, 0)
+    sync_code()
+    println("C6LAST=" + read64(OUT).to_string())
+    println("REAL_DONE")
+    return 0
+}

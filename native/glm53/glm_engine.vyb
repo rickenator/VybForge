@@ -363,6 +363,85 @@ mm_host(x<Vec<Float>>, rows<Int>, K<Int>, B<Int>, N<Int>, faddr<Int>)<Vec<Float>
     return out
 }
 
+// wr_pdev — write one Int into a device params buffer (the loc(v) traffic is
+// freedom-only, so this is a fn not an inline).
+share(all)
+wr_pdev(p<Int>, off<Int>, v<Int>)<Int> -> {
+    rcw<Int> = 1
+    freedom { rcw = cuMemcpyHtoD_v2(p + off, loc(v), 8) as Int }
+    return rcw
+}
+
+// mm_host32 — the f32-path twin of mm_host: A comes in as a host f64 Vec,
+// is htod'd and cast32'd to f32 (the same cast path the layer uses for
+// activations), B is already f32 on device (from exl3_deq32f), and the gemm
+// runs the f32 split-K triple (gemm32_p + gemm32_r, f64 output) from
+// layer.ptx. Returns the host f64 Vec like mm_host so callers are unchanged.
+// pb must be a >=192-byte device params buffer. KSP=32 fixed, matching the
+// verified gemm32_real probe (native/host/gemm32_real.vyb, rel <= 1.3e-5).
+share(all)
+mm_host32(x<Vec<Float>>, rows<Int>, K<Int>, B32<Int>, N<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb<Int>)<Vec<Float>> -> {
+    out32<Vec<Float>> = Vec()
+    dA64<Int> = 0
+    dA32<Int> = 0
+    dSK<Int> = 0
+    dCC<Int> = 0
+    dA64 = alloc_dev(rows * K * 8)
+    dA32 = alloc_dev((rows + 4) * K * 4)
+    dSK = alloc_dev(32 * rows * N * 4)
+    dCC = alloc_dev(rows * N * 8)
+    if (dA64 == 0 || dA32 == 0 || dSK == 0 || dCC == 0) {
+        if (dA64 != 0) { free_dev(dA64) }
+        if (dA32 != 0) { free_dev(dA32) }
+        if (dSK != 0) { free_dev(dSK) }
+        if (dCC != 0) { free_dev(dCC) }
+        return out32
+    }
+    bulk_htod(dA64, view(x))
+    // cast32: params (src64, dst32, n) at pb[0..2]
+    if (wr_pdev(pb, 0, dA64) != 0) { return out32 }
+    if (wr_pdev(pb, 8, dA32) != 0) { return out32 }
+    if (wr_pdev(pb, 16, rows * K) != 0) { return out32 }
+    freedom {
+        clrc<Int> = cuda_launch4i(from<loc<CVoid>>(fcast32), (rows * K + 255) / 256, 1, 1, 256, 1, 1, pb, 0, 0, 0) as Int
+        csyn<Int> = cuCtxSynchronize() as Int
+        if (clrc != 0 || csyn != 0) { println("MM32FAIL cast lrc=" + clrc.to_string() + " sync=" + csyn.to_string()) }
+    }
+    // gemm32_p: params (A, B, SK, M, N, K, NBLK, KSP) at pb[0..7]
+    nblk<Int> = ((rows + 3) / 4 * N + 255) / 256
+    if (wr_pdev(pb, 0, dA32) != 0) { return out32 }
+    if (wr_pdev(pb, 8, B32) != 0) { return out32 }
+    if (wr_pdev(pb, 16, dSK) != 0) { return out32 }
+    if (wr_pdev(pb, 24, rows) != 0) { return out32 }
+    if (wr_pdev(pb, 32, N) != 0) { return out32 }
+    if (wr_pdev(pb, 40, K) != 0) { return out32 }
+    if (wr_pdev(pb, 48, nblk) != 0) { return out32 }
+    if (wr_pdev(pb, 56, 32) != 0) { return out32 }
+    freedom {
+        plrc<Int> = cuda_launch4i(from<loc<CVoid>>(fgp), nblk * 32, 1, 1, 256, 1, 1, pb, 0, 0, 0) as Int
+        psyn<Int> = cuCtxSynchronize() as Int
+        if (plrc != 0 || psyn != 0) { println("MM32FAIL p1 lrc=" + plrc.to_string() + " sync=" + psyn.to_string()) }
+    }
+    // gemm32_r: params (SK, CC, M, N, [gap], KSP) — KSP sits at +48, matching
+    // the harness/probe layout (the +32/+40 slots are the legacy alpha/beta).
+    if (wr_pdev(pb, 0, dSK) != 0) { return out32 }
+    if (wr_pdev(pb, 8, dCC) != 0) { return out32 }
+    if (wr_pdev(pb, 16, rows) != 0) { return out32 }
+    if (wr_pdev(pb, 24, N) != 0) { return out32 }
+    if (wr_pdev(pb, 48, 32) != 0) { return out32 }
+    freedom {
+        rlrc<Int> = cuda_launch4i(from<loc<CVoid>>(fgr), (rows * N + 255) / 256, 1, 1, 256, 1, 1, pb, 0, 0, 0) as Int
+        rsyn<Int> = cuCtxSynchronize() as Int
+        if (rlrc != 0 || rsyn != 0) { println("MM32FAIL p2 lrc=" + rlrc.to_string() + " sync=" + rsyn.to_string()) }
+    }
+    out32 = bulk_dtoh(dCC, rows * N)
+    free_dev(dA64)
+    free_dev(dA32)
+    free_dev(dSK)
+    free_dev(dCC)
+    return out32
+}
+
 share(all)
 silu(x<Float>)<Float> -> {
     return x * (1.0 / (1.0 + vexp(0.0 - x)))
@@ -1199,6 +1278,81 @@ exl3_deq32(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>,
         out = fdc
     }
     return out
+}
+
+// exl3_deq32f — the deq32 chain with the F32 OUTPUT: identical to exl3_deq32
+// but the final f32->f64 cvt launch is skipped and the f32 intermediate (fd)
+// is returned directly (the caller frees it). Halves the deq write traffic and
+// drops the cvt kernel; the consumer must be an f32 gemm (gemm32_p/gemm32_r).
+share(all)
+exl3_deq32f(fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>,
+         trellis<String>, suh<String>, svh<String>, body<String>,
+         cw<Int>, ntiles<Int>, hd_pre32<Int>,
+         qda<Int>, tda<Int>, oda<Int>, td2a<Int>,
+         suda<Int>, svda<Int>, pda<Int>, mda<Int>, ivb<Int>)<Int> -> {
+    var<Int> outf = 0
+    tb2<Int> = trellis.len()
+    nbody2<Int> = body.len()
+    nsuh2<Int> = suh.len()
+    nsvh2<Int> = svh.len()
+    if (tb2 < ntiles * 128) { println("EXL3FAIL32F size"); return 0 }
+    if (tb2 > 8388608) { println("EXL3FAIL32F trellis arena"); return 0 }
+    kn2<Int> = (ntiles / (cw / 16)) * 16 * cw
+    krows2<Int> = kn2 / cw
+    if ((nsuh2 % 8) != 0 || (nsvh2 % 8) != 0) { println("EXL3FAIL32F mod"); return 0 }
+    if (nsuh2 != krows2 * 2 || nsvh2 != cw * 2) { println("EXL3FAIL32F scales"); return 0 }
+    nbc2<Int> = cw / 128
+    nblocks2<Int> = (kn2 / cw / 128) * nbc2
+    freedom {
+        qd2<Int> = qda
+        td2f<Int> = tda
+        od2<Int> = oda
+        td2x<Int> = td2a
+        pd2<Int> = pda
+        sud2<Int> = suda
+        svd2<Int> = svda
+        fdx<Int> = 0
+        frcf<Int> = cuMemAlloc_v2(loc(fdx), kn2 * 4) as Int
+        if (frcf != 0) { println("EXL3FAIL32F fdalloc"); return 0 }
+        if (cuMemcpyHtoD_v2(qd2, trellis, tb2) != 0) { println("EXL3FAIL32F htod1"); return 0 }
+        if (cuMemcpyHtoD_v2(sud2, suh, nsuh2) != 0) { println("EXL3FAIL32F htod5"); return 0 }
+        if (cuMemcpyHtoD_v2(svd2, svh, nsvh2) != 0) { println("EXL3FAIL32F htod6"); return 0 }
+        pqf<Int> = 0
+        chqf<Int> = 0
+        while (pqf < 6) {
+            chqf = 0
+            if (pqf == 0) { chqf = qd2 }
+            if (pqf == 1) { chqf = mda }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = td2x }
+            if (pqf == 4) { chqf = cw }
+            if (pqf == 5) { chqf = ivb }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p1"); return 0 }
+            pqf = pqf + 1
+        }
+        lrcBf<Int> = cuda_launch4i(from<loc<CVoid>>(fdqs), ntiles, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srBf<Int> = cuCtxSynchronize() as Int
+        if (lrcBf != 0 || srBf != 0) { println("EXL3FAIL32F dq1s"); return 0 }
+        pqf = 0
+        while (pqf < 8) {
+            chqf = 0
+            if (pqf == 0) { chqf = td2x }
+            if (pqf == 1) { chqf = fdx }
+            if (pqf == 2) { chqf = hd_pre32 }
+            if (pqf == 3) { chqf = sud2 }
+            if (pqf == 4) { chqf = svd2 }
+            if (pqf == 5) { chqf = cw }
+            if (pqf == 6) { chqf = nbc2 }
+            if (pqf == 7) { chqf = nblocks2 }
+            if (cuMemcpyHtoD_v2(pd2 + pqf * 8, loc(chqf), 8) != 0) { println("EXL3FAIL32F p2"); return 0 }
+            pqf = pqf + 1
+        }
+        lrcCf<Int> = cuda_launch4i(from<loc<CVoid>>(fhad232), nblocks2 * 64, 1, 1, 256, 1, 1, pd2, 0, 0, 0) as Int
+        srCf<Int> = cuCtxSynchronize() as Int
+        if (lrcCf != 0 || srCf != 0) { println("EXL3FAIL32F had2"); return 0 }
+        outf = fdx
+    }
+    return outf
 }
 
 share(all)
@@ -2560,7 +2714,7 @@ ffn_dense_site(streams1<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<
     return streams2
 }
 share(all)
-tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>)<Vec<Float>> -> {
+tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, hdg<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>, arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>, fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
     bestv<Float> = 0.0
@@ -2972,7 +3126,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
             g_ge_6 = gx_read(ge, 6)
-            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+            dWd<Int> = exl3_deq32f(fdeq32, fdqs, fhad132, fhad232, g_ge_6, g_ge_7,
                                 g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             acc_deq = acc_deq + (time_mono_millis() - tA)
             if (dWg == 0 || dWu == 0 || dWd == 0) {
@@ -3010,7 +3164,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                 act.push(silu(g1) * u1)
                 j = j + 1
             }
-            yv<Vec<Float>> = mm_host(act, nt, EINTER, dWd, H, fgemm)
+            yv<Vec<Float>> = mm_host32(act, nt, EINTER, dWd, H, fcast32, fgp, fgr, pb32)
             acc_mm = acc_mm + (time_mono_millis() - tA)
             # scatter w*y back
             j = 0
