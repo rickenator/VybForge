@@ -5966,3 +5966,23 @@ question in round 114 and otherwise just doubles the work again.
 STATUS: correctness is established for all three projections; the PERFORMANCE claim for them is
 established only from the older standalone probes (0.600 ms vs 13 ms at nt=1; 1 ms vs 8 ms at nt=4).
 The in-engine end-to-end number still needs the fused-only mode.
+=== ROUND 120: P6_FUSED_ONLY WORKS -- but single-shot timing cannot measure it ===
+Added P6_FUSED_ONLY=1: skips the three exl3_deq32f calls AND the three mm_host32 calls, so the layer
+computes ONLY the fused chain. Two things had to be adjusted for it to run:
+  - the `if (dWg == 0 || dWu == 0 || dWd == 0) { ALL_FAIL deq }` guard now only fires when
+    fOnlyG == "0" -- in fused-only mode zero handles are the point, not a failure.
+  - the comparison loops are skipped (nothing to compare against), and each projection adopts its
+    fused result unconditionally.
+It runs clean: no CHAIN_FAIL, the model completes.
+BUT THE TIMING IS NOT MEASURABLE THIS WAY. SEC P1ffn across runs:
+    FG=0 (deq)                 : 2015, 2024, 2924, 2925, 2018
+    FG=1 + ONLY (fused-only)   : 928 (gate only), 3971 (all three)
+i.e. the same configuration varies by 1.5x run to run, and the fused mode has come out both 2.2x FASTER
+and 2x SLOWER. Cause: every run is a fresh process reading a 175 GB checkpoint cold from disk, so the
+MoE section is dominated by I/O, not compute. p6r10's warm in-process measurements (0.600 ms vs 13 ms at
+nt=1; 1 ms vs 8 ms at nt=4) remain the only trustworthy performance numbers in this project.
+TO MEASURE PROPERLY: one long-lived server process, several WARM requests, and take the steady-state
+steps (the script currently makes one request then kills the server). That is a harness change
+(scripts/run_fgate.sh: loop N requests, report per-step deltas), not an engine change.
+STATE: correctness DONE for all three projections (verified 6e-07..2.6e-06 in-engine); fused-only mode
+DONE and runnable; end-to-end warm BENCHMARK still outstanding.

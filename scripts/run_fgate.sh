@@ -32,9 +32,21 @@ for i in $(seq 1 60); do
 done
 
 if grep -q "listening on" "$LOG"; then
-  echo "--- posting request"
-  curl -s -m 600 -X POST "http://127.0.0.1:${PORT}/v1/generate?ids=${IDS}&nsteps=1" | head -c 400
-  echo
+  # WARM REPEATED MEASUREMENT: the first request pays the cold read of a 175 GB
+  # checkpoint; later ones are warm. Report every request's wall time so the
+  # steady state is visible instead of being hidden inside one cold number.
+  REQS=${REQS:-5}
+  # NOTE: the id list MUST vary per request -- an identical repeat is answered from
+  # cache in ~0.1 ms and measures nothing. Appending the request index does that.
+  echo "--- timed requests (n=${REQS}), seconds:"
+  i=1
+  while [ "$i" -le "$REQS" ]; do
+    T=$(curl -s -o /tmp/resp.$$ -w '%{time_total}' -m 900 -X POST \
+        "http://127.0.0.1:${PORT}/v1/generate?ids=${IDS},${i}&nsteps=1")
+    echo "req${i} ${T}s  $(head -c 80 /tmp/resp.$$)"
+    i=$((i+1))
+  done
+  rm -f /tmp/resp.$$
 fi
 
 echo "--- SEC (MoE section timers):"
