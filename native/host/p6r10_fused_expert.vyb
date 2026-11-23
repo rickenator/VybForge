@@ -163,6 +163,24 @@ main()<Int> -> {
     gper<Float> = ((gb - ga) as Float) / 20.0
     println("P6R10 GEMM_WARM per_ms=" + gper.to_string_precise() + " (20 reps)")
 
+    // ---- WARM DEQ: the dominant term in the DECODE path ----
+    // The first deq above paid the checkpoint read; the steady-state cost is what matters when
+    // asking whether the fused path is worth porting into moe_tail_step. Each rep frees its buffer,
+    // otherwise 20 reps leak 20 multi-MB device allocations.
+    dq0<Int> = time_mono_millis()
+    var<Int> drp = 0
+    while (drp < 20) {
+        dWt<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                               arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+        if (dWt != 0) { free_dev(dWt) }
+        drp = drp + 1
+    }
+    sync()
+    dq1<Int> = time_mono_millis()
+    dper<Float> = ((dq1 - dq0) as Float) / 20.0
+    println("P6R10 DEQ_WARM per_ms=" + dper.to_string_precise() + " (20 reps)")
+    println("P6R10 DECODE_PATH per_projection_ms=" + (dper + gper).to_string_precise() + " (deq_warm + gemm_warm)")
+
     // ---- FUSED: xhat -> matvec -> yhat, W never built ----
     xp<Int> = dev_alloc(nin * 4)
     yr<Int> = dev_alloc(cw * 4)

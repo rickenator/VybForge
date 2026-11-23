@@ -6545,3 +6545,19 @@ CONSEQUENCE -- HOW DECODE WORK MUST BE MEASURED FROM HERE:
 CAPT=40 stays (harmless: more cache rows, values unchanged) but the digest baselines must be re-verified
 by the sweep, since CAPT participates in cache sizing. THE BENCH SCRIPTS STAY: bench_decode.sh is still
 the only way to see per-step behaviour, and it is what exposed this -- just do not trust it as a timer.
+=== ROUND 147: THE PROBE JUSTIFIES THE PORT -- deq is 4.85 ms, fused 0.55 ms (9.2x at nt=1) ===
+Extended p6r10 with DEQ_WARM (20 warm reps, freeing each buffer -- the first deq pays the checkpoint
+read, and 20 reps would otherwise leak 20 multi-MB allocations). Measured at the DECODE shape (nt=1):
+    DEQ_WARM  per_ms = 4.85     <- the dominant term in moe_tail_step
+    GEMM_WARM per_ms = 0.20
+    DECODE_PATH per_projection_ms = 5.05   (deq_warm + gemm_warm)
+    FUSED_WARM total_ms = 0.55  (xhat ~0 + matvec 0.50 + yhat 0.05)
+    -> the fused path is 9.2x faster per expert-projection AT nt=1, not just at the prefill shape.
+This resolves the open risk: porting the fused matvec into moe_tail_step is a real 9x on the term that
+dominates the decode layer, not a guess carried over from prefill.
+NOTE the decode layer measures ~28 ms (SEC mlpmoe) against 24 x 5.05 = 121 ms if every expert did a
+deq -- so not every expert/nt>0 slot pays a full deq on every layer (weights stay resident between
+steps). The probe gives the PER-PROJECTION cost; the layer number is a different measurement and they
+should not be multiplied together as if independent.
+NEXT: port the fused matvec into moe_tail_step (glm_engine:4009), gated by the FGATE-style per-projection
+comparison (deterministic, I/O-independent). Measure with p6r10's numbers, never the serve wall clock.
