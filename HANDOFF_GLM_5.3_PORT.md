@@ -4605,3 +4605,25 @@ STOPPING HERE FOR REAL. This kernel has consumed rounds 20-45; every piece of it
 proven and the remaining defect is now a one-variable question (does the kernel see ONLY == 2 and
 nb128 == 2?). Nothing else in the program is blocked: two-node increments 1-3 are green, the tab
 cache gave 37x, the buffer cache 16%, the infrastructure work is done.
+=== ROUND 46: TWO-SLOT CHECK — EVERYTHING SAYS IT SHOULD WORK, AND IT DOES NOT ===
+Kernel-visible diagnostics (stored from inside the guarded phase-2 branch, full grid):
+    only_seen        = 2          (the +88 param ARRIVES correctly)
+    only_eq2_count   = 1,048,576  (= 8192 CTAs x 128 active threads: EVERY thread sees ONLY == 2)
+    nb128_eq2_count  =   131,072  (= 64 blocks x 2048 threads: the nb128 == 2 blocks exist and run)
+    nb128_seen       = 13         (last-writer; irrelevant)
+AND YET with ONLY = 2 the outputs 256..383 are EXACTLY ZERO.
+So: the param arrives, the branch is entered by every thread, nb128 == 2 is real, cb = 256..383 is
+in range, atomics are compiled as atom.global.add.f32 (verified in PTX), and the accumulators still
+never move. Combined with the earlier facts (slab bit-identical to the oracle, xp exact, per-output
+histogram uniform at 512, blocks 0..1 correct), NOTHING in the source explains it.
+Most likely explanations now, in order: (1) the shared slab is genuinely zero for those CTAs at
+phase-2 time (a shared-memory initialisation/visibility issue tied to which CTAs get scheduled, not
+to the code path), (2) a compiler/codegen fault that only manifests for this combination.
+NEXT SESSION, the one experiment that separates them: have phase 2 write `acc` (the raw dot) into a
+global scratch indexed by (nb128*128+d) for ONLY == 2 WITHOUT the atomic — a plain st_f32. If that
+store lands and is zero, the acc/slab is empty; if it is non-zero, the atomic path is the fault.
+=== END OF THIS SESSION'S KERNEL WORK (rounds 20-46) ===
+Banked and proven: the algebra W = H(T(Hx)) (~4000x less Hadamard work, W never materialised), the
+W^T layout, su-before-H / sv-after-H ordering, bit-identical decode, exact xp, exact single-CTA and
+small-grid partials, uniform atomic coverage + correct addresses, and the OOB bug initcheck found.
+Open: the block-2 accumulator mystery above. Everything else in the program is green.

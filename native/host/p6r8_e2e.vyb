@@ -54,7 +54,7 @@ main()<Int> -> {
     arI<Int> = dev_alloc(64)
     pb32<Int> = dev_alloc(192)
     pbx<Int> = dev_alloc(64)
-    pbm<Int> = dev_alloc(128)
+    pbm<Int> = dev_alloc(144)
     pby<Int> = dev_alloc(48)
     bx<Int> = dev_alloc(16384)
     bxp<Int> = dev_alloc(16384)
@@ -332,6 +332,9 @@ main()<Int> -> {
         wr_pdev(pbm, 64, dscr)
         wr_pdev(pbm, 72, 0)
         wr_pdev(pbm, 88, -1)
+        stb<Int> = dev_alloc(8192)
+        cuMemcpyHtoD_v2(stb, zero_bytes(8192), 8192)
+        wr_pdev(pbm, 104, stb)
         dbgb<Int> = dev_alloc(64)
         cuMemcpyHtoD_v2(dbgb, zero_bytes(64), 64)
         wr_pdev(pbm, 96, dbgb)
@@ -438,7 +441,26 @@ main()<Int> -> {
                 if (ado > 1e-4) { ndo2 = ndo2 + 1 ; if (fbo < 0) { fbo = n13 } }
                 n13 = n13 + 1
             }
-            println("E2E ONLY2 count_over_1e-4=" + ndo2.to_string() + " max_abs=" + mxo2.to_string_precise() + " first_bad=" + fbo.to_string() + " u256=" + UO.get(256).to_string_precise())
+            // plain-store readback for outputs 256..383
+        stf<Int> = dev_alloc(16384)
+        wr_pdev(pb32, 0, stb)
+        wr_pdev(pb32, 8, stf)
+        wr_pdev(pb32, 16, 2048)
+        launch_kernel(fcv, 8, pb32)
+        cuCtxSynchronize()
+        STV<Vec<Float>> = bulk_dtoh(stf, 2048)
+        var<Int> nz = 0
+        var<Float> mxs = 0.0
+        n14<Int> = 256
+        while (n14 < 384) {
+            av<Float> = STV.get(n14)
+            if (av < 0.0) { av = 0.0 - av }
+            if (av > 0.0) { nz = nz + 1 }
+            if (av > mxs) { mxs = av }
+            n14 = n14 + 1
+        }
+        println("E2E STORE_ACC nonzero_256_383=" + nz.to_string() + " max_abs=" + mxs.to_string_precise() + " v256=" + STV.get(256).to_string_precise())
+        println("E2E ONLY2 count_over_1e-4=" + ndo2.to_string() + " max_abs=" + mxo2.to_string_precise() + " first_bad=" + fbo.to_string() + " u256=" + UO.get(256).to_string_precise())
 
         }
         wr_pdev(pbm, 88, -1)

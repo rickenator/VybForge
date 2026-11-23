@@ -104,6 +104,7 @@ exl3mv1s4(p<Int>) -> {
     CNT2<Int> = ld_i64(p + 80)
     ONLY<Int> = ld_i64(p + 88)
     DBG<Int> = ld_i64(p + 96)
+    STB<Int> = ld_i64(p + 104)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -178,8 +179,15 @@ exl3mv1s4(p<Int>) -> {
         }
         # ONLY >= 0 restricts accumulation to ONE column block (diagnostic):
         # isolates exactly which block's contributions are wrong.
+        # plain store (no atomic): separates "acc is zero" from "the atomic path fails"
+        if (STB != 0) { st_f32(STB + cb * 4, acc) }
         if (ONLY < 0 || ONLY == nb128) {
-            if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
+            if (cb < cw) {
+                tptr<Int> = T
+                offb<Int> = cb * 4
+                dst<Int> = tptr + offb
+                atomic_add_f32(dst, acc)
+            }
         }
     }
 }
