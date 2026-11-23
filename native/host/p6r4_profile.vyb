@@ -9,6 +9,7 @@ import env::{env_get}
 import time::{time_mono_millis}
 import tensor::{tensor_init, dev_alloc, sync}
 import gx::{gx_read}
+import cuda_binding::{cuMemcpyHtoD_v2, cuMemAlloc_v2, cuMemFree_v2, cuCtxSynchronize}
 import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, gx_resolve_tab, launch_kernel, free_dev, H}
 
 main()<Int> -> {

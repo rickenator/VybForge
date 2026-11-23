@@ -5986,3 +5986,20 @@ steps (the script currently makes one request then kills the server). That is a 
 (scripts/run_fgate.sh: loop N requests, report per-step deltas), not an engine change.
 STATE: correctness DONE for all three projections (verified 6e-07..2.6e-06 in-engine); fused-only mode
 DONE and runnable; end-to-end warm BENCHMARK still outstanding.
+=== ROUND 121: THE HTTP SERVE HARNESS IS NOT A VIABLE BENCHMARK (three attempts, three blockers) ===
+Attempt 1 (single request, SEC P1ffn): varied 1.5x run-to-run; cold 175 GB checkpoint read dominates.
+Attempt 2 (5 identical requests, timed): req1 = real work, req2 = 13 ms, req3+ = 0.0001 s -> the server
+   ANSWERS REPEATS FROM CACHE, so nothing after the first is measured.
+Attempt 3 (vary the id list per request so they cannot match): STILL 0.0001 s for req3+. The cache is
+   not keyed on the ids in the way that would defeat it.
+Only req1 does real work and it is a cold process (weight reads from disk), so it cannot separate compute
+from I/O either:
+    FG=0 (deq)          req1 9.02 s     FG=1 + FUSED_ONLY   req1 10.05 s
+CONCLUSION: glm_serve is built to serve, not to benchmark. Getting a trustworthy end-to-end number needs
+a purpose-built in-process benchmark -- load one layer's weights ONCE, then time N warm iterations of the
+MoE tail directly, exactly as p6r10 does for a single expert. That is a new probe, not a harness tweak.
+THE PERFORMANCE NUMBERS THAT REMAIN TRUSTWORTHY are p6r10's warm in-process ones:
+    0.600 ms fused vs 13 ms deq+gemm per expert-projection at nt=1 (21x)
+    1 ms fused vs 8 ms deq+gemm at nt=4 (4-8x)
+and the composed projection built on them (~34.7 tok/s deq path, ~68 tok/s with the MoE fused) is an
+ESTIMATE, clearly labelled as such, not a measurement.

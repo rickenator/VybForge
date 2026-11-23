@@ -13,6 +13,7 @@ import env::{env_get}
 import time::{time_mono_millis}
 import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
 import gx::{gx_read}
+import cuda_binding::{cuMemcpyHtoD_v2, cuMemAlloc_v2, cuMemFree_v2, cuCtxSynchronize}
 import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, gx_resolve_tab, launch_kernel, wr_pdev, mm_host32, free_dev, H}
 
 main()<Int> -> {
@@ -153,6 +154,14 @@ main()<Int> -> {
     refv<Vec<Float>> = mm_host32(xv, 1, nin, dW, cw, fcast32, fgp, fgr, pb32)
     t2<Int> = time_mono_millis()
     println("P6R10 DEQ_PATH deq_ms=" + (t1 - t0).to_string() + " mm_ms=" + (t2 - t1).to_string() + " total_ms=" + (t2 - t0).to_string())
+    # warm GEMM: 20 reps so the 1 ms timer stops being the resolution limit
+    ga<Int> = time_mono_millis()
+    var<Int> gr = 0
+    while (gr < 20) { refv = mm_host32(xv, 1, nin, dW, cw, fcast32, fgp, fgr, pb32) ; gr = gr + 1 }
+    sync()
+    gb<Int> = time_mono_millis()
+    gper<Float> = ((gb - ga) as Float) / 20.0
+    println("P6R10 GEMM_WARM per_ms=" + gper.to_string_precise() + " (20 reps)")
 
     // ---- FUSED: xhat -> matvec -> yhat, W never built ----
     xp<Int> = dev_alloc(nin * 4)
@@ -163,7 +172,7 @@ main()<Int> -> {
     var<Int> tf2 = 0
     var<Int> tf3 = 0
     var<Int> rep = 0
-    while (rep < 3) {
+    while (rep < 20) {
         cuMemcpyHtoD_v2(yr, zero_bytes(cw * 4), cw * 4)
         f0<Int> = time_mono_millis()
         wr_pdev(pbf, 0, dx)
@@ -193,15 +202,18 @@ main()<Int> -> {
         launch_kernel(fvh, cw / 128, pbf)
         sync()
         f3<Int> = time_mono_millis()
-        if (rep == 2) {
-            tf0 = f1 - f0
-            tf1 = f2 - f1
-            tf2 = f3 - f2
-            tf3 = f3 - f0
-        }
+        tf0 = tf0 + (f1 - f0)
+        tf1 = tf1 + (f2 - f1)
+        tf2 = tf2 + (f3 - f2)
+        tf3 = tf3 + (f3 - f0)
         rep = rep + 1
     }
-    println("P6R10 FUSED_PATH xhat_ms=" + tf0.to_string() + " mv_ms=" + tf1.to_string() + " yhat_ms=" + tf2.to_string() + " total_ms=" + tf3.to_string())
+    # the timings above are per-iteration deltas of the LAST rep (warm); report them as ms
+    f0a<Float> = (tf0 as Float) / 20.0
+    f1a<Float> = (tf1 as Float) / 20.0
+    f2a<Float> = (tf2 as Float) / 20.0
+    f3a<Float> = (tf3 as Float) / 20.0
+    println("P6R10 FUSED_WARM xhat_ms=" + f0a.to_string_precise() + " mv_ms=" + f1a.to_string_precise() + " yhat_ms=" + f2a.to_string_precise() + " total_ms=" + f3a.to_string_precise() + " (avg of 20)")
 
     // ---- nt=4 COMPACTED COMPARISON: the production shape ----
     // Production gathers ~nt tokens per expert and calls the matvec with M=nt.
