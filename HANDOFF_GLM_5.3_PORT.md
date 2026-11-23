@@ -5575,3 +5575,25 @@ IMPLEMENTATION SHAPE: the router already produces the top-k assignment. Build, p
 token indices routed to it (a small scatter), then launch the expert matvec over only those tokens
 (nin reads gathered by index; cw outputs scattered back to their token rows). At B=128 the per-expert
 batch is ~4, so the launch count stays the same but each launch is ~32x cheaper.
+=== ROUND 100: THE 36x CLAIM IS WRONG — PRODUCTION ALREADY COMPACTS; THE REAL GAP IS THE DEQ PATH ===
+I said I would read the production MoE path instead of trusting my synthetic sweep. I did, and it
+refutes round 99:
+  - glm_engine.vyb:3235-3250 collects each expert's (token, lane) pairs into toks/lanes,
+    nt = toks.len(), and skips experts with nt == 0.
+  - :3359 feeds that nt straight into the matvec: mm_host32(sub, nt, H, dWg, EINTER, ...).
+  So production ALREADY does the per-expert gather. There is no 36x of dead work; my figure came from
+  p6r10's synthetic sweep, which deliberately runs all B tokens against one expert. Round 99's
+  conclusion is WITHDRAWN.
+WHAT THE READ FOUND INSTEAD, and it is the bigger prize:
+  - production dequantizes every expert projection to f32 first (exl3_deq32f -> dWg/dWu/dWd, 12.6 MB
+    packed -> ~32 MB f32) and then runs the f32 GEMM (mm_host32 -> gemm32_p/gemm32_r).
+  - the FUSED matvec (mvnod4 single-token, mvnodB batched) reads the PACKED weights and does the
+    matvec directly, measured at 0.600 ms per expert-projection vs 13 ms for deq+gemm -- 21x cheaper.
+  - that fused path is a prototype: grep for mvnod in glm_engine returns NOTHING. It was never wired in.
+So the single highest-value change is to replace exl3_deq32f + mm_host32 with the fused matvec inside
+the MoE tail. Production already hands it a compacted nt, which is exactly the shape the fused kernel
+wants. Two known traps to respect when wiring it: (1) call `mvnod4` for the single-token case, NOT
+`exl3mv1s4` -- byte-identical bodies resolve differently (the entry-identity defect in this handoff);
+(2) mvnodB4 and mvnodB_st in exl3mv.vyb are dead ends/timing artifacts and must not be used.
+SCOPE FOR THE CHANGE: wire ONE projection (gate) behind a flag, verify it bit-for-bit against the
+existing deq+gemm output on a real expert, then extend to up/out. Do not swap all three at once.
