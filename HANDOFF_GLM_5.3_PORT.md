@@ -6156,3 +6156,28 @@ TWO WAYS FORWARD (this is the real remaining decision, not the gate wording):
 RECOMMENDATION: (a). Determinism is worth having on its own -- it is what makes any future digest gate,
 golden-output test or bisect meaningful -- and this project has already built the split-K + reduce
 pattern twice (gemm32_p/r and bfgemm_p/widen32).
+=== ROUND 129: DETERMINISTIC REDUCTION IMPLEMENTED -- AND IT IS NOT THE (WHOLE) PROBLEM ===
+Built exactly what round 128 recommended:
+  - mvnodB_det: writes one partial per k-split CTA (cta*B + b2)*cw + cb instead of atomic_add_f32
+  - mvnodR: sums the 8 partials in FIXED order into T
+  - zfill: zeroes the partial buffer first (mvnodB_det only writes the slots its grid covers, and the
+    atomic version had relied on T being pre-zeroed -- without this the reduce sums stale memory)
+  - mvn_det_run(fdet, fred, T, X, cw, q, td, inv, LUT, B, nin, pb): the 192-byte param block, the
+    zero, the det launch, the reduce launch and the free, in one place. Wired into all three projection
+    sites (gate, up, down) plus the optional synthetic pass. PTX builds (20 functions), engine compiles.
+RESULT: the fused path is STILL not run-to-run deterministic, and the deq path IS. Evidence:
+    deq   run A vs run B : BIT-IDENTICAL across 4 layers
+    fused run A vs run B : differ (layer 3 v0 650196491479 vs 650084881532)
+    note run A reproduces EXACTLY across separate sessions (650196491479 again), while run B differs --
+    i.e. this is bimodal, not random, which smells like STATE rather than float ordering.
+So the atomic accumulation was at most a contributor, not the cause. Something else in the fused path is
+state-dependent. Prime suspects, in order:
+  1. FUSED_ONLY skips the deq entirely, and the deq is what populates the arena/handles the fused path
+     may still be touching (arA, and anything else re-pointed per projection). In VERIFICATION mode
+     (fused + deq + compare) the comparisons pass at ~1e-6, so the fused chain is only known-correct in
+     that mode -- fused-only has never been checked against the deq result at all.
+  2. a second atomic path in the MoE that is not the matvec (shared expert / combination).
+NEXT STEP (cheap, decisive): run the VERIFICATION mode twice (FG=1, FUSED_ONLY unset) and diff. If that
+is deterministic, the state dependency is the skipped deq, not the arithmetic -- and fused-only needs the
+same setup the deq performed, or must not be the default at all.
+=== END ===
