@@ -6445,3 +6445,19 @@ are BIT-IDENTICAL to native/baselines/digest_fused_only45.txt -- the optimisatio
 STILL TO ATTACK: mm remains ~531 ms per layer, ~34x the microbenchmark for 24 matvecs. Per-call costs
 left inside it: the per-projection weight upload, 14 wr_pdev scalar param writes, and 2 sync() per
 call. Next: preallocate/hoist those the same way.
+=== ROUND 142: mm SPLITS 168/306, AND THE CORRECTED A/B IS 3.2x (not 2.02x) ===
+Instrumented mm per projection. At NLAY=6, production:
+    T_MOE  mm=474  |  mmG=59  mmU=56  mmD=53        -> the matvec calls are only 168 ms of 474
+    ~306 ms of the mm span is spent AROUND the calls: xhatB/yhatB launches+syncs, the bulk_dtoh
+    readbacks, and the per-projection trellis upload. wr_pdev is a single 8-byte cuMemcpyHtoD, so its
+    15 calls per matvec do NOT explain the gap (each call is 7.4 ms vs a 0.65 ms microbenchmark).
+So "mm" is 65% NOT-matvec: the next target is the surrounding per-projection work, and it needs one
+more instrumentation pass rather than another guess.
+CORRECTED A/B (the 2.02x in round 138 was measured while BOTH modes paid the per-expert load_fn cost,
+which compressed the ratio):
+    production   deq=165..252   experts=745..856    T_SPLIT ~850 ms
+    verification deq=1717..1770 experts=2636..2693  T_SPLIT ~2700 ms
+    -> deq 9.7x cheaper, experts 3.3x, TOTAL 3.2x for the fused path.
+LAYER TRAJECTORY THIS SESSION: 1668 ms -> ~850 ms (1.96x), with bit-identical output at 45 layers and
+0 comparison failures at every step. Remaining budget: ~306 ms around the matvec, deq ~180 ms (near the
+disk limit for 12.6 MB/expert), shared ~40 ms, resolve ~20 ms, router ~9 ms.
