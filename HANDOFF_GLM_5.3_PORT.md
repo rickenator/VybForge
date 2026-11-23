@@ -5491,3 +5491,23 @@ bandwidth headroom -- it is compute-bound, so more batch will not help. Raising 
 accumulators per thread, fewer loads per MAC, f32 vectorisation) is now the only remaining lever.
 NEXT: measure the plateau more precisely (>=20 reps so 1 ms quantisation stops swamping the result),
 then decide between kernel compute work and measuring the composed path end to end.
+=== ROUND 96: bfgemm8 (8 rows/thread) — 1.67x, and the MoE becomes the bottleneck ===
+Same algebra, same TRANSP addressing, same KSP split; 8 independent accumulator chains per thread and
+half the bf16 loads per MAC. CERTIFIED by both standing gates first:
+    T all8: 36 72 0 0 0 0     (micro-test still exact)
+    gates at every M: bad=0, max <= 3.68e-08
+COST CURVE (ms/token, bfgemm_p -> bfgemm8):
+    M=128   0.00781 -> 0.00521
+    M=256   0.00651 -> 0.00391
+    M=512   0.00651 -> 0.00391
+    M=1024  (not run) -> 0.00391   <- new plateau, still exactly 0.00390625
+    at M=1024 the kernel sustains 2.15 G MAC / 4 ms = ~537 GFLOP/s f32 (up from 322).
+So the ILP change bought 1.67x and moved the plateau from M=256 to M=256 (value 0.00651 -> 0.00391).
+UPDATED PROJECTION (arithmetic, on the plateau value 0.00390625 ms/token per 4.19 MB):
+    attention 234.9 MB/layer * 0.0009323 * 45 = 9.86 ms/token = ~101 tok/s   (comfortably past the bar)
+    MoE at B=128                              = 18.97 ms/token
+    composed                                  = 28.8 ms/token = ~34.7 tok/s  (still short of 45-50)
+THE BOTTLENECK HAS MOVED: MoE is now 66% of the composed cost. The next 1.5x has to come from the MoE
+path (mvnodB / the fused decode matvec + expert gather), not from attention.
+NOTE the timing caveat still applies (1 ms resolution); the plateau value repeats exactly at 256/512/
+1024 which makes it trustworthy, but the small-M points are noise.

@@ -233,7 +233,10 @@ main()<Int> -> {
         println("P6R10 GATHER_SPIKE real_gather_ms=" + ra.to_string_precise() + " nogather_ms=" + ng.to_string_precise() + " ratio=" + (ra / ng).to_string_precise())
     }
     // ---- BATCH SWEEP: weights decoded once, B tokens amortise them ----
-    fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+    mvk<String> = env_get("P6_MVK") else "mvnodB"
+    println("P6R10 MVKERNEL " + mvk)
+    fmb<Int> = load_fn("native/build/exl3mv.ptx", mvk)
+    println("P6R10 MVK handle=" + fmb.to_string())
     if (fmb != 0) {
         var<Int> B = 1
         while (B <= 128) {
