@@ -6500,3 +6500,29 @@ SESSION SUMMARY (decode layer, per layer, production mode):
    the kernel -- so steady-state A/Bs should be done in-process over many reps, as the probes do.
 STATUS: the pb2 / one-sync experiment is open, not refuted. Next attempt should run it 3x and compare
 medians, in-process rather than via cold serve requests.
+=== ROUND 145: THE FUSED MoE NEVER APPLIED TO DECODE -- moe_tail_step IS STILL DEQ+GEMM ===
+Built the in-process bench (scripts/bench_decode.sh + scripts/analyse_bench.py). Two things fell out.
+1) THE DECODE PATH IS A DIFFERENT FUNCTION. `tail_site` (glm_engine:2998) is the PREFILL path (R=20)
+   and is the one that prints T_MOE/T_SPLIT and carries all the fused work. The decode step calls
+   `moe_tail_step` (glm_engine:4009) with R=1, which prints only `SEC mlpmoe` / `SEC moexpert`.
+   EVERY optimisation in rounds 141-144 measured tail_site, i.e. the prefill. The decode path was
+   never touched, which is why nothing this session moved tok/s.
+2) moe_tail_step HAS NO FUSED PATH AT ALL. It still dequantises and runs host GEMMs:
+       4233 dWg = exl3_deq32(...)   4261 gv = mm_host(sub, nt, H, dWg, EINTER, ...)
+       4238 dWu = exl3_deq32(...)   4262 uv = mm_host(sub, nt, H, dWu, EINTER, ...)
+       4243 dWd = exl3_deq32(...)   4274 yv = mm_host(act, nt, EINTER, dWd, H, ...)
+       4312/4313/4325 shared expert: three mm_host calls
+   grep for P6_FUSED / mvn_run after line 4009: ZERO occurrences.
+SO THE REAL NUMBERS ARE:
+   warm decode layer (SEC mlpmoe, steps 0-1) = 28 ms   ->  45 layers = 1.26 s/token = 0.79 tok/s
+   the 20-22 ms/token bar is 60x faster.
+   The ~850 ms "per layer" figure from rounds 141-144 is PREFILL with R=20, not decode. Do not quote
+   it as a decode number.
+BENCH CONSTRAINT: sv_CAPT/CAPT = 22 = "20 prefill + 2 decode", so ONLY TWO warm decode steps fit per
+process; steps 3+ fall into the documented out-of-bounds slow path (measured median 494 ms vs 28 ms,
+~18x, matching the source comment). So this harness gives 2 warm samples per process -- take medians
+across 3-5 processes, or shorten the prefill, before trusting any small comparison.
+NEXT WORK (now the obvious highest value): port the fused matvec into moe_tail_step. Everything needed
+is already built and verified in tail_site -- handle hoisting, preallocated partials, mvn_run, and the
+P6_FUSED_ONLY/P6_FUSED_TOL gating -- and the measured advantage on the shared code was 3.2x overall
+(deq 9.7x cheaper). Expect the decode layer to move from 28 ms toward ~10-15 ms.
