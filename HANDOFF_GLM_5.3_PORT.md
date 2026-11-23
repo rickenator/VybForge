@@ -5804,3 +5804,17 @@ catch any error the moment it appears. Both are larger than a verification step;
 SO THE DEPENDENCY CHAIN IS: fix glm_serve's mtp-stage fault -> tail_site becomes reachable -> FGATE
 prints -> flip the flag -> gold digest confirms. Everything downstream is already correct and committed.
 THE ONE REMAINING BLOCKER IS A RUNTIME FAULT IN AN UNEXERCISED glm_serve PATH.
+=== ROUND 112: glm_serve IS REACHABLE -- it is an HTTP server, and MTP can be skipped ===
+Two things unblocked the engine-path verification:
+ 1. VYBFORGE_SKIP_MTP=1 now skips mtp_stage_deqs -- the 19-tensor MTP deq stage that faults with rc=700
+    BEFORE any layer runs. mdw (its output) is consumed ONLY by mtp_layer_step (speculative decoding),
+    so the plain forward does not need it. With the flag, glm_serve.vyb gets past setup:
+        SETUP S3stage skipped (VYBFORGE_SKIP_MTP)
+        SETUP S3listen 0 / SETUP S3listen 1
+ 2. glm_serve ALWAYS runs as an HTTP listener (http_listen on VYBFORGE_SERVE_PORT) -- there is no
+    one-shot mode, which is why an earlier run appeared to "hang" after setup: it was waiting for a
+    request. The route is  POST /v1/generate  {"prompt_ids": [...], "nsteps": N}  (glm_serve.vyb:47,572).
+    So the driver is exercised by starting it and POSTing a request, on 127.0.0.1 only (LAN, never the
+    Tailnet).
+This is the vehicle for the in-engine FGATE verification. Nothing about the fused-gate block was wrong;
+it simply needed a caller that runs.
