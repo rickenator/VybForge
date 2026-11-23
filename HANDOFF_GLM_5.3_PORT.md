@@ -6333,3 +6333,20 @@ comparisons (45 layers, real routing):
 The 1e-05 threshold came from a shallow probe and sat BELOW the real full-depth maximum (0.7x headroom).
 P6_FUSED_TOL now defaults to 3e-05: 2.2x the observed max, 33x the median agreement, still 3.3x tighter
 than the original 1e-4. Pass 2 with it: 9810 comparisons, 0 failures.
+=== ROUND 137: SWEEP PASS -- the default flip is validated end to end ===
+scripts/regression_sweep.sh, NLAY=45, three passes, all green:
+    pass 1  fast path vs exact baseline : 45 digests, BIT-IDENTICAL (confirms the round-135 revert
+                                          restored the exact known-good behaviour, and that the
+                                          recorded baseline is still authoritative)
+    pass 2  verification mode           : 9810 comparisons, 0 failures
+                                          (gate 3.34e-06 / up 1.31e-06 / down 8.34e-07 at expert 0)
+    pass 3  logit gate vs deq logits    : 20/20 argmax, max delta-top1 1.341e-05, smallest margin
+                                          0.1607 -> SAFETY FACTOR 11,985x
+    VERDICT: SWEEP PASS
+So P6_FUSED_ONLY=1 as the production default is now backed by all three checks at full depth.
+OPEN: the END-TO-END SPEED has still never been measured cleanly. The only SEC numbers available are
+from one-request cold runs and are ambiguous between the prefill section and the decode section
+(observed: attn 937 / ffn 28 / tail 2, then attn 36 / ffn 927 / tail 2 at NLAY=45). The 10.6x figure is
+a per-projection MICROBENCHMARK, not a tok/s result. Next measurement should be: production vs
+verification mode, same 45-layer run, reading SEC P1ffn and the request wall time from the harness
+stdout (the sweep sends that to /dev/null), to state ms/token against the 20-22 ms/token bar.
