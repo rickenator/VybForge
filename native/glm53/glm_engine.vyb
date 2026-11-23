@@ -1608,6 +1608,46 @@ had_hoist32(fhgen32<Int>)<Int> -> {
     return out
 }
 
+
+# mvn_det_run — the DETERMINISTIC fused matvec: mvnodB_det writes one partial per k-split CTA,
+# mvnodR sums them in fixed order. Bit-identical across runs, unlike the atomic-add mvnodB.
+# Returns 0 on success. `pb` must be >= 192 bytes (the det kernel reads its partial pointer at +184).
+share(all)
+mvn_det_run(fdet<Int>, fred<Int>, T<Int>, X<Int>, cw<Int>, q<Int>, td<Int>, inv<Int>, LUT<Int>,
+            Bt<Int>, nin<Int>, pb<Int>)<Int> -> {
+    P<Int> = dev_alloc(8 * Bt * cw * 4)
+    if (P == 0) { return 1 }
+    # zero the partials: mvnodB_det writes only the slots its grid covers
+    fz<Int> = load_fn("native/build/exl3mv.ptx", "zfill")
+    if (fz != 0) {
+        wr_pdev(pb, 0, P)
+        wr_pdev(pb, 8, 8 * Bt * cw)
+        launch_kernel(fz, (8 * Bt * cw + 255) / 256, pb)
+        sync()
+    }
+    wr_pdev(pb, 0, T)
+    wr_pdev(pb, 8, X)
+    wr_pdev(pb, 24, cw)
+    wr_pdev(pb, 40, q)
+    wr_pdev(pb, 48, td)
+    wr_pdev(pb, 56, inv)
+    wr_pdev(pb, 144, LUT)
+    wr_pdev(pb, 168, Bt)
+    wr_pdev(pb, 176, nin)
+    wr_pdev(pb, 184, P)
+    launch_kernel(fdet, (nin / 64) * (cw / 128) * 8, pb)
+    sync()
+    wr_pdev(pb, 0, T)
+    wr_pdev(pb, 8, P)
+    wr_pdev(pb, 16, Bt)
+    wr_pdev(pb, 24, cw)
+    wr_pdev(pb, 32, 8)
+    launch_kernel(fred, (Bt * cw + 255) / 256, pb)
+    sync()
+    free_dev(P)
+    return 0
+}
+
 # ============================================================ phase-1 sites with state capture
 # The prefill sites verbatim, plus borrows that copy the carried decode state out as
 # the batched pass goes. The copies are read-only additions: the batched arithmetic
@@ -3441,8 +3481,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 144, dLUT)
                         wr_pdev(pb32, 168, nt)
                         wr_pdev(pb32, 176, H)
-                        launch_kernel(fmb, (H / 64) * (EINTER / 128) * 8, pb32)
-                        sync()
+                        fmbDet<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+                        fmbRed<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+                        var<Int> mrc = 1
+                        if (fmbDet != 0 && fmbRed != 0) {
+                            mrc = mvn_det_run(fmbDet, fmbRed, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32)
+                        }
                         # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
@@ -3509,8 +3553,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 144, dLUT)
                         wr_pdev(pb32, 168, nt)
                         wr_pdev(pb32, 176, H)
-                        launch_kernel(fmb, (H / 64) * (EINTER / 128) * 8, pb32)
-                        sync()
+                        fmbDet<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+                        fmbRed<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+                        var<Int> mrc = 1
+                        if (fmbDet != 0 && fmbRed != 0) {
+                            mrc = mvn_det_run(fmbDet, fmbRed, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32)
+                        }
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
                         wr_pdev(pb32, 16, hdg32)
@@ -3569,8 +3617,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             wr_pdev(pb32, 144, dLUT)
                             wr_pdev(pb32, 168, nt)
                             wr_pdev(pb32, 176, H)
-                            launch_kernel(fmb, (H / 64) * (EINTER / 128) * 8, pb32)
-                            sync()
+                            fmbDetU<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+                            fmbRedU<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+                            var<Int> mrcU = 1
+                            if (fmbDetU != 0 && fmbRedU != 0) {
+                                mrcU = mvn_det_run(fmbDetU, fmbRedU, dyr, dxh, EINTER, dQu, mapdev, invbase, dLUT, nt, H, pb32)
+                            }
                             wr_pdev(pb32, 0, dyr)
                             wr_pdev(pb32, 8, dyp)
                             wr_pdev(pb32, 16, hdg32)
@@ -3679,8 +3731,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 144, dLUTD)
                         wr_pdev(pb32, 168, nt)
                         wr_pdev(pb32, 176, EINTER)
-                        launch_kernel(fmbD, (EINTER / 64) * (H / 128) * 8, pb32)
-                        sync()
+                        fmbDetD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+                        fmbRedD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+                        var<Int> mrcD = 1
+                        if (fmbDetD != 0 && fmbRedD != 0) {
+                            mrcD = mvn_det_run(fmbDetD, fmbRedD, dYr, dXh, H, dQD, mapdev, invbase, dLUTD, nt, EINTER, pb32)
+                        }
                         wr_pdev(pb32, 0, dYr)
                         wr_pdev(pb32, 8, dYp)
                         wr_pdev(pb32, 16, hdg32)
