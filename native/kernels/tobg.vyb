@@ -1,0 +1,15 @@
+// tobg — the plainest possible bf16 -> f32 conversion.
+// Deliberately minimal so there is nothing to doubt: params are read with
+// ld_i64 (the same way the working kernels read theirs), one thread per
+// element, linear store. Used to prove ONE known BF16 word round-trips.
+// p: +0 src(bf16), +8 dst(f32), +16 n
+tobg(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    D<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        v<Float> = ld_bf16(S + gid * 2)
+        st_f32(D + gid * 4, v)
+    }
+}

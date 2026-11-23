@@ -1,0 +1,88 @@
+// p6r13_step0 — STEP 0 of the batched attention build: prove ONE known BF16 word
+// round-trips from the checkpoint to the host through the upload path.
+//
+// The on-disk first word of layers.3.self_attn.kv_a_proj_with_mqa.weight is
+// 0xBC30 little-endian, which as BF16 is exactly -0.0107422. If the device
+// reports that value, the upload and the conversion are both sound and the
+// attention projections can be built on top. If not, nothing else is worth doing.
+// env: P6_DIR
+import io::{open_read, read_all, close}
+import env::{env_get}
+import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    if (tensor_init() != 0) { println("S0_FAIL cuda"); return 1 }
+    f<Int> = load_fn("native/build/tobg.ptx", "tobg")
+    if (f == 0) { println("S0_FAIL fn"); return 2 }
+
+    cs<String> = ""
+    match (open_read("native/out/gx_tabs.cache")) {
+        fr -> { match (read_all(fr)) { s -> { cs = s } ? -> { return 3 } } close(fr) }
+        ? -> { println("S0_FAIL tabcache"); return 3 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    var<Int> ti = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("S0_FAIL trunc"); return 3 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+
+    nm<String> = "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
+    w1<Vec<String>> = Vec()
+    w1.push(nm)
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
+    fnd<Int> = ge.found.get(0)
+    # ONE read per GxLoc
+    g0<String> = gx_read(ge, 0)
+    println("S0 found=" + fnd.to_string() + " bytes=" + g0.len().to_string())
+    println("S0 host bytes: " + (g0.char_at(0) as Int).to_string() + "," + (g0.char_at(1) as Int).to_string() + "," + (g0.char_at(2) as Int).to_string() + "," + (g0.char_at(3) as Int).to_string())
+
+    # first 8 elements only: 16 bytes
+    dS<Int> = dev_alloc(64)
+    dD<Int> = dev_alloc(64)
+    pb<Int> = dev_alloc(32)
+    if (dS == 0 || dD == 0 || pb == 0) { println("S0_FAIL alloc"); return 4 }
+    # upload straight from the String gx_read returned (the way the working
+    # trellis path does); a substring() copy was the source of corrupted bytes
+    cuMemcpyHtoD_v2(dS, g0, 16)
+    sync()
+    wr_pdev(pb, 0, dS)
+    wr_pdev(pb, 8, dD)
+    wr_pdev(pb, 16, 8)
+    launch_kernel(f, 1, pb)
+    sync()
+    V<Vec<Float>> = bulk_dtoh(dD, 8)
+    println("S0 device values: " + V.get(0).to_string_precise() + " " + V.get(1).to_string_precise() + " " + V.get(2).to_string_precise() + " " + V.get(3).to_string_precise())
+    dv<Float> = V.get(0) - (0.0 - 0.0107421875)
+    if (dv < 0.0) { dv = 0.0 - dv }
+    if (dv < 1e-12 && (V.get(0) + 0.0107421875) < 0.0) { println("S0_PASS first_value=-0.0107421875 as expected") }
+    else { println("S0_FAIL expected -0.0107421875 got " + V.get(0).to_string_precise()) }
+    println("S0_DONE")
+    return 0
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}

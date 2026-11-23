@@ -5175,3 +5175,22 @@ WHAT IS ACTUALLY ESTABLISHED:
   - use the engine's deq_bf16(fbf, rawString, n, z); a manual htod + bf16deq32 with (q,o,n,z) gave zeros
   - reading once and reusing the buffer is still the sane pattern, just not a proven fix
   - bfgemm_p agrees with deq_bf16 to 2.4e-11 (round 78), on weights that decoded to ~1e-18 magnitudes
+=== ROUND 80: THE ATTENTION BUILD IS BLOCKED AT STEP 0 — NO VERIFIED BF16 WEIGHT LOAD ===
+Starting the batched MLA attention build exposed a blocker that must be fixed before any of it is
+worth writing, and it is worth recording precisely because it invalidates part of round 78's result.
+FACTS:
+  - gx_read gives the right BYTES for a real attention tensor. layers.3.self_attn.kv_a_proj_with_mqa
+    .weight -> first bytes 48,188 = 0xBC30 little-endian, which is exactly the -17360 word a direct
+    safetensors read of shard 00005 shows. The String is correct.
+  - little-endian word 0xBC30 as bf16 is -0.0107422 (sign 1, exp 0x78, mantissa 0x30).
+  - My manual path (cuMemcpyHtoD_v2 + bf16deq32 with q,o,n,z) produced w[0][0] = 0        <- zeros
+  - The engine helper deq_bf16(fbf, g0, n, 0) produced w[0][0] = 7.806e-18, whose top 16 bits are
+    0x2310 -- i.e. it decoded a DIFFERENT word than the String holds, so its upload path differs.
+CONSEQUENCE FOR ROUND 78: bfgemm_p "agreeing with deq_bf16 to 2.4e-11" only shows the two GPU bf16
+decoders agree with each other on whatever buffer they were given. Since the buffer's contents are
+now in doubt, that validation is weaker than stated: it validates bfgemm_p's addressing and split-K
+accumulation, NOT that it reads real checkpoint weights correctly.
+STEP 0 (must do first, small): upload a known BF16 tensor and prove ONE value round-trips --
+0xBC30 -> -0.0107422 -- through the same upload path the EXL3 trellis uses (which is bit-exact).
+Only then build q_a / kv_a / q_b / kv_b / o_proj on bfgemm_p.
+=== END (rounds 20-80) ===
