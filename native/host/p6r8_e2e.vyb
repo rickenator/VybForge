@@ -110,10 +110,11 @@ main()<Int> -> {
     cuMemcpyHtoD_v2(arG, g1, g1.len())
     cuMemcpyHtoD_v2(arH, g2, g2.len())
     // x = e_0 -> f32 device
+    onesm<Bool> = (env_get("P6_ONES") else "0") == "1"
     x<Vec<Float>> = Vec()
     i = 0
     while (i < 4096) {
-        if (i == 0) { x.push(1.0) } else { x.push(0.0) }
+        if (onesm) { x.push(1.0) } else { if (i == 0) { x.push(1.0) } else { x.push(0.0) } }
         i = i + 1
     }
     d64<Int> = alloc_dev(32768)
@@ -322,6 +323,38 @@ main()<Int> -> {
     launch_kernel(fcv, 8, pb32)
     cuCtxSynchronize()
     bref<Vec<Float>> = bulk_dtoh(w64, 2048)
+    if (onesm) {
+        // x = ones: y[n] must equal sum_k B[k][n] — the full column sums of the
+        // verified deq buffer. This tests the whole chain with no one-hot luck.
+        tall<Int> = dev_alloc(67108864)
+        pbc3<Int> = dev_alloc(24)
+        wr_pdev(pbc3, 0, dW)
+        wr_pdev(pbc3, 8, tall)
+        wr_pdev(pbc3, 16, 8388608)
+        launch_kernel(fcv, 32768, pbc3)
+        cuCtxSynchronize()
+        B64<Vec<Float>> = bulk_dtoh(tall, 8388608)
+        var<Int> ndo = 0
+        var<Float> mxo = 0.0
+        n9<Int> = 0
+        while (n9 < 2048) {
+            cs2<Float> = 0.0
+            k9<Int> = 0
+            while (k9 < 4096) {
+                cs2 = cs2 + B64.get(k9 * 2048 + n9)
+                k9 = k9 + 1
+            }
+            do2<Float> = cs2 - ynew.get(n9)
+            ao2<Float> = do2
+            if (ao2 < 0.0) { ao2 = 0.0 - ao2 }
+            if (ao2 > mxo) { mxo = ao2 }
+            if (ao2 > 1e-3) { ndo = ndo + 1 }
+            n9 = n9 + 1
+        }
+        println("E2E ONES_GATE count_over_1e-3=" + ndo.to_string() + " max_abs=" + mxo.to_string_precise())
+        println("E2E ONES fused y0=" + ynew.get(0).to_string_precise() + " colsum0=" + colsum_b(B64, 0).to_string_precise())
+        return 0
+    }
     println("E2E onehot fused y0=" + ynew.get(0).to_string_precise() + " y1=" + ynew.get(1).to_string_precise())
     println("E2E onehot B[0]  y0=" + bref.get(0).to_string_precise() + " y1=" + bref.get(1).to_string_precise())
     nd<Int> = 0
@@ -395,6 +428,16 @@ hexv(v<Int>)<String> -> {
     while (k < 12) {
         n<Int> = (v >> (k * 4)) & 15
         s = digs.get(n) + s
+        k = k + 1
+    }
+    return s
+}
+
+colsum_b(B<Vec<Float>>, n<Int>)<Float> -> {
+    s<Float> = 0.0
+    k<Int> = 0
+    while (k < 4096) {
+        s = s + B.get(k * 2048 + n)
         k = k + 1
     }
     return s

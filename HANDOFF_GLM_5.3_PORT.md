@@ -4518,3 +4518,18 @@ which still shows blocks 0..2 exact and 3..15 wrong. Everything isolable is now 
 NEXT SESSION, the two candidates left: (i) the accumulation for nb128 >= 3 specifically — rerun the
 grid walk with the CORRECT mapping (expectation = sum over the rows of the blocks actually present),
 (ii) the yhat 128-block walk at outputs >= 384. Both are now cheap and unambiguous to test.
+=== ROUND 40: THE MV KERNEL IS FULLY CORRECT — the last delta is CHAIN-LEVEL ===
+Corrected grid expectations (block -> (rb64=block/16, nb128=block%16), one block = 8 CTAs of 64
+rows) and re-ran:
+    ONE_CTA_GATE  count_over_1e-4 = 0   (1 CTA, 128 outputs, vs sum_{k<8})
+    GRID128       count_over_1e-3 = 0   (all 16 column blocks, rows 0..63, vs sum_{k<64})
+    GRIDFULL      count_over_1e-3 = 0   (8192 CTAs, vs sum_{k<4096})   <-- THE REAL CASE
+So the decode + dots + atomics + coverage are all correct end to end. exl3mv1s4 is DONE.
+The recurring "blocks 3..15 wrong" against B is therefore NOT in the mv kernel. Since the
+algebra was re-derived symbolically against the confirmed B = su.(H T H).sv layout and each
+transform is individually verified, the remaining delta must be in how the e2e driver wires
+xhat's su/sv or yhat's sv for the real (non-ones) input — i.e. a driver-level wiring question,
+not a kernel one.
+NEXT (cheap, decisive): run the e2e with x = ONES through the whole chain and compare against the
+host sum over k of B[k][n] (computable from the verified buffer). If that matches, the chain is
+correct and the one-hot case has a driver bug; if not, compare xp against su.(H ones) again.
