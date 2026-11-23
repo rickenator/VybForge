@@ -4757,3 +4757,19 @@ MINIMAL REPRO TO WRITE (compiler-side): take dotprobe_acc (which is correct at e
 the slab fill in `if (flag) { 0.5 } else { <something else> }`; if the atomics stop landing, the
 defect is reproduced in ~30 lines and the fix is in the register allocator / branch lowering.
 === END (rounds 20-54) ===
+=== ROUND 55: THE BRANCH HYPOTHESIS IS WRONG TOO ===
+dotprobe_br — dotprobe_acc with the slab fill inside an if/else (0.5 vs 0.25), grid 64:
+    flag=1  -> every output = 256  (64 * 4.0)  CORRECT
+    flag=0  -> every output = 128  (64 * 2.0)  CORRECT
+So taking the other arm of an if/else does NOT break the atomic in a small kernel. The round-54
+correlation (CONST=1 <=> no atomics land) must be a consequence of the real kernel's SIZE, not of the
+branch construct.
+WHAT IS NOW RULED OUT, with evidence: the dot loop (exact), the multi-CTA atomics (exact 1..1024),
+the slab contents in situ (bit-identical), xp in situ (bit-identical), the CONST branch itself (0.5
+really written), optimisation level (-O0 identical), and branch/if-else lowering (exact).
+WHAT REMAINS: a defect that only appears when ~250 statements are present — i.e. something in the
+full kernel that this 35-line probe cannot exercise. The honest next move is not another black-box
+experiment but a bisection of exl3mv1s4 itself: comment out the decode block (keeping phase 2) and
+see whether the constant-slab sum becomes correct; then re-add the decode in halves. Four bisection
+rounds should localise it to a few statements, which is small enough to reason about on the PTX.
+=== END (rounds 20-55) — the fused kernel is NOT resolvable by black-box probing; it needs bisection ===

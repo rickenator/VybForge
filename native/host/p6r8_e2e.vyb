@@ -54,7 +54,17 @@ main()<Int> -> {
     arI<Int> = dev_alloc(64)
     pb32<Int> = dev_alloc(192)
     pbx<Int> = dev_alloc(64)
-    pbm<Int> = dev_alloc(208)
+    pbm<Int> = dev_alloc(256)
+    // half->f32 LUT, needed BEFORE any exl3mv1s4 launch (the decode indexes it)
+    flut<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
+    lut<Int> = dev_alloc(262144)
+    if (flut != 0 && lut != 0) {
+        wr_pdev(pb32, 0, lut)
+        launch_kernel(flut, 256, pb32)
+        cuCtxSynchronize()
+        wr_pdev(pbm, 144, lut)
+        println("E2E LUT_OK")
+    } else { println("E2E LUT_FAIL flut=" + flut.to_string() + " lut=" + lut.to_string()) }
     pby<Int> = dev_alloc(48)
     bx<Int> = dev_alloc(16384)
     bxp<Int> = dev_alloc(16384)
@@ -444,6 +454,66 @@ main()<Int> -> {
             XD1<Vec<Float>> = bulk_dtoh(xf, 8)
             println("E2E XDUMP k0=" + XD1.get(0).to_string_precise() + " k1=" + XD1.get(1).to_string_precise() + " k7=" + XD1.get(7).to_string_precise())
             println("E2E XHOST k0=" + XP.get(0).to_string_precise() + " k1=" + XP.get(1).to_string_precise() + " k7=" + XP.get(7).to_string_precise())
+            // ---- BISECT: mvnod (decode code removed entirely) ----
+            mvn<Int> = load_fn("native/build/exl3mv.ptx", "mvnod")
+            if (mvn != 0) {
+                cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+                launch_kernel(mvn, 8192, pbm)
+                cuCtxSynchronize()
+                nf2<Int> = dev_alloc(16384)
+                wr_pdev(pb32, 0, byr)
+                wr_pdev(pb32, 8, nf2)
+                wr_pdev(pb32, 16, 2048)
+                launch_kernel(fcv, 8, pb32)
+                cuCtxSynchronize()
+                NV<Vec<Float>> = bulk_dtoh(nf2, 2048)
+                sumxp2<Float> = 0.0
+                ii<Int> = 0
+                while (ii < 4096) { sumxp2 = sumxp2 + XP.get(ii) ; ii = ii + 1 }
+                expn<Float> = 0.5 * sumxp2
+                var<Int> nbn = 0
+                var<Float> mxn = 0.0
+                n17<Int> = 0
+                while (n17 < 2048) {
+                    dn<Float> = NV.get(n17) - expn
+                    adn<Float> = dn
+                    if (adn < 0.0) { adn = 0.0 - adn }
+                    if (adn > mxn) { mxn = adn }
+                    if (adn > 1e-3) { nbn = nbn + 1 }
+                    n17 = n17 + 1
+                }
+                println("E2E MVNOD count_over_1e-3=" + nbn.to_string() + " max_abs=" + mxn.to_string_precise() + " expected=" + expn.to_string_precise() + " v0=" + NV.get(0).to_string_precise() + " v256=" + NV.get(256).to_string_precise())
+            } else { println("E2E MVNOD load_fn=0") }
+            // ---- BISECT STEP 2: mvnod2 (full decode, no fp16_to_f64 call) ----
+            mv2<Int> = load_fn("native/build/exl3mv.ptx", "mvnod2")
+            sx3<Float> = 0.0
+            i3<Int> = 0
+            while (i3 < 4096) { sx3 = sx3 + XP.get(i3) ; i3 = i3 + 1 }
+            expn<Float> = 0.5 * sx3
+            if (mv2 != 0) {
+                cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+                launch_kernel(mv2, 8192, pbm)
+                cuCtxSynchronize()
+                nf3<Int> = dev_alloc(16384)
+                wr_pdev(pb32, 0, byr)
+                wr_pdev(pb32, 8, nf3)
+                wr_pdev(pb32, 16, 2048)
+                launch_kernel(fcv, 8, pb32)
+                cuCtxSynchronize()
+                NV2<Vec<Float>> = bulk_dtoh(nf3, 2048)
+                var<Int> nb4 = 0
+                var<Float> mx4 = 0.0
+                n18<Int> = 0
+                while (n18 < 2048) {
+                    d4<Float> = NV2.get(n18) - expn
+                    ad4<Float> = d4
+                    if (ad4 < 0.0) { ad4 = 0.0 - ad4 }
+                    if (ad4 > mx4) { mx4 = ad4 }
+                    if (ad4 > 1e-3) { nb4 = nb4 + 1 }
+                    n18 = n18 + 1
+                }
+                println("E2E MVNOD2 count_over_1e-3=" + nb4.to_string() + " max_abs=" + mx4.to_string_precise() + " v0=" + NV2.get(0).to_string_precise() + " v256=" + NV2.get(256).to_string_precise())
+            } else { println("E2E MVNOD2 load_fn=0") }
             // ---- CONSTANT-SLAB TEST: slab := 0.5 => every output must be 0.5*sum(xp) ----
             // NOTE: the slab is dumped in the SAME run so we can prove the 0.5 actually landed.
             sbd2<Int> = dev_alloc(8192)

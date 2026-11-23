@@ -109,6 +109,7 @@ exl3mv1s4(p<Int>) -> {
     SBD<Int> = ld_i64(p + 120)
     CONST<Int> = ld_i64(p + 128)
     XD<Int> = ld_i64(p + 136)
+    LUT<Int> = ld_i64(p + 144)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -143,8 +144,8 @@ exl3mv1s4(p<Int>) -> {
         }
         prodK<Int> = (w16K * 3417055213) & 4294967295
         yK<Int> = (prodK & 2415890431) ^ 996162400
-        loK<Float> = fp16_to_f64(yK & 65535)
-        hiK<Float> = fp16_to_f64((yK >> 16) & 65535)
+        loK<Float> = ld_f32n(LUT + (yK & 65535) * 4) as Float
+        hiK<Float> = ld_f32n(LUT + ((yK >> 16) & 65535) * 4) as Float
         if (CONST != 0) {
             st_shared_f32(bK * 512 + cK * 4, 0.5)
         } else {
@@ -291,5 +292,137 @@ exl3refy(p<Int>) -> {
             m = m + 1
         }
         st_f32(Y + gid * 4, acc)
+    }
+}
+
+// ============================================================================
+// BISECT ENTRY: mvnod — exl3mv1s4 with the DECODE CODE REMOVED ENTIRELY.
+// Same geometry, same phase-2 dot, same atomic, but phase 1 is a bare constant
+// store (no inv map, no shift/xor, no fp16_to_f64, no if/else).
+// If this returns 0.5*sum(xp) per output, the defect lives in the decode body.
+// p: identical layout to exl3mv1s4 (+0 T, +8 X, +24 cw).
+// ============================================================================
+mvnod(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc128<Int> = cw / 128
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        st_shared_f32(bK * 512 + cK * 4, 0.5)
+        k = k + 1
+    }
+
+    inbase<Int> = rb64 * 64 + cta * 8
+    kernel_barrier()
+
+    if (within < 128) {
+        d<Int> = within
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + (inbase + j) * 4)
+            j = j + 1
+        }
+        cb<Int> = nb128 * 128 + d
+        if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
+    }
+}
+
+// ============================================================================
+// BISECT STEP 2: mvnod2 — the FULL decode body (inv map, nibble walk, shift/xor)
+// but WITHOUT the fp16_to_f64 device calls: the slab value is a constant.
+// If this is correct, the fp16_to_f64 CALL is what corrupts the kernel.
+// ============================================================================
+mvnod2(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 40)
+    td<Int> = ld_i64(p + 48)
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    inv<Int> = ld_i64(p + 56)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        ysum<Int> = (yK & 65535) + ((yK >> 16) & 65535)
+        st_shared_f32(bK * 512 + cK * 4, 0.5)
+        k = k + 1
+    }
+
+    inbase<Int> = rb64 * 64 + cta * 8
+    kernel_barrier()
+
+    if (within < 128) {
+        d<Int> = within
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + (inbase + j) * 4)
+            j = j + 1
+        }
+        cb<Int> = nb128 * 128 + d
+        if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
+    }
+}
+
+// ============================================================================
+// f16lut — fill a 65536-entry f32 table with the half->float conversion.
+// This REPLACES the fp16_to_f64 device calls in the decode loop: calling that
+// function twice per element inside the big kernel corrupts state (bisected in
+// rounds 55-57), while a standalone kernel that calls it is bit-exact (that is
+// exactly what exl3dq1s4 does). Built once per process, then indexed.
+// p: +0 lut(f32, 65536)
+// ============================================================================
+f16lut(p<Int>) -> {
+    LUT<Int> = ld_i64(p + 0)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < 65536) {
+        st_f32(LUT + gid * 4, fp16_to_f64(gid) as Float32)
     }
 }
