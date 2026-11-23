@@ -4533,3 +4533,14 @@ not a kernel one.
 NEXT (cheap, decisive): run the e2e with x = ONES through the whole chain and compare against the
 host sum over k of B[k][n] (computable from the verified buffer). If that matches, the chain is
 correct and the one-hot case has a driver bug; if not, compare xp against su.(H ones) again.
+=== ROUND 41: ONES INPUT — THE CHAIN IS OFF BY ~1%, SO THE DELTA IS xp OR yhat ===
+With x = ones the mv kernel is proven correct (GRIDFULL = 0 diffs against the T-based reference),
+so this run isolates the remaining pieces end to end against the verified B:
+    E2E ONES fused y0 = 1.7713700    colsum of B[k][0] = 1.7924903   (1.2% off)
+    ONES_GATE: 2039 of 2048 outputs differ by > 1e-3 (max_abs 3.08)
+Since the dots are exact, the ~1% error must enter through xp (xhat on this input) or through
+yhat/sv. Note a 1.2% RELATIVE error on a sum of 4096 terms smells like ONE block's worth of terms
+being wrong (a block is 128 of 4096 = 3% of the terms; half of them wrong = 1.5%).
+NEXT (one run, decisive): dump xp for x = ones and compare against the host sum
+sum_k su[k].H[k][b] computed from the dumped H and su; if xp matches, run yhat on that same xp and
+compare against sv.(H u) on the host. Whichever disagrees is the remaining defect.

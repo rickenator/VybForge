@@ -262,6 +262,122 @@ main()<Int> -> {
         println("E2E GRIDFULL count_over_1e-3=" + ndf.to_string() + " v0=" + YGF.get(0).to_string_precise())
         return 0
     }
+    // ---- XP CHECK (P6_XP=1): xp for x = ones against the host formula ----
+    // xp[b] = sum_{j<128} H[(b%128)*128 + j] * su[block(b)+j]   (x == 1)
+    if ((env_get("P6_XP") else "0") == "1") {
+        ones3<Vec<Float>> = Vec()
+        i = 0
+        while (i < 4096) { ones3.push(1.0) ; i = i + 1 }
+        d64c<Int> = alloc_dev(32768)
+        bulk_htod(d64c, view(ones3))
+        wr_pdev(pb32, 0, d64c)
+        wr_pdev(pb32, 8, bx)
+        wr_pdev(pb32, 16, 4096)
+        launch_kernel(fcast32, 16, pb32)
+        cuCtxSynchronize()
+        free_dev(d64c)
+        wr_pdev(pbx, 0, bx)
+        wr_pdev(pbx, 8, bxp)
+        wr_pdev(pbx, 16, hd_pre32)
+        wr_pdev(pbx, 24, arG)
+        wr_pdev(pbx, 32, 4096)
+        launch_kernel(fxh, 32, pbx)
+        cuCtxSynchronize()
+        // xp -> host
+        xp64<Int> = dev_alloc(32768)
+        wr_pdev(pb32, 0, bxp)
+        wr_pdev(pb32, 8, xp64)
+        wr_pdev(pb32, 16, 4096)
+        launch_kernel(fcv, 16, pb32)
+        cuCtxSynchronize()
+        XP<Vec<Float>> = bulk_dtoh(xp64, 4096)
+        // H -> host
+        h64<Int> = dev_alloc(131072)
+        wr_pdev(pb32, 0, hd_pre32)
+        wr_pdev(pb32, 8, h64)
+        wr_pdev(pb32, 16, 16384)
+        launch_kernel(fcv, 64, pb32)
+        cuCtxSynchronize()
+        HX<Vec<Float>> = bulk_dtoh(h64, 16384)
+        var<Int> ndx = 0
+        var<Float> mxx = 0.0
+        b9<Int> = 0
+        while (b9 < 4096) {
+            d9<Int> = b9 % 128
+            base9<Int> = b9 - d9
+            acc9<Float> = 0.0
+            j9<Int> = 0
+            while (j9 < 128) {
+                acc9 = acc9 + HX.get(d9 * 128 + j9) * f16_host(g1, base9 + j9)
+                j9 = j9 + 1
+            }
+            dd9<Float> = acc9 - XP.get(b9)
+            ad9<Float> = dd9
+            if (ad9 < 0.0) { ad9 = 0.0 - ad9 }
+            if (ad9 > mxx) { mxx = ad9 }
+            if (ad9 > 1e-6) { ndx = ndx + 1 }
+            b9 = b9 + 1
+        }
+        println("E2E XP_GATE count_over_1e-6=" + ndx.to_string() + " max_abs=" + mxx.to_string_precise())
+        println("E2E XP xp0=" + XP.get(0).to_string_precise() + " xp129=" + XP.get(129).to_string_precise())
+        // ---- y check: mv (full grid, proven) -> u, then yhat -> y, vs host ----
+        wr_pdev(pbm, 0, byr)
+        wr_pdev(pbm, 8, bxp)
+        wr_pdev(pbm, 16, arH)
+        wr_pdev(pbm, 24, 2048)
+        wr_pdev(pbm, 32, 0)
+        wr_pdev(pbm, 40, arA)
+        wr_pdev(pbm, 48, mapdev)
+        wr_pdev(pbm, 56, invbase)
+        wr_pdev(pbm, 64, dscr)
+        wr_pdev(pbm, 72, 0)
+        cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+        launch_kernel(fmv, 8192, pbm)
+        cuCtxSynchronize()
+        u64<Int> = dev_alloc(16384)
+        wr_pdev(pb32, 0, byr)
+        wr_pdev(pb32, 8, u64)
+        wr_pdev(pb32, 16, 2048)
+        launch_kernel(fcv, 1, pb32)
+        cuCtxSynchronize()
+        UY<Vec<Float>> = bulk_dtoh(u64, 2048)
+        wr_pdev(pby, 0, byr)
+        wr_pdev(pby, 8, by)
+        wr_pdev(pby, 16, hd_pre32)
+        wr_pdev(pby, 24, 2048)
+        wr_pdev(pby, 32, arH)
+        launch_kernel(fyh, 16, pby)
+        cuCtxSynchronize()
+        y64b<Int> = dev_alloc(16384)
+        wr_pdev(pb32, 0, by)
+        wr_pdev(pb32, 8, y64b)
+        wr_pdev(pb32, 16, 2048)
+        launch_kernel(fcv, 1, pb32)
+        cuCtxSynchronize()
+        YY<Vec<Float>> = bulk_dtoh(y64b, 2048)
+        var<Int> ndy2 = 0
+        var<Float> mxy = 0.0
+        n10<Int> = 0
+        while (n10 < 2048) {
+            a10<Int> = n10 % 128
+            bs10<Int> = n10 - a10
+            acc10<Float> = 0.0
+            m10<Int> = 0
+            while (m10 < 128) {
+                acc10 = acc10 + HX.get(a10 * 128 + m10) * UY.get(bs10 + m10)
+                m10 = m10 + 1
+            }
+            yref10<Float> = acc10 * f16_host(g2, n10)
+            dy10<Float> = yref10 - YY.get(n10)
+            ady10<Float> = dy10
+            if (ady10 < 0.0) { ady10 = 0.0 - ady10 }
+            if (ady10 > mxy) { mxy = ady10 }
+            if (ady10 > 1e-6) { ndy2 = ndy2 + 1 }
+            n10 = n10 + 1
+        }
+        println("E2E YH_GATE count_over_1e-6=" + ndy2.to_string() + " max_abs=" + mxy.to_string_precise())
+        return 0
+    }
     // ---- fused path ----
     t0<Int> = time_mono_millis()
     wr_pdev(pbx, 0, bx)
@@ -431,6 +547,26 @@ hexv(v<Int>)<String> -> {
         k = k + 1
     }
     return s
+}
+
+f16_host(s<String>, i<Int>)<Float> -> {
+    b0<Int> = (s.char_at(i * 2) as Int) & 255
+    b1<Int> = (s.char_at(i * 2 + 1) as Int) & 255
+    u<Int> = b0 + b1 * 256
+    sgn<Int> = (u >> 15) & 1
+    e<Int> = (u >> 10) & 31
+    m<Int> = u & 1023
+    v<Float> = 0.0
+    if (e == 0) {
+        v = (m as Float) * 5.960464477539063e-08
+    } else {
+        v = 1.0 + (m as Float) / 1024.0
+        k<Int> = 0
+        while (k < e - 15) { v = v * 2.0 ; k = k + 1 }
+        while (k < 15 - e) { v = v * 0.5 ; k = k + 1 }
+    }
+    if (sgn == 1) { return 0.0 - v }
+    return v
 }
 
 colsum_b(B<Vec<Float>>, n<Int>)<Float> -> {
