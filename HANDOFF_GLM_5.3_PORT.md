@@ -4773,3 +4773,23 @@ experiment but a bisection of exl3mv1s4 itself: comment out the decode block (ke
 see whether the constant-slab sum becomes correct; then re-add the decode in halves. Four bisection
 rounds should localise it to a few statements, which is small enough to reason about on the PTX.
 === END (rounds 20-55) — the fused kernel is NOT resolvable by black-box probing; it needs bisection ===
+=== ROUND 56-57: BISECT + LUT — AND AN HONEST CORRECTION OF MY OWN RESULT ===
+Bisect entries added to exl3mv.vyb:
+    mvnod  — phase 2 with the decode code REMOVED: correct (0/2048, v0 = 0.601973 = 0.5*sum(xp))
+    mvnod2 — full decode chain (inv map, nibble walk, shift/xor) but stores a CONSTANT 0.5: also correct
+I read that as "the fp16_to_f64 calls are the culprit" and replaced them with a 65536-entry
+half->f32 LUT (new kernel f16lut, built once per process, param +144). The LUT is bit-exact — the
+slab dump STILL matches T exactly (SLAB_DIFF = 0) — and it removes two device calls per element.
+BUT U_FULL IS STILL WRONG (2048/2048, first_bad 0). So fp16_to_f64 is NOT the culprit.
+CORRECTION I must state plainly: in mvnod2 the computed chain (prodK/yK) feeds only `ysum`, which is
+never stored, so the compiler almost certainly dead-code-eliminated the entire decode. mvnod2 was
+therefore ~equivalent to mvnod and proves nothing about the decode. The bisect step was invalid.
+VERIFIED GOOD in the current kernel (LUT build): LUT_OK, PEROUT uniform 512 at c0/c255/c256/c2047,
+SLAB_DIFF = 0. So the LUT is a genuine (small) performance win and changes no numerics — it is kept.
+WHERE THE INVESTIGATION ACTUALLY STANDS: the decode chain is still implicated by elimination (remove
+it => correct; keep it => wrong), but every individual ingredient has been checked in situ and is
+right. The next bisect must keep the chain LIVE — e.g. remove the nibble walk by replacing w16K with
+a constant derived from the slot id, so the store still depends on the remaining chain. Doing this
+properly (with a liveness audit of each step, i.e. never leaving a value unused) is the only honest
+way forward, and it is a fresh-session job.
+=== END OF THIS SESSION (rounds 20-57) ===

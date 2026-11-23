@@ -54,7 +54,7 @@ main()<Int> -> {
     arI<Int> = dev_alloc(64)
     pb32<Int> = dev_alloc(192)
     pbx<Int> = dev_alloc(64)
-    pbm<Int> = dev_alloc(256)
+    pbm<Int> = dev_alloc(272)
     // half->f32 LUT, needed BEFORE any exl3mv1s4 launch (the decode indexes it)
     flut<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
     lut<Int> = dev_alloc(262144)
@@ -454,6 +454,76 @@ main()<Int> -> {
             XD1<Vec<Float>> = bulk_dtoh(xf, 8)
             println("E2E XDUMP k0=" + XD1.get(0).to_string_precise() + " k1=" + XD1.get(1).to_string_precise() + " k7=" + XD1.get(7).to_string_precise())
             println("E2E XHOST k0=" + XP.get(0).to_string_precise() + " k1=" + XP.get(1).to_string_precise() + " k7=" + XP.get(7).to_string_precise())
+            // ---- BISECT STEP 4: mvnod4 (chain + REAL LUT value, minimal body) ----
+            mv4<Int> = load_fn("native/build/exl3mv.ptx", "mvnod4")
+            if (mv4 != 0) {
+                sbd4<Int> = dev_alloc(8192)
+                cuMemcpyHtoD_v2(sbd4, zero_bytes(8192), 8192)
+                wr_pdev(pbm, 120, sbd4)
+                cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+                launch_kernel(mv4, 8192, pbm)
+                cuCtxSynchronize()
+                wr_pdev(pbm, 120, 0)
+                nf5<Int> = dev_alloc(32768)
+                wr_pdev(pb32, 0, byr)
+                wr_pdev(pb32, 8, nf5)
+                wr_pdev(pb32, 16, 2048)
+                launch_kernel(fcv, 8, pb32)
+                cuCtxSynchronize()
+                NV4<Vec<Float>> = bulk_dtoh(nf5, 2048)
+                var<Int> nb6 = 0
+                var<Float> mx6 = 0.0
+                var<Int> fbi = -1
+                n20<Int> = 0
+                while (n20 < 2048) {
+                    # local reference: u[n] = T[n] . xp  (T4 row-major [4096][2048])
+                    ref6<Float> = 0.0
+                    kk6<Int> = 0
+                    while (kk6 < 4096) {
+                        ref6 = ref6 + T4.get(kk6 * 2048 + n20) * XP.get(kk6)
+                        kk6 = kk6 + 1
+                    }
+                    d6<Float> = NV4.get(n20) - ref6
+                    ad6<Float> = d6
+                    if (ad6 < 0.0) { ad6 = 0.0 - ad6 }
+                    if (ad6 > mx6) { mx6 = ad6 }
+                    if (ad6 > 1e-4) { if (fbi < 0) { fbi = n20 } ; nb6 = nb6 + 1 }
+                    n20 = n20 + 1
+                }
+                println("E2E MVNOD4 count_over_1e-4=" + nb6.to_string() + " max_abs=" + mx6.to_string_precise() + " first_bad=" + fbi.to_string() + " v0=" + NV4.get(0).to_string_precise())
+            } else { println("E2E MVNOD4 load=0") }
+            // ---- BISECT STEP 3: mvnod3 (chain LIVE, slab constant) ----
+            mv3<Int> = load_fn("native/build/exl3mv.ptx", "mvnod3")
+            scr<Int> = dev_alloc(256)
+            if (mv3 != 0 && scr != 0) {
+                wr_pdev(pbm, 152, scr)
+                cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+                launch_kernel(mv3, 8192, pbm)
+                cuCtxSynchronize()
+                nf4<Int> = dev_alloc(16384)
+                wr_pdev(pb32, 0, byr)
+                wr_pdev(pb32, 8, nf4)
+                wr_pdev(pb32, 16, 2048)
+                launch_kernel(fcv, 8, pb32)
+                cuCtxSynchronize()
+                NV3<Vec<Float>> = bulk_dtoh(nf4, 2048)
+                sx4<Float> = 0.0
+                i4<Int> = 0
+                while (i4 < 4096) { sx4 = sx4 + XP.get(i4) ; i4 = i4 + 1 }
+                expn3<Float> = 0.5 * sx4
+                var<Int> nb5 = 0
+                var<Float> mx5 = 0.0
+                n19<Int> = 0
+                while (n19 < 2048) {
+                    d5<Float> = NV3.get(n19) - expn3
+                    ad5<Float> = d5
+                    if (ad5 < 0.0) { ad5 = 0.0 - ad5 }
+                    if (ad5 > mx5) { mx5 = ad5 }
+                    if (ad5 > 1e-3) { nb5 = nb5 + 1 }
+                    n19 = n19 + 1
+                }
+                println("E2E MVNOD3 count_over_1e-3=" + nb5.to_string() + " max_abs=" + mx5.to_string_precise() + " expected=" + expn3.to_string_precise() + " v0=" + NV3.get(0).to_string_precise())
+            } else { println("E2E MVNOD3 load=0") }
             // ---- BISECT: mvnod (decode code removed entirely) ----
             mvn<Int> = load_fn("native/build/exl3mv.ptx", "mvnod")
             if (mvn != 0) {
