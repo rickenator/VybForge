@@ -16,14 +16,14 @@ import glm_engine::{load_fn, launch_kernel, wr_pdev}
 
 main()<Int> -> {
     if (tensor_init() != 0) { println("T_FAIL cuda"); return 1 }
-    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_1s")
     fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
     fc<Int> = load_fn("native/build/layer.ptx", "cast32")
     println("T handles: gemm=" + fp.to_string() + " widen=" + fw.to_string() + " cast=" + fc.to_string())
     if (fp == 0 || fw == 0 || fc == 0) { println("T_FAIL handle"); return 2 }
 
     var<Int> M = 1
-    var<Int> N = 2
+    var<Int> N = 1
     var<Int> K = 8
 
     # A: f64 1..8 on the host, cast to f32 on device
@@ -54,7 +54,17 @@ main()<Int> -> {
     sync()
 
     # run the GEMM
-    dS<Int> = dev_alloc(M * N * 4)
+    # 8 slots, explicitly zeroed, so the printout shows exactly which slots the
+    # kernel touches (and which it leaves alone)
+    dS<Int> = dev_alloc(64)
+    wr_pdev(dS, 0, 0)
+    wr_pdev(dS, 8, 0)
+    wr_pdev(dS, 16, 0)
+    wr_pdev(dS, 24, 0)
+    wr_pdev(dS, 32, 0)
+    wr_pdev(dS, 40, 0)
+    wr_pdev(dS, 48, 0)
+    wr_pdev(dS, 56, 0)
     pbg<Int> = dev_alloc(96)
     wr_pdev(pbg, 0, dA)
     wr_pdev(pbg, 8, dB)
@@ -70,14 +80,15 @@ main()<Int> -> {
     println("T gemm grid=" + nblk.to_string() + " rc=" + rcg.to_string())
 
     # widen f32 -> f64 and read back
-    dS64<Int> = dev_alloc(M * N * 8)
+    dS64<Int> = dev_alloc(64)
     wr_pdev(pbc, 0, dS)
     wr_pdev(pbc, 8, dS64)
-    wr_pdev(pbc, 16, M * N)
+    wr_pdev(pbc, 16, 8)
     launch_kernel(fw, 1, pbc)
     sync()
-    O<Vec<Float>> = bulk_dtoh(dS64, M * N)
-    println("T o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise() + "   (expect 36 and 72)")
+    O<Vec<Float>> = bulk_dtoh(dS64, 8)
+    println("T all8: " + O.get(0).to_string_precise() + " " + O.get(1).to_string_precise() + " " + O.get(2).to_string_precise() + " " + O.get(3).to_string_precise() + " " + O.get(4).to_string_precise() + " " + O.get(5).to_string_precise())
+    println("T o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise() + "   (N=1: expect 36 in slot 0)")
     d0<Float> = O.get(0) - 36.0
     d1<Float> = O.get(1) - 72.0
     if (d0 < 0.0) { d0 = 0.0 - d0 }

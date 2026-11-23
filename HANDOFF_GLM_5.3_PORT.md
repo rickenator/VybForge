@@ -5356,3 +5356,21 @@ arithmetic I can do by hand. Do not re-enter the real tensor until that case is 
 KERNEL-SIDE NOTE: bfgemm_p's structure looks correct on inspection (pa0 = A + (mm0*K+k0)*4 stepping
 4; pb = B + (nn*K+k0)*2 stepping 2 for TRANSP; KSP=1 so no reduce is needed). The failure is more
 likely in the probe's buffers than in the addressing, given the history.
+=== ROUND 89: THE HAND-CHECKABLE CASE — bfgemm_p IS WRONG, WITH A SHARP SIGNATURE ===
+native/host/p6r14_tiny.vyb: A = [1..8] f32, B = [N][K] = 2 rows of bf16 1.0 and 2.0,
+M=1 N=2 K=8 KSP=1 TRANSP=1. Arithmetic by hand: o[0] = sum(1..8) = 36, o[1] = 2*36 = 72.
+Both machines, identical and deterministic:
+    T handles: gemm=... widen=... cast=...      (all resolve; grid=1 rc=0)
+    T o[0]=-17.9375  o[1]=36                    (expect 36 and 72)
+    T_FAIL d0=53.9375 d1=36
+SIGNATURE: the arithmetically CORRECT row-0 dot (36) is sitting at index 1, index 0 holds garbage
+(-17.9375), and row 1's correct 72 appears nowhere. So the accumulation is right and the EPILOGUE's
+index mapping is off -- roughly "value for nn lands at nn+1, index 0 never written".
+Where to look (all in bfgemm_p's epilogue): the store index (ks*total + mm0*N + nn)*4 versus the
+thread mapping gid = nb*dim_x() + tid_x(); and whether the 4-row epilogue's guarded stores
+(if (mm0+1 < M) ...) interact with M=1. On paper the index math reads correctly
+(nn = gid % N; store at nn*4; store data at B + (nn*K + k0)*2), so this is likely a CODEGEN issue in
+the 4-output-row epilogue rather than a source-arithmetic one -- which would also explain why the
+real-tensor run was wrong in a "plausible but shifted" way rather than obviously broken.
+NEXT: bisect the epilogue -- replace the 4-row store block with a single st_f32 for a0 only and re-run
+this same tiny case. If [36, 72] appears, the guarded 4-row store is the defect.
