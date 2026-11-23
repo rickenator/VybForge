@@ -5094,3 +5094,22 @@ RECOMMENDATION: do 1 (the bf16 GEMM) as the next self-contained step — it is s
 primitive, and it can be validated in isolation the same way mvnod4 was. Then attack 2 with the
 45-layer digest gate as the safety net.
 === END (rounds 20-74) ===
+=== ROUND 75: bfgemm_p WRITTEN AND COMPILED — NOT YET VALIDATED (stated plainly) ===
+The missing primitive for batched attention: native/kernels/bfgemm.vyb, a faithful port of the proven
+split-K gemm32_p that reads BF16 weights directly with the language's ld_bf16 (no dequant pass, no f32
+copy of the weights), keeping the 4-output-rows-per-thread structure and the Float32-bound MACs that
+the original needed to stay at mul.rn.f32 rate. It also gained a TRANSP flag for the checkpoint's
+[out][in] layout (correct but uncoalesced; production should transpose once at load).
+    ptxas: "PTX contains all 1 device function(s)" / "validated (sm_86)" -- it COMPILES.
+IT IS NOT VALIDATED. I started a validation driver and hit a real problem: building BF16 weights on
+the host side needs an encoder Vyb does not expose (bf16 rounding is the GPU's ld_bf16), so a synthetic
+case cannot be constructed from the host, and a real-data case needs a slice of the safetensors file
+with its header offsets. I deleted the half-written driver rather than ship a kernel with an
+unvalidated claim attached.
+VALIDATION PLAN for the next session (one of):
+  a) slice the real o_proj BF16 file (say N=64, K=256) and compare against a host dot product -- 2M
+     MACs, fast, and it exercises the real addressing and conversion;
+  b) feed the same weights through bf16deq32 -> f32 and run gemm32_p/r as the reference, comparing
+     the two kernels on identical values (needs both to use the TRANSP layout).
+Until one of those passes, DO NOT use bfgemm_p in any path.
+=== END (rounds 20-75) ===
