@@ -4825,3 +4825,20 @@ PRACTICAL STATE: a correct fused decode matvec exists at 0.6 ms/expert. Next: wi
 tail (replacing exl3_deq32f + gemm32 for the routed experts), then measure a whole decode step in
 ms/token against the 20-22 ms competitive bar.
 === END OF SESSION (rounds 20-59) ===
+=== ROUND 60: WHAT 0.6 ms/EXPERT ACTUALLY BUYS (projection, tool-computed) ===
+From the measured 0.600 ms per 4096x2048 fused expert matrix, and the model's geometry
+(45 layers, 8 routed + 1 shared expert, 3 projections each):
+    per expert            1.80 ms
+    per layer (MoE)      16.20 ms
+    per step (MoE only) 729  ms   -> 1.37 tok/s
+    competitive bar      21.1 ms/token (45-50 tok/s)
+    remaining gap        34.6x, MoE alone, BEFORE attention, router and the rest of the block
+Effective bandwidth of the fused kernel today: 4.2 MB packed / 0.6 ms = ~7 GB/s, against ~273 GB/s
+HBM on the GB10. To hit the bar the step would need ~243 GB/s effective. So the fused decode matvec
+is 21x better than dequant (13 ms -> 1.8 ms per expert) but it is GATHER/COMPUTE-bound at ~2 ns per
+element, exactly what the 24 GB feasibility round concluded. This is NOT tunable into the bar:
+the remaining path is the gather-restructured dequant kernel (offline re-pack + a new kernel),
+or a tensor-core formulation, or a multi-node split that divides the per-step weight traffic.
+DO NOT report the fused kernel as "competitive" — it is a 21x engineering win on top of a ~35x
+architectural gap.
+=== END (rounds 20-60) ===
