@@ -1,0 +1,89 @@
+// p6r14_tiny — the hand-checkable bfgemm_p test. No real weights, no model.
+//
+//   A = [1,2,3,4,5,6,7,8]            (f32 activations, cast from f64)
+//   B = [N][K] = 2 rows: row0 = 1.0 everywhere, row1 = 2.0 everywhere (bf16)
+//   M=1, N=2, K=8, KSP=1, TRANSP=1
+//
+//   expected: o[0] = 1+2+...+8 = 36.0
+//             o[1] = 2*(1+2+...+8) = 72.0
+//
+// If this is not exactly 36 and 72 there is no point running the real tensor:
+// the arithmetic is small enough to do by hand, so any deviation is a bug with
+// nowhere to hide.
+import io::{open_read, read_all, close}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import glm_engine::{load_fn, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    if (tensor_init() != 0) { println("T_FAIL cuda"); return 1 }
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
+    fc<Int> = load_fn("native/build/layer.ptx", "cast32")
+    println("T handles: gemm=" + fp.to_string() + " widen=" + fw.to_string() + " cast=" + fc.to_string())
+    if (fp == 0 || fw == 0 || fc == 0) { println("T_FAIL handle"); return 2 }
+
+    var<Int> M = 1
+    var<Int> N = 2
+    var<Int> K = 8
+
+    # A: f64 1..8 on the host, cast to f32 on device
+    xv<Vec<Float>> = Vec()
+    var<Int> i = 0
+    while (i < K) { xv.push(((i + 1) as Float)) ; i = i + 1 }
+    dA64<Int> = dev_alloc(K * 8)
+    bulk_htod(dA64, view(xv))
+    dA<Int> = dev_alloc(K * 4)
+    pbc<Int> = dev_alloc(32)
+    wr_pdev(pbc, 0, dA64)
+    wr_pdev(pbc, 8, dA)
+    wr_pdev(pbc, 16, K)
+    launch_kernel(fc, 1, pbc)
+    sync()
+
+    # B: 16 bf16 words. 1.0 = 0x3F80, 2.0 = 0x4000. Four u16 per 8-byte Int.
+    dB<Int> = dev_alloc(32)
+    w_one<Int> = 0
+    w_two<Int> = 0
+    # build the packed Ints by shifting: 0x3F80 repeated four times
+    w_one = 0x3F80 + 0x3F8000 + 0x3F800000 + 0x3F80000000
+    w_two = 0x4000 + 0x400000 + 0x40000000 + 0x4000000000
+    wr_pdev(dB, 0, w_one)
+    wr_pdev(dB, 8, w_one)
+    wr_pdev(dB, 16, w_two)
+    wr_pdev(dB, 24, w_two)
+    sync()
+
+    # run the GEMM
+    dS<Int> = dev_alloc(M * N * 4)
+    pbg<Int> = dev_alloc(96)
+    wr_pdev(pbg, 0, dA)
+    wr_pdev(pbg, 8, dB)
+    wr_pdev(pbg, 16, dS)
+    wr_pdev(pbg, 24, M)
+    wr_pdev(pbg, 32, N)
+    wr_pdev(pbg, 40, K)
+    wr_pdev(pbg, 56, 1)
+    wr_pdev(pbg, 64, 1)
+    nblk<Int> = (((M + 3) / 4) * N + 255) / 256
+    rcg<Int> = launch_kernel(fp, nblk, pbg) as Int
+    sync()
+    println("T gemm grid=" + nblk.to_string() + " rc=" + rcg.to_string())
+
+    # widen f32 -> f64 and read back
+    dS64<Int> = dev_alloc(M * N * 8)
+    wr_pdev(pbc, 0, dS)
+    wr_pdev(pbc, 8, dS64)
+    wr_pdev(pbc, 16, M * N)
+    launch_kernel(fw, 1, pbc)
+    sync()
+    O<Vec<Float>> = bulk_dtoh(dS64, M * N)
+    println("T o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise() + "   (expect 36 and 72)")
+    d0<Float> = O.get(0) - 36.0
+    d1<Float> = O.get(1) - 72.0
+    if (d0 < 0.0) { d0 = 0.0 - d0 }
+    if (d1 < 0.0) { d1 = 0.0 - d1 }
+    if (d0 < 1e-5 && d1 < 1e-5) { println("T_PASS bfgemm_p is correct on the hand-checkable case") }
+    else { println("T_FAIL bfgemm_p wrong: d0=" + d0.to_string_precise() + " d1=" + d1.to_string_precise()) }
+    println("T_DONE")
+    return 0
+}

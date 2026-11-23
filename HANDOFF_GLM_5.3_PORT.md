@@ -5337,3 +5337,22 @@ probe may not have invoked -- if gemm32_r's twin is missing, the partial sums ar
 which would produce exactly this "plausible but wrong" profile).
 Lesson (twice in a row now): a numerical gate only means something when the INPUT magnitudes are
 real. Both of today's withdrawn claims (String upload, bfgemm PASS) came from near-zero buffers.
+=== ROUND 88: bfgemm_p ENDS THE SESSION UNRESOLVED, WITH A CLEAN NEXT PROBE ===
+Fixed on the way (all the same f32/f64 width class that has plagued this whole probe):
+  - A: bulk_htod writes f64 but bfgemm_p reads A as f32 -> added a device cast32 (mm_host32's
+    two-step). Correct fix, kept.
+  - SK: the kernel stores f32 partials but bulk_dtoh reads f64 -> added a widen32 kernel (f32->f64),
+    now in native/kernels/bfgemm.vyb. Correct fix, kept.
+  - grid: was 1, must be NBLK*KSP = ((M+3)/4*N+255)/256 = 2. Fixed.
+STILL: BFG handle fp=206877382065248 (resolves), grid=2, launch rc=0, and yet
+  BFG_GATE count_over_1e-4=128  max_abs=0.77522620372474194  of 128     and o[0]=0
+with max_abs BIT-IDENTICAL to the run before any of the above fixes. Identical output from changed
+inputs means the value being compared is not coming from where I think -- either dS64 never receives
+the widen output, or OF is being computed from a stale buffer.
+NEXT PROBE (small, precise): after the GEMM, print (a) three raw f32 values by widening dS itself,
+(b) three values of dS64, and (c) the reference value for the same index. Also run ONE trivially
+checkable case first (M=1, N=1, K=8, A=[1,2,...,8], B=identity-ish) where the expected number is
+arithmetic I can do by hand. Do not re-enter the real tensor until that case is right.
+KERNEL-SIDE NOTE: bfgemm_p's structure looks correct on inspection (pa0 = A + (mm0*K+k0)*4 stepping
+4; pb = B + (nn*K+k0)*2 stepping 2 for TRANSP; KSP=1 so no reduce is needed). The failure is more
+likely in the probe's buffers than in the addressing, given the history.
