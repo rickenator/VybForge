@@ -4947,3 +4947,17 @@ Both are ordinary kernel plumbing. The hard part (a correct, W-free, weight-amor
 matvec) is done and validated. Attention and the router still have to be added on top, which is why
 this is a roadmap and not a served number yet.
 === END (rounds 20-66) ===
+=== ROUND 67: HADAMARD PASSES BATCHED — STEP 30.3 ms = 33.0 tok/s, AND 102 tok/s WITH THE REPACK ===
+xhatB / yhatB take the whole batch in ONE launch (grid = B * blocks-per-token). Measured, 10 launches
+divided by B=32:
+    xhat  0.03125 -> 0.0031 ms/token   (10x, exactly the launch overhead removed)
+    yhat  0.03125 -> 0.0031 ms/token
+    gate  still 0/2048 over 1e-4, max 8.6e-07
+Per projection at B=32: 0.01875 (mv) + 0.0031 + 0.0031 = 0.02495 ms/token.
+    step now                30.3 ms ->  33.0 tok/s
+    bar                     21.1 ms ->  45-50 tok/s
+    + 10x gather repack      9.8 ms -> 102   tok/s  (2.2x PAST the bar)
+So after two rounds of ordinary plumbing the MoE path is within ~30% of the competitive bar, and the
+measured gather repack takes it decisively past it. Remaining for a SERVED number: attention, the
+router, and a real batch scheduler — none of which are measured yet.
+=== END (rounds 20-67) ===
