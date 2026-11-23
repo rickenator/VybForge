@@ -4463,3 +4463,24 @@ rb64 x 16 nb128 x 8 cta = 8192 exactly, so every column block has its 512 contri
 question is whether nb128 is being computed correctly at the upper end. A one-line probe: have
 the kernel atomically add 1.0 to a counter indexed by nb128 and check that all 16 blocks receive
 512 increments.
+=== ROUND 37: COVERAGE IS UNIFORM — the last fault is in the VALUES, not the grid ===
+Added a per-column-block contribution counter (f32 atomic, diagnostic only, +72):
+    E2E cnt: 65536 x16   (512 CTAs x 128 threads per block, identical for all 16 blocks)
+So every output column block receives exactly the same number of contributions; the grid mapping
+(nb128 = block - rb64*nbc128, nbc128 = 16) is CORRECT.
+RESULT WITH THE FIX: blocks 0 0 0 | 128 128 128 ... — the first three blocks exact, the rest wrong,
+deterministically. Combined with uniform coverage, the wrongness must be in the VALUES the dots
+accumulate for block >= 3, i.e. in the shared slab contents or in xp for the corresponding tiles.
+CANDIDATE (untested): the slab's compact re-index `rl = (within/128)*4` with `bK = eK/128` in
+phase 1 — both drop `cta`, which is fine ONLY if the 8 rows each CTA decodes are exactly
+cta*8..cta*8+7; if the phase-1 row mapping and the phase-2 row mapping disagree by cta, the first
+few tiles (cta small) can still line up while later ones do not — which is exactly the observed
+"first three blocks right, rest wrong" pattern with uniform coverage.
+NEXT: dump CTA 0's phase-2 acc values alongside the slab it read (8 rows x 128) and check the row
+identity directly for a cta >= 3 tile.
+=== SESSION STOP POINT ===
+This kernel has consumed rounds 20-37. Everything outside it is done and green (two-node
+increments 1-3, tab cache 37x, buffer cache 16%, ComfyUI relocation, reclaim). The fused path has
+the algebra, layout, decode and bounds all correct; one deterministic defect remains at the
+cta/row-mapping level. Recommend continuing it in a fresh session with the tools now in place
+(initcheck, racecheck, the block counter, p6r8_e2e).

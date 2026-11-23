@@ -210,6 +210,22 @@ main()<Int> -> {
         i = i + 1
     }
     println("E2E first_mismatch_index=" + firstbad.to_string())
+    // Is block 3+ shifted onto another input row? Compare y[384] with B[k][384].
+    k2<Int> = 0
+    while (k2 < 4) {
+        w64b<Int> = dev_alloc(8192)
+        pbc2<Int> = dev_alloc(24)
+        wr_pdev(pbc2, 0, dW + (k2 * 2048 + 384) * 4)
+        wr_pdev(pbc2, 8, w64b)
+        wr_pdev(pbc2, 16, 4)
+        launch_kernel(fcv, 1, pbc2)
+        cuCtxSynchronize()
+        bv2<Vec<Float>> = bulk_dtoh(w64b, 4)
+        println("E2E row" + k2.to_string() + "[384..387]=" + bv2.get(0).to_string_precise() + " " + bv2.get(1).to_string_precise() + " " + bv2.get(2).to_string_precise())
+        free_dev(w64b)
+        k2 = k2 + 1
+    }
+    println("E2E fused[384..387]=" + ynew.get(384).to_string_precise() + " " + ynew.get(385).to_string_precise() + " " + ynew.get(386).to_string_precise())
     // per-128-block error counts: structural pattern or scattered?
     var<Int> blk = 0
     line<String> = "E2E blocks:"
