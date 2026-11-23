@@ -4863,3 +4863,16 @@ distributed path end to end), but it is NOT the route to the competitive bar and
 presented as such. The bar needs the kernel restructure; the cluster is a multiplier of ~2-2.5x on
 this geometry, not a solution.
 === END (rounds 20-61) ===
+=== ROUND 62: THE FULL FUSED EXPERT IS VALIDATED AGAINST DEQ+GEMM (8x) ===
+native/host/p6r10_fused_expert.vyb compares, for expert 153's gate_proj (4096x2048):
+    REFERENCE  exl3_deq32f (materialise W, 33.5 MB) + mm_host32   deq 5 ms + mm 3 ms = 8 ms
+    FUSED      xhat -> fused matvec -> yhat (W never built)       1 + 0 + 0 = <=1 ms
+    GATE       count_over_1e-4 = 0, max_abs = 8.3e-07, first_bad = -1
+               (ref_max = 1.6734, so ~5e-07 relative — the two agree to f32 rounding)
+    y0 fused = -0.25333684682846069   ref = -0.25333666801452637
+So the complete composition y = sv . H . (T . (H . (su . x))) reproduces the production path exactly,
+at roughly 1/8 the cost, with no 33.5 MB W buffer.
+GRID GOTCHA worth remembering: the matvec needs (nin/64)*(cw/128)*8 CTAs — the *8 because each
+"block" in the kernel is 8 CTAs of 256 threads. Launching the block count (1024) instead of the CTA
+count (8192) silently computes only an eighth of the output and looks like a numerics bug (it did).
+=== END (rounds 20-62) ===
