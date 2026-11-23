@@ -33,15 +33,16 @@ import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod
 import vmath::{vexp, vsqrt}
 import time::{time_mono_millis}
 
+# The driver-API calls that bindings/cuda/cuda_binding.vyb already declares are IMPORTED
+# rather than re-declared: a second declaration in this file makes any module that imports
+# BOTH fail with "Duplicate symbol after splice: 'cuModuleLoadData'". Only the four
+# functions the binding does not carry are declared here.
+import cuda_binding::{cuMemFree_v2, cuMemAlloc_v2, cuMemcpyHtoD_v2, cuCtxSynchronize,
+                      cuModuleLoadData, cuModuleGetFunction}
+
 extern "C" {
-    cuMemFree_v2(dptr<Int>)<CInt>
-    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
-    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt>
-    cuCtxSynchronize()<CInt>
     cuMemGetInfo_v2(free<loc<Int>>, total<loc<Int>>)<CInt>
     vyb_str_stats()<CInt>
-    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
-    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
     cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
                   blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
                   a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
@@ -1562,6 +1563,7 @@ exl3_deq32f_into_h(fdeq32<Int>, fdqs<Int>, fdqs4<Int>, fhad132<Int>, fhad232<Int
     }
     return outb
 }
+share(all)
 had_hoist(fhgen<Int>)<Int> -> {
     var<Int> out = 0
     freedom {
@@ -3405,7 +3407,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         sync()
                         # mvnodB: +0 T, +8 X, +24 cw, +40 q, +48 td, +56 inv, +144 LUT,
                         #         +168 B, +176 nin   (atomics, so T starts zeroed)
-                        cuMemcpyHtoD_v2(dyr, zero_bytes(nt * EINTER * 4), nt * EINTER * 4)
+                        # zero T for the atomics (zero_bytes is not available in this module)
+                        var<Int> zw = 0
+                        while (zw < nt * EINTER * 4) { wr_pdev(dyr, zw, 0) ; zw = zw + 8 }
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dxh)
                         wr_pdev(pb32, 24, EINTER)

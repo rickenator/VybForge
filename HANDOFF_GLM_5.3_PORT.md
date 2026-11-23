@@ -5725,3 +5725,27 @@ and the G9PROBE offsets are IDENTICAL across both runs (1646384088, 174881192, 7
 Therefore neither 30-minute run could ever have reached tail_site, and the fused-gate verification
 needs its own vehicle rather than a 45-layer prefill harness. The cache improvement stays (it removes
 the walk for every future full-chain run and now demonstrably hits).
+=== ROUND 108: NO DRIVER CURRENTLY REACHES glm_engine.tail_site -- that is why FGATE never prints ===
+Chased the verification vehicle properly and found the real reason the FGATE block has never run:
+  - glm_decode_chain.vyb defines its OWN local moe_tail_step (14 params) and never imports the
+    engine's -- my block is not in that code path at all.
+  - glm_prefill.vyb likewise defines its OWN local tail_site (26 params, line 1458).
+  - glm_serve.vyb DOES call the engine's tail_site (28 params, line 707) -- and cannot compile:
+        Duplicate symbol after splice: 'cuModuleLoadData' while importing 'import glm_engine;'
+        already defined by bindings/cuda/cuda_binding.vyb, also defined by native/glm53/glm_engine.vyb
+    glm_engine.vyb declares its own extern "C" block (line ~35) that duplicates the new
+    bindings/cuda/cuda_binding.vyb module.
+So NO current driver reaches glm_engine.tail_site. The FGATE block is correct and compiles, but nothing
+can execute it until one of these is done:
+  a. remove glm_engine's duplicate extern block and import cuda_binding instead (the clean fix; touches
+     the engine's FFI declarations only, but every engine caller must still compile)
+  b. add the FGATE block to glm_decode_chain's LOCAL moe_tail_step too (duplicate logic in a second
+     place -- works, but invites drift)
+c. fix arity/copy-drift so glm_decode_chain could call the engine's tail_site instead of its own copy
+   (the real long-term answer: the driver's copies are why the engine and the driver keep diverging)
+ALSO DONE THIS ROUND: VYBFORGE_NLAY -> nlay in glm_decode_chain (1 layer runs in seconds once the tab
+cache hits: "CHAIN TABCACHE hit" then "CHAIN_OK"), and the whole native/glm53 module dir synced to lefty
+(it only had 2 of 4 files, which is why glm_serve failed on import deq_cache first).
+MEASURED FACTS FROM THE FAST RUNS: with the tab cache, a 1-layer and a 4-layer glm_decode_chain both
+complete in seconds ("CHAIN_OK"), so the harness is now cheap -- but both use the LOCAL tail_site, so
+neither exercises FGATE.
