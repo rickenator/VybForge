@@ -6526,3 +6526,22 @@ NEXT WORK (now the obvious highest value): port the fused matvec into moe_tail_s
 is already built and verified in tail_site -- handle hoisting, preallocated partials, mvn_run, and the
 P6_FUSED_ONLY/P6_FUSED_TOL gating -- and the measured advantage on the shared code was 3.2x overall
 (deq 9.7x cheaper). Expect the decode layer to move from 28 ms toward ~10-15 ms.
+=== ROUND 146: THE SERVE PATH CANNOT MEASURE DECODE STEADY STATE (IN-RUN INSTABILITY) ===
+Raised CAPT 22 -> 40 (sv_CAPT and CAPT must match) so more warm decode steps fit per process, and
+extended the harness id list to 38 ids for steps past 2. Parsing improved: 48 -> 73 samples over 12
+steps. But the timings are not usable -- the instability is WITHIN a run, not just run to run:
+    step   0    1    2    3    4    5    6    7    8    9   10   11
+    med   37  479   35   36  497   48  498  498  946  950  500  500     (ms, SEC mlpmoe)
+    max 1034 1943 1992 2951 5013 6020 6040 6957 6986 7014 7032 7948
+Medians swing 35 <-> 950 and the max grows monotonically to 7.9 s. That is memory pressure: the
+footprint grows each step and evicts resident weight pages, so later steps pay cold reads. So the
+in-process bench does NOT deliver a steady-state decode number either.
+CONSEQUENCE -- HOW DECODE WORK MUST BE MEASURED FROM HERE:
+  1. CORRECTNESS: use the per-projection numeric comparison against the deq result (the FGATE pattern).
+     It is deterministic and independent of I/O / page-cache state, which is exactly what the wall
+     clock is not. A port is "correct" when its max_abs sits at the same ~1e-6 the prefill gate shows.
+  2. TIME: a standalone probe with fixed inputs and N>=20 reps (the p6r10 pattern), NOT the serve loop.
+     The serve path's own numbers are dominated by checkpoint I/O and cannot arbitrate a 10-20 ms change.
+CAPT=40 stays (harmless: more cache rows, values unchanged) but the digest baselines must be re-verified
+by the sweep, since CAPT participates in cache sizing. THE BENCH SCRIPTS STAY: bench_decode.sh is still
+the only way to see per-step behaviour, and it is what exposed this -- just do not trust it as a timer.

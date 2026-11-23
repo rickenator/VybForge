@@ -54,7 +54,9 @@ extern "C" {
 share(all)
 R<Int> = 20
 share(all)
-CAPT<Int> = 22          # DSA cache rows per layer slot: 20 prefill + 2 decode
+CAPT<Int> = 40          # DSA cache rows per layer slot: 20 prefill + up to 20 decode: the bench needs more than
+                        # 2 warm steps per process, and steps past this fall into the out-of-bounds
+                        # slow path (measured 494 ms vs 28 ms per layer). Must match sv_CAPT.
 share(all)
 NLAY<Int> = 45
 share(all)
