@@ -5213,3 +5213,20 @@ question. Next session should read gx_read's implementation and the trellis uplo
 (does gx_read return raw bytes, or does the trellis path use a different transfer helper?) rather than
 continuing to infer from behaviour.
 === END (rounds 20-81) — STOPPING HERE ===
+=== ROUND 82: STEP 0 — htod RETURNS 0 WHILE NOTHING LANDS; THE SOURCE STRING IS THE SUSPECT ===
+Two more facts, and they narrow it to the String representation:
+    godzilla: found=1 bytes=0 (the tensor is not on that box) -> host bytes 0,0,0,0,
+              htod rc=0, device = garbage -> the copy reports SUCCESS while copying nothing
+    lefty   : bytes=4194304, host bytes 48,188 48,188,98,60 (correct),
+              device values all denormal (~1e-18..1e-26)
+rc=0 with garbage downstream means the failure is not an error being swallowed -- it is what the
+source pointer looks like to the binding. The denormal magnitudes are the signature of reading the
+wrong 16-bit halves, i.e. Vyb's String does not lay its characters out the way a raw byte copy
+assumes (UTF-8/wide encoding), while gx_read + the trellis path clearly get raw bytes somehow.
+STOPPING HERE. The next action is to READ, not to infer:
+    1. how gx_read stores its result (raw bytes, or code points in a wide buffer?)
+    2. what cuMemcpyHtoD_v2 does with a String argument (does it take .data()? an encoded form? a
+       length prefix?), and why the trellis path's call of the same shape works
+    3. whether there is a dedicated raw-bytes upload helper that the trellis path actually uses
+I have now spent several rounds inferring this from behaviour; the answer is in two function bodies.
+=== END (rounds 20-82) — STOPPING ===

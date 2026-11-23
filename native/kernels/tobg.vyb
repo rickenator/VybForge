@@ -13,3 +13,17 @@ tobg(p<Int>) -> {
         st_f32(D + gid * 4, v)
     }
 }
+
+// tobg_word — store the raw 16-bit word NUMERICALLY (no bf16 conversion), so a
+// caller can tell an upload problem from a decode problem.
+// p: +0 src(bf16), +8 dst(f32), +16 n
+tobg_word(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    D<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        w<Int> = ld_u16(S + gid * 2) as Int
+        st_f32(D + gid * 4, w as Float32)
+    }
+}

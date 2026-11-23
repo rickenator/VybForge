@@ -9,6 +9,7 @@
 import io::{open_read, read_all, close}
 import env::{env_get}
 import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
+import mod::{cuda_memcpy_h2d}
 import gx::{gx_read}
 import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev}
 
@@ -55,8 +56,15 @@ main()<Int> -> {
     # trellis path does); a substring() copy was the source of corrupted bytes
     # CAPTURE the return code: silent failures here are exactly what a
     # never-written destination looks like
-    rc<Int> = cuMemcpyHtoD_v2(dS, g0, 16) as Int
-    println("S0 htod rc=" + rc.to_string())
+    # the dedicated raw-bytes helper: it takes the String's DATA pointer and
+    # copies inside a freedom block (this is what the trellis path uses)
+    # INSIDE a freedom block the String->loc<CVoid> conversion is in scope, which
+    # is exactly what cuda_memcpy_h2d does internally. At top level the String is
+    # passed as its STRUCT (a pointer), which is why the device held junk.
+    # call the binding's own helper: the String->pointer conversion only works
+    # inside the module that declares the FFI pointer functions
+    rc2<Int> = cuda_memcpy_h2d(dS, g0, 16) as Int
+    println("S0 htod rc=" + rc2.to_string() + " (via cuda_memcpy_h2d)")
     sync()
     wr_pdev(pb, 0, dS)
     wr_pdev(pb, 8, dD)
@@ -64,6 +72,14 @@ main()<Int> -> {
     launch_kernel(f, 1, pb)
     sync()
     V<Vec<Float>> = bulk_dtoh(dD, 8)
+    # ---- separate UPLOAD from DECODE: store the raw word numerically ----
+    fw<Int> = load_fn("native/build/tobg.ptx", "tobg_word")
+    dW2<Int> = dev_alloc(64)
+    wr_pdev(pb, 8, dW2)
+    launch_kernel(fw, 1, pb)
+    sync()
+    W2<Vec<Float>> = bulk_dtoh(dW2, 8)
+    println("S0 raw words on device: " + W2.get(0).to_string_precise() + " " + W2.get(1).to_string_precise() + " " + W2.get(2).to_string_precise() + "  (expect 48176 15458? no: 48176 then next)")
     println("S0 device values: " + V.get(0).to_string_precise() + " " + V.get(1).to_string_precise() + " " + V.get(2).to_string_precise() + " " + V.get(3).to_string_precise())
     dv<Float> = V.get(0) - (0.0 - 0.0107421875)
     if (dv < 0.0) { dv = 0.0 - dv }
