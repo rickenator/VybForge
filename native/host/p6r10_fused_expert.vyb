@@ -348,6 +348,45 @@ main()<Int> -> {
             println("P6R10 TOKEN_PASSES xhat_ms_per_token=" + xh.to_string_precise() + " yhat_ms_per_token=" + yh.to_string_precise())
         }
     }
+    // ---- BATCHED SERVE LOOP: one full step's worth of MoE projections ----
+    // 45 layers x 9 experts x 3 projections = 1215 fused matvec launches at B=128,
+    // all on one expert's weights (same element count for gate/up/down), which is
+    // exactly the workload the step projection assumed. This measures the REAL
+    // wall time including launch and host-loop overhead.
+    if (fmb != 0) {
+        var<Int> BS = 128
+        xs<Int> = dev_alloc(nin * 4 * BS)
+        ts<Int> = dev_alloc(cw * 4 * BS)
+        if (xs != 0 && ts != 0) {
+            wr_pdev(pbv, 0, ts)
+            wr_pdev(pbv, 8, xs)
+            wr_pdev(pbv, 24, cw)
+            wr_pdev(pbv, 40, arA)
+            wr_pdev(pbv, 48, mapdev)
+            wr_pdev(pbv, 56, invbase)
+            wr_pdev(pbv, 144, lut)
+            wr_pdev(pbv, 168, BS)
+            wr_pdev(pbv, 176, nin)
+            launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+            sync()
+            s0<Int> = time_mono_millis()
+            var<Int> L = 0
+            while (L < 45) {
+                var<Int> ex = 0
+                while (ex < 9) {
+                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                    ex = ex + 1
+                }
+                L = L + 1
+            }
+            sync()
+            s1<Int> = time_mono_millis()
+            step_ms<Float> = (s1 - s0) as Float
+            println("P6R10 SERVE_LOOP launches=1215 batch=128 step_ms=" + step_ms.to_string_precise() + " tok_per_s=" + ((128.0 * 1000.0) / step_ms).to_string_precise())
+        }
+    }
     // ---- ATTENTION PROJECTION at B=128: shape derived from suh/svh lengths ----
     if (fmb != 0) {
         apre<String> = "model.language_model.layers.3.self_attn.q_proj."

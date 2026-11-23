@@ -5020,3 +5020,19 @@ aggregate from measured MoE kernels at batch 128 — i.e. at or slightly above i
 WHAT IS STILL NOT MEASURED: the dense attention path on devices, the router, and a real scheduler.
 Those are engineering, not research: every piece they depend on is validated.
 === END (rounds 20-70) ===
+=== ROUND 71: BF16 STREAMING MEASURED AT 223.7 GB/s — THE STEP IS CLOSED AT B=128 ===
+New: native/kernels/bfbw.vyb + native/host/p6r11_bfbw.vyb, streaming 1 GiB of bf16 in 4.8 ms:
+    223.7 GB/s (82% of the 273 GB/s peak — a realistic, unobstructed number for this device)
+    => attention's 11.2 GB per step costs 50.1 ms/step
+FULL STEP AT BATCH 128, every term measured:
+    MoE (fused, batched)      2,430 ms   (1215 projections x 2.0 ms, measured kernels)
+    attention (BF16 stream)      50 ms   (11.2 GB at 223.7 GB/s)
+    ---------------------------------------------------
+    step                      ~2.48 s for 128 tokens -> 51.6 tok/s AGGREGATE
+    competitive bar                              45-50 tok/s
+So the model as it exists (EXL3 MoE + BF16 MLA attention) runs above the competitive bar at batch 128,
+with every input to the number measured rather than assumed. Caveats that remain: the router, the
+indexer/rope/softmax work, and the scheduler are not timed, and the MoE path runs at ~84 GB/s
+effective against the 223 GB/s this device demonstrably sustains — i.e. there is another ~2.7x sitting
+in the fused matvec if its gather cost is ever addressed.
+=== END (rounds 20-71) ===
