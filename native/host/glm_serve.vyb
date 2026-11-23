@@ -1926,7 +1926,7 @@ main()<Int> -> {
                         }
 
                         # ============================================================ MTP head (layer 45)
-                        if (nlay == 45) {
+                        if (nlay == 45 && skipM != "1") {  # MTP head (phase 2): gate with the stage it depends on
                             # refresh the index/map strings: the 45-layer walk churned Strings (the
                             # same corruption window the per-step refresh above brackets)
                             match (open_read("native/exl3/map.bin")) {
