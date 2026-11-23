@@ -764,6 +764,97 @@ mvnodB4(p<Int>) -> {
     }
 }
 
+mvnodB_st(p<Int>) -> {  // TIMING ONLY: plain store instead of the atomic (numerically WRONG: k-split races)
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 40)
+    td<Int> = ld_i64(p + 48)
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    inv<Int> = ld_i64(p + 56)
+    LUT<Int> = ld_i64(p + 144)
+    B<Int> = ld_i64(p + 168)
+    nin<Int> = ld_i64(p + 176)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+
+    # ---- decode the packed weights ONCE ----
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = ld_f32n(LUT + (yK & 65535) * 4) as Float
+        hiK<Float> = ld_f32n(LUT + ((yK >> 16) & 65535) * 4) as Float
+        st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
+        k = k + 1
+    }
+
+    inbase<Int> = rb64 * 64 + cta * 8
+    kernel_barrier()
+
+    # ---- B dots over the SAME slab: the weights are not re-read ----
+    # ILP: 4 output columns per thread. The four accumulators are independent, and
+    # the X element for a given j is loaded ONCE and reused by all four (mvnodB
+    # reloads it for every column).
+    if (within < 32) {
+        d0<Int> = within * 4
+        cb0<Int> = nb128 * 128 + d0
+        b2<Int> = 0
+        while (b2 < B) {
+            xb<Int> = X + b2 * nin * 4
+            acc0<Float32> = 0.0
+            acc1<Float32> = 0.0
+            acc2<Float32> = 0.0
+            acc3<Float32> = 0.0
+            j<Int> = 0
+            while (j < 8) {
+                xv<Float32> = ld_f32n(xb + (inbase + j) * 4)
+                base<Int> = j * 512 + d0 * 4
+                acc0 = acc0 + ld_shared_f32(base) * xv
+                acc1 = acc1 + ld_shared_f32(base + 4) * xv
+                acc2 = acc2 + ld_shared_f32(base + 8) * xv
+                acc3 = acc3 + ld_shared_f32(base + 12) * xv
+                j = j + 1
+            }
+            if (cb0 < cw) { st_f32(T + (b2 * cw + cb0) * 4, acc0) }
+            if (cb0 + 1 < cw) { st_f32(T + (b2 * cw + cb0 + 1) * 4, acc1) }
+            if (cb0 + 2 < cw) { st_f32(T + (b2 * cw + cb0 + 2) * 4, acc2) }
+            if (cb0 + 3 < cw) { st_f32(T + (b2 * cw + cb0 + 3) * 4, acc3) }
+            b2 = b2 + 1
+        }
+    }
+}
+
 // ============================================================================
 // xhatB / yhatB — BATCHED Hadamard passes. The single-token versions are one
 // launch PER TOKEN, which measured as pure launch overhead (0.03125 ms each =

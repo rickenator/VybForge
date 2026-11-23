@@ -5532,3 +5532,24 @@ LESSON: ILP restructuring is not a universal lever. It helped bfgemm8 (dense, 1-
 starvation) and hurt mvnodB4 (latency/occupancy-bound with 256 threads already active).
 CURRENT COMPOSED ESTIMATE: attention ~101 tok/s (bfgemm8 plateau), MoE ~52.7 tok/s (B=128, 2.43 s/step)
 -> composed ~34.7 tok/s. Still short of the 45-50 bar; the MoE decode is the wall.
+=== ROUND 98: DECODE BROKEN DOWN -- it is only 0.16 ms; the MoE's cost is the DOT/ATOMICS ===
+native/kernels/dparts.vyb splits EXL3 decode into cumulative stages (tile lookup -> nibble assembly ->
+hash -> LUT), each doing mvnodB's exact tile/thread mapping, each with an anti-DCE store, timed at 50
+reps (0.02 ms resolution):
+    tile  0.060 ms   (37%)   the inv[] slot lookup + address arithmetic
+    nib   0.120 ms   (+0.060) nidx/pp loads, byte loads, nibble shifts, w16 assembly
+    hash  0.120 ms   (+0.000) the multiply-xor is FREE
+    lut   0.160 ms   (+0.040) the two 65536-entry f32 gathers
+So decoding one expert projection = 0.16 ms total. THIS CONTRADICTS MY OWN PREVIOUS CONCLUSION
+(round 97 said the decode was the wall): at B=128 mvnodB costs 1.3 ms per launch, of which only 0.16
+is decode -- the other ~1.1 ms is the DOT.
+AND THE DOT IS PATHETIC: 2048 outputs x 128 tokens x 8 MACs = 2.1 M MACs in 1.1 ms = 1.9 GFLOP/s. The
+inner loop is 8 MACs then `atomic_add_f32` into T -- so there is roughly ONE ATOMIC PER 8 MACs, and the
+atomics are to global memory, contended across the 8 CTAs that k-split each output.
+NEW HYPOTHESIS (testable, cheap): the MoE's cost at batch is ATOMIC-BOUND, not arithmetic-bound. The
+test is a variant that PLAIN-STORES instead of atomically adding (numerically wrong, but it measures
+the ceiling exactly). If that variant runs in ~0.2 ms instead of 1.3 ms, atomics are ~85% of the cost
+and the fix is a real reduction (each CTA owning exclusive outputs, or a separate reduce pass) rather
+than micro-optimising the decode.
+REMINDER OF THE LARGER PICTURE: attention ~101 tok/s (certified bfgemm8), MoE ~52.7 tok/s,
+composed ~34.7 tok/s vs the 45-50 bar. The MoE dot is where the remaining 1.5x lives.
