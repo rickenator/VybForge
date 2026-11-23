@@ -4644,3 +4644,20 @@ store and the atomic in the same branch (both write adjacent addresses).
 NEXT SESSION, cheapest experiment: DELETE the plain-store line (keep only the atomic), rebuild, and
 re-run ONLY=2. If u256 becomes non-zero, the STORE was interfering with the atomic (the two writes in
 one branch), and the kernel is fixed by keeping one of them.
+=== ROUND 48: THE ATOMICS ARE FINE — THE T BUFFER IS THE PROBLEM ===
+Same kernel, same launch (ONLY = 2), only the atomic target differs:
+    atomic into a FRESH 8 KB buffer : v256 = -3.2290  v257 = 5.2195   <- LANDS, correct magnitude
+    atomic into T (byr)             : u256 = 0                        <- does not land
+and from the full run T does receive atomics for cb < 256. So atom.global.add.f32 is healthy; the
+8 KB T buffer (byr = dev_alloc(8192)) behaves as if only its first 1 KB exists.
+Most likely: byr is aliased/overlapped by a later allocation (by = dev_alloc(16384) is the next one)
+or the allocation is smaller than requested, so writes past 1 KB go somewhere else and reads of
+"T" beyond that never see them.
+NEXT SESSION (two lines, definitive): (1) have the HOST write sentinels into byr at offsets 0, 1024,
+4096 and 8188 bytes via cuMemcpyHtoD and read them back — if the upper ones do not round-trip the
+buffer is broken; (2) print every allocation pointer (bx, bxp, byr, by, atgt) and check for overlaps.
+If byr is fine, then the kernel's T pointer differs from the host's byr (a param-plumbing issue).
+=== END OF SESSION (rounds 20-48) ===
+Fused path proven: algebra W = H(T(Hx)), W^T layout, su-before-H / sv-after-H, bit-identical decode,
+exact xp, exact accumulators (plain store and fresh-buffer atomics both correct). Open: the T buffer
+not receiving atomics past 1 KB. Everything else in the program is green; the 24 GB verdict stands.

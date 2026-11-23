@@ -426,6 +426,15 @@ main()<Int> -> {
         cuCtxSynchronize()
         DBGV<Vec<Float>> = bulk_dtoh(dbgf, 4)
         println("E2E DBG only_seen=" + DBGV.get(0).to_string_precise() + " nb128_seen=" + DBGV.get(1).to_string_precise() + " nb128_eq2_count=" + DBGV.get(2).to_string_precise() + " only_eq2_count=" + DBGV.get(3).to_string_precise())
+            // read the FRESH atomic target (atgt): the only buffer where the
+            // block-2 atomics demonstrably land
+            atf1<Int> = dev_alloc(16384)
+            wr_pdev(pb32, 0, atgt)
+            wr_pdev(pb32, 8, atf1)
+            wr_pdev(pb32, 16, 2048)
+            launch_kernel(fcv, 8, pb32)
+            cuCtxSynchronize()
+            ATV0<Vec<Float>> = bulk_dtoh(atf1, 2048)
             var<Int> ndo2 = 0
             var<Float> mxo2 = 0.0
             var<Int> fbo = -1
@@ -437,7 +446,7 @@ main()<Int> -> {
                     ao = ao + T4.get(k13 * 2048 + n13) * XP.get(k13)
                     k13 = k13 + 1
                 }
-                do3<Float> = ao - UO.get(n13)
+                do3<Float> = ao - ATV0.get(n13)
                 ado<Float> = do3
                 if (ado < 0.0) { ado = 0.0 - ado }
                 if (ado > mxo2) { mxo2 = ado }
