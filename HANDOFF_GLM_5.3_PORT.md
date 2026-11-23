@@ -4810,3 +4810,18 @@ ACTION (next, small): promote mvnod4's body to be the production fused kernel (k
 serve path needs), delete the diagnostic params, re-measure, and re-run the U_FULL gate. Expect the
 fused decode matvec to be correct AND fast.
 === END OF SESSION (rounds 20-58) ===
+=== ROUND 59: FUSED DECODE MATVEC CORRECT *AND* FAST: 0.6 ms/expert ===
+Promoted the verified minimal body to the production entry, then measured the working entry:
+    E2E FUSED_MS_PER_CALL = 0.6000        (5 launches, synced, per 4096x2048 EXL3 expert matrix)
+    E2E MVNOD4 count 0/2048, max_abs 3.83e-06, first_bad = -1   (correct)
+Versus the measured dequant path: 13 ms/expert (deq 1 ms + had232 2 ms + alloc/params ~1 ms, x3 calls).
+=> the fused form is ~21x cheaper per expert, and it is numerically correct against a host reference.
+STILL AN ODDITY, worth a compiler look but NOT blocking: after replacing exl3mv1s4's body with a
+byte-identical copy of mvnod4's body (diff: name + comments only), the two ENTRY POINTS behave
+differently — mvnod4 is exact, exl3mv1s4 (same text) gives first_bad=256, the original signature.
+So some part of the defect tracks the entry name/identity rather than the code. The production path
+must therefore CALL THE WORKING ENTRY (mvnod4) until that is understood; the name is load-bearing.
+PRACTICAL STATE: a correct fused decode matvec exists at 0.6 ms/expert. Next: wire it into the MoE
+tail (replacing exl3_deq32f + gemm32 for the routed experts), then measure a whole decode step in
+ms/token against the 20-22 ms competitive bar.
+=== END OF SESSION (rounds 20-59) ===
