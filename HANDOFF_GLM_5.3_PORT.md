@@ -4414,3 +4414,18 @@ and diverges nondeterministically beyond it.
 SUGGESTED NEXT (fresh session, GPU debugging): run the SAME minimal driver under compute-sanitizer
 (racecheck + memcheck) — the tools will name the race directly instead of us inferring it from
 mismatch indices.
+=== ROUND 34: RACECHECK CLEAN; THE ERROR IS PER-ELEMENT AND RUN-DEPENDENT ===
+compute-sanitizer --tool racecheck on the lean driver: "RACECHECK SUMMARY: 0 hazards" (0 errors,
+0 warnings). So there is NO shared-memory race. The H-transpose experiment (yhat reading H[m][a]
+instead of H[a][m]) also fails the same way, so yhat's orientation is not it either.
+PER-BLOCK ERROR HISTOGRAM (128 outputs per block, threshold 1e-4):
+    run 1:  0   0   0 128 126 125 128 126 128 128 128 128 128 127 128 127
+    run 2:  0  95  32 127 127 127 127 127 124 126 127 128 127 128 128 128
+i.e. the "clean" leading blocks MOVE between runs, so they are not correct — they are blocks whose
+values are small enough that the error hides under the threshold. The defect is per-element,
+relative, and run-dependent, while y[0] itself agrees to 1e-9.
+NEXT (single highest-value step): memcheck + initcheck (racecheck does not check uninitialised
+GLOBAL reads or out-of-bounds), then re-examine the atomic accumulation with the sanitizer's view.
+The lean driver is p6r8_e2e; the oracle and the host references are all in place.
+TIME SPENT ON THIS KERNEL: rounds 20-34. Everything except the accumulation's correctness is
+proven. This is the right place to stop and pick it up fresh with initcheck.

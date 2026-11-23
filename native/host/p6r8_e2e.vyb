@@ -65,6 +65,17 @@ main()<Int> -> {
         println("E2E_FAIL arena")
         return 6
     }
+    // Zero every work buffer up front: initcheck flagged uninitialised GLOBAL
+    // reads inside exl3xhat, i.e. some buffer it consumes is not fully written
+    // before the read. Zeroing makes the offender visible (it will still report
+    // on whatever remains never-written) and rules out stale-memory noise.
+    cuMemcpyHtoD_v2(bx, zero_bytes(16384), 16384)
+    cuMemcpyHtoD_v2(bxp, zero_bytes(16384), 16384)
+    cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+    cuMemcpyHtoD_v2(by, zero_bytes(16384), 16384)
+    cuMemcpyHtoD_v2(arG, zero_bytes(16384), 16384)
+    cuMemcpyHtoD_v2(arH, zero_bytes(16384), 16384)
+    println("E2E zeroed work buffers")
     // tab (layer 3)
     cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
     cs<String> = ""
