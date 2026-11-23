@@ -5695,3 +5695,19 @@ TO ACTUALLY OBSERVE FGATE, one of these is needed first:
   b. fixing the index walk itself: `native/out/gx_tabs.cache` already exists as a per-layer tab cache,
      but this driver appears to rebuild the tab rather than load the cache
 PRIORITY NOTE: (b) is worth doing for its own sake -- every full-chain run pays this cost.
+=== ROUND 106: TAB CACHE WIRED INTO glm_decode_chain -- but the driver is the wrong vehicle ===
+Added the "GXTAB1" cache load to glm_decode_chain (copied from glm_serve's proven loader) and guarded
+the 83-shard walk behind it; also added the find_from helper the file lacked. Two findings:
+  1. The cache never hit with the original signature: the stored tag embeds the checkpoint DIR, and
+     lefty built it under a different one ("CHAIN TABCACHE miss -> walking shards"). The payload holds
+     only (name, shard#, offset, nbytes, dtype) -- NO absolute paths -- so the cache is
+     dir-independent; the match is now on the "GXTAB1 " format tag alone, with the payload still
+     validated end-to-end (45 entries, exact byte consumption) before acceptance.
+  2. Even with that, the driver is still not a quick verification vehicle: its first output is
+     "CHAIN phase 1: prefill 20 tokens, 45 layers" -- a full 45-layer prefill -- and the G9PROBE
+     stream comes from inside that phase, not from the tab walk alone. Two runs at 700-1800 s never
+     reached tail_site, so NO FGATE line yet exists.
+CONCLUSION: stop trying to observe the fused gate through this driver. It is a 45-layer prefill
+harness; the verification needs a purpose-built single-expert path (or P6_FUSED_ONCE + early exit
+immediately after the first expert's FGATE print). The cache fix stays -- it is a real improvement for
+every future full-chain run -- but it is not sufficient by itself.
