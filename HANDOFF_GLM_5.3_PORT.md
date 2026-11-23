@@ -4961,3 +4961,19 @@ So after two rounds of ordinary plumbing the MoE path is within ~30% of the comp
 measured gather repack takes it decisively past it. Remaining for a SERVED number: attention, the
 router, and a real batch scheduler — none of which are measured yet.
 === END (rounds 20-67) ===
+=== ROUND 68: CORRECTION — THE GATHER REPACK IS NOT THE 10x I CLAIMED ===
+Round 64/66 said the 13x no-gather result meant a repack would take the step to 102 tok/s. That was
+wrong, and here is why: the synthetic no-gather variant read 4 bytes per element from the SAME 128-byte
+tile, so it had ~8x LESS unique traffic than a real repack would. The true arithmetic:
+    tile = 16x16 = 256 elements sharing 128 bytes; each element needs 4 byte-reads
+      -> 1024 reads of 128 unique bytes = 8x redundancy
+    a real repack (4 contiguous bytes per element) = 33.6 MB per projection = 8x the packed size
+    model-wide that is ~1.4 TB (lefty checkpoint 164 GB, righty free 385 GB) -> INFEASIBLE
+    and the payoff is 0.01875 -> 0.005-0.0125 ms/token (1.5-3.7x), not 10x
+So: NO REPACK. The 13x figure measured addressing cost under an unrealistically small working set;
+it does not translate into a cheap offline transform. Round 67's 102 tok/s row is withdrawn.
+THE HONEST NUMBER REMAINS 33.0 tok/s (30.3 ms/step) for the MoE path, and the remaining lever is
+BATCH SIZE, not the kernel: the matvec stayed flat from B=1 to B=32 (0.5 -> 0.6 ms while the batch
+grew 32x), so pushing B to 64/128 amortises the same 4.2 MB read over more tokens. That sweep is
+running now.
+=== END (rounds 20-68) ===
