@@ -3442,6 +3442,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             zz = zz + 1
                         }
                         println("FGATE expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nb2.to_string() + " max_abs=" + mx2.to_string_precise() + " of " + (nt * EINTER).to_string())
+                        println("FGATEDBG h=" + hdg32.to_string() + " lut=" + dLUT.to_string() + " su=" + dsu.to_string() + " sv=" + dsv.to_string() + " su_len=" + g_ge_1.len().to_string() + " sv_len=" + g_ge_2.len().to_string())
+                        println("FGATEDBG fused0=" + FV.get(0).to_string_precise() + " ref0=" + gv.get(0).to_string_precise() + " sub0=" + sub.get(0).to_string_precise())
                     } else {
                         println("FGATE alloc failed")
                     }
