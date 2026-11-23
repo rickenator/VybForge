@@ -343,12 +343,12 @@ deq_bf16f(faddr32<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     return outf
 }
 
-// mapdev_build — the serve's map setup, exported for drivers: allocates the
+// mapdevuild — the serve's map setup, exported for drivers: allocates the
 // 8 KB map buffer, copies the map.bin bytes, and runs exl3inv to build the
 // inverse map at mapdev + 16 + nbody. Returns the mapdev handle (0 on failure)
 // -- the caller computes invbase = mapdev + 16 + (mapd.len() - 16).
 share(all)
-mapdev_build(finvk<Int>, mapd<String>)<Int> -> {
+mapdevuild(finvk<Int>, mapd<String>)<Int> -> {
     var<Int> out = 0
     freedom {
         md<Int> = 0
@@ -3887,6 +3887,95 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     return streams2
 }
 
+
+# fdec_free — release the fused-decode buffers. Separate function because moe_tail_step has several
+# early-return paths plus the normal one, and a leak here is multi-MB per layer.
+share(all)
+fdec_free(dQd<Int>, dLUTd<Int>, dsud<Int>, dsvd<Int>, dsub64d<Int>, dxfd<Int>, dxhd<Int>,
+          dyrd<Int>, dypd<Int>, pPd<Int>)<Int> -> {
+    if (dQd != 0) { free_dev(dQd) }
+    if (dLUTd != 0) { free_dev(dLUTd) }
+    if (dsud != 0) { free_dev(dsud) }
+    if (dsvd != 0) { free_dev(dsvd) }
+    if (dsub64d != 0) { free_dev(dsub64d) }
+    if (dxfd != 0) { free_dev(dxfd) }
+    if (dxhd != 0) { free_dev(dxhd) }
+    if (dyrd != 0) { free_dev(dyrd) }
+    if (dypd != 0) { free_dev(dypd) }
+    if (pPd != 0) { free_dev(pPd) }
+    return 0
+}
+
+# fused_proj — ONE MoE projection (gate/up/down) straight from the packed EXL3 trellis, with no f32
+# weight tensor materialised. This is the decode-path twin of the fused block in tail_site: at nt=1 the
+# dequantise path costs 5.05 ms per expert-projection (deq 4.85 + gemm 0.20) against 0.55 ms here
+# (measured, p6r10 DEQ_WARM / FUSED_WARM, 20 warm reps each).
+#
+# Every device buffer is passed in PREALLOCATED: allocating per projection put cudaMalloc/cudaFree in
+# the hottest loop and cost ~140 ms per layer in the prefill path.
+#
+# The trellis MUST be uploaded into our own buffer (dQ). `arA` is the deq's arena and is re-filled by
+# every dequantise call, so reusing it silently multiplies by a DIFFERENT expert's weights (that defect
+# measured max_abs 3.84 before it was found).
+#
+#   g_trellis/g_su/g_sv : the expert's three tensors as read from the checkpoint
+#   sub                 : [nt][nin] host activations (the token rows for this expert)
+#   nin, cw, nout       : projection shape -- for gate/up nin=H, cw=EINTER, nout=EINTER;
+#                         for down nin=EINTER, cw=H, nout=H
+# Returns [nt][nout] on the host.
+share(all)
+fused_proj(fxb<Int>, fyb<Int>, fmbDet<Int>, fmbRed<Int>, fmb<Int>, flt<Int>,
+           fcast32<Int>, hdg32<Int>, mapdev<Int>, invbase<Int>,
+           dxf<Int>, dxh<Int>, dyr<Int>, dyp<Int>, dsub64<Int>, dsu<Int>, dsv<Int>, dQ<Int>,
+           dLUT<Int>, pP<Int>, g_trellis<String>, g_su<String>, g_sv<String>, sub<Vec<Float>>,
+           nt<Int>, nin<Int>, cw<Int>, nout<Int>, pb<Int>)<Vec<Float>> -> {
+    nonev<Vec<Float>> = Vec()
+    if (fxb == 0 || fyb == 0 || fmbDet == 0 || fmbRed == 0 || fmb == 0 || flt == 0) { return nonev }
+    if (nt <= 0) { return nonev }
+    # the caller allocates dsu/dsv/dQ at fixed sizes; refuse rather than overflow (an overflow here
+    # silently corrupts the projection and shows up as a huge digest delta, not as a crash)
+    if (g_su.len() > 262144 || g_sv.len() > 262144 || g_trellis.len() > 20971520) {
+        println("FDEC_FAIL operand " + g_su.len().to_string() + "/" + g_sv.len().to_string() + "/" + g_trellis.len().to_string())
+        return nonev
+    }
+    # ---- ship the operands to the device ----
+    wr_pdev(pb, 0, dLUT)
+    launch_kernel(flt, 256, pb)
+    sync()
+    cuMemcpyHtoD_v2(dsu, g_su, g_su.len())
+    cuMemcpyHtoD_v2(dsv, g_sv, g_sv.len())
+    cuMemcpyHtoD_v2(dQ, g_trellis, g_trellis.len())
+    bulk_htod(dsub64, view(sub))
+    sync()
+    # f64 activations -> f32
+    wr_pdev(pb, 0, dsub64)
+    wr_pdev(pb, 8, dxf)
+    wr_pdev(pb, 16, nt * nin)
+    launch_kernel(fcast32, (nt * nin + 255) / 256, pb)
+    sync()
+    # xhat: +0 x, +8 out, +16 H(hadamard), +24 su, +32 nin, +40 B
+    wr_pdev(pb, 0, dxf)
+    wr_pdev(pb, 8, dxh)
+    wr_pdev(pb, 16, hdg32)
+    wr_pdev(pb, 24, dsu)
+    wr_pdev(pb, 32, nin)
+    wr_pdev(pb, 40, nt)
+    launch_kernel(fxb, nt * (nin / 128), pb)
+    sync()
+    # the matvec itself (deterministic: per-split partials + fixed-order reduce)
+    mvn_run(fmbDet, fmbRed, fmb, (nin / 64) * (cw / 128) * 8, dyr, dxh, cw, dQ, mapdev, invbase, dLUT, nt, nin, pb, pP)
+    # yhat: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
+    wr_pdev(pb, 0, dyr)
+    wr_pdev(pb, 8, dyp)
+    wr_pdev(pb, 16, hdg32)
+    wr_pdev(pb, 24, cw)
+    wr_pdev(pb, 32, dsv)
+    wr_pdev(pb, 40, nt)
+    launch_kernel(fyb, nt * (cw / 128), pb)
+    sync()
+    return bulk_dtoh(dyp, nt * nout)
+}
+
 # ============================================================ phase-2 KDA step math
 # Verbatim from glm_decode_step.vyb (DEC_STEP_VYB gated): the one-token causal conv
 # step and the recurrence step that takes the carried state in. Both are R-generic;
@@ -4028,6 +4117,57 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     i<Int> = 0
     j<Int> = 0
     k<Int> = 0
+    # ---- FUSED DECODE PATH: handles and buffers ONCE per layer (P6_FUSED_DEC=1) ----
+    # Default OFF: the deq path stays authoritative until the fused one is verified here. Everything
+    # falls back together if any handle or buffer fails, so a partial setup can never run.
+    fdecS<String> = env_get("P6_FUSED_DEC") else "0"
+    fdecOn<Int> = 0
+    if (fdecS == "1") { fdecOn = 1 }
+    fxbd<Int> = 0
+    fybd<Int> = 0
+    fmbDd<Int> = 0
+    fmbRd<Int> = 0
+    fmbAd<Int> = 0
+    fltd<Int> = 0
+    dQd<Int> = 0
+    dLUTd<Int> = 0
+    dsud<Int> = 0
+    dsvd<Int> = 0
+    dsub64d<Int> = 0
+    dxfd<Int> = 0
+    dxhd<Int> = 0
+    dyrd<Int> = 0
+    dypd<Int> = 0
+    pPd<Int> = 0
+    if (fdecOn == 1) {
+        fxbd = load_fn("native/build/exl3mv.ptx", "xhatB")
+        fybd = load_fn("native/build/exl3mv.ptx", "yhatB")
+        fmbDd = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+        fmbRd = load_fn("native/build/exl3mv.ptx", "mvnodR")
+        fmbAd = load_fn("native/build/exl3mv.ptx", "mvnodB")
+        fltd = load_fn("native/build/exl3mv.ptx", "f16lut")
+        dQd = dev_alloc(20971520)
+        dLUTd = dev_alloc(262144)
+        # sized from the GATE projection in tail_site (su 8192 / sv 4096) but the up/down projections
+        # carry their own tensors of unknown size -- the first port overwrote them and produced deltas
+        # of 7900x the data range. Allocate generously and REFUSE the call if a tensor does not fit.
+        dsud = dev_alloc(262144)
+        dsvd = dev_alloc(262144)
+        dsub64d = dev_alloc(R * H * 8)
+        dxfd = dev_alloc(R * H * 4)
+        dxhd = dev_alloc(R * H * 4)
+        dyrd = dev_alloc(R * H * 4)
+        dypd = dev_alloc(R * H * 8)
+        pPd = dev_alloc(mvn_partial_bytes(R))
+        if (fxbd == 0 || fybd == 0 || fmbDd == 0 || fmbRd == 0 || fmbAd == 0 || fltd == 0 ||
+            dQd == 0 || dLUTd == 0 || dsud == 0 || dsvd == 0 || dsub64d == 0 || dxfd == 0 ||
+            dxhd == 0 || dyrd == 0 || dypd == 0 || pPd == 0) {
+            println("FDEC fail: setup incomplete, falling back to the deq path")
+            fdecOn = 0
+        } else {
+            println("FDEC on: fused decode path")
+        }
+    }
     lane<Int> = 0
     nex<Int> = 0
     nfound<Int> = 0
@@ -4232,19 +4372,28 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            dWg<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
-                                g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            dWg<Int> = 0
+            if (fdecOn == 0) {
+                dWg = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+                                 g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            }
             g_ge_5 = gx_read(ge, 5)
             g_ge_4 = gx_read(ge, 4)
             g_ge_3 = gx_read(ge, 3)
-            dWu<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
-                                g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            dWu<Int> = 0
+            if (fdecOn == 0) {
+                dWu = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+                                 g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            }
             g_ge_8 = gx_read(ge, 8)
             g_ge_7 = gx_read(ge, 7)
             g_ge_6 = gx_read(ge, 6)
-            dWd<Int> = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
-                                g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
-            if (dWg == 0 || dWu == 0 || dWd == 0) {
+            dWd<Int> = 0
+            if (fdecOn == 0) {
+                dWd = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+                                 g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+            }
+            if (fdecOn == 0 && (dWg == 0 || dWu == 0 || dWd == 0)) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
                 return nonev
             }
@@ -4260,8 +4409,24 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 }
                 j = j + 1
             }
-            gv<Vec<Float>> = mm_host(sub, nt, H, dWg, EINTER, fgemm)
-            uv<Vec<Float>> = mm_host(sub, nt, H, dWu, EINTER, fgemm)
+            gv<Vec<Float>> = Vec()
+            if (fdecOn == 1) {
+                gv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
+                                dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
+                                g_ge_0, g_ge_1, g_ge_2, sub, nt, H, EINTER, EINTER, pb32)
+                if (gv.len() == 0) { println("FDEC_FAIL gate"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
+            } else {
+                gv = mm_host(sub, nt, H, dWg, EINTER, fgemm)
+            }
+            uv<Vec<Float>> = Vec()
+            if (fdecOn == 1) {
+                uv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
+                                dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
+                                g_ge_3, g_ge_4, g_ge_5, sub, nt, H, EINTER, EINTER, pb32)
+                if (uv.len() == 0) { println("FDEC_FAIL up"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
+            } else {
+                uv = mm_host(sub, nt, H, dWu, EINTER, fgemm)
+            }
             act<Vec<Float>> = Vec()
             j = 0
             while (j < gv.len()) {
@@ -4273,7 +4438,15 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 act.push(silu(g1) * u1)
                 j = j + 1
             }
-            yv<Vec<Float>> = mm_host(act, nt, EINTER, dWd, H, fgemm)
+            yv<Vec<Float>> = Vec()
+            if (fdecOn == 1) {
+                yv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
+                                dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
+                                g_ge_6, g_ge_7, g_ge_8, act, nt, EINTER, H, H, pb32)
+                if (yv.len() == 0) { println("FDEC_FAIL down"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
+            } else {
+                yv = mm_host(act, nt, EINTER, dWd, H, fgemm)
+            }
             j = 0
             while (j < nt) {
                 tk = toks.get(j)
@@ -4340,6 +4513,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
 
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
     println("SEC moestage share=" + (time_mono_millis() - msS).to_string())
+    if (fdecOn == 1) { fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) }
     return streams2
 }
 

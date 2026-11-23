@@ -6561,3 +6561,29 @@ steps). The probe gives the PER-PROJECTION cost; the layer number is a different
 should not be multiplied together as if independent.
 NEXT: port the fused matvec into moe_tail_step (glm_engine:4009), gated by the FGATE-style per-projection
 comparison (deterministic, I/O-independent). Measure with p6r10's numbers, never the serve wall clock.
+=== ROUND 148: FUSED MATVEC PORTED INTO moe_tail_step -- EQUIVALENT AT 2-5e-07, FLAG OFF BY DEFAULT ===
+The decode path now has the fused option. Structure:
+  - fused_proj(...)  : ONE projection straight from the packed trellis (xhatB -> mvn_run -> yhatB), all
+                       device buffers passed in PREALLOCATED, trellis uploaded into our own dQ.
+  - fdec_free(...)   : releases those buffers; moe_tail_step has several exit paths and the leak would
+                       be multi-MB per layer.
+  - moe_tail_step    : loads the six kernel handles and allocates once per layer, then routes each of
+                       the three projections to fused_proj when P6_FUSED_DEC=1, skipping the deq.
+                       ANY handle/buffer failure falls back to the deq path together, so a partial
+                       setup can never run. P6_FUSED_DEC defaults to 0: the deq path is unchanged.
+VERIFIED at NLAY=6, flag on vs off:
+    18 decode-phase digest lines each; 0 FDEC_FAIL / CHAIN_FAIL
+    decode digests differ at 3 of 18 entries, delta/range 1.77e-07 (l4s0), 4.73e-07 (l5s0),
+      2.52e-07 (l5s0attn) -- i.e. 1.5x to 4x float32 epsilon. EQUIVALENT, not bit-identical.
+BUG FOUND AND FIXED ON THE WAY: the first port differed by 7900x the data range. Cause: dsu/dsv were
+sized from the GATE projection's observed tensor lengths (8192 / 4096 bytes, from FGATEDBG su_len/sv_len)
+and reused for up/down, which carry their own -- larger -- Hadamard tensors. The upload overran the
+buffer and silently corrupted the projection. Buffers are now 256 KB each with an explicit
+  if (g_su.len() > 262144 || g_sv.len() > 262144 || g_trellis.len() > 20971520) { return nonev }
+guard so an operand that does not fit REFUSES the call instead of corrupting memory. Lesson: an
+oversized memcpy shows up as a numerical error, never as a crash.
+PERFORMANCE: p6r10 measures the per-projection cost this replaces -- deq 4.85 ms + gemm 0.20 = 5.05 ms
+against fused 0.55 ms, a 9.2x on the term that dominates the decode layer. The serve path cannot confirm
+the layer-level gain (see round 146: within-run instability from page-cache pressure), so the layer
+number stays unclaimed until a probe measures the whole fused decode layer.
+NEXT: run the decode bench with the flag on and off (warm steps only), then decide the default.
