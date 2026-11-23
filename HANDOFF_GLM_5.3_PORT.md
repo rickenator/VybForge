@@ -5113,3 +5113,19 @@ VALIDATION PLAN for the next session (one of):
      the two kernels on identical values (needs both to use the TRANSP layout).
 Until one of those passes, DO NOT use bfgemm_p in any path.
 === END (rounds 20-75) ===
+=== ROUND 76: bfgemm VALIDATION BLOCKED BY A SILENT-ZEROS TRAP (worth knowing) ===
+Wrote native/host/p6r12_bfgemm.vyb: reads layers.3.self_attn.indexer.wk.weight [128,4096] BF16 (1 MB),
+converts it to f32 on device with the existing bf16deq32, computes a host reference for M=2 x N=128 over
+the full K=4096, then runs bfgemm_p (TRANSP=1, KSP=1) and compares.
+RESULT: BFG_GATE count_over_1e-4=0 max_abs=0 -- but the tensor came back ALL ZEROS (w[0][0]=0), so the
+comparison was 0 vs 0: an INVALID validation, not a passing one.
+ROOT CAUSE FOUND: the on-disk tensor is fine. A direct byte read of shard model-00005-of-00083 shows
+524,287 of 524,288 u16 words non-zero, first words [15680,-16976,15808,...]. So gx_read returned zeros
+because MY RESOLVE FAILED and I never checked `found`. That is a silent-zeros trap in the probe style:
+gx_resolve_tab / gx_read return a correctly-SIZED, all-zero buffer when the name is not in the tab,
+which looks exactly like a real tensor of zeros. ANY future probe MUST assert found == 1 before using
+the data, and should sanity-check one element against the raw file.
+NEXT STEP (small): assert found, and if the tab lacks the attention entry, add it (the 45-layer chain
+does resolve self_attn.q_b_proj.weight, so the tab format supports it -- it is likely my layer-3 table
+entry list that is short). Then the bfgemm validation runs for real.
+=== END (rounds 20-76) ===

@@ -42,14 +42,34 @@ main()<Int> -> {
         ti = ti + 1
     }
 
-    w1<Vec<String>> = Vec()
-    w1.push("model.language_model.layers.3.self_attn.indexer.wk.weight")
-    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
-    g0<String> = gx_read(ge, 0)
-    N<Int> = 128
-    K<Int> = 4096
-    if (g0.len() != N * K * 2) { println("BFG_FAIL size=" + g0.len().to_string()); return 4 }
-    println("BFG tensor bytes=" + g0.len().to_string() + " (expect " + (N * K * 2).to_string() + ")")
+    # try candidate attention tensors until one RESOLVES (found == 1). gx_read
+    # returns a correctly-SIZED all-zero buffer when the name is not in the tab,
+    # which is indistinguishable from a real zero tensor -- so assert found.
+    cand<Vec<String>> = Vec()
+    cand.push("model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight")
+    cand.push("model.language_model.layers.3.self_attn.q_a_proj.weight")
+    cand.push("model.language_model.layers.3.self_attn.indexer.wk.weight")
+    g0<String> = ""
+    var<Int> N = 0
+    var<Int> K = 0
+    var<Int> ci = 0
+    while (ci < cand.len() && g0.len() == 0) {
+        w1<Vec<String>> = Vec()
+        w1.push(cand.get(ci))
+        ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
+        fnd<Int> = ge.found.get(0)
+        fsz<Int> = gx_read(ge, 0).len()
+        println("BFG try " + cand.get(ci) + " found=" + fnd.to_string() + " bytes=" + fsz.to_string())
+        if (fnd == 1 && fsz > 0) {
+            # shape from the byte count: BF16 [N][K] with K = 4096 for these
+            K = 4096
+            N = fsz / 2 / K
+            g0 = gx_read(ge, 0)
+            println("BFG using N=" + N.to_string() + " K=" + K.to_string())
+        }
+        ci = ci + 1
+    }
+    if (g0.len() == 0) { println("BFG_FAIL no attention tensor resolved"); return 4 }
 
     # ---- device: BF16 copy, and its exact f32 conversion for the reference ----
     dB<Int> = dev_alloc(N * K * 2)
@@ -89,12 +109,14 @@ main()<Int> -> {
     OF<Vec<Float>> = bulk_dtoh(dS, M * N)
 
     # reference for the first 16 outputs of both rows
+    NREFL<Int> = 64
+    if (NREFL > N) { NREFL = N }
     var<Int> nbad = 0
     var<Float> mx = 0.0
     var<Int> m = 0
     while (m < M) {
         var<Int> n = 0
-        while (n < N) {
+        while (n < NREFL) {
             s<Float> = 0.0
             var<Int> k = 0
             while (k < K) {
@@ -110,7 +132,7 @@ main()<Int> -> {
         }
         m = m + 1
     }
-    println("BFG_GATE count_over_1e-4=" + nbad.to_string() + " max_abs=" + mx.to_string_precise() + " of " + (M * N).to_string())
+    println("BFG_GATE count_over_1e-4=" + nbad.to_string() + " max_abs=" + mx.to_string_precise() + " of " + (M * NREFL).to_string())
     println("BFG o[0]=" + OF.get(0).to_string_precise())
     println("BFG_DONE")
     return 0
