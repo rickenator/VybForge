@@ -5075,3 +5075,22 @@ FINAL ANSWER TO THE COMPETITIVE BAR, with every term measured on this device:
 STILL NOT COUNTED: the router (2.4 MB BF16/layer), the indexer/rope/softmax work, and the scheduler.
 Those are ordinary per-layer pieces; they will cost something, but the margin is ~1.8x.
 === END (rounds 20-73) ===
+=== ROUND 74: WHAT A REAL BATCHED SERVE PATH ACTUALLY NEEDS (scope, not a start) ===
+Asked to turn the 88 tok/s projection into a served endpoint. Surveyed the engine first, and the
+honest answer is that this is a multi-day build, not a next step. The gap, concretely:
+ 1. NO BATCHED BF16 GEMM PRIMITIVE. Attention is BF16 (o_proj 134 MB, q_b 50 MB, kv_b 34 MB ...) and
+    the engine multiplies it with gemm32 (f32, SIMT). A batched B-token attention path needs a bf16
+    GEMM (or a tensor-core one, which Vyb has no intrinsics for yet). Nothing exists to reuse.
+ 2. ATTENTION IS SINGLE-TOKEN in glm_serve.vyb: the MLA structure (q_a -> norm -> q_b, kv_a ->
+    kv_b, the DeepSeek-style indexer) is written per token, with rope/softmax interleaved. Batching it
+    means restructuring the hot loop of an ~8,000-line file AND adding a KV cache keyed by batch slot.
+ 3. NO SCHEDULER. glm_serve.vyb takes one request at a time; continuous batching needs a queue, a
+    batch builder, per-slot KV bookkeeping and a token streamer.
+EFFORT, honestly: 1 is ~a day (kernel + validation vs gemm32), 2 is the big one (~2-3 days plus a
+re-validation of the whole 45-layer chain against the existing digests), 3 is ~a day on top of 2.
+WHAT DOES NOT NEED REDOING: the MoE path. The fused batched matvec, the batched Hadamard passes and
+the measured 1,404 ms/step serve loop are done, exact, and cold-cache verified.
+RECOMMENDATION: do 1 (the bf16 GEMM) as the next self-contained step — it is small, it is the missing
+primitive, and it can be validated in isolation the same way mvnod4 was. Then attack 2 with the
+45-layer digest gate as the safety net.
+=== END (rounds 20-74) ===
