@@ -5788,3 +5788,19 @@ RECOMMENDATION: stop treating in-engine FGATE as the gate. Either (a) port the d
 path -- which is the same work as making the driver call the engine's tail_site, i.e. the real
 consolidation -- or (b) accept p6r10's proof and flip the flag behind a gold-digest check, which would
 catch any error the moment it appears. Both are larger than a verification step; neither is a paste.
+=== ROUND 111: THE ENGINE IS HEALTHY; THE FLAG IS UNREACHABLE; glm_serve's rc=700 IS PRE-EXISTING ===
+1. The extern swap is PROVEN HARMLESS: p6r14_tiny (which imports glm_engine and therefore exercises the
+   imported cuMemAlloc_v2 / cuMemcpyHtoD_v2 / cuModuleLoadData / cuModuleGetFunction path) still passes
+   on lefty -- "T all8: 36 72 0 0 0 0", "T o[0]=36 o[1]=72". Allocations, uploads and launches all work.
+   So rc=700 in glm_serve is specific to that driver's mtp stage, not to the FFI consolidation.
+2. BLOCKING FACT for the next decision: glm_engine.tail_site still has NO working caller. glm_serve is
+   the only driver that calls it and it dies at DEQFAIL (rc=700) BEFORE any layer. Therefore FLIPPING
+   P6_FUSED_GATE TO USE THE FUSED RESULT IS A NO-OP TODAY -- nothing would execute it, and the gold
+   digest could not be checked. Round 110's recommendation (flip and gate on the digest) is not
+   executable until a driver reaches tail_site.
+3. rc=700 = CUDA_ERROR_ILLEGAL_ADDRESS at a 16 MB cuMemAlloc_v2 inside deq_bf16, i.e. the context is
+   already faulted by something EARLIER in glm_serve's mtp stage. Not resource pressure (no leftover vyb
+   processes; nvidia-smi reports N/A on GB10 unified memory).
+SO THE DEPENDENCY CHAIN IS: fix glm_serve's mtp-stage fault -> tail_site becomes reachable -> FGATE
+prints -> flip the flag -> gold digest confirms. Everything downstream is already correct and committed.
+THE ONE REMAINING BLOCKER IS A RUNTIME FAULT IN AN UNEXERCISED glm_serve PATH.
