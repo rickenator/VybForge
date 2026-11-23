@@ -6461,3 +6461,23 @@ which compressed the ratio):
 LAYER TRAJECTORY THIS SESSION: 1668 ms -> ~850 ms (1.96x), with bit-identical output at 45 layers and
 0 comparison failures at every step. Remaining budget: ~306 ms around the matvec, deq ~180 ms (near the
 disk limit for 12.6 MB/expert), shared ~40 ms, resolve ~20 ms, router ~9 ms.
+=== ROUND 143: FULL SWEEP AFTER ALL FOUR CHANGES -- PASS, AND THE BASELINE STILL BIT-IDENTICAL ===
+scripts/regression_sweep.sh, NLAY=45, after: 512-slot deterministic matvec, load_fn hoisting,
+preallocated partials, and the mm/setup instrumentation:
+    pass 1  fast path vs exact baseline : 45/45 BIT-IDENTICAL -> all the optimisation work was
+                                          numerically neutral against a baseline recorded BEFORE it
+    pass 2  verification mode           : 9810 comparisons, 0 failures
+                                          (gate 3.34e-06 / up 1.31e-06 / down 8.34e-07 at expert 0)
+    pass 3  logit gate vs deq logits    : 20/20 argmax, max delta-top1 1.341e-05, margin 0.1607,
+                                          SAFETY FACTOR 11,985x
+    VERDICT: SWEEP PASS
+That pass 1 is bit-identical is the strongest statement available here: the layer got 1.96x faster
+(1668 -> ~850 ms) and the digests did not move at all.
+SESSION SUMMARY (decode layer, per layer, production mode):
+    start of session 1668 ms -> now ~850 ms
+    current budget: matvec 160 (36% of the mm span), yhatB+readback ~210 (47%), setup ~93 (21%),
+                    deq ~180, shared ~40, resolve ~20, router ~9
+    THE LARGEST REMAINING ITEM IS yhatB + ITS READBACK (~210 ms/layer, 25% of the layer) -- 70 ms per
+    projection for a small kernel plus an 8 KB device->host copy. That is an ENGINE SEQUENCING problem
+    (synchronisation granularity), not a kernel one, and it is where the next win is.
+    deq (~180 ms) is already near the disk limit for 12.6 MB/expert: little headroom there.
