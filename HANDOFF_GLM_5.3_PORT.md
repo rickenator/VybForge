@@ -5941,3 +5941,28 @@ TO ENABLE: P6_FUSED_GATE=1 in the serving environment. Default is off, so nothin
 REMAINING WORK (not blockers): measure end-to-end tok/s with the flag on (expect the composed number to
 move from ~34.7 toward the 60s); decide whether to make the flag the default after a full 45-layer gold
 digest comparison; and root-cause the MTP rc=700 that VYBFORGE_SKIP_MTP currently skips.
+=== ROUND 119: THE WIN CANNOT BE MEASURED IN THE VERIFICATION BUILD -- BY CONSTRUCTION ===
+Measured SEC P1ffn (the MoE section) for an identical 4-layer / 20-token prefill:
+    FG=0 (deq path)                 : 28, 28, 928, 2924
+    FG=1 (fused, no synth pass)     : 28, 27, 926, 5956
+FG=1 is ~2x SLOWER, and the reason is structural, not a regression: with the flag on, the block still
+computes BOTH paths for every projection --
+    gv = mm_host32(sub, nt, H, dWg, ...)   AND then  gv = FV      (the fused chain)
+    uv = mm_host32(...)                    AND then  uv = FU2
+    yv = mm_host32(...)                    AND then  yv = FD
+so the verification run does deq + gemm + fused everywhere. That is exactly what a verification build
+should do (it is how the equality was proven), but it makes its timing meaningless as a measure of the
+fused path's cost.
+To get a real number the deq must be SKIPPED, not merely compared against:
+    - in fused-only mode, do NOT call exl3_deq32f for gate/up/down (it is ~4 ms per expert-projection,
+      the single biggest MoE cost) and do NOT call mm_host32; compute only the fused chain and feed
+      that straight to the activation.
+    - that is the ~8 ms -> ~1 ms per projection change this whole line of work was for.
+    - it is a small structural edit (guard the three dW* deqs and the three mm_host32 calls behind the
+      same flag) but it changes control flow in the hottest part of the layer, so it deserves a careful
+      pass rather than the tail of a very long session.
+Also done: FGATESYN (the synthetic discriminator) is now opt-in via P6_FUSED_SYN=1 -- it answered its
+question in round 114 and otherwise just doubles the work again.
+STATUS: correctness is established for all three projections; the PERFORMANCE claim for them is
+established only from the older standalone probes (0.600 ms vs 13 ms at nt=1; 1 ms vs 8 ms at nt=4).
+The in-engine end-to-end number still needs the fused-only mode.
