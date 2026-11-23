@@ -6225,3 +6225,53 @@ between 10.6x and 1x.
 STILL TO DO IF PURSUED: (a) verify coverage empirically, (b) pre-allocate the 32 MB partial buffer once
 instead of per call, (c) re-run the FGATE gate and the 45-layer determinism check, (d) decide whether
 the fast path should be deterministic at all given the default already is.
+=== ROUND 132: DETERMINISTIC FUSED MATVEC LANDED -- CORRECT, BIT-IDENTICAL, 1.08x ===
+THE MEMORY BLOCKER FROM ROUND 131 WAS A MISCOUNT, NOT A DESIGN FLAW. launch_kernel() launches
+256-THREAD blocks (launch_kernel -> cuda_launch4i(..., 256, ...)), so the "8 CTAs" of a 2048-thread
+group are 8 PHYSICAL blocks. rb64 therefore ranges over nin/64 (64 for the gate shape), not 512, and
+the true k-split is (nin/64)*8 = 512 contributions per output -- exactly the "shared-memory reduction"
+target I had specified as a separate kernel change. It was already achieved by the rb64*8+cta indexing.
+Measured in p6r10 with the corrected slot count:
+    partial buffer 4 MB (not 32)   coverage with-vs-without-zero: 0 diffs of 2048 (NaN pre-fill)
+    atomic_ms 0.65   det_ms 0.70   reduce below timer resolution   ratio 1.08x
+So determinism costs ~8%, not 1.29x/1.64x, and needs no new kernel and no shared-memory work.
+LANDED:
+  - mvn_det_run now sizes NS = (nin/64)*8 and allocates NS*B*cw*4 (~4 MB/token for every shape here:
+    gate/up 512 slots x cw 2048, down 256 slots x cw 4096).
+  - zfill removed from the det path -- coverage is provably complete.
+  - mvn_run(fdet, fred, fatomic, grid, ...) dispatches det when the PTX provides the pair and falls
+    back to the atomic kernel otherwise, so a stale PTX degrades to correct-but-nondeterministic
+    instead of silently producing zeros.
+  - wired into all four sites (gate, synthetic, up, down); the atomic zero-T loops are gone.
+VERIFIED (lefty, clean GPU):
+  CORRECTNESS  339 comparisons, 0 failures, max_abs 3.34e-06 / 1.31e-06 / 8.34e-07  (tol 1e-5)
+  DETERMINISM  fused-only run twice: 4/4 digests BIT-IDENTICAL
+So the fast path is now BOTH ~9.8x over deq and gate-able by exact baseline. P6_FUSED_ONLY stays opt-in
+(verification is still worth defaulting to), but a fused-only baseline is now meaningful.
+NEXT: record the 45-layer fused-only baseline and confirm it reproduces, then decide whether
+FUSED_ONLY should become the production default.
+=== ROUND 133: 45-LAYER DETERMINISM PASS -- and the honest cross-configuration number ===
+DETERMINISM AT FULL DEPTH: two fresh processes, P6_FUSED_ONLY=1, NLAY=45:
+    RUN A digests 45 / RUN B digests 45 -> 45/45 BIT-IDENTICAL. PASS.
+Baseline recorded: native/baselines/digest_fused_only45.txt (45 digests, in-repo and on lefty).
+CROSS-CONFIGURATION (verification-mode baseline vs fused-only baseline, both deterministic):
+    layers byte-identical: 3/45 (the dense layers 0-2, as always)
+    median normalised delta: 1.08e-05      worst: 3.72e-05 at layer 19 (field `max`)
+    TREND IS FLAT: 5.6e-06 at layer 3 -> 3.7e-05 at layer 19 -> 6.6e-06 at layer 43. It does NOT
+    compound with depth, which is the signature of bounded accumulation-order noise, not drift.
+    Worst is ~312x float32 eps of the DATA RANGE.
+THE LAYER-22 "1.08e-02 OUTLIER" FROM ROUND 128 IS EXPLAINED AND BENIGN. It is the `sum` field only:
+    sum 1.57e-02  BUT abs 7.2e-08, sq 2.3e-07, max 1.9e-09, and every element v0..v7 <= 2.4e-06.
+    `sum` accumulates 327680 terms of magnitude ~2e11 that cancel to 4.7e10 -- six orders below the
+    stream -- so a 1e-7 per-element change moves it by a full percent. It was never evidence of drift,
+    and the earlier "layer 22 outlier not explained by the atomic argument" note is withdrawn.
+TOOLING FIXED (scripts/analyse_digests.py):
+    - takes the two digest paths as argv instead of hardcoding /tmp/d_deq.txt and /tmp/d_fused.txt
+      (a stale /tmp copy silently analysed the wrong runs and printed "missing digests");
+    - computes a NORMALISED delta: per-element fields against the stream mean |value| (abs/n),
+      aggregates against their own magnitude -- and EXCLUDES `sum` from the verdict entirely, since
+      its magnitude is meaningless by construction. The old raw relative delta reported 1e-2 for a
+      1e-7 change and produced a false DRIFT verdict.
+STATUS: the fast path is now correct (339/339 <= 3.3e-06), deterministic at 45/45, and gate-able by
+exact baseline. It remains OPT-IN. Flipping it to the production default needs the logit/argmax gate
+(the real decision boundary) re-measured on the det path -- the per-layer digest cannot answer it.
