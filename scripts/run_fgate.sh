@@ -51,6 +51,8 @@ fi
 
 echo "--- SEC (MoE section timers):"
 grep -E "SEC P1ffn|SEC P1tail|SEC P1attn" "$LOG" | head -12
+echo "--- LOGITS lines:"
+grep -E "^LOGITS" "$LOG" | head -8
 echo "--- FGATE lines:"
 grep FGATE "$LOG" | head -20
 echo "--- failures:"

@@ -733,6 +733,51 @@ main()<Int> -> {
                         n = n + 1
                     }
 
+                    # ---- P6_LOGITS=1: final head on the MAIN path (no MTP involvement) ----
+                    # Compares the two configurations at the decision boundary rather than at
+                    # intermediate digests: per-token argmax, top-1/top-2 margin, and an aggregate
+                    # checksum over the whole 288-way logit vector. This is what decides whether a
+                    # ~2e-05 hidden-state drift can flip a token.
+                    lgOn<String> = env_get("P6_LOGITS") else "0"
+                    if (lgOn == "1") {
+                        wlg<Vec<String>> = Vec()
+                        wlg.push(lpre45 + "shared_head.norm.weight")
+                        wlg.push("lm_head.weight")
+                        # the head tensors live in layer 45's tab, not the last layer tab that is in `tab` here
+glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
+                        if (glg.found.get(0) == 1 && glg.found.get(1) == 1) {
+                            g = gx_read(glg, 0)
+                            d_ln<Int> = deq_bf16(fbf, g, sv_H, 0)
+                            g = gx_read(glg, 1)
+                            d_lm<Int> = deq_bf16(fbf, g, sv_NE * sv_H, sv_H)
+                            if (d_ln != 0 && d_lm != 0) {
+                                pln<Vec<Float>> = bulk_dtoh(d_ln, sv_H)
+                                h2m<Vec<Float>> = rms_rows(borrow(streams), sv_R, sv_H, pln)
+                                lgs<Vec<Float>> = mm_host(h2m, sv_R, sv_H, d_lm, sv_NE, fgemm)
+                                var<Int> tt2 = 0
+                                while (tt2 < sv_R) {
+                                    var<Int> bi = 0
+                                    var<Float> bv = -1e30
+                                    var<Float> b2 = -1e30
+                                    var<Int> j2 = 0
+                                    while (j2 < sv_NE) {
+                                        vv<Float> = lgs.get(tt2 * sv_NE + j2)
+                                        if (vv > bv) { b2 = bv ; bv = vv ; bi = j2 }
+                                        else { if (vv > b2) { b2 = vv } }
+                                        j2 = j2 + 1
+                                    }
+                                    println("LOGITS tok=" + tt2.to_string() + " argmax=" + bi.to_string() +
+                                            " top1=" + bv.to_string_precise() + " top2=" + b2.to_string_precise() +
+                                            " margin=" + (bv - b2).to_string_precise())
+                                    tt2 = tt2 + 1
+                                }
+                                println("LOGITS_SUM " + digest("logits", lgs))
+                                cuMemFree_v2(d_lm)
+                                cuMemFree_v2(d_ln)
+                            }
+                        } else { println("LOGITS_FAIL resolve") }
+                    }
+
                     # ================================================================ phase 1b: MTP head
                     # prime layer 45's own cache over the prompt: for each prefill token, the trunk
                     # state is the mean over its 4 layer-44 streams -> trunk final norm -> hnorm, and

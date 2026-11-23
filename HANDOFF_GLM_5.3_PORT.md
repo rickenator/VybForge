@@ -6044,3 +6044,26 @@ construction.
 THE 45-LAYER RUN IS NOW IN FLIGHT (same script, NL=45) to answer the remaining question: does the ~1e-7
 per-layer difference COMPOUND across 45 layers (drift), or stay bounded? That is what decides whether
 the flag can ever be defaulted.
+=== ROUND 124: *** GOAL RESULT: FAIL — the fused MoE is NOT digest-identical, and it drifts *** ===
+Command: NL=45 bash scripts/digest_ab.sh on lefty (two fresh glm_serve processes, deq vs
+P6_FUSED_GATE=1+P6_FUSED_ONLY=1, each with its own VYBFORGE_CHAIN_OUT, then diffed). Both sides produced
+the full 45 layer digests (45 vs 45), so the comparison is complete:
+    layers byte-identical : 3 / 45        (layers 0,1,2 -- the dense ones, before any MoE)
+    first differing layer : 3             (the first MoE layer; the fused path activates exactly there)
+    typical relative delta: 1e-06 .. 5e-06
+    outliers              : layer 5  1.02e-04 (v6, a near-cancelling component)
+                            layer 22 3.45e-03 (sum, the most cancellation-prone aggregate)
+    worst overall         : 3.45e-03 at layer 22
+    float32 epsilon       : 1.19e-07
+VERDICT: FAIL. The fused MoE is numerically close but NOT bit-identical, and the difference COMPOUNDS
+across the 45-layer chain: ~5e-07 at layer 3 to ~1e-05..2e-05 by layers 40-44, with cancellation-prone
+aggregates reaching 1e-04..3e-03. Nothing indicates a bug -- the per-projection error was measured at
+6e-07..2.6e-06 (rounds 115-118) and a different accumulation order propagating through 45 layers explains
+exactly this shape.
+WHAT THIS MEANS FOR THE FLAG: P6_FUSED_GATE must NOT become the default under the project's existing
+bit-identical digest gate. The fused path buys 10.6x on the MoE (round 122) at the cost of bit-identity.
+That is a POLICY decision for Rick, not something to decide here: either (a) the gate relaxes to a
+tolerance for the MoE path, or (b) the fused kernels must reproduce the deq path's exact summation order
+and f32 rounding, which is a much harder problem than the speedup was.
+NO DEFAULT WAS CHANGED. P6_FUSED_GATE remains opt-in and off by default.
+=== END ===
