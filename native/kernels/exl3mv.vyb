@@ -227,7 +227,7 @@ exl3refy(p<Int>) -> {
         acc<Float32> = 0.0
         m<Int> = 0
         while (m < 128) {
-            acc = acc + ld_f32n(H + (a * 128 + m) * 4) * ld_f32n(U + (base + m) * 4)
+            acc = acc + ld_f32n(H + (m * 128 + a) * 4) * ld_f32n(U + (base + m) * 4)
             m = m + 1
         }
         st_f32(Y + gid * 4, acc)

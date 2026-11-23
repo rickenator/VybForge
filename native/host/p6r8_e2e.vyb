@@ -181,6 +181,23 @@ main()<Int> -> {
         i = i + 1
     }
     println("E2E first_mismatch_index=" + firstbad.to_string())
+    // per-128-block error counts: structural pattern or scattered?
+    var<Int> blk = 0
+    line<String> = "E2E blocks:"
+    while (blk < 16) {
+        cnt<Int> = 0
+        i = blk * 128
+        while (i < blk * 128 + 128) {
+            d3<Float> = ynew.get(i) - bref.get(i)
+            ad3<Float> = d3
+            if (ad3 < 0.0) { ad3 = 0.0 - ad3 }
+            if (ad3 > 1e-4) { cnt = cnt + 1 }
+            i = i + 1
+        }
+        line = line + " " + cnt.to_string()
+        blk = blk + 1
+    }
+    println(line)
     if (nd == 0) { println("E2E_DONE FUSED_OK") } else { println("E2E_DONE FUSED_FAIL") }
     return 0
 }

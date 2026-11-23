@@ -4398,3 +4398,19 @@ yhat's block walk is wrong. One run either way.
 STATE: fused kernel is 90% right (first two output blocks are exact); the driver is now lean and
 trustworthy (p6r8_e2e); everything is committed. Two-node stack and all green deliverables
 untouched.
+=== ROUND 33: DUMP BRANCH REMOVED — NONDETERMINISM PERSISTS; atomics are real ===
+Removed the mv kernel's dump branch entirely (the oracle kernel already produces T). Two identical
+runs on the same binary, same inputs:
+    run 1: first_mismatch 224  max_abs 0.0575
+    run 2: first_mismatch 384  max_abs 0.0478   (y1 agrees only to 8 digits)
+So the dump was NOT the race. The PTX confirms the accumulation is a real atom.global.add.f32.
+With correct atomics the sum order can only move the last bits (~1e-7), not 0.05 on 0.02-magnitude
+values, so there is a SECOND, still-unexplained source of run-to-run variation inside exl3mv1s4's
+phase 2 (candidates: a shared-slab visibility issue around kernel_barrier in this specific kernel
+shape, or an occupancy/resource quirk of the 8192-CTA launch with 8 KB shared).
+WHAT IS TRUSTWORTHY NOW: p6r8_e2e (lean driver), the algebra (su before H, sv after yhat), the
+layout, the decode equality, the vector pass. The fused kernel agrees to 1e-9 on the first block
+and diverges nondeterministically beyond it.
+SUGGESTED NEXT (fresh session, GPU debugging): run the SAME minimal driver under compute-sanitizer
+(racecheck + memcheck) — the tools will name the race directly instead of us inferring it from
+mismatch indices.
