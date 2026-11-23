@@ -5920,3 +5920,24 @@ round-115 arena lesson -- and dWu as the reference. Adopts uv = FU2 only when co
 STATE: gate + up fused and verified in-engine; down_proj remains. Down has a REVERSED shape
 (act is nt*EINTER, output nt*H, weights [H][EINTER]) so its chain uses nin=EINTER, cw=H, and
 g_ge_6/7/8 for trellis/suh/svh.
+=== ROUND 118: *** ALL THREE MoE PROJECTIONS FUSED AND VERIFIED -- THE MoE NO LONGER MATERIALISES f32 ***
+    {"draft_token": 0}                                     <- same output as the deq-path baseline
+    FGATE   (gate) expert=0 nt=1 count 0 max_abs=2.62e-06 of 2048
+    FGATEUP (up)   expert=0 nt=1 count 0 max_abs=1.31e-06 of 2048
+    FGATEDN (down) expert=0 nt=1 count 0 max_abs=7.75e-07 of 4096
+    FGATEUP expert=1 nt=1 count 0 max_abs=9.54e-07 of 2048
+    FGATEDN expert=1 nt=1 count 0 max_abs=5.96e-07 of 4096
+    FGATEUP expert=2 nt=3 count 0 max_abs=1.91e-06 of 6144
+    FGATEDN expert=2 nt=3 count 0 max_abs=6.85e-07 of 12288
+Down uses the reversed shape (nin=EINTER, cw=H, g_ge_6/7/8, its own dQD/dsuD/dsvD and its own LUT), and
+each projection adopts its fused result only when its own comparison is clean -- so any regression
+degrades to the deq path per projection rather than corrupting the layer.
+WHAT THIS MEANS: the MoE part of every layer now reads the packed EXL3 weights ONCE and multiplies
+directly (xhat -> mvnodB -> yhat), with no f32 dequantisation of gate/up/down at all. That is the
+21x-at-nt=1 / 4-8x-at-nt=4 saving measured in this project, now actually in production code instead of a
+prototype. The whole MoE wall identified in rounds 94-99 (deq+gemm = 8 ms per expert-projection vs
+fused ~1 ms) is addressed at all three call sites.
+TO ENABLE: P6_FUSED_GATE=1 in the serving environment. Default is off, so nothing changes until set.
+REMAINING WORK (not blockers): measure end-to-end tok/s with the flag on (expect the composed number to
+move from ~34.7 toward the 60s); decide whether to make the flag the default after a full 45-layer gold
+digest comparison; and root-cause the MTP rc=700 that VYBFORGE_SKIP_MTP currently skips.

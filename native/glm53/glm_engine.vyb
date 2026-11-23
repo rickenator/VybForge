@@ -3455,8 +3455,11 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         println("FGATEDBG fused0=" + FV.get(0).to_string_precise() + " ref0=" + gv.get(0).to_string_precise() + " sub0=" + sub.get(0).to_string_precise())
 
                         # ---- DISCRIMINATOR: same chain, SYNTHETIC input (p6r10's pattern).
-                        # passes -> the problem is specific to `sub`; fails -> the engine's call
-                        # site differs from p6r10's.
+                        # It answered its question (round 114) and costs a whole extra fused pass
+                        # plus an mm_host32, which distorts any timing measured with the flag on.
+                        # Now opt-in: P6_FUSED_SYN=1.
+                        synFlag<String> = env_get("P6_FUSED_SYN") else "0"
+                        if (synFlag == "1") {
                         xs<Vec<Float>> = Vec()
                         var<Int> si = 0
                         while (si < nt * H) {
@@ -3511,6 +3514,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             zz2 = zz2 + 1
                         }
                         println("FGATESYN expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nbs.to_string() + " max_abs=" + mxs.to_string_precise() + " fused0=" + FS.get(0).to_string_precise() + " ref0=" + RS.get(0).to_string_precise())
+                        }
 
                         # ================= UP PROJECTION (same chain, up's own tensors) =================
                         # g_ge_3/4/5 are up's trellis/suh/svh; dWu is up's dequantised weights.
