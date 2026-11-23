@@ -5876,3 +5876,19 @@ RECOMMENDED: print arA/mapdev/invbase and a few dWg values, and check whether ar
 g_ge_0 at the point the fused chain runs. If the arena is per-projection, capture the gate's arena
 handles BEFORE the up/down deqs (or run the verification immediately after dWg is computed).
 === END ===
+=== ROUND 115: *** FGATE PASSES IN-ENGINE *** -- the culprit was the shared deq arena ===
+    FGATE    expert=0 nt=1 count_over_1e-4=0 max_abs=1.9073486328125e-06 of 2048
+             fused0=0.24333177506923676  ref0=0.24333183467388153
+    FGATESYN expert=0 nt=1 count_over_1e-4=0 max_abs=7.7486038208007812e-07
+    FGATE    expert=1 nt=1 count_over_1e-4=0 max_abs=1.2516975402832031e-06 of 2048
+ROOT CAUSE: `arA` is the deq's ARENA, not a per-projection buffer. tail_site dequantises gate, then up,
+then down, and each deq re-points/re-fills the arena -- so by the time the verification block ran (after
+up and down), arA held the DOWN trellis. The fused pass was multiplying gate activations by down weights;
+the deq path was unaffected because it re-uploads for each projection. Fix: upload the gate's trellis
+(g_ge_0) into our OWN device buffer dQ and pass that as mvnodB's q, exactly as su/sv are already
+uploaded from g_ge_1/g_ge_2. That single change took max_abs from 3.84 to 1.9e-06.
+LESSON (worth generalising): in tail_site, ANY handle borrowed from the deq's argument list must be
+treated as per-call scratch. su, sv and the trellis all had to be uploaded separately; only hdg32 (the
+hoisted Hadamard), LUT, mapdev and invbase are genuinely stable across projections.
+STATE: the fused gate is now verified against the production path INSIDE the engine, on real compacted
+activations and on a synthetic input. Step 2 (flip the flag to USE FV, then gold digest) is unblocked.
