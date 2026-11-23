@@ -5770,3 +5770,21 @@ rc=700 is a runtime context/allocation failure in the mtp stage, BEFORE any laye
 still unobserved. The extern swap is not implicated: the binding's declarations are signature-identical
 to the engine's originals. This is the next thing to chase, and it is now the ONLY thing between the
 flag and a printed verification.
+=== ROUND 110: THE "PASTE THE BLOCK" OPTION IS NOT A PASTE — the driver's copy is older ===
+Checked glm_decode_chain's local moe_tail_step (line 3014) before porting the FGATE block into it. It is
+the PREVIOUS GENERATION of the MoE tail:
+    signature: (streams1, lpre, tab, dir, total, mapbody, gt<GxLoc>, fgemm, fbf, fdeq,
+                fhgen, fhad1, fhad2, hdg)     -- 14 params
+    uses exl3_deq + fgemm (the f64 path, :3233/:3238/:3243), NOT exl3_deq32f + mm_host32
+The engine's tail_site is the f32 generation (28 params). So the FGATE block cannot simply be pasted:
+it needs the f32 kernel handles (fdeq32/fdqs/fdqs4/fhad132/fhad232/fcvt32/hdg32/fcast32/fgp/fgr/pb32)
+threaded into the driver's function first, i.e. a port to a different kernel set.
+Also checked rc=700 on glm_serve: nvidia-smi reports N/A on GB10 (unified memory) and there are no
+leftover vyb processes, so it is not resource contention -- it is a context error in an unexercised path.
+WHERE THIS LEAVES THE VERIFICATION: both vehicles are blocked, for different and now-precisely-known
+reasons (glm_serve: rc=700 in the mtp stage; glm_decode_chain: pre-f32-generation tail). The fused-gate
+block itself is correct, compiles, and is default-off. Its numerical equality is proven by p6r10 NT4.
+RECOMMENDATION: stop treating in-engine FGATE as the gate. Either (a) port the driver's tail to the f32
+path -- which is the same work as making the driver call the engine's tail_site, i.e. the real
+consolidation -- or (b) accept p6r10's proof and flip the flag behind a gold-digest check, which would
+catch any error the moment it appears. Both are larger than a verification step; neither is a paste.
