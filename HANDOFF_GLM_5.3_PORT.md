@@ -6481,3 +6481,22 @@ SESSION SUMMARY (decode layer, per layer, production mode):
     projection for a small kernel plus an 8 KB device->host copy. That is an ENGINE SEQUENCING problem
     (synchronisation granularity), not a kernel one, and it is where the next win is.
     deq (~180 ms) is already near the disk limit for 12.6 MB/expert: little headroom there.
+=== ROUND 144: TWO CORRECTIONS -- WINDOW DOUBLE-COUNT, AND A NOISE FLOOR THAT INVALIDATES MICRO-A/Bs ===
+1) THE ROUND-143 ATTRIBUTION WAS DOUBLE-COUNTED. The "yh+rb" window opened before xhatB and closed
+   after the readback, so it CONTAINED the matvec already timed separately -- that is where "yhatB +
+   readback = 47% of mm" came from. WITHDRAWN. Disjoint windows now give, per layer (production):
+       mm total ~432-505   matvec (mmG+mmU+mmD) 162-243   setup 23-28   xhatB 2-4   yhatB+rb 8-17
+   (gate projection only; the up/down setup+readback are not instrumented, ~120-130 ms unexplained)
+   So the matvec IS still the largest single item (~37%), not yhatB.
+2) MEASUREMENT NOISE IS +-17% AT THIS GRANULARITY. The identical binary, two consecutive runs:
+       run1 mm=505 (mmG=89)      run2 mm=432 (mmG=57)
+   That means my "one sync instead of two is worse" conclusion was NOT supported -- 510-520 vs 456-464
+   is inside the spread. That variant (a second param buffer, pb2, so the reduce does not need a host
+   wait) was REVERTED for simplicity, not because it measured worse; it remains UNTESTED.
+   KERNEL KERNELS: any per-layer comparison below ~100 ms needs N>=3 runs and a median. The session's
+   real wins (1578->1009->850) were 15-60% steps and are far outside this floor; anything smaller is
+   not measurable this way and must not be claimed.
+   ROOT CAUSE OF THE VARIANCE is the cold serve path (175 GB checkpoint, per-run page-cache state), not
+   the kernel -- so steady-state A/Bs should be done in-process over many reps, as the probes do.
+STATUS: the pb2 / one-sync experiment is open, not refuted. Next attempt should run it 3x and compare
+medians, in-process rather than via cold serve requests.

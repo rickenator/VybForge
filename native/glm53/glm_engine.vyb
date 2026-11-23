@@ -3067,6 +3067,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     acc_mmD<Int> = 0
     acc_set<Int> = 0
     acc_yh<Int> = 0
+    acc_xh<Int> = 0
     acc_host<Int> = 0
     tA<Int> = 0
     tt0<Int> = 0
@@ -3542,10 +3543,12 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 40, nt)
                         launch_kernel(fxb, nt * (H / 128), pb32)
                         sync()
+                        acc_xh = acc_xh + (time_mono_millis() - tYh)
                         # DETERMINISTIC fused gate: per-split partials + fixed-order reduce
                         tSG<Int> = time_mono_millis()
                         mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32, pP)
                         acc_mmG = acc_mmG + (time_mono_millis() - tSG)
+                        tYh2<Int> = time_mono_millis()
                         # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
@@ -3556,7 +3559,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         launch_kernel(fyb, nt * (EINTER / 128), pb32)
                         sync()
                         FV<Vec<Float>> = bulk_dtoh(dyp, nt * EINTER)
-                        acc_yh = acc_yh + (time_mono_millis() - tYh)
+                        acc_yh = acc_yh + (time_mono_millis() - tYh2)
                         var<Int> nb2 = 0
                         if (fOnlyG == "1") { nb2 = 0 }   # nothing to compare against
                         var<Float> mx2 = 0.0
@@ -3812,7 +3815,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             " lookup=" + (acc_res - acc_scan - acc_open).to_string())
     println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string() +
             " | mmG=" + acc_mmG.to_string() + " mmU=" + acc_mmU.to_string() + " mmD=" + acc_mmD.to_string() +
-            " set=" + acc_set.to_string() + " yh+rb=" + acc_yh.to_string())
+            " set=" + acc_set.to_string() + " xh=" + acc_xh.to_string() + " yh+rb=" + acc_yh.to_string())
     freedom {
     }
 
