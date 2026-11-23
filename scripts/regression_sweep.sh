@@ -77,8 +77,11 @@ say "pass 2: verification mode (P6_FUSED_ONLY=0) -- per-expert comparison"
 rm -f /tmp/sweep_ver.txt
 OUT=/tmp/sweep_ver.txt NLAY=$NLAY FG=1 REQS=1 PORT=$((PORT+1)) P6_FUSED_ONLY=0 \
   bash "$run_fgate" >/dev/null 2>&1
-cmps=$(grep -cE "^(FGATE|FGATEUP|FGATEDN|FGATESYN) expert" /tmp/serve_fgate.log 2>/dev/null || echo 0)
-fails=$(grep -cE "count_over_[0-9.e-]+=[1-9]" /tmp/serve_fgate.log 2>/dev/null || echo 0)
+cmps=$(grep -cE "^(FGATE|FGATEUP|FGATEDN|FGATESYN) expert" /tmp/serve_fgate.log 2>/dev/null || true)
+fails=$(grep -cE "count_over_[0-9.e-]+=[1-9]" /tmp/serve_fgate.log 2>/dev/null || true)
+# grep -c prints 0 AND exits 1 on no match, so `|| echo 0` would append a second 0 and turn the
+# variable into "0\n0" -- the test below then reads it as a failure. `|| true` keeps a single value.
+cmps=${cmps:-0}; fails=${fails:-0}
 echo "comparisons: $cmps   failures: $fails"
 grep -E "^(FGATE|FGATEUP|FGATEDN) expert" /tmp/serve_fgate.log | head -3
 if [ "$fails" != "0" ]; then

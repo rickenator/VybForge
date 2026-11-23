@@ -6305,3 +6305,31 @@ Evidence FOR: 9.8x throughput, correct at 339/339 <= 3.3e-06, deterministic at 4
 11,985x safety, and gated by an exact baseline. Evidence AGAINST: it skips the per-expert comparison,
 so a future shape/weight regression is caught only by the recorded baseline (or by periodically
 re-running the verification mode), not at runtime.
+=== ROUND 135: THE "FGATE GATING BUG" WAS NOT A BUG -- REVERTED; SWEEP CAUGHT A REAL BREAK ===
+WHAT I GOT WRONG (commit b29d9c2): I decided the FGATE/FGATEDN blocks were "pure verification" and
+gated them on `fOnlyG == "0"` so production would not run them. They are NOT pure verification -- in
+PRODUCTION (P6_FUSED_ONLY=1) `gv` is never computed by the deq (line ~3453), so THOSE BLOCKS ARE THE
+PROJECTION: they compute FV and the adopt at `if (ffixed == "1" && nb2 == 0) { gv = FV }` is what fills
+the value every layer downstream consumes. `nb2` is 0 in that mode precisely because there is nothing
+to compare against, which is why the adopt still fires.
+Gating them off left `gv` EMPTY and silently produced garbage. Measured by the sweep's pass 3:
+    19/20 argmax disagreeing, max |delta top1| = 8.168 (vs 1.3e-05 when correct).
+The pass-1 digest shift I attributed to "the verification block having side effects" was the same bug.
+Reverted in this round; production at 4 layers now reproduces the pre-flip fused-only reference EXACTLY.
+LESSON: a block that "only verifies" is only a verifier when its output is also computed elsewhere.
+Check whether the code path assigns the downstream variable on ANY branch before disabling its writer.
+GENERALISED: when removing work from a fast path, assert the fast path still produces the REFERENCE
+value, not merely that it "runs" -- a fast path that skips its own computation runs happily and prints
+confident nonsense. The logit gate (pass 3) is what caught this; the digest diff alone looked like noise.
+ALSO FIXED: the sweep's `fails=$(grep -cE ... || echo 0)` produced "0\n0" (grep -c prints 0 AND exits 1),
+so a clean pass 2 printed "FAIL: 0" and "0 projection(s) outside tolerance". Now `|| true` + `${fails:-0}`.
+=== ROUND 136: TOLERANCE SET FROM THE FULL-DEPTH DISTRIBUTION ===
+Pass 2 with tolerance 1e-05 produced 2 failures of 9810. Distribution over all 9810 full-depth
+comparisons (45 layers, real routing):
+    FGATE   median 1.07e-06  max 5.25e-06
+    FGATEUP median 1.04e-06  max 4.77e-06
+    FGATEDN median 1.94e-07  max 1.34e-05   <- the tail; the down projection cancels over K=2048
+    ALL     median 8.94e-07  p99.9 4.29e-06  max 1.34e-05
+The 1e-05 threshold came from a shallow probe and sat BELOW the real full-depth maximum (0.7x headroom).
+P6_FUSED_TOL now defaults to 3e-05: 2.2x the observed max, 33x the median agreement, still 3.3x tighter
+than the original 1e-4. Pass 2 with it: 9810 comparisons, 0 failures.

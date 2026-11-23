@@ -3459,12 +3459,22 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             # the difference against the deq+gemm result above. Nothing downstream uses FV.
             # Verified equal at the production shape in p6r10 (nt=4, 8192 outputs, 1.01e-06).
             fgate<String> = env_get("P6_FUSED_GATE") else "1"
-            fTolS<String> = env_get("P6_FUSED_TOL") else "1e-05"
+            # Tolerance set from the FULL-DEPTH distribution of 9810 comparisons (45 layers, real
+            # routing): median 8.9e-07, p99.9 4.3e-06, max 1.34e-05 (that tail is the DOWN
+            # projection, which cancels over K=2048; its median is only 1.9e-07). 3e-05 gives 2.2x
+            # headroom over the observed max, is 33x the median agreement, and is still 3.3x tighter
+            # than the original 1e-4. The previous 1e-05 came from a shallow probe and sat BELOW the
+            # real maximum, so it cried wolf on 2 of 9810 projections.
+            fTolS<String> = env_get("P6_FUSED_TOL") else "3e-05"
             fTol<Float> = fTolS.to_float()
-            # ALSO requires the deq to have run: in production (P6_FUSED_ONLY=1) there is no gv to
-            # compare against, and this block would compute the fused projection a second time and
-            # print meaningless comparisons -- pure waste plus false failures in the log.
-            if (fOnlyG == "0" && fgate == "1" && nt > 0) {
+            # DO NOT gate this on fOnlyG == "0". In PRODUCTION (P6_FUSED_ONLY=1) gv is never computed
+            # and this block IS the projection: it computes FV and the adopt below (`gv = FV`) is what
+            # fills the value the layers downstream consume. Disabling it in production leaves gv empty
+            # and silently produces garbage -- measured as 1/20 argmax agreement and a max logit delta
+            # of 8.17. In VERIFICATION mode the same block is the second (fused) pass compared against
+            # the deq; `nb2` is 0 there for the fused-only case because there is nothing to compare
+            # against, which is why the adopt still fires.
+            if (fgate == "1" && nt > 0) {
                 fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
                 fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
@@ -3678,9 +3688,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             # ---- DOWN PROJECTION: reversed shape (nin=EINTER, cw=H) ----
             # Same fused chain, its own buffers and its own trellis (g_ge_6/7/8).
             fgateD<String> = env_get("P6_FUSED_GATE") else "1"
-            fTolDS<String> = env_get("P6_FUSED_TOL") else "1e-05"
+            fTolDS<String> = env_get("P6_FUSED_TOL") else "3e-05"   # see the gate-projection note
             fTolD<Float> = fTolDS.to_float()
-            if (fOnlyG == "0" && fgateD == "1" && nt > 0) {
+            if (fgateD == "1" && nt > 0) {   # load-bearing in production -- see the gate note above
                 fxbD<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fybD<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
                 fmbD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
