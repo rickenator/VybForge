@@ -3390,9 +3390,20 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
-            # P6_FUSED_ONLY=1 skips the f32 dequantisation entirely: the fused chain reads the
-            # packed weights directly, so dWg (and its ~4 ms deq) is not needed at all.
-            fOnlyG<String> = env_get("P6_FUSED_ONLY") else "0"
+            # P6_FUSED_ONLY skips the f32 dequantisation entirely: the fused chain reads the packed
+            # weights directly, so dWg (and its ~4 ms deq) is not needed at all. DEFAULT 1: the fast
+            # path is the production path.
+            #
+            # Set P6_FUSED_ONLY=0 to run the verification mode instead -- the deq runs ALONGSIDE the
+            # fused chain and every projection is compared against it (<=3.3e-06, 339 comparisons).
+            # That mode is ~2x slower by construction, so it belongs in the regression sweep
+            # (scripts/regression_sweep.sh) rather than in production.
+            #
+            # Why this default is safe: the fast path is correct (339/339 <= 3.3e-06), deterministic
+            # (45/45 bit-identical across fresh processes, exact baseline in
+            # native/baselines/digest_fused_only45.txt) and equivalent at the decision boundary
+            # (20/20 argmax, max delta-top1 1.34e-05 against a 0.16 minimum margin => 11,985x safety).
+            fOnlyG<String> = env_get("P6_FUSED_ONLY") else "1"
             var<Int> dWg = 0
             if (fOnlyG == "0") {
                 dWg = exl3_deq32f(fdeq32, fdqs, fdqs4, fhad132, fhad232, g_ge_0, g_ge_1,
@@ -3450,7 +3461,10 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             fgate<String> = env_get("P6_FUSED_GATE") else "1"
             fTolS<String> = env_get("P6_FUSED_TOL") else "1e-05"
             fTol<Float> = fTolS.to_float()
-            if (fgate == "1" && nt > 0) {
+            # ALSO requires the deq to have run: in production (P6_FUSED_ONLY=1) there is no gv to
+            # compare against, and this block would compute the fused projection a second time and
+            # print meaningless comparisons -- pure waste plus false failures in the log.
+            if (fOnlyG == "0" && fgate == "1" && nt > 0) {
                 fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
                 fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
@@ -3666,7 +3680,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             fgateD<String> = env_get("P6_FUSED_GATE") else "1"
             fTolDS<String> = env_get("P6_FUSED_TOL") else "1e-05"
             fTolD<Float> = fTolDS.to_float()
-            if (fgateD == "1" && nt > 0) {
+            if (fOnlyG == "0" && fgateD == "1" && nt > 0) {
                 fxbD<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fybD<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
                 fmbD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
