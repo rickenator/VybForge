@@ -4842,3 +4842,24 @@ or a tensor-core formulation, or a multi-node split that divides the per-step we
 DO NOT report the fused kernel as "competitive" — it is a 21x engineering win on top of a ~35x
 architectural gap.
 === END (rounds 20-60) ===
+=== ROUND 61: MULTI-NODE SCALING — IT SATURATES AT ~6 tok/s, WELL SHORT OF THE BAR ===
+Tool-computed from the measured 0.600 ms per fused expert matrix, 45 layers, 8 routed + 1 shared,
+3 projections per expert, bar 21.1 ms/token:
+    nodes | experts/node | ms/layer | ms/step | tok/s | gap   | partition
+      1   |       8      |  16.2    |   729   | 1.37  | 34.5x | 175.6 GB
+      2   |       4      |   9.0    |   405   | 2.47  | 19.2x |  87.8 GB
+      4   |       2      |   5.4    |   243   | 4.12  | 11.5x |  43.9 GB
+      8   |       1      |   3.6    |   162   | 6.17  |  7.7x |  21.9 GB
+    8..35 |      1      |   3.6    |   162   | 6.17  |  7.7x |  ...
+STRATEGIC FINDING: expert-parallelism FLATTENS at 8 nodes, because each node then runs exactly one
+routed expert (1.8 ms) PLUS the always-dense shared expert (1.8 ms). Adding nodes buys nothing more.
+Ceiling from scaling alone: ~6.2 tok/s = 7.7x short of the bar. To beat that, a SINGLE expert matrix
+has to be split across nodes (tensor-parallel by column blocks) — which only helps if the per-expert
+0.6 ms itself improves, i.e. back to the gather-restructured kernel.
+CAPACITY IS NOT THE CONSTRAINT: righty has 385 GB free on disk and 111 GB RAM free, so an 87.8 GB
+half-partition is both disk- and RAM-resident.
+RECOMMENDATION: the 2-node split is still worth building (1.37 -> 2.47 tok/s, and it exercises the
+distributed path end to end), but it is NOT the route to the competitive bar and must not be
+presented as such. The bar needs the kernel restructure; the cluster is a multiplier of ~2-2.5x on
+this geometry, not a solution.
+=== END (rounds 20-61) ===

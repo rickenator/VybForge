@@ -1,0 +1,234 @@
+// p6r10_fused_expert — validate and time the FULL fused expert projection
+// (xhat -> fused matvec -> yhat) against the production dequant + gemm path,
+// for ONE expert's gate_proj (4096 x 2048).
+//
+// The deq path materialises W (33.5 MB) and reads it back for the matvec; the
+// fused path never builds W at all. This driver answers two questions at once:
+//   1. does the fused composition give the SAME answer as deq+gemm?
+//   2. how much faster is it per expert, end to end (incl. the two Hadamard
+//      vector passes that the deq path gets for free by materialising W)?
+// env: P6_DIR, P6_EXP
+import io::{open_read, read_all, close}
+import env::{env_get}
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, had_hoist32, mapdev_build, exl3_deq32f, gx_resolve_tab, launch_kernel, wr_pdev, mm_host32, free_dev, H}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    expS<String> = env_get("P6_EXP") else "153"
+    e<Int> = 0
+    i<Int> = 0
+    while (i < expS.len()) {
+        c<Int> = (expS.char_at(i) as Int) & 255
+        if (c >= 48 && c <= 57) { e = e * 10 + (c - 48) }
+        i = i + 1
+    }
+    if (tensor_init() != 0) { println("P6_FAIL cuda"); return 1 }
+
+    fdqs4<Int> = load_fn("native/build/exl3dq.ptx", "exl3dq1s4")
+    fhad232<Int> = load_fn("native/build/exl3.ptx", "exl3had232")
+    fhgen32<Int> = load_fn("native/build/exl3.ptx", "exl3hgen32")
+    finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
+    fxhat<Int> = load_fn("native/build/exl3mv.ptx", "exl3xhat")
+    fvh<Int> = load_fn("native/build/exl3mv.ptx", "exl3yhat")
+    fmv<Int> = load_fn("native/build/exl3mv.ptx", "mvnod4")
+    flut<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
+    if (fdqs4 == 0 || fhad232 == 0 || fhgen32 == 0 || finvk == 0) { println("P6_FAIL kernels"); return 2 }
+    if (fxhat == 0 || fvh == 0 || fmv == 0 || flut == 0) { println("P6_FAIL fused=" + fxhat.to_string() + "/" + fmv.to_string() + "/" + fvh.to_string() + "/" + flut.to_string()); return 2 }
+    hd_pre32<Int> = had_hoist32(fhgen32)
+    if (hd_pre32 == 0) { println("P6_FAIL hadhoist"); return 3 }
+
+    mapd<String> = ""
+    match (open_read("native/exl3/map.bin")) {
+        f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL map.bin"); return 4 }
+    }
+    mapbody<String> = mapd.substring(16, mapd.len())
+    mapdev<Int> = mapdev_build(finvk, mapd)
+    if (mapdev == 0) { println("P6_FAIL mapdev"); return 5 }
+    invbase<Int> = mapdev + 16 + (mapd.len() - 16)
+
+    arA<Int> = dev_alloc(8388608)
+    arB<Int> = dev_alloc(65536)
+    arC<Int> = dev_alloc(33554432)
+    arD<Int> = dev_alloc(33554432)
+    arG<Int> = dev_alloc(16384)
+    arH<Int> = dev_alloc(16384)
+    arI<Int> = dev_alloc(64)
+    pb32<Int> = dev_alloc(192)
+    pbf<Int> = dev_alloc(192)
+    pbv<Int> = dev_alloc(192)
+    if (arA == 0 || arB == 0 || arC == 0 || arD == 0 || arG == 0 || arH == 0 || arI == 0) { println("P6_FAIL arena"); return 6 }
+
+    // half->f32 LUT (the decode indexes it instead of calling fp16_to_f64)
+    lut<Int> = dev_alloc(262144)
+    wr_pdev(pbf, 0, lut)
+    launch_kernel(flut, 256, pbf)
+    sync()
+
+    // the tab cache, layer 3
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    cs<String> = ""
+    match (open_read(cache_path)) {
+        f -> { match (read_all(f)) { s -> { cs = s } ? -> { return 4 } } close(f) }
+        ? -> { println("P6_FAIL tabcache"); return 4 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    ti<Int> = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("P6_FAIL tabcache_trunc"); return 5 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+
+    epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
+    w2<Vec<String>> = Vec()
+    w2.push(epre + "gate_proj.trellis")
+    w2.push(epre + "gate_proj.suh")
+    w2.push(epre + "gate_proj.svh")
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w2)
+    g0<String> = gx_read(ge, 0)
+    g1<String> = gx_read(ge, 1)
+    g2<String> = gx_read(ge, 2)
+    if (g0.len() == 0 || g1.len() == 0) { println("P6_FAIL resolve"); return 7 }
+    cw<Int> = 2048
+    nin<Int> = 4096
+    println("P6R10 expert=" + e.to_string() + " trellis=" + g0.len().to_string() + " suh=" + g1.len().to_string() + " svh=" + g2.len().to_string())
+
+    cuMemcpyHtoD_v2(arA, g0, g0.len())
+    cuMemcpyHtoD_v2(arG, g1, g1.len())
+    cuMemcpyHtoD_v2(arH, g2, g2.len())
+    sync()
+
+    // ---- input vector: a fixed, non-trivial pattern ----
+    xv<Vec<Float>> = Vec()
+    i = 0
+    while (i < nin) {
+        xv.push(((i % 17) as Float) * 0.0625 - 0.5)
+        i = i + 1
+    }
+    dx64<Int> = dev_alloc(nin * 8)
+    dx<Int> = dev_alloc(nin * 4)
+    bulk_htod(dx64, view(xv))
+    fcast32<Int> = load_fn("native/build/layer.ptx", "cast32")
+    wr_pdev(pb32, 0, dx64)
+    wr_pdev(pb32, 8, dx)
+    wr_pdev(pb32, 16, nin)
+    launch_kernel(fcast32, 16, pb32)
+    sync()
+
+    // ---- REFERENCE: dequant W then gemm ----
+    t0<Int> = time_mono_millis()
+    dW<Int> = exl3_deq32f(0, 0, fdqs4, 0, fhad232, g0, g1, g2, mapbody, 2048, 32768, hd_pre32,
+                          arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+    if (dW == 0) { println("P6_FAIL deq"); return 8 }
+    t1<Int> = time_mono_millis()
+    fgp<Int> = load_fn("native/build/layer.ptx", "gemm32_p")
+    fgr<Int> = load_fn("native/build/layer.ptx", "gemm32_r")
+    refv<Vec<Float>> = mm_host32(xv, 1, nin, dW, cw, fcast32, fgp, fgr, pb32)
+    t2<Int> = time_mono_millis()
+    println("P6R10 DEQ_PATH deq_ms=" + (t1 - t0).to_string() + " mm_ms=" + (t2 - t1).to_string() + " total_ms=" + (t2 - t0).to_string())
+
+    // ---- FUSED: xhat -> matvec -> yhat, W never built ----
+    xp<Int> = dev_alloc(nin * 4)
+    yr<Int> = dev_alloc(cw * 4)
+    dy<Int> = dev_alloc(cw * 8)
+    var<Int> tf0 = 0
+    var<Int> tf1 = 0
+    var<Int> tf2 = 0
+    var<Int> tf3 = 0
+    var<Int> rep = 0
+    while (rep < 3) {
+        cuMemcpyHtoD_v2(yr, zero_bytes(cw * 4), cw * 4)
+        f0<Int> = time_mono_millis()
+        wr_pdev(pbf, 0, dx)
+        wr_pdev(pbf, 8, xp)
+        wr_pdev(pbf, 16, hd_pre32)
+        wr_pdev(pbf, 24, arG)
+        wr_pdev(pbf, 32, nin)
+        launch_kernel(fxhat, nin / 128, pbf)
+        sync()
+        f1<Int> = time_mono_millis()
+        wr_pdev(pbv, 0, yr)
+        wr_pdev(pbv, 8, xp)
+        wr_pdev(pbv, 24, cw)
+        wr_pdev(pbv, 40, arA)
+        wr_pdev(pbv, 48, mapdev)
+        wr_pdev(pbv, 56, invbase)
+        wr_pdev(pbv, 144, lut)
+        # each block (2048 threads) is 8 CTAs of 256, so the grid is 8x the block count
+        launch_kernel(fmv, (nin / 64) * (cw / 128) * 8, pbv)
+        sync()
+        f2<Int> = time_mono_millis()
+        wr_pdev(pbf, 0, yr)
+        wr_pdev(pbf, 8, dy)
+        wr_pdev(pbf, 16, hd_pre32)
+        wr_pdev(pbf, 24, cw)
+        wr_pdev(pbf, 32, arH)
+        launch_kernel(fvh, cw / 128, pbf)
+        sync()
+        f3<Int> = time_mono_millis()
+        if (rep == 2) {
+            tf0 = f1 - f0
+            tf1 = f2 - f1
+            tf2 = f3 - f2
+            tf3 = f3 - f0
+        }
+        rep = rep + 1
+    }
+    println("P6R10 FUSED_PATH xhat_ms=" + tf0.to_string() + " mv_ms=" + tf1.to_string() + " yhat_ms=" + tf2.to_string() + " total_ms=" + tf3.to_string())
+
+    // ---- compare ----
+    fv<Vec<Float>> = bulk_dtoh(dy, cw)
+    var<Int> nbad = 0
+    var<Float> mx = 0.0
+    var<Float> rel = 0.0
+    var<Int> fb = -1
+    i = 0
+    while (i < cw) {
+        dv<Float> = fv.get(i) - refv.get(i)
+        adv<Float> = dv
+        if (adv < 0.0) { adv = 0.0 - adv }
+        if (adv > mx) { mx = adv }
+        rv<Float> = refv.get(i)
+        if (rv < 0.0) { rv = 0.0 - rv }
+        if (rv > rel) { rel = rv }
+        if (adv > 1e-4) { if (fb < 0) { fb = i } ; nbad = nbad + 1 }
+        i = i + 1
+    }
+    println("P6R10 GATE count_over_1e-4=" + nbad.to_string() + " max_abs=" + mx.to_string_precise() + " ref_max=" + rel.to_string_precise() + " first_bad=" + fb.to_string())
+    println("P6R10 y0 fused=" + fv.get(0).to_string_precise() + " ref=" + refv.get(0).to_string_precise())
+    println("P6R10_DONE")
+    return 0
+}
+
+zero_bytes(n<Int>)<String> -> {
+    s<String> = ""
+    k<Int> = 0
+    while (k < n) { s = s + " " ; k = k + 1 }
+    return s
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
