@@ -5129,3 +5129,19 @@ NEXT STEP (small): assert found, and if the tab lacks the attention entry, add i
 does resolve self_attn.q_b_proj.weight, so the tab format supports it -- it is likely my layer-3 table
 entry list that is short). Then the bfgemm validation runs for real.
 === END (rounds 20-76) ===
+=== ROUND 77: gx_read RETURNS ZEROS FOR ATTENTION TENSORS IN THIS PROBE (found == 1) ===
+Hardened the resolve (candidate list + a real `found` assertion), and it does find the tensor:
+    BFG try ...self_attn.kv_a_proj_with_mqa.weight found=1 bytes=4194304
+    BFG using N=512 K=4096
+    BFG converted 2097152 values; w[0][0]=0 w[1][1]=0      <- STILL ALL ZEROS
+And the on-disk data is definitely non-zero: a direct safetensors read gives
+    kv_a_proj_with_mqa.weight  shard 00005, 4194304 bytes, first words [-17360, 15458, -17413, -17617]
+    q_a_proj.weight            shard 00005, 12582912 bytes, first words [-17376, 15381, -17845, 15520]
+So: found=1, correct byte count, correct shape, and the bytes on disk are real -> but gx_read hands back a
+zero buffer. The 45-layer chain reads these same attention tensors correctly (the model produces the
+right digests), so this is either (a) my probe's usage of gx_read/gx_resolve_tab, or (b) something about
+the tab I am using for layer 3 in a probe context. It is NOT a broken checkpoint and NOT a broken kernel.
+STATUS OF bfgemm_p: still NOT validated. It compiles and ptxas accepts it; its correctness is unknown.
+ONE FOCUSED DEBUG needed (next session): compare against how glm_serve.vyb reads a self_attn tensor --
+same resolve call, same gx_read, print the first 4 bytes straight after the read -- rather than guessing.
+=== END (rounds 20-77) ===

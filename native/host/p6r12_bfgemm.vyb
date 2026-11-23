@@ -13,7 +13,7 @@ import io::{open_read, read_all, close}
 import env::{env_get}
 import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
 import gx::{gx_read}
-import glm_engine::{load_fn, mapdev_build, gx_resolve_tab, launch_kernel, wr_pdev}
+import glm_engine::{load_fn, mapdev_build, gx_resolve_tab, launch_kernel, wr_pdev, deq_bf16}
 
 main()<Int> -> {
     dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
@@ -58,14 +58,16 @@ main()<Int> -> {
         w1.push(cand.get(ci))
         ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
         fnd<Int> = ge.found.get(0)
-        fsz<Int> = gx_read(ge, 0).len()
+        # ONE read only: calling gx_read twice on the same GxLoc is a suspect for
+        # the all-zero buffer, so read once and derive both from this buffer
+        buf<String> = gx_read(ge, 0)
+        fsz<Int> = buf.len()
         println("BFG try " + cand.get(ci) + " found=" + fnd.to_string() + " bytes=" + fsz.to_string())
         if (fnd == 1 && fsz > 0) {
-            # shape from the byte count: BF16 [N][K] with K = 4096 for these
             K = 4096
             N = fsz / 2 / K
-            g0 = gx_read(ge, 0)
-            println("BFG using N=" + N.to_string() + " K=" + K.to_string())
+            g0 = buf
+            println("BFG using N=" + N.to_string() + " K=" + K.to_string() + " first4=" + (g0.char_at(0) as Int).to_string() + "," + (g0.char_at(1) as Int).to_string() + "," + (g0.char_at(2) as Int).to_string() + "," + (g0.char_at(3) as Int).to_string())
         }
         ci = ci + 1
     }
@@ -77,14 +79,12 @@ main()<Int> -> {
     if (dB == 0 || dF == 0) { println("BFG_FAIL alloc"); return 5 }
     cuMemcpyHtoD_v2(dB, g0, N * K * 2)
     sync()
-    pbc<Int> = dev_alloc(64)
-    wr_pdev(pbc, 0, dB)
-    wr_pdev(pbc, 8, dF)
-    wr_pdev(pbc, 16, N * K)
-    wr_pdev(pbc, 24, 0)
-    launch_kernel(fdq, (N * K + 255) / 256, pbc)
+    # the engine's own decoder: takes the raw String, uploads and converts
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq32")
+    dF2<Int> = deq_bf16(fbf, g0, N * K, 0)
+    if (dF2 == 0) { println("BFG_FAIL deq_bf16"); return 6 }
     sync()
-    WF<Vec<Float>> = bulk_dtoh(dF, N * K)
+    WF<Vec<Float>> = bulk_dtoh(dF2, N * K)
     println("BFG converted " + (N * K).to_string() + " values; w[0][0]=" + WF.get(0).to_string_precise() + " w[1][1]=" + WF.get(K + 1).to_string_precise())
 
     # ---- activations M=2, and the host reference ----
