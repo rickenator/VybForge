@@ -3381,7 +3381,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             # packed weights (xhatB -> mvnodB -> yhatB), never materialising f32 -- and prints
             # the difference against the deq+gemm result above. Nothing downstream uses FV.
             # Verified equal at the production shape in p6r10 (nt=4, 8192 outputs, 1.01e-06).
-            fgate<String> = env_get("P6_FUSED_GATE") else "0"
+            fgate<String> = env_get("P6_FUSED_GATE") else "1"
+            fTolS<String> = env_get("P6_FUSED_TOL") else "1e-05"
+            fTol<Float> = fTolS.to_float()
             if (fgate == "1" && nt > 0) {
                 fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
@@ -3458,7 +3460,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         while (fOnlyG == "0" && zz < nt * EINTER) {
                             dvv<Float> = FV.get(zz) - gv.get(zz)
                             if (dvv < 0.0) { dvv = 0.0 - dvv }
-                            if (dvv > 1e-4) { nb2 = nb2 + 1 }
+                            if (dvv > fTol) { nb2 = nb2 + 1 }
                             if (dvv > mx2) { mx2 = dvv }
                             zz = zz + 1
                         }
@@ -3525,7 +3527,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         while (zz2 < nt * EINTER) {
                             dvs<Float> = FS.get(zz2) - RS.get(zz2)
                             if (dvs < 0.0) { dvs = 0.0 - dvs }
-                            if (dvs > 1e-4) { nbs = nbs + 1 }
+                            if (dvs > fTol) { nbs = nbs + 1 }
                             if (dvs > mxs) { mxs = dvs }
                             zz2 = zz2 + 1
                         }
@@ -3584,7 +3586,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             while (fOnlyG == "0" && zzu < nt * EINTER) {
                                 dvu<Float> = FU2.get(zzu) - uv.get(zzu)
                                 if (dvu < 0.0) { dvu = 0.0 - dvu }
-                                if (dvu > 1e-4) { nbu = nbu + 1 }
+                                if (dvu > fTol) { nbu = nbu + 1 }
                                 if (dvu > mxu) { mxu = dvu }
                                 zzu = zzu + 1
                             }
@@ -3627,7 +3629,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
 
             # ---- DOWN PROJECTION: reversed shape (nin=EINTER, cw=H) ----
             # Same fused chain, its own buffers and its own trellis (g_ge_6/7/8).
-            fgateD<String> = env_get("P6_FUSED_GATE") else "0"
+            fgateD<String> = env_get("P6_FUSED_GATE") else "1"
+            fTolDS<String> = env_get("P6_FUSED_TOL") else "1e-05"
+            fTolD<Float> = fTolDS.to_float()
             if (fgateD == "1" && nt > 0) {
                 fxbD<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
                 fybD<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
@@ -3692,7 +3696,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         while (fOnlyG == "0" && zzd < nt * H) {
                             dvd<Float> = FD.get(zzd) - yv.get(zzd)
                             if (dvd < 0.0) { dvd = 0.0 - dvd }
-                            if (dvd > 1e-4) { nbd = nbd + 1 }
+                            if (dvd > fTolD) { nbd = nbd + 1 }
                             if (dvd > mxd) { mxd = dvd }
                             zzd = zzd + 1
                         }

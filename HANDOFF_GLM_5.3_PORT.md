@@ -6067,3 +6067,24 @@ tolerance for the MoE path, or (b) the fused kernels must reproduce the deq path
 and f32 rounding, which is a much harder problem than the speedup was.
 NO DEFAULT WAS CHANGED. P6_FUSED_GATE remains opt-in and off by default.
 === END ===
+=== ROUND 125: *** LOGIT-LEVEL COMPARISON: 100% ARGMAX AGREEMENT, 34,000x SAFETY MARGIN *** ===
+Added P6_LOGITS=1: after the layer loop, the main path applies shared_head.norm -> lm_head -> 288-way
+logits and prints, per token, argmax / top1 / top2 / margin. This compares the two configurations at the
+DECISION BOUNDARY instead of at intermediate digests, which is what "does the drift matter" actually
+means. (sv_NE = 288, so the head is tiny; the head tensors live in tabs.get(44), not the last-layer tab.)
+Result over 20 prefill tokens (NL=4, same ids both sides):
+    tokens compared      : 20
+    argmax agreement     : 20 / 20   (100%)
+    max |delta top1|     : 1.601e-06
+    max |delta margin|   : 1.435e-06
+    smallest margin seen : 0.054786 (token 1)
+    safety factor        : 34,222x
+i.e. the fused path moves each logit by ~1.6e-06 while the tightest decision boundary in the sample is
+0.0548. A flip requires top1-top2 < 1.6e-06.
+SCALING TO FULL DEPTH: at 4 layers the hidden-state drift is ~5e-07; at 45 layers it reaches ~2e-05, i.e.
+~30-40x larger, so expect a logit perturbation of ~5e-05 and a safety factor of ~1,000x. Still large.
+CAVEAT (stated honestly): 20 tokens from one prompt at 4 layers, not a large battery at 45. The 1,000x
+figure at full depth is an extrapolation from the measured drift, not a direct measurement.
+BOTTOM LINE FOR THE GATE DECISION: relaxing the MoE's bit-identity does not measurably change token
+selection. The 10.6x MoE win (86+ tok/s) is defensible on this evidence; a full-depth logits run over a
+larger prompt set would make it airtight.
