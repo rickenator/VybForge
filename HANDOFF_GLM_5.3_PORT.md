@@ -4678,3 +4678,21 @@ small-grid partials exact, atomic mechanics healthy — and the block-2+ accumul
 wrong in a way that needs a fresh, minimal, hand-written reproducer (one block, one CTA's slab
 dumped to host, compared term by term). That is the only remaining work on this kernel.
 Everything else in the program is green and unaffected.
+=== ROUND 50: THE SLAB IS BIT-IDENTICAL TOO — every input to the sum is verified ===
+Dumped the slab of ONE block-2 CTA (nb128==2, rb64==0, cta==0: 8 rows x 128 cols) and compared it
+Element for element against the proven T (rows 0..7, cols 256..383):
+    SLAB_DIFF count_over_1e-6 = 0   max_abs = 0   s00 = t00 = 2.40966796875
+So for column block 2: the decoded slab is exact, xp is exact (round 42), the coverage is uniform
+(round 44), the atomics land (round 47/48), and the target indices are correct (round 44) — and the
+sum over 512 CTAs STILL differs from the host sum of the SAME terms over the SAME indices by 4.18.
+That is a set of statements that cannot all be true of a correct kernel, which means one of the
+"verified" pieces is verified under subtly different conditions than the failing path uses.
+THE SINGLE MOST SUSPICIOUS REMAINING DIFFERENCE: every isolated verification (single CTA, grids
+1..128, slab dump, atomic-into-fresh) was done with a SEPARATE LAUNCH, while the failing case is the
+8192-CTA full-grid launch. A resource/occupancy interaction (e.g. shared-memory aliasing between
+co-resident CTAs, or a launch with more CTAs than the grid was sized for) is the one variable never
+varied.
+NEXT SESSION: launch the FULL grid but with a TRIVIAL phase 1 (slab := constant) and check whether
+the sum of constants over 512 CTAs equals 512*constant for block 2 — that isolates the multi-CTA
+accumulation from the decode entirely.
+=== SESSION CLOSED (rounds 20-50) ===

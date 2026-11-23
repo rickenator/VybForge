@@ -107,6 +107,7 @@ exl3mv1s4(p<Int>) -> {
     STB<Int> = ld_i64(p + 104)
     ATGT<Int> = ld_i64(p + 112)
     SBD<Int> = ld_i64(p + 120)
+    CONST<Int> = ld_i64(p + 128)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -143,7 +144,11 @@ exl3mv1s4(p<Int>) -> {
         yK<Int> = (prodK & 2415890431) ^ 996162400
         loK<Float> = fp16_to_f64(yK & 65535)
         hiK<Float> = fp16_to_f64((yK >> 16) & 65535)
-        st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
+        if (CONST != 0) {
+            st_shared_f32(bK * 512 + cK * 4, 0.5)
+        } else {
+            st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
+        }
         k = k + 1
     }
 

@@ -54,7 +54,7 @@ main()<Int> -> {
     arI<Int> = dev_alloc(64)
     pb32<Int> = dev_alloc(192)
     pbx<Int> = dev_alloc(64)
-    pbm<Int> = dev_alloc(176)
+    pbm<Int> = dev_alloc(192)
     pby<Int> = dev_alloc(48)
     bx<Int> = dev_alloc(16384)
     bxp<Int> = dev_alloc(16384)
@@ -426,6 +426,40 @@ main()<Int> -> {
         cuCtxSynchronize()
         DBGV<Vec<Float>> = bulk_dtoh(dbgf, 4)
         println("E2E DBG only_seen=" + DBGV.get(0).to_string_precise() + " nb128_seen=" + DBGV.get(1).to_string_precise() + " nb128_eq2_count=" + DBGV.get(2).to_string_precise() + " only_eq2_count=" + DBGV.get(3).to_string_precise())
+            // ---- CONSTANT-SLAB TEST: slab := 0.5 => every output must be 0.5*sum(xp) ----
+            wr_pdev(pbm, 120, 0)
+            wr_pdev(pbm, 128, 1)
+            wr_pdev(pbm, 88, -1)
+            cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+            launch_kernel(fmv, 8192, pbm)
+            cuCtxSynchronize()
+            wr_pdev(pbm, 128, 0)
+            cf0<Int> = dev_alloc(16384)
+            wr_pdev(pb32, 0, byr)
+            wr_pdev(pb32, 8, cf0)
+            wr_pdev(pb32, 16, 2048)
+            launch_kernel(fcv, 8, pb32)
+            cuCtxSynchronize()
+            CF<Vec<Float>> = bulk_dtoh(cf0, 2048)
+            sumxp<Float> = 0.0
+            i = 0
+            while (i < 4096) {
+                sumxp = sumxp + XP.get(i)
+                i = i + 1
+            }
+            expv2<Float> = 0.5 * sumxp
+            var<Int> ndc2 = 0
+            var<Float> mxc = 0.0
+            n16<Int> = 0
+            while (n16 < 2048) {
+                dc2<Float> = CF.get(n16) - expv2
+                adc<Float> = dc2
+                if (adc < 0.0) { adc = 0.0 - adc }
+                if (adc > mxc) { mxc = adc }
+                if (adc > 1e-3) { ndc2 = ndc2 + 1 }
+                n16 = n16 + 1
+            }
+            println("E2E CONSTSLAB count_over_1e-3=" + ndc2.to_string() + " max_abs=" + mxc.to_string_precise() + " expected=" + expv2.to_string_precise() + " v256=" + CF.get(256).to_string_precise() + " v0=" + CF.get(0).to_string_precise())
             // ---- SLAB REPRODUCER: block-2, cta-0 slab vs the proven T ----
             sbd<Int> = dev_alloc(8192)
             cuMemcpyHtoD_v2(sbd, zero_bytes(8192), 8192)
