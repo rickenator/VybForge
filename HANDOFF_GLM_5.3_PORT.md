@@ -6181,3 +6181,27 @@ NEXT STEP (cheap, decisive): run the VERIFICATION mode twice (FG=1, FUSED_ONLY u
 is deterministic, the state dependency is the skipped deq, not the arithmetic -- and fused-only needs the
 same setup the deq performed, or must not be the default at all.
 === END ===
+=== ROUND 130: DETERMINISTIC MATVEC REVERTED (IT WAS WRONG) -- AND THE DEFAULT IS ALREADY DETERMINISTIC ===
+MY mvnodB_det/mvnodR WAS INCORRECT and is REVERTED from the engine (kernels stay in exl3mv.vyb as WIP).
+The bug: I assumed the k-split was 8-way (the 8 CTAs of a 2048-thread block). It is actually
+4096-way = rb64 (0..511 row blocks) x cta (0..7). Each of those contributes ONE element of the dot to
+the output, so an 8-slot partial buffer discards almost everything. Symptom: 339 FGATE comparison
+failures the moment it was wired in (and, before zfill, garbage-but-varying results). A correct
+deterministic version needs FEWER splits that each sum sequentially -- i.e. restructure the decode loop
+so one CTA walks many k-elements, not one. That is real kernel work, not a buffer change.
+REVERTED AND RE-VERIFIED: 339 comparisons, 0 failures, max_abs 7.7e-07..2.6e-06. The atomic path is
+correct.
+THE IMPORTANT RESULT FROM THIS ROUND, which changes the recommendation:
+    VERIFICATION MODE (P6_FUSED_GATE=1, P6_FUSED_ONLY unset) IS DETERMINISTIC -- two runs bit-identical.
+That is the DEFAULT configuration. So the default fused path is BOTH correct (339/339 within tolerance)
+AND reproducible (bit-identical run to run), which means it IS a valid gate: a fresh run can be diffed
+against a recorded baseline exactly.
+ONLY FUSED-ONLY MODE IS NONDETERMINISTIC, and it is opt-in. It skips the deq -- and the comparisons --
+so it has never been validated against the deq result at all. It exists to measure speed, not to gate.
+REVISED GUIDANCE:
+  - enable the fused MoE with P6_FUSED_GATE=1 (default) and LEAVE P6_FUSED_ONLY UNSET for anything whose
+    output must be reproducible or gated; it runs the verification and adopts only clean results.
+  - use P6_FUSED_ONLY=1 only for performance measurement, and expect ~1e-6 run-to-run variation in MoE
+    layers plus no correctness check at all.
+  - the 10.6x figure remains valid as a measurement of the fused computation; it is not a claim that the
+    fused-only mode is gate-ready.

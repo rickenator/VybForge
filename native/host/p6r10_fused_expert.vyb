@@ -307,6 +307,97 @@ main()<Int> -> {
         println("P6R10 NT4_SKIP handles xhatB=" + fxb.to_string() + " yhatB=" + fyb.to_string() + " mvnodB=" + fmb4.to_string())
     }
 
+    // ---- DETERMINISTIC MATVEC COST: atomic mvnodB vs mvnodB_det + mvnodR (4096 slots) ----
+    // Answers one question: does writing 4096 per-split partials and reducing them cost more than the
+    // atomic accumulation it replaces? Same params, same B, 20 warm reps each.
+    fdet<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+    fred<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+    fzf<Int> = load_fn("native/build/exl3mv.ptx", "zfill")
+    fatom<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+    println("P6R10 DET handles det=" + fdet.to_string() + " red=" + fred.to_string() + " zf=" + fzf.to_string() + " atom=" + fatom.to_string())
+    if (fdet != 0 && fred != 0 && fzf != 0 && fatom != 0) {
+        var<Int> Bd = 1
+        dTy<Int> = dev_alloc(cw * 4)
+        dXy<Int> = dev_alloc(nin * 4)
+        nslot<Int> = 4096
+        dPy<Int> = dev_alloc(nslot * Bd * cw * 4)
+        println("P6R10 DET partial buffer MB=" + (nslot * Bd * cw * 4 / 1048576).to_string())
+        if (dTy != 0 && dXy != 0 && dPy != 0) {
+            # ---- atomic baseline ----
+            wr_pdev(pbv, 0, dTy)
+            wr_pdev(pbv, 8, dXy)
+            wr_pdev(pbv, 24, cw)
+            wr_pdev(pbv, 40, arA)
+            wr_pdev(pbv, 48, mapdev)
+            wr_pdev(pbv, 56, invbase)
+            wr_pdev(pbv, 144, lut)
+            wr_pdev(pbv, 168, Bd)
+            wr_pdev(pbv, 176, nin)
+            launch_kernel(fatom, (nin / 64) * (cw / 128) * 8, pbv)
+            sync()
+            ta0<Int> = time_mono_millis()
+            var<Int> ra = 0
+            while (ra < 20) { launch_kernel(fatom, (nin / 64) * (cw / 128) * 8, pbv) ; ra = ra + 1 }
+            sync()
+            ta1<Int> = time_mono_millis()
+            atomms<Float> = ((ta1 - ta0) as Float) / 20.0
+
+            # ---- deterministic path: zero + det + reduce ----
+            tz0<Int> = time_mono_millis()
+            var<Int> rz = 0
+            while (rz < 20) {
+                wr_pdev(pbv, 0, dPy)
+                wr_pdev(pbv, 8, nslot * Bd * cw)
+                launch_kernel(fzf, (nslot * Bd * cw + 255) / 256, pbv)
+                rz = rz + 1
+            }
+            sync()
+            tz1<Int> = time_mono_millis()
+            zfms<Float> = ((tz1 - tz0) as Float) / 20.0
+
+            td0<Int> = time_mono_millis()
+            var<Int> rd = 0
+            while (rd < 20) {
+                wr_pdev(pbv, 0, dTy)
+                wr_pdev(pbv, 8, dXy)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 40, arA)
+                wr_pdev(pbv, 48, mapdev)
+                wr_pdev(pbv, 56, invbase)
+                wr_pdev(pbv, 144, lut)
+                wr_pdev(pbv, 168, Bd)
+                wr_pdev(pbv, 176, nin)
+                wr_pdev(pbv, 184, dPy)
+                launch_kernel(fdet, (nin / 64) * (cw / 128) * 8, pbv)
+                rd = rd + 1
+            }
+            sync()
+            td1<Int> = time_mono_millis()
+            detms<Float> = ((td1 - td0) as Float) / 20.0
+
+            tr0<Int> = time_mono_millis()
+            var<Int> rr2 = 0
+            while (rr2 < 20) {
+                wr_pdev(pbv, 0, dTy)
+                wr_pdev(pbv, 8, dPy)
+                wr_pdev(pbv, 16, Bd)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 32, nslot)
+                launch_kernel(fred, (Bd * cw + 255) / 256, pbv)
+                rr2 = rr2 + 1
+            }
+            sync()
+            tr1<Int> = time_mono_millis()
+            redms<Float> = ((tr1 - tr0) as Float) / 20.0
+
+            tot<Float> = zfms + detms + redms
+            println("P6R10 DETCOST atomic_ms=" + atomms.to_string_precise() + " det_ms=" + detms.to_string_precise() + " zero_ms=" + zfms.to_string_precise() + " reduce_ms=" + redms.to_string_precise() + " total_ms=" + tot.to_string_precise() + " ratio=" + (tot / atomms).to_string_precise())
+            free_dev(dPy)
+        }
+        free_dev(dTy)
+        free_dev(dXy)
+    }
+
     // ---- GATHER-COST SPIKE: 20 launches each, divided for sub-ms resolution ----
     fng<Int> = load_fn("native/build/exl3mv.ptx", "mvnod5")
     if (fng != 0) {

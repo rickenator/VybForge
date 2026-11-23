@@ -937,7 +937,9 @@ mvnodB_det(p<Int>) -> {
             # CTAs each own one slot, so every value is written exactly once and mvnodR sums
             # them in a fixed order -- bit-identical across runs.
             P<Int> = ld_i64(p + 184)
-            if (cb < cw) { st_f32(P + ((cta * B + b2) * cw + cb) * 4, acc) }
+            # the k-split is rb64 (0..511) x cta (0..7) = 4096 contributions per output, NOT 8.
+            slot<Int> = rb64 * 8 + cta
+            if (cb < cw) { st_f32(P + ((slot * B + b2) * cw + cb) * 4, acc) }
             b2 = b2 + 1
         }
     }
