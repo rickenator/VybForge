@@ -185,6 +185,35 @@ main()<Int> -> {
     }
     println("P6R10 FUSED_PATH xhat_ms=" + tf0.to_string() + " mv_ms=" + tf1.to_string() + " yhat_ms=" + tf2.to_string() + " total_ms=" + tf3.to_string())
 
+    // ---- GATHER-COST SPIKE: 20 launches each, divided for sub-ms resolution ----
+    fng<Int> = load_fn("native/build/exl3mv.ptx", "mvnod5")
+    if (fng != 0) {
+        cuMemcpyHtoD_v2(yr, zero_bytes(cw * 4), cw * 4)
+        launch_kernel(fmv, (nin / 64) * (cw / 128) * 8, pbv)
+        sync()
+        cuMemcpyHtoD_v2(yr, zero_bytes(cw * 4), cw * 4)
+        launch_kernel(fng, (nin / 64) * (cw / 128) * 8, pbv)
+        sync()
+        ta<Int> = time_mono_millis()
+        rep = 0
+        while (rep < 20) {
+            launch_kernel(fmv, (nin / 64) * (cw / 128) * 8, pbv)
+            rep = rep + 1
+        }
+        sync()
+        tb<Int> = time_mono_millis()
+        tc<Int> = time_mono_millis()
+        rep = 0
+        while (rep < 20) {
+            launch_kernel(fng, (nin / 64) * (cw / 128) * 8, pbv)
+            rep = rep + 1
+        }
+        sync()
+        td2<Int> = time_mono_millis()
+        ra<Float> = ((tb - ta) as Float) / 20.0
+        ng<Float> = ((td2 - tc) as Float) / 20.0
+        println("P6R10 GATHER_SPIKE real_gather_ms=" + ra.to_string_precise() + " nogather_ms=" + ng.to_string_precise() + " ratio=" + (ra / ng).to_string_precise())
+    }
     // ---- compare ----
     fv<Vec<Float>> = bulk_dtoh(dy, cw)
     var<Int> nbad = 0

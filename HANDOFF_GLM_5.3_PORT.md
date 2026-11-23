@@ -4876,3 +4876,18 @@ GRID GOTCHA worth remembering: the matvec needs (nin/64)*(cw/128)*8 CTAs — the
 "block" in the kernel is 8 CTAs of 256 threads. Launching the block count (1024) instead of the CTA
 count (8192) silently computes only an eighth of the output and looks like a numerics bug (it did).
 === END (rounds 20-62) ===
+=== ROUND 63: HONEST STEP NUMBERS AFTER THE FUSED EXPERT LANDS ===
+All from measured per-projection cost (45 layers, 8 routed + 1 shared expert, 3 projections each):
+    today's production path : 8 ms/projection -> step 9.72 s -> 0.103 tok/s
+    fused, optimistic (0.6) : 850 ms/step  -> 1.18 tok/s  (40x off the bar)
+    fused, conservative (1.0): 1.34 s/step -> 0.75 tok/s  (63x off the bar)
+    competitive bar         : 21.1 ms/token (45-50 tok/s)
+=> the fused expert buys roughly 8-11x on the real path (0.10 -> 0.75-1.18 tok/s) and is correctly
+   validated against deq+gemm, but it is still 40-63x from vLLM. The gap is the same one the 24 GB
+   feasibility round identified: the decode is gather/compute-bound (~7 GB/s effective vs ~273 GB/s
+   HBM), and no amount of node count fixes it (expert parallelism flattens at ~6 tok/s).
+WHAT WOULD ACTUALLY CLOSE IT, in order of expected value:
+   1. gather-restructured decode kernel (offline re-pack so the nibble walk reads sequentially)
+   2. tensor-core formulation (FP4/FP8 + tcgen05) if the dequant can be expressed as a small GEMM
+   3. multi-node only as a 2-2.5x multiplier on top of whichever of the above lands
+=== END OF SESSION (rounds 20-63) ===
