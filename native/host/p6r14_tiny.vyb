@@ -16,7 +16,7 @@ import glm_engine::{load_fn, launch_kernel, wr_pdev}
 
 main()<Int> -> {
     if (tensor_init() != 0) { println("T_FAIL cuda"); return 1 }
-    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_1s")
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm8")
     fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
     fc<Int> = load_fn("native/build/layer.ptx", "cast32")
     println("T handles: gemm=" + fp.to_string() + " widen=" + fw.to_string() + " cast=" + fc.to_string())
@@ -94,7 +94,7 @@ main()<Int> -> {
     wr_pdev(pbg, 40, K)
     wr_pdev(pbg, 56, 1)
     wr_pdev(pbg, 64, 1)
-    nblk<Int> = (((M + 3) / 4) * N + 255) / 256
+    nblk<Int> = (((M + 7) / 8) * N + 255) / 256
     rcg<Int> = launch_kernel(fp, nblk, pbg) as Int
     sync()
     println("T gemm grid=" + nblk.to_string() + " rc=" + rcg.to_string())

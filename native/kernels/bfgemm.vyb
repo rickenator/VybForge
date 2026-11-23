@@ -169,3 +169,95 @@ b2d(p<Int>) -> {
         st_f64(D + gid * 8, v)
     }
 }
+
+// bfgemm8 — 8 output rows per thread (ILP twin of bfgemm_p's 4). Same algebra,
+// same TRANSP addressing, KSP split unchanged; the point is 8 independent
+// accumulator chains per thread and half the bf16 loads per MAC. Certified by
+// the same two gates (p6r14_tiny: 36/72 exact; p6r16_real: vs host dot).
+// Params identical to bfgemm_p.
+bfgemm8(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    SK<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    KSP<Int> = ld_i64(p + 56)
+    TRANSP<Int> = ld_i64(p + 64)
+    MB<Int> = (M + 7) / 8
+    NBLK<Int> = (MB * N + 255) / 256
+    bx<Int> = blk_x()
+    ks<Int> = bx / NBLK
+    nb<Int> = bx % NBLK
+    gid<Int> = nb * dim_x() + tid_x()
+    total<Int> = M * N
+    if (gid < MB * N) {
+        mb<Int> = gid / N
+        nn<Int> = gid % N
+        mm0<Int> = mb * 8
+        kl<Int> = (K + KSP - 1) / KSP
+        k0<Int> = ks * kl
+        k1<Int> = k0 + kl
+        if (k1 > K) { k1 = K }
+        a0<Float32> = 0.0
+        a1<Float32> = 0.0
+        a2<Float32> = 0.0
+        a3<Float32> = 0.0
+        a4<Float32> = 0.0
+        a5<Float32> = 0.0
+        a6<Float32> = 0.0
+        a7<Float32> = 0.0
+        pa0<Int> = A + (mm0 * K + k0) * 4
+        pa1<Int> = pa0 + K * 4
+        pa2<Int> = pa0 + K * 8
+        pa3<Int> = pa0 + K * 12
+        pa4<Int> = pa0 + K * 16
+        pa5<Int> = pa0 + K * 20
+        pa6<Int> = pa0 + K * 24
+        pa7<Int> = pa0 + K * 28
+        pb<Int> = B + (k0 * N + nn) * 2
+        pbx<Int> = N * 2
+        if (TRANSP != 0) {
+            pb = B + (nn * K + k0) * 2
+            pbx = 2
+        }
+        kk<Int> = k0
+        while (kk < k1) {
+            bv<Float32> = ld_bf16(pb) as Float32
+            v0<Float32> = ld_f32(pa0)
+            v1<Float32> = ld_f32(pa1)
+            v2<Float32> = ld_f32(pa2)
+            v3<Float32> = ld_f32(pa3)
+            v4<Float32> = ld_f32(pa4)
+            v5<Float32> = ld_f32(pa5)
+            v6<Float32> = ld_f32(pa6)
+            v7<Float32> = ld_f32(pa7)
+            a0 = a0 + v0 * bv
+            a1 = a1 + v1 * bv
+            a2 = a2 + v2 * bv
+            a3 = a3 + v3 * bv
+            a4 = a4 + v4 * bv
+            a5 = a5 + v5 * bv
+            a6 = a6 + v6 * bv
+            a7 = a7 + v7 * bv
+            pa0 = pa0 + 4
+            pa1 = pa1 + 4
+            pa2 = pa2 + 4
+            pa3 = pa3 + 4
+            pa4 = pa4 + 4
+            pa5 = pa5 + 4
+            pa6 = pa6 + 4
+            pa7 = pa7 + 4
+            pb = pb + pbx
+            kk = kk + 1
+        }
+        st_f32(SK + (ks * total + mm0 * N + nn) * 4, a0)
+        if (mm0 + 1 < M) { st_f32(SK + (ks * total + (mm0 + 1) * N + nn) * 4, a1) }
+        if (mm0 + 2 < M) { st_f32(SK + (ks * total + (mm0 + 2) * N + nn) * 4, a2) }
+        if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn) * 4, a3) }
+        if (mm0 + 4 < M) { st_f32(SK + (ks * total + (mm0 + 4) * N + nn) * 4, a4) }
+        if (mm0 + 5 < M) { st_f32(SK + (ks * total + (mm0 + 5) * N + nn) * 4, a5) }
+        if (mm0 + 6 < M) { st_f32(SK + (ks * total + (mm0 + 6) * N + nn) * 4, a6) }
+        if (mm0 + 7 < M) { st_f32(SK + (ks * total + (mm0 + 7) * N + nn) * 4, a7) }
+    }
+}

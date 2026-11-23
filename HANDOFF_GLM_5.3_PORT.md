@@ -5470,3 +5470,24 @@ COMPUTE-bound, not bandwidth-bound -- which is exactly why ms/token kept falling
 M further is the cheapest remaining lever (M=256/512 should keep improving until the 223 GB/s wall).
 NEXT: extend the sweep to M=256 and M=512; if ms/token keeps halving, the bar is reachable by batch
 size alone. If it flattens early, the kernel needs a compute fix (more ILP / fewer loads per MAC).
+=== ROUND 95: THE BATCH CURVE PLATEAUS AT M=256 — batch leverage is exhausted ===
+    M=2    0.6667 ms  0.33333 ms/token
+    M=32   0.3333     0.01042
+    M=64   0.3333     0.00521
+    M=128  1.0000     0.00781
+    M=256  1.6667     0.00651   <- plateau
+    M=512  3.3333     0.00651   <- identical, no further gain
+Gates clean at every size (bad=0, max <= 5.03e-08).
+MEASUREMENT CAVEAT (important for anything built on these numbers): time_mono_millis has 1 ms
+resolution and these runs are 1-10 ms over 3 reps, so every figure is quantised to a multiple of
+0.333 and differences under ~30% are noise. The plateau itself is solid (M=256 and M=512 give the
+identical quantised value); individual points below M=256 are not.
+AT THE PLATEAU, 0.00651 ms/token per 4.19 MB of weights (0.001554 ms/token/MB):
+    attention 234.9 MB/layer * 0.001554 * 45 layers = 16.4 ms/token  = ~61 tok/s
+    + MoE at B=128 (18.97 ms/token, from the 2.43 s/step measurement)  = 35.3 ms/token = ~28 tok/s
+So: attention ALONE clears the 45-50 bar with room; the COMPOSED path is ~28 tok/s and needs ~1.8x.
+The kernel saturates at roughly 1.07 G MAC / 3.33 ms = ~322 GFLOP/s f32, against 223.7 GB/s of
+bandwidth headroom -- it is compute-bound, so more batch will not help. Raising GFLOP/s (independent
+accumulators per thread, fewer loads per MAC, f32 vectorisation) is now the only remaining lever.
+NEXT: measure the plateau more precisely (>=20 reps so 1 ms quantisation stops swamping the result),
+then decide between kernel compute work and measuring the composed path end to end.

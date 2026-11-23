@@ -17,7 +17,7 @@ import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev, deq_bf16}
 main()<Int> -> {
     dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
     if (tensor_init() != 0) { println("B_FAIL cuda"); return 1 }
-    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm8")
     fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
     fc<Int> = load_fn("native/build/layer.ptx", "cast32")
     fb2<Int> = load_fn("native/build/bfgemm.ptx", "b2d")
@@ -74,6 +74,7 @@ main()<Int> -> {
     ms.push(128)
     ms.push(256)
     ms.push(512)
+    ms.push(1024)
     var<Int> mi = 0
     while (mi < ms.len()) {
         M<Int> = ms.get(mi)
@@ -99,7 +100,7 @@ main()<Int> -> {
         wr_pdev(pbg, 40, K)
         wr_pdev(pbg, 56, 1)
         wr_pdev(pbg, 64, 1)
-        nblk<Int> = (((M + 3) / 4) * N + 255) / 256
+        nblk<Int> = (((M + 7) / 8) * N + 255) / 256
 
         # warm-up (first launch pays context/JIT costs that are not the kernel's)
         launch_kernel(fp, nblk, pbg)
