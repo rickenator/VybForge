@@ -483,9 +483,17 @@ main()<Int> -> {
         println("CHAIN_FAIL kernels")
         return 4
     }
-    mdw = mtp_stage_deqs(lpre45, tab, dir, total, fbf)
-    if (mdw.len() != 19) { println("CHAIN_FAIL mtp stage"); return 39 }
-    println("SETUP S3stage " + mdw.len().to_string())
+    # VYBFORGE_SKIP_MTP=1 skips the 19-tensor MTP deq stage. mdw is consumed ONLY by
+    # mtp_layer_step (speculative decoding), so the plain forward does not need it.
+    # Exists because that stage faults with rc=700 on this box before any layer runs.
+    skipM<String> = env_get("VYBFORGE_SKIP_MTP") else "0"
+    if (skipM == "1") {
+        println("SETUP S3stage skipped (VYBFORGE_SKIP_MTP)")
+    } else {
+        mdw = mtp_stage_deqs(lpre45, tab, dir, total, fbf)
+        if (mdw.len() != 19) { println("CHAIN_FAIL mtp stage"); return 39 }
+        println("SETUP S3stage " + mdw.len().to_string())
+    }
     mapd = ""
     match (open_read("native/exl3/map.bin")) {
         f -> { match (read_all(f)) { s -> { mapd = s } ? -> { return 5 } } close(f) }
