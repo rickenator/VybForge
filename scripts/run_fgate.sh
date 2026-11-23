@@ -9,10 +9,11 @@ PORT=${PORT:-18102}
 FG=${FG:-1}          # 1 = fused MoE projections, 0 = deq path
 NLAY=${NLAY:-4}
 LOG=/tmp/serve_fgate.log
-IDS="785,1234,4321,111,222,333,444,555,666,777,888,999,1010,1111,1212,1313,1414,1515,1616,1717,1818,1919"
+# IDS_OVERRIDE lets the caller run a different prompt set (>=22 ids required).
+IDS="${IDS_OVERRIDE:-785,1234,4321,111,222,333,444,555,666,777,888,999,1010,1111,1212,1313,1414,1515,1616,1717,1818,1919}"
 
 rm -f "$LOG"
-P6_FUSED_GATE="$FG" VYBFORGE_SKIP_MTP=1 VYBFORGE_SERVE_PORT="$PORT" VYBFORGE_NLAYERS="$NLAY" \
+P6_FUSED_GATE="$FG" VYBFORGE_SKIP_MTP=1 VYBFORGE_SERVE_PORT="$PORT" VYBFORGE_NLAYERS="$NLAY" VYBFORGE_CHAIN_OUT="${OUT:-native/out/decchain_vyb.txt}" \
   nohup "$HOME/Projects/Vyb/build2/vyb" \
     --module-path native/glm53 \
     --module-path native/tensor \
