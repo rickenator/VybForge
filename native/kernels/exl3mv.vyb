@@ -106,6 +106,7 @@ exl3mv1s4(p<Int>) -> {
     DBG<Int> = ld_i64(p + 96)
     STB<Int> = ld_i64(p + 104)
     ATGT<Int> = ld_i64(p + 112)
+    SBD<Int> = ld_i64(p + 120)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -149,6 +150,20 @@ exl3mv1s4(p<Int>) -> {
     inbase<Int> = rb64 * 64 + cta * 8
 
     kernel_barrier()
+
+    # diagnostic: dump THIS CTA's slab tile (8 rows x 128 cols) when it is the
+    # chosen one (nb128 == 2, rb64 == 0, cta == 0) so the host can compare the
+    # decoder's output for a block-2 CTA against the proven T.
+    if (SBD != 0 && nb128 == 2 && rb64 == 0 && cta == 0) {
+        kd<Int> = 0
+        while (kd < 4) {
+            ed<Int> = within + kd * 256
+            bd<Int> = ed / 128
+            cd<Int> = ed - bd * 128
+            st_f32(SBD + (bd * 128 + cd) * 4, ld_shared_f32(bd * 512 + cd * 4))
+            kd = kd + 1
+        }
+    }
 
     # ---- phase 2: per-OUTPUT dot down the slab columns ----
     # The EXL3 buffer is W^T: slab ROWS are the input dim (su scales them), slab

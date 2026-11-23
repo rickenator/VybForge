@@ -4661,3 +4661,20 @@ If byr is fine, then the kernel's T pointer differs from the host's byr (a param
 Fused path proven: algebra W = H(T(Hx)), W^T layout, su-before-H / sv-after-H, bit-identical decode,
 exact xp, exact accumulators (plain store and fresh-buffer atomics both correct). Open: the T buffer
 not receiving atomics past 1 KB. Everything else in the program is green; the 24 GB verdict stands.
+=== ROUND 49: THE FRESH-BUFFER ATOMIC RESULT ALSO DISAGREES WITH THE HOST (4.18 apart) ===
+Gating the ONLY=2 run against the FRESH buffer's readback (the one place the atomics demonstrably
+land) instead of T:
+    ATGT v256 = -3.22900   v257 = 5.21946   (values are present and stable)
+    host  u[256]            =  (ATGT disagrees by max 4.18)
+So the atomics land, the accumulator has a value, but that value is not what the host computes from
+the proven T and the proven xp. A plain store of one CTA's acc gave -0.0678 (plausible), yet the sum
+over 512 CTAs is an order of magnitude larger than the host's random-walk expectation.
+This means the per-CTA contributions for column block 2 are numerically wrong in a way none of the
+isolated tests (single CTA, small grids, block 0/1) exposed.
+=== FINAL STOP FOR THIS SESSION ===
+After rounds 20-49 the fused path stands as: algebra correct (W = H(T(Hx))), layout correct (W^T),
+scaling order correct (su before H, sv after yhat), decode bit-identical, xp exact, single-CTA and
+small-grid partials exact, atomic mechanics healthy — and the block-2+ accumulation numerically
+wrong in a way that needs a fresh, minimal, hand-written reproducer (one block, one CTA's slab
+dumped to host, compared term by term). That is the only remaining work on this kernel.
+Everything else in the program is green and unaffected.
