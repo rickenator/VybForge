@@ -5553,3 +5553,25 @@ and the fix is a real reduction (each CTA owning exclusive outputs, or a separat
 than micro-optimising the decode.
 REMINDER OF THE LARGER PICTURE: attention ~101 tok/s (certified bfgemm8), MoE ~52.7 tok/s,
 composed ~34.7 tok/s vs the 45-50 bar. The MoE dot is where the remaining 1.5x lives.
+=== ROUND 99: ATOMICS REFUTED, AND THE REAL MoE WASTE FOUND: 36x OF DEAD WORK PER LAUNCH ===
+(mvnodB_st: plain store instead of atomic_add_f32 at B=128 -> 1.4 ms vs 1.3 ms. IDENTICAL within
+noise. The atomics hypothesis is dead; mvnodB_st stays in exl3mv.vyb as a documented timing artifact
+and must never be used for results -- its k-split races by construction.)
+WHAT THE MEASUREMENT ACTUALLY REVEALED:
+  - one mvnodB launch does 128 x 2048 x 4096 = 1.074 G MAC in 1.3 ms = 826 GFLOP/s. That is FASTER than
+    bfgemm8's 537 GFLOP/s, i.e. the MoE dot is not slow at all. My round-98 estimate of 1.9 GFLOP/s was
+    simply wrong (I forgot the k-split replication when counting work).
+  - the waste is elsewhere: with B=128 tokens and top-8 routing, there are 128*8 = 1024 assignments
+    spread over <=288 experts = ~3.6 tokens per expert. But the kernel multiplies ALL 128 tokens by
+    EVERY expert's weights. Useful fraction 3.6/128 = 2.8% -> **36x of the MoE's work is dead**.
+  - cross-check: 288 experts x 3 projections = 864 launches x 1.3 ms = 1.12 s/step, the same order as
+    the measured 2.43 s/step (the rest being Hadamard passes, the gate, and scheduling).
+IF THE MATVEC WERE COMPACTED TO THE ASSIGNED TOKENS (the gather that every production MoE does):
+    MoE 2.43 s/step -> ~0.03 s/step = ~0.2 ms/token
+    composed with attention (9.86 ms/token) = ~10.1 ms/token = **~99 tok/s**, comfortably past the bar
+THIS IS NOW THE SINGLE HIGHEST-VALUE CHANGE IN THE PROJECT -- worth far more than any kernel
+micro-optimisation: it is not making the arithmetic faster, it is not doing 36x of it.
+IMPLEMENTATION SHAPE: the router already produces the top-k assignment. Build, per expert, the list of
+token indices routed to it (a small scatter), then launch the expert matvec over only those tokens
+(nin reads gathered by index; cw outputs scattered back to their token rows). At B=128 the per-expert
+batch is ~4, so the launch count stays the same but each launch is ~32x cheaper.
