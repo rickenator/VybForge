@@ -5822,3 +5822,6 @@ it simply needed a caller that runs.
         POST /v1/generate?ids=785,1234&nsteps=1
     (the header comment at :47 says JSON, but the code reads q.index_of("ids=") / ("nsteps=") off the
     request path). Sending JSON gives "CHAIN_FAIL ids 0" and the request is dropped.
+    ALSO: the ids list must contain at least 22 ids ("CHAIN_FAIL ids 2" otherwise). Phase 1 prefills
+    ids[0..19] and the two teacher-forced decode steps re-walk ids[20] and ids[21], so the driver needs
+    all three groups present even for nsteps=1.
