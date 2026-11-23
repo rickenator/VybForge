@@ -6422,3 +6422,26 @@ magnitude, and NOT because of the matvec (23%) or the I/O (5%). The targets, in 
     (4) resolve                     0.75 s/layer -- tab/HashMap/String churn, ~94 ms per expert
 Step 1 of the plan (make I/O active-set-only) is therefore NOT the right next move: it would optimise
 5% of the problem. Step 3 was worth doing precisely because it prevented that.
+=== ROUND 141: T_SPLIT FOUND THE REAL COST -- load_fn INSIDE THE EXPERT LOOP (1.85x layer speedup) ===
+Added sub-timers to the T_TAIL block (mR/mE/mS/mM/mH -> "T_SPLIT router= experts= shared= combine=
+hc_apply= after="). At NLAY=6 the opaque 3.2 s was NOT router/shared/hc_apply:
+    T_SPLIT router=3  experts=1530  shared=43  combine=0  hc_apply=2      (ms per layer)
+    T_MOE   resolve=18..28  deq=229..295  mm=1177..1204
+The expert loop was 95% of the layer and "mm" was 77% of THAT. 1.2 s for 24 single-token matvecs is
+~147 ms per expert against a 0.65 ms microbenchmark -- 300x, so it was not GEMM time at all.
+ROOT CAUSE: load_fn() re-reads the ENTIRE PTX file and calls cuModuleLoadData (a full module load) on
+every call, and the function made SIXTEEN such calls per expert iteration (fxb/fyb/fmb/flt, the det/reduce
+pair at each of the three projection sites, and the D-variants). My own deterministic-matvec wiring this
+morning added six of them; the gate kernels were already per-expert before that.
+FIX 1 -- hoist: six unique handles loaded ONCE per layer instead of 16 per expert.
+    T_SPLIT experts 1530..1619 -> 958..1055 ,  T_MOE mm 1177..1204 -> 672..683 ,  T_TAIL 1578..1668 -> 1009..1106
+FIX 2 -- preallocate the partial buffer: mvn_det_run was calling dev_alloc/free for a 4 MB buffer on
+every projection. It now takes a `P` argument allocated once per layer (mvn_partial_bytes(R); every
+shape here has NS*cw == 1 Mi so one buffer serves gate, up and down), freed on both exit paths.
+    T_MOE mm 672..683 -> 531..538 ,  experts 958..1055 -> 782..880
+CUMULATIVE: T_TAIL 1668 -> ~850 ms (1.85x on the decode layer).
+CORRECTNESS AT EVERY STEP: 1014 comparisons, 0 failures (NLAY=6); and at NLAY=45 the fused-only digests
+are BIT-IDENTICAL to native/baselines/digest_fused_only45.txt -- the optimisations changed no numerics.
+STILL TO ATTACK: mm remains ~531 ms per layer, ~34x the microbenchmark for 24 matvecs. Per-call costs
+left inside it: the per-projection weight upload, 14 wr_pdev scalar param writes, and 2 sync() per
+call. Next: preallocate/hoist those the same way.

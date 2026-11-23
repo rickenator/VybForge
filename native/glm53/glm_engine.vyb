@@ -1622,9 +1622,10 @@ had_hoist32(fhgen32<Int>)<Int> -> {
 # Returns 0 on success. `pb` must be >= 192 bytes (the det kernel reads its partial pointer at +184).
 share(all)
 mvn_det_run(fdet<Int>, fred<Int>, T<Int>, X<Int>, cw<Int>, q<Int>, td<Int>, inv<Int>, LUT<Int>,
-            Bt<Int>, nin<Int>, pb<Int>)<Int> -> {
+            Bt<Int>, nin<Int>, pb<Int>, P<Int>)<Int> -> {
     NS<Int> = (nin / 64) * 8
-    P<Int> = dev_alloc(NS * Bt * cw * 4)
+    # P is preallocated by the caller (see mvn_partial_bytes): allocating and freeing a 4 MB device
+    # buffer per projection put cudaMalloc/cudaFree in the hottest loop.
     if (P == 0) { return 1 }
     wr_pdev(pb, 0, T)
     wr_pdev(pb, 8, X)
@@ -1646,17 +1647,23 @@ mvn_det_run(fdet<Int>, fred<Int>, T<Int>, X<Int>, cw<Int>, q<Int>, td<Int>, inv<
     wr_pdev(pb, 32, NS)
     launch_kernel(fred, (Bt * cw + 255) / 256, pb)
     sync()
-    free_dev(P)
     return 0
 }
 
 # mvn_run — run the fused matvec deterministically when the PTX provides the pair, otherwise fall
 # back to the atomic kernel (correct, but summation order varies per run). Grid is the same for both.
+# Bytes needed for the deterministic partials: every shape here has NS*cw == (nin/64)*8*cw == 1 Mi
+# (gate/up: 512 x 2048; down: 256 x 4096), so one buffer of Bt * 1 Mi * 4 bytes serves all three.
+share(all)
+mvn_partial_bytes(Bt<Int>)<Int> -> {
+    return Bt * 1048576 * 4
+}
+
 share(all)
 mvn_run(fdet<Int>, fred<Int>, fatomic<Int>, grid<Int>, T<Int>, X<Int>, cw<Int>, q<Int>, td<Int>,
-        inv<Int>, LUT<Int>, Bt<Int>, nin<Int>, pb<Int>)<Int> -> {
+        inv<Int>, LUT<Int>, Bt<Int>, nin<Int>, pb<Int>, P<Int>)<Int> -> {
     if (fdet != 0 && fred != 0) {
-        return mvn_det_run(fdet, fred, T, X, cw, q, td, inv, LUT, Bt, nin, pb)
+        return mvn_det_run(fdet, fred, T, X, cw, q, td, inv, LUT, Bt, nin, pb, P)
     }
     var<Int> zw = 0
     while (zw < Bt * cw * 4) { wr_pdev(T, zw, 0) ; zw = zw + 8 }
@@ -3230,6 +3237,20 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
         r = r + 1
     }
 
+    # ---- sub-timers: T_TAIL was one opaque ~6.5 s number; this splits it ----
+    # ---- kernel handles: HOISTED out of the expert loop ----
+    # load_fn() re-reads the whole PTX and calls cuModuleLoadData (a full module load). Calling it
+    # per expert -- which this loop did, 16 times per iteration -- cost ~1.2 s per layer and was
+    # hiding inside the T_MOE "mm" timer. Load once per layer instead.
+    fmbDet<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
+    fmbRed<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
+    fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
+    fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
+    fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+    flt<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
+    pP<Int> = dev_alloc(mvn_partial_bytes(R))
+    if (pP == 0) { return nonev }
+    mR<Int> = time_mono_millis()      # end of router
     # ---- routed experts: one dequant per (expert, projection), FFN on that expert's tokens
     accr<Vec<Float>> = Vec()
     i = 0
@@ -3475,10 +3496,6 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             # the deq; `nb2` is 0 there for the fused-only case because there is nothing to compare
             # against, which is why the adopt still fires.
             if (fgate == "1" && nt > 0) {
-                fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
-                fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
-                fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
-                flt<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
                 if (fxb != 0 && fyb != 0 && fmb != 0 && flt != 0) {
                     dLUT<Int> = dev_alloc(262144)
                     dsu<Int> = dev_alloc(g_ge_1.len())
@@ -3518,9 +3535,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         launch_kernel(fxb, nt * (H / 128), pb32)
                         sync()
                         # DETERMINISTIC fused gate: per-split partials + fixed-order reduce
-                        fmbDet<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
-                        fmbRed<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
-                        mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32)
+                        mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32, pP)
                         # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
@@ -3576,9 +3591,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 40, nt)
                         launch_kernel(fxb, nt * (H / 128), pb32)
                         sync()
-                        fmbDetS<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
-                        fmbRedS<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
-                        mvn_run(fmbDetS, fmbRedS, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32)
+                        mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32, pP)
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
                         wr_pdev(pb32, 16, hdg32)
@@ -3626,9 +3639,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             wr_pdev(pb32, 40, nt)
                             launch_kernel(fxb, nt * (H / 128), pb32)
                             sync()
-                            fmbDetU<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
-                            fmbRedU<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
-                            mvn_run(fmbDetU, fmbRedU, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQu, mapdev, invbase, dLUT, nt, H, pb32)
+                            mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQu, mapdev, invbase, dLUT, nt, H, pb32, pP)
                             wr_pdev(pb32, 0, dyr)
                             wr_pdev(pb32, 8, dyp)
                             wr_pdev(pb32, 16, hdg32)
@@ -3691,11 +3702,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             fTolDS<String> = env_get("P6_FUSED_TOL") else "3e-05"   # see the gate-projection note
             fTolD<Float> = fTolDS.to_float()
             if (fgateD == "1" && nt > 0) {   # load-bearing in production -- see the gate note above
-                fxbD<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
-                fybD<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
-                fmbD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
-                fltD<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
-                if (fxbD != 0 && fybD != 0 && fmbD != 0 && fltD != 0) {
+                if (fxb != 0 && fyb != 0 && fmb != 0 && flt != 0) {
                     dLUTD<Int> = dev_alloc(262144)
                     dQD<Int> = dev_alloc(g_ge_6.len())
                     dsuD<Int> = dev_alloc(g_ge_7.len())
@@ -3707,7 +3714,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                     dYp<Int> = dev_alloc(nt * H * 8)
                     if (dLUTD != 0 && dQD != 0 && dsuD != 0 && dsvD != 0 && dX64 != 0 && dXf != 0 && dXh != 0 && dYr != 0 && dYp != 0) {
                         wr_pdev(pb32, 0, dLUTD)
-                        launch_kernel(fltD, 256, pb32)
+                        launch_kernel(flt, 256, pb32)
                         sync()
                         cuMemcpyHtoD_v2(dQD, g_ge_6, g_ge_6.len())
                         cuMemcpyHtoD_v2(dsuD, g_ge_7, g_ge_7.len())
@@ -3724,18 +3731,16 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 24, dsuD)
                         wr_pdev(pb32, 32, EINTER)
                         wr_pdev(pb32, 40, nt)
-                        launch_kernel(fxbD, nt * (EINTER / 128), pb32)
+                        launch_kernel(fxb, nt * (EINTER / 128), pb32)
                         sync()
-                        fmbDetD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB_det")
-                        fmbRedD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodR")
-                        mvn_run(fmbDetD, fmbRedD, fmbD, (EINTER / 64) * (H / 128) * 8, dYr, dXh, H, dQD, mapdev, invbase, dLUTD, nt, EINTER, pb32)
+                        mvn_run(fmbDet, fmbRed, fmb, (EINTER / 64) * (H / 128) * 8, dYr, dXh, H, dQD, mapdev, invbase, dLUTD, nt, EINTER, pb32, pP)
                         wr_pdev(pb32, 0, dYr)
                         wr_pdev(pb32, 8, dYp)
                         wr_pdev(pb32, 16, hdg32)
                         wr_pdev(pb32, 24, H)
                         wr_pdev(pb32, 32, dsvD)
                         wr_pdev(pb32, 40, nt)
-                        launch_kernel(fybD, nt * (H / 128), pb32)
+                        launch_kernel(fyb, nt * (H / 128), pb32)
                         sync()
                         FD<Vec<Float>> = bulk_dtoh(dYp, nt * H)
                         var<Int> nbd = 0
@@ -3786,6 +3791,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
         }
         e = e + 1
     }
+    mE<Int> = time_mono_millis()      # end of the routed-expert loop
     println("routed experts used: " + nex.to_string())
     println("T_RSLV nopen=" + nopen.to_string() + " scan=" + acc_scan.to_string() + " open=" + acc_open.to_string() +
             " lookup=" + (acc_res - acc_scan - acc_open).to_string())
@@ -3805,7 +3811,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     d_su = deq_bf16(fbf, g_gs_1, EINTER * H, H)
     g_gs_2 = gx_read(gs, 2)
     d_sd = deq_bf16(fbf, g_gs_2, H * EINTER, EINTER)
-    if (d_sg == 0 || d_su == 0 || d_sd == 0) { return nonev }
+    if (d_sg == 0 || d_su == 0 || d_sd == 0) { free_dev(pP) ; return nonev }
     sgate<Vec<Float>> = mm_host(h2, R, H, d_sg, EINTER, fgemm)
     sup<Vec<Float>> = mm_host(h2, R, H, d_su, EINTER, fgemm)
     sact<Vec<Float>> = Vec()
@@ -3826,6 +3832,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
         cuMemFree_v2(d_sd)
     }
 
+    mS<Int> = time_mono_millis()      # end of the shared expert
     mlp<Vec<Float>> = Vec()
     i = 0
     while (i < R * H) {
@@ -3834,7 +3841,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     }
 
 
+    mM<Int> = time_mono_millis()      # end of the routed+shared combine
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
+    mH<Int> = time_mono_millis()      # end of hc_apply
     dg33<String> = digest("mlp", mlp)
     dg34<String> = digest("streams2", streams2)
     println(dg34)
@@ -3846,6 +3855,13 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
 
     println("T_TAIL total=" + (time_mono_millis() - tt0).to_string() +
             " (router+MoE+shared+hc_apply)")
+    println("T_SPLIT router=" + (mR - tt0).to_string() +
+            " experts=" + (mE - mR).to_string() +
+            " shared=" + (mS - mE).to_string() +
+            " combine=" + (mM - mS).to_string() +
+            " hc_apply=" + (mH - mM).to_string() +
+            " after=" + (time_mono_millis() - mH).to_string())
+    free_dev(pP)
     return streams2
 }
 
