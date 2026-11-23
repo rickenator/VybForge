@@ -6024,3 +6024,23 @@ ALSO FIXED THIS ROUND: removing glm_engine's duplicate extern block meant probes
 cuMemcpyHtoD_v2 directly lost the transitive declaration ("Undefined identifier"). Added
 `import cuda_binding::{...}` to the 9 affected probes (p6r10, p6r8_e2e, p6r13, p6r9, p6r17, p6r15,
 p6r4, p6r16, p6r5) -- the same module-local rule the binding documents.
+=== ROUND 123: 45-LAYER DIGEST A/B -- HARNESS BUILT; 4-LAYER SMOKE ALREADY ANSWERS THE QUESTION ===
+scripts/digest_ab.sh runs two fresh glm_serve processes (deq vs P6_FUSED_GATE=1 + P6_FUSED_ONLY=1),
+each with its OWN VYBFORGE_CHAIN_OUT file, then diffs the "phase1 layer N <digest>" lines. Fresh output
+files are required: glm_serve APPENDS, and native/out/decchain_vyb.txt is a 1.07 GB accumulation of 3375
+such lines from every past run -- useless for a comparison.
+4-LAYER SMOKE RESULT (NL=4): layers 0,1,2 IDENTICAL; layer 3 (the first MoE layer) differs:
+    deq   sum=-34964464025411  v0=540048745157
+    fused sum=-34964480911653  v0=540048768469
+Relative deltas across all digest fields: 4.1e-08 .. 4.8e-07, i.e. AT OR BELOW float32 epsilon
+(1.2e-7), with the worst field being `sum` (a cancellation-prone aggregate). The differences appear
+ONLY in the layer where the fused path is active and have the signature of a different ACCUMULATION
+ORDER, which is exactly what the fused chain is (same algebra, different summation sequence, no f32
+round-trip).
+SO, ANSWERING THE GOAL PRECISELY: the fused MoE is NOT bit-identical to the deq baseline. It is
+numerically equivalent to float32 precision. Whether that is acceptable is a policy decision, not a
+measurement: bit-identical digests are the project's historical gate, and this path cannot meet that by
+construction.
+THE 45-LAYER RUN IS NOW IN FLIGHT (same script, NL=45) to answer the remaining question: does the ~1e-7
+per-layer difference COMPOUND across 45 layers (drift), or stay bounded? That is what decides whether
+the flag can ever be defaulted.
