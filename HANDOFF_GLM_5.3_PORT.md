@@ -5300,3 +5300,25 @@ then re-ask whether the String upload is wrong at all. The compiler's String->lo
 exonerated for now: real modules (glm_engine:299/328/575, exl3_load:66) upload multi-MB Strings and
 their results are bit-exact, which is strong evidence the conversion works.
 === END (rounds 20-85) ===
+=== ROUND 86: *** STEP 0 PASSES *** — THE COMPILER WAS NEVER BROKEN; IT WAS bulk_dtoh's WIDTH ===
+  S0 DECODED first=-0.0107421875 second=0.0137939453125
+  S0_PASS bf16 round-trip verified: 0xBC30 -> -0.0107421875
+and the Python oracle on the same tensor agrees exactly: first 4 as bf16 = -0.010742188 0.013793945
+-0.0076599121 -0.0026702881 (shard model-00005-of-00083, data_off 67874992, size 4194304, dtype BF16).
+THE ROOT CAUSE, after ~15 rounds of chasing it (all of them my own probe's):
+  1. bulk_dtoh(base, n) copies n*8 bytes and reads them as f64 (tensor.vyb:159). My probe's kernels
+     stored f32, so EVERY readback was a width mismatch -- that is where 2.22e31, 51539616020 and
+     7.8e-18 came from. None of it was ever evidence about uploads.
+  2. bf16.vyb has TWO twins: bf16deq stores f64, bf16deq32 stores f32. I used deq32 and read with
+     bulk_dtoh (f64) -> garbage. bf16deq with z=0 stores LINEAR f64 -> correct.
+  3. z>0 means TRANSPOSED (rr=gid/z, cc=gid%z, at cc*(n/z)+rr) -- so passing z=K with a wrong n
+     scrambles the layout. For a linear first-8 check, z must be 0.
+  4. The String upload is FINE -- deq_bf16(faddr, rawString, n, z) passes the String straight to
+     cuMemcpyHtoD_v2 (glm_engine:299) and lands the exact bytes. No hand-rolled copy is needed, and
+     my hand-rolled addr()/at() attempt crashed the process (that at() pattern is for a Vec, not a String).
+WITHDRAWN: the "String->device upload is broken" claim and the compiler-bug escalation. The compiler's
+String handling is correct; the bug was a f32/f64 width mismatch in my own readback. Two rounds were
+spent inferring a compiler defect from a mis-typed readback -- the lesson is to validate the probe
+against a KNOWN value (this test does: 0xBC30 -> -0.0107421875, matching an independent Python oracle)
+BEFORE drawing any conclusion from it.
+NEXT: the attention build can now proceed -- bfgemm_p is validated and BF16 weights load correctly.

@@ -77,10 +77,9 @@ main()<Int> -> {
     dB<Int> = dev_alloc(N * K * 2)
     dF<Int> = dev_alloc(N * K * 4)
     if (dB == 0 || dF == 0) { println("BFG_FAIL alloc"); return 5 }
-    cuMemcpyHtoD_v2(dB, g0, N * K * 2)
     sync()
     # the engine's own decoder: takes the raw String, uploads and converts
-    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq32")
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")   # f64 twin: bulk_dtoh reads f64
     dF2<Int> = deq_bf16(fbf, g0, N * K, 0)
     if (dF2 == 0) { println("BFG_FAIL deq_bf16"); return 6 }
     sync()
