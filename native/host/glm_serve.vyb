@@ -738,7 +738,11 @@ main()<Int> -> {
                     # state is the mean over its 4 layer-44 streams -> trunk final norm -> hnorm, and
                     # e = enorm(embed(token)); the per-row MTP input + post-layer hidden are dumped
                     # full precision for the gold oracle (gate A / gate B inputs).
-                    if (nlay == 45) {
+                    # VYBFORGE_SKIP_MTP also skips the MTP HEAD, not just its weights: the head is a
+                    # separate speculative layer 45 whose inputs (mdw) only exist if the stage deq
+                    # succeeded. The 45 main-layer digests are produced in phase 1, above, so gating
+                    # this block does not affect them.
+                    if (nlay == 45 && skipM != "1") {
                     secT = now_ms()
                         println("CHAIN phase 1b: MTP head over " + sv_R.to_string() + " prompt tokens")
                         # fresh index/map strings: phase 1's 45 layers of String churn corrupt a buffer
