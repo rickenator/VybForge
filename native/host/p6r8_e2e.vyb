@@ -331,9 +331,26 @@ main()<Int> -> {
         wr_pdev(pbm, 56, invbase)
         wr_pdev(pbm, 64, dscr)
         wr_pdev(pbm, 72, 0)
+        cnt2b<Int> = dev_alloc(8192)
+        cuMemcpyHtoD_v2(cnt2b, zero_bytes(8192), 8192)
+        wr_pdev(pbm, 80, cnt2b)
         cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
         launch_kernel(fmv, 8192, pbm)
         cuCtxSynchronize()
+        cnt2f<Int> = dev_alloc(16384)
+        wr_pdev(pb32, 0, cnt2b)
+        wr_pdev(pb32, 8, cnt2f)
+        wr_pdev(pb32, 16, 2048)
+        launch_kernel(fcv, 8, pb32)
+        cuCtxSynchronize()
+        C2<Vec<Float>> = bulk_dtoh(cnt2f, 2048)
+        var<Int> zeros2 = 0
+        n12<Int> = 0
+        while (n12 < 2048) {
+            if ((C2.get(n12) as Int) == 0) { zeros2 = zeros2 + 1 }
+            n12 = n12 + 1
+        }
+        println("E2E PEROUT zero_outputs=" + zeros2.to_string() + " c0=" + (C2.get(0) as Int).to_string() + " c255=" + (C2.get(255) as Int).to_string() + " c256=" + (C2.get(256) as Int).to_string() + " c2047=" + (C2.get(2047) as Int).to_string())
         u64<Int> = dev_alloc(16384)
         wr_pdev(pb32, 0, byr)
         wr_pdev(pb32, 8, u64)

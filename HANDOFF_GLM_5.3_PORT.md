@@ -4558,3 +4558,20 @@ NEXT (one run): dump yhat's coverage like the mv's block counter (atomic_add_f32
 output) or simply print which indices are untouched. Fix the grid/guard so all 16 blocks write.
 Everything else in the fused chain is now proven: layout, decode (bit-identical), xp (exact), the
 dots/atomics/coverage (GRIDFULL exact), and the algebraic order (su before H, sv after yhat).
+=== ROUND 43: u IS WRONG FROM OUTPUT 256 ON — and everything feeding it is proven ===
+Full-u comparison (u[n] vs sum_k T[k][n].xp[k] on the host, ALL 2048 outputs, x = ones):
+    U_FULL count_over_1e-4 = 1792   max_abs = 5.06   first_bad = 256
+i.e. u is correct for outputs 0..255 (two column blocks) and wrong for 256..2047 (14 blocks), which
+is exactly the complement of the earlier "256 unwritten" observation — so the mv's yraw tail is the
+fault and yhat was only reporting it.
+WHAT IS PROVEN AND CANNOT BE THE CAUSE: xp (0 diffs over 4096), the decode (0 diffs over 8.4M vs
+the oracle), the per-block coverage counter (65536 = 512x128 on every one of the 16 blocks), the
+single-CTA partial (exact), and grids 2/4/8/128 (exact).
+CONTRADICTION TO CHASE: coverage says every block gets 512 CTA contributions, yet only blocks 0..1
+produce correct sums. Either the atomic target address is wrong for nb128 >= 2 despite the counter
+being right (both use the same nb128 expression — suspect CODEGEN of the atomic address), or the
+slab/xp values differ for those CTAs in a way the isolated tests did not exercise.
+NEXT SESSION, first move: in exl3mv1s4 phase 2, atomically add 1.0 to a SECOND counter indexed by
+(nb128*128 + d) and dump all 2048 values — if that histogram is uniform, the addresses are fine and
+the values are wrong; if it is zero beyond 255, the atomic address computation is broken for
+nb128 >= 2 (a codegen bug worth a minimal repro for the Vyb compiler).
