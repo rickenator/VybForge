@@ -19,6 +19,7 @@ main()<Int> -> {
     dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
     if (tensor_init() != 0) { println("BFG_FAIL cuda"); return 1 }
     fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    println("BFG handle fp=" + fp.to_string())
     fdq<Int> = load_fn("native/build/bf16.ptx", "bf16deq32")
     finvk<Int> = load_fn("native/build/exl3.ptx", "exl3inv")
     if (fp == 0 || fdq == 0) { println("BFG_FAIL fn p=" + fp.to_string() + " dq=" + fdq.to_string()); return 2 }
@@ -91,8 +92,18 @@ main()<Int> -> {
     xv<Vec<Float>> = Vec()
     var<Int> i = 0
     while (i < M * K) { xv.push(((i % 11) as Float) * 0.0625 - 0.25) ; i = i + 1 }
+    # bulk_htod writes f64; bfgemm_p reads A as f32. Cast on device first
+    # (the same two-step mm_host32 uses).
+    dA64<Int> = dev_alloc(M * K * 8)
+    bulk_htod(dA64, view(xv))
+    fcast<Int> = load_fn("native/build/layer.ptx", "cast32")
     dA<Int> = dev_alloc(M * K * 4)
-    bulk_htod(dA, view(xv))
+    pbc<Int> = dev_alloc(32)
+    wr_pdev(pbc, 0, dA64)
+    wr_pdev(pbc, 8, dA)
+    wr_pdev(pbc, 16, M * K)
+    launch_kernel(fcast, (M * K + 255) / 256, pbc)
+    sync()
     dS<Int> = dev_alloc(M * N * 4)
     pbg<Int> = dev_alloc(96)
     wr_pdev(pbg, 0, dA)
@@ -103,9 +114,21 @@ main()<Int> -> {
     wr_pdev(pbg, 40, K)
     wr_pdev(pbg, 56, 1)
     wr_pdev(pbg, 64, 1)     # TRANSP: the file is [N][K]
-    launch_kernel(fp, 1, pbg)
+    nblk<Int> = ((M + 3) / 4 * N + 255) / 256
+    println("BFG grid=" + nblk.to_string())
+    rc_bf<Int> = launch_kernel(fp, nblk, pbg) as Int
+    println("BFG launch rc=" + rc_bf.to_string())
     sync()
-    OF<Vec<Float>> = bulk_dtoh(dS, M * N)
+    # dS holds f32; bulk_dtoh reads f64 -- widen first (the bug that has bitten
+    # every probe in this session)
+    fw32<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
+    dS64<Int> = dev_alloc(M * N * 8)
+    wr_pdev(pbc, 0, dS)
+    wr_pdev(pbc, 8, dS64)
+    wr_pdev(pbc, 16, M * N)
+    launch_kernel(fw32, (M * N + 255) / 256, pbc)
+    sync()
+    OF<Vec<Float>> = bulk_dtoh(dS64, M * N)
 
     # reference for the first 16 outputs of both rows
     NREFL<Int> = 64

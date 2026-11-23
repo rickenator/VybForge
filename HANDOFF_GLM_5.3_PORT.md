@@ -5322,3 +5322,18 @@ spent inferring a compiler defect from a mis-typed readback -- the lesson is to 
 against a KNOWN value (this test does: 0xBC30 -> -0.0107421875, matching an independent Python oracle)
 BEFORE drawing any conclusion from it.
 NEXT: the attention build can now proceed -- bfgemm_p is validated and BF16 weights load correctly.
+=== ROUND 87: bfgemm_p IS **NOT** VALIDATED — the 2.4e-11 WAS GARBAGE-vs-GARBAGE ===
+With the reference decoded correctly (bf16deq, f64, z=0) the picture inverts:
+    BFG using N=512 K=4096 first4=48,188,98,60
+    w[0][0]=-0.0107421875   w[1][1]=0.016845703125        <- weights now provably correct
+    BFG_GATE count_over_1e-4=128  max_abs=0.77522620372474194  of 128   <- GEMM MISMATCHES
+Round 78's "agrees with deq_bf16 to 2.37e-11" compared two near-zero denormal buffers: the reference
+was f32-encoded data read as f64, so both sides were ~1e-18 and "agreement" meant nothing. With real
+O(1e-2) weights the kernel is wrong on all 128 outputs, max error 0.7752.
+SO: bfgemm_p's addressing / TRANSP / split-K needs debugging before ANY attention projection is built
+on it. Do not trust the earlier PASS. Likely suspects (in order): the TRANSP=1 [N][K] indexing, the
+4-rows-per-thread output mapping, and the split-K reduction (KSP=1 + a separate reduce step that the
+probe may not have invoked -- if gemm32_r's twin is missing, the partial sums are never combined,
+which would produce exactly this "plausible but wrong" profile).
+Lesson (twice in a row now): a numerical gate only means something when the INPUT magnitudes are
+real. Both of today's withdrawn claims (String upload, bfgemm PASS) came from near-zero buffers.

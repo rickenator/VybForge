@@ -79,3 +79,17 @@ bfgemm_p(p<Int>) -> {
         if (mm0 + 3 < M) { st_f32(SK + (ks * total + (mm0 + 3) * N + nn) * 4, a3) }
     }
 }
+
+// widen32 — f32 -> f64, for reading an f32 kernel's output with bulk_dtoh
+// (which copies n*8 bytes and reads f64). Probe-only helper.
+// p: +0 src(f32), +8 dst(f64), +16 n
+widen32(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    D<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        v<Float> = ld_f32(S + gid * 4)
+        st_f64(D + gid * 8, v)
+    }
+}
