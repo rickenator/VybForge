@@ -76,6 +76,7 @@ main()<Int> -> {
     cuMemcpyHtoD_v2(arG, zero_bytes(16384), 16384)
     cuMemcpyHtoD_v2(arH, zero_bytes(16384), 16384)
     println("E2E zeroed work buffers")
+    println("E2E ptrs bx=0x" + hexv(bx) + " bxp=0x" + hexv(bxp) + " H=0x" + hexv(hd_pre32) + " arG=0x" + hexv(arG) + " byr=0x" + hexv(byr))
     // tab (layer 3)
     cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
     cs<String> = ""
@@ -211,6 +212,22 @@ main()<Int> -> {
     println(line)
     if (nd == 0) { println("E2E_DONE FUSED_OK") } else { println("E2E_DONE FUSED_FAIL") }
     return 0
+}
+
+hexv(v<Int>)<String> -> {
+    digs<Vec<String>> = Vec()
+    digs.push("0") ; digs.push("1") ; digs.push("2") ; digs.push("3")
+    digs.push("4") ; digs.push("5") ; digs.push("6") ; digs.push("7")
+    digs.push("8") ; digs.push("9") ; digs.push("a") ; digs.push("b")
+    digs.push("c") ; digs.push("d") ; digs.push("e") ; digs.push("f")
+    s<String> = ""
+    k<Int> = 0
+    while (k < 12) {
+        n<Int> = (v >> (k * 4)) & 15
+        s = digs.get(n) + s
+        k = k + 1
+    }
+    return s
 }
 
 zero_bytes(n<Int>)<String> -> {

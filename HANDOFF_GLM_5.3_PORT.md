@@ -4429,3 +4429,19 @@ GLOBAL reads or out-of-bounds), then re-examine the atomic accumulation with the
 The lean driver is p6r8_e2e; the oracle and the host references are all in place.
 TIME SPENT ON THIS KERNEL: rounds 20-34. Everything except the accumulation's correctness is
 proven. This is the right place to stop and pick it up fresh with initcheck.
+=== ROUND 35: INITCHECK NAMES THE FAULT CLASS — exl3xhat READS UNINITIALISED GLOBAL MEMORY ===
+compute-sanitizer --tool initcheck on the lean driver: 100 "Uninitialized __global__ memory read of
+size 4 bytes" ALL at the same instruction (exl3xhat+0x1e0), across many threads of block 0. This
+is the fault class that explains every symptom: uninitialised device memory is stale garbage whose
+contents differ run to run, so the outputs it feeds are wrong in a way that varies between runs
+(exactly the first_mismatch 128/224/352/384 pattern) while elements that happen not to touch it
+(e.g. y[0]) stay correct to 1e-9. racecheck being clean is consistent: this is not a race, it is a
+read-before-write.
+RULED OUT this round: bx, bxp, byr, by, arG, arH are all explicitly zeroed at allocation and the
+report persists, so the uninitialised buffer is one of xhat's remaining inputs — the Hadamard
+hd_pre32 (or memory just past a buffer it indexes). exl3hgen32 itself looks complete (grid 64x256
+= 16384 threads, guard gid<16384, one f32 per thread), so the next step is to print the device
+pointers and map the reported address (e.g. 0xfcb7c9018000) to the buffer it lands in.
+NEXT: (1) print bx/bxp/hd_pre32/arG + the H alloc size and map the sanitizer address; (2) if it is
+H, check whether had_hoist32's 64 KB write actually completes before xhat (the launch sync is
+inside had_hoist32); (3) if it is past a buffer end, fix xhat's indexing bound.

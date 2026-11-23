@@ -63,7 +63,10 @@ exl3xhat(p<Int>) -> {
     nb<Int> = blk_x()
     d<Int> = tid_x()
     base<Int> = nb * 128
-    if (base < cw) {
+    # launch_kernel always runs 256 threads but H has only 128 rows: threads with
+    # d >= 128 would index H[d*128+j] past the 64 KB Hadamard (and write past the
+    # output). This was the bug initcheck found — out-of-bounds global reads.
+    if (base < cw && d < 128) {
         # xp[i] = sum_k H[i][k] * (su[k] * x[k]): su is a DIAGONAL on the input
         # axis and does NOT commute with H, so it must scale x BEFORE the
         # transform (the same mistake as sv, which belongs AFTER exl3yhat).
@@ -174,7 +177,7 @@ exl3yhat(p<Int>) -> {
     nb<Int> = blk_x()
     a<Int> = tid_x()
     base<Int> = nb * 128
-    if (base < cw) {
+    if (base < cw && a < 128) {
         acc<Float32> = 0.0
         b<Int> = 0
         while (b < 128) {
