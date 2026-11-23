@@ -5848,3 +5848,31 @@ dWg, and compare against a host dot.
     - if it FAILS, the engine's copy of the chain differs from p6r10's in some detail (grid, param
       slot, freedom nesting) and can be found by direct comparison of the two call sites
 === END ===
+=== ROUND 114: SYNTHETIC INPUT FAILS TOO -> IT IS THE CALL SITE, NOT `sub` ===
+The discriminator answered cleanly:
+    FGATE    expert=0 nt=1 count_over_1e-4=2048 max_abs=3.8424 fused0=-0.8780  ref0=0.2433
+    FGATESYN expert=0 nt=1 count_over_1e-4=2047 max_abs=1.3081 fused0=0.07559  ref0=-0.03600
+With p6r10's exact synthetic input pattern the engine's chain STILL disagrees, so the problem is not
+`sub`, not its layout, not its scaling: the engine's call site differs from p6r10's in some detail I
+have not been able to find by inspection.
+WHAT HAS BEEN CHECKED AND MATCHES (so do not re-check these):
+  mvnodB argv  +0 T=dyr +8 X=dxh +24 cw=EINTER +40 q=arA +48 td=mapdev +56 inv=invbase
+               +144 LUT=dLUT +168 B=nt +176 nin=H
+  xhatB  argv  +0 dxf +8 dxh +16 hdg32 +24 dsu +32 H +40 nt
+  yhatB  argv  +0 dyr +8 dyp +16 hdg32 +24 EINTER +32 dsv +40 nt
+  grids        xhatB nt*(H/128), mvnodB (H/64)*(EINTER/128)*8, yhatB nt*(EINTER/128)
+  H            hdg32 == had_hoist32(fhgen32) (literally the same call p6r10 uses as hd_pre32)
+  params buf   pb32 = 192 bytes, enough for +176
+  su/sv        uploaded raw from g_ge_1/g_ge_2, lengths 8192 and 4096 (2x4096 and 2x2048 f16) == correct
+  T zeroing    wr_pdev loop over nt*EINTER*4 before the atomic accumulation
+WHAT IS STILL UNVERIFIED AND IS THE NEXT THING TO LOOK AT:
+  - that `arA`, `mapdev`, `invbase` in tail_site hold what p6r10's did at the SAME moment (arA is the
+    trellis arena; if the up/down deqs or the deq itself reposition/advance any of these, the gate's
+    fused pass would read the wrong arena while the deq path (which re-uploads) still works)
+  - whether the engine's deq leaves `arA` bound to the GATE trellis specifically
+  - the single most likely culprit: the deq path may UPLOAD THE TRELLIS INTO arA per projection, so by
+    the time my block runs (after up and down), arA holds the DOWN trellis, not the gate's
+RECOMMENDED: print arA/mapdev/invbase and a few dWg values, and check whether arA still corresponds to
+g_ge_0 at the point the fused chain runs. If the arena is per-projection, capture the gate's arena
+handles BEFORE the up/down deqs (or run the verification immediately after dWg is computed).
+=== END ===

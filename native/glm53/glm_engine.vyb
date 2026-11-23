@@ -3376,18 +3376,23 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                     dLUT<Int> = dev_alloc(262144)
                     dsu<Int> = dev_alloc(g_ge_1.len())
                     dsv<Int> = dev_alloc(g_ge_2.len())
+                    dQ<Int> = dev_alloc(g_ge_0.len())
                     dsub64<Int> = dev_alloc(nt * H * 8)
                     dxf<Int> = dev_alloc(nt * H * 4)
                     dxh<Int> = dev_alloc(nt * H * 4)
                     dyr<Int> = dev_alloc(nt * EINTER * 4)
                     dyp<Int> = dev_alloc(nt * EINTER * 8)
-                    if (dLUT != 0 && dsu != 0 && dsv != 0 && dsub64 != 0 && dxf != 0 && dxh != 0 && dyr != 0 && dyp != 0) {
+                    if (dLUT != 0 && dsu != 0 && dsv != 0 && dQ != 0 && dsub64 != 0 && dxf != 0 && dxh != 0 && dyr != 0 && dyp != 0) {
                         # the f16 LUT the fused kernel needs (the engine builds none today)
                         wr_pdev(pb32, 0, dLUT)
                         launch_kernel(flt, 256, pb32)
                         sync()
                         cuMemcpyHtoD_v2(dsu, g_ge_1, g_ge_1.len())
                         cuMemcpyHtoD_v2(dsv, g_ge_2, g_ge_2.len())
+                        # the trellis must be uploaded HERE: arA is the deq's arena and by the time
+                        # this block runs (after the up and down deqs) it holds the DOWN trellis,
+                        # which is why the fused pass disagreed while the deq path still worked.
+                        cuMemcpyHtoD_v2(dQ, g_ge_0, g_ge_0.len())
                         bulk_htod(dsub64, view(sub))
                         sync()
                         # f64 activations -> f32
@@ -3413,7 +3418,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dxh)
                         wr_pdev(pb32, 24, EINTER)
-                        wr_pdev(pb32, 40, arA)
+                        wr_pdev(pb32, 40, dQ)
                         wr_pdev(pb32, 48, mapdev)
                         wr_pdev(pb32, 56, invbase)
                         wr_pdev(pb32, 144, dLUT)
@@ -3473,7 +3478,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dxh)
                         wr_pdev(pb32, 24, EINTER)
-                        wr_pdev(pb32, 40, arA)
+                        wr_pdev(pb32, 40, dQ)
                         wr_pdev(pb32, 48, mapdev)
                         wr_pdev(pb32, 56, invbase)
                         wr_pdev(pb32, 144, dLUT)
@@ -3509,6 +3514,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                     free_dev(dLUT)
                     free_dev(dsu)
                     free_dev(dsv)
+                    free_dev(dQ)
                     free_dev(dsub64)
                     free_dev(dxf)
                     free_dev(dxh)
