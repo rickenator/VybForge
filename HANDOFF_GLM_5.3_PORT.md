@@ -4627,3 +4627,20 @@ Banked and proven: the algebra W = H(T(Hx)) (~4000x less Hadamard work, W never 
 W^T layout, su-before-H / sv-after-H ordering, bit-identical decode, exact xp, exact single-CTA and
 small-grid partials, uniform atomic coverage + correct addresses, and the OOB bug initcheck found.
 Open: the block-2 accumulator mystery above. Everything else in the program is green.
+=== ROUND 47: THE PLAIN STORE WORKS, THE ATOMIC DOES NOT — AND THE PTX FOR BOTH IS CORRECT ===
+Decisive discrimination (ONLY = 2, full grid):
+    plain st_f32 of acc   -> nonzero_256_383 = 128/128, v256 = -0.06782   (the value IS right)
+    atomic_add_f32 of acc -> u256 = 0                                      (nothing lands)
+and a precomputed-pointer variant of the atomic changes nothing. The emitted PTX was then read line
+by line: FIVE distinct atom.global.add.f32 sites (the four counters + the data) are all present, the
+skip predicate is exactly `(ONLY >= 0 && ONLY != nb128) || (cb >= cw)` (i.e. execute iff ONLY<0 or
+ONLY==nb128, AND cb<cw — correct), and the address is `add.s64 %rd43, %rd40, %rd11` with rd11 = T
+and rd40 = cb*4 — also correct. So this is NOT a Vyb codegen bug in the atomic address.
+STATE: the accumulator is correct, the store lands, the atomic's PTX is correct, and the atomic does
+not move the target for cb >= 256 while it demonstrably moves the counter targets (which are <= 16
+entries) in the same kernel. The remaining suspicion is a driver/hardware scope issue for
+atom.global.add.f32 against a cuMemAlloc'd buffer beyond 1 KB, or interference between the plain
+store and the atomic in the same branch (both write adjacent addresses).
+NEXT SESSION, cheapest experiment: DELETE the plain-store line (keep only the atomic), rebuild, and
+re-run ONLY=2. If u256 becomes non-zero, the STORE was interfering with the atomic (the two writes in
+one branch), and the kernel is fixed by keeping one of them.
