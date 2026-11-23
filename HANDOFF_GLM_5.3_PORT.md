@@ -5163,3 +5163,15 @@ weak -- it proves the two paths agree, not that they agree well at O(1) magnitud
 real-magnitude weights would strengthen it. Note also that o[0]=0 because the dot of near-zero values
 is near zero.
 === END (rounds 20-78) ===
+=== ROUND 79: CORRECTION — THE DOUBLE gx_read WAS NEVER PROVEN; THE CONVERSION WAS THE BUG ===
+Round 78 blamed the silent zeros on calling gx_read twice per GxLoc. The two runs side by side show
+that is not established:
+    single read + manual (htod + bf16deq32)  : first4=48,188,98,60 (CORRECT), w[0][0]=0        <- zeros
+    single read + engine deq_bf16            : first4=48,188,98,60 (CORRECT), w[0][0]=7.8e-18   <- data
+The bytes were right in BOTH cases, so the confirmed cause of the zeros is the HAND-ROLLED CONVERSION
+path, not the read. The double-read runs (rounds 76-77) never printed first4, so whether the second
+read also returns zeros is UNPROVEN. I should not have written it as a rule.
+WHAT IS ACTUALLY ESTABLISHED:
+  - use the engine's deq_bf16(fbf, rawString, n, z); a manual htod + bf16deq32 with (q,o,n,z) gave zeros
+  - reading once and reusing the buffer is still the sane pattern, just not a proven fix
+  - bfgemm_p agrees with deq_bf16 to 2.4e-11 (round 78), on weights that decoded to ~1e-18 magnitudes
