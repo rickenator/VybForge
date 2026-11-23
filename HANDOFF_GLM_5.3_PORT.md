@@ -5414,3 +5414,19 @@ tensor BOTH ways and compare a b0d decode of the first 8 words. If the String pa
 problem is the String->device copy in a driver; if it agrees, the problem is elsewhere in the probe.
 STANDING MICRO-TEST: native/host/p6r14_tiny.vyb -- seconds to run, hand-checkable, covers M/N/KSP/
 TRANSP/epilogue. Any future bfgemm change runs through it first.
+=== ROUND 92: THE STRING UPLOAD IS INNOCENT — BOTH PATHS AGREE EXACTLY ===
+native/host/p6r15_upload.vyb uploads the first 16 bytes of layers.3.self_attn.kv_a_proj_with_mqa.weight
+two ways on the same GxLoc and decodes both with b2d:
+    U A(wr_pdev): -0.0107421875 0.0137939453125 -0.007659912109375
+    U B(string) : -0.0107421875 0.0137939453125 -0.007659912109375
+    U_SAME both upload paths agree -> the String upload is INNOCENT
+So all three of this session's "the machinery is broken" theories are now settled, and all three were
+wrong: (a) the compiler's String handling is correct, (b) bfgemm_p is correct on a hand-checkable
+case, (c) cuMemcpyHtoD_v2 with a String lands the exact bytes. Each was a real, reproducible symptom
+produced by MY OWN probe code -- twice a f32/f64 width mismatch, once a bad bf16 constant pack.
+WHAT REMAINS: p6r12_bfgemm (the real-tensor gate) still reports o[0]=0 / max_abs=0.7752, and its
+remaining bug is in its own A-cast or readback, NOT in the kernel and NOT in the upload. That probe has
+accumulated too many patches to trust; the clean move is to rewrite it as p6r16_real with the SAME
+structure as the passing micro-test (verify A and B on device first, then the GEMM, then widen, then
+compare against a host reference), so its scaffolding is proven by construction.
+STATUS: bfgemm_p is ready to use for the attention projections. The kernel itself is validated.

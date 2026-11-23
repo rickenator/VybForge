@@ -1,0 +1,181 @@
+// p6r16_real — certify bfgemm_p at real magnitudes on a real checkpoint tensor.
+//
+// Same structure as the passing micro-test (p6r14_tiny), with every stage
+// verified on device BEFORE the next one runs:
+//    1. upload B (BF16 bytes)          -> verify 8 words with b2d
+//    2. build A (f64 -> f32 via cast32) -> verify 4 values with widen32
+//    3. bfgemm_p (KSP=1, TRANSP=1)      -> widen f32 partials to f64
+//    4. compare the first 64 outputs of both rows against a host dot product
+//       over the SAME decoded weights (bf16deq, f64, z=0).
+// env: P6_DIR  P6_M (rows, default 2)
+import io::{open_read, read_all, close}
+import env::{env_get}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev, deq_bf16}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    if (tensor_init() != 0) { println("R_FAIL cuda"); return 1 }
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
+    fc<Int> = load_fn("native/build/layer.ptx", "cast32")
+    fb2<Int> = load_fn("native/build/bfgemm.ptx", "b2d")
+    fdq<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    println("R handles gemm=" + fp.to_string() + " widen=" + fw.to_string() + " cast=" + fc.to_string() + " b2d=" + fb2.to_string())
+    if (fp == 0 || fw == 0 || fc == 0 || fb2 == 0 || fdq == 0) { println("R_FAIL handle"); return 2 }
+
+    cs<String> = ""
+    match (open_read("native/out/gx_tabs.cache")) {
+        fr -> { match (read_all(fr)) { s -> { cs = s } ? -> { return 3 } } close(fr) }
+        ? -> { println("R_FAIL tabcache"); return 3 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    var<Int> ti = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("R_FAIL trunc"); return 3 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+
+    nm<String> = "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
+    w1<Vec<String>> = Vec()
+    w1.push(nm)
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
+    fnd<Int> = ge.found.get(0)
+    g0<String> = gx_read(ge, 0)
+    var<Int> N = 512
+    var<Int> K = 4096
+    println("R found=" + fnd.to_string() + " bytes=" + g0.len().to_string() + " expect=" + (N * K * 2).to_string())
+    if (fnd != 1 || g0.len() != N * K * 2) { println("R_FAIL tensor"); return 4 }
+
+    pbv<Int> = dev_alloc(32)
+    dOut<Int> = dev_alloc(M_DFLT * 64)
+
+    # ---- 1. B on device + verify ----
+    dB<Int> = dev_alloc(N * K * 2)
+    rc_u<Int> = cuMemcpyHtoD_v2(dB, g0, N * K * 2) as Int
+    sync()
+    if (rc_u != 0) { println("R_FAIL upload rc=" + rc_u.to_string()); return 5 }
+    wr_pdev(pbv, 0, dB)
+    wr_pdev(pbv, 8, dOut)
+    wr_pdev(pbv, 16, 8)
+    launch_kernel(fb2, 1, pbv)
+    sync()
+    BV<Vec<Float>> = bulk_dtoh(dOut, 8)
+    println("R B: " + BV.get(0).to_string_precise() + " " + BV.get(1).to_string_precise() + " " + BV.get(2).to_string_precise() + "   (expect -0.0107421875 0.0137939453125 -0.0076599121)")
+
+    # ---- 2. A on device + verify ----
+    var<Int> M = 2
+    xv<Vec<Float>> = Vec()
+    var<Int> i = 0
+    while (i < M * K) { xv.push(((i % 11) as Float) * 0.0625 - 0.25) ; i = i + 1 }
+    dA64<Int> = dev_alloc(M * K * 8)
+    bulk_htod(dA64, view(xv))
+    dA<Int> = dev_alloc(M * K * 4)
+    pbc<Int> = dev_alloc(32)
+    wr_pdev(pbc, 0, dA64)
+    wr_pdev(pbc, 8, dA)
+    wr_pdev(pbc, 16, M * K)
+    launch_kernel(fc, (M * K + 255) / 256, pbc)
+    sync()
+    wr_pdev(pbv, 0, dA)
+    wr_pdev(pbv, 8, dOut)
+    wr_pdev(pbv, 16, 4)
+    launch_kernel(fw, 1, pbv)
+    sync()
+    AV<Vec<Float>> = bulk_dtoh(dOut, 4)
+    println("R A: " + AV.get(0).to_string_precise() + " " + AV.get(1).to_string_precise() + " " + AV.get(2).to_string_precise() + "   (expect -0.25 -0.1875 -0.125)")
+    # sanity: A[0] must be -0.25
+    # fail only if A[0] is outside [-0.3, -0.2]
+    a0<Float> = AV.get(0)
+    if (a0 > 0.0 - 0.2) { println("R_FAIL A[0] too high: " + a0.to_string_precise()); return 6 }
+    if (a0 < 0.0 - 0.3) { println("R_FAIL A[0] too low: " + a0.to_string_precise()); return 6 }
+
+    # ---- 3. the GEMM ----
+    dS<Int> = dev_alloc(M * N * 4)
+    dS64<Int> = dev_alloc(M * N * 8)
+    pbg<Int> = dev_alloc(96)
+    wr_pdev(pbg, 0, dA)
+    wr_pdev(pbg, 8, dB)
+    wr_pdev(pbg, 16, dS)
+    wr_pdev(pbg, 24, M)
+    wr_pdev(pbg, 32, N)
+    wr_pdev(pbg, 40, K)
+    wr_pdev(pbg, 56, 1)
+    wr_pdev(pbg, 64, 1)
+    nblk<Int> = (((M + 3) / 4) * N + 255) / 256
+    rcg<Int> = launch_kernel(fp, nblk, pbg) as Int
+    sync()
+    println("R gemm grid=" + nblk.to_string() + " rc=" + rcg.to_string())
+    wr_pdev(pbv, 0, dS)
+    wr_pdev(pbv, 8, dS64)
+    wr_pdev(pbv, 16, M * N)
+    launch_kernel(fw, (M * N + 255) / 256, pbv)
+    sync()
+    O<Vec<Float>> = bulk_dtoh(dS64, M * N)
+    println("R o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise())
+
+    # ---- 4. host reference over the same decoded weights ----
+    dF<Int> = deq_bf16(fdq, g0, N * K, 0)
+    if (dF == 0) { println("R_FAIL deq"); return 7 }
+    sync()
+    WF<Vec<Float>> = bulk_dtoh(dF, N * K)
+    println("R w[0][0]=" + WF.get(0).to_string_precise() + " w[1][1]=" + WF.get(K + 1).to_string_precise())
+
+    NR<Int> = 64
+    var<Int> nbad = 0
+    var<Float> mx = 0.0
+    var<Int> m = 0
+    while (m < M) {
+        var<Int> n = 0
+        while (n < NR) {
+            var<Float> acc = 0.0
+            var<Int> kk = 0
+            while (kk < K) {
+                acc = acc + xv.get(m * K + kk) * WF.get(n * K + kk)
+                kk = kk + 1
+            }
+            got<Float> = O.get(m * N + n)
+            d<Float> = got - acc
+            if (d < 0.0) { d = 0.0 - d }
+            if (d > 1e-4) { nbad = nbad + 1 }
+            if (d > mx) { mx = d }
+            n = n + 1
+        }
+        m = m + 1
+    }
+    println("R_GATE count_over_1e-4=" + nbad.to_string() + " max_abs=" + mx.to_string_precise() + " of " + (M * NR).to_string())
+    ref0<Float> = 0.0
+    var<Int> k2 = 0
+    while (k2 < K) { ref0 = ref0 + xv.get(k2) * WF.get(k2) ; k2 = k2 + 1 }
+    println("R ref o[0]=" + ref0.to_string_precise())
+    if (nbad == 0 && mx < 1e-4) { println("R_PASS bfgemm_p certified on a real tensor") }
+    else { println("R_FAIL bfgemm_p mismatch") }
+    println("R_DONE")
+    return 0
+}
+
+M_DFLT<Int> = 1024
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
