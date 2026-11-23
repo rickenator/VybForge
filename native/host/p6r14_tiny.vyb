@@ -23,7 +23,7 @@ main()<Int> -> {
     if (fp == 0 || fw == 0 || fc == 0) { println("T_FAIL handle"); return 2 }
 
     var<Int> M = 1
-    var<Int> N = 1
+    var<Int> N = 2
     var<Int> K = 8
 
     # A: f64 1..8 on the host, cast to f32 on device
@@ -45,13 +45,33 @@ main()<Int> -> {
     w_one<Int> = 0
     w_two<Int> = 0
     # build the packed Ints by shifting: 0x3F80 repeated four times
-    w_one = 0x3F80 + 0x3F8000 + 0x3F800000 + 0x3F80000000
-    w_two = 0x4000 + 0x400000 + 0x40000000 + 0x4000000000
+    # four bf16 words packed per 8-byte Int, low word first
+    w_one = 0x3F803F803F803F80
+    w_two = 0x4000400040004000
     wr_pdev(dB, 0, w_one)
     wr_pdev(dB, 8, w_one)
     wr_pdev(dB, 16, w_two)
     wr_pdev(dB, 24, w_two)
     sync()
+
+    # ---- VERIFY THE INPUTS LANDED, before blaming the GEMM ----
+    fb2<Int> = load_fn("native/build/bfgemm.ptx", "b2d")
+    dAc<Int> = dev_alloc(K * 8)
+    wr_pdev(pbc, 0, dA)
+    wr_pdev(pbc, 8, dAc)
+    wr_pdev(pbc, 16, K)
+    launch_kernel(fw, 1, pbc)
+    sync()
+    AC<Vec<Float>> = bulk_dtoh(dAc, K)
+    println("T A on device: " + AC.get(0).to_string_precise() + " " + AC.get(1).to_string_precise() + " " + AC.get(2).to_string_precise() + " ... " + AC.get(7).to_string_precise())
+    dBc<Int> = dev_alloc(16 * 8)
+    wr_pdev(pbc, 0, dB)
+    wr_pdev(pbc, 8, dBc)
+    wr_pdev(pbc, 16, 16)
+    launch_kernel(fb2, 1, pbc)
+    sync()
+    BC<Vec<Float>> = bulk_dtoh(dBc, 16)
+    println("T B on device: " + BC.get(0).to_string_precise() + " " + BC.get(7).to_string_precise() + " | " + BC.get(8).to_string_precise() + " " + BC.get(15).to_string_precise() + "   (expect 1 1 | 2 2)")
 
     # run the GEMM
     # 8 slots, explicitly zeroed, so the printout shows exactly which slots the
@@ -88,7 +108,7 @@ main()<Int> -> {
     sync()
     O<Vec<Float>> = bulk_dtoh(dS64, 8)
     println("T all8: " + O.get(0).to_string_precise() + " " + O.get(1).to_string_precise() + " " + O.get(2).to_string_precise() + " " + O.get(3).to_string_precise() + " " + O.get(4).to_string_precise() + " " + O.get(5).to_string_precise())
-    println("T o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise() + "   (N=1: expect 36 in slot 0)")
+    println("T o[0]=" + O.get(0).to_string_precise() + " o[1]=" + O.get(1).to_string_precise() + "   (expect 36 and 72)")
     d0<Float> = O.get(0) - 36.0
     d1<Float> = O.get(1) - 72.0
     if (d0 < 0.0) { d0 = 0.0 - d0 }

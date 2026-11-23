@@ -156,3 +156,16 @@ widen32(p<Int>) -> {
         st_f64(D + gid * 8, v)
     }
 }
+
+// b2d — bf16 (device) -> f64, so a probe can verify bf16 weights that were
+// written with wr_pdev (no String involved). p: +0 src, +8 dst, +16 n
+b2d(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    D<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < N) {
+        v<Float> = ld_bf16(S + gid * 2)
+        st_f64(D + gid * 8, v)
+    }
+}

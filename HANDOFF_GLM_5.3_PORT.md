@@ -5374,3 +5374,22 @@ the 4-output-row epilogue rather than a source-arithmetic one -- which would als
 real-tensor run was wrong in a "plausible but shifted" way rather than obviously broken.
 NEXT: bisect the epilogue -- replace the 4-row store block with a single st_f32 for a0 only and re-run
 this same tiny case. If [36, 72] appears, the guarded 4-row store is the defect.
+=== ROUND 90: bfgemm_p BISECT — NOT the epilogue; a CONSTANT -17.9375 THAT IGNORES THE INPUTS ===
+Three deterministic runs of the hand-checkable case (A=[1..8], B rows of bf16 1.0 / 2.0):
+  N=2, guarded 4-row epilogue   (bfgemm_p) : slots [-17.9375, 36, 0,0,0,0]   expect [36, 72]
+  N=2, single-store epilogue    (bfgemm_1s): slots [-17.9375, 36, 0,0,0,0]   identical
+  N=1, single-store epilogue               : slots [-17.9375, 0, 0,0,0,0]    expect [36]
+FACTS:
+  - the epilogue is NOT the defect: at M=1 the guarded a1..a3 stores never fire, so both variants
+    execute the same store, and both give identical output (my bisect was inconclusive by design).
+  - slots 2..7 stay 0 in every run, and I zeroed dS first, so the printout shows EXACTLY two writes
+    (N=2) / one write (N=1). The kernel does run, and it writes where it should.
+  - -17.9375 is CONSTANT across N=1 and N=2, and it is not any function of the inputs I can construct:
+    the dot of [1..8] with eight 1.0s is 36, with 2.0s is 72. Nothing yields -17.9375.
+  - N=2 also writes 36 into slot 1 -- the CORRECT row-0 dot, in the WRONG slot; row 1's 72 never
+    appears at all.
+READING: the accumulation is not reading the buffers I think it is. Either A (the cast f64->f32) or B
+is not landing, and the "36" is a coincidence of the same wrong read. Next probe should dump the
+DEVICE's A and B as f64 right before the launch (widen32 + bulk_dtoh) and print them -- if A is not
+exactly 1..8 or B is not 1.0/2.0, the GEMM was never given the inputs, and bfgemm_p may be innocent.
+That check costs one run and eliminates the whole ambiguity.
