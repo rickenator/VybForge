@@ -4741,3 +4741,19 @@ NEXT SESSION (compiler-side, in ~/Projects/Vyb): reproduce with dotprobe padded 
 statement count, or inspect the emitted PTX of the real phase-2 region for spilled/reused registers;
 and try compiling exl3mv with optimisation disabled to confirm the pass is responsible.
 === END (rounds 20-53) ===
+=== ROUND 54: -O0 CHANGES NOTHING, AND WITH CONST=1 NO ATOMIC LANDS AT ALL ===
+1) Recompiled exl3mv1s4 at -O0: identical results (CONSTSLAB ~0, U_FULL first_bad 0) => NOT an
+   optimisation pass. The defect is in base codegen.
+2) Verified my own CONST test was sound: with CONST=1 the slab really does hold 0.5 in all 1024
+   dumped entries (s0=0.5, s300=0.5). So the test is valid.
+3) THE KEY NEW FACT: with CONST=1, outputs 0..2047 are ALL ~0. But with CONST=0 (the real decode)
+   outputs 0..255 were CORRECT. The only difference is which branch filled the slab — so merely
+   TAKING the `if (CONST != 0) {...} else { decode }` branch makes the phase-2 atomics stop landing.
+   That is register/state corruption across a branch: a value live in phase 2 (T, or the address
+   base) is clobbered or wrongly allocated when the other branch of that if/else is taken.
+4) The value read back is ALWAYS 1.3563156426940112e-19 — identical across every run, every output
+   and every block. A constant, not noise.
+MINIMAL REPRO TO WRITE (compiler-side): take dotprobe_acc (which is correct at every grid) and wrap
+the slab fill in `if (flag) { 0.5 } else { <something else> }`; if the atomics stop landing, the
+defect is reproduced in ~30 lines and the fix is in the register allocator / branch lowering.
+=== END (rounds 20-54) ===

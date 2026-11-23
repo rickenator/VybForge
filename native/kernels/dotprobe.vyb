@@ -58,3 +58,39 @@ dotprobe_acc(p<Int>) -> {
         atomic_add_f32(OUT + d * 4, acc)
     }
 }
+
+// dotprobe_br — IDENTICAL to dotprobe_acc except the slab fill is inside an
+// if/else. This is the suspected compiler trigger: taking one arm of the
+// branch is believed to clobber state that phase 2's atomic needs.
+// p: +0 x(f32), +8 out(f32), +16 flag
+dotprobe_br(p<Int>) -> {
+    tid<Int> = tid_x()
+    OUT<Int> = ld_i64(p + 8)
+    FLAG<Int> = ld_i64(p + 16)
+    if (tid < 128) {
+        b<Int> = 0
+        if (FLAG != 0) {
+            while (b < 8) {
+                st_shared_f32(b * 512 + tid * 4, 0.5)
+                b = b + 1
+            }
+        } else {
+            while (b < 8) {
+                st_shared_f32(b * 512 + tid * 4, 0.25)
+                b = b + 1
+            }
+        }
+    }
+    kernel_barrier()
+    if (tid < 128) {
+        X<Int> = ld_i64(p + 0)
+        d<Int> = tid
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + j * 4)
+            j = j + 1
+        }
+        atomic_add_f32(OUT + d * 4, acc)
+    }
+}

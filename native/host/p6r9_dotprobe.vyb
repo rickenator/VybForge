@@ -90,6 +90,37 @@ main()<Int> -> {
         println("DP_ACC g=" + gsz.to_string() + " bad=" + nb2.to_string() + " v0=" + MV.get(0).to_string_precise() + " exp=" + expv.to_string_precise() + " firstbad=" + fbv.to_string_precise())
         gsz = gsz * 2
     }
+    // ---- branched slab fill: does the if/else break the atomic? ----
+    fbr<Int> = load_fn("native/build/dotprobe.ptx", "dotprobe_br")
+    if (fbr == 0) { println("DP_FAIL br_fn"); return 5 }
+    var<Int> fl = 1
+    while (fl >= 0) {
+        cuMemcpyHtoD_v2(out, zero_bytes(512), 512)
+        wr_pdev(pb, 0, bx)
+        wr_pdev(pb, 8, out)
+        wr_pdev(pb, 16, fl)
+        launch_kernel(fbr, 64, pb)
+        sync()
+        raw4<Int> = dev_alloc(2048)
+        wr_pdev(pb, 0, out)
+        wr_pdev(pb, 8, raw4)
+        wr_pdev(pb, 16, 128)
+        launch_kernel(fcast64, 1, pb)
+        sync()
+        BV<Vec<Float>> = bulk_dtoh(raw4, 128)
+        expv3<Float> = 2.0 * (64 as Float)
+        if (fl != 0) { expv3 = 4.0 * (64 as Float) }
+        var<Int> nb3 = 0
+        var<Int> k3 = 0
+        while (k3 < 128) {
+            d3<Float> = BV.get(k3) - expv3
+            if (d3 < 0.0) { d3 = 0.0 - d3 }
+            if (d3 > 1e-3) { nb3 = nb3 + 1 }
+            k3 = k3 + 1
+        }
+        println("DP_BR flag=" + fl.to_string() + " bad=" + nb3.to_string() + " v0=" + BV.get(0).to_string_precise() + " exp=" + expv3.to_string_precise())
+        fl = fl - 1
+    }
     return 0
 }
 
