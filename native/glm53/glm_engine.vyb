@@ -3065,6 +3065,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     acc_mmG<Int> = 0
     acc_mmU<Int> = 0
     acc_mmD<Int> = 0
+    acc_set<Int> = 0
+    acc_yh<Int> = 0
     acc_host<Int> = 0
     tA<Int> = 0
     tt0<Int> = 0
@@ -3511,6 +3513,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                     dyp<Int> = dev_alloc(nt * EINTER * 8)
                     if (dLUT != 0 && dsu != 0 && dsv != 0 && dQ != 0 && dsub64 != 0 && dxf != 0 && dxh != 0 && dyr != 0 && dyp != 0) {
                         # the f16 LUT the fused kernel needs (the engine builds none today)
+                        tSet<Int> = time_mono_millis()
                         wr_pdev(pb32, 0, dLUT)
                         launch_kernel(flt, 256, pb32)
                         sync()
@@ -3528,6 +3531,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 16, nt * H)
                         launch_kernel(fcast32, (nt * H + 255) / 256, pb32)
                         sync()
+                        acc_set = acc_set + (time_mono_millis() - tSet)
+                        tYh<Int> = time_mono_millis()
                         # xhatB: +0 x, +8 out, +16 H, +24 su, +32 nin, +40 B
                         wr_pdev(pb32, 0, dxf)
                         wr_pdev(pb32, 8, dxh)
@@ -3551,6 +3556,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         launch_kernel(fyb, nt * (EINTER / 128), pb32)
                         sync()
                         FV<Vec<Float>> = bulk_dtoh(dyp, nt * EINTER)
+                        acc_yh = acc_yh + (time_mono_millis() - tYh)
                         var<Int> nb2 = 0
                         if (fOnlyG == "1") { nb2 = 0 }   # nothing to compare against
                         var<Float> mx2 = 0.0
@@ -3805,7 +3811,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     println("T_RSLV nopen=" + nopen.to_string() + " scan=" + acc_scan.to_string() + " open=" + acc_open.to_string() +
             " lookup=" + (acc_res - acc_scan - acc_open).to_string())
     println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string() +
-            " | mmG=" + acc_mmG.to_string() + " mmU=" + acc_mmU.to_string() + " mmD=" + acc_mmD.to_string())
+            " | mmG=" + acc_mmG.to_string() + " mmU=" + acc_mmU.to_string() + " mmD=" + acc_mmD.to_string() +
+            " set=" + acc_set.to_string() + " yh+rb=" + acc_yh.to_string())
     freedom {
     }
 
