@@ -5252,3 +5252,28 @@ implies it is, yet cuda_memcpy_h2d lives in the right module and still does not 
 suggests the failure is upstream of the copy, e.g. the String gx_read returns is not a plain byte
 buffer for a 4 MB read).
 === END (rounds 20-83) — STOPPING, NOT BLOCKED ON MY OWN REASONING ANY FURTHER ===
+=== ROUND 84: THE WORKING PATTERN FOUND — AND IT DOES NOT REPRODUCE IN A DRIVER main() ===
+The working upload sites all do this, with the String passed DIRECTLY (no cast, no helper):
+    native/glm53/glm_engine.vyb:299   hrc  = cuMemcpyHtoD_v2(q,   raw, raw.len())
+    native/glm53/glm_engine.vyb:328   hrcf = cuMemcpyHtoD_v2(qf,  raw, raw.len())
+    native/glm53/glm_engine.vyb:575   rc   = cuMemcpyHtoD_v2(dst, raw, raw.len())
+    native/glm53/exl3_load.vyb:66     cuMemcpyHtoD_v2(qd, trellis, tb)
+and each of those FILES declares the extern itself:
+    extern "C" { cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, ByteCount<Int>)<CInt> }
+So the rule is: the CALLING module must declare the extern; that is what puts the String->loc<CVoid>
+conversion in scope. I copied that exact declaration into my driver and called it inside a freedom
+block -- and the device STILL holds pointer-bit junk (identical 2.2223504967623686e+31 etc. on lefty,
+a different junk value on godzilla where bytes=0).
+WHAT IS NOW ESTABLISHED PRECISELY, for Rick:
+  - the same source line works inside a MODULE (glm_engine/exl3_load) and fails inside a host DRIVER
+    with a main() -- the extern is declared in both cases, freedom is used in both cases
+  - the copied bytes never arrive (a raw u16 readback shows 0x738C4002-class garbage, not 0xBC30)
+  - rc is 0 in every variant, so nothing reports failure
+  - wr_pdev's pattern -- cuMemcpyHtoD_v2(p + off, loc(v), 8) with a LOCAL SCALAR -- does work from
+    the same driver, so the driver CAN upload; it is specifically the String argument form that fails
+NEXT BEST MOVES (for someone with the compiler): (a) check whether String->loc<CVoid> conversion is
+implemented only for module-scope calls and silently degrades in a script main(); (b) if so, use
+loc(v) over a byte Vec the way wr_pdev does, or move the upload into glm_engine (deq_bf16 already
+lives there -- but note deq_bf16 ALSO returned a wrong word (0x2310 instead of 0xBC30), so it needs
+the same scrutiny).
+=== END (rounds 20-84) ===

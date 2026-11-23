@@ -70,9 +70,16 @@ main()<Int> -> {
     # passed as its STRUCT (a pointer), which is why the device held junk.
     # call the binding's own helper: the String->pointer conversion only works
     # inside the module that declares the FFI pointer functions
+    # the explicit form real code uses (deq_cache.vyb:31,45): take the String's
+    # address with addr(), then convert it to loc<CVoid> with from<>. Passing a
+    # String straight to the extern does NOT do this conversion in a driver.
     rc2<Int> = 0
-    freedom { rc2 = cuMemcpyHtoD_v2(dS, g0, 16) as Int }
-    println("S0 htod rc=" + rc2.to_string() + " (extern declared in this module)")
+    freedom {
+        var<Int> dp = 0
+        dp = addr(g0)
+        rc2 = cuMemcpyHtoD_v2(dS, from<loc<CVoid>>(dp), 16) as Int
+    }
+    println("S0 htod rc=" + rc2.to_string() + " (from<loc<CVoid>>(addr(g0)))")
     sync()
     wr_pdev(pb, 0, dS)
     wr_pdev(pb, 8, dD)
@@ -88,6 +95,34 @@ main()<Int> -> {
     sync()
     W2<Vec<Float>> = bulk_dtoh(dW2, 8)
     println("S0 raw words on device: " + W2.get(0).to_string_precise() + " " + W2.get(1).to_string_precise() + " " + W2.get(2).to_string_precise() + "  (expect 48176 15458? no: 48176 then next)")
+    # ---- does my kernel run AT ALL? write a constant, read it back
+    fc<Int> = load_fn("native/build/tobg.ptx", "tobg_const")
+    println("S0 const_fn=" + fc.to_string())
+    dC<Int> = dev_alloc(64)
+    wr_pdev(pb, 8, dC)
+    rcc<Int> = launch_kernel(fc, 1, pb) as Int
+    sync()
+    println("S0 const launch rc=" + rcc.to_string())
+    VC<Vec<Float>> = bulk_dtoh(dC, 8)
+    println("S0 const values=" + VC.get(0).to_string_precise() + " " + VC.get(1).to_string_precise())
+    # ---- DECISIVE: write KNOWN words with wr_pdev (a proven path), then decode.
+    # 0xBC30 = 48176 as a u16, 0x3C62 = 15458. If THIS decodes correctly the
+    # upload/kernel are fine and only the String copy was ever wrong.
+    wr_pdev(dS, 0, 48176)
+    wr_pdev(dS, 8, 15458)
+    sync()
+    wr_pdev(pb, 0, dS)
+    wr_pdev(pb, 8, dD)
+    wr_pdev(pb, 16, 8)
+    launch_kernel(f, 1, pb)
+    sync()
+    VK<Vec<Float>> = bulk_dtoh(dD, 8)
+    println("S0 KNOWN first=" + VK.get(0).to_string_precise() + " second=" + VK.get(1).to_string_precise() + "  (expect -0.0107421875, 0.0110...)")
+    wr_pdev(pb, 8, dW2)
+    launch_kernel(fw, 1, pb)
+    sync()
+    WK<Vec<Float>> = bulk_dtoh(dW2, 8)
+    println("S0 KNOWN words=" + WK.get(0).to_string_precise() + " " + WK.get(1).to_string_precise() + "  (expect 48176 15458)")
     println("S0 device values: " + V.get(0).to_string_precise() + " " + V.get(1).to_string_precise() + " " + V.get(2).to_string_precise() + " " + V.get(3).to_string_precise())
     dv<Float> = V.get(0) - (0.0 - 0.0107421875)
     if (dv < 0.0) { dv = 0.0 - dv }

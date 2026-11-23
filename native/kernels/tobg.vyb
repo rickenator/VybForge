@@ -27,3 +27,14 @@ tobg_word(p<Int>) -> {
         st_f32(D + gid * 4, w as Float32)
     }
 }
+
+// tobg_const — write a constant. If this does not appear, the LAUNCH path is
+// broken and nothing else in this probe means anything.
+// p: +8 dst(f32)
+tobg_const(p<Int>) -> {
+    D<Int> = ld_i64(p + 8)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < 8) {
+        st_f32(D + gid * 4, 42.0)
+    }
+}
