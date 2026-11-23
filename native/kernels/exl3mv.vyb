@@ -100,6 +100,7 @@ exl3mv1s4(p<Int>) -> {
     T<Int> = ld_i64(p + 0)
     X<Int> = ld_i64(p + 8)
     SU<Int> = ld_i64(p + 16)
+    CNT<Int> = ld_i64(p + 72)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -163,6 +164,7 @@ exl3mv1s4(p<Int>) -> {
         # AFTER exl3yhat (applying it here gave a self-consistent but wrong
         # result: yraw matched a reference that made the same mistake).
         cb<Int> = nb128 * 128 + d
+        if (CNT != 0) { atomic_add_f32(CNT + nb128 * 4, 1.0) }
         if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
     }
 }

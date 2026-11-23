@@ -144,6 +144,9 @@ main()<Int> -> {
     wr_pdev(pbm, 48, mapdev)
     wr_pdev(pbm, 56, invbase)
     wr_pdev(pbm, 64, dscr)
+    cntb<Int> = dev_alloc(64)
+    cuMemcpyHtoD_v2(cntb, zero_bytes(64), 64)
+    wr_pdev(pbm, 72, cntb)
     r2<Int> = launch_kernel(fmv, 8192, pbm)
     cuCtxSynchronize()
     t2<Int> = time_mono_millis()
@@ -155,6 +158,20 @@ main()<Int> -> {
     r3<Int> = launch_kernel(fyh, 16, pby)
     cuCtxSynchronize()
     t3<Int> = time_mono_millis()
+    // contributions per column block (expect 512 each: 64 rb64 x 8 cta)
+    fcv2<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    cnt64<Int> = dev_alloc(128)
+    pbcnt<Int> = dev_alloc(24)
+    wr_pdev(pbcnt, 0, cntb)
+    wr_pdev(pbcnt, 8, cnt64)
+    wr_pdev(pbcnt, 16, 16)
+    launch_kernel(fcv2, 1, pbcnt)
+    cuCtxSynchronize()
+    cntv<Vec<Float>> = bulk_dtoh(cnt64, 16)
+    line2<String> = "E2E cnt:"
+    i = 0
+    while (i < 16) { line2 = line2 + " " + (cntv.get(i) as Int).to_string() ; i = i + 1 }
+    println(line2)
     ynew<Vec<Float>> = bulk_dtoh(by, 2048)
     println("E2E fused rc=" + r1.to_string() + "/" + r2.to_string() + "/" + r3.to_string() + " xhat=" + (t1 - t0).to_string() + "mv=" + (t2 - t1).to_string() + "yhat=" + (t3 - t2).to_string() + "ms")
     // ---- reference: the one-hot row of the verified deq buffer ----

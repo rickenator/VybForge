@@ -4445,3 +4445,21 @@ pointers and map the reported address (e.g. 0xfcb7c9018000) to the buffer it lan
 NEXT: (1) print bx/bxp/hd_pre32/arG + the H alloc size and map the sanitizer address; (2) if it is
 H, check whether had_hoist32's 64 KB write actually completes before xhat (the launch sync is
 inside had_hoist32); (3) if it is past a buffer end, fix xhat's indexing bound.
+=== ROUND 36: THE OUT-OF-BOUNDS BUG (real, fixed) + THE LAST PATTERN ===
+initcheck's flagged addresses mapped cleanly in the SAME run: reads at H_base+0x1c000 with a 0x200
+stride (one Hadamard row) — PAST the 64 KB H. Cause: exl3xhat and exl3yhat index the 128x128
+Hadamard with tid_x(), but launch_kernel ALWAYS launches 256 threads, so threads 128..255 read
+H[d*128+j] up to d=255 (offset 0x1FFFC) and yhat wrote y[] past its buffer too. FIXED with
+`d < 128` / `a < 128` guards in both kernels. That is a genuine bug and it is now gone.
+AFTER THE FIX (two runs, same binary):
+    run 1: y0 = -0.019450763240456581  (EXACTLY B[0][0])   blocks: 0 0 0 126 127 ... 
+    run 2: y0 = -0.019450768828392029  (varies)           blocks: 0 0 0 128 126 ...
+So the first THREE output blocks (0..383) are now correct in every run and everything from block 3
+on is wrong, while a few digits of y0 still drift (atomic order). The wrongness is no longer
+nondeterministic in WHICH blocks fail — only in the low digits — so the remaining fault is a
+deterministic indexing error that starts at output 384 = block 3.
+NEXT: examine the accumulation for nb128 >= 3 (cb = nb128*128 + d): grid 8192 CTAs covers 64
+rb64 x 16 nb128 x 8 cta = 8192 exactly, so every column block has its 512 contributors — the
+question is whether nb128 is being computed correctly at the upper end. A one-line probe: have
+the kernel atomically add 1.0 to a counter indexed by nb128 and check that all 16 blocks receive
+512 increments.
