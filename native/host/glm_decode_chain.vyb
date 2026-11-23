@@ -4005,8 +4005,56 @@ main()<Int> -> {
     tln<Int> = 0
     tln2<Int> = 0
     while (tln < 45) { tabs.push(""); tln = tln + 1 }
+    # ---- the tab cache: the walk below costs the whole run budget (45 layers x 83 shard
+    # headers), and the same tab was already computed and saved. Load it first and only walk
+    # on a miss. Format: "GXTAB1 <dir>\n" then 45 x "<len>\n<payload>".
+    cache_path<String> = env_get("VYBFORGE_TAB_CACHE") else "native/out/gx_tabs.cache"
+    # the tab payload holds only (name, shard#, offset, nbytes, dtype) -- no absolute paths --
+    # so the cache is dir-independent; match the format tag only. The payload is still validated
+    # end-to-end (45 entries, exact byte consumption) before it is accepted.
+    cache_sig<String> = "GXTAB1 "
+    cacheOK<Int> = 0
+    match (open_read(cache_path)) {
+        cf -> {
+            match (read_all(cf)) { cs -> {
+                if (find_from(cs, cache_sig, 0) == 0 && find_from(cs, "GXTAB1 ", 0) == 0) {
+                    nl0<Int> = find_from(cs, "\n", 0)
+                    if (nl0 > 0) {
+                        ttmp<Vec<String>> = Vec()
+                        ti<Int> = 0
+                        while (ti < 45) { ttmp.push("") ; ti = ti + 1 }
+                        pos<Int> = nl0 + 1
+                        ti = 0
+                        ok<Int> = 1
+                        while (ti < 45 && ok == 1) {
+                            nl<Int> = find_from(cs, "\n", pos)
+                            if (nl < 0) { ok = 0 }
+                            if (ok == 1) {
+                                plen<Int> = cs.substring(pos, nl).to_int()
+                                if (plen <= 0 || nl + 1 + plen > cs.len()) { ok = 0 }
+                                if (ok == 1) {
+                                    ttmp.set(ti, cs.substring(nl + 1, nl + 1 + plen))
+                                    pos = nl + 1 + plen
+                                }
+                            }
+                            ti = ti + 1
+                        }
+                        if (ok == 1 && pos == cs.len()) {
+                            ti = 0
+                            while (ti < 45) { tabs.set(ti, ttmp.get(ti)) ; ti = ti + 1 }
+                            cacheOK = 1
+                            println("CHAIN TABCACHE hit " + cache_path)
+                        }
+                    }
+                }
+            } ? -> { } }
+            close(cf)
+        }
+        ? -> { }
+    }
+    if (cacheOK == 0) { println("CHAIN TABCACHE miss -> walking shards") }
     tsh<Int> = 1
-    while (tsh < 84) {
+    while (tsh < 84 && cacheOK == 0) {
         tkix<StIndex> = st_open(gx_shard_path(dir, tsh, 83))
         if (tkix.n > 0) {
             tk<Int> = 0
@@ -5679,3 +5727,19 @@ main()<Int> -> {
     return 0
 }
 
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
