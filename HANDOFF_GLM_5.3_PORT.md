@@ -6088,3 +6088,41 @@ figure at full depth is an extrapolation from the measured drift, not a direct m
 BOTTOM LINE FOR THE GATE DECISION: relaxing the MoE's bit-identity does not measurably change token
 selection. The 10.6x MoE win (86+ tok/s) is defensible on this evidence; a full-depth logits run over a
 larger prompt set would make it airtight.
+=== ROUND 126: STEP 1 COMPLETE (safe at depth) + STEP 2 APPLIED (fused is now the default) ===
+STEP 1 -- full-depth logit comparison, two prompt sets, 45 layers each, 20 tokens per set:
+    set A  n=20  agree 20/20   max|dtop1|=1.163e-06  min margin=0.054786  safety 47,115x
+    set B  n=20  agree 20/20   max|dtop1|=8.364e-07  min margin=0.000312  safety    373x
+    TOTAL 40/40 tokens agree (100%); worst safety factor 373x
+IMPORTANT: the logit perturbation at FULL depth is only ~1.1e-06 -- NOT the ~5e-05 my earlier
+extrapolation predicted. The final norm + head are much less sensitive than the hidden state, so the
+45-layer hidden-state drift (~2e-05) does not translate into proportional logit drift. Set B contains a
+token whose decision margin is 0.000312 (175x tighter than anything in set A) and it still agrees, with
+373x of headroom. A token can only flip if top1-top2 < ~1e-06.
+STEP 2 -- applied:
+  - P6_FUSED_GATE default "0" -> "1" in BOTH the gate and the down blocks
+  - new P6_FUSED_TOL (default 1e-05, was a hardcoded 1e-4) applied to all five comparison sites:
+    5x the measured noise floor, 10x tighter than before
+  - P6_FUSED_ONLY stays default "0": verification runs by default and each projection adopts its fused
+    result only when its own comparison is clean, so a future regression degrades to the deq path rather
+    than silently corrupting a layer. Speed is opt-in (P6_FUSED_ONLY=1), which is what a serving config
+    should set.
+  - native/out/digest_baseline_fused45.txt recorded: the 45-layer digests WITH the fused path active, as
+    the new bit-identical regression baseline. Future runs compare against this, so the digest gate keeps
+    its full sensitivity for detecting unintended changes -- only the cross-configuration requirement of
+    matching the deq path is dropped, and that equivalence is instead established by (i) the per-expert
+    FGATE comparisons at <=2.6e-06 and (ii) the 40/40 full-depth argmax agreement above.
+=== ROUND 127: TWO HARNESS BUGS FOUND WHILE VERIFYING STEP 2 (both mine, both fixed) ===
+Verifying the new defaults end-to-end took three attempts, all failing on measurement plumbing rather
+than on the change. Recorded so they are not repeated:
+  1. the baseline file was written with a shell redirect that ran LOCALLY (outside the ssh), so lefty
+     never had it and the diff errored with "No such file or directory".
+  2. run_fgate.sh takes NLAY (default 4) while digest_ab.sh takes NL -- I passed NL=45 to run_fgate.sh,
+     so the "45-layer" verification was silently a 4-layer run. Worse, glm_serve prints a HARDCODED
+     "CHAIN_OK 45 layers x 2 teacher-forced decode steps" regardless of nlay, so the log looked like a
+     successful full run while only 4 layers had executed. ALWAYS trust the digest count, not that line.
+  3. run_fgate.sh defaulted VYBFORGE_CHAIN_OUT at the 1 GB append-accumulation file, so per-layer
+     digests could not be isolated; it now takes OUT to point at a fresh file.
+WHAT IS ALREADY ESTABLISHED DESPITE THE MESS: with the new P6_FUSED_TOL=1e-05, every FGATE comparison
+that ran passed (count_over_1e-4 failures = 0), and CHAIN_OK was reached -- so the changed code runs and
+verifies cleanly at 4 layers.
+STILL PENDING: the 45-layer reproducibility check against native/baselines/digest_fused45.txt.
