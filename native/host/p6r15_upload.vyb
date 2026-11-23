@@ -1,0 +1,117 @@
+// p6r15_upload — race the two String->device upload paths on the SAME tensor.
+//
+// Path A: pack the String's bytes into Ints on the host and write them with
+//         wr_pdev (the path the passing micro-test uses).
+// Path B: cuMemcpyHtoD_v2(dst, g0, 16) with the String, the path the failing
+//         real-tensor probe uses.
+//
+// Both are then decoded with b2d and printed. If A and B differ, the String
+// upload is the defect; if they agree, the upload is innocent and the real
+// probe's remaining bug is somewhere else.
+import io::{open_read, read_all, close}
+import env::{env_get}
+import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
+import gx::{gx_read}
+import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    if (tensor_init() != 0) { println("U_FAIL cuda"); return 1 }
+    fb2<Int> = load_fn("native/build/bfgemm.ptx", "b2d")
+    if (fb2 == 0) { println("U_FAIL fn"); return 2 }
+
+    cs<String> = ""
+    match (open_read("native/out/gx_tabs.cache")) {
+        fr -> { match (read_all(fr)) { s -> { cs = s } ? -> { return 3 } } close(fr) }
+        ? -> { println("U_FAIL tabcache"); return 3 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    var<Int> ti = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("U_FAIL trunc"); return 3 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+
+    nm<String> = "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
+    w1<Vec<String>> = Vec()
+    w1.push(nm)
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
+    println("U found=" + ge.found.get(0).to_string())
+    g0<String> = gx_read(ge, 0)
+    println("U bytes=" + g0.len().to_string())
+
+    pbv<Int> = dev_alloc(32)
+    dOut<Int> = dev_alloc(64)
+    dA<Int> = dev_alloc(64)
+    dB<Int> = dev_alloc(64)
+
+    # ---- path A: pack the first 16 bytes into two Ints, wr_pdev them ----
+    w0<Int> = 0
+    var<Int> k = 0
+    while (k < 8) { w0 = w0 + ((g0.char_at(k) as Int) * pow2(k)) ; k = k + 1 }
+    w1v<Int> = 0
+    k = 0
+    while (k < 8) { w1v = w1v + ((g0.char_at(8 + k) as Int) * pow2(k)) ; k = k + 1 }
+    wr_pdev(dA, 0, w0)
+    wr_pdev(dA, 8, w1v)
+    sync()
+
+    # ---- path B: the String form the real probe uses ----
+    rcb<Int> = cuMemcpyHtoD_v2(dB, g0, 16) as Int
+    sync()
+    println("U pathB rc=" + rcb.to_string())
+
+    # ---- decode both ----
+    wr_pdev(pbv, 0, dA)
+    wr_pdev(pbv, 8, dOut)
+    wr_pdev(pbv, 16, 8)
+    launch_kernel(fb2, 1, pbv)
+    sync()
+    A<Vec<Float>> = bulk_dtoh(dOut, 8)
+    println("U A(wr_pdev): " + A.get(0).to_string_precise() + " " + A.get(1).to_string_precise() + " " + A.get(2).to_string_precise())
+
+    wr_pdev(pbv, 0, dB)
+    launch_kernel(fb2, 1, pbv)
+    sync()
+    B<Vec<Float>> = bulk_dtoh(dOut, 8)
+    println("U B(string) : " + B.get(0).to_string_precise() + " " + B.get(1).to_string_precise() + " " + B.get(2).to_string_precise())
+    println("U expect    : -0.0107421875 0.0137939453125 -0.0076599121")
+
+    dv<Float> = A.get(0) - B.get(0)
+    if (dv < 0.0) { dv = 0.0 - dv }
+    if (dv < 1e-12 && A.get(0) != 0.0) { println("U_SAME both upload paths agree -> the String upload is INNOCENT") }
+    else if (A.get(0) == 0.0) { println("U_FAIL path A itself produced zero"); }
+    else { println("U_DIFFER A=" + A.get(0).to_string_precise() + " B=" + B.get(0).to_string_precise() + " -> the String upload is BROKEN") }
+    println("U_DONE")
+    return 0
+}
+
+pow2(k<Int>)<Int> -> {
+    r<Int> = 1
+    var<Int> i = 0
+    while (i < k) { r = r * 256 ; i = i + 1 }
+    return r
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}

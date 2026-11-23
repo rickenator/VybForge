@@ -5393,3 +5393,24 @@ is not landing, and the "36" is a coincidence of the same wrong read. Next probe
 DEVICE's A and B as f64 right before the launch (widen32 + bulk_dtoh) and print them -- if A is not
 exactly 1..8 or B is not 1.0/2.0, the GEMM was never given the inputs, and bfgemm_p may be innocent.
 That check costs one run and eliminates the whole ambiguity.
+=== ROUND 91: *** bfgemm_p PASSES THE HAND-CHECKABLE CASE *** (the bug was my bf16 packing) ===
+  T A on device: 1 2 3 ... 8
+  T B on device: 1 1 | 2 2
+  T all8: 36 72 0 0 0 0
+  T o[0]=36 o[1]=72   (expect 36 and 72)
+  T_PASS bfgemm_p is correct on the hand-checkable case
+THE BUG WAS MINE: I packed four bf16 words per 8-byte Int as a SUM OF SHIFTS
+(0x3F80 + 0x3F8000 + 0x3F800000 + 0x3F80000000) which double-counted a term and produced
+0xBF80 (=-1.0) in word 0. The device showed it immediately: "T B on device: -1 0 | 2 0".
+Correct constants: w_one = 0x3F803F803F803F80, w_two = 0x4000400040004000.
+So bfgemm_p's arithmetic, TRANSP addressing and KSP=1 epilogue are all CORRECT on a case whose answer
+I can compute by hand. The earlier real-tensor failure (max_abs 0.7752, o[0]=0) therefore has a
+DIFFERENT cause -- and the one remaining difference between the passing micro-test and the failing
+real-tensor probe is how B reaches the device:
+    micro-test : wr_pdev(dB, off, int)  -- 8-byte scalar writes          -> PASSES
+    real probe : cuMemcpyHtoD_v2(dB, g0, N*K*2) with g0 a String        -> FAILS
+That is the exact hypothesis to test next, and it can now be tested cleanly: upload the same real
+tensor BOTH ways and compare a b0d decode of the first 8 words. If the String path disagrees, the
+problem is the String->device copy in a driver; if it agrees, the problem is elsewhere in the probe.
+STANDING MICRO-TEST: native/host/p6r14_tiny.vyb -- seconds to run, hand-checkable, covers M/N/KSP/
+TRANSP/epilogue. Any future bfgemm change runs through it first.
