@@ -390,6 +390,76 @@ main()<Int> -> {
             tr1<Int> = time_mono_millis()
             redms<Float> = ((tr1 - tr0) as Float) / 20.0
 
+            # ---- COVERAGE TEST: does the det path give the SAME result with and without the zero? ----
+            # If the partial buffer is fully overwritten every call, the zero is dead weight (0.20 ms).
+            dTz<Int> = dev_alloc(cw * 4)
+            dTn<Int> = dev_alloc(cw * 4)
+            if (dTz != 0 && dTn != 0) {
+                # with zero
+                wr_pdev(pbv, 0, dPy)
+                wr_pdev(pbv, 8, nslot * Bd * cw)
+                launch_kernel(fzf, (nslot * Bd * cw + 255) / 256, pbv)
+                sync()
+                wr_pdev(pbv, 0, dTz)
+                wr_pdev(pbv, 8, dXy)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 40, arA)
+                wr_pdev(pbv, 48, mapdev)
+                wr_pdev(pbv, 56, invbase)
+                wr_pdev(pbv, 144, lut)
+                wr_pdev(pbv, 168, Bd)
+                wr_pdev(pbv, 176, nin)
+                wr_pdev(pbv, 184, dPy)
+                launch_kernel(fdet, (nin / 64) * (cw / 128) * 8, pbv)
+                sync()
+                wr_pdev(pbv, 0, dTz)
+                wr_pdev(pbv, 8, dPy)
+                wr_pdev(pbv, 16, Bd)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 32, nslot)
+                launch_kernel(fred, (Bd * cw + 255) / 256, pbv)
+                sync()
+                # WITHOUT zero -- fill P with garbage first so a missed slot would show up
+                var<Int> gg = 0
+                while (gg < 20) { wr_pdev(dPy, gg * 8, 0x7FC000007FC00000) ; gg = gg + 1 }
+                sync()
+                wr_pdev(pbv, 0, dTn)
+                wr_pdev(pbv, 8, dXy)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 40, arA)
+                wr_pdev(pbv, 48, mapdev)
+                wr_pdev(pbv, 56, invbase)
+                wr_pdev(pbv, 144, lut)
+                wr_pdev(pbv, 168, Bd)
+                wr_pdev(pbv, 176, nin)
+                wr_pdev(pbv, 184, dPy)
+                launch_kernel(fdet, (nin / 64) * (cw / 128) * 8, pbv)
+                sync()
+                wr_pdev(pbv, 0, dTn)
+                wr_pdev(pbv, 8, dPy)
+                wr_pdev(pbv, 16, Bd)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 32, nslot)
+                launch_kernel(fred, (Bd * cw + 255) / 256, pbv)
+                sync()
+                VZ<Vec<Float>> = bulk_dtoh(dTz, cw)
+                VN<Vec<Float>> = bulk_dtoh(dTn, cw)
+                var<Int> nbad5 = 0
+                var<Float> mx5 = 0.0
+                var<Int> q5 = 0
+                while (q5 < cw) {
+                    d5<Float> = VZ.get(q5) - VN.get(q5)
+                    if (d5 < 0.0) { d5 = 0.0 - d5 }
+                    if (d5 > 1e-6) { nbad5 = nbad5 + 1 }
+                    if (d5 > mx5) { mx5 = d5 }
+                    q5 = q5 + 1
+                }
+                println("P6R10 COVERAGE with_vs_without_zero count_over_1e-6=" + nbad5.to_string() + " max_abs=" + mx5.to_string_precise() + " of " + cw.to_string())
+                if (nbad5 == 0) { println("P6R10 COVERAGE_OK -> the zero is dead weight, drop it") }
+                else { println("P6R10 COVERAGE_GAP -> some slots are NOT written; the zero is required") }
+                free_dev(dTz)
+                free_dev(dTn)
+            }
             tot<Float> = zfms + detms + redms
             println("P6R10 DETCOST atomic_ms=" + atomms.to_string_precise() + " det_ms=" + detms.to_string_precise() + " zero_ms=" + zfms.to_string_precise() + " reduce_ms=" + redms.to_string_precise() + " total_ms=" + tot.to_string_precise() + " ratio=" + (tot / atomms).to_string_precise())
             free_dev(dPy)

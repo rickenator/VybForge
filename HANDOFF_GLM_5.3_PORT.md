@@ -6205,3 +6205,23 @@ REVISED GUIDANCE:
     layers plus no correctness check at all.
   - the 10.6x figure remains valid as a measurement of the fused computation; it is not a claim that the
     fused-only mode is gate-ready.
+=== ROUND 131: MEASURED COST OF A DETERMINISTIC MATVEC -- 1.64x, or 1.36x with the zero dropped ===
+p6r10 now times the atomic mvnodB against mvnodB_det + mvnodR with the CORRECTED 4096-slot indexing
+(slot = rb64*8 + cta; 32 MB of partials at B=1), 20 warm reps each, same params:
+    atomic_ms = 0.70      det_ms = 0.70      zero_ms = 0.20      reduce_ms = 0.25
+    total_ms  = 1.15      ratio  = 1.64x slower
+KEY POINTS:
+  - the deterministic kernel itself costs NOTHING (0.70 vs 0.70): writing 4096 partials per output is as
+    cheap as the atomic accumulation it replaces. My earlier worry about the split shape was unfounded --
+    the split is unchanged, only the write target is.
+  - the whole penalty is the zero (0.20) + the reduce (0.25).
+  - THE ZERO IS UNNECESSARY: coverage is complete -- one block per (rb64, nb128) pair, 8 CTAs each
+    writing its own slot, so all 4096 slots per output are always written before the reduce reads them.
+    Dropping zfill gives total = 0.95 ms = 1.36x, and the claim should be re-tested with coverage
+    asserted (det result with and without the zero must be identical) before it is relied on.
+ECONOMICS: the fused matvec advantage over dequantise+gemm is ~10.6x. Paying 1.36x for determinism
+leaves ~7.8x (or ~6.5x at 1.64x). So a deterministic fast path is AFFORDABLE -- it is not a choice
+between 10.6x and 1x.
+STILL TO DO IF PURSUED: (a) verify coverage empirically, (b) pre-allocate the 32 MB partial buffer once
+instead of per call, (c) re-run the FGATE gate and the 45-layer determinism check, (d) decide whether
+the fast path should be deterministic at all given the default already is.
