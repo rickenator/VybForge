@@ -4575,3 +4575,20 @@ NEXT SESSION, first move: in exl3mv1s4 phase 2, atomically add 1.0 to a SECOND c
 (nb128*128 + d) and dump all 2048 values — if that histogram is uniform, the addresses are fine and
 the values are wrong; if it is zero beyond 255, the atomic address computation is broken for
 nb128 >= 2 (a codegen bug worth a minimal repro for the Vyb compiler).
+=== ROUND 44: PER-OUTPUT HISTOGRAM IS UNIFORM — the addresses are fine; the values are not ===
+Second counter indexed by cb = nb128*128 + d, dumped over all 2048 outputs:
+    PEROUT zero_outputs = 0   c0 = 512  c255 = 512  c256 = 512  c2047 = 512
+So every output receives exactly its 512 contributions — the atomic ADDRESS computation is correct
+(the codegen hypothesis from round 43 is dead). Yet U_FULL still reports 1792 of 2048 wrong from
+output 256 on, with xp, the decode, the coverage and the isolated grid cases all proven exact.
+That leaves one narrow possibility: the VALUES added for the CTAs of column blocks >= 2 differ from
+the slab/xp values the isolated tests exercised — i.e. something specific to how phase 2 reads the
+shared slab for those blocks (the compact slab index (j*512 + d*4) combined with the cta-dependent
+row base), which the single-CTA and g<=8 cases (nb128 == 0 only) never reached.
+NEXT SESSION (one run): launch with a grid that covers nb128 == 2 ONLY (blocks 32..39 = rb64 0,
+nb128 2, cta 0..7 -> launch offsets are not available, so instead dump the slab for one such CTA
+via the mv's own shared values) and compare its contribution against sum_j T[8j..][nb128*128+d].xp.
+That is the first time a block-2 CTA's contribution is checked in isolation.
+STOPPING HERE: 44 rounds on this kernel. Everything is committed and the remaining question is
+fully characterised (correct inputs, correct coverage, correct addresses, wrong sums for 14 of 16
+column blocks).

@@ -331,6 +331,7 @@ main()<Int> -> {
         wr_pdev(pbm, 56, invbase)
         wr_pdev(pbm, 64, dscr)
         wr_pdev(pbm, 72, 0)
+        wr_pdev(pbm, 88, -1)
         cnt2b<Int> = dev_alloc(8192)
         cuMemcpyHtoD_v2(cnt2b, zero_bytes(8192), 8192)
         wr_pdev(pbm, 80, cnt2b)
@@ -397,7 +398,39 @@ main()<Int> -> {
                 n11 = n11 + 1
             }
             println("E2E U_FULL count_over_1e-4=" + ndu.to_string() + " max_abs=" + mxu.to_string_precise() + " first_bad=" + firstbad_u.to_string())
+            // ---- ONLY block 2: does that block's own contribution sum correctly? ----
+            wr_pdev(pbm, 88, 2)
+            cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+            launch_kernel(fmv, 8192, pbm)
+            cuCtxSynchronize()
+            wr_pdev(pb32, 0, byr)
+            wr_pdev(pb32, 8, u64)
+            wr_pdev(pb32, 16, 2048)
+            launch_kernel(fcv, 1, pb32)
+            cuCtxSynchronize()
+            UO<Vec<Float>> = bulk_dtoh(u64, 2048)
+            var<Int> ndo2 = 0
+            var<Float> mxo2 = 0.0
+            var<Int> fbo = -1
+            n13<Int> = 256
+            while (n13 < 384) {
+                ao<Float> = 0.0
+                k13<Int> = 0
+                while (k13 < 4096) {
+                    ao = ao + T4.get(k13 * 2048 + n13) * XP.get(k13)
+                    k13 = k13 + 1
+                }
+                do3<Float> = ao - UO.get(n13)
+                ado<Float> = do3
+                if (ado < 0.0) { ado = 0.0 - ado }
+                if (ado > mxo2) { mxo2 = ado }
+                if (ado > 1e-4) { ndo2 = ndo2 + 1 ; if (fbo < 0) { fbo = n13 } }
+                n13 = n13 + 1
+            }
+            println("E2E ONLY2 count_over_1e-4=" + ndo2.to_string() + " max_abs=" + mxo2.to_string_precise() + " first_bad=" + fbo.to_string() + " u256=" + UO.get(256).to_string_precise())
+
         }
+        wr_pdev(pbm, 88, -1)
         wr_pdev(pby, 0, byr)
         wr_pdev(pby, 8, by)
         wr_pdev(pby, 16, hd_pre32)

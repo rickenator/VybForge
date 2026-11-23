@@ -102,6 +102,7 @@ exl3mv1s4(p<Int>) -> {
     SU<Int> = ld_i64(p + 16)
     CNT<Int> = ld_i64(p + 72)
     CNT2<Int> = ld_i64(p + 80)
+    ONLY<Int> = ld_i64(p + 88)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -167,7 +168,11 @@ exl3mv1s4(p<Int>) -> {
         cb<Int> = nb128 * 128 + d
         if (CNT != 0) { atomic_add_f32(CNT + nb128 * 4, 1.0) }
         if (CNT2 != 0) { atomic_add_f32(CNT2 + cb * 4, 1.0) }
-        if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
+        # ONLY >= 0 restricts accumulation to ONE column block (diagnostic):
+        # isolates exactly which block's contributions are wrong.
+        if (ONLY < 0 || ONLY == nb128) {
+            if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
+        }
     }
 }
 
