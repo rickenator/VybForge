@@ -5818,3 +5818,7 @@ Two things unblocked the engine-path verification:
     Tailnet).
 This is the vehicle for the in-engine FGATE verification. Nothing about the fused-gate block was wrong;
 it simply needed a caller that runs.
+    CORRECTION to the route signature: glm_serve.vyb:572 parses QUERY-STRING params, not JSON --
+        POST /v1/generate?ids=785,1234&nsteps=1
+    (the header comment at :47 says JSON, but the code reads q.index_of("ids=") / ("nsteps=") off the
+    request path). Sending JSON gives "CHAIN_FAIL ids 0" and the request is dropped.
