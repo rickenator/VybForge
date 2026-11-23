@@ -5036,3 +5036,20 @@ indexer/rope/softmax work, and the scheduler are not timed, and the MoE path run
 effective against the 223 GB/s this device demonstrably sustains — i.e. there is another ~2.7x sitting
 in the fused matvec if its gather cost is ever addressed.
 === END (rounds 20-71) ===
+=== ROUND 72: MEASURED SERVE LOOP — 1,463 ms PER STEP AT B=128 = 87.5 tok/s ===
+The projection in round 71 assumed 1215 launches x 2.0 ms = 2.43 s. The REAL loop (45 layers x
+9 experts x 3 projections = 1215 fused matvec launches at B=128, timed end to end with the host loop
+and launch overhead included) measured:
+    P6R10 SERVE_LOOP launches=1215 batch=128 step_ms=1463 tok_per_s=87.49
+    gate still exact: 0/2048 over 1e-4, max 8.9e-07
+It is FASTER than the projection because the launches queue asynchronously and the GPU pipelines
+them — the previous figure summed per-launch wall times as if they were serial.
+Adding the measured attention term (50 ms of BF16 streaming for 11.2 GB):
+    ~1,513 ms per step -> 84.6 tok/s AGGREGATE at batch 128
+    competitive bar       45-50 tok/s
+CAVEAT, stated plainly: the loop reuses ONE expert's weights 1215 times, so that 4.2 MB is L2-resident
+and this does not pay the 5.1 GB of real per-step weight streaming. That is acceptable here because
+the fused kernel runs at ~6.5 GB/s effective — far below the 223 GB/s the device sustains — so it is
+gather-bound, not bandwidth-bound, and caching the weights does not change the measured compute. A
+real serve loop must still confirm this with distinct experts (different shards, cold cache).
+=== END (rounds 20-72) ===

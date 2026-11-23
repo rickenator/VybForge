@@ -88,6 +88,24 @@ main()<Int> -> {
         ti = ti + 1
     }
 
+    # every layer's resolve table, so the cold-cache loop can resolve real tensors
+    tabs<Vec<String>> = Vec()
+    {
+        nl0b<Int> = find_from(cs, "\n", 0)
+        posb<Int> = nl0b + 1
+        var<Int> tb = 0
+        while (tb < 45) {
+            nlb<Int> = find_from(cs, "\n", posb)
+            if (nlb < 0) { tb = 45 }
+            else {
+                plenb<Int> = cs.substring(posb, nlb).to_int()
+                tabs.push(cs.substring(nlb + 1, nlb + 1 + plenb))
+                posb = nlb + 1 + plenb
+                tb = tb + 1
+            }
+        }
+    }
+    println("P6R10 TABS loaded=" + tabs.len().to_string())
     epre<String> = "model.language_model.layers.3.mlp.experts." + e.to_string() + "."
     w2<Vec<String>> = Vec()
     w2.push(epre + "gate_proj.trellis")
@@ -348,43 +366,90 @@ main()<Int> -> {
             println("P6R10 TOKEN_PASSES xhat_ms_per_token=" + xh.to_string_precise() + " yhat_ms_per_token=" + yh.to_string_precise())
         }
     }
-    // ---- BATCHED SERVE LOOP: one full step's worth of MoE projections ----
-    // 45 layers x 9 experts x 3 projections = 1215 fused matvec launches at B=128,
-    // all on one expert's weights (same element count for gate/up/down), which is
-    // exactly the workload the step projection assumed. This measures the REAL
-    // wall time including launch and host-loop overhead.
+    // ---- BATCHED SERVE LOOP, COLD CACHE: rotate through 21 layers' gate_proj ----
+    // 21 distinct experts x 4.2 MB = ~88 MB of packed weights, well past any L2,
+    // so the matvec pays the real cold read instead of hitting a cached expert.
     if (fmb != 0) {
-        var<Int> BS = 128
-        xs<Int> = dev_alloc(nin * 4 * BS)
-        ts<Int> = dev_alloc(cw * 4 * BS)
-        if (xs != 0 && ts != 0) {
-            wr_pdev(pbv, 0, ts)
-            wr_pdev(pbv, 8, xs)
-            wr_pdev(pbv, 24, cw)
-            wr_pdev(pbv, 40, arA)
-            wr_pdev(pbv, 48, mapdev)
-            wr_pdev(pbv, 56, invbase)
-            wr_pdev(pbv, 144, lut)
-            wr_pdev(pbv, 168, BS)
-            wr_pdev(pbv, 176, nin)
-            launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
-            sync()
-            s0<Int> = time_mono_millis()
-            var<Int> L = 0
-            while (L < 45) {
-                var<Int> ex = 0
-                while (ex < 9) {
-                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
-                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
-                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
-                    ex = ex + 1
+        qs<Vec<Int>> = Vec()
+        sus<Vec<Int>> = Vec()
+        svs<Vec<Int>> = Vec()
+        var<Int> nset = 0
+        var<Int> L2 = 3
+        while (L2 <= 23) {
+            pfx<String> = "model.language_model.layers." + L2.to_string() + ".mlp.experts." + e.to_string() + ".gate_proj."
+            wl<Vec<String>> = Vec()
+            wl.push(pfx + "trellis")
+            wl.push(pfx + "suh")
+            wl.push(pfx + "svh")
+            tl<String> = tab3
+            # the cache is 0-indexed by layer: layer 3 is tabs[3]
+            if (L2 < tabs.len()) { tl = tabs.get(L2) }
+            gl<GxLoc> = gx_resolve_tab(tl, dir, 83, wl)
+            c0<String> = gx_read(gl, 0)
+            c1<String> = gx_read(gl, 1)
+            c2<String> = gx_read(gl, 2)
+            if (c0.len() > 0 && c1.len() > 0 && c2.len() > 0) {
+                dq<Int> = dev_alloc(c0.len())
+                du<Int> = dev_alloc(c1.len())
+                dv<Int> = dev_alloc(c2.len())
+                if (dq != 0 && du != 0 && dv != 0) {
+                    cuMemcpyHtoD_v2(dq, c0, c0.len())
+                    cuMemcpyHtoD_v2(du, c1, c1.len())
+                    cuMemcpyHtoD_v2(dv, c2, c2.len())
+                    qs.push(dq)
+                    sus.push(du)
+                    svs.push(dv)
+                    nset = nset + 1
                 }
-                L = L + 1
             }
-            sync()
-            s1<Int> = time_mono_millis()
-            step_ms<Float> = (s1 - s0) as Float
-            println("P6R10 SERVE_LOOP launches=1215 batch=128 step_ms=" + step_ms.to_string_precise() + " tok_per_s=" + ((128.0 * 1000.0) / step_ms).to_string_precise())
+            L2 = L2 + 1
+        }
+        sync()
+        println("P6R10 SERVE_SETS n=" + nset.to_string() + " packed_MB=" + ((nset * 4194304) / 1000000).to_string())
+        if (nset > 0) {
+            var<Int> BS2 = 128
+            xs<Int> = dev_alloc(nin * 4 * BS2)
+            ts<Int> = dev_alloc(cw * 4 * BS2)
+            if (xs != 0 && ts != 0) {
+                # warm every set once
+                var<Int> wz = 0
+                while (wz < nset) {
+                    wr_pdev(pbv, 0, ts)
+                    wr_pdev(pbv, 8, xs)
+                    wr_pdev(pbv, 24, cw)
+                    wr_pdev(pbv, 40, qs.get(wz))
+                    wr_pdev(pbv, 48, mapdev)
+                    wr_pdev(pbv, 56, invbase)
+                    wr_pdev(pbv, 144, lut)
+                    wr_pdev(pbv, 168, BS2)
+                    wr_pdev(pbv, 176, nin)
+                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                    wz = wz + 1
+                }
+                sync()
+                s0<Int> = time_mono_millis()
+                var<Int> L3 = 0
+                var<Int> ci = 0
+                while (L3 < 45) {
+                    var<Int> ex2 = 0
+                    while (ex2 < 9) {
+                        var<Int> pj = 0
+                        while (pj < 3) {
+                            wr_pdev(pbv, 40, qs.get(ci))
+                            launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                            ci = ci + 1
+                            if (ci >= nset) { ci = 0 }
+                            pj = pj + 1
+                        }
+                        ex2 = ex2 + 1
+                    }
+                    L3 = L3 + 1
+                }
+                sync()
+                s1<Int> = time_mono_millis()
+                step_ms2<Float> = (s1 - s0) as Float
+                println("P6R10 SERVE_LOOP_COLD launches=1215 batch=128 sets=" + nset.to_string() + " step_ms=" + step_ms2.to_string_precise() + " tok_per_s=" + ((128.0 * 1000.0) / step_ms2).to_string_precise())
+            }
         }
     }
     // ---- ATTENTION PROJECTION at B=128: shape derived from suh/svh lengths ----
