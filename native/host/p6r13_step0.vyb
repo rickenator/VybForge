@@ -10,7 +10,7 @@ import io::{open_read, read_all, close}
 import env::{env_get}
 import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
 import gx::{gx_read}
-import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev}
+import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev, deq_bf16}
 
 # Declaring the extern in THIS module is what enables the String -> loc<CVoid>
 # conversion. Importing it is not enough: the binding's comment says an importer
@@ -44,6 +44,7 @@ main()<Int> -> {
         ti = ti + 1
     }
 
+    K<Int> = 4096
     nm<String> = "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
     w1<Vec<String>> = Vec()
     w1.push(nm)
@@ -70,64 +71,21 @@ main()<Int> -> {
     # passed as its STRUCT (a pointer), which is why the device held junk.
     # call the binding's own helper: the String->pointer conversion only works
     # inside the module that declares the FFI pointer functions
-    # the explicit form real code uses (deq_cache.vyb:31,45): take the String's
-    # address with addr(), then convert it to loc<CVoid> with from<>. Passing a
-    # String straight to the extern does NOT do this conversion in a driver.
-    rc2<Int> = 0
-    freedom {
-        var<Int> dp = 0
-        dp = addr(g0)
-        rc2 = cuMemcpyHtoD_v2(dS, from<loc<CVoid>>(dp), 16) as Int
-    }
-    println("S0 htod rc=" + rc2.to_string() + " (from<loc<CVoid>>(addr(g0)))")
+    # (the hand-rolled copy is gone: deq_bf16 below does the upload itself,
+    #  the way glm_engine:299 does -- String passed straight to cuMemcpyHtoD_v2)
+    # ---- THE REAL TEST: the engine's own decoder with z = row width.
+    # bf16.vyb stores f64 when z > 0 and f32 when z == 0; bulk_dtoh reads f64.
+    # z = K (row width) is how glm_engine calls it, and it is the f64 branch.
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")   # f64 twin, linear when z=0
+    dF3<Int> = deq_bf16(fbf, g0, 512 * K, 0)
     sync()
-    wr_pdev(pb, 0, dS)
-    wr_pdev(pb, 8, dD)
-    wr_pdev(pb, 16, 8)
-    launch_kernel(f, 1, pb)
-    sync()
-    V<Vec<Float>> = bulk_dtoh(dD, 8)
-    # ---- separate UPLOAD from DECODE: store the raw word numerically ----
-    fw<Int> = load_fn("native/build/tobg.ptx", "tobg_word")
-    dW2<Int> = dev_alloc(64)
-    wr_pdev(pb, 8, dW2)
-    launch_kernel(fw, 1, pb)
-    sync()
-    W2<Vec<Float>> = bulk_dtoh(dW2, 8)
-    println("S0 raw words on device: " + W2.get(0).to_string_precise() + " " + W2.get(1).to_string_precise() + " " + W2.get(2).to_string_precise() + "  (expect 48176 15458? no: 48176 then next)")
-    # ---- does my kernel run AT ALL? write a constant, read it back
-    fc<Int> = load_fn("native/build/tobg.ptx", "tobg_const")
-    println("S0 const_fn=" + fc.to_string())
-    dC<Int> = dev_alloc(64)
-    wr_pdev(pb, 8, dC)
-    rcc<Int> = launch_kernel(fc, 1, pb) as Int
-    sync()
-    println("S0 const launch rc=" + rcc.to_string())
-    VC<Vec<Float>> = bulk_dtoh(dC, 8)
-    println("S0 const values=" + VC.get(0).to_string_precise() + " " + VC.get(1).to_string_precise())
-    # ---- DECISIVE: write KNOWN words with wr_pdev (a proven path), then decode.
-    # 0xBC30 = 48176 as a u16, 0x3C62 = 15458. If THIS decodes correctly the
-    # upload/kernel are fine and only the String copy was ever wrong.
-    wr_pdev(dS, 0, 48176)
-    wr_pdev(dS, 8, 15458)
-    sync()
-    wr_pdev(pb, 0, dS)
-    wr_pdev(pb, 8, dD)
-    wr_pdev(pb, 16, 8)
-    launch_kernel(f, 1, pb)
-    sync()
-    VK<Vec<Float>> = bulk_dtoh(dD, 8)
-    println("S0 KNOWN first=" + VK.get(0).to_string_precise() + " second=" + VK.get(1).to_string_precise() + "  (expect -0.0107421875, 0.0110...)")
-    wr_pdev(pb, 8, dW2)
-    launch_kernel(fw, 1, pb)
-    sync()
-    WK<Vec<Float>> = bulk_dtoh(dW2, 8)
-    println("S0 KNOWN words=" + WK.get(0).to_string_precise() + " " + WK.get(1).to_string_precise() + "  (expect 48176 15458)")
-    println("S0 device values: " + V.get(0).to_string_precise() + " " + V.get(1).to_string_precise() + " " + V.get(2).to_string_precise() + " " + V.get(3).to_string_precise())
-    dv<Float> = V.get(0) - (0.0 - 0.0107421875)
-    if (dv < 0.0) { dv = 0.0 - dv }
-    if (dv < 1e-12 && (V.get(0) + 0.0107421875) < 0.0) { println("S0_PASS first_value=-0.0107421875 as expected") }
-    else { println("S0_FAIL expected -0.0107421875 got " + V.get(0).to_string_precise()) }
+    if (dF3 == 0) { println("S0_FAIL deq_bf16 returned 0"); return 5 }
+    W3<Vec<Float>> = bulk_dtoh(dF3, 8)
+    println("S0 DECODED first=" + W3.get(0).to_string_precise() + " second=" + W3.get(1).to_string_precise() + "  (expect -0.010742188 0.013793945)")
+    d0<Float> = W3.get(0) + 0.0107421875
+    if (d0 < 0.0) { d0 = 0.0 - d0 }
+    if (d0 < 1e-9) { println("S0_PASS bf16 round-trip verified: 0xBC30 -> -0.0107421875") }
+    else { println("S0_FAIL expected -0.0107421875 got " + W3.get(0).to_string_precise()) }
     println("S0_DONE")
     return 0
 }

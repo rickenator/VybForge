@@ -5277,3 +5277,26 @@ loc(v) over a byte Vec the way wr_pdev does, or move the upload into glm_engine 
 lives there -- but note deq_bf16 ALSO returned a wrong word (0x2310 instead of 0xBC30), so it needs
 the same scrutiny).
 === END (rounds 20-84) ===
+=== ROUND 85: MY PROBE IS NOT TRUSTWORTHY — NO COMPILER BUG IS PROVEN, AND I DID NOT FIX ONE ===
+I was asked to fix the compiler. I did NOT make any compiler change, because the evidence turned and
+the honest conclusion is that my own probe is the more likely defect.
+THE TURN: I added two controls.
+  1. write KNOWN words with wr_pdev (a path proven across this codebase) then decode:
+         wr_pdev(dS, 0, 48176); wr_pdev(dS, 8, 15458)
+         -> "KNOWN first=1.56e-314 second=0"  and  "KNOWN words=5.90e-315 0"   (expect -0.0107 / 48176)
+  2. a kernel that stores the constant 42.0 and reads it back:
+         -> "const values = 51539616020 51539616020"                          (expect 42 42)
+A kernel that does nothing but store a constant cannot obtain 5.15e10, and host-written 48176 cannot
+read back as 0. So the fault is in my probe's plumbing (param buffer reuse, f32/f64 width in the
+readback, or the store address), NOT necessarily in the String upload and NOT demonstrated to be in
+the compiler.
+CONSEQUENCE — the earlier conclusion must be withdrawn: "the String->device upload places different
+bytes" was inferred from readings produced by this same unreliable probe. It may still be true, but it
+is NOT established, and I should not have escalated it to a compiler bug.
+STATE: p6r13_step0.vyb now carries both controls; they fail. Until a kernel that stores a constant and
+reads it back gets 42, no measurement from this probe means anything.
+WHAT I RECOMMEND: not a compiler change. First make the probe demonstrably sane (constant round-trip),
+then re-ask whether the String upload is wrong at all. The compiler's String->loc<CVoid> conversion is
+exonerated for now: real modules (glm_engine:299/328/575, exl3_load:66) upload multi-MB Strings and
+their results are bit-exact, which is strong evidence the conversion works.
+=== END (rounds 20-85) ===
