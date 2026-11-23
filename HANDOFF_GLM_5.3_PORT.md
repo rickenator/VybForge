@@ -4484,3 +4484,21 @@ increments 1-3, tab cache 37x, buffer cache 16%, ComfyUI relocation, reclaim). T
 the algebra, layout, decode and bounds all correct; one deterministic defect remains at the
 cta/row-mapping level. Recommend continuing it in a fresh session with the tools now in place
 (initcheck, racecheck, the block counter, p6r8_e2e).
+=== ROUND 38: NO ROW SHIFT — block 3+ looks like a NEAR-CANCELLATION of wrong partials ===
+Corrected the diagnostic address (it was reading the row start, not column 384) and compared:
+    B[0][384..386]  = -0.00110900  -0.00949111  -0.01381710
+    B[1][384..386]  = -0.03604311   0.02125968  -0.01038862
+    B[2][384..386]  = -0.02006697  -0.00925906   0.00306942
+    B[3][384..386]  =  0.01275985  -0.00582917   0.00616271
+    fused[384..386] =  0.00001842  -0.01353373  -0.01162989
+No row matches, so the fused output is not a shifted copy: for those columns the sum lands ~60x
+small, i.e. the partials are mostly wrong or missing while the block counter (65536 = 512x128)
+proves every thread ran. That combination means the atomics for nb128 >= 3 are landing on the
+wrong addresses or the slab contents are wrong for those tiles.
+NEXT SESSION — smallest possible isolation (do this first, it is one run):
+  run the mv kernel with a REDUCED grid of exactly ONE CTA (blk 0) and dump yraw; then compare
+  against the single-CTA partial computed on the host from that CTA's 8 input rows of the proven T.
+  One CTA removes all atomics contention and all cross-CTA confusion; if its partial is right, walk
+  the grid up (1 -> 2 -> 8 -> 512 CTAs per column block) until the first wrong value appears.
+All state is committed. This is a clean handoff: p6r8_e2e (driver), exl3dqdbg (T oracle), dbg_sh
+(f32t64/cmp32), exl3mv (the three kernels + the block counter).

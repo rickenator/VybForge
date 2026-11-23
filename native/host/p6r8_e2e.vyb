@@ -124,6 +124,117 @@ main()<Int> -> {
     launch_kernel(fcast32, 16, pb32)
     cuCtxSynchronize()
     free_dev(d64)
+    // ---- SINGLE-CTA ISOLATION (P6_C1=1) ----
+    // One CTA (blk 0) covers input rows 0..7 and output columns 0..127. With
+    // xp = ones its yraw[n] must equal sum_{k<8} T[k][n] — computable on the host
+    // from the PROVEN T. No atomics contention, no cross-CTA confusion.
+    if ((env_get("P6_C1") else "0") == "1") {
+        fo3<Int> = load_fn("native/build/exl3dqdbg.ptx", "exl3dqdbg1s4")
+        if (fo3 == 0) { println("E2E_FAIL oracle"); return 2 }
+        bT<Int> = dev_alloc(33554432)
+        pbo3<Int> = dev_alloc(64)
+        wr_pdev(pbo3, 0, arA)
+        wr_pdev(pbo3, 8, mapdev)
+        wr_pdev(pbo3, 16, 0)
+        wr_pdev(pbo3, 24, bT)
+        wr_pdev(pbo3, 32, 2048)
+        wr_pdev(pbo3, 40, invbase)
+        launch_kernel(fo3, 8192, pbo3)
+        cuCtxSynchronize()
+        // xp = ones
+        ones2<Vec<Float>> = Vec()
+        i = 0
+        while (i < 4096) { ones2.push(1.0) ; i = i + 1 }
+        d64b<Int> = alloc_dev(32768)
+        bulk_htod(d64b, view(ones2))
+        wr_pdev(pb32, 0, d64b)
+        wr_pdev(pb32, 8, bxp)
+        wr_pdev(pb32, 16, 4096)
+        launch_kernel(fcast32, 16, pb32)
+        cuCtxSynchronize()
+        free_dev(d64b)
+        // ONE CTA (the mv params are set here: this mode runs before the fused path)
+        wr_pdev(pbm, 0, byr)
+        wr_pdev(pbm, 8, bxp)
+        wr_pdev(pbm, 16, arH)
+        wr_pdev(pbm, 24, 2048)
+        wr_pdev(pbm, 32, 0)
+        wr_pdev(pbm, 40, arA)
+        wr_pdev(pbm, 48, mapdev)
+        wr_pdev(pbm, 56, invbase)
+        wr_pdev(pbm, 64, dscr)
+        wr_pdev(pbm, 72, 0)
+        cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+        r1c<Int> = launch_kernel(fmv, 1, pbm)
+        cuCtxSynchronize()
+        yr3<Int> = dev_alloc(16384)
+        wr_pdev(pb32, 0, byr)
+        wr_pdev(pb32, 8, yr3)
+        wr_pdev(pb32, 16, 128)
+        launch_kernel(fcv, 1, pb32)
+        cuCtxSynchronize()
+        YR3<Vec<Float>> = bulk_dtoh(yr3, 128)
+        // T -> host
+        t64c<Int> = dev_alloc(67108864)
+        wr_pdev(pb32, 0, bT)
+        wr_pdev(pb32, 8, t64c)
+        wr_pdev(pb32, 16, 8388608)
+        launch_kernel(fcv, 32768, pb32)
+        cuCtxSynchronize()
+        T3<Vec<Float>> = bulk_dtoh(t64c, 8388608)
+        var<Int> ndc = 0
+        var<Float> suma = 0.0
+        n5<Int> = 0
+        while (n5 < 128) {
+            ap<Float> = 0.0
+            k5<Int> = 0
+            while (k5 < 8) {
+                ap = ap + T3.get(k5 * 2048 + n5)
+                k5 = k5 + 1
+            }
+            dd5<Float> = ap - YR3.get(n5)
+            ad5<Float> = dd5
+            if (ad5 < 0.0) { ad5 = 0.0 - ad5 }
+            if (ad5 > 1e-4) { ndc = ndc + 1 }
+            suma = suma + ad5
+            n5 = n5 + 1
+        }
+        println("E2E ONE_CTA rc=" + r1c.to_string() + " colsum_partial0=" + YR3.get(0).to_string_precise() + " colsum_partial1=" + YR3.get(1).to_string_precise())
+        println("E2E ONE_CTA_GATE count_over_1e-4=" + ndc.to_string() + " sum_absdiff=" + suma.to_string_precise())
+        // walk the grid up: G CTAs cover input rows 0..8G-1, so the expected
+        // yraw[n] = sum_{k < 8G} T[k][n]. The first G whose result diverges is
+        // where the multi-CTA path breaks.
+        g<Int> = 2
+        while (g <= 64) {
+            cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+            launch_kernel(fmv, g, pbm)
+            cuCtxSynchronize()
+            wr_pdev(pb32, 0, byr)
+            wr_pdev(pb32, 8, yr3)
+            wr_pdev(pb32, 16, 128)
+            launch_kernel(fcv, 1, pb32)
+            cuCtxSynchronize()
+            YG<Vec<Float>> = bulk_dtoh(yr3, 128)
+            var<Int> ndg = 0
+            n6<Int> = 0
+            while (n6 < 128) {
+                ap2<Float> = 0.0
+                k6<Int> = 0
+                while (k6 < 8 * g) {
+                    ap2 = ap2 + T3.get(k6 * 2048 + n6)
+                    k6 = k6 + 1
+                }
+                dg2<Float> = ap2 - YG.get(n6)
+                ad6<Float> = dg2
+                if (ad6 < 0.0) { ad6 = 0.0 - ad6 }
+                if (ad6 > 1e-3) { ndg = ndg + 1 }
+                n6 = n6 + 1
+            }
+            println("E2E GRID g=" + g.to_string() + " count_over_1e-3=" + ndg.to_string() + " v0=" + YG.get(0).to_string_precise())
+            g = g * 2
+        }
+        return 0
+    }
     // ---- fused path ----
     t0<Int> = time_mono_millis()
     wr_pdev(pbx, 0, bx)
