@@ -218,15 +218,13 @@ main()<Int> -> {
     fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
     if (fmb != 0) {
         var<Int> B = 1
-        while (B <= 32) {
+        while (B <= 128) {
             dxb<Int> = dev_alloc(nin * 4 * B)
             tyb<Int> = dev_alloc(cw * 4 * B)
             xpb<Int> = dev_alloc(nin * 4 * B)
             if (dxb != 0 && tyb != 0 && xpb != 0) {
-                # same input vector replicated B times (throughput measurement only)
-                cuMemcpyHtoD_v2(dxb, zero_bytes(nin * 4 * B), nin * 4 * B)
-                cuMemcpyHtoD_v2(tyb, zero_bytes(cw * 4 * B), cw * 4 * B)
-                cuMemcpyHtoD_v2(xpb, zero_bytes(nin * 4 * B), nin * 4 * B)
+                # throughput measurement only: no zeroing (zero_bytes is O(n) string
+                # concatenation in Vyb and took minutes at MB sizes)
                 wr_pdev(pbf, 0, dx)
                 wr_pdev(pbf, 8, xpb)
                 wr_pdev(pbf, 16, hd_pre32)
@@ -349,6 +347,54 @@ main()<Int> -> {
             yh<Float> = ((p3t - p2t) as Float) / (B2 as Float)
             println("P6R10 TOKEN_PASSES xhat_ms_per_token=" + xh.to_string_precise() + " yhat_ms_per_token=" + yh.to_string_precise())
         }
+    }
+    // ---- ATTENTION PROJECTION at B=128: shape derived from suh/svh lengths ----
+    if (fmb != 0) {
+        apre<String> = "model.language_model.layers.3.self_attn.q_proj."
+        wa<Vec<String>> = Vec()
+        wa.push(apre + "trellis")
+        wa.push(apre + "suh")
+        wa.push(apre + "svh")
+        ga<GxLoc> = gx_resolve_tab(tab3, dir, 83, wa)
+        a0<String> = gx_read(ga, 0)
+        a1<String> = gx_read(ga, 1)
+        a2<String> = gx_read(ga, 2)
+        if (a1.len() > 0 && a2.len() > 0) {
+            ninA<Int> = a1.len() / 2
+            cwA<Int> = a2.len() / 2
+            println("P6R10 ATTN q_proj nin=" + ninA.to_string() + " cw=" + cwA.to_string() + " trellis=" + a0.len().to_string())
+            cuMemcpyHtoD_v2(arA, a0, a0.len())
+            cuMemcpyHtoD_v2(arG, a1, a1.len())
+            cuMemcpyHtoD_v2(arH, a2, a2.len())
+            sync()
+            var<Int> BA = 128
+            dxa<Int> = dev_alloc(ninA * 4 * BA)
+            tya<Int> = dev_alloc(cwA * 4 * BA)
+            if (dxa != 0 && tya != 0) {
+                wr_pdev(pbv, 0, tya)
+                wr_pdev(pbv, 8, dxa)
+                wr_pdev(pbv, 24, cwA)
+                wr_pdev(pbv, 40, arA)
+                wr_pdev(pbv, 48, mapdev)
+                wr_pdev(pbv, 56, invbase)
+                wr_pdev(pbv, 144, lut)
+                wr_pdev(pbv, 168, BA)
+                wr_pdev(pbv, 176, ninA)
+                launch_kernel(fmb, (ninA / 64) * (cwA / 128) * 8, pbv)
+                sync()
+                ta0<Int> = time_mono_millis()
+                var<Int> ra = 0
+                while (ra < 10) {
+                    launch_kernel(fmb, (ninA / 64) * (cwA / 128) * 8, pbv)
+                    ra = ra + 1
+                }
+                sync()
+                ta1<Int> = time_mono_millis()
+                pa<Float> = ((ta1 - ta0) as Float) / 10.0
+                bya<Float> = 2.0 * (a0.len() as Float)
+                println("P6R10 ATTN_MV B=128 mv_ms=" + pa.to_string_precise() + " ms_per_token=" + (pa / 128.0).to_string_precise() + " GBps=" + (bya / (pa * 1000000.0)).to_string_precise())
+            }
+        } else { println("P6R10 ATTN resolve failed a1=" + a1.len().to_string()) }
     }
     // ---- compare ----
     fv<Vec<Float>> = bulk_dtoh(dy, cw)

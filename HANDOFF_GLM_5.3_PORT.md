@@ -4977,3 +4977,24 @@ BATCH SIZE, not the kernel: the matvec stayed flat from B=1 to B=32 (0.5 -> 0.6 
 grew 32x), so pushing B to 64/128 amortises the same 4.2 MB read over more tokens. That sweep is
 running now.
 === END (rounds 20-68) ===
+=== ROUND 69: BATCH 128 CLEARS THE BAR (52.8 tok/s projected from measured matvec) ===
+Extended batch sweep, this run, same validated expert (gate still 0/2048, max 8.3e-07):
+    B=  1 mv 0.60 ms -> 0.60000 ms/token
+    B=  2 mv 0.60     -> 0.30000
+    B=  4 mv 0.60     -> 0.15000
+    B=  8 mv 0.60     -> 0.07500
+    B= 16 mv 0.50     -> 0.03125
+    B= 32 mv 0.70     -> 0.021875
+    B= 64 mv 0.80     -> 0.012500
+    B=128 mv 1.20     -> 0.009375
+The matvec grows only 2x while the batch grows 128x: the expert's 4.2 MB is read once per batch.
+With the measured batched-Hadamard cost (0.0031 ms/token each) the step projects to:
+    B=  1 : 736.5 ms ->  1.4 tok/s
+    B= 32 :  34.1 ms -> 29.3 tok/s
+    B= 64 :  22.7 ms -> 44.0 tok/s     <- at the bar
+    B=128 :  19.0 ms -> 52.8 tok/s     <- CLEARS the 45-50 tok/s bar by ~11%
+NO repack needed (round 68 withdrew it). The lever is batch size, exactly as the bandwidth arithmetic
+said it had to be. CAVEAT, stated plainly: this is the MoE path only — attention, the router and the
+batch scheduler are still unmeasured, and they consume the same 19 ms budget. It is a projection from
+measured kernels, not a served throughput number.
+=== END (rounds 20-69) ===
