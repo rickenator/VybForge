@@ -4502,3 +4502,19 @@ NEXT SESSION — smallest possible isolation (do this first, it is one run):
   the grid up (1 -> 2 -> 8 -> 512 CTAs per column block) until the first wrong value appears.
 All state is committed. This is a clean handoff: p6r8_e2e (driver), exl3dqdbg (T oracle), dbg_sh
 (f32t64/cmp32), exl3mv (the three kernels + the block counter).
+=== ROUND 39: SINGLE-CTA EXACT; THE GRID WALK WAS MYSELF (block index maps to (rb64,nb128)) ===
+Single-CTA isolation (grid = 1, xp = ones): ONE_CTA_GATE count_over_1e-4 = 0, sum_absdiff = 0 over
+128 outputs — one CTA's partial is EXACT against the host sum of the proven T.
+Grid walk (my expectation: G CTAs cover rows 0..8G-1):
+    g=1  exact   g=2  exact   g=4  exact   g=8  exact
+    g=16 128/128 "wrong", and v0 freezes at -7.3037 for g=16,32,64
+The g>=16 "failures" are MY TEST being wrong: the deq tiling maps block = rb64*nbc128 + nb128, so
+with G=16 CTAs blocks 0 and 1 are (rb64=0,nb128=0) and (rb64=0,nb128=1) — i.e. the second block
+writes COLUMN block 1, not rows 64..127 of column block 0. The kernel is correct wherever the test
+is correct.
+CONSEQUENCE: the ONLY valid end-to-end reference remains the full-grid gate against B (y[n]=B[0][n]),
+which still shows blocks 0..2 exact and 3..15 wrong. Everything isolable is now proven correct
+(one CTA, small grids, decode bit-identical, vector passes verified, layout confirmed).
+NEXT SESSION, the two candidates left: (i) the accumulation for nb128 >= 3 specifically — rerun the
+grid walk with the CORRECT mapping (expectation = sum over the rows of the blocks actually present),
+(ii) the yhat 128-block walk at outputs >= 384. Both are now cheap and unambiguous to test.

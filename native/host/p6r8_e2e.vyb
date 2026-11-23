@@ -201,38 +201,64 @@ main()<Int> -> {
         }
         println("E2E ONE_CTA rc=" + r1c.to_string() + " colsum_partial0=" + YR3.get(0).to_string_precise() + " colsum_partial1=" + YR3.get(1).to_string_precise())
         println("E2E ONE_CTA_GATE count_over_1e-4=" + ndc.to_string() + " sum_absdiff=" + suma.to_string_precise())
-        // walk the grid up: G CTAs cover input rows 0..8G-1, so the expected
-        // yraw[n] = sum_{k < 8G} T[k][n]. The first G whose result diverges is
-        // where the multi-CTA path breaks.
-        g<Int> = 2
-        while (g <= 64) {
-            cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
-            launch_kernel(fmv, g, pbm)
-            cuCtxSynchronize()
-            wr_pdev(pb32, 0, byr)
-            wr_pdev(pb32, 8, yr3)
-            wr_pdev(pb32, 16, 128)
-            launch_kernel(fcv, 1, pb32)
-            cuCtxSynchronize()
-            YG<Vec<Float>> = bulk_dtoh(yr3, 128)
-            var<Int> ndg = 0
-            n6<Int> = 0
-            while (n6 < 128) {
-                ap2<Float> = 0.0
-                k6<Int> = 0
-                while (k6 < 8 * g) {
-                    ap2 = ap2 + T3.get(k6 * 2048 + n6)
-                    k6 = k6 + 1
-                }
-                dg2<Float> = ap2 - YG.get(n6)
-                ad6<Float> = dg2
-                if (ad6 < 0.0) { ad6 = 0.0 - ad6 }
-                if (ad6 > 1e-3) { ndg = ndg + 1 }
-                n6 = n6 + 1
+        // CORRECTED grid walk. The deq tiling maps block -> (rb64 = block/16,
+        // nb128 = block%16); one block = 8 CTAs covering rows rb64*64 .. +63 of
+        // column block nb128. So with G CTAs (G/8 blocks, rb64 = 0 only for
+        // G <= 128) EVERY output column gets a partial over rows 0..63.
+        // G=128 is therefore the first VALID multi-block test:
+        //   yraw[n] must equal sum_{k<64} T[k][n]   for all n.
+        g2<Int> = 128
+        cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+        launch_kernel(fmv, g2, pbm)
+        cuCtxSynchronize()
+        wr_pdev(pb32, 0, byr)
+        wr_pdev(pb32, 8, yr3)
+        wr_pdev(pb32, 16, 128)
+        launch_kernel(fcv, 1, pb32)
+        cuCtxSynchronize()
+        YG2<Vec<Float>> = bulk_dtoh(yr3, 128)
+        var<Int> ndh2 = 0
+        n7<Int> = 0
+        while (n7 < 128) {
+            ap3<Float> = 0.0
+            k7<Int> = 0
+            while (k7 < 64) {
+                ap3 = ap3 + T3.get(k7 * 2048 + n7)
+                k7 = k7 + 1
             }
-            println("E2E GRID g=" + g.to_string() + " count_over_1e-3=" + ndg.to_string() + " v0=" + YG.get(0).to_string_precise())
-            g = g * 2
+            dg3<Float> = ap3 - YG2.get(n7)
+            ad7<Float> = dg3
+            if (ad7 < 0.0) { ad7 = 0.0 - ad7 }
+            if (ad7 > 1e-3) { ndh2 = ndh2 + 1 }
+            n7 = n7 + 1
         }
+        println("E2E GRID128 count_over_1e-3=" + ndh2.to_string() + " v0=" + YG2.get(0).to_string_precise())
+        // and the FULL grid against the full column sum (the real case)
+        cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
+        launch_kernel(fmv, 8192, pbm)
+        cuCtxSynchronize()
+        wr_pdev(pb32, 0, byr)
+        wr_pdev(pb32, 8, yr3)
+        wr_pdev(pb32, 16, 128)
+        launch_kernel(fcv, 1, pb32)
+        cuCtxSynchronize()
+        YGF<Vec<Float>> = bulk_dtoh(yr3, 128)
+        var<Int> ndf = 0
+        n8<Int> = 0
+        while (n8 < 128) {
+            ap4<Float> = 0.0
+            k8<Int> = 0
+            while (k8 < 4096) {
+                ap4 = ap4 + T3.get(k8 * 2048 + n8)
+                k8 = k8 + 1
+            }
+            dg4<Float> = ap4 - YGF.get(n8)
+            ad8<Float> = dg4
+            if (ad8 < 0.0) { ad8 = 0.0 - ad8 }
+            if (ad8 > 1e-3) { ndf = ndf + 1 }
+            n8 = n8 + 1
+        }
+        println("E2E GRIDFULL count_over_1e-3=" + ndf.to_string() + " v0=" + YGF.get(0).to_string_precise())
         return 0
     }
     // ---- fused path ----
