@@ -1,0 +1,101 @@
+// p6r9_dotprobe — isolated host for native/kernels/dotprobe.vyb.
+// x = [1,1,1,1,1,1,1,1], slab = 0.5 everywhere, one CTA, 128 outputs.
+// Every output MUST be 8 * 0.5 * 1.0 = 4.0. Anything else is the dot loop.
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import glm_engine::{load_fn, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    if (tensor_init() != 0) { println("DP_FAIL cuda"); return 1 }
+    fdot<Int> = load_fn("native/build/dotprobe.ptx", "dotprobe")
+    fcast64<Int> = load_fn("native/build/dbg_sh.ptx", "f32t64")
+    fcast32<Int> = load_fn("native/build/layer.ptx", "cast32")
+    println("DP fns dot=" + fdot.to_string() + " c32=" + fcast32.to_string() + " c64=" + fcast64.to_string())
+    if (fdot == 0) { return 2 }
+
+    raw<Int> = dev_alloc(64)
+    bx<Int> = dev_alloc(64)
+    out<Int> = dev_alloc(1024)
+    pb<Int> = dev_alloc(32)
+    if (raw == 0 || bx == 0 || out == 0 || pb == 0) { println("DP_FAIL alloc"); return 3 }
+
+    xv<Vec<Float>> = Vec()
+    var<Int> i = 0
+    while (i < 8) { xv.push(1.0) ; i = i + 1 }
+    bulk_htod(raw, view(xv))
+    # f64 -> f32 into bx
+    wr_pdev(pb, 0, raw)
+    wr_pdev(pb, 8, bx)
+    wr_pdev(pb, 16, 8)
+    launch_kernel(fcast32, 1, pb)
+    sync()
+
+    # the dot
+    wr_pdev(pb, 0, bx)
+    wr_pdev(pb, 8, out)
+    launch_kernel(fdot, 1, pb)
+    sync()
+
+    # f32 -> f64 back to the host
+    raw2<Int> = dev_alloc(2048)
+    wr_pdev(pb, 0, out)
+    wr_pdev(pb, 8, raw2)
+    wr_pdev(pb, 16, 128)
+    launch_kernel(fcast64, 1, pb)
+    sync()
+    OV<Vec<Float>> = bulk_dtoh(raw2, 128)
+    var<Int> okc = 0
+    var<Float> firstbad = 0.0
+    var<Int> nbad = 0
+    var<Int> k = 0
+    while (k < 128) {
+        av<Float> = OV.get(k)
+        dv<Float> = av - 4.0
+        if (dv < 0.0) { dv = 0.0 - dv }
+        if (dv < 1e-5) { okc = okc + 1 }
+        else {
+            if (nbad == 0) { firstbad = av }
+            nbad = nbad + 1
+        }
+        k = k + 1
+    }
+    println("DP_RESULT ok=" + okc.to_string() + " bad=" + nbad.to_string() + " firstbad=" + firstbad.to_string_precise())
+    println("DP o0=" + OV.get(0).to_string_precise() + " o1=" + OV.get(1).to_string_precise() + " o127=" + OV.get(127).to_string_precise())
+    // ---- multi-CTA accumulation: grid g, each output must reach g*4.0 ----
+    facc<Int> = load_fn("native/build/dotprobe.ptx", "dotprobe_acc")
+    if (facc == 0) { println("DP_FAIL acc_fn"); return 4 }
+    var<Int> gsz = 1
+    while (gsz <= 1024) {
+        cuMemcpyHtoD_v2(out, zero_bytes(512), 512)
+        wr_pdev(pb, 0, bx)
+        wr_pdev(pb, 8, out)
+        launch_kernel(facc, gsz, pb)
+        sync()
+        raw3<Int> = dev_alloc(2048)
+        wr_pdev(pb, 0, out)
+        wr_pdev(pb, 8, raw3)
+        wr_pdev(pb, 16, 128)
+        launch_kernel(fcast64, 1, pb)
+        sync()
+        MV<Vec<Float>> = bulk_dtoh(raw3, 128)
+        expv<Float> = 4.0 * (gsz as Float)
+        var<Int> nb2 = 0
+        var<Float> fbv = 0.0
+        var<Int> k2 = 0
+        while (k2 < 128) {
+            dvv<Float> = MV.get(k2) - expv
+            if (dvv < 0.0) { dvv = 0.0 - dvv }
+            if (dvv > 1e-3) { if (nb2 == 0) { fbv = MV.get(k2) } ; nb2 = nb2 + 1 }
+            k2 = k2 + 1
+        }
+        println("DP_ACC g=" + gsz.to_string() + " bad=" + nb2.to_string() + " v0=" + MV.get(0).to_string_precise() + " exp=" + expv.to_string_precise() + " firstbad=" + fbv.to_string_precise())
+        gsz = gsz * 2
+    }
+    return 0
+}
+
+zero_bytes(n<Int>)<String> -> {
+    s<String> = ""
+    k<Int> = 0
+    while (k < n) { s = s + " " ; k = k + 1 }
+    return s
+}

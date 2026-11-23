@@ -1,0 +1,60 @@
+# Minimal isolated reproducer for the phase-2 dot loop of exl3mv1s4.
+# ONE CTA, 128 threads active. The slab is a constant 0.5 (no decode, no
+# Hadamard, no 8192-CTA grid) so the only thing under test is:
+#
+#     acc = sum_{j<8} shared[j*128 + d] * x[j]
+#
+# Expected, for x[j] = 1.0  ->  acc = 8 * 0.5 * 1.0 = 4.0
+#          for x[j] = j     ->  acc = 0.5 * 28        = 14.0
+# Every output must equal that, for all d.
+
+dotprobe(p<Int>) -> {
+    tid<Int> = tid_x()
+    if (tid < 128) {
+        # fill the slab: 8 rows x 128 cols of 0.5
+        b<Int> = 0
+        while (b < 8) {
+            st_shared_f32(b * 512 + tid * 4, 0.5)
+            b = b + 1
+        }
+    }
+    kernel_barrier()
+    if (tid < 128) {
+        X<Int> = ld_i64(p + 0)
+        OUT<Int> = ld_i64(p + 8)
+        d<Int> = tid
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + j * 4)
+            j = j + 1
+        }
+        st_f32(OUT + d * 4, acc)
+    }
+}
+
+// Same dot, but every CTA ACCUMULATES into OUT[d] with an atomic. Launched with
+// g CTAs, each output must end at g * (8 * 0.5 * 1.0) = g * 4.0.
+dotprobe_acc(p<Int>) -> {
+    tid<Int> = tid_x()
+    OUT<Int> = ld_i64(p + 8)
+    if (tid < 128) {
+        b<Int> = 0
+        while (b < 8) {
+            st_shared_f32(b * 512 + tid * 4, 0.5)
+            b = b + 1
+        }
+    }
+    kernel_barrier()
+    if (tid < 128) {
+        X<Int> = ld_i64(p + 0)
+        d<Int> = tid
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 8) {
+            acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + j * 4)
+            j = j + 1
+        }
+        atomic_add_f32(OUT + d * 4, acc)
+    }
+}

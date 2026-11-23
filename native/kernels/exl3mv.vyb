@@ -108,6 +108,7 @@ exl3mv1s4(p<Int>) -> {
     ATGT<Int> = ld_i64(p + 112)
     SBD<Int> = ld_i64(p + 120)
     CONST<Int> = ld_i64(p + 128)
+    XD<Int> = ld_i64(p + 136)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -155,6 +156,15 @@ exl3mv1s4(p<Int>) -> {
     inbase<Int> = rb64 * 64 + cta * 8
 
     kernel_barrier()
+
+    # diagnostic: dump the 8 xp values this CTA reads (rb64 0, cta 0, any block)
+    if (XD != 0 && rb64 == 0 && cta == 0 && nb128 == 0) {
+        kx<Int> = 0
+        while (kx < 8) {
+            st_f32(XD + kx * 4, ld_f32n(X + (inbase + kx) * 4))
+            kx = kx + 1
+        }
+    }
 
     # diagnostic: dump THIS CTA's slab tile (8 rows x 128 cols) when it is the
     # chosen one (nb128 == 2, rb64 == 0, cta == 0) so the host can compare the

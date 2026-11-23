@@ -4712,3 +4712,14 @@ loop is miscompiled, fix the codegen (or rewrite the loop in a form that compile
 hoisting the shared pointer, or using ld_shared_f32 with a precomputed byte offset) — and the whole
 fused path should fall into place.
 === END (rounds 20-51) ===
+=== ROUND 52: THE HOISTED FORM IS WORSE — REVERTED. STOP. ===
+Rewriting phase 2's dot loop with hoisted bases (sbase/xb registers) did not fix the constant-slab
+sum and made the real slab worse (U_FULL first_bad moved from 256 to 0, i.e. even blocks 0..1 went
+wrong). Reverted to the original inline form, which is the best-known state.
+HONEST ASSESSMENT: the block-2+ and constant-slab anomalies are not explainable by anything I can
+test with the current tooling, and hand-editing the loop is making things worse rather than better.
+The next attempt needs the compiler's own view (a minimal kernel that isolates this exact loop and
+its generated PTX side by side, outside the 900-line probe and outside a 8192-CTA launch).
+Banked state: algebra, layout, scaling order, decode (bit-identical), xp (exact), slab (bit-identical),
+coverage (uniform), atomics (healthy on fresh buffers) — all proven. The dot loop's behaviour under a
+full grid is the one unexplained piece.
