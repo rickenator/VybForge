@@ -282,6 +282,46 @@ main()<Int> -> {
             B = B * 2
         }
     }
+    // ---- DECODE STAGE BREAKDOWN: where do the MoE's milliseconds actually go? ----
+    if (fmb != 0) {
+        fd1<Int> = load_fn("native/build/dparts.ptx", "d_tile")
+        fd2<Int> = load_fn("native/build/dparts.ptx", "d_nib")
+        fd3<Int> = load_fn("native/build/dparts.ptx", "d_hash")
+        fd4<Int> = load_fn("native/build/dparts.ptx", "d_lut")
+        println("P6R10 DPART handles " + fd1.to_string() + " " + fd2.to_string() + " " + fd3.to_string() + " " + fd4.to_string())
+        sinkd<Int> = dev_alloc(8388608)
+        gblocks<Int> = (nin / 64) * (cw / 128) * 8
+        println("P6R10 DPART grid=" + gblocks.to_string())
+        var<Int> st = 0
+        while (st < 4) {
+            fcur<Int> = fd1
+            if (st == 1) { fcur = fd2 }
+            if (st == 2) { fcur = fd3 }
+            if (st == 3) { fcur = fd4 }
+            wr_pdev(pbv, 0, sinkd)
+            wr_pdev(pbv, 24, cw)
+            wr_pdev(pbv, 40, arA)
+            wr_pdev(pbv, 48, mapdev)
+            wr_pdev(pbv, 56, invbase)
+            wr_pdev(pbv, 144, lut)
+            wr_pdev(pbv, 176, nin)
+            # warm
+            launch_kernel(fcur, gblocks, pbv)
+            sync()
+            d0<Int> = time_mono_millis()
+            var<Int> rq = 0
+            while (rq < 50) { launch_kernel(fcur, gblocks, pbv) ; rq = rq + 1 }
+            sync()
+            d1<Int> = time_mono_millis()
+            pt<Float> = ((d1 - d0) as Float) / 50.0
+            nm2<String> = "tile"
+            if (st == 1) { nm2 = "nib" }
+            if (st == 2) { nm2 = "hash" }
+            if (st == 3) { nm2 = "lut" }
+            println("P6R10 DPART " + nm2 + " ms=" + pt.to_string_precise())
+            st = st + 1
+        }
+    }
     // ---- per-token Hadamard passes: xhat + yhat for B tokens ----
     if (fmb != 0) {
         var<Int> B2 = 32

@@ -5511,3 +5511,24 @@ THE BOTTLENECK HAS MOVED: MoE is now 66% of the composed cost. The next 1.5x has
 path (mvnodB / the fused decode matvec + expert gather), not from attention.
 NOTE the timing caveat still applies (1 ms resolution); the plateau value repeats exactly at 256/512/
 1024 which makes it trustworthy, but the small-M points are noise.
+=== ROUND 97: ILP ON THE MoE MATVEC MAKES IT WORSE — the MoE's cost is the DECODE, not the dot ===
+Applied the winning attention pattern (4 independent output columns per thread, X loaded once and
+reused) to mvnodB as mvnodB4. Measured both through p6r10's batch sweep (P6_MVK selects the kernel):
+    B        mvnodB ms   ms/token      mvnodB4 ms   ms/token
+    8        0.60        0.0750        0.70         0.0875
+    32       0.80        0.0250        1.30         0.0406
+    64       1.00        0.0156        2.00         0.0313
+    128      1.30        0.0102        3.40         0.0266     <- 2.6x WORSE
+mvnodB4 is neutral at B<=4 and progressively worse above that. Reason: the 4-column mapping concentrates
+all 128 columns into 32 threads, so 224 of the kernel's 256 threads sit idle, and the dot was never the
+bottleneck in the first place. It is now REMOVED from the production path (the kernel stays in
+exl3mv.vyb as a documented dead end).
+WHY THIS MATTERS: it contradicts the "more ILP will help the MoE too" assumption and confirms the
+original diagnosis from the gather spike (round 64: real_gather_ms=0.65 vs nogather_ms=0.05, ratio 13x).
+The MoE's time is in DECODING the packed EXL3 weights (4-bit nibble extraction, tile lookup, LUT
+gather), not in the multiply-accumulate. Any further MoE gain has to come from making the decode
+cheaper per weight (fewer bit ops per element, better LUT locality), NOT from restructuring the dot.
+LESSON: ILP restructuring is not a universal lever. It helped bfgemm8 (dense, 1-accumulator-per-row
+starvation) and hurt mvnodB4 (latency/occupancy-bound with 256 threads already active).
+CURRENT COMPOSED ESTIMATE: attention ~101 tok/s (bfgemm8 plateau), MoE ~52.7 tok/s (B=128, 2.43 s/step)
+-> composed ~34.7 tok/s. Still short of the 45-50 bar; the MoE decode is the wall.

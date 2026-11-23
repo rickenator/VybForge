@@ -1,0 +1,194 @@
+// dparts — the EXL3 decode split into cumulative stages, each timed, so the
+// expensive part of the MoE path stops being a guess.
+//
+// Each entry performs the SAME tile/thread mapping as mvnodB's decode loop
+// (4 packed weights per thread) but stops after a different stage. Every stage
+// stores its result to a global sink, so nothing is dead-code-eliminated
+// (that trap already cost a round on this project).
+//
+//   d_tile : tile lookup only            -> stores slotK
+//   d_nib  : + index/byte/nibble assembly -> stores w16K
+//   d_hash : + the multiply-xor hash      -> stores yK
+//   d_lut  : + the two LUT gathers        -> stores lo+hi
+//   (mvnodB's decode does d_lut's work and then feeds the dot)
+//
+// p: +0 sink(u32 out), +24 cw, +40 q, +48 td, +56 inv, +144 LUT, +176 nin
+d_tile(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / (cw / 128)
+    nb128<Int> = block - rb64 * (cw / 128)
+    td<Int> = ld_i64(p + 48)
+    inv<Int> = ld_i64(p + 56)
+    sink<Int> = ld_i64(p + 0)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    k<Int> = 0
+    var<Int> s = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        s = s + (slotK as Int)
+        k = k + 1
+    }
+    st_u32(sink + tid * 4, s as UInt32)
+}
+
+d_nib(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / (cw / 128)
+    nb128<Int> = block - rb64 * (cw / 128)
+    td<Int> = ld_i64(p + 48)
+    inv<Int> = ld_i64(p + 56)
+    q<Int> = ld_i64(p + 40)
+    sink<Int> = ld_i64(p + 0)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    k<Int> = 0
+    var<Int> s = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        s = s + w16K
+        k = k + 1
+    }
+    st_u32(sink + tid * 4, s as UInt32)
+}
+
+d_hash(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / (cw / 128)
+    nb128<Int> = block - rb64 * (cw / 128)
+    td<Int> = ld_i64(p + 48)
+    inv<Int> = ld_i64(p + 56)
+    q<Int> = ld_i64(p + 40)
+    sink<Int> = ld_i64(p + 0)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    k<Int> = 0
+    var<Int> s = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        s = s + yK
+        k = k + 1
+    }
+    st_u32(sink + tid * 4, s as UInt32)
+}
+
+d_lut(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / (cw / 128)
+    nb128<Int> = block - rb64 * (cw / 128)
+    td<Int> = ld_i64(p + 48)
+    inv<Int> = ld_i64(p + 56)
+    q<Int> = ld_i64(p + 40)
+    LUT<Int> = ld_i64(p + 144)
+    sink<Int> = ld_i64(p + 0)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+    k<Int> = 0
+    var<Float> s = 0.0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = ld_f32n(LUT + (yK & 65535) * 4) as Float
+        hiK<Float> = ld_f32n(LUT + ((yK >> 16) & 65535) * 4) as Float
+        s = s + loK + hiK
+        k = k + 1
+    }
+    st_f32(sink + tid * 4, s)
+}
