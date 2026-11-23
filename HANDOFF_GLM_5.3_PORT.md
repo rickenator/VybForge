@@ -6275,3 +6275,33 @@ TOOLING FIXED (scripts/analyse_digests.py):
 STATUS: the fast path is now correct (339/339 <= 3.3e-06), deterministic at 45/45, and gate-able by
 exact baseline. It remains OPT-IN. Flipping it to the production default needs the logit/argmax gate
 (the real decision boundary) re-measured on the det path -- the per-layer digest cannot answer it.
+=== ROUND 134: LOGIT GATE PASSES ON THE DETERMINISTIC FUSED PATH -- SAFETY 11,985x ===
+Full depth (NLAY=45), one request each, identical ids, P6_LOGITS=1, VYBFORGE_SKIP_MTP=1:
+    A = deq reference (FG=0), B = det fused-only (FG=1, P6_FUSED_ONLY=1). 20/20 LOGITS lines each.
+    argmax agreement   : 20/20
+    max |delta top1|   : 1.341e-05 (tok 5)
+    smallest margin    : 1.607e-01 (tok 8)
+    SAFETY FACTOR      : 11,985x  -> no observed token can flip; a flip needs the margin to shrink
+                         by four orders of magnitude.
+    VERDICT: PASS.
+Note the safety factor is ~32x better than the 373x recorded for the earlier all-experts prompt set,
+because the tightest margin on THIS prompt set is 0.16 rather than 0.0003. The safety factor is a
+property of the prompt set as much as of the kernel -- always report the margin it came from.
+CLEAN CROSS-CONFIGURATION DIGESTS (the comparison that was impossible while the path was
+nondeterministic; both sides are deterministic now):
+    deq vs det-fused, 45 layers: 3/45 byte-identical (dense 0-2), median 9.65e-06,
+    worst 8.96e-05 of the data range at layer 18 (`max`). Bounded, not compounding.
+So: hidden state moves by <=9e-05 of the data range, logits move by <=1.3e-05 absolute, and the
+tightest decision margin is 0.16. That is the whole argument for enabling the fast path.
+NEW ARTIFACTS:
+    native/baselines/digest_deq45.txt        deq per-layer digests, 45 layers
+    native/baselines/logits_deq45.txt        deq head probe, 20 tokens
+    native/baselines/logits_detfused45.txt   det-fused head probe, 20 tokens
+    scripts/compare_logits.py                the gate: parses LOGITS pairs, reports argmax agreement,
+                                             max perturbation, smallest margin and the safety factor,
+                                             exits 0 only if no token can flip. Unit-checked.
+OPEN DECISION (the user's, not the agent's): whether to make P6_FUSED_ONLY=1 the production default.
+Evidence FOR: 9.8x throughput, correct at 339/339 <= 3.3e-06, deterministic at 45/45, 20/20 argmax,
+11,985x safety, and gated by an exact baseline. Evidence AGAINST: it skips the per-expert comparison,
+so a future shape/weight regression is caught only by the recorded baseline (or by periodically
+re-running the verification mode), not at runtime.
