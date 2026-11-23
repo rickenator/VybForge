@@ -5230,3 +5230,25 @@ STOPPING HERE. The next action is to READ, not to infer:
     3. whether there is a dedicated raw-bytes upload helper that the trellis path actually uses
 I have now spent several rounds inferring this from behaviour; the answer is in two function bodies.
 === END (rounds 20-82) — STOPPING ===
+=== ROUND 83: THE THREE QUESTIONS ANSWERED — AND THE UPLOAD STILL FAILS VIA EVERY ROUTE ===
+(1) gx_read(g,i): opens g.paths[i], read_at(f, g.off[i], g.nbytes[i]) -> a Vyb String of raw bytes.
+    It also returns "" when found != 1 (which is the silent-zeros trap I hit earlier).
+(2) cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<loc<CVoid>>, n) takes a RAW POINTER, not a String. The
+    binding's own comment explains the trap: "ALL raw-pointer work ... stays inside these freedom
+    blocks, where the FFI pointer intrinsics are in scope (enabled only in modules that declare FFI
+    pointer functions -- an importer does NOT inherit them, so no pointer types leak out)".
+    At top level a String is therefore passed as its STRUCT (a host pointer), which is exactly what
+    the device showed: "raw words on device" = 2.22e31, 1.41e35 ... i.e. pointer bits, not 48176.
+(3) YES, the dedicated helper exists: cuda_memcpy_h2d(dst<Int>, src<String>, n<Int>) in
+    bindings/cuda/mod.vyb, which checks n <= src.len() and does the copy inside a freedom block. It
+    is imported as  import mod::{cuda_memcpy_h2d}  (the module file is mod.vyb).
+AND IT STILL FAILS: calling cuda_memcpy_h2d gives rc=0 and the SAME pointer-bit garbage on the device,
+and a freedom block written by hand in the driver does the same. Meanwhile the EXL3 trellis path
+uploads multi-MB Strings and decodes them bit-exactly, so SOME route works -- but not any of the three
+I can construct from the driver.
+STOPPING. This needs hands-on debugging by someone who can put a breakpoint on the copy (or who knows
+whether `freedom` + String->loc conversion in an *importer* module is silently degraded -- the comment
+implies it is, yet cuda_memcpy_h2d lives in the right module and still does not land the bytes, which
+suggests the failure is upstream of the copy, e.g. the String gx_read returns is not a plain byte
+buffer for a 4 MB read).
+=== END (rounds 20-83) — STOPPING, NOT BLOCKED ON MY OWN REASONING ANY FURTHER ===
