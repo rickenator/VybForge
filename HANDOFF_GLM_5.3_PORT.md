@@ -5825,3 +5825,26 @@ it simply needed a caller that runs.
     ALSO: the ids list must contain at least 22 ids ("CHAIN_FAIL ids 2" otherwise). Phase 1 prefills
     ids[0..19] and the two teacher-forced decode steps re-walk ids[20] and ids[21], so the driver needs
     all three groups present even for nsteps=1.
+=== ROUND 113: FGATE NOW RUNS IN-ENGINE -- AND IT SAYS THE FUSED PATH DISAGREES ===
+The verification vehicle finally works end to end (script: scripts/run_fgate.sh on lefty):
+    set VYB_STDLIB, VYBFORGE_GX_DIR; P6_FUSED_GATE=1 VYBFORGE_SKIP_MTP=1 VYBFORGE_SERVE_PORT=18102
+    VYBFORGE_NLAYERS=4; start glm_serve; wait for "listening on"; then
+    POST /v1/generate?ids=<22 ids>&nsteps=1        (query string, NOT json; >=22 ids required)
+It produced real FGATE lines for a real layer, and the driver completed (CHAIN_OK):
+    FGATE expert=0  nt=1  count_over_1e-4=2048  max_abs=3.8424 of 2048
+    FGATE expert=10 nt=13 count_over_1e-4=26621 max_abs=6.1146 of 26624
+    FGATE expert=5  nt=3  count_over_1e-4=6143  max_abs=4.4720 of 6144
+EVERY output disagrees, at O(1) magnitude -- this is not a scaling slip, it is a different computation.
+DIAGNOSTICS ADDED AND READ (FGATEDBG lines): every input and handle is CORRECT --
+    h (hdg32) live, lut live, su buffer live with su_len=8192 (= 2x4096 f16, the right tensor),
+    sv_len=4096 (= 2x2048 f16, the right tensor), fused0=-0.878 vs ref0=0.243, sub0=0.486 (a sane
+    activation). And hdg32 is literally had_hoist32(fhgen32) -- the same call p6r10 used as hd_pre32.
+So the inputs match p6r10's passing test, the handles match, the chain matches -- and the numbers do not.
+THE DISCREPANCY IS THEREFORE SUBTLE AND MUST BE BISECTED, NOT REASONED ABOUT. The decisive next probe:
+inside the block, ALSO run the fused chain on a SYNTHETIC input (p6r10's xv pattern) against the same
+dWg, and compare against a host dot.
+    - if the synthetic case PASSES in-engine, the difference is specific to `sub` (its layout or its
+      scaling at this point in the layer)
+    - if it FAILS, the engine's copy of the chain differs from p6r10's in some detail (grid, param
+      slot, freedom nesting) and can be found by direct comparison of the two call sites
+=== END ===
