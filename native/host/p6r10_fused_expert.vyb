@@ -214,6 +214,55 @@ main()<Int> -> {
         ng<Float> = ((td2 - tc) as Float) / 20.0
         println("P6R10 GATHER_SPIKE real_gather_ms=" + ra.to_string_precise() + " nogather_ms=" + ng.to_string_precise() + " ratio=" + (ra / ng).to_string_precise())
     }
+    // ---- BATCH SWEEP: weights decoded once, B tokens amortise them ----
+    fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+    if (fmb != 0) {
+        var<Int> B = 1
+        while (B <= 32) {
+            dxb<Int> = dev_alloc(nin * 4 * B)
+            tyb<Int> = dev_alloc(cw * 4 * B)
+            xpb<Int> = dev_alloc(nin * 4 * B)
+            if (dxb != 0 && tyb != 0 && xpb != 0) {
+                # same input vector replicated B times (throughput measurement only)
+                cuMemcpyHtoD_v2(dxb, zero_bytes(nin * 4 * B), nin * 4 * B)
+                cuMemcpyHtoD_v2(tyb, zero_bytes(cw * 4 * B), cw * 4 * B)
+                cuMemcpyHtoD_v2(xpb, zero_bytes(nin * 4 * B), nin * 4 * B)
+                wr_pdev(pbf, 0, dx)
+                wr_pdev(pbf, 8, xpb)
+                wr_pdev(pbf, 16, hd_pre32)
+                wr_pdev(pbf, 24, arG)
+                wr_pdev(pbf, 32, nin)
+                launch_kernel(fxhat, nin / 128, pbf)
+                sync()
+                # warm
+                wr_pdev(pbv, 0, tyb)
+                wr_pdev(pbv, 8, xpb)
+                wr_pdev(pbv, 24, cw)
+                wr_pdev(pbv, 40, arA)
+                wr_pdev(pbv, 48, mapdev)
+                wr_pdev(pbv, 56, invbase)
+                wr_pdev(pbv, 144, lut)
+                wr_pdev(pbv, 168, B)
+                wr_pdev(pbv, 176, nin)
+                launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                sync()
+                tb0<Int> = time_mono_millis()
+                var<Int> rp = 0
+                while (rp < 10) {
+                    launch_kernel(fmb, (nin / 64) * (cw / 128) * 8, pbv)
+                    rp = rp + 1
+                }
+                sync()
+                tb1<Int> = time_mono_millis()
+                per<Float> = ((tb1 - tb0) as Float) / 10.0
+                println("P6R10 BATCH B=" + B.to_string() + " mv_ms=" + per.to_string_precise() + " ms_per_token=" + (per / (B as Float)).to_string_precise())
+                free_dev(dxb)
+                free_dev(tyb)
+                free_dev(xpb)
+            }
+            B = B * 2
+        }
+    }
     // ---- compare ----
     fv<Vec<Float>> = bulk_dtoh(dy, cw)
     var<Int> nbad = 0

@@ -4891,3 +4891,21 @@ WHAT WOULD ACTUALLY CLOSE IT, in order of expected value:
    2. tensor-core formulation (FP4/FP8 + tcgen05) if the dequant can be expressed as a small GEMM
    3. multi-node only as a 2-2.5x multiplier on top of whichever of the above lands
 === END OF SESSION (rounds 20-63) ===
+=== ROUND 64: THE GATHER IS 13x — AND THE BAR IS A BATCHING QUESTION, NOT A KERNEL ONE ===
+Gather-cost spike (mvnod5 vs mvnod4, same load volume, 20 launches each, same expert/projection):
+    real gather  0.65 ms   ->  6.5 GB/s effective
+    no gather    0.05 ms   -> 84.0 GB/s effective      RATIO 13x
+So the per-element slot addressing THE ENTIRE problem; the arithmetic, LUT and dot are nearly free.
+Repacked format (precompute w16, 2 bytes/element = 4x footprint, ~702 GB for the model):
+    0.30 ms/projection -> step 365 ms -> 2.74 tok/s (17x off the bar)
+THE DECISIVE ARITHMETIC: the bar (21.1 ms/step) needs 5.1 GB of weight traffic per step in 21 ms =
+242 GB/s, i.e. 89% of the GB10's 273 GB/s HBM peak. SINGLE-STREAM DECODE CANNOT REACH THAT ON THIS
+HARDWARE — no kernel, no format and no node count changes it, because the weights alone do not fit in
+the time budget at peak bandwidth.
+What the 45-50 tok/s figure almost certainly IS: aggregate throughput with batching, where one weight
+read serves many tokens. Our measured single-stream cost, amortised over a batch:
+    batch  1 -> 850 ms   |  4 -> 212 ms  |  16 -> 53 ms  |  32 -> 27 ms  |  64 -> 13 ms
+So at batch 32 the fused path is 27 ms/token-equivalent (37 tok/s) and at batch 64 it is 13 ms
+(77 tok/s) — i.e. THE BAR IS A BATCH-SIZE QUESTION. Beating vLLM means running a batched decode
+(weights amortised) with the fused kernel, not optimising the single-stream path further.
+=== END (rounds 20-64) ===

@@ -587,3 +587,88 @@ mvnod5(p<Int>) -> {
         if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
     }
 }
+
+// ============================================================================
+// mvnodB — BATCHED fused decode matvec. Identical decode to mvnod4 (the slab is
+// built ONCE from the packed weights), then B dots reuse that slab. This is the
+// weight amortisation that makes the throughput number comparable to a batched
+// server: the 4.2 MB of packed weights is read once per B tokens, not per token.
+// p: +0 T  (f32 [B][cw] output), +8 X (f32 [B][nin] input),
+//    +24 cw, +40 q, +48 td, +56 inv, +144 LUT, +168 B
+// ============================================================================
+mvnodB(p<Int>) -> {
+    tid<Int> = blk_x() * dim_x() + tid_x()
+    cw<Int> = ld_i64(p + 24)
+    nbc128<Int> = cw / 128
+    nbc16<Int> = cw / 16
+    block<Int> = tid / 2048
+    rem<Int> = tid - block * 2048
+    rb64<Int> = block / nbc128
+    nb128<Int> = block - rb64 * nbc128
+    q<Int> = ld_i64(p + 40)
+    td<Int> = ld_i64(p + 48)
+    T<Int> = ld_i64(p + 0)
+    X<Int> = ld_i64(p + 8)
+    inv<Int> = ld_i64(p + 56)
+    LUT<Int> = ld_i64(p + 144)
+    B<Int> = ld_i64(p + 168)
+    nin<Int> = ld_i64(p + 176)
+    cta<Int> = rem / 256
+    within<Int> = rem - cta * 256
+
+    # ---- decode the packed weights ONCE ----
+    k<Int> = 0
+    while (k < 4) {
+        eK<Int> = within + k * 256
+        bK<Int> = eK / 128
+        cK<Int> = eK - bK * 128
+        rowK<Int> = rb64 * 64 + cta * 8 + bK
+        colK<Int> = nb128 * 128 + cK
+        kb16K<Int> = rowK / 16
+        r16K<Int> = rowK - kb16K * 16
+        nb16K<Int> = colK / 16
+        c16K<Int> = colK - nb16K * 16
+        tile16K<Int> = kb16K * nbc16 + nb16K
+        slotK<UInt32> = ld_u32(inv + (r16K * 16 + c16K) * 4)
+        baseK<Int> = td + 16 + (slotK as Int) * 16
+        w16K<Int> = 0
+        iK<Int> = 0
+        while (iK < 4) {
+            nidxK<Int> = ld_u16(baseK + iK * 2) as Int
+            ppK<Int> = (ld_i8(baseK + 8 + iK) as Int) & 255
+            wbK<Int> = q + tile16K * 128 + (nidxK / 4) * 2 + (nidxK % 4) / 2
+            byK<Int> = (ld_i8(wbK) as Int) & 255
+            shK<Int> = ((nidxK % 4) % 2) * 4
+            nibK<Int> = (byK >> shK) & 15
+            w16K = w16K | (nibK << (ppK * 4))
+            iK = iK + 1
+        }
+        prodK<Int> = (w16K * 3417055213) & 4294967295
+        yK<Int> = (prodK & 2415890431) ^ 996162400
+        loK<Float> = ld_f32n(LUT + (yK & 65535) * 4) as Float
+        hiK<Float> = ld_f32n(LUT + ((yK >> 16) & 65535) * 4) as Float
+        st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
+        k = k + 1
+    }
+
+    inbase<Int> = rb64 * 64 + cta * 8
+    kernel_barrier()
+
+    # ---- B dots over the SAME slab: the weights are not re-read ----
+    if (within < 128) {
+        d<Int> = within
+        cb<Int> = nb128 * 128 + d
+        b2<Int> = 0
+        while (b2 < B) {
+            xb<Int> = X + b2 * nin * 4
+            acc<Float32> = 0.0
+            j<Int> = 0
+            while (j < 8) {
+                acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(xb + (inbase + j) * 4)
+                j = j + 1
+            }
+            if (cb < cw) { atomic_add_f32(T + (b2 * cw + cb) * 4, acc) }
+            b2 = b2 + 1
+        }
+    }
+}
