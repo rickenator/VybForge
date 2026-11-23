@@ -5597,3 +5597,29 @@ wants. Two known traps to respect when wiring it: (1) call `mvnod4` for the sing
 (2) mvnodB4 and mvnodB_st in exl3mv.vyb are dead ends/timing artifacts and must not be used.
 SCOPE FOR THE CHANGE: wire ONE projection (gate) behind a flag, verify it bit-for-bit against the
 existing deq+gemm output on a real expert, then extend to up/out. Do not swap all three at once.
+=== ROUND 101: FUSED-PATH WIRING — SCOPED, NOT STARTED (and why that is the right call) ===
+I read the wiring surface instead of starting it. The change is bigger than one step and I am stopping
+short of it deliberately, at the end of a long session, rather than leaving a half-built edit inside a
+certified production engine.
+WHAT IT NEEDS (all inside tail_site, glm_engine.vyb:2923, 4729 lines):
+  1. device upload of the expert's trellis + su + sv (f16) + LUT -- the deq path does this internally
+  2. the Hadamard build (had_hoist32/hdg32 exists) and handles for exl3xhat, exl3yhat, mvnodB, which
+     are NOT in the engine at all (grep: only had_hoist32 matches)
+  3. sub is a host Vec<Float> (f64): upload -> cast32 -> xhatB (batched, params +0 x,+8 out,+16 H,
+     +24 su,+32 nin,+40 B) -> mvnodB (+0 T,+8 X,+24 cw,+40 q,+48 td,+56 inv,+144 LUT,+168 B,+176 nin)
+     -> yhatB -> dtoh. mm_host32 does all of this in ONE call today.
+  4. three handles through a 28-parameter signature, or load_fn per layer as a workaround
+  5. bit-for-bit comparison against dWg + mm_host32 before anything replaces it
+WHY IT IS WORTH DOING (unchanged): the fused path measured 0.600 ms vs 13 ms per expert-projection,
+i.e. 21x, and round 71 already verified it against the deq path at 8.34e-07 for one expert/token. The
+win is real; only the plumbing is missing.
+RECOMMENDED SEQUENCE FOR THE NEXT SESSION (in this order, each verified before the next):
+  a. extend p6r10's existing FUSED_PATH vs DEQ_PATH comparison from nt=1 to nt=4 using mvnodB +
+     xhatB/yhatB (the true production shape -- compacted tokens). No production code touched.
+  b. only then edit tail_site: add the three handles to the signature, add a `P6_FUSED_GATE` flag
+     branch that computes gv both ways and prints max_abs, with the deq path still authoritative.
+  c. flip the flag to use the fused gv, verify the 45-layer digest is unchanged, then extend to up/out.
+TRAPS TO CARRY FORWARD: call `mvnod4` (not `exl3mv1s4`) for single-token; `mvnodB4` and `mvnodB_st` in
+exl3mv.vyb are dead ends / timing artifacts; verify each device buffer on device before the next stage
+(this is what finally cracked bfgemm_p); validate the instrument against a known value before trusting
+any number from it.

@@ -203,6 +203,98 @@ main()<Int> -> {
     }
     println("P6R10 FUSED_PATH xhat_ms=" + tf0.to_string() + " mv_ms=" + tf1.to_string() + " yhat_ms=" + tf2.to_string() + " total_ms=" + tf3.to_string())
 
+    // ---- nt=4 COMPACTED COMPARISON: the production shape ----
+    // Production gathers ~nt tokens per expert and calls the matvec with M=nt.
+    // Round 71 verified the fused path at nt=1; this checks the same equality
+    // with mvnodB + xhatB/yhatB for 4 compacted tokens.
+    nt4<Int> = 4
+    xs<Vec<Float>> = Vec()
+    var<Int> tt = 0
+    while (tt < nt4) {
+        var<Int> jj = 0
+        while (jj < nin) {
+            xs.push((((jj + tt * 7) % 17) as Float) * 0.0625 - 0.5)
+            jj = jj + 1
+        }
+        tt = tt + 1
+    }
+    dx4_64<Int> = dev_alloc(nt4 * nin * 8)
+    bulk_htod(dx4_64, view(xs))
+    x4f<Int> = dev_alloc(nt4 * nin * 4)
+    wr_pdev(pb32, 0, dx4_64)
+    wr_pdev(pb32, 8, x4f)
+    wr_pdev(pb32, 16, nt4 * nin)
+    launch_kernel(fcast32, (nt4 * nin + 255) / 256, pb32)
+    sync()
+
+    # reference: the production path (deq + f32 gemm) for the same 4 tokens
+    ref4<Vec<Float>> = mm_host32(xs, nt4, nin, dW, cw, fcast32, fgp, fgr, pb32)
+
+    fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
+    fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
+    fmb4<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+    if (fxb != 0 && fyb != 0 && fmb4 != 0) {
+        xp4<Int> = dev_alloc(nt4 * nin * 4)
+        yr4<Int> = dev_alloc(nt4 * cw * 4)
+        dy4<Int> = dev_alloc(nt4 * cw * 8)
+        # xhatB: +0 x, +8 out, +16 H, +24 su, +32 nin, +40 B
+        wr_pdev(pbf, 0, x4f)
+        wr_pdev(pbf, 8, xp4)
+        wr_pdev(pbf, 16, hd_pre32)
+        wr_pdev(pbf, 24, arG)
+        wr_pdev(pbf, 32, nin)
+        wr_pdev(pbf, 40, nt4)
+        launch_kernel(fxb, nt4 * (nin / 128), pbf)
+        sync()
+        # mvnodB: +0 T, +8 X, +24 cw, +40 q, +48 td, +56 inv, +144 LUT, +168 B, +176 nin
+        cuMemcpyHtoD_v2(yr4, zero_bytes(nt4 * cw * 4), nt4 * cw * 4)
+        wr_pdev(pbv, 0, yr4)
+        wr_pdev(pbv, 8, xp4)
+        wr_pdev(pbv, 24, cw)
+        wr_pdev(pbv, 40, arA)
+        wr_pdev(pbv, 48, mapdev)
+        wr_pdev(pbv, 56, invbase)
+        wr_pdev(pbv, 144, lut)
+        wr_pdev(pbv, 168, nt4)
+        wr_pdev(pbv, 176, nin)
+        q0<Int> = time_mono_millis()
+        launch_kernel(fmb4, (nin / 64) * (cw / 128) * 8, pbv)
+        sync()
+        q1<Int> = time_mono_millis()
+        # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
+        wr_pdev(pbf, 0, yr4)
+        wr_pdev(pbf, 8, dy4)
+        wr_pdev(pbf, 16, hd_pre32)
+        wr_pdev(pbf, 24, cw)
+        wr_pdev(pbf, 32, arH)
+        wr_pdev(pbf, 40, nt4)
+        launch_kernel(fyb, nt4 * (cw / 128), pbf)
+        sync()
+        FU<Vec<Float>> = bulk_dtoh(dy4, nt4 * cw)
+        var<Int> nbad4 = 0
+        var<Float> mx4 = 0.0
+        var<Float> rmx = 0.0
+        var<Int> z4 = 0
+        while (z4 < nt4 * cw) {
+            gv4<Float> = FU.get(z4)
+            rv4<Float> = ref4.get(z4)
+            dv4<Float> = gv4 - rv4
+            if (dv4 < 0.0) { dv4 = 0.0 - dv4 }
+            if (dv4 > 1e-4) { nbad4 = nbad4 + 1 }
+            if (dv4 > mx4) { mx4 = dv4 }
+            av4<Float> = rv4
+            if (av4 < 0.0) { av4 = 0.0 - av4 }
+            if (av4 > rmx) { rmx = av4 }
+            z4 = z4 + 1
+        }
+        println("P6R10 NT4 mv_ms=" + (q1 - q0).to_string() + " count_over_1e-4=" + nbad4.to_string() + " max_abs=" + mx4.to_string_precise() + " ref_max=" + rmx.to_string_precise() + " of " + (nt4 * cw).to_string())
+        println("P6R10 NT4 fused0=" + FU.get(0).to_string_precise() + " ref0=" + ref4.get(0).to_string_precise())
+        if (nbad4 == 0) { println("P6R10 NT4_PASS fused == deq+gemm for 4 compacted tokens") }
+        else { println("P6R10 NT4_FAIL fused != deq+gemm") }
+    } else {
+        println("P6R10 NT4_SKIP handles xhatB=" + fxb.to_string() + " yhatB=" + fyb.to_string() + " mvnodB=" + fmb4.to_string())
+    }
+
     // ---- GATHER-COST SPIKE: 20 launches each, divided for sub-ms resolution ----
     fng<Int> = load_fn("native/build/exl3mv.ptx", "mvnod5")
     if (fng != 0) {
