@@ -4723,3 +4723,21 @@ its generated PTX side by side, outside the 900-line probe and outside a 8192-CT
 Banked state: algebra, layout, scaling order, decode (bit-identical), xp (exact), slab (bit-identical),
 coverage (uniform), atomics (healthy on fresh buffers) — all proven. The dot loop's behaviour under a
 full grid is the one unexplained piece.
+=== ROUND 53: THE ISOLATED REPRO IS PERFECT — SO THE BUG IS CODEGEN IN SITU ===
+New minimal artifacts: native/kernels/dotprobe.vyb + native/host/p6r9_dotprobe.vyb.
+Constant slab 0.5, x = ones, EXACTLY the phase-2 loop from exl3mv1s4, one entry per test:
+    single CTA            : ok=128/128, every output = 4.0                  <- loop is CORRECT
+    dotprobe_acc, grid 1..1024: every output = g*4.0 at EVERY grid size     <- accumulation CORRECT
+And in the real kernel, the xp values actually READ for CTA (rb64 0, cta 0) match the host bit for bit:
+    XDUMP k0=0.022076860070228577 k1=-0.015808098018169403 k7=0.034466002136468887
+    XHOST k0=0.022076860070228577 k1=-0.015808098018169403 k7=0.034466002136468887
+So: xp correct in situ, slab bit-identical in situ (round 50), the loop correct in isolation, the
+multi-CTA atomics correct in isolation — and the same computation in the REAL kernel still yields
+~1e-19 instead of 0.6 for every output, non-deterministically.
+CONCLUSION: this is a CODEGEN defect that only appears in the larger kernel body (the probe has ~30
+statements, exl3mv1s4 has ~250 plus the decode block). Classic signatures of that: register-pressure
+spill corruption or a bad optimisation pass. Nondeterminism across identical runs supports it.
+NEXT SESSION (compiler-side, in ~/Projects/Vyb): reproduce with dotprobe padded out to the same
+statement count, or inspect the emitted PTX of the real phase-2 region for spilled/reused registers;
+and try compiling exl3mv with optimisation disabled to confirm the pass is responsible.
+=== END (rounds 20-53) ===

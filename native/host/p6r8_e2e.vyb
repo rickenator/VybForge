@@ -445,7 +445,10 @@ main()<Int> -> {
             println("E2E XDUMP k0=" + XD1.get(0).to_string_precise() + " k1=" + XD1.get(1).to_string_precise() + " k7=" + XD1.get(7).to_string_precise())
             println("E2E XHOST k0=" + XP.get(0).to_string_precise() + " k1=" + XP.get(1).to_string_precise() + " k7=" + XP.get(7).to_string_precise())
             // ---- CONSTANT-SLAB TEST: slab := 0.5 => every output must be 0.5*sum(xp) ----
-            wr_pdev(pbm, 120, 0)
+            // NOTE: the slab is dumped in the SAME run so we can prove the 0.5 actually landed.
+            sbd2<Int> = dev_alloc(8192)
+            cuMemcpyHtoD_v2(sbd2, zero_bytes(8192), 8192)
+            wr_pdev(pbm, 120, sbd2)
             wr_pdev(pbm, 128, 1)
             wr_pdev(pbm, 88, -1)
             cuMemcpyHtoD_v2(byr, zero_bytes(8192), 8192)
@@ -459,6 +462,22 @@ main()<Int> -> {
             launch_kernel(fcv, 8, pb32)
             cuCtxSynchronize()
             CF<Vec<Float>> = bulk_dtoh(cf0, 2048)
+            // read the slab as the CONST branch left it
+            wr_pdev(pbm, 120, 0)
+            sb2f<Int> = dev_alloc(8192)
+            wr_pdev(pb32, 0, sbd2)
+            wr_pdev(pb32, 8, sb2f)
+            wr_pdev(pb32, 16, 1024)
+            launch_kernel(fcv, 4, pb32)
+            cuCtxSynchronize()
+            SB2<Vec<Float>> = bulk_dtoh(sb2f, 1024)
+            var<Int> nconst = 0
+            var<Int> kk = 0
+            while (kk < 1024) {
+                if (SB2.get(kk) > 0.49 && SB2.get(kk) < 0.51) { nconst = nconst + 1 }
+                kk = kk + 1
+            }
+            println("E2E CONST_SLAB_HALFWISE n_0.5=" + nconst.to_string() + "/1024 s0=" + SB2.get(0).to_string_precise() + " s300=" + SB2.get(300).to_string_precise())
             sumxp<Float> = 0.0
             i = 0
             while (i < 4096) {
