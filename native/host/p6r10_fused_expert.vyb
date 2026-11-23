@@ -319,7 +319,11 @@ main()<Int> -> {
         var<Int> Bd = 1
         dTy<Int> = dev_alloc(cw * 4)
         dXy<Int> = dev_alloc(nin * 4)
-        nslot<Int> = 4096
+        # contributions per output = rb64 (nin/64) x cta (8) = 512 for the gate shape, NOT 4096:
+        # launch_kernel uses 256-thread blocks, so the 8 CTAs are 8 PHYSICAL blocks and each
+        # rb64 group covers 64 rows. Verified against the grid: (nin/64)*(cw/128)*8 physical
+        # blocks = (nin/64)*(cw/128) logical 2048-thread units.
+        nslot<Int> = (nin / 64) * 8
         dPy<Int> = dev_alloc(nslot * Bd * cw * 4)
         println("P6R10 DET partial buffer MB=" + (nslot * Bd * cw * 4 / 1048576).to_string())
         if (dTy != 0 && dXy != 0 && dPy != 0) {
