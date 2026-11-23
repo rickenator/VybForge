@@ -6395,3 +6395,30 @@ streams 175 GB/token from disk. The kernel work already done is necessary (it is
 path once the data is in HBM) but not sufficient, and its 2x cannot show up in tok/s until (1) and (2).
 HARNESS FIX: run_fgate.sh now takes CTIMEOUT (default 900). A multi-step request silently truncated at
 exactly 900.0 s with an empty body, which reads like a hang rather than a timeout.
+=== ROUND 140: CORRECTION -- THE DECODE PATH IS NOT I/O-BOUND. MY ROUND-139 CLAIM WAS WRONG. ===
+Round 139 concluded "175 GB/token from disk" by dividing wall time by disk bandwidth. The per-layer
+timers refute it. Production, per DECODE layer (R=1, so only 8 routed experts = ~100 MB of weights):
+    T_MOE layer resolve=682..831   deq=1087..1350   mm=1463..1837   host=0
+    T_TAIL total=6313..9421   (router + MoE + shared + hc_apply)
+Verification for comparison: resolve 692..848, deq 1922..2397, mm 1775..2191, total 7589..10673.
+SANITY CHECK ON THE I/O HYPOTHESIS: 100 MB of experts at 280 MB/s is ~0.36 s, against ~6.5 s per
+layer -- I/O is ~5% of the cost, not 100%. And the storage is a PCIe SSD (rotational=0) with 77 GB of
+the 175.6 GB model already in page cache. The 39.6x "over-read" story in round 139 is WITHDRAWN.
+WHERE THE TIME ACTUALLY GOES (production, ~6.5 s per decode layer):
+    mm (GEMM)                       ~1.5 s   23%
+    deq (read + unpack)             ~1.15 s  18%
+    resolve (tab/HashMap/String)    ~0.75 s  11%
+    router + shared + hc_apply      ~3.2 s   49%   <- LARGEST, and unmeasured in detail
+    implied I/O                     ~0.36 s   5%
+WHY deq IS NOT ZERO IN PRODUCTION: the routed experts are fused, but the SHARED expert is not -- it is
+still dequantised and run through mm_host (glm_engine:3822 `shared = mm_host(sact, R, EINTER, d_sd, H,
+fgemm)`). That is part of the residual deq time; it should be fused next, since it is a full 1/9 of the
+MoE work per layer.
+THE REAL BAR DISTANCE: ~6.5 s/layer x 45 = ~290 s/token against 20-22 ms/token = about 4 orders of
+magnitude, and NOT because of the matvec (23%) or the I/O (5%). The targets, in order of size:
+    (1) router + shared + hc_apply  3.2 s/layer  -- biggest, needs sub-timers to split
+    (2) deq                         1.15 s/layer -- fuse the shared expert; check what else still deqs
+    (3) mm                          1.5 s/layer  -- already the fused path; the 2x already banked
+    (4) resolve                     0.75 s/layer -- tab/HashMap/String churn, ~94 ms per expert
+Step 1 of the plan (make I/O active-set-only) is therefore NOT the right next move: it would optimise
+5% of the problem. Step 3 was worth doing precisely because it prevented that.
