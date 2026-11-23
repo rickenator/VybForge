@@ -4544,3 +4544,17 @@ being wrong (a block is 128 of 4096 = 3% of the terms; half of them wrong = 1.5%
 NEXT (one run, decisive): dump xp for x = ones and compare against the host sum
 sum_k su[k].H[k][b] computed from the dumped H and su; if xp matches, run yhat on that same xp and
 compare against sv.(H u) on the host. Whichever disagrees is the remaining defect.
+=== ROUND 42: xp EXACT; yhat FAILS ON EXACTLY 256 OUTPUTS WITH GARBAGE ===
+x = ones, xp dumped and compared against the host formula sum_j H[(b%128)*128+j].su[block+j]:
+    XP_GATE count_over_1e-6 = 0   max_abs = 2.57e-08   over all 4096      -> exl3xhat is CORRECT
+u from the (proven) mv, then y from yhat, compared against the host sv.(H u):
+    YH_GATE count_over_1e-6 = 256  max_abs = 3.69e+19
+Exactly 256 outputs (two 128-blocks, the last two) differ by ~1e19 — an UNINITIALISED f64 read, not a
+numeric error. Since y is dumped from a fresh device buffer via bulk_dtoh, the 256 unwritten outputs
+mean exl3yhat did not write them: with 16 blocks x 256 threads and the `a < 128` guard it should
+write all 2048 (blocks 14 and 15 = outputs 1792..2047). Prime suspects: the guard's interaction
+with base = blk_x()*128 for the last blocks, or the launch grid.
+NEXT (one run): dump yhat's coverage like the mv's block counter (atomic_add_f32 per written
+output) or simply print which indices are untouched. Fix the grid/guard so all 16 blocks write.
+Everything else in the fused chain is now proven: layout, decode (bit-identical), xp (exact), the
+dots/atomics/coverage (GRIDFULL exact), and the algebraic order (su before H, sv after yhat).

@@ -341,6 +341,46 @@ main()<Int> -> {
         launch_kernel(fcv, 1, pb32)
         cuCtxSynchronize()
         UY<Vec<Float>> = bulk_dtoh(u64, 2048)
+        // ---- full-u check: u[n] = sum_k T[k][n] . xp[k] for ALL 2048 outputs ----
+        fo4<Int> = load_fn("native/build/exl3dqdbg.ptx", "exl3dqdbg1s4")
+        if (fo4 != 0) {
+            bT2<Int> = dev_alloc(33554432)
+            pbo4<Int> = dev_alloc(64)
+            wr_pdev(pbo4, 0, arA)
+            wr_pdev(pbo4, 8, mapdev)
+            wr_pdev(pbo4, 16, 0)
+            wr_pdev(pbo4, 24, bT2)
+            wr_pdev(pbo4, 32, 2048)
+            wr_pdev(pbo4, 40, invbase)
+            launch_kernel(fo4, 8192, pbo4)
+            cuCtxSynchronize()
+            t64d<Int> = dev_alloc(67108864)
+            wr_pdev(pb32, 0, bT2)
+            wr_pdev(pb32, 8, t64d)
+            wr_pdev(pb32, 16, 8388608)
+            launch_kernel(fcv, 32768, pb32)
+            cuCtxSynchronize()
+            T4<Vec<Float>> = bulk_dtoh(t64d, 8388608)
+            var<Int> ndu = 0
+            var<Float> mxu = 0.0
+            var<Int> firstbad_u = -1
+            n11<Int> = 0
+            while (n11 < 2048) {
+                au<Float> = 0.0
+                k11<Int> = 0
+                while (k11 < 4096) {
+                    au = au + T4.get(k11 * 2048 + n11) * XP.get(k11)
+                    k11 = k11 + 1
+                }
+                du<Float> = au - UY.get(n11)
+                adu<Float> = du
+                if (adu < 0.0) { adu = 0.0 - adu }
+                if (adu > mxu) { mxu = adu }
+                if (adu > 1e-4) { ndu = ndu + 1 ; if (firstbad_u < 0) { firstbad_u = n11 } }
+                n11 = n11 + 1
+            }
+            println("E2E U_FULL count_over_1e-4=" + ndu.to_string() + " max_abs=" + mxu.to_string_precise() + " first_bad=" + firstbad_u.to_string())
+        }
         wr_pdev(pby, 0, byr)
         wr_pdev(pby, 8, by)
         wr_pdev(pby, 16, hd_pre32)
