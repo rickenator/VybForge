@@ -103,6 +103,7 @@ exl3mv1s4(p<Int>) -> {
     CNT<Int> = ld_i64(p + 72)
     CNT2<Int> = ld_i64(p + 80)
     ONLY<Int> = ld_i64(p + 88)
+    DBG<Int> = ld_i64(p + 96)
     inv<Int> = ld_i64(p + 56)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
@@ -168,6 +169,13 @@ exl3mv1s4(p<Int>) -> {
         cb<Int> = nb128 * 128 + d
         if (CNT != 0) { atomic_add_f32(CNT + nb128 * 4, 1.0) }
         if (CNT2 != 0) { atomic_add_f32(CNT2 + cb * 4, 1.0) }
+        # two-slot diagnostic: what does the kernel actually SEE?
+        if (DBG != 0) {
+            st_f32(DBG + 0, ONLY as Float32)
+            st_f32(DBG + 4, nb128 as Float32)
+            if (nb128 == 2) { atomic_add_f32(DBG + 8, 1.0) }
+            if (ONLY == 2) { atomic_add_f32(DBG + 12, 1.0) }
+        }
         # ONLY >= 0 restricts accumulation to ONE column block (diagnostic):
         # isolates exactly which block's contributions are wrong.
         if (ONLY < 0 || ONLY == nb128) {

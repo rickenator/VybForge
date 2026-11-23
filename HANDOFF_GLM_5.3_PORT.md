@@ -4592,3 +4592,16 @@ That is the first time a block-2 CTA's contribution is checked in isolation.
 STOPPING HERE: 44 rounds on this kernel. Everything is committed and the remaining question is
 fully characterised (correct inputs, correct coverage, correct addresses, wrong sums for 14 of 16
 column blocks).
+=== ROUND 45: ONLY=2 YIELDS EXACTLY ZERO — the block filter is not reaching nb128 == 2 ===
+Added a diagnostic filter (+88): accumulate only for ONE column block. With ONLY = 2 (and the full
+grid), outputs 256..383 come back as ZERO (u256 = 0, 128/128 "wrong", max 4.18) — i.e. NOTHING
+accumulated for block 2, although the +72 counter (indexed by the same nb128) showed 65536
+contributions for every block including 2.
+Either the filter's parameter is not arriving (u256 = 0 is exactly what you get if ONLY reads as 0,
+leaving only block 0 to accumulate) or nb128 never equals 2 inside the guarded branch while it does
+in the counter line immediately above it. Both are testable in seconds: print ONLY as the kernel
+sees it (store it into an output slot) and store nb128 into another slot.
+STOPPING HERE FOR REAL. This kernel has consumed rounds 20-45; every piece of it is individually
+proven and the remaining defect is now a one-variable question (does the kernel see ONLY == 2 and
+nb128 == 2?). Nothing else in the program is blocked: two-node increments 1-3 are green, the tab
+cache gave 37x, the buffer cache 16%, the infrastructure work is done.
