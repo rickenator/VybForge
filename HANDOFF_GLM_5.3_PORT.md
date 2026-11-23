@@ -5664,3 +5664,14 @@ NEXT: get one driver through to tail_site (fix the load_fn resolution, or use gl
 which may not hit the failing entry), then run with P6_FUSED_GATE=1 and read the FGATE lines. Once those
 show 0 over 1e-4 across a layer's experts, flip the flag to USE the fused gv, re-check the layer digest
 against gold, and then extend to up/down.
+=== ROUND 104: SESSION RULES COMMITTED TO THE SKILL ===
+The measurement lessons from this session now live in the `vybforge-gpu-model` skill as
+references/measurement-discipline.md (the SKILL.md body is at 99,849/100,000 chars and CANNOT take a
+pointer to it -- it needs consolidating before anything else is added; skill_view still surfaces the
+file via linked_files, so it is discoverable).
+Contents: the bulk_dtoh f64-width trap and its garbage signatures; bf16deq vs bf16deq32 and the z>0
+transpose; literal bf16 constant packing; the verified reference values for
+layers.3 kv_a_proj_with_mqa; the three standing micro-tests (p6r14_tiny / p6r16_real / p6r10 NT4);
+verify-each-stage-on-device; the blame order (artifact present -> argument types -> readback width ->
+compiler last); time_mono_millis's 1 ms quantisation; ILP being non-universal (bfgemm8 1.67x faster,
+mvnodB4 2.6x slower); and plain-store timing variants.
