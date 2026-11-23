@@ -6369,3 +6369,29 @@ HOW TO GET ms/token FROM THIS HARNESS: no timestamps in the log, so measure DIFF
 wall(NSTEPS) - wall(1) = (NSTEPS-1) decode steps, which cancels the one-time cold read. run_fgate.sh
 now takes NSTEPS for exactly this. (An identical repeat request is useless: the serve loop answers it
 from its result cache in ~0.1 ms.)
+=== ROUND 139: THE PIPELINE IS I/O-BOUND PER TOKEN -- 0.0016 tok/s, AND THE 2x KERNEL WIN IS SWAMPED ===
+The differential decode measurement did not complete: with NSTEPS=2 both requests returned EXACTLY
+900.002 s, which is curl's `-m 900` timeout, not a result. The server was killed mid-step: it had done
+step 0 (prefill) and reached "step1 layer 20" of 45.
+    step 0 (prefill, 20 tokens) : ~625 s
+    step 1  : 20 of 45 layers in the remaining ~275 s -> ~13.8 s/layer -> ~620 s for a full step
+    RSS     : ~21 GB throughout, against a 175.6 GB model -> only ~12% resident
+Each decode step re-reads essentially the whole checkpoint: 620 s x 280 MB/s = 174 GB, which is the
+model size. So the current cost is ~627 s/token = **0.0016 tok/s**, and the fused-MoE 2.02x from
+round 138 is a rounding error against it.
+THE ARITHMETIC THAT MATTERS (per token):
+    full model from disk            : 175.6 GB / 0.28 GB/s = 627 s/token   = 0.0016 tok/s  <- TODAY
+    active experts only, from disk  : 45 x 8 x 12.6 MB = 4.43 GB / 0.28 GB/s = 15.8 s/token = 0.063 tok/s
+    active experts from HBM @223GB/s: 4.43 GB / 223 GB/s = 19.9 ms/token   = 50.3 tok/s   <- THE BAR
+The bar (45-50 tok/s = 20-22 ms/token) is EXACTLY the active-expert set read at near-peak HBM
+bandwidth. So two independent fixes are required, and neither is a kernel change:
+    (1) read 4.43 GB/token instead of 175.6 GB  -> 39.6x, requires per-expert addressing of the ROUTED
+        experts only (routing is known before the read);
+    (2) deliver them from HBM, not disk        -> ~800x, requires the weights to be RESIDENT.
+Residency feasibility: lefty HBM 128 GB + righty HBM 128 GB = 256 GB against a 175.6 GB model -> FITS,
+but only distributed across both nodes; a single Spark (128 GB) cannot hold it.
+CONSEQUENCE FOR THE STANDING GOAL: no amount of MoE kernel tuning reaches 45-50 tok/s while the path
+streams 175 GB/token from disk. The kernel work already done is necessary (it is exactly the critical
+path once the data is in HBM) but not sufficient, and its 2x cannot show up in tok/s until (1) and (2).
+HARNESS FIX: run_fgate.sh now takes CTIMEOUT (default 900). A multi-step request silently truncated at
+exactly 900.0 s with an empty body, which reads like a hang rather than a timeout.

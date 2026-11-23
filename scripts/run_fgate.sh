@@ -13,6 +13,10 @@ NLAY=${NLAY:-4}
 # request (~175 GB at disk speed). That difference is the only reliable way to get a warm ms/token
 # out of this harness without timestamps in the log.
 NSTEPS=${NSTEPS:-1}
+# A multi-step request costs ~NSTEPS x (one full streaming pass of the checkpoint), so the default
+# 900 s curl timeout silently truncates it at exactly 900.0 s with an EMPTY body -- which reads like
+# "the request hung" rather than "the timeout fired". Raise CTIMEOUT for any NSTEPS run.
+CTIMEOUT=${CTIMEOUT:-900}
 LOG=/tmp/serve_fgate.log
 # IDS_OVERRIDE lets the caller run a different prompt set (>=22 ids required).
 IDS="${IDS_OVERRIDE:-785,1234,4321,111,222,333,444,555,666,777,888,999,1010,1111,1212,1313,1414,1515,1616,1717,1818,1919}"
@@ -47,7 +51,7 @@ if grep -q "listening on" "$LOG"; then
   echo "--- timed requests (n=${REQS}), seconds:"
   i=1
   while [ "$i" -le "$REQS" ]; do
-    T=$(curl -s -o /tmp/resp.$$ -w '%{time_total}' -m 900 -X POST \
+    T=$(curl -s -o /tmp/resp.$$ -w '%{time_total}' -m "$CTIMEOUT" -X POST \
         "http://127.0.0.1:${PORT}/v1/generate?ids=${IDS},${i}&nsteps=${NSTEPS}")
     echo "req${i} ${T}s  $(head -c 80 /tmp/resp.$$)"
     i=$((i+1))
