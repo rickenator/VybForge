@@ -1,0 +1,166 @@
+// p6r17_batched — bfgemm_p cost curve at batched M (the batching thesis).
+//
+// For each M in {2, 32, 64, 128}: build A (M x K f32), run bfgemm_p against the
+// real kv_a_proj_with_mqa BF16 weights (N=512, K=4096), time the GEMM, widen the
+// partials and gate a slice against a host dot over the same decoded weights.
+//
+// The number that matters is ms per TOKEN (ms_gemm / M): the standing bar is
+// 45-50 tok/s aggregate, i.e. ~20-22 ms per step for the whole 45-layer forward.
+// env: P6_DIR
+import io::{open_read, read_all, close}
+import env::{env_get}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import gx::{gx_read}
+import time::{time_mono_millis}
+import glm_engine::{load_fn, gx_resolve_tab, launch_kernel, wr_pdev, deq_bf16}
+
+main()<Int> -> {
+    dir<String> = env_get("P6_DIR") else "/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c"
+    if (tensor_init() != 0) { println("B_FAIL cuda"); return 1 }
+    fp<Int> = load_fn("native/build/bfgemm.ptx", "bfgemm_p")
+    fw<Int> = load_fn("native/build/bfgemm.ptx", "widen32")
+    fc<Int> = load_fn("native/build/layer.ptx", "cast32")
+    fb2<Int> = load_fn("native/build/bfgemm.ptx", "b2d")
+    fdq<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fp == 0 || fw == 0 || fc == 0 || fb2 == 0 || fdq == 0) { println("B_FAIL handle"); return 2 }
+
+    cs<String> = ""
+    match (open_read("native/out/gx_tabs.cache")) {
+        fr -> { match (read_all(fr)) { s -> { cs = s } ? -> { return 3 } } close(fr) }
+        ? -> { println("B_FAIL tabcache"); return 3 }
+    }
+    nl0<Int> = find_from(cs, "\n", 0)
+    pos<Int> = nl0 + 1
+    tab3<String> = ""
+    var<Int> ti = 0
+    while (ti < 45) {
+        nl<Int> = find_from(cs, "\n", pos)
+        if (nl < 0) { println("B_FAIL trunc"); return 3 }
+        plen<Int> = cs.substring(pos, nl).to_int()
+        if (ti == 3) { tab3 = cs.substring(nl + 1, nl + 1 + plen) }
+        pos = nl + 1 + plen
+        ti = ti + 1
+    }
+
+    nm<String> = "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
+    w1<Vec<String>> = Vec()
+    w1.push(nm)
+    ge<GxLoc> = gx_resolve_tab(tab3, dir, 83, w1)
+    fnd<Int> = ge.found.get(0)
+    g0<String> = gx_read(ge, 0)
+    var<Int> N = 512
+    var<Int> K = 4096
+    if (fnd != 1 || g0.len() != N * K * 2) { println("B_FAIL tensor"); return 4 }
+
+    dB<Int> = dev_alloc(N * K * 2)
+    if (cuMemcpyHtoD_v2(dB, g0, N * K * 2) as Int != 0) { println("B_FAIL upload"); return 5 }
+    sync()
+    # decoded weights, once, for the host reference
+    dF<Int> = deq_bf16(fdq, g0, N * K, 0)
+    if (dF == 0) { println("B_FAIL deq"); return 6 }
+    sync()
+    WF<Vec<Float>> = bulk_dtoh(dF, N * K)
+    println("B w[0][0]=" + WF.get(0).to_string_precise() + " (expect -0.0107421875)")
+
+    pbv<Int> = dev_alloc(32)
+    dOut<Int> = dev_alloc(65536 * 8)
+    pbc<Int> = dev_alloc(32)
+    pbg<Int> = dev_alloc(96)
+
+    ms<Vec<Int>> = Vec()
+    ms.push(2)
+    ms.push(32)
+    ms.push(64)
+    ms.push(128)
+    var<Int> mi = 0
+    while (mi < ms.len()) {
+        M<Int> = ms.get(mi)
+        xv<Vec<Float>> = Vec()
+        var<Int> i = 0
+        while (i < M * K) { xv.push(((i % 11) as Float) * 0.0625 - 0.25) ; i = i + 1 }
+        dA64<Int> = dev_alloc(M * K * 8)
+        bulk_htod(dA64, view(xv))
+        dA<Int> = dev_alloc(M * K * 4)
+        wr_pdev(pbc, 0, dA64)
+        wr_pdev(pbc, 8, dA)
+        wr_pdev(pbc, 16, M * K)
+        launch_kernel(fc, (M * K + 255) / 256, pbc)
+        sync()
+
+        dS<Int> = dev_alloc(M * N * 4)
+        dS64<Int> = dev_alloc(M * N * 8)
+        wr_pdev(pbg, 0, dA)
+        wr_pdev(pbg, 8, dB)
+        wr_pdev(pbg, 16, dS)
+        wr_pdev(pbg, 24, M)
+        wr_pdev(pbg, 32, N)
+        wr_pdev(pbg, 40, K)
+        wr_pdev(pbg, 56, 1)
+        wr_pdev(pbg, 64, 1)
+        nblk<Int> = (((M + 3) / 4) * N + 255) / 256
+
+        # warm-up (first launch pays context/JIT costs that are not the kernel's)
+        launch_kernel(fp, nblk, pbg)
+        sync()
+
+        t0<Int> = time_mono_millis()
+        var<Int> rep = 0
+        while (rep < 3) { launch_kernel(fp, nblk, pbg) ; rep = rep + 1 }
+        sync()
+        t1<Int> = time_mono_millis()
+        gms<Float> = (t1 - t0) as Float / 3.0
+
+        wr_pdev(pbv, 0, dS)
+        wr_pdev(pbv, 8, dS64)
+        wr_pdev(pbv, 16, M * N)
+        launch_kernel(fw, (M * N + 255) / 256, pbv)
+        sync()
+        O<Vec<Float>> = bulk_dtoh(dS64, M * N)
+
+        # gate: first 8 outputs of row 0 and of the last row
+        var<Int> nbad = 0
+        var<Float> mx = 0.0
+        var<Int> rr = 0
+        while (rr < 2) {
+            r0<Int> = rr * (M - 1)
+            var<Int> n = 0
+            while (n < 8) {
+                var<Float> acc = 0.0
+                var<Int> kk = 0
+                while (kk < K) {
+                    acc = acc + xv.get(r0 * K + kk) * WF.get(n * K + kk)
+                    kk = kk + 1
+                }
+                got<Float> = O.get(r0 * N + n)
+                d<Float> = got - acc
+                if (d < 0.0) { d = 0.0 - d }
+                if (d > 1e-4) { nbad = nbad + 1 }
+                if (d > mx) { mx = d }
+                n = n + 1
+            }
+            rr = rr + 1
+        }
+        perT<Float> = gms / (M as Float)
+        println("B M=" + M.to_string() + " grid=" + nblk.to_string() + " gemm_ms=" + gms.to_string_precise() + " ms_per_token=" + perT.to_string_precise() + " bad=" + nbad.to_string() + " max=" + mx.to_string_precise())
+        mi = mi + 1
+    }
+    println("B_DONE")
+    return 0
+}
+
+find_from(s<String>, needle<String>, start<Int>)<Int> -> {
+    n<Int> = s.len()
+    m<Int> = needle.len()
+    i<Int> = start
+    while (i <= n - m) {
+        ok<Int> = 1
+        j<Int> = 0
+        while (j < m) {
+            if (s.char_at(i + j) != needle.char_at(j)) { ok = 0 ; j = m }
+            j = j + 1
+        }
+        if (ok == 1) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}

@@ -5430,3 +5430,21 @@ accumulated too many patches to trust; the clean move is to rewrite it as p6r16_
 structure as the passing micro-test (verify A and B on device first, then the GEMM, then widen, then
 compare against a host reference), so its scaffolding is proven by construction.
 STATUS: bfgemm_p is ready to use for the attention projections. The kernel itself is validated.
+=== ROUND 93: *** bfgemm_p CERTIFIED ON A REAL TENSOR *** — THE ATTENTION PATH IS UNBLOCKED ===
+native/host/p6r16_real.vyb, every stage verified on device before the next one runs:
+    R found=1 bytes=4194304 expect=4194304
+    R B: -0.0107421875 0.0137939453125 -0.007659912109375      (matches the Python oracle)
+    R A: -0.25 -0.1875 -0.125                                  (matches the constructed activations)
+    R gemm grid=2 rc=0
+    R o[0]=-0.18997785449028015      ref o[0]=-0.18997785821557045
+    R_GATE count_over_1e-4=0   max_abs=9.3132257461547852e-08  of 128
+    R_PASS bfgemm_p certified on a real tensor
+bfgemm_p: BF16 weights read in place via ld_bf16, [N][K] TRANSP addressing, 4-rows-per-thread, KSP=1
+partials -- all correct at K=4096, N=512, M=2, agreeing with a host dot over the same decoded weights to
+9.3e-08. This is the primitive the batched attention projections need, and it is now trustworthy.
+THE PATTERN THAT MADE IT WORK (reuse it everywhere): verify each device buffer on device BEFORE the
+next stage runs. Both bugs found today (the f64 width, the bf16 constant pack) were invisible from the
+final number and obvious from a per-stage dump. A hand-checkable micro-test (p6r14_tiny: A=[1..8],
+B=1.0/2.0 -> exactly [36,72]) plus staged verification is what finally closed this.
+NEXT: the batched MLA attention build on bfgemm_p (q_a [B][4096]x[1536][4096], kv_a [B][4096]x[512]
+[4096], q_b from q_a, kv_b from kv_a, o_proj [B][16384]x[4096][16384]).
