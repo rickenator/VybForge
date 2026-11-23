@@ -5892,3 +5892,20 @@ treated as per-call scratch. su, sv and the trellis all had to be uploaded separ
 hoisted Hadamard), LUT, mapdev and invbase are genuinely stable across projections.
 STATE: the fused gate is now verified against the production path INSIDE the engine, on real compacted
 activations and on a synthetic input. Step 2 (flip the flag to USE FV, then gold digest) is unblocked.
+=== ROUND 116: *** STEP 2 DONE -- THE FUSED GATE IS LIVE IN THE ENGINE *** ===
+With P6_FUSED_GATE=1 and the adopt-condition (count_over_1e-4 == 0), tail_site replaces gv with the fused
+result:  if (ffixed == "1" && nb2 == 0) { gv = FV }
+A full 4-layer generation through the HTTP endpoint completes and agrees everywhere:
+    {"draft_token": 0}                      <- identical to the pre-flip run
+    FGATE expert=0  nt=1  count 0  max_abs=2.62e-06 of 2048
+    FGATE expert=1  nt=1  count 0  max_abs=1.19e-06 of 2048
+    FGATE expert=2  nt=3  count 0  max_abs=1.31e-06 of 6144
+    FGATE expert=5  nt=3  count 0  max_abs=1.55e-06 of 6144
+    FGATE expert=6  nt=1  count 0  max_abs=1.22e-06 of 2048
+So one of the MoE's three projections (gate) is now served straight from the packed EXL3 weights with no
+f32 materialisation, verified at ~1-3e-06 against deq+gemm on every expert of a real layer, and the
+model still produces its reference output.
+SAFETY: the adopt is conditional on a clean comparison, so a regression cannot silently take effect --
+it degrades to the deq path. P6_FUSED_USE=0 forces the deq path even with the verification on.
+REMAINING (step 3): up_proj (g_ge_3/4/5) and down_proj (g_ge_6/7/8) -- same pattern, but each must
+upload ITS OWN trellis into its own dQ (the arena lesson from round 115) and its own su/sv.

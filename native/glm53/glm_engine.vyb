@@ -3360,7 +3360,7 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             }
             tA = time_mono_millis()
             var<Vec<Float>> gv = mm_host32(sub, nt, H, dWg, EINTER, fcast32, fgp, fgr, pb32)
-            uv<Vec<Float>> = mm_host32(sub, nt, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
+            var<Vec<Float>> uv = mm_host32(sub, nt, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
             # ---- FUSED-GATE VERIFICATION (flag-gated; the deq path stays authoritative) ----
             # P6_FUSED_GATE=1 computes the gate projection a second way -- straight from the
             # packed weights (xhatB -> mvnodB -> yhatB), never materialising f32 -- and prints
@@ -3511,6 +3511,69 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             zz2 = zz2 + 1
                         }
                         println("FGATESYN expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nbs.to_string() + " max_abs=" + mxs.to_string_precise() + " fused0=" + FS.get(0).to_string_precise() + " ref0=" + RS.get(0).to_string_precise())
+
+                        # ================= UP PROJECTION (same chain, up's own tensors) =================
+                        # g_ge_3/4/5 are up's trellis/suh/svh; dWu is up's dequantised weights.
+                        # Its trellis goes into dQ again -- the arena lesson: never borrow arA here.
+                        dQu<Int> = dev_alloc(g_ge_3.len())
+                        dsuU<Int> = dev_alloc(g_ge_4.len())
+                        dsvU<Int> = dev_alloc(g_ge_5.len())
+                        if (dQu != 0 && dsuU != 0 && dsvU != 0) {
+                            cuMemcpyHtoD_v2(dQu, g_ge_3, g_ge_3.len())
+                            cuMemcpyHtoD_v2(dsuU, g_ge_4, g_ge_4.len())
+                            cuMemcpyHtoD_v2(dsvU, g_ge_5, g_ge_5.len())
+                            bulk_htod(dsub64, view(sub))
+                            wr_pdev(pb32, 0, dsub64)
+                            wr_pdev(pb32, 8, dxf)
+                            wr_pdev(pb32, 16, nt * H)
+                            launch_kernel(fcast32, (nt * H + 255) / 256, pb32)
+                            sync()
+                            wr_pdev(pb32, 0, dxf)
+                            wr_pdev(pb32, 8, dxh)
+                            wr_pdev(pb32, 16, hdg32)
+                            wr_pdev(pb32, 24, dsuU)
+                            wr_pdev(pb32, 32, H)
+                            wr_pdev(pb32, 40, nt)
+                            launch_kernel(fxb, nt * (H / 128), pb32)
+                            sync()
+                            var<Int> zwu = 0
+                            while (zwu < nt * EINTER * 4) { wr_pdev(dyr, zwu, 0) ; zwu = zwu + 8 }
+                            wr_pdev(pb32, 0, dyr)
+                            wr_pdev(pb32, 8, dxh)
+                            wr_pdev(pb32, 24, EINTER)
+                            wr_pdev(pb32, 40, dQu)
+                            wr_pdev(pb32, 48, mapdev)
+                            wr_pdev(pb32, 56, invbase)
+                            wr_pdev(pb32, 144, dLUT)
+                            wr_pdev(pb32, 168, nt)
+                            wr_pdev(pb32, 176, H)
+                            launch_kernel(fmb, (H / 64) * (EINTER / 128) * 8, pb32)
+                            sync()
+                            wr_pdev(pb32, 0, dyr)
+                            wr_pdev(pb32, 8, dyp)
+                            wr_pdev(pb32, 16, hdg32)
+                            wr_pdev(pb32, 24, EINTER)
+                            wr_pdev(pb32, 32, dsvU)
+                            wr_pdev(pb32, 40, nt)
+                            launch_kernel(fyb, nt * (EINTER / 128), pb32)
+                            sync()
+                            FU2<Vec<Float>> = bulk_dtoh(dyp, nt * EINTER)
+                            var<Int> nbu = 0
+                            var<Float> mxu = 0.0
+                            var<Int> zzu = 0
+                            while (zzu < nt * EINTER) {
+                                dvu<Float> = FU2.get(zzu) - uv.get(zzu)
+                                if (dvu < 0.0) { dvu = 0.0 - dvu }
+                                if (dvu > 1e-4) { nbu = nbu + 1 }
+                                if (dvu > mxu) { mxu = dvu }
+                                zzu = zzu + 1
+                            }
+                            println("FGATEUP expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nbu.to_string() + " max_abs=" + mxu.to_string_precise() + " of " + (nt * EINTER).to_string())
+                            if (nbu == 0) { uv = FU2 }
+                        }
+                        free_dev(dQu)
+                        free_dev(dsuU)
+                        free_dev(dsvU)
                     } else {
                         println("FGATE alloc failed")
                     }
