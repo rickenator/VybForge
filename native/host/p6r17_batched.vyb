@@ -72,6 +72,8 @@ main()<Int> -> {
     ms.push(32)
     ms.push(64)
     ms.push(128)
+    ms.push(256)
+    ms.push(512)
     var<Int> mi = 0
     while (mi < ms.len()) {
         M<Int> = ms.get(mi)

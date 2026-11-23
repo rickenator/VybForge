@@ -5448,3 +5448,25 @@ final number and obvious from a per-stage dump. A hand-checkable micro-test (p6r
 B=1.0/2.0 -> exactly [36,72]) plus staged verification is what finally closed this.
 NEXT: the batched MLA attention build on bfgemm_p (q_a [B][4096]x[1536][4096], kv_a [B][4096]x[512]
 [4096], q_b from q_a, kv_b from kv_a, o_proj [B][16384]x[4096][16384]).
+=== ROUND 94: bfgemm_p BATCHED COST CURVE — and the extrapolation that matters ===
+Real weights (kv_a_proj_with_mqa: N=512, K=4096, 4.19 MB BF16), 3 timed reps after a warm-up:
+    M=2    grid=2   gemm_ms=0.3333  ms/token=0.16667   bad=0  max=5.03e-08
+    M=32   grid=16  gemm_ms=0.6667  ms/token=0.02083   bad=0  max=4.47e-08
+    M=64   grid=32  gemm_ms=0.6667  ms/token=0.01042   bad=0  max=2.98e-08
+    M=128  grid=64  gemm_ms=1.0000  ms/token=0.00781   bad=0  max=2.98e-08
+Correctness holds at every batch size (max <= 5e-08 over the gate), and ms/token improves 21x from
+M=2 to M=128. The curve is still falling at M=128, i.e. NOT yet bandwidth-bound.
+EXTRAPOLATION TO ATTENTION (arithmetic, not measurement -- treat as an estimate):
+  attention weights per layer = q_a 12.6 + kv_a 4.2 + q_b 50.3 + kv_b 33.6 + o_proj 134.2 = 234.9 MB
+  measured cost at M=128 = 1.0 ms per 4.19 MB  ->  0.2387 ms/MB
+  per layer = 234.9 * 0.2387 = 56.1 ms   ->  x45 layers = 2,524 ms per 128-token step = ~50.7 tok/s
+  add the measured MoE at B=128 (2.43 s/step, ~52.7 tok/s) = ~4.95 s/step = ~26 tok/s
+So attention ALONE lands right at the 45-50 bar, and attention+MoE together land ~26 tok/s -- BELOW the
+bar. The honest conclusion is that the composed path is not yet at 45-50 and the batching thesis alone
+does not get there.
+WHERE THE HEADROOM IS: the kernel runs at 4.19MB/1.0ms = 4.2 GB/s effective, while this device streams
+BF16 at 223.7 GB/s measured (p6r11_bfbw). That is a factor of ~53. So at these batch sizes the GEMM is
+COMPUTE-bound, not bandwidth-bound -- which is exactly why ms/token kept falling with M and why raising
+M further is the cheapest remaining lever (M=256/512 should keep improving until the 223 GB/s wall).
+NEXT: extend the sweep to M=256 and M=512; if ms/token keeps halving, the bar is reachable by batch
+size alone. If it flattens early, the kernel needs a compute fix (more ILP / fewer loads per MAC).
