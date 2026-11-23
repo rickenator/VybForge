@@ -5639,3 +5639,28 @@ small nt -- 21x at nt=1 -- and ~4-8x at nt=4; production's nt averages ~3.6 at B
 THE LAST GATE BEFORE WIRING IS NOW CLEARED. What remains is pure plumbing in tail_site, precisely
 enumerated in round 101 (three kernel handles, trellis/su/sv/LUT uploads, the f64->f32->xhatB->mvnodB
 ->yhatB chain, and a flag-gated dual-compute comparison). Nothing about the mathematics is in doubt.
+=== ROUND 103: FUSED-GATE VERIFICATION IS WIRED INTO tail_site (flag-gated, default OFF) ===
+glm_engine.vyb, immediately after gv/uv are computed by mm_host32, there is now a P6_FUSED_GATE block:
+  - loads exl3mv.ptx entries xhatB / yhatB / mvnodB / f16lut
+  - builds the f16 LUT locally (the engine has none -- grep found zero references)
+  - uploads this expert's suh/svh (g_ge_1/g_ge_2) and the compacted `sub` activations
+  - runs f64 -> cast32 -> xhatB(su) -> mvnodB(B=nt) -> yhatB(sv) -> D2H
+  - compares against gv element-by-element and prints
+      FGATE expert=<e> nt=<nt> count_over_1e-4=<n> max_abs=<m> of <nt*EINTER>
+  - frees every temporary (this runs per expert, so a leak here would be fatal)
+  - the deq path REMAINS AUTHORITATIVE: FV is never used downstream, and with P6_FUSED_GATE unset the
+    block is skipped entirely, so default behaviour is bit-identical to before.
+STATUS: compiles clean (no semantic errors from the engine or any module). NOT yet observed running:
+  - glm_l3_full.vyb is a stale driver (pre-existing "Unsupported cast i64 -> {ptr,i64,i64}").
+  - glm_decode_chain.vyb printed CHAIN_FAIL kernels on lefty. CORRECTION: this was NOT the load_fn
+    defect as first stated -- native/build/gemm.ptx (entry "gemm") was simply absent from lefty's
+    build dir. Building it from native/kernels/gemm.vyb and rsyncing removed the failure. Lesson
+    repeated: check for the missing artifact before blaming the compiler.
+So the flag's runtime verification is blocked on that driver/kernel-load issue, NOT on anything in the
+edit. The numerical equality it would check is already established independently: p6r10 NT4 verified
+the identical chain (xhatB -> mvnodB -> yhatB vs deq32f + mm_host32) at the production shape, all 8192
+outputs, max_abs 1.01e-06.
+NEXT: get one driver through to tail_site (fix the load_fn resolution, or use glm_serve/glm_prefill
+which may not hit the failing entry), then run with P6_FUSED_GATE=1 and read the FGATE lines. Once those
+show 0 over 1e-4 across a layer's experts, flip the flag to USE the fused gv, re-check the layer digest
+against gold, and then extend to up/down.
