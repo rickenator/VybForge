@@ -1,0 +1,39 @@
+// p6r11_bfbw — measure achievable BF16 streaming bandwidth.
+// Attention (BF16, 11.2 GB/step) is bounded by this number, not by arithmetic.
+import env::{env_get}
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, bulk_dtoh, sync}
+import glm_engine::{load_fn, launch_kernel, wr_pdev}
+
+main()<Int> -> {
+    if (tensor_init() != 0) { println("BW_FAIL cuda"); return 1 }
+    f<Int> = load_fn("native/build/bfbw.ptx", "bfbw")
+    if (f == 0) { println("BW_FAIL fn"); return 2 }
+    # 1 GiB of bf16 = 536,870,912 elements
+    N<Int> = 536870912
+    src<Int> = dev_alloc(N * 2)
+    out<Int> = dev_alloc(4096)
+    pb<Int> = dev_alloc(64)
+    if (src == 0 || out == 0 || pb == 0) { println("BW_FAIL alloc src=" + src.to_string()); return 3 }
+    wr_pdev(pb, 0, src)
+    wr_pdev(pb, 8, out)
+    wr_pdev(pb, 16, N)
+    # warm
+    launch_kernel(f, 256, pb)
+    sync()
+    t0<Int> = time_mono_millis()
+    var<Int> r = 0
+    while (r < 5) {
+        launch_kernel(f, 256, pb)
+        r = r + 1
+    }
+    sync()
+    t1<Int> = time_mono_millis()
+    ms<Float> = ((t1 - t0) as Float) / 5.0
+    gb<Float> = (N as Float) * 2.0 / 1000000000.0
+    println("BW ms_per_pass=" + ms.to_string_precise() + " GB=" + gb.to_string_precise() + " GBps=" + (gb / (ms / 1000.0)).to_string_precise())
+    attn<Float> = 11.2
+    println("BW attention_11.2GB_ms=" + (attn / (gb / (ms / 1000.0)) * 1000.0).to_string_precise())
+    println("BW_DONE")
+    return 0
+}

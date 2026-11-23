@@ -1,0 +1,23 @@
+// bfbw — achievable BF16 streaming bandwidth on this device.
+//
+// Attention in GLM-5.3 is BF16 and is NOT EXL3-packed: 11.2 GB of it has to be
+// read every step, so first we need the real number for "how fast can this GPU
+// stream BF16", measured the same way the production kernels read it (one
+// coalesced pass, no reuse).
+//
+// p: +0 src (bf16, n words), +8 out (f32, one per block), +16 n (elements)
+bfbw(p<Int>) -> {
+    S<Int> = ld_i64(p + 0)
+    O<Int> = ld_i64(p + 8)
+    N<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    acc<Float32> = 0.0
+    i<Int> = gid
+    while (i < N) {
+        acc = acc + (ld_u16(S + i * 2) as Float32)
+        i = i + 65536
+    }
+    if (tid_x() == 0) {
+        st_f32(O + blk_x() * 4, acc)
+    }
+}
