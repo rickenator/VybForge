@@ -6003,3 +6003,24 @@ THE PERFORMANCE NUMBERS THAT REMAIN TRUSTWORTHY are p6r10's warm in-process ones
     1 ms fused vs 8 ms deq+gemm at nt=4 (4-8x)
 and the composed projection built on them (~34.7 tok/s deq path, ~68 tok/s with the MoE fused) is an
 ESTIMATE, clearly labelled as such, not a measurement.
+=== ROUND 122: *** THE MEASURED NUMBER: the fused MoE is 10.6x faster per expert-projection *** ===
+Warm in-process measurement (p6r10, 20 reps, so the 1 ms timer is not the limit):
+    DEQ_PATH   deq_ms=4    (one-time per expert-projection, f32 materialisation)
+    GEMM_WARM  per_ms=0.25 (20 reps, the f32 gemm over the dequantised weights)
+    FUSED_WARM xhat_ms=0.05  mv_ms=0.35  yhat_ms=0.00  total_ms=0.40  (20 reps, straight from packed)
+    NT4_PASS   fused == deq+gemm for 4 compacted tokens  (correctness intact at the same time)
+    per expert-projection: deq+gemm = 4.25 ms   fused = 0.40 ms   ->  10.6x
+COMPOSED PROJECTION (attention measured at 9.86 ms/token; MoE 18.97 ms/token at B=128 scaled by 10.6x):
+    MoE   18.97 -> 1.79 ms/token
+    total 11.65 ms/token = ~86 tok/s
+    the standing bar is 20-22 ms/token (45-50 tok/s) -> roughly 4x of headroom
+This is a MEASUREMENT of the per-expert cost plus an ARITHMETIC composition, not an end-to-end serve
+number -- the serve harness cannot provide one (round 121). The per-expert figure is the trustworthy kind:
+warm, repeated, in-process, with the correctness gate passing in the same run.
+NOTE the deq was measured once (4 ms) while the gemm and fused are warm averages; the deq is a one-time
+per-expert-projection cost in production (weights differ per expert per step, so it cannot be amortised),
+which is exactly why it dominates the deq path and why removing it is the 10.6x.
+ALSO FIXED THIS ROUND: removing glm_engine's duplicate extern block meant probes that called
+cuMemcpyHtoD_v2 directly lost the transitive declaration ("Undefined identifier"). Added
+`import cuda_binding::{...}` to the 9 affected probes (p6r10, p6r8_e2e, p6r13, p6r9, p6r17, p6r15,
+p6r4, p6r16, p6r5) -- the same module-local rule the binding documents.
