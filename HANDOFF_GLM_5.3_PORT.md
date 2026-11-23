@@ -6126,3 +6126,33 @@ WHAT IS ALREADY ESTABLISHED DESPITE THE MESS: with the new P6_FUSED_TOL=1e-05, e
 that ran passed (count_over_1e-4 failures = 0), and CHAIN_OK was reached -- so the changed code runs and
 verifies cleanly at 4 layers.
 STILL PENDING: the 45-layer reproducibility check against native/baselines/digest_fused45.txt.
+=== ROUND 128: THE FUSED PATH IS NOT RUN-TO-RUN DETERMINISTIC -- re-baselining cannot be bit-identical ===
+The 45-layer verification ran correctly this time (45 digests captured) and did NOT match the recorded
+baseline -- not because the code changed, but because the SAME code produces different digests on
+different runs:
+    layers byte-identical : 3 / 45     (layers 0-2: the dense ones, no MoE involvement)
+    median run-to-run delta: 1.78e-06
+    worst                 : 1.08e-02 at layer 22
+    FGATE comparison failures: 0        (the per-expert checks passed on every expert)
+ROOT CAUSE: mvnodB accumulates with atomic_add_f32. Floating-point addition is not associative, so the
+summation order depends on thread scheduling and varies run to run. The observed run-to-run noise
+(~1e-06, median) is the SAME ORDER as the deq-vs-fused difference (5.5e-07 at layer 3) -- i.e. the two
+configurations differ by about as much as the fused path differs from ITSELF. That also explains why the
+digest comparison could never be bit-identical, and why layer 22 keeps appearing as an outlier (it is a
+cancellation-sensitive aggregate).
+CONSEQUENCE FOR STEP 2 AS IMPLEMENTED: recording native/baselines/digest_fused45.txt and diffing it
+exactly is INVALID -- a rerun of identical code fails that diff. The baseline is still useful, but it
+must be compared with a TOLERANCE (use scripts/analyse_digests.py), not with `diff`. Layers 0-2 (no MoE)
+remain deterministic, so a strict bit-identical check is still meaningful for the attention/dense path --
+it just cannot cover MoE layers.
+TWO WAYS FORWARD (this is the real remaining decision, not the gate wording):
+  a. DETERMINISTIC REDUCTION: give mvnodB per-CTA partial buffers and a reduce pass (exactly what
+     gemm32_p + gemm32_r already do), instead of atomics. That restores run-to-run determinism, makes
+     bit-identical baselining valid again, and is probably neutral-to-faster (atomics measured as not the
+     bottleneck, but they buy nothing here). This is the principled fix.
+  b. TOLERANCE GATE: accept ~1e-6 run-to-run noise and gate MoE layers on a relative tolerance
+     (median 1.8e-06, so a 1e-4 or even 1e-05 bound is comfortable). Cheaper, but quantisation of results
+     is lost forever and any real regression must be larger than the noise floor to be visible.
+RECOMMENDATION: (a). Determinism is worth having on its own -- it is what makes any future digest gate,
+golden-output test or bisect meaningful -- and this project has already built the split-K + reduce
+pattern twice (gemm32_p/r and bfgemm_p/widen32).
