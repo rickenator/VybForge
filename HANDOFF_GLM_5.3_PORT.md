@@ -5749,3 +5749,24 @@ cache hits: "CHAIN TABCACHE hit" then "CHAIN_OK"), and the whole native/glm53 mo
 MEASURED FACTS FROM THE FAST RUNS: with the tab cache, a 1-layer and a 4-layer glm_decode_chain both
 complete in seconds ("CHAIN_OK"), so the harness is now cheap -- but both use the LOCAL tail_site, so
 neither exercises FGATE.
+=== ROUND 109: glm_serve NOW COMPILES (three real defects fixed) -- but fails at runtime pre-layer ===
+Removed the duplicate FFI and two related breaks. All three were genuine, and each blocked use of the
+engine from any driver:
+  1. glm_engine declared its own extern "C" block duplicating bindings/cuda/cuda_binding.vyb, so any
+     module importing BOTH died with "Duplicate symbol after splice: 'cuModuleLoadData'". Now the six
+     calls the binding carries are IMPORTED (cuMemFree_v2, cuMemAlloc_v2, cuMemcpyHtoD_v2,
+     cuCtxSynchronize, cuModuleLoadData, cuModuleGetFunction -- signatures verified identical) and only
+     the four the binding LACKS stay declared: cuMemGetInfo_v2, vyb_str_stats, cuda_launch4i,
+     malloc_trim. (A blind swap would have broken the engine: the binding has none of those four.)
+  2. my P6_FUSED_GATE block used zero_bytes(..), which does not exist in this module -> replaced with a
+     wr_pdev zero loop.
+  3. had_hoist (glm_engine:1566) lacked share(all) while its twin had_hoist32 had it, so glm_serve's
+     call was "Undefined identifier: had_hoist". Added share(all).
+VERIFIED: glm_serve.vyb now compiles with zero semantic errors, and on lefty it RUNS:
+    SETUP S0walk 560114099 / SETUP S0cache hit / SETUP S1tab 0
+    DEQFAIL alloc q rc=700 len=16777216
+    CHAIN_FAIL mtp stage deq
+rc=700 is a runtime context/allocation failure in the mtp stage, BEFORE any layer runs, so FGATE is
+still unobserved. The extern swap is not implicated: the binding's declarations are signature-identical
+to the engine's originals. This is the next thing to chase, and it is now the ONLY thing between the
+flag and a printed verification.
