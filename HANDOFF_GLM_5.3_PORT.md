@@ -5623,3 +5623,19 @@ TRAPS TO CARRY FORWARD: call `mvnod4` (not `exl3mv1s4`) for single-token; `mvnod
 exl3mv.vyb are dead ends / timing artifacts; verify each device buffer on device before the next stage
 (this is what finally cracked bfgemm_p); validate the instrument against a known value before trusting
 any number from it.
+=== ROUND 102: FUSED PATH VERIFIED AT THE PRODUCTION SHAPE (nt=4, compacted) ===
+Extended p6r10's comparison from nt=1 (round 71) to nt=4 with the batched kernels production would
+actually use -- xhatB -> mvnodB -> yhatB -- against the existing deq32f + mm_host32 reference:
+    P6R10 DEQ_PATH   deq_ms=4  mm_ms=4  total_ms=8
+    P6R10 FUSED_PATH xhat_ms=0 mv_ms=1  yhat_ms=0 total_ms=1     (nt=1)
+    P6R10 NT4 mv_ms=1 count_over_1e-4=0 max_abs=1.0132789611816406e-06 ref_max=1.67340087890625 of 8192
+    P6R10 NT4 fused0=-0.25333678722381592  ref0=-0.25333666801452637
+    P6R10 NT4_PASS fused == deq+gemm for 4 compacted tokens
+So the fused path is numerically equal to the production path for the compacted multi-token shape, over
+all 8192 outputs of a real expert's gate projection, at 1.01e-06 max error.
+Timing at nt=4: the fused matvec alone is 1 ms against deq 4 ms + gemm 4 ms = 8 ms for the same result
+(the deq cost is per-expert and does not amortise with nt, which is why the win ratio is larger at
+small nt -- 21x at nt=1 -- and ~4-8x at nt=4; production's nt averages ~3.6 at B=128).
+THE LAST GATE BEFORE WIRING IS NOW CLEARED. What remains is pure plumbing in tail_site, precisely
+enumerated in round 101 (three kernel handles, trellis/su/sv/LUT uploads, the f64->f32->xhatB->mvnodB
+->yhatB chain, and a flag-gated dual-compute comparison). Nothing about the mathematics is in doubt.

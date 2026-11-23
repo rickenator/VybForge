@@ -3359,6 +3359,101 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
             tA = time_mono_millis()
             gv<Vec<Float>> = mm_host32(sub, nt, H, dWg, EINTER, fcast32, fgp, fgr, pb32)
             uv<Vec<Float>> = mm_host32(sub, nt, H, dWu, EINTER, fcast32, fgp, fgr, pb32)
+            # ---- FUSED-GATE VERIFICATION (flag-gated; the deq path stays authoritative) ----
+            # P6_FUSED_GATE=1 computes the gate projection a second way -- straight from the
+            # packed weights (xhatB -> mvnodB -> yhatB), never materialising f32 -- and prints
+            # the difference against the deq+gemm result above. Nothing downstream uses FV.
+            # Verified equal at the production shape in p6r10 (nt=4, 8192 outputs, 1.01e-06).
+            fgate<String> = env_get("P6_FUSED_GATE") else "0"
+            if (fgate == "1" && nt > 0) {
+                fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
+                fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
+                fmb<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+                flt<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
+                if (fxb != 0 && fyb != 0 && fmb != 0 && flt != 0) {
+                    dLUT<Int> = dev_alloc(262144)
+                    dsu<Int> = dev_alloc(g_ge_1.len())
+                    dsv<Int> = dev_alloc(g_ge_2.len())
+                    dsub64<Int> = dev_alloc(nt * H * 8)
+                    dxf<Int> = dev_alloc(nt * H * 4)
+                    dxh<Int> = dev_alloc(nt * H * 4)
+                    dyr<Int> = dev_alloc(nt * EINTER * 4)
+                    dyp<Int> = dev_alloc(nt * EINTER * 8)
+                    if (dLUT != 0 && dsu != 0 && dsv != 0 && dsub64 != 0 && dxf != 0 && dxh != 0 && dyr != 0 && dyp != 0) {
+                        # the f16 LUT the fused kernel needs (the engine builds none today)
+                        wr_pdev(pb32, 0, dLUT)
+                        launch_kernel(flt, 256, pb32)
+                        sync()
+                        cuMemcpyHtoD_v2(dsu, g_ge_1, g_ge_1.len())
+                        cuMemcpyHtoD_v2(dsv, g_ge_2, g_ge_2.len())
+                        bulk_htod(dsub64, view(sub))
+                        sync()
+                        # f64 activations -> f32
+                        wr_pdev(pb32, 0, dsub64)
+                        wr_pdev(pb32, 8, dxf)
+                        wr_pdev(pb32, 16, nt * H)
+                        launch_kernel(fcast32, (nt * H + 255) / 256, pb32)
+                        sync()
+                        # xhatB: +0 x, +8 out, +16 H, +24 su, +32 nin, +40 B
+                        wr_pdev(pb32, 0, dxf)
+                        wr_pdev(pb32, 8, dxh)
+                        wr_pdev(pb32, 16, hdg32)
+                        wr_pdev(pb32, 24, dsu)
+                        wr_pdev(pb32, 32, H)
+                        wr_pdev(pb32, 40, nt)
+                        launch_kernel(fxb, nt * (H / 128), pb32)
+                        sync()
+                        # mvnodB: +0 T, +8 X, +24 cw, +40 q, +48 td, +56 inv, +144 LUT,
+                        #         +168 B, +176 nin   (atomics, so T starts zeroed)
+                        cuMemcpyHtoD_v2(dyr, zero_bytes(nt * EINTER * 4), nt * EINTER * 4)
+                        wr_pdev(pb32, 0, dyr)
+                        wr_pdev(pb32, 8, dxh)
+                        wr_pdev(pb32, 24, EINTER)
+                        wr_pdev(pb32, 40, arA)
+                        wr_pdev(pb32, 48, mapdev)
+                        wr_pdev(pb32, 56, invbase)
+                        wr_pdev(pb32, 144, dLUT)
+                        wr_pdev(pb32, 168, nt)
+                        wr_pdev(pb32, 176, H)
+                        launch_kernel(fmb, (H / 64) * (EINTER / 128) * 8, pb32)
+                        sync()
+                        # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
+                        wr_pdev(pb32, 0, dyr)
+                        wr_pdev(pb32, 8, dyp)
+                        wr_pdev(pb32, 16, hdg32)
+                        wr_pdev(pb32, 24, EINTER)
+                        wr_pdev(pb32, 32, dsv)
+                        wr_pdev(pb32, 40, nt)
+                        launch_kernel(fyb, nt * (EINTER / 128), pb32)
+                        sync()
+                        FV<Vec<Float>> = bulk_dtoh(dyp, nt * EINTER)
+                        var<Int> nb2 = 0
+                        var<Float> mx2 = 0.0
+                        var<Int> zz = 0
+                        while (zz < nt * EINTER) {
+                            dvv<Float> = FV.get(zz) - gv.get(zz)
+                            if (dvv < 0.0) { dvv = 0.0 - dvv }
+                            if (dvv > 1e-4) { nb2 = nb2 + 1 }
+                            if (dvv > mx2) { mx2 = dvv }
+                            zz = zz + 1
+                        }
+                        println("FGATE expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nb2.to_string() + " max_abs=" + mx2.to_string_precise() + " of " + (nt * EINTER).to_string())
+                    } else {
+                        println("FGATE alloc failed")
+                    }
+                    # free every temporary: this runs per expert, so a leak here would be fatal
+                    free_dev(dLUT)
+                    free_dev(dsu)
+                    free_dev(dsv)
+                    free_dev(dsub64)
+                    free_dev(dxf)
+                    free_dev(dxh)
+                    free_dev(dyr)
+                    free_dev(dyp)
+                } else {
+                    println("FGATE handles fxb=" + fxb.to_string() + " fyb=" + fyb.to_string() + " fmb=" + fmb.to_string() + " flt=" + flt.to_string())
+                }
+            }
             act<Vec<Float>> = Vec()
             j = 0
             while (j < gv.len()) {
