@@ -8,6 +8,11 @@ export VYBFORGE_GX_DIR=/srv/models/hf/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-
 PORT=${PORT:-18102}
 FG=${FG:-1}          # 1 = fused MoE projections, 0 = deq path
 NLAY=${NLAY:-4}
+# NSTEPS > 1 turns this into the DIFFERENTIAL decode measurement: wall(NSTEPS) - wall(1) is
+# NSTEPS-1 decode steps, which cancels the one-time cold checkpoint read that dominates a single
+# request (~175 GB at disk speed). That difference is the only reliable way to get a warm ms/token
+# out of this harness without timestamps in the log.
+NSTEPS=${NSTEPS:-1}
 LOG=/tmp/serve_fgate.log
 # IDS_OVERRIDE lets the caller run a different prompt set (>=22 ids required).
 IDS="${IDS_OVERRIDE:-785,1234,4321,111,222,333,444,555,666,777,888,999,1010,1111,1212,1313,1414,1515,1616,1717,1818,1919}"
@@ -43,7 +48,7 @@ if grep -q "listening on" "$LOG"; then
   i=1
   while [ "$i" -le "$REQS" ]; do
     T=$(curl -s -o /tmp/resp.$$ -w '%{time_total}' -m 900 -X POST \
-        "http://127.0.0.1:${PORT}/v1/generate?ids=${IDS},${i}&nsteps=1")
+        "http://127.0.0.1:${PORT}/v1/generate?ids=${IDS},${i}&nsteps=${NSTEPS}")
     echo "req${i} ${T}s  $(head -c 80 /tmp/resp.$$)"
     i=$((i+1))
   done

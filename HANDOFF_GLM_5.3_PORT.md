@@ -6350,3 +6350,22 @@ from one-request cold runs and are ambiguous between the prefill section and the
 a per-projection MICROBENCHMARK, not a tok/s result. Next measurement should be: production vs
 verification mode, same 45-layer run, reading SEC P1ffn and the request wall time from the harness
 stdout (the sweep sends that to /dev/null), to state ms/token against the 20-22 ms/token bar.
+=== ROUND 138: END-TO-END A/B -- THE FUSED PATH HALVES THE FFN SECTION (2.02x) ===
+Same 45-layer request, one per mode, production (P6_FUSED_ONLY=1) vs verification (=0):
+    request wall          : 625.5 s   vs  716.0 s      (12.6% faster end to end)
+    SEC P1ffn, warm layers: 1958/1965/1956 ms  vs  3961/3993/3052 ms   -> 2.02x
+    SEC P1ffn, total      : 120,293 ms vs 201,150 ms   -> 1.67x (the total includes the cold first
+                            layers, where checkpoint I/O dominates and masks the compute difference)
+CROSS-CHECK THAT MATTERS: the wall-time difference is 90.5 s and the FFN-section difference is 80.9 s
+of measured ffn plus the same-order attn; the two agree, which is what makes the 2x credible rather
+than a coincidence of two noisy numbers.
+WHY THE WALL TIME IS NOT A THROUGHPUT NUMBER: 625 s for one request is DISK speed, not compute --
+175 GB at ~280 MB/s. Measured compute in that run is only ~120 s of FFN, so the request is I/O-bound
+and says nothing about steady-state tok/s. RSS at step0 was ~21 GB, i.e. the model is NOT resident.
+THE SEC SECTIONS ARE PER-LAYER AND COLD-CONTAMINATED. `phase1 layer N done` separates them, and they
+alternate (e.g. 937/27 then 36/928) because whichever subsection touches new weights first pays the
+read. Only the repeating steady-state values (1958-1965 prod, 3961-3993 ver) mean anything.
+HOW TO GET ms/token FROM THIS HARNESS: no timestamps in the log, so measure DIFFERENTIALLY --
+wall(NSTEPS) - wall(1) = (NSTEPS-1) decode steps, which cancels the one-time cold read. run_fgate.sh
+now takes NSTEPS for exactly this. (An identical repeat request is useless: the serve loop answers it
+from its result cache in ~0.1 ms.)
