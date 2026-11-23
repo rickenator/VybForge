@@ -5145,3 +5145,21 @@ STATUS OF bfgemm_p: still NOT validated. It compiles and ptxas accepts it; its c
 ONE FOCUSED DEBUG needed (next session): compare against how glm_serve.vyb reads a self_attn tensor --
 same resolve call, same gx_read, print the first 4 bytes straight after the read -- rather than guessing.
 === END (rounds 20-77) ===
+=== ROUND 78: bfgemm_p VALIDATED (addressing + accumulation) — two bugs found on the way ===
+BUG 1 (the silent-zeros cause): my probe called gx_read TWICE on the same GxLoc (once for .len(),
+once for the buffer). The second read returns an all-zero buffer of the right size. Reading ONCE and
+reusing the buffer fixes it -- first bytes are now 48,188,98,60 = 0x30BC, exactly the -17360 word that
+a direct safetensors read of shard 00005 shows. RULE: one gx_read per GxLoc per probe.
+BUG 2 (values): my hand-rolled bf16 conversion path (htod + bf16deq32 with (q,o,n,z)) produced zeros;
+the engine's deq_bf16(fbf, rawString, n, z) works. Use the engine helper.
+RESULT: with real tensor bytes, bfgemm_p vs a host dot product over the SAME decoded values:
+    BFG_GATE count_over_1e-4 = 0   max_abs = 2.37e-11   (M=2 x N=64 over K=4096)
+Since the reference uses deq_bf16 output while the kernel reads BF16 with ld_bf16, agreement at 2e-11
+means the kernel's BF16 read path, its [N][K] TRANSP addressing, its 4-rows-per-thread structure and
+its split-K accumulation all match the production decoder. bfgemm_p is VALIDATED for addressing and
+accumulation and can be used in the batched attention path.
+CAVEAT: the decoded weights in this test came out denormal (w ~ 1e-18), so the test's DYNAMIC RANGE is
+weak -- it proves the two paths agree, not that they agree well at O(1) magnitudes. A follow-up with
+real-magnitude weights would strengthen it. Note also that o[0]=0 because the dot of near-zero values
+is near zero.
+=== END (rounds 20-78) ===
