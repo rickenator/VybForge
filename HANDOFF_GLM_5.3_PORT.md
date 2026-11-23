@@ -5711,3 +5711,17 @@ CONCLUSION: stop trying to observe the fused gate through this driver. It is a 4
 harness; the verification needs a purpose-built single-expert path (or P6_FUSED_ONCE + early exit
 immediately after the first expert's FGATE print). The cache fix stays -- it is a real improvement for
 every future full-chain run -- but it is not sufficient by itself.
+=== ROUND 107: TAB CACHE CONFIRMED WORKING; G9PROBE WAS NEVER THE WALK ===
+Two runs side by side prove the round-106 fix:
+    before: "CHAIN TABCACHE miss -> walking shards"   then G9PROBE stream
+    after : "CHAIN TABCACHE hit native/out/gx_tabs.cache"  then the SAME G9PROBE stream
+and the G9PROBE offsets are IDENTICAL across both runs (1646384088, 174881192, 753908392, 70552288,
+126952376, 126951992, 126951344, 128533520, ...). So:
+  - the cache load works: the shard walk is now skipped on a hit
+  - G9PROBE comes from the attention/prefill path, NOT from the tab walk -- my round-105 attribution
+    was wrong
+  - the remaining runtime is "CHAIN phase 1: prefill 20 tokens, 45 layers", i.e. real model work that
+    no cache can remove
+Therefore neither 30-minute run could ever have reached tail_site, and the fused-gate verification
+needs its own vehicle rather than a 45-layer prefill harness. The cache improvement stays (it removes
+the walk for every future full-chain run and now demonstrably hits).

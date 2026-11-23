@@ -4141,7 +4141,11 @@ main()<Int> -> {
     nex<Int> = 0
     t<Int> = 0
     tid<Int> = 0
-    nlay<Int> = 45
+    # VYBFORGE_NLAY shrinks the run to N layers -- used to reach the MoE tail (and the
+    # P6_FUSED_GATE verification) in seconds instead of running all 45.
+    nlayS<String> = env_get("VYBFORGE_NLAY") else "45"
+    nlay<Int> = nlayS.to_int()
+    if (nlay <= 0) { nlay = 45 }
     is_dsa<Int> = 0
     lpre<String> = ""
     tab<String> = ""
