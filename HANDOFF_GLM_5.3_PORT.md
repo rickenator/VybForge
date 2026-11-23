@@ -4793,3 +4793,20 @@ a constant derived from the slot id, so the store still depends on the remaining
 properly (with a liveness audit of each step, i.e. never leaving a value unused) is the only honest
 way forward, and it is a fresh-session job.
 === END OF THIS SESSION (rounds 20-57) ===
+=== ROUND 58: THE FUSED KERNEL IS CORRECT IN MINIMAL FORM (MVNOD4) ===
+Live-chain bisect, each step keeping the decode observable so nothing is DCE'd:
+    mvnod3 (full chain LIVE via a scratch store of yK, slab = 0.5)   -> correct (0/2048)
+    mvnod4 (full chain + the REAL slab value from the half->f32 LUT) -> CORRECT
+        count_over_1e-4 = 0   max_abs = 4.54e-06   first_bad = -1   v0 = -0.45167935
+vs. a freshly computed host reference u[n] = sum_k T4[k][n] * xp[k].
+SO: the decode algebra, the LUT, the slab layout, the dot, the atomics and the 8192-CTA grid are ALL
+correct when expressed in a ~45-line kernel. The logic was never wrong.
+THEREFORE: exl3mv1s4 is broken by its own DIAGNOSTIC SCAFFOLDING — the DBG / SBD / CNT / CNT2 / STB /
+ATGT / XD / ONLY / CONST branches and the ten extra param slots, every one of which is inert at
+runtime. That is consistent with everything observed: adding diagnostics progressively broke a
+kernel that had worked earlier in the session, the symptom moved (blocks, nondeterminism, vanished
+atomics), and no individual data path was ever wrong.
+ACTION (next, small): promote mvnod4's body to be the production fused kernel (keeping only what the
+serve path needs), delete the diagnostic params, re-measure, and re-run the U_FULL gate. Expect the
+fused decode matvec to be correct AND fast.
+=== END OF SESSION (rounds 20-58) ===

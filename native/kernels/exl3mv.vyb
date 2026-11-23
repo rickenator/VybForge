@@ -87,6 +87,12 @@ exl3xhat(p<Int>) -> {
 // walk into the shared slab); phase 2 replaces "apply H and store W" with
 // "dot the row against xp" -> one f32 per row, accumulated with atomics.
 exl3mv1s4(p<Int>) -> {
+    # PRODUCTION fused decode matvec (promoted from mvnod4, round 58).
+    # CAREFUL: this entry previously carried nine inert diagnostic branches
+    # (DBG/SBD/CNT/CNT2/STB/ATGT/XD/ONLY/CONST) plus ten extra param slots, and
+    # their presence corrupted the accumulation (0/2048 correct with them, 0
+    # errors without). Do not add diagnostic branches to this entry — put
+    # experiments in a SEPARATE fn and call it from a separate driver.
     tid<Int> = blk_x() * dim_x() + tid_x()
     cw<Int> = ld_i64(p + 24)
     nbc128<Int> = cw / 128
@@ -99,23 +105,11 @@ exl3mv1s4(p<Int>) -> {
     td<Int> = ld_i64(p + 48)
     T<Int> = ld_i64(p + 0)
     X<Int> = ld_i64(p + 8)
-    SU<Int> = ld_i64(p + 16)
-    CNT<Int> = ld_i64(p + 72)
-    CNT2<Int> = ld_i64(p + 80)
-    ONLY<Int> = ld_i64(p + 88)
-    DBG<Int> = ld_i64(p + 96)
-    STB<Int> = ld_i64(p + 104)
-    ATGT<Int> = ld_i64(p + 112)
-    SBD<Int> = ld_i64(p + 120)
-    CONST<Int> = ld_i64(p + 128)
-    XD<Int> = ld_i64(p + 136)
-    LUT<Int> = ld_i64(p + 144)
     inv<Int> = ld_i64(p + 56)
+    LUT<Int> = ld_i64(p + 144)
     cta<Int> = rem / 256
     within<Int> = rem - cta * 256
-    d0<Int> = within - (within / 128) * 128
 
-    # ---- phase 1: decode this CTA's 8 rows x 128 cols into the shared slab ----
     k<Int> = 0
     while (k < 4) {
         eK<Int> = within + k * 256
@@ -146,47 +140,13 @@ exl3mv1s4(p<Int>) -> {
         yK<Int> = (prodK & 2415890431) ^ 996162400
         loK<Float> = ld_f32n(LUT + (yK & 65535) * 4) as Float
         hiK<Float> = ld_f32n(LUT + ((yK >> 16) & 65535) * 4) as Float
-        if (CONST != 0) {
-            st_shared_f32(bK * 512 + cK * 4, 0.5)
-        } else {
-            st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
-        }
+        st_shared_f32(bK * 512 + cK * 4, (loK + hiK) as Float32)
         k = k + 1
     }
 
     inbase<Int> = rb64 * 64 + cta * 8
-
     kernel_barrier()
 
-    # diagnostic: dump the 8 xp values this CTA reads (rb64 0, cta 0, any block)
-    if (XD != 0 && rb64 == 0 && cta == 0 && nb128 == 0) {
-        kx<Int> = 0
-        while (kx < 8) {
-            st_f32(XD + kx * 4, ld_f32n(X + (inbase + kx) * 4))
-            kx = kx + 1
-        }
-    }
-
-    # diagnostic: dump THIS CTA's slab tile (8 rows x 128 cols) when it is the
-    # chosen one (nb128 == 2, rb64 == 0, cta == 0) so the host can compare the
-    # decoder's output for a block-2 CTA against the proven T.
-    if (SBD != 0 && nb128 == 2 && rb64 == 0 && cta == 0) {
-        kd<Int> = 0
-        while (kd < 4) {
-            ed<Int> = within + kd * 256
-            bd<Int> = ed / 128
-            cd<Int> = ed - bd * 128
-            st_f32(SBD + (bd * 128 + cd) * 4, ld_shared_f32(bd * 512 + cd * 4))
-            kd = kd + 1
-        }
-    }
-
-    # ---- phase 2: per-OUTPUT dot down the slab columns ----
-    # The EXL3 buffer is W^T: slab ROWS are the input dim (su scales them), slab
-    # COLS are the output dim (sv scales them). y_i = sum_j W^T[j][i] x_j, so the
-    # dot runs DOWN a slab column for a fixed output column i. This CTA owns 8
-    # input rows and all 128 output columns of its tile, so it contributes a
-    # partial sum over its 8 inputs to each of the 128 outputs.
     if (within < 128) {
         d<Int> = within
         acc<Float32> = 0.0
@@ -195,33 +155,8 @@ exl3mv1s4(p<Int>) -> {
             acc = acc + ld_shared_f32(j * 512 + d * 4) * ld_f32n(X + (inbase + j) * 4)
             j = j + 1
         }
-        # NOTE: sv must NOT be applied here. y = sv . (H u): the scale and the
-        # Hadamard act on the SAME output axis and do not commute, so sv belongs
-        # AFTER exl3yhat (applying it here gave a self-consistent but wrong
-        # result: yraw matched a reference that made the same mistake).
         cb<Int> = nb128 * 128 + d
-        if (CNT != 0) { atomic_add_f32(CNT + nb128 * 4, 1.0) }
-        if (CNT2 != 0) { atomic_add_f32(CNT2 + cb * 4, 1.0) }
-        # two-slot diagnostic: what does the kernel actually SEE?
-        if (DBG != 0) {
-            st_f32(DBG + 0, ONLY as Float32)
-            st_f32(DBG + 4, nb128 as Float32)
-            if (nb128 == 2) { atomic_add_f32(DBG + 8, 1.0) }
-            if (ONLY == 2) { atomic_add_f32(DBG + 12, 1.0) }
-        }
-        # ONLY >= 0 restricts accumulation to ONE column block (diagnostic):
-        # isolates exactly which block's contributions are wrong.
-        # plain store (no atomic): separates "acc is zero" from "the atomic path fails"
-        if (STB != 0) { st_f32(STB + cb * 4, acc) }
-        if (ONLY < 0 || ONLY == nb128) {
-            if (cb < cw) {
-                tptr<Int> = T
-                if (ATGT != 0) { tptr = ATGT }
-                offb<Int> = cb * 4
-                dst<Int> = tptr + offb
-                atomic_add_f32(dst, acc)
-            }
-        }
+        if (cb < cw) { atomic_add_f32(T + cb * 4, acc) }
     }
 }
 

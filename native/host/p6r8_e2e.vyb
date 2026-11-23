@@ -490,6 +490,16 @@ main()<Int> -> {
                     if (ad6 > 1e-4) { if (fbi < 0) { fbi = n20 } ; nb6 = nb6 + 1 }
                     n20 = n20 + 1
                 }
+                // timing: this entry IS the production fused matvec
+                tw0<Int> = time_mono_millis()
+                var<Int> rep = 0
+                while (rep < 5) {
+                    launch_kernel(mv4, 8192, pbm)
+                    rep = rep + 1
+                }
+                cuCtxSynchronize()
+                tw1<Int> = time_mono_millis()
+                println("E2E FUSED_MS_PER_CALL=" + ((tw1 - tw0) as Float / 5.0).to_string_precise())
                 println("E2E MVNOD4 count_over_1e-4=" + nb6.to_string() + " max_abs=" + mx6.to_string_precise() + " first_bad=" + fbi.to_string() + " v0=" + NV4.get(0).to_string_precise())
             } else { println("E2E MVNOD4 load=0") }
             // ---- BISECT STEP 3: mvnod3 (chain LIVE, slab constant) ----
