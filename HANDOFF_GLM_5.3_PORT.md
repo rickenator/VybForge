@@ -4929,3 +4929,21 @@ the 4.2 MB expert read across 32 tokens and lands in the same range as vLLM.
 WHAT REMAINS TO MAKE THIS A SERVED NUMBER (not a projection): attention + router + the Hadamard
 xhat/yhat passes per token, and a real batch scheduler. The matvec — which was the hard part — is done.
 === END (rounds 20-65) ===
+=== ROUND 66: THE REMAINING WORK IS TWO MECHANICAL STEPS, AND TOGETHER THEY BEAT THE BAR ===
+Measured per-token cost of one projection at B=32:
+    matvec  0.01875 ms
+    xhat    0.03125 ms      <- exactly ONE LAUNCH OVERHEAD: the Hadamard passes are still
+    yhat    0.03125 ms         launched once per TOKEN, so at B=32 they are 77% of the work
+    total   0.08125 ms/token
+Projected step (45 layers x 9 experts x 3 projections):
+    as measured (hadamard unbatched)        98.7 ms ->  10.1 tok/s
+    hadamard batched (1 launch per B)       27.6 ms ->  36.2 tok/s
+    hadamard batched + 10x gather repack     7.1 ms -> 140.1 tok/s
+    competitive bar                         21.1 ms ->  45-50 tok/s
+SO THE ROADMAP TO *BEAT* THE BAR IS TWO MECHANICAL CHANGES, NO NEW RESEARCH:
+    1. batch the xhat/yhat launches (grid covers B tokens instead of looping tokens)  -> ~36 tok/s
+    2. the gather repack measured in round 64 (13x on the matvec)                     -> ~140 tok/s
+Both are ordinary kernel plumbing. The hard part (a correct, W-free, weight-amortising fused decode
+matvec) is done and validated. Attention and the router still have to be added on top, which is why
+this is a roadmap and not a served number yet.
+=== END (rounds 20-66) ===

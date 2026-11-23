@@ -263,6 +263,93 @@ main()<Int> -> {
             B = B * 2
         }
     }
+    // ---- per-token Hadamard passes: xhat + yhat for B tokens ----
+    if (fmb != 0) {
+        var<Int> B2 = 32
+        dxp<Int> = dev_alloc(nin * 4 * B2)
+        dyp<Int> = dev_alloc(cw * 8 * B2)
+        if (dxp != 0 && dyp != 0) {
+            cuMemcpyHtoD_v2(dxp, zero_bytes(nin * 4 * B2), nin * 4 * B2)
+            cuMemcpyHtoD_v2(dyp, zero_bytes(cw * 8 * B2), cw * 8 * B2)
+            # warm
+            wr_pdev(pbf, 0, dx)
+            wr_pdev(pbf, 8, xp)
+            wr_pdev(pbf, 16, hd_pre32)
+            wr_pdev(pbf, 24, arG)
+            wr_pdev(pbf, 32, nin)
+            launch_kernel(fxhat, nin / 128, pbf)
+            sync()
+            fxb<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
+            fyb<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
+            if (fxb != 0 && fyb != 0) {
+                # one launch for all B tokens
+                wr_pdev(pbf, 0, dxp)
+                wr_pdev(pbf, 8, dxp)
+                wr_pdev(pbf, 16, hd_pre32)
+                wr_pdev(pbf, 24, arG)
+                wr_pdev(pbf, 32, nin)
+                wr_pdev(pbf, 40, B2)
+                launch_kernel(fxb, B2 * (nin / 128), pbf)
+                sync()
+                q0<Int> = time_mono_millis()
+                var<Int> rq = 0
+                while (rq < 10) {
+                    launch_kernel(fxb, B2 * (nin / 128), pbf)
+                    rq = rq + 1
+                }
+                sync()
+                q1<Int> = time_mono_millis()
+                wr_pdev(pbf, 0, dxp)
+                wr_pdev(pbf, 8, dyp)
+                wr_pdev(pbf, 16, hd_pre32)
+                wr_pdev(pbf, 24, cw)
+                wr_pdev(pbf, 32, arH)
+                wr_pdev(pbf, 40, B2)
+                launch_kernel(fyb, B2 * (cw / 128), pbf)
+                sync()
+                q2<Int> = time_mono_millis()
+                rq = 0
+                while (rq < 10) {
+                    launch_kernel(fyb, B2 * (cw / 128), pbf)
+                    rq = rq + 1
+                }
+                sync()
+                q3<Int> = time_mono_millis()
+                xhb<Float> = (((q1 - q0) as Float) / 10.0) / (B2 as Float)
+                yhb<Float> = (((q3 - q2) as Float) / 10.0) / (B2 as Float)
+                println("P6R10 TOKEN_PASSES_BATCHED xhat_ms_per_token=" + xhb.to_string_precise() + " yhat_ms_per_token=" + yhb.to_string_precise())
+            }
+            p0<Int> = time_mono_millis()
+            var<Int> bb = 0
+            while (bb < B2) {
+                wr_pdev(pbf, 0, dx)
+                wr_pdev(pbf, 8, xp)
+                wr_pdev(pbf, 16, hd_pre32)
+                wr_pdev(pbf, 24, arG)
+                wr_pdev(pbf, 32, nin)
+                launch_kernel(fxhat, nin / 128, pbf)
+                bb = bb + 1
+            }
+            sync()
+            p1<Int> = time_mono_millis()
+            p2t<Int> = time_mono_millis()
+            bb = 0
+            while (bb < B2) {
+                wr_pdev(pbf, 0, yr)
+                wr_pdev(pbf, 8, dyp)
+                wr_pdev(pbf, 16, hd_pre32)
+                wr_pdev(pbf, 24, cw)
+                wr_pdev(pbf, 32, arH)
+                launch_kernel(fvh, cw / 128, pbf)
+                bb = bb + 1
+            }
+            sync()
+            p3t<Int> = time_mono_millis()
+            xh<Float> = ((p1 - p0) as Float) / (B2 as Float)
+            yh<Float> = ((p3t - p2t) as Float) / (B2 as Float)
+            println("P6R10 TOKEN_PASSES xhat_ms_per_token=" + xh.to_string_precise() + " yhat_ms_per_token=" + yh.to_string_precise())
+        }
+    }
     // ---- compare ----
     fv<Vec<Float>> = bulk_dtoh(dy, cw)
     var<Int> nbad = 0

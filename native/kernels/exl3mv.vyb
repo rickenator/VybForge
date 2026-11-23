@@ -672,3 +672,65 @@ mvnodB(p<Int>) -> {
         }
     }
 }
+
+// ============================================================================
+// xhatB / yhatB — BATCHED Hadamard passes. The single-token versions are one
+// launch PER TOKEN, which measured as pure launch overhead (0.03125 ms each =
+// 77% of per-token work at B=32). These cover all B tokens in ONE launch: the
+// grid is B * (blocks per token).
+// xhatB p: +0 x(f32 [B][nin]), +8 out(f32 [B][nin]), +16 H, +24 su(f16),
+//          +32 nin, +40 B
+// ============================================================================
+xhatB(p<Int>) -> {
+    x<Int> = ld_i64(p + 0)
+    o<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    SV<Int> = ld_i64(p + 24)
+    nin<Int> = ld_i64(p + 32)
+    B<Int> = ld_i64(p + 40)
+    nbpt<Int> = nin / 128
+    gid<Int> = blk_x()
+    tok<Int> = gid / nbpt
+    blk<Int> = gid - tok * nbpt
+    d<Int> = tid_x()
+    base<Int> = blk * 128
+    if (tok < B && base < nin && d < 128) {
+        xo<Int> = x + tok * nin * 4
+        oo<Int> = o + tok * nin * 4
+        acc<Float32> = 0.0
+        j<Int> = 0
+        while (j < 128) {
+            suj<Float32> = ld_f16(SV + (base + j) * 2) as Float32
+            acc = acc + ld_f32n(H + (d * 128 + j) * 4) * ld_f32n(xo + (base + j) * 4) * suj
+            j = j + 1
+        }
+        st_f32(oo + (base + d) * 4, acc)
+    }
+}
+
+// yhatB p: +0 yraw(f32 [B][cw]), +8 y(f64 [B][cw]), +16 H, +24 cw,
+//          +32 sv(f16), +40 B
+yhatB(p<Int>) -> {
+    YR<Int> = ld_i64(p + 0)
+    Y<Int> = ld_i64(p + 8)
+    H<Int> = ld_i64(p + 16)
+    cw<Int> = ld_i64(p + 24)
+    SV<Int> = ld_i64(p + 32)
+    B<Int> = ld_i64(p + 40)
+    nbpt<Int> = cw / 128
+    gid<Int> = blk_x()
+    tok<Int> = gid / nbpt
+    blk<Int> = gid - tok * nbpt
+    a<Int> = tid_x()
+    base<Int> = blk * 128
+    if (tok < B && base < cw && a < 128) {
+        acc<Float32> = 0.0
+        b<Int> = 0
+        while (b < 128) {
+            acc = acc + ld_f32n(H + (a * 128 + b) * 4) * ld_f32n(YR + tok * cw * 4 + (base + b) * 4)
+            b = b + 1
+        }
+        svy<Float32> = ld_f16(SV + (base + a) * 2) as Float32
+        st_f64(Y + (tok * cw + base + a) * 8, acc * svy)
+    }
+}
