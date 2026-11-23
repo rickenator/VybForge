@@ -3062,6 +3062,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     nopen<Int> = 0
     acc_deq<Int> = 0
     acc_mm<Int> = 0
+    acc_mmG<Int> = 0
+    acc_mmU<Int> = 0
+    acc_mmD<Int> = 0
     acc_host<Int> = 0
     tA<Int> = 0
     tt0<Int> = 0
@@ -3535,7 +3538,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         launch_kernel(fxb, nt * (H / 128), pb32)
                         sync()
                         # DETERMINISTIC fused gate: per-split partials + fixed-order reduce
+                        tSG<Int> = time_mono_millis()
                         mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQ, mapdev, invbase, dLUT, nt, H, pb32, pP)
+                        acc_mmG = acc_mmG + (time_mono_millis() - tSG)
                         # yhatB: +0 YR, +8 Y, +16 H, +24 cw, +32 SV, +40 B
                         wr_pdev(pb32, 0, dyr)
                         wr_pdev(pb32, 8, dyp)
@@ -3639,7 +3644,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                             wr_pdev(pb32, 40, nt)
                             launch_kernel(fxb, nt * (H / 128), pb32)
                             sync()
+                            tSU<Int> = time_mono_millis()
                             mvn_run(fmbDet, fmbRed, fmb, (H / 64) * (EINTER / 128) * 8, dyr, dxh, EINTER, dQu, mapdev, invbase, dLUT, nt, H, pb32, pP)
+                            acc_mmU = acc_mmU + (time_mono_millis() - tSU)
                             wr_pdev(pb32, 0, dyr)
                             wr_pdev(pb32, 8, dyp)
                             wr_pdev(pb32, 16, hdg32)
@@ -3733,7 +3740,9 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                         wr_pdev(pb32, 40, nt)
                         launch_kernel(fxb, nt * (EINTER / 128), pb32)
                         sync()
+                        tSD<Int> = time_mono_millis()
                         mvn_run(fmbDet, fmbRed, fmb, (EINTER / 64) * (H / 128) * 8, dYr, dXh, H, dQD, mapdev, invbase, dLUTD, nt, EINTER, pb32, pP)
+                        acc_mmD = acc_mmD + (time_mono_millis() - tSD)
                         wr_pdev(pb32, 0, dYr)
                         wr_pdev(pb32, 8, dYp)
                         wr_pdev(pb32, 16, hdg32)
@@ -3795,7 +3804,8 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
     println("routed experts used: " + nex.to_string())
     println("T_RSLV nopen=" + nopen.to_string() + " scan=" + acc_scan.to_string() + " open=" + acc_open.to_string() +
             " lookup=" + (acc_res - acc_scan - acc_open).to_string())
-    println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string())
+    println("T_MOE layer resolve=" + acc_res.to_string() + " deq=" + acc_deq.to_string() + " mm=" + acc_mm.to_string() + " host=" + acc_host.to_string() +
+            " | mmG=" + acc_mmG.to_string() + " mmU=" + acc_mmU.to_string() + " mmD=" + acc_mmD.to_string())
     freedom {
     }
 
