@@ -4696,3 +4696,19 @@ NEXT SESSION: launch the FULL grid but with a TRIVIAL phase 1 (slab := constant)
 the sum of constants over 512 CTAs equals 512*constant for block 2 — that isolates the multi-CTA
 accumulation from the decode entirely.
 === SESSION CLOSED (rounds 20-50) ===
+=== ROUND 51: CONSTANT SLAB -> EVERY OUTPUT IS ~0 INSTEAD OF 0.6 (and the slab is still exact) ===
+Constant-slab run (slab := 0.5 for every CTA, full grid, all blocks):
+    expected 0.5*sum(xp) = 0.601973
+    kernel v0 = v256 = 1.356e-19      (i.e. zero everywhere, 2048/2048 "wrong")
+and in the SAME run the slab dump again matches the proven T bit for bit (SLAB_DIFF = 0).
+So with a CONSTANT slab and the same xp buffer the host sums to 0.6, the kernel sums to ~0 — for
+EVERY output, not just block 2. Identical inputs, identical indices, different sums: the dot loop
+itself (phase 2's `acc = acc + ld_shared_f32(j*512 + d*4) * ld_f32n(X + (inbase+j)*4)`) does not
+compute what it reads, which now points squarely at CODEGEN of that loop rather than at any data.
+That also explains every earlier anomaly in one stroke: it never depended on the block index.
+NEXT SESSION (small, compiler-side): compile a MINIMAL kernel that does exactly this loop over a
+constant slab and prints acc for a few threads, and compare against a hand-computed value. If the
+loop is miscompiled, fix the codegen (or rewrite the loop in a form that compiles correctly, e.g.
+hoisting the shared pointer, or using ld_shared_f32 with a precomputed byte offset) — and the whole
+fused path should fall into place.
+=== END (rounds 20-51) ===
