@@ -5675,3 +5675,23 @@ layers.3 kv_a_proj_with_mqa; the three standing micro-tests (p6r14_tiny / p6r16_
 verify-each-stage-on-device; the blame order (artifact present -> argument types -> readback width ->
 compiler last); time_mono_millis's 1 ms quantisation; ILP being non-universal (bfgemm8 1.67x faster,
 mvnodB4 2.6x slower); and plain-store timing variants.
+=== ROUND 105: THE 30-MINUTE RUN PRODUCED NO FGATE -- the driver never reached tail_site ===
+P6_FUSED_GATE=1 ~/vyb glm_decode_chain.vyb on lefty ran the full 1800 s cap and was killed still inside
+the shard/index walk: the only output was a stream of
+    G9PROBE found=1 off=1269539xx nbytes=256 pathlen=156 path=.../model-000NN-of-00083.safetensors
+with offsets that DECREASE monotonically (126953992 -> 126953680 -> 126953368 -> ... -> 126951344)
+across many shards. That is the per-layer index walk (glm_decode_chain:2244), not MoE work, and it never
+finished. NO FGATE LINE WAS EVER PRINTED, so the in-engine verification remains UNOBSERVED.
+This is a DRIVER-SIDE cost, not a problem with the fused-gate block: the block sits inside tail_site,
+which runs long after all resolving. The handoff already lists this area as pre-existing trouble
+("gx/gxload segfault at shard walk", "decchain monolith stale vs the engine split").
+STATE OF THE WIRING (unchanged and safe): the P6_FUSED_GATE block is committed, compiles clean, is
+skipped entirely unless the env var is set, and the deq path stays authoritative. The numerical equality
+it would report is ALREADY established independently by p6r10 NT4 (xhatB -> mvnodB -> yhatB vs
+deq32f + mm_host32, all 8192 outputs, max_abs 1.01e-06).
+TO ACTUALLY OBSERVE FGATE, one of these is needed first:
+  a. a driver that reaches tail_site without the 45-layer index walk -- a single-layer or single-expert
+     path (glm_prefill may be lighter; untested), or a P6_FUSED_ONCE guard plus an early exit
+  b. fixing the index walk itself: `native/out/gx_tabs.cache` already exists as a per-layer tab cache,
+     but this driver appears to rebuild the tab rather than load the cache
+PRIORITY NOTE: (b) is worth doing for its own sake -- every full-chain run pays this cost.
