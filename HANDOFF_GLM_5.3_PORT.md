@@ -5194,3 +5194,22 @@ STEP 0 (must do first, small): upload a known BF16 tensor and prove ONE value ro
 0xBC30 -> -0.0107422 -- through the same upload path the EXL3 trellis uses (which is bit-exact).
 Only then build q_a / kv_a / q_b / kv_b / o_proj on bfgemm_p.
 === END (rounds 20-80) ===
+=== ROUND 81: STEP 0 FAILS — A KNOWN BF16 WORD DOES NOT SURVIVE THE UPLOAD ===
+Minimal possible test (native/kernels/tobg.vyb: nothing but ld_bf16 + st_f32, params via ld_i64;
+native/host/p6r13_step0.vyb: ONE gx_read, upload, convert 8 elements):
+    S0 found=1 bytes=4194304
+    S0 host bytes: 48,188,98,60          <- 0xBC30 little-endian, provably the on-disk word
+    S0 device values: 7.806e-18 -1.282e-23 7.858e-24 -5.170e-26
+    S0_FAIL expected -0.0107421875
+Uploading straight from the String (rather than a substring) changes nothing, so substring was not it.
+EVERY value is denormal, i.e. the device is reading words whose exponent field is ~0 while the host
+holds real bytes. So the String->device transfer is putting different bytes on the device than the
+String contains -- and this is the SAME operation the EXL3 trellis path performs successfully
+(cuMemcpyHtoD_v2(arA, g0, g0.len()) gives bit-exact decode results), which means the difference lies
+in something I have not identified about how that path uploads.
+CONSEQUENCE: the batched MLA attention build CANNOT START until one known value round-trips. This is
+now the single blocking item for that workstream, and it is a TOOLING question, not a model or kernel
+question. Next session should read gx_read's implementation and the trellis upload call directly
+(does gx_read return raw bytes, or does the trellis path use a different transfer helper?) rather than
+continuing to infer from behaviour.
+=== END (rounds 20-81) — STOPPING HERE ===

@@ -53,7 +53,10 @@ main()<Int> -> {
     if (dS == 0 || dD == 0 || pb == 0) { println("S0_FAIL alloc"); return 4 }
     # upload straight from the String gx_read returned (the way the working
     # trellis path does); a substring() copy was the source of corrupted bytes
-    cuMemcpyHtoD_v2(dS, g0, 16)
+    # CAPTURE the return code: silent failures here are exactly what a
+    # never-written destination looks like
+    rc<Int> = cuMemcpyHtoD_v2(dS, g0, 16) as Int
+    println("S0 htod rc=" + rc.to_string())
     sync()
     wr_pdev(pb, 0, dS)
     wr_pdev(pb, 8, dD)
