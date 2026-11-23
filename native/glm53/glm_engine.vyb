@@ -3602,7 +3602,93 @@ tail_site(streams1<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>,
                 act.push(silu(g1) * u1)
                 j = j + 1
             }
-            yv<Vec<Float>> = mm_host32(act, nt, EINTER, dWd, H, fcast32, fgp, fgr, pb32)
+            var<Vec<Float>> yv = mm_host32(act, nt, EINTER, dWd, H, fcast32, fgp, fgr, pb32)
+
+            # ---- DOWN PROJECTION: reversed shape (nin=EINTER, cw=H) ----
+            # Same fused chain, its own buffers and its own trellis (g_ge_6/7/8).
+            fgateD<String> = env_get("P6_FUSED_GATE") else "0"
+            if (fgateD == "1" && nt > 0) {
+                fxbD<Int> = load_fn("native/build/exl3mv.ptx", "xhatB")
+                fybD<Int> = load_fn("native/build/exl3mv.ptx", "yhatB")
+                fmbD<Int> = load_fn("native/build/exl3mv.ptx", "mvnodB")
+                fltD<Int> = load_fn("native/build/exl3mv.ptx", "f16lut")
+                if (fxbD != 0 && fybD != 0 && fmbD != 0 && fltD != 0) {
+                    dLUTD<Int> = dev_alloc(262144)
+                    dQD<Int> = dev_alloc(g_ge_6.len())
+                    dsuD<Int> = dev_alloc(g_ge_7.len())
+                    dsvD<Int> = dev_alloc(g_ge_8.len())
+                    dX64<Int> = dev_alloc(nt * EINTER * 8)
+                    dXf<Int> = dev_alloc(nt * EINTER * 4)
+                    dXh<Int> = dev_alloc(nt * EINTER * 4)
+                    dYr<Int> = dev_alloc(nt * H * 4)
+                    dYp<Int> = dev_alloc(nt * H * 8)
+                    if (dLUTD != 0 && dQD != 0 && dsuD != 0 && dsvD != 0 && dX64 != 0 && dXf != 0 && dXh != 0 && dYr != 0 && dYp != 0) {
+                        wr_pdev(pb32, 0, dLUTD)
+                        launch_kernel(fltD, 256, pb32)
+                        sync()
+                        cuMemcpyHtoD_v2(dQD, g_ge_6, g_ge_6.len())
+                        cuMemcpyHtoD_v2(dsuD, g_ge_7, g_ge_7.len())
+                        cuMemcpyHtoD_v2(dsvD, g_ge_8, g_ge_8.len())
+                        bulk_htod(dX64, view(act))
+                        wr_pdev(pb32, 0, dX64)
+                        wr_pdev(pb32, 8, dXf)
+                        wr_pdev(pb32, 16, nt * EINTER)
+                        launch_kernel(fcast32, (nt * EINTER + 255) / 256, pb32)
+                        sync()
+                        wr_pdev(pb32, 0, dXf)
+                        wr_pdev(pb32, 8, dXh)
+                        wr_pdev(pb32, 16, hdg32)
+                        wr_pdev(pb32, 24, dsuD)
+                        wr_pdev(pb32, 32, EINTER)
+                        wr_pdev(pb32, 40, nt)
+                        launch_kernel(fxbD, nt * (EINTER / 128), pb32)
+                        sync()
+                        var<Int> zwd = 0
+                        while (zwd < nt * H * 4) { wr_pdev(dYr, zwd, 0) ; zwd = zwd + 8 }
+                        wr_pdev(pb32, 0, dYr)
+                        wr_pdev(pb32, 8, dXh)
+                        wr_pdev(pb32, 24, H)
+                        wr_pdev(pb32, 40, dQD)
+                        wr_pdev(pb32, 48, mapdev)
+                        wr_pdev(pb32, 56, invbase)
+                        wr_pdev(pb32, 144, dLUTD)
+                        wr_pdev(pb32, 168, nt)
+                        wr_pdev(pb32, 176, EINTER)
+                        launch_kernel(fmbD, (EINTER / 64) * (H / 128) * 8, pb32)
+                        sync()
+                        wr_pdev(pb32, 0, dYr)
+                        wr_pdev(pb32, 8, dYp)
+                        wr_pdev(pb32, 16, hdg32)
+                        wr_pdev(pb32, 24, H)
+                        wr_pdev(pb32, 32, dsvD)
+                        wr_pdev(pb32, 40, nt)
+                        launch_kernel(fybD, nt * (H / 128), pb32)
+                        sync()
+                        FD<Vec<Float>> = bulk_dtoh(dYp, nt * H)
+                        var<Int> nbd = 0
+                        var<Float> mxd = 0.0
+                        var<Int> zzd = 0
+                        while (zzd < nt * H) {
+                            dvd<Float> = FD.get(zzd) - yv.get(zzd)
+                            if (dvd < 0.0) { dvd = 0.0 - dvd }
+                            if (dvd > 1e-4) { nbd = nbd + 1 }
+                            if (dvd > mxd) { mxd = dvd }
+                            zzd = zzd + 1
+                        }
+                        println("FGATEDN expert=" + e.to_string() + " nt=" + nt.to_string() + " count_over_1e-4=" + nbd.to_string() + " max_abs=" + mxd.to_string_precise() + " of " + (nt * H).to_string())
+                        if (nbd == 0) { yv = FD }
+                    }
+                    free_dev(dLUTD)
+                    free_dev(dQD)
+                    free_dev(dsuD)
+                    free_dev(dsvD)
+                    free_dev(dX64)
+                    free_dev(dXf)
+                    free_dev(dXh)
+                    free_dev(dYr)
+                    free_dev(dYp)
+                }
+            }
             acc_mm = acc_mm + (time_mono_millis() - tA)
             # scatter w*y back
             j = 0

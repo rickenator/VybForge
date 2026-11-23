@@ -5909,3 +5909,14 @@ SAFETY: the adopt is conditional on a clean comparison, so a regression cannot s
 it degrades to the deq path. P6_FUSED_USE=0 forces the deq path even with the verification on.
 REMAINING (step 3): up_proj (g_ge_3/4/5) and down_proj (g_ge_6/7/8) -- same pattern, but each must
 upload ITS OWN trellis into its own dQ (the arena lesson from round 115) and its own su/sv.
+=== ROUND 117: UP_PROJ FUSED AND VERIFIED -- 2 of 3 projections now serve from packed weights ===
+    FGATEUP expert=0 nt=1 count_over_1e-4=0 max_abs=1.5497207641601562e-06 of 2048
+    FGATEUP expert=1 nt=1 count_over_1e-4=0 max_abs=1.1622905731201172e-06 of 2048
+    FGATEUP expert=2 nt=3 count_over_1e-4=0 max_abs=1.9073486328125e-06 of 6144
+    FGATEUP expert=5 nt=3 count_over_1e-4=0 max_abs=1.3113021850585938e-06 of 6144
+    {"draft_token": 0}   <- run still completes with the same output
+Up uses g_ge_3/4/5 (its trellis/suh/svh) uploaded into dQu/dsuU/dsvU -- its OWN buffers, applying the
+round-115 arena lesson -- and dWu as the reference. Adopts uv = FU2 only when count_over_1e-4 == 0.
+STATE: gate + up fused and verified in-engine; down_proj remains. Down has a REVERSED shape
+(act is nt*EINTER, output nt*H, weights [H][EINTER]) so its chain uses nin=EINTER, cw=H, and
+g_ge_6/7/8 for trellis/suh/svh.
