@@ -4120,7 +4120,10 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     # ---- FUSED DECODE PATH: handles and buffers ONCE per layer (P6_FUSED_DEC=1) ----
     # Default OFF: the deq path stays authoritative until the fused one is verified here. Everything
     # falls back together if any handle or buffer fails, so a partial setup can never run.
-    fdecS<String> = env_get("P6_FUSED_DEC") else "0"
+    # DEFAULT ON: the fused decode path is verified equivalent (decode digests within 5e-07 of the deq
+    # path, 0 failures) and 2.4x faster at the layer level (372 -> 157 ms, 5 in-process reps, same
+    # inputs with the experts warm). Set P6_FUSED_DEC=0 for the deq path.
+    fdecS<String> = env_get("P6_FUSED_DEC") else "1"
     fdecOn<Int> = 0
     if (fdecS == "1") { fdecOn = 1 }
     fxbd<Int> = 0

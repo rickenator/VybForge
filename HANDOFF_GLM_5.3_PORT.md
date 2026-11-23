@@ -6587,3 +6587,20 @@ against fused 0.55 ms, a 9.2x on the term that dominates the decode layer. The s
 the layer-level gain (see round 146: within-run instability from page-cache pressure), so the layer
 number stays unclaimed until a probe measures the whole fused decode layer.
 NEXT: run the decode bench with the flag on and off (warm steps only), then decide the default.
+=== ROUND 149: FUSED DECODE IS THE DEFAULT -- 2.4x at the layer level, DETERMINISTIC, PASS 4 ADDED ===
+STEP 2 (the layer-level number) came from a new in-process repeat: VYBFORGE_BENCH_LAYER=N re-runs the
+SAME layer's moe_tail_step call N times on identical inputs, so the experts stay resident and the
+per-step page-cache drift (round 146) cannot contaminate it. 5 reps each, NLAY=6:
+    P6_FUSED_DEC=0 : layer 4 = 372 ms   layer 5 = 371 ms   (deq path)
+    P6_FUSED_DEC=1 : layer 4 = 157 ms   layer 5 = 145 ms   (fused)
+    -> 2.4x - 2.6x on the decode MoE layer.
+STEP 1 (flip + gate): P6_FUSED_DEC now defaults to 1. Set 0 for the deq path.
+    The decode path is DETERMINISTIC: two runs, 18 decode digest lines, BIT-IDENTICAL.
+    Baseline recorded: native/baselines/digest_decode6.txt
+GAP CLOSED -- the sweep could not have caught this: passes 1-3 all measure the PREFILL, and the decode
+path is a different function (moe_tail_step). A decode regression would have shipped with every pass
+green. scripts/regression_sweep.sh now has PASS 4: it re-runs NLAY=6 and diffs the decode digests
+(`l<s>s<n>` lines) against the baseline, bit-identical, with the same REBASELINE escape hatch.
+CAVEAT ON THE 2.4x: BENCH_LAYER repeats one layer with its experts already resident, so it measures the
+COMPUTE difference cleanly; a real step also re-reads evicted weights, so end-to-end gain will be
+smaller than 2.4x. Do not quote 2.4x as a tok/s number.

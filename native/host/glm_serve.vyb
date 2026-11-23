@@ -1935,10 +1935,32 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     streams2 = hc_apply(streams1, mlp, post2, comb2)
                                 } else {
                                     # ---- MoE tail (tail_site's body, sv_R = 1)
+                                    # VYBFORGE_BENCH_LAYER=N repeats THIS layer's MoE call N times on the
+                                    # same inputs. That is the only honest way to time a decode layer:
+                                    # across steps the footprint grows and evicts weight pages, so
+                                    # SEC mlpmoe swings 35 -> 950 ms (round 146). Repeating one layer
+                                    # keeps its experts resident, so the per-rep figure is the warm cost.
+                                    bN<Int> = 1
+                                    bNs<String> = env_get("VYBFORGE_BENCH_LAYER") else "0"
+                                    if (bNs.to_int() > 1) { bN = bNs.to_int() }
+                                    bT0<Int> = time_mono_millis()
                                     streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                              fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                              arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
                                                              fcast32, fgp, fgr, pb32)
+                                    if (bN > 1) {
+                                        var<Int> bRep = 1
+                                        while (bRep < bN) {
+                                            streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
+                                                                     fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
+                                                                     arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
+                                                                     fcast32, fgp, fgr, pb32)
+                                            bRep = bRep + 1
+                                        }
+                                    }
+                                    bT1<Int> = time_mono_millis()
+                                    println("BENCH_LAYER layer=" + n.to_string() + " reps=" + bN.to_string() +
+                                            " per_ms=" + ((bT1 - bT0) / bN).to_string())
                                 }
                             }
 

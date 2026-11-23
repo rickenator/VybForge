@@ -114,6 +114,35 @@ else
   say "pass 3: SKIPPED (needs NLAY=45 and the recorded deq logits)"
 fi
 
+# ---------------------------------------------------------------- pass 4: decode-path digests
+# The other three passes all measure the PREFILL. The decode path is a different function
+# (moe_tail_step) and would regress with every other pass still green, so it needs its own check.
+# The fused decode path is deterministic, so this is a bit-identical comparison.
+BASE_DEC=native/baselines/digest_decode6.txt
+if [ -f "$BASE_DEC" ]; then
+  say "pass 4: decode-path digests vs baseline"
+  rm -f /tmp/sweep_dec.txt
+  OUT=/tmp/sweep_dec.txt NLAY=6 FG=1 REQS=1 NSTEPS=1 PORT=$((PORT+3)) \
+    bash "$run_fgate" >/dev/null 2>&1
+  grep -E "^l[0-9]+s[0-9]+" /tmp/sweep_dec.txt | sort > /tmp/sweep_dec_d.txt
+  n=$(wc -l < /tmp/sweep_dec_d.txt)
+  echo "decode digest lines: $n"
+  if [ "$n" = "0" ]; then
+    echo "FAIL: no decode digests produced"; FAILED=1
+  elif diff -q "$BASE_DEC" /tmp/sweep_dec_d.txt >/dev/null 2>&1; then
+    echo "PASS: decode digests bit-identical"
+  elif [ "$REBASELINE" = "1" ]; then
+    cp /tmp/sweep_dec_d.txt "$BASE_DEC"
+    echo "REBASELINED: $BASE_DEC"
+  else
+    echo "DIFFERS from the decode baseline:"
+    diff "$BASE_DEC" /tmp/sweep_dec_d.txt | head -4
+    FAILED=1
+  fi
+else
+  say "pass 4: SKIPPED (no $BASE_DEC recorded)"
+fi
+
 # ---------------------------------------------------------------- verdict
 say "VERDICT"
 if [ "$FAILED" = "0" ]; then
