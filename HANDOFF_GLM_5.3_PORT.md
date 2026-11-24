@@ -6809,3 +6809,22 @@ WHAT IS STILL OPEN (unchanged by this attempt):
     3. Absolute tok/s still unmeasured.
 NEXT ATTEMPT should: verify deq_bf16_into standalone in a probe (p6r-style, one tensor, compare against
 deq_bf16) BEFORE wiring it into the layer loop -- the same rule as every other win this session.
+=== ROUND 160: THE DSA STAIRCASE IS DEPTH-DEPENDENT, NOT ACCUMULATION -- HYPOTHESIS REFUTED ===
+Same layer, three depths (zero code change; scripts/dsa_scale.sh + dsa_scale_report.py):
+    NLAY=12 :  989, 986, 982                                  -> FLAT ~985 ms
+    NLAY=24 :  994, 984, 991, 984, 992, 991                   -> FLAT ~990 ms
+    NLAY=45 : 1936, 1963, 1082, 1988, 2003, 2075, 2981, 4035, 4966, 4963, 4061
+TWO CONCLUSIONS:
+1) SIMPLE ACCUMULATION IS REFUTED. If each DSA layer accumulated state, the 24-layer run would show the
+   same growth as the 45-layer one. It is perfectly flat to 24 layers. The round-159 hypothesis (caching
+   deq_bf16's outputs accumulating ~9.6 GB) is WITHDRAWN -- it does not explain a flat 24 and a climbing 45.
+2) THE COST DEPENDS ON THE TOTAL DEPTH. Layer n=3 costs 989 ms in a 24-layer run and 1936 ms in a
+   45-layer run -- the SAME layer, same work, twice the time. So the variable is the run's overall
+   footprint (state sized for nlay), not anything about that layer's position or history.
+IMPLICATION: this is a memory-footprint / pressure effect, most likely the unified-memory allocator or
+page-cache contention as the process touches more of a 175.6 GB checkpoint in a 121 GB machine. It is
+NOT a per-layer algorithmic defect, and it means the 45-layer decode step we have been profiling has a
+large environment-dependent component that a shorter run does not show.
+NEXT (cheap, no code): run NLAY=45 with the DSA output-cache DISABLED (deq_bf16 per call, no cache) and
+compare the n=3 cost. If uncached n=3 is also ~1900 ms, the cache is irrelevant to the depth effect and
+the footprint is the whole story; if it is ~990 ms, the cache itself is what inflates the footprint.
