@@ -7038,3 +7038,26 @@ it is a hitch that lands on whichever large GPU operation triggers it. The stall
 i.e. not warmed. Extended the list with the exact sizes (268/384/402/768/1536 MB); run in flight.
 LESSON (generalises): when a cost is ~900 ms regardless of which stage reports it, suspect the memory
 subsystem and test by pre-touching size classes -- do not chase the stage that happens to report it.
+=== ROUND 171: RESIDUAL HITCH IS DRIVER-INTERNAL -- HOST KERNEL EXONERATED BY MEASUREMENT ===
+Sampled /proc/vmstat before and after a full NLAY=12 run. EVERY counter that would indicate host memory
+pressure is IDENTICAL:
+    pswpin       49294626 -> 49294626   (no swap-in)
+    pswpout      59994083 -> 59994083   (no swap-out)
+    pgmajfault     31095966 -> 31095966  (no major faults)
+    pgsteal       508183097 -> 508183097 (no reclaim)
+    nr_free_pages   9962018 -> 7801127   (8.6 GB consumed -- normal allocation, no pressure)
+So swap, page reclaim and faulting are all ruled out. The ~900 ms hitch lives entirely inside the GPU
+driver. Consistent with that, the free stage itself always measures 0 ms while the NEXT operation after a
+large device free pays ~900 ms -- i.e. the cost is teardown/completion of the mapping, not the call.
+WHERE THINGS STAND AFTER ROUNDS 168-171:
+  * DSA attention itself: FIXED. ~950 ms -> ~45 ms per layer (58/43/41 and 58/40/41 across runs), 20x.
+  * Residual: a ~900 ms driver-internal event that lands on the next large operation, 1-4 times per run
+    at NLAY=12, apparently ~1 per layer at NLAY=45. It is NOT compute, NOT the attention code, NOT the
+    host kernel, NOT allocation size (134 MB and 268 MB both cost ~901 ms).
+REMAINING FIX: eliminate large device alloc/free churn in the hot loop so the driver never has mappings
+to tear down mid-step. That is the arena/pool refactor: one device arena per attention layer,
+sub-allocate every deq_bf16 output from it, drop the ~12 free_dev calls on those buffers, free the arena
+once at the end. This is the only remaining lever, and it is now justified by mechanism rather than guess.
+CHEAPER DIAGNOSTIC IF IT IS TRIED AGAIN: leak q in deq_bf16 for one diagnostic run (do NOT free) and see
+whether the hitch count changes. If frees are the trigger, hitches vanish; if allocations are, they stay.
+Budget the risk: leaking every q at NLAY=12 could reach tens of GB on a 121 GB unified box -- run at NLAY=4.
