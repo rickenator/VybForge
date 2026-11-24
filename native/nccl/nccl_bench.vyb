@@ -1,0 +1,189 @@
+// nccl_bench.vyb -- measure what the TP=2 vs expert-parallel decision actually costs.
+//
+// The question is not "which scheme sounds better" but "which one fits the budget". At 20-22 ms/token
+// across 45 layers, each layer has ~440 us total. So the decisive quantities are:
+//   * all-reduce LATENCY at the message sizes a tensor-parallel layer would actually exchange
+//     (hidden=4096 f64 = 32 KB per token; R=20 tokens -> 640 KB), not peak bandwidth at 64 MB
+//   * all-to-all LATENCY at the sizes expert-parallel token routing would need
+// A scheme that needs two 100 us collectives per layer costs 9 ms/token and cannot reach the bar, no
+// matter how good the kernels are. Measure first.
+//
+// Clock: clock_gettime(CLOCK_MONOTONIC) via libc, because /proc/uptime's centisecond resolution
+// quantised a 10 ms reduce to 0 in the ping test. The timespec buffer is a Vec<Int>, whose data pointer
+// is obtained with addr()/at() -- the pattern tensor::bulk_dtoh uses, and the only one proven to work
+// (passing a String to an FFI output param writes into a copy).
+//
+//   lefty :  RANK=0 WORLD=2 PORT=18420 ...
+//   righty:  RANK=1 WORLD=2 PEER_IP=192.168.192.1 PORT=18420 ...
+import io
+import env
+import time
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
+
+share(all)
+clock_gettime(clk<CInt>, tp<loc<CVoid>>)<CInt>
+
+share(all)
+ncclGetUniqueId(uid<String>)<CInt>
+
+share(all)
+ncclCommInitRank(comm<loc<Int>>, nranks<Int>, uid<loc<CVoid>>, rank<Int>)<CInt>
+
+share(all)
+ncclCommCount(comm<Int>, count<loc<Int>>)<CInt>
+
+share(all)
+ncclAllReduce(sendbuff<Int>, recvbuff<Int>, count<Int>, datatype<CInt>, op<CInt>, comm<Int>, stream<Int>)<CInt>
+
+share(all)
+ncclCommDestroy(comm<Int>)<CInt>
+
+share(all)
+nccl_sum()<CInt> -> { return 0 }
+
+share(all)
+nccl_f64()<CInt> -> { return 8 }
+
+# Monotonic nanoseconds. The timespec (two int64) lives in a Vec<Int> we can address.
+clock_ns()<Int> -> {
+    ts<Vec<Int>> = Vec()
+    ts.push(0)
+    ts.push(0)
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(ts))
+        dp<Int> = at(hdr)
+        if (dp != 0) { clock_gettime(1, from<loc<CVoid>>(dp)) }
+    }
+    return ts.get(0) * 1000000000 + ts.get(1)
+}
+
+blanks(n<Int>)<String> -> {
+    s<String> = "0123456789"
+    while (s.len() < n) { s = s + s }
+    return s.substring(0, n)
+}
+
+main()<Int> -> {
+    rs<String> = env_get("RANK") else "0"
+    ws<String> = env_get("WORLD") else "2"
+    ps<String> = env_get("PORT") else "18420"
+    peer<String> = env_get("PEER_IP") else "192.168.192.1"
+    rep_s<String> = env_get("REPS") else "30"
+    rank<Int> = rs.to_int()
+    world<Int> = ws.to_int()
+    port<Int> = ps.to_int()
+    reps<Int> = rep_s.to_int()
+
+    if (tensor_init() != 0) { println("NCCLB_FAIL cuda init"); return 1 }
+    println("NCCLB rank=" + rank.to_string() + " world=" + world.to_string() + " reps=" + reps.to_string())
+
+    # ---- rendezvous (same proven path as nccl_ping) ----
+    uid<String> = blanks(128)
+    if (rank == 0) {
+        grc<Int> = 0
+        freedom { grc = (ncclGetUniqueId(uid) as Int) }
+        if (grc != 0) { println("NCCLB_FAIL getuid"); return 2 }
+        fd<Int> = socket_open(2, 1, 0) else 0
+        if (fd == 0) { println("NCCLB_FAIL socket"); return 3 }
+        o1<Bool> = socket_bind(fd, "0.0.0.0", port) else false
+        o2<Bool> = socket_listen(fd, 4) else false
+        if (!o1 || !o2) { println("NCCLB_FAIL bind/listen"); return 4 }
+        println("NCCLB listening")
+        c<Int> = socket_accept(fd) else 0
+        if (c == 0) { println("NCCLB_FAIL accept"); return 5 }
+        n<Int> = socket_send(c, uid) else 0
+        socket_close(c)
+        socket_close(fd)
+    } else {
+        d<Int> = socket_open(2, 1, 0) else 0
+        if (d == 0) { println("NCCLB_FAIL socket"); return 6 }
+        oc<Bool> = socket_connect(d, peer, port) else false
+        if (!oc) { println("NCCLB_FAIL connect"); return 7 }
+        got<String> = socket_recv(d, 256) else ""
+        if (got.len() < 128) { println("NCCLB_FAIL uid"); return 8 }
+        uid = got.substring(0, 128)
+        socket_close(d)
+    }
+
+    comm<Int> = 0
+    var<Int> irc = 0
+    freedom { irc = (ncclCommInitRank(loc(comm), world, uid, rank) as Int) }
+    if (irc != 0) { println("NCCLB_FAIL commInitRank rc=" + irc.to_string()); return 9 }
+    nrank<Int> = 0
+    freedom { ncclCommCount(comm, loc(nrank)) }
+    println("NCCLB comm ready nranks=" + nrank.to_string())
+
+    # ---- all-reduce latency sweep at the sizes a TP layer would exchange ----
+    # counts are f64 elements: hidden*R per token block, plus the per-expert MoE blocks.
+    cnts<Vec<Int>> = Vec()
+    cnts.push(512)         # 4 KB   -- one token's hidden state at 4096 / 8
+    cnts.push(4096)        # 32 KB  -- one token, hidden=4096 f64
+    cnts.push(81920)       # 640 KB -- R=20 tokens x hidden
+    cnts.push(327680)      # 2.5 MB -- 4x that (a wider TP reduce)
+    cnts.push(2621440)     # 20 MB  -- MoE-sized block
+    cnts.push(8388608)     # 64 MB  -- bandwidth reference
+
+    ci<Int> = 0
+    while (ci < cnts.len()) {
+        count<Int> = cnts.get(ci)
+        dbuf<Int> = dev_alloc(count * 8)
+        sbuf<Int> = dev_alloc(count * 8)
+        if (dbuf == 0 || sbuf == 0) { println("NCCLB_FAIL alloc"); return 10 }
+        fill<Vec<Float>> = Vec()
+        fi<Int> = 0
+        while (fi < count) { fill.push(1.0) ; fi = fi + 1 }
+        if (bulk_htod(sbuf, view(fill)) != 0) { println("NCCLB_FAIL htod"); return 11 }
+        sync()
+
+        # warm up this size so the first timing is not paying connection setup
+        var<Int> rc0 = 0
+        freedom { rc0 = (ncclAllReduce(sbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+        sync()
+        if (rc0 != 0) { println("NCCLB_FAIL allreduce rc=" + rc0.to_string()); return 12 }
+
+        # collect reps timings, then report the MEDIAN (a single sample on this fabric is meaningless)
+        tms<Vec<Int>> = Vec()
+        r<Int> = 0
+        while (r < reps) {
+            t0<Int> = clock_ns()
+            freedom { rc0 = (ncclAllReduce(sbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+            sync()
+            t1<Int> = clock_ns()
+            tms.push((t1 - t0) / 1000)          # microseconds
+            r = r + 1
+        }
+        # insertion sort (small N, and keeps the artifact dependency-free)
+        a<Int> = 0
+        while (a < tms.len()) {
+            b<Int> = a + 1
+            while (b < tms.len()) {
+                if (tms.get(b) < tms.get(a)) {
+                    tmp<Int> = tms.get(a)
+                    tms.set(a, tms.get(b))
+                    tms.set(b, tmp)
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        med<Int> = tms.get(tms.len() / 2)
+        mn<Int> = tms.get(0)
+        mxv<Int> = tms.get(tms.len() - 1)
+        bytes<Int> = count * 8
+        gbs<Float> = 0.0
+        if (med > 0) { gbs = (2.0 * (bytes as Float) / 1000000000.0) / ((med as Float) / 1000000.0) }
+        println("NCCLB_ALLREDUCE bytes=" + bytes.to_string() + " min_us=" + mn.to_string()
+            + " med_us=" + med.to_string() + " max_us=" + mxv.to_string() + " gbps=" + gbs.to_string())
+        ci = ci + 1
+    }
+
+    # NOTE: an all-to-all section was removed because this NCCL build does not export ncclAllToAll.
+    # Expert-parallel routing therefore has to be built from ncclSend/ncclRecv or ncclAllGather; the
+    # all-reduce numbers above already bound the fabric's small-message latency, which is the binding
+    # constraint either way.
+
+    freedom { ncclCommDestroy(comm) }
+    println("NCCLB_DONE rank=" + rank.to_string())
+    return 0
+}

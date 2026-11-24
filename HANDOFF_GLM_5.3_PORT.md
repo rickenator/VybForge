@@ -7166,3 +7166,30 @@ rated at. Comms is not the bottleneck and the primitive is usable for per-layer 
 CAVEAT: the test's clock reads /proc/uptime at centisecond resolution, so timings below ~10 ms are 0 or
 quantised. Any future microbenchmark of small collectives must swap in a finer clock (or repeat N times
 and divide) or it will report meaningless zeros -- rank 1 did exactly that here.
+=== ROUND 176: MEASURED THE COMMS BUDGET -- TP-WITHIN-EXPERT IT IS ===
+Ran native/nccl/nccl_bench.vyb (all-reduce sweep, MEDIAN of 30 reps, monotonic ns clock via
+clock_gettime -- /proc/uptime's centisecond resolution had already produced a false 0). Both ranks agree:
+    bytes        med_us   gbps
+    4 KB            35    0.23     <- latency floor
+    32 KB           36    1.82     <- one token, hidden=4096 f64
+    640 KB         287    4.57     <- 20 tokens batched
+    2,621,440      268   19.6      <- 2.5 MB, FASTER than 640 KB
+    20,971,520    1173   35.8
+    67,108,864    3697   36.3      <- peak fabric 36 GB/s
+TWO DECISIVE FACTS:
+ 1. LATENCY-BOUND BELOW ~32 KB. 4 KB and 32 KB both cost ~35 us, so a per-token collective costs the same
+    in f64 as in bf16. At batch=1: ~3 collectives/layer x 36 us x 45 layers = ~4.9 ms/token of comms,
+    against a 20-22 ms/token budget. Workable.
+ 2. BATCHING IS EXPENSIVE AND NON-MONOTONIC. 640 KB costs 287 us -- 8x the latency of 32 KB for 20x the
+    data -- and is SLOWER than 2.5 MB at 268 us. Per-20-token collectives would cost ~0.55 ms/layer
+    (~25 ms/token), blowing the budget before any compute. This is the same shape as vLLM's numbers:
+    fine at small batch, degrading with concurrency. Any future batching must re-measure this step.
+DECISION -- TENSOR-PARALLEL WITHIN EXPERT (not expert-parallel):
+  * TP needs ~3 small collectives per MoE layer, all on the ~35 us floor.
+  * Expert-parallel needs all-to-all, and this NCCL build does NOT export ncclAllToAll (verified: JIT
+    symbol lookup failed; the bench section was removed). It would have to be built from ncclSend/ncclRecv
+    pairs -- more sync points at a higher floor -- for the same payloads.
+  * EP's advantage (only ~half the routed experts crossing nodes) does not beat 3 fixed small collectives.
+LANDMINE CARRIED FORWARD: Vyb computes in f64 (Vec<Float> = 8 bytes), which doubles comms payload versus
+bf16. Harmless today because 32 KB is on the latency floor, but it halves the batch size at which comms
+starts to bite -- the first thing to revisit if throughput (not latency) becomes the goal.
