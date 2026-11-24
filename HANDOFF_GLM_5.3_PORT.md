@@ -6954,3 +6954,24 @@ than a requirement.
 IF SOMEONE RETRIES THE COMPILER WORK: start from why the struct comes back null -- the runtime returns a
 valid non-null char*, so the fault is in how the handler assembles/returns the String value (compare
 against handleStringFromBytes, which returns a working view) rather than in the allocation.
+=== ROUND 167: THE DSA "I/O-BOUND" ARITHMETIC WAS WRONG -- MEASURED DIRECTLY ===
+Round 166 claimed the DSA layers are disk-read bound: 235 MB per layer, "235 MB at 280 MB/s = 839 ms",
+matching the measured 989 ms at NLAY=24. THE BANDWIDTH ASSUMPTION WAS WRONG, so the match was a
+coincidence. Measured on lefty against the real shard (GLM-5.3-Flash-NVFP4, model-00020-of-00033,
+5.9 GB), 235 MB window, three consecutive reads:
+    read1 216 ms   (~1.1 GB/s, COLD -- four times faster than the assumed 280 MB/s)
+    read2  10 ms   (page cache)
+    read3   9 ms
+So: disk is fast, the page cache works, and a repeat read of a DSA weight tensor costs ~10 ms, not
+839 ms. The host-side raw-bf16 cache (the plan carried since round 159) would have saved roughly 10 ms
+per layer and would NOT have closed the 989-2982 ms. Plan withdrawn before spending a cycle on it.
+CONSEQUENCE: I/O is NOT the DSA hog. Per layer the budget is: read ~10 ms cached (216 ms worst case),
+htod ~23 ms at PCIe rates -- so roughly 40-240 ms of the 989-2982 ms is accounted for by data movement.
+** The remaining ~750-2750 ms per DSA layer is UNEXPLAINED and is where the hog actually lives. **
+NEXT STEP, and it is measurement, not theory: instrument the INSIDE of the production DSA layer
+(dsa_attn_site_c, native/glm53/glm_engine.vyb ~line 2301) with disjoint phase timers -- weight
+read+dequant, q/kv projections, indexer (gpool + topk), attention over the cache, output projection --
+and report medians over warm steps. Do not propose a fix until those phases are attributed.
+PROCESS NOTE: this is the third time an I/O explanation for the DSA layers has been asserted and then
+refuted by measurement (rounds 139, 140, and now 166/167). The rule that catches it: never derive a
+cost from an assumed bandwidth -- measure the bandwidth on the actual device first.
