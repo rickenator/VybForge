@@ -24,6 +24,7 @@ import env::{env_get}
 import safetensors
 import gx
 import tensor::{tensor_init, dtoh_vec}
+import time::{time_mono_millis}
 
 R<Int> = 22
 H<Int> = 4096
@@ -153,15 +154,21 @@ main()<Int> -> {
         raw<String> = gx_read(g, ti)
         if (raw.len() == 0) { println("RES_AB_FAIL read idx=" + ti.to_string()); return 6 }
 
-        # disk path
+        # disk path (packed bytes fetched from disk + uploaded on this call)
+        td0<Int> = time_mono_millis()
         d1<Int> = deq_bf16(fbf, raw, n, z)
+        td1<Int> = time_mono_millis() - td0
         if (d1 == 0) { println("RES_AB_FAIL disk deq idx=" + ti.to_string()); return 7 }
         v1<Vec<Float>> = dtoh_vec(d1, n)
 
-        # resident path
+        # resident path (bytes already on the device; upload timed separately as a one-off setup cost)
+        tu0<Int> = time_mono_millis()
         qp<Int> = res_upload(raw)
+        tu1<Int> = time_mono_millis() - tu0
         if (qp == 0) { println("RES_AB_FAIL upload idx=" + ti.to_string()); return 8 }
+        tr0<Int> = time_mono_millis()
         d2<Int> = deq_bf16_res(fbf, qp, n, z)
+        tr1<Int> = time_mono_millis() - tr0
         if (d2 == 0) { println("RES_AB_FAIL res deq idx=" + ti.to_string()); return 9 }
         v2<Vec<Float>> = dtoh_vec(d2, n)
 
@@ -182,7 +189,7 @@ main()<Int> -> {
             j = j + stride
         }
         bad_total = bad_total + ndiff
-        println("RES_AB idx=" + ti.to_string() + " n=" + n.to_string() + " z=" + z.to_string() + " packed_bytes=" + raw.len().to_string() + " ndiff=" + ndiff.to_string() + " firstbad=" + firstbad.to_string() + " ncmp=" + ncmp.to_string())
+        println("RES_AB idx=" + ti.to_string() + " n=" + n.to_string() + " z=" + z.to_string() + " packed_bytes=" + raw.len().to_string() + " ndiff=" + ndiff.to_string() + " firstbad=" + firstbad.to_string() + " ncmp=" + ncmp.to_string() + " disk_ms=" + td1.to_string() + " res_ms=" + tr1.to_string() + " upload_once_ms=" + tu1.to_string())
 
         freedom { cuMemFree_v2(d1) }
         freedom { cuMemFree_v2(d2) }

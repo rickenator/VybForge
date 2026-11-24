@@ -8040,3 +8040,19 @@ back through it (`bulk_dtoh` in the tensor module is a different, faster path). 
 site uses before attributing a stall to arithmetic.
 NEXT: wire res_upload + deq_bf16_res into one real consumer end-to-end (a decode layer), then the TP split
 (rank-sharded residency) and the per-layer all-reduce.
+--- ROUND 212b: WHAT RESIDENCY BUYS, MEASURED PER CALL ---
+Timed both paths on identical real tensors (warm page cache):
+    idx=0  12.6 MB packed, 6.3M outputs:  deq_bf16 (disk) = 8 ms   deq_bf16_res = 3 ms   upload once = 2 ms
+    idx=1  3 KB:                          disk = 1 ms              res = 0 ms
+    idx=4  1 KB:                          disk = 0 ms              res = 0 ms
+so ~2.7x on a mid-sized tensor, with the upload paid once instead of per call.
+CROSS-CHECK AGAINST THE ENGINE: a decode layer issues 22-28 deq calls; at ~10-15 ms each that is 300-400 ms,
+which is exactly the 323-584 ms/layer the engine measures. So the per-layer cost IS these calls, one at a
+time, and residency should take a layer's load from ~323 ms to ~70-90 ms -- about 240 ms/layer, i.e. ~11 s
+per step over 45 layers. These are WARM-CACHE disk numbers; cold, the disk term is larger and the residency
+win is bigger.
+CAVEAT: these are single-shot timings at 1-8 ms, near the clock's resolution for the small tensors, so treat
+only the idx=0 ratio as meaningful and re-measure after integration rather than quoting 2.7x as a projection.
+NEXT: wire res_upload + deq_bf16_res into glm_serve's decode path (preload once at startup, swap the deq
+call sites), then re-measure SEC STEP in production mode and compare against the ~118 s / 26-35 s-per-step
+baseline.
