@@ -30,9 +30,11 @@ LOG=/tmp/serve_fgate.log
 
 echo "bench: NLAY=$NLAY STEPS=$STEPS field=$FIELD port=$PORT"
 rm -f "$OUT"
+# VYBFORGE_SERVE=1 disables the per-layer dumps: they cost ~10x wall time (29 s vs 291 s for the same
+# 6-step request) and every earlier decode timing included them.
 # NSTEPS>1 is the whole point; CTIMEOUT must exceed prefill + STEPS x step cost or the request is
 # truncated at exactly the timeout with an empty body (which looks like a hang).
-OUT="$OUT" NLAY="$NLAY" FG=1 REQS=1 NSTEPS="$STEPS" CTIMEOUT=${CTIMEOUT:-5400} PORT="$PORT" \
+OUT="$OUT" NLAY="$NLAY" FG=1 REQS=1 NSTEPS="$STEPS" CTIMEOUT=${CTIMEOUT:-5400} PORT="$PORT" VYBFORGE_SERVE=1 \
   bash "$run_fgate" > /tmp/bench_harness_out.txt 2>&1
 if [ ! -f "$LOG" ]; then
   echo "FAIL: no log at $LOG — harness output was:"

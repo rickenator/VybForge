@@ -6624,3 +6624,24 @@ STATE OF THE PROJECT:
       residency/eviction (round 146: the serve path's per-step cost is dominated by page-cache churn)
       is now the thing to attack, not the matvec.
     - `SEC mlpmoe` remains unusable as a timer across steps; BENCH_LAYER is the way to time a layer.
+=== ROUND 151: THE DECODE TIMINGS WERE 10x INFLATED BY THE DRIVER'S DUMPS ===
+1) RESIDENCY IS REFUTED. Measured /proc/<pid>/io across a whole 6-step request at NLAY=6: the process
+   read **123 MB total** (~20 MB/step) while SEC mlpmoe swung 20 -> 920 -> 6000 ms. The swings cannot be
+   page cache or disk: there was almost no I/O. Round 146's "memory pressure evicting weight pages"
+   explanation is WITHDRAWN.
+2) THE REAL CAUSE IS THE DRIVER'S PER-LAYER DUMPS. glm_serve gates them on
+        if (srv == "1" && dsFlag != "1") { dump_on = 0 }
+   i.e. they are skipped ONLY when VYBFORGE_SERVE=1, and the source comment says they cost ~12 s/step-layer
+   from "format+concat churn on real data". The harness never sets VYBFORGE_SERVE, so every decode timing
+   this session measured included them. Same request, 6 steps at NLAY=6:
+        VYBFORGE_SERVE=1 (dumps off) : wall  29 s
+        dumps on (default)           : wall 291 s      -> 10x
+   CONSEQUENCE: the 0.79 tok/s figure, the 35<->950 ms "instability", and the 2.4x BENCH_LAYER ratio are
+   all suspect. The BENCH_LAYER ratio is the safest of the three (both arms repeated the same call, but
+   both also ran with dumps ON, which may have compressed the ratio).
+3) WHAT SURVIVES: with dumps off, a 6-layer step takes ~4.8 s and the per-layer distribution is BIMODAL
+      most layers ~20 ms, but 1-2 per step cost ~950-1000 ms
+   with no disk I/O to explain the slow ones. That ~950 ms is now the thing to explain, and it is a real
+   compute-side outlier, not I/O and not logging.
+ACTION: timing runs MUST set VYBFORGE_SERVE=1. Digest/gate runs must NOT (the flag exists to keep
+offline-verification output), so the sweep stays as-is and bench_decode.sh now sets SERVE=1.
