@@ -7990,3 +7990,18 @@ NEXT IN THE TP=2 PLAN, in order:
      342 us vs 556);
   3. two-rank launcher with the LAN addresses and a real barrier;
   4. verification gate that exercises the TP path end to end against the single-node reference.
+--- ROUND 211b: A CONSTRAINT THAT SHAPES THE WHOLE TP=2 DESIGN ---
+Residency must hold the PACKED weights, NOT dequantised ones. The 175.62 GB model is already EXL3 4-bit;
+the measured 88.50/87.13 GB shard split is a split of the PACKED bytes. Dequantised to bf16 that would be
+roughly 4x, i.e. ~700 GB across the pair, which does not fit anywhere near 121 GB per node. So the correct
+architecture is:
+  * at startup, each rank reads its half of the packed shards and keeps those bytes RESIDENT on device
+    (~88 GB, proven allocatable by round 211);
+  * every layer then dequantises ON THE DEVICE from the resident packed bytes and runs its GEMM, which is
+    exactly what the prefill site (`dsa_attn_site_c` via `deq_bf16_arena`) already does -- the deq kernels
+    take a DEVICE pointer to packed data (dq1s4_probe synthesises packed data on the device and runs them).
+  * what must change is the READER: today `deq_bf16(fbf, addr, ...)` pulls packed bytes from DISK on every
+    call, which is the 323-584 ms/layer, 50-67% of the step. A resident variant takes a device offset
+    instead of a disk address and the whole per-step load disappears.
+So TP=2 residency is really "replace the disk-backed tensor reader with a device-resident one, sharded by
+rank". The kernels and the arena already exist; the reader is the piece to build.
