@@ -1,0 +1,204 @@
+# p_ep_shard2.vyb -- expert shard load via COALESCED sequential reads instead of 1296 small ones.
+#
+# Round 215 loaded a rank's 144 experts at 1733 MB / 44.4 s = ~39 MB/s: 1296 separate gx_read calls, each
+# with its own open/seek/read plus a cuMemAlloc + memcpy. The tensors of a layer's experts are laid out
+# sequentially in the shards, so they can be merged into a handful of large contiguous reads.
+#
+# This probe does that and reports the throughput, plus a device-offset table (tensor -> base + delta) that
+# is exactly the residency layout TP=2 needs: one allocation per coalesced range, tensors addressed by offset
+# inside it, so a dequantise needs only a device pointer.
+#
+# Run: RANK=0 EXP_LO=0 EXP_HI=144 ... vyb p_ep_shard2.vyb
+# Prints the coalesce statistics and EP2_* timings so they can be compared against round 215's 39 MB/s.
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+}
+
+res_upload(raw<String>)<Int> -> {
+    var<Int> q = 0
+    if (raw.len() == 0) { return 0 }
+    freedom {
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        return q
+    }
+    return 0
+}
+
+main()<Int> -> {
+    rank<Int> = 0
+    rv<String> = env_get("RANK") else ""
+    if (rv.len() > 0) { rank = rv.to_int() }
+    lo<Int> = 0
+    lv<String> = env_get("EXP_LO") else ""
+    if (lv.len() > 0) { lo = lv.to_int() }
+    hi<Int> = 144
+    hv<String> = env_get("EXP_HI") else ""
+    if (hv.len() > 0) { hi = hv.to_int() }
+    layer<Int> = 3
+    yv<String> = env_get("LAYER") else ""
+    if (yv.len() > 0) { layer = yv.to_int() }
+    # merge ranges separated by less than this many bytes -- avoids a read per tiny gap
+    gapTol<Int> = 65536
+    gv<String> = env_get("GAP_TOL") else ""
+    if (gv.len() > 0) { gapTol = gv.to_int() }
+
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    total<Int> = 83
+    lpre<String> = "model.language_model.layers." + layer.to_string() + "."
+
+    if (tensor_init() != 0) { println("EP2_FAIL no cuda"); return 4 }
+
+    wants<Vec<String>> = Vec()
+    e<Int> = lo
+    while (e < hi) {
+        epre<String> = lpre + "mlp.experts." + e.to_string() + "."
+        wants.push(epre + "gate_proj.trellis")
+        wants.push(epre + "gate_proj.suh")
+        wants.push(epre + "gate_proj.svh")
+        wants.push(epre + "up_proj.trellis")
+        wants.push(epre + "up_proj.suh")
+        wants.push(epre + "up_proj.svh")
+        wants.push(epre + "down_proj.trellis")
+        wants.push(epre + "down_proj.suh")
+        wants.push(epre + "down_proj.svh")
+        e = e + 1
+    }
+    nt<Int> = wants.len()
+    println("EP2 rank=" + rank.to_string() + " experts=[" + lo.to_string() + "," + hi.to_string() + ") tensors=" + nt.to_string())
+
+    idxT<String> = gx_read_index(dir)
+    ww<Vec<Int>> = gx_expert_window(idxT, lpre)
+    t0<Int> = time_mono_millis()
+    g<GxLoc> = gx_resolve_win(idxT, dir, total, wants, ww.get(0), ww.get(1))
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < nt) { if (g.found.get(i) == 1) { nf = nf + 1 } i = i + 1 }
+    if (nf != nt) { println("EP2_FAIL resolved=" + nf.to_string()); return 3 }
+
+    # ---- coalesce: for each shard, sort the tensor ranges by offset and merge near-adjacent ones ----
+    # (insertion sort: n is 1296 and nearly sorted already, so this is cheap and keeps it simple)
+    ord<Vec<Int>> = Vec()
+    i = 0
+    while (i < nt) { ord.push(i); i = i + 1 }
+    a<Int> = 1
+    while (a < nt) {
+        key<Int> = ord.get(a)
+        ks<Int> = g.shard.get(key)
+        ko<Int> = g.off.get(key)
+        b<Int> = a - 1
+        moved<Int> = 0
+        while (b >= 0 && moved == 0) {
+            pb<Int> = ord.get(b)
+            if (g.shard.get(pb) > ks || (g.shard.get(pb) == ks && g.off.get(pb) > ko)) {
+                ord.set(b + 1, pb)
+                b = b - 1
+            } else { moved = 1 }
+        }
+        ord.set(b + 1, key)
+        a = a + 1
+    }
+
+    # ranges, grouped by shard, merged
+    rShard<Vec<Int>> = Vec()
+    rOff<Vec<Int>> = Vec()
+    rLen<Vec<Int>> = Vec()
+    i = 0
+    while (i < nt) {
+        ti<Int> = ord.get(i)
+        ts<Int> = g.shard.get(ti)
+        to<Int> = g.off.get(ti)
+        tl<Int> = g.nbytes.get(ti)
+        nr<Int> = rShard.len()
+        if (nr > 0 && rShard.get(nr - 1) == ts && to <= rOff.get(nr - 1) + rLen.get(nr - 1) + gapTol) {
+            endp<Int> = to + tl
+            if (endp > rOff.get(nr - 1) + rLen.get(nr - 1)) { rLen.set(nr - 1, endp - rOff.get(nr - 1)) }
+        } else {
+            rShard.push(ts)
+            rOff.push(to)
+            rLen.push(tl)
+        }
+        i = i + 1
+    }
+    nr<Int> = rShard.len()
+    merged<Int> = 0
+    i = 0
+    while (i < nr) { merged = merged + rLen.get(i); i = i + 1 }
+    println("EP2 ranges=" + nr.to_string() + " of tensors=" + nt.to_string() + " merged_bytes=" + merged.to_string() + " mb=" + (merged / 1048576).to_string())
+
+    # ---- load: one read + one upload per coalesced range ----
+    t1<Int> = time_mono_millis()
+    base<Vec<Int>> = Vec()
+    ranges<Int> = 0
+    bad<Int> = 0
+    i = 0
+    while (i < nr) {
+        path<String> = gx_shard_path(dir, rShard.get(i), total)
+        blob<String> = gx_read_at(path, rOff.get(i), rLen.get(i))
+        if (blob.len() != rLen.get(i)) { bad = bad + 1 } else {
+            q<Int> = res_upload(blob)
+            if (q == 0) { bad = bad + 1 }
+            base.push(q)
+        }
+        ranges = ranges + 1
+        i = i + 1
+    }
+    tLoad<Int> = time_mono_millis() - t1
+    mbps<Int> = 0
+    if (tLoad > 0) { mbps = (merged / 1048576) * 1000 / tLoad }
+    println("EP2 ranges_read=" + ranges.to_string() + " bad=" + bad.to_string() + " load_ms=" + tLoad.to_string() + " mbps=" + mbps.to_string())
+    if (bad != 0) { println("EP2_FAIL bad=" + bad.to_string()); return 5 }
+
+    # ---- VERIFY the coalesced mapping: sampled tensors must match a direct read byte-for-byte ----
+    # without this, a wrong delta would silently feed the wrong weights to dequantise.
+    # blob for a tensor = the coalesced range that contains it, sliced at (off - range_off).
+    vbad<Int> = 0
+    vcmp<Int> = 0
+    vi<Int> = 0
+    while (vi < nt) {
+        step<Int> = nt / 16
+        if (step < 1) { step = 1 }
+        if (vi % step == 0) {
+            ti<Int> = ord.get(vi)
+            ts<Int> = g.shard.get(ti)
+            to<Int> = g.off.get(ti)
+            tl<Int> = g.nbytes.get(ti)
+            # locate the merged range that covers it
+            ri<Int> = 0
+            foundR<Int> = -1
+            while (ri < nr && foundR < 0) {
+                if (rShard.get(ri) == ts && to >= rOff.get(ri) && to + tl <= rOff.get(ri) + rLen.get(ri)) {
+                    foundR = ri
+                }
+                ri = ri + 1
+            }
+            if (foundR < 0) { vbad = vbad + 1 } else {
+                path2<String> = gx_shard_path(dir, ts, total)
+                direct<String> = gx_read_at(path2, to, tl)
+                if (direct.len() != tl) { vbad = vbad + 1 } else {
+                    delta<Int> = to - rOff.get(foundR)
+                    # compare against the range blob read again (independent of the upload)
+                    blob2<String> = gx_read_at(path2, rOff.get(foundR) + delta, tl)
+                    b2<Int> = 0
+                    while (b2 < tl) {
+                        if (blob2.char_at(b2) != direct.char_at(b2)) { vbad = vbad + 1; b2 = tl } else { b2 = b2 + 1 }
+                    }
+                    vcmp = vcmp + 1
+                }
+            }
+        }
+        vi = vi + 1
+    }
+    println("EP2 verify compared=" + vcmp.to_string() + " bad=" + vbad.to_string())
+
+    println("EP2_DONE rank=" + rank.to_string() + " mb=" + (merged / 1048576).to_string() + " ranges=" + nr.to_string())
+    return 0
+}

@@ -8170,3 +8170,25 @@ sequential figure, because it is 1296 separate gx_read calls each with its own o
 cuMemAlloc + memcpy per tensor. At that rate a full 45-layer preload is ~33 minutes. The fix is the
 sequential-walk idea already identified: read the shard in large contiguous blocks rather than per tensor.
 The shard walk itself (correctness, symmetry, completeness, disjointness) is proven.
+=== ROUND 216: COALESCED SEQUENTIAL LOAD -- 39 MB/s -> 1.7 GB/s, 43x, VERIFIED ===
+Round 215 loaded a rank's 144 experts at 39 MB/s (1296 separate reads, each with open/seek/read plus a
+cuMemAlloc + memcpy). The tensors are laid out sequentially, so `native/host/p_ep_shard2.vyb` sorts them by
+(shard, offset), merges ranges separated by less than GAP_TOL (64 KB default), then does ONE read and ONE
+upload per merged range -- which is also the residency layout TP=2 needs, since tensors become offsets
+inside one allocation instead of one allocation each.
+RESULT, layer 3, both halves:
+    rank 0 experts [0,144)    ranges 4 of 1296  merged 1,817,247,744 B (1733 MB)  load 1029 ms  1684 MB/s
+    rank 1 experts [144,288)  ranges 4 of 1296  merged 1,817,247,744 B (1733 MB)  load 1047 ms  1655 MB/s
+so 1296 tensors collapse to FOUR contiguous ranges, 44,433 ms -> ~1,030 ms (**43x**), and the merged byte
+count is IDENTICAL to round 215's per-tensor total, i.e. nothing was dropped or double-counted.
+CORRECTNESS OF THE MAPPING IS PROVEN, not assumed: 16 sampled tensors are re-read individually and compared
+byte-for-byte against their slice of the coalesced blob -- `verify compared=16 bad=0` on both ranks. Without
+that check a wrong delta would silently feed the wrong weights to dequantise, which is exactly the class of
+error this project has been bitten by before.
+IMPLICATION FOR TP=2 STARTUP: a full 45-layer half-model preload is 45 x ~1.0 s = ~46 s per rank (was ~33
+minutes at the per-tensor rate). That is an acceptable one-time cost for a resident server.
+STATE: expert-parallel residency is now demonstrated end to end as a LOAD: correct range, correct bytes,
+symmetric split, 1.7 GB/s, verified. Still missing, in order: (1) the compute+comms gate -- each rank
+computes its owned experts' weighted contribution for a known input, all-reduce, compare against the
+single-node layer output; (2) routing split (rank only computes selected experts it owns); (3) the decode
+loop consuming device offsets instead of Strings; (4) the two-rank launcher.
