@@ -7495,3 +7495,28 @@ WHAT DOMINATES NOW (warm): read 44 ms, proj 30-38 ms, res 8-15 ms. On a COLD cac
 near 180 ms, so read is still the biggest real term and the open-once-per-expert / windowed-read work is
 the next honest target -- but it must be measured cold, which needs a way to drop page cache (root) or a
 paired cold/warm comparison designed up front.
+=== ROUND 191: ONE OPEN PER EXPERT -- read 44 -> 33 ms, loop 103 -> 91 ms (WARM) ===
+gx_read did open_read + read_at + close PER TENSOR: 9 opens per expert, 72 per MoE layer. gx_read9 opens
+once when an expert's tensors share a shard (the normal case, since they are adjacent in the index) and
+reads all nine against that handle, falling back to per-tensor reads if shards differ. moe_tail_step now
+takes the nine buffers from one call.
+MEASURED (NLAY=12, 8 experts/layer), warm state:
+    before: res=13  read=44  proj=32  loop=103
+    after : res=13  read=33  proj=32  loop= 91
+so read ~25% lower and the loop ~12% lower. Digest line count unchanged (27) and no CHAIN_FAIL; the VALUES
+were not diffed, so correctness rests on gx_read9 addressing the same files/offsets/lengths -- the fallback
+paths are the only new risk. A digest value comparison is still owed.
+A FALSE REGRESSION WORTH REMEMBERING: the first post-change run reported loop=247-273 with res=95 and
+proj=51 -- EVERY phase inflated ~2.5x including ones the change cannot touch. The cause was a stray
+`nccl_ping.vyb` from an earlier test still holding a CUDA context (pid 1892687, 170 MiB on the GPU) plus
+load 0.99. Killing it restored res=13/loop=91 immediately with no code change.
+RULE, and this one has now cost time twice: BEFORE READING ANY PERF NUMBER, check
+`nvidia-smi --query-compute-apps` AND `pgrep -af vyb` -- and when several unrelated phases inflate
+together, suspect contention before suspecting the edit.
+CACHE CONFOUND, AGAIN UNRESOLVED: warm read is 33 ms for ~100 MB = ~3 GB/s, i.e. page-cache hits. A
+40-shard eviction attempt FAILED to cool it (buff/cache went 79 -> 98 GB; 121 GB of RAM absorbs the
+stream). A genuinely cold measurement needs either root to drop caches or a full 45-layer pass, which
+thrashes naturally.
+STATE OF THE MOE LAYER (warm): read 33 + proj 32 + res 13 + sub ~1 = loop ~91 ms, from 350 ms at round 187.
+Everything measurable in the warm regime has now been reduced; what remains is dominated by data movement
+that only shows its true cost under memory pressure.
