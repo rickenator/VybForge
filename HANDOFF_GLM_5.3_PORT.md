@@ -6745,3 +6745,25 @@ So the per-step re-reading was the growth term, and a handful of layers remain s
 identified. Decode is now ~2.5x faster than at the start of these rounds.
 CAVEAT: this is the same request shape as before (22 ids, 3 steps), dumps off. The absolute tok/s still
 needs the full-depth, full-step measurement, and the remaining max-latency layers need their own look.
+=== ROUND 157: FOUR-PASS SWEEP GREEN AFTER THE DSA CACHE ===
+    pass 1  prefill fast path vs exact baseline : 45/45 BIT-IDENTICAL
+    pass 2  verification mode                   : 9810 comparisons, 0 failures
+    pass 3  logit gate                          : 20/20 argmax, 11,985x safety
+    pass 4  decode path vs baseline             : 18 digest lines BIT-IDENTICAL
+    VERDICT: SWEEP PASS
+Pass 4 passing bit-identically is the specific confirmation that the DSA cache is numerically neutral:
+caching immutable weights must not move a digit, and it did not.
+FINAL STATE OF THIS SESSION'S DECODE WORK:
+    - fused MoE on BOTH paths (prefill P6_FUSED_ONLY=1, decode P6_FUSED_DEC=1), deterministic, gated.
+    - 2.5x end-to-end on the decode path from the DSA attention-weight cache (127 s vs 318 s per
+      45-layer/3-step request, dumps off), plus 2.4x on the MoE layer and 1.96x on prefill.
+    - four harness passes cover prefill digests, per-expert numeric equivalence, the logit decision
+      boundary, and decode digests.
+REMAINING, in order of evidence:
+    1. A handful of layers still cost ~5 s each (max layerbody 4974 ms, unchanged by the DSA cache).
+       That is now the largest single unknown and needs the same treatment: split the timer on those
+       specific layers rather than guessing which phase they belong to.
+    2. The absolute tok/s has still never been measured cleanly (full depth, many steps, dumps off,
+       timings from the harness wall clock). Everything above is a relative improvement.
+    3. The MoE's own phases (SEC_MOE2: router 14-38, experts 90-338, shared 28-41 ms) show the expert
+       loop as the MoE's dominant term -- worth revisiting only after (1).
