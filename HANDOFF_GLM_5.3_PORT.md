@@ -8332,3 +8332,27 @@ CAVEATS, stated because the earlier conclusion was wrong precisely by over-readi
 NEXT: (1) still fix the readback so lockstep is actually demonstrated -- try reading back through a String
 instead of bulk_dtoh, or verify with a single element rather than a full buffer; (2) re-measure 32 KB with
 >=1000 iterations to put an error bar on the 0.23 ms; (3) then the overlapped reduce as an optimisation.
+=== ROUND 222: THE 32 KB NUMBER, MEASURED PROPERLY -- AND ROUND 221 IS WITHDRAWN ===
+Three runs at 5000 iterations each (per-iteration timer excludes the readback, so long runs stay cheap),
+both ranks agreeing to within 1 ms in every run:
+    total_ms=3139.5 / 3140  ->  0.628 ms/iter
+    total_ms=2947.0 / 2947  ->  0.589 ms/iter
+    total_ms=2018.0 / 2018  ->  0.404 ms/iter  (fast outlier)
+    MEDIAN 0.589 ms/iter at 4096 f64 = 32 KB
+** ROUND 221 IS WITHDRAWN. ** It reported 0.23 ms and "comms is viable on its own, ~10 ms/token" from
+100-iteration runs. Those runs are too SHORT: at 100 iterations the first stretch of collectives is cheap
+(transport warm-up), which drags the average down, and p50 was quantised to 0-1 ms so nothing contradicted it
+inside the run. Over 5000 iterations the cost converges to ~0.59 ms, i.e.
+    45 layers x 0.589 ms = ~26.5 ms per token
+which is ABOVE the 20-22 ms/token bar before any compute. So round 220's original concern STANDS and round
+221's reassuring correction was an artefact of a too-short measurement.
+METHOD LESSON, now learned twice on this same number: a sub-millisecond per-iteration cost needs >=1000
+iterations before the average means anything, because warm-up and quantisation both bias short runs LOW. I
+have now flip-flopped on this figure once by measuring for 100 iterations and believing it. Any future
+comms figure from this harness should state its iteration count alongside the result.
+CONSEQUENCE FOR THE PLAN: TP=2 cannot meet the bar by paying one 0.59 ms collective per layer serially.
+** THE OVERLAPPED REDUCE IS THEREFORE REQUIRED, NOT AN OPTIMISATION ** -- that is the opposite of what round
+221 concluded, and it is the design question worth working next: overlap the all-reduce with the next
+block's compute so its ~26.5 ms hides inside ~10+ ms of work per token, or reduce the number of collectives
+per layer (e.g. one reduce per layer rather than one per projection).
+STILL OPEN: DESYNC on every run -> LOCKSTEP unproven; the readback check is still my bug.
