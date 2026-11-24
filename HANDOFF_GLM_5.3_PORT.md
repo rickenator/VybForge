@@ -8279,3 +8279,28 @@ WHERE THE ECONOMICS ACTUALLY CHANGE: at TP=2 each rank's entire half (~88 GB) is
 cache becomes irrelevant, so there is nothing to compete with. Residency should be judged there, not here.
 CODE STATE: glm_engine has res_get_host (budget-capped, lazy, falls back to gx_read); glm_serve has the
 cache alloc, 52 wired read sites and RES_HOST_STATS. Default P6_HCACHE_GB=0 leaves behaviour unchanged.
+=== ROUND 220: TWO-RANK LAUNCHER RUNS -- AND THE PER-LAYER COMMS COST IS ~0.65 ms ===
+`native/nccl/tp_launch.vyb` + `scripts/tp_launch.sh`: a rank-aware program that rendezvouses over TCP,
+forms an NCCL communicator, then runs a locked-step loop of 4096-element f64 all-reduces (the residual-stream
+width a TP layer must exchange), each iteration verifiable because rank 0 fills 1*(i+1) and rank 1 2*(i+1)
+so the SUM must be 3*(i+1).
+WHAT WORKED: both ranks rendezvous, ncclCommInitRank succeeds on both, and 50 iterations complete with the
+two ranks AGREEING on the cost:
+    rank0: iters=50 total_ms=34 p50_ms=1 p95_ms=1
+    rank1: iters=50 total_ms=32 p50_ms=0 p95_ms=1
+    -> **0.64-0.68 ms per layer all-reduce at 4096 f64 (32 KB)**, throughput ~30 MB/s
+** THE NUMBER THAT MATTERS FOR THE PLAN: 0.65 ms x 45 layers = ~29 ms per token of PURE comms, which is
+ALREADY ABOVE the 20-22 ms/token bar before any compute. ** So TP=2 cannot meet the target by paying this
+collective serially per layer; the reduce must be OVERLAPPED with compute (the usual TP practice) or the
+exchanged payload made smaller. This is the first quantification of the term that decides whether the
+bar is reachable at all -- nccl_bench was written for it rounds ago and its numbers were never preserved.
+MY BUG, NOT A COMMS DEFECT: the verification reports DESYNC on every iteration with got0 = -1.1e-305, i.e.
+denormal garbage rather than a wrong sum. A wrong sum would be a plausible number; garbage means the readback
+is misreading the buffer, so the fault is in my check. The TIMING is unaffected because it measures wall
+clock around the collective, and both ranks independently agree. The value check must be fixed before
+"LOCKSTEP" can be claimed -- do not treat the DESYNC verdict as evidence about the transport.
+ALSO UNRESOLVED: the first scripted launch never started rank 1 (its log stayed empty) while the same rank-1
+command run by hand worked, so `scripts/tp_launch.sh` has an orchestration bug in how it starts the peer.
+The manual two-terminal sequence works, which is how the numbers above were obtained.
+NEXT: (1) fix the readback check so the lockstep claim rests on verification; (2) decide how the per-layer
+reduce is overlapped with compute, since 29 ms/token of serial comms alone exceeds the bar.

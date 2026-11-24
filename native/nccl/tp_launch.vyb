@@ -1,0 +1,184 @@
+// tp_launch.vyb -- the two-rank TP=2 launcher and barrier, plus the per-layer collective cost.
+//
+// Two jobs, deliberately in one program:
+//   1. LAUNCHER/BARRIER: prove rank 0 (lefty) and rank 1 (righty) can rendezvous, form an NCCL communicator
+//      and stay in lockstep for many iterations without drift or deadlock. Everything downstream in TP=2
+//      needs this to exist first.
+//   2. THE MISSING NUMBER: what does ONE per-layer all-reduce actually cost? That has been unquantified
+//      since the NCCL work began (nccl_bench was written for it but its numbers were never preserved).
+//      Each iteration reduces a 4096-element f64 buffer -- the residual-stream width a TP layer must
+//      exchange -- so p50 here is the per-layer comms budget for the TP=2 plan.
+//
+// Barrier correctness is checked, not assumed: iteration i has rank 0 fill 1*(i+1) and rank 1 fill 2*(i+1),
+// so the SUM must be exactly 3*(i+1) on both ranks every single iteration. A rank that fell out of step
+// would produce a different value immediately.
+//
+// Run:
+//   lefty :  RANK=0 WORLD=2 PORT=18420 COUNT=4096 ITERS=200 ...
+//   righty:  RANK=1 WORLD=2 PEER_IP=192.168.192.1 PORT=18420 COUNT=4096 ITERS=200 ...
+import io
+import env
+import time::{time_mono_millis}
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
+
+share(all)
+ncclGetUniqueId(uid<String>)<CInt>
+share(all)
+ncclCommInitRank(comm<loc<Int>>, nranks<Int>, uid<loc<CVoid>>, rank<Int>)<CInt>
+share(all)
+ncclCommCount(comm<Int>, n<loc<Int>>)<CInt>
+share(all)
+ncclGetVersion(v<loc<Int>>)<CInt>
+share(all)
+ncclAllReduce(sbuf<Int>, rbuf<Int>, count<Int>, dt<Int>, op<Int>, comm<Int>, stream<Int>)<CInt>
+share(all)
+nccl_f64()<Int> -> { return 4 }
+share(all)
+nccl_sum()<Int> -> { return 0 }
+share(all)
+blanks(n<Int>)<String> -> {
+    s<String> = ""
+    i<Int> = 0
+    while (i < n) { s = s + " "; i = i + 1 }
+    return s
+}
+
+main()<Int> -> {
+    rank<Int> = 0
+    rv<String> = env_get("RANK") else ""
+    if (rv.len() > 0) { rank = rv.to_int() }
+    world<Int> = 2
+    wv<String> = env_get("WORLD") else ""
+    if (wv.len() > 0) { world = wv.to_int() }
+    port<Int> = 18420
+    pv<String> = env_get("PORT") else ""
+    if (pv.len() > 0) { port = pv.to_int() }
+    peer<String> = env_get("PEER_IP") else "192.168.192.1"
+    count<Int> = 4096
+    cv<String> = env_get("COUNT") else ""
+    if (cv.len() > 0) { count = cv.to_int() }
+    iters<Int> = 200
+    iv<String> = env_get("ITERS") else ""
+    if (iv.len() > 0) { iters = iv.to_int() }
+
+    println("TPLAUNCH rank=" + rank.to_string() + " world=" + world.to_string() + " port=" + port.to_string() + " count=" + count.to_string() + " iters=" + iters.to_string())
+    if (tensor_init() != 0) { println("TPLAUNCH_FAIL cuda"); return 1 }
+
+    # ---- rendezvous: 128-byte unique id over TCP, as in nccl_ping ----
+    uid<String> = blanks(128)
+    if (rank == 0) {
+        grc<Int> = 0
+        freedom { grc = (ncclGetUniqueId(uid) as Int) }
+        if (grc != 0) { println("TPLAUNCH_FAIL getuid rc=" + grc.to_string()); return 11 }
+        fd<Int> = socket_open(2, 1, 0) else 0
+        if (fd == 0) { println("TPLAUNCH_FAIL socket_open"); return 12 }
+        okb<Bool> = socket_bind(fd, "0.0.0.0", port) else false
+        if (!okb) { println("TPLAUNCH_FAIL bind " + port.to_string()); return 13 }
+        okl<Bool> = socket_listen(fd, 4) else false
+        if (!okl) { println("TPLAUNCH_FAIL listen"); return 14 }
+        println("TPLAUNCH listening port=" + port.to_string())
+        c<Int> = socket_accept(fd) else 0
+        if (c == 0) { println("TPLAUNCH_FAIL accept"); return 15 }
+        n<Int> = socket_send(c, uid) else 0
+        println("TPLAUNCH sent uid bytes=" + n.to_string())
+        socket_close(c)
+        socket_close(fd)
+    } else {
+        d<Int> = socket_open(2, 1, 0) else 0
+        if (d == 0) { println("TPLAUNCH_FAIL socket_open"); return 16 }
+        okc<Bool> = socket_connect(d, peer, port) else false
+        if (!okc) { println("TPLAUNCH_FAIL connect " + peer + ":" + port.to_string()); return 17 }
+        got<String> = socket_recv(d, 256) else ""
+        if (got.len() < 128) { println("TPLAUNCH_FAIL uid short"); return 18 }
+        uid = got.substring(0, 128)
+        socket_close(d)
+    }
+
+    comm<Int> = 0
+    var<Int> irc = 0
+    freedom { irc = (ncclCommInitRank(loc(comm), world, uid, rank) as Int) }
+    if (irc != 0) { println("TPLAUNCH_FAIL commInitRank rc=" + irc.to_string()); return 19 }
+    nrank<Int> = 0
+    freedom { ncclCommCount(comm, loc(nrank)) }
+    println("TPLAUNCH comm ready nranks=" + nrank.to_string())
+
+    bytes<Int> = count * 8
+    dbuf<Int> = dev_alloc(bytes)
+    if (dbuf == 0) { println("TPLAUNCH_FAIL dev alloc"); return 20 }
+
+    # ---- warm-up: one untimed exchange so lazily-initialised transport costs are not counted ----
+    fillv<Float> = 1.0
+    if (rank == 1) { fillv = 2.0 }
+    fill<Vec<Float>> = Vec()
+    fi<Int> = 0
+    while (fi < count) { fill.push(fillv); fi = fi + 1 }
+    if (bulk_htod(dbuf, view(fill)) != 0) { println("TPLAUNCH_FAIL htod"); return 21 }
+    sync()
+    var<Int> arc = 0
+    freedom { arc = (ncclAllReduce(dbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+    if (arc != 0) { println("TPLAUNCH_FAIL warmup rc=" + arc.to_string()); return 22 }
+    sync()
+    println("TPLAUNCH warmup done")
+
+    # ---- the locked-step loop: every iteration is verifiable (-1 = unchecked = a rank fell out of step)
+    tAll<Int> = time_mono_millis()
+    bad<Int> = 0
+    firstbad<Int> = -1
+    worst<Int> = 0
+    hist<Vec<Int>> = Vec()
+    it<Int> = 0
+    while (it < iters) {
+        v<Float> = 1.0 * ((it + 1) as Float)
+        if (rank == 1) { v = 2.0 * ((it + 1) as Float) }
+        fv<Vec<Float>> = Vec()
+        fj<Int> = 0
+        while (fj < count) { fv.push(v); fj = fj + 1 }
+        if (bulk_htod(dbuf, view(fv)) != 0) { println("TPLAUNCH_FAIL htod iter=" + it.to_string()); return 23 }
+        sync()
+        t0<Int> = time_mono_millis()
+        freedom { arc = (ncclAllReduce(dbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+        if (arc != 0) { println("TPLAUNCH_FAIL allreduce iter=" + it.to_string()); return 24 }
+        sync()
+        dt<Int> = time_mono_millis() - t0
+        hist.push(dt)
+        if (dt > worst) { worst = dt }
+        # spot-check the sum at both ends of the buffer
+        got<Vec<Float>> = bulk_dtoh(dbuf, count)
+        want<Float> = 3.0 * ((it + 1) as Float)
+        if (got.get(0) != want || got.get(count - 1) != want) {
+            bad = bad + 1
+            if (firstbad < 0) { firstbad = it }
+            println("TPLAUNCH_DESYNC iter=" + it.to_string() + " got0=" + got.get(0).to_string() + " want=" + want.to_string())
+        }
+        it = it + 1
+    }
+    tTot<Int> = time_mono_millis() - tAll
+
+    # percentiles
+    si<Int> = 1
+    while (si < hist.len()) {
+        key<Int> = hist.get(si)
+        b<Int> = si - 1
+        moved<Int> = 0
+        while (b >= 0 && moved == 0) {
+            if (hist.get(b) > key) { hist.set(b + 1, hist.get(b)); b = b - 1 } else { moved = 1 }
+        }
+        hist.set(b + 1, key)
+        si = si + 1
+    }
+    p50<Int> = 0
+    p95<Int> = 0
+    if (hist.len() > 0) {
+        p50 = hist.get(hist.len() / 2)
+        p95 = hist.get((hist.len() * 95) / 100)
+    }
+    println("TPLAUNCH_RESULT rank=" + rank.to_string() + " iters=" + iters.to_string() + " bad=" + bad.to_string() + " firstbad=" + firstbad.to_string())
+    println("TPLAUNCH_LAT p50_ms=" + p50.to_string() + " p95_ms=" + p95.to_string() + " worst_ms=" + worst.to_string() + " total_ms=" + tTot.to_string())
+    mbps<Int> = 0
+    if (tTot > 0) { mbps = ((bytes * iters) / 1048576) * 1000 / tTot }
+    println("TPLAUNCH_THROUGHPUT mbps=" + mbps.to_string() + " bytes=" + bytes.to_string())
+    if (bad != 0) { println("TPLAUNCH_VERDICT DESYNC"); return 30 }
+    println("TPLAUNCH_VERDICT LOCKSTEP")
+    return 0
+}
