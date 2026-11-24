@@ -7520,3 +7520,12 @@ thrashes naturally.
 STATE OF THE MOE LAYER (warm): read 33 + proj 32 + res 13 + sub ~1 = loop ~91 ms, from 350 ms at round 187.
 Everything measurable in the warm regime has now been reduced; what remains is dominated by data movement
 that only shows its true cost under memory pressure.
+=== ROUND 192: gx_read9 IS BYTE-IDENTICAL -- CORRECTNESS DEBT CLOSED ===
+The owed proof: build the pre-change engine (f063db1) and the current one, run both at NLAY=12 with the
+same request, and diff the digest VALUES.
+    RUN A (gx_read9 absent): 27 digest lines
+    RUN B (gx_read9 present): 27 digest lines
+    diff A B: 0 lines
+So the one-open-per-expert read path returns exactly the same bytes as nine per-tensor reads. The diff
+between the two engines is confined to the gx_read9 function and its call site (verified with `git diff`
+before running), so nothing else can explain the identity. The ~12% loop gain from round 191 stands.
