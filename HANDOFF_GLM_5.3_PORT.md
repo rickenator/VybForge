@@ -7720,3 +7720,20 @@ WHAT TO RE-MEASURE NEXT, in order: (a) attribute the ~2.2 s/layer that is not th
 per layer -- it is now the largest single term nobody has split; (b) confirm the step-1 growth is page-cache
 thrash by watching /proc/diskstats across a 45-layer run; (c) only then start the residency work with a
 measured budget instead of an assumed one.
+=== ROUND 201: STEP-0 ATTRIBUTED -- ATTENTION IS NOW THE LARGEST TERM ===
+Summed the per-layer phase timers from the production 45-layer run, grouped by step:
+    step 0: attn=26,775 ms  ffn=17,231 ms  tail=1,011 ms  sum=45,017 ms
+            vs SEC STEP t=0 = 50,986 ms  ->  88% accounted, ~6.0 s elsewhere in the step
+so the step-0 budget is: ATTENTION 53%, FFN/MoE 34%, tail 2%, other 12%.
+CONSEQUENCE: ATTENTION IS NOW THE HOG, NOT THE MoE. 26.8 s over 45 layers is ~595 ms/layer. The DSA fix
+(round 168-173) took the 11 DSA layers to ~45 ms each, so the 34 KDA layers are what carry this -- and they
+have never been attributed in production mode. The MoE work of the last several rounds is the 34%.
+ALSO NOTE: only ONE step emitted per-layer timers (135 lines = 45 layers x 3 phases). Step t=1 (the 116 s
+one) emitted NONE, so the escalating step is entirely unattributed -- that is the biggest single unknown
+left, and it is the one that grows.
+NEXT, in order:
+  1. attribute the KDA attention path in production mode the same way the MoE was attributed (read / deq /
+     projections / other), since it is now the largest measured term;
+  2. find why step t=1 emits no per-layer lines at all -- whether it takes a different branch or the prints
+     are gated -- because a step that grows 2.3x and reports nothing is the highest-value unknown;
+  3. then residency, with a measured budget.
