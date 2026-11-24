@@ -1765,6 +1765,7 @@ delta_rule_cap(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<V
 
 share(all)
 attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, capslot<Int>)<Vec<Float>> -> {
+    t0<Int> = now_ms()
     nonev<Vec<Float>> = Vec()
     a<Int> = 0
     acc<Float> = 0.0
@@ -1884,6 +1885,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     if (fgemm == 0 || fbf == 0) { println("L3_FAIL kernels"); return nonev }
 
     lines = ""
+    t1<Int> = now_ms()
     # ---- q_a latent, q_b, kv_a latent ----
     var<Int> d_qa = 0
     var<Int> d_qb = 0
@@ -1931,6 +1933,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     println(dg2)
     lines = lines + dg2 + "\n"
 
+    t2<Int> = now_ms()
     # ---- per-head absorbed keys/values from kv_b ----
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
     free_dev(d_kvb)
@@ -1938,6 +1941,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     println(dg3)
     lines = lines + dg3 + "\n"
 
+    t3<Int> = now_ms()
     # ---- indexer: projections ----
     var<Int> d_wqb = 0
     var<Int> d_wk = 0
@@ -1991,6 +1995,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     println(dg6)
     lines = lines + dg6 + "\n"
 
+    t4<Int> = now_ms()
     # ---- absorbed per-head keys/values: K = ckv @ [uk_h | ...], V = ckv @ [uv_h | ...] ----
     # kvb holds [heads, nope+v, kv_lora]; uk[h] = kvb[h][:NOPE], uv[h] = kvb[h][NOPE:]
     ukm<Vec<Float>> = Vec()          # [KV_LORA, HEADS*NOPE]
@@ -2032,6 +2037,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     println(dg7)
     lines = lines + dg7 + "\n"
 
+    t5<Int> = now_ms()
     # ---- indexer: gpool pooling + per-query pool scores (dsa_ref.indexer_topk) ----
     ape<Vec<Float>> = Vec()
     raw_ape = gx_read(g, 12)
@@ -2193,6 +2199,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     lines = lines + selline + "\n"
     println(selline)
 
+    t6<Int> = now_ms()
     # ---- masked MLA attention per head, then o_proj ----
     # probs[q][h][i] is materialised once per (query, head): the naive form recomputed the
     # q·k dot inside the value loop, which is O(R^2 * H * VDIM * NOPE) and never finishes.
@@ -2292,6 +2299,16 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     println(dg10)
     lines = lines + dg10 + "\n"
 
+    t7<Int> = now_ms()
+    println("SEC_ATTN capslot=" + capslot.to_string()
+        + " S=" + (t1 - t0).to_string()
+        + " W=" + (t2 - t1).to_string()
+        + " I=" + (t3 - t2).to_string()
+        + " H=" + (t4 - t3).to_string()
+        + " P=" + (t5 - t4).to_string()
+        + " M=" + (t6 - t5).to_string()
+        + " T=" + (t7 - t6).to_string()
+        + " tot=" + (t7 - t0).to_string())
     return attn
 }
 
@@ -2307,6 +2324,11 @@ dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre
     d_flat<Int> = 0
     d_mv<Int> = 0
     d_scr<Int> = 0
+    # ---- DSA phase timers (round 168): three DISJOINT windows so nothing is double-counted.
+    # A = resolve + weight read/dequant + the hc mix gemm + hc_glue + CPU splits + input rms
+    # B = attn_site_c (its own weight dequant + attention + output projection)
+    # C = digests + hc_apply (pure CPU work that has never been measured)
+    tD<Int> = now_ms()
     # ---- hc_attn mix -> collapsed -> input_layernorm -> h_a ----
     w<Vec<String>> = Vec()
     w.push(lpre + "hc_attn_fn")
@@ -2377,10 +2399,14 @@ dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre
         i = i + 1
     }
     h_a<Vec<Float>> = rms_rows(view(collapsed), R, H, in_ln)
+    tA<Int> = now_ms() - tD
+    tD = now_ms()
     lines<String> = ""
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
     attn<Vec<Float>> = attn_site_c(h_a, tab, lpre, fgemm, fbf, ckv_out, ik_out, gsc_out, slot)
+    tB<Int> = now_ms() - tD
+    tD = now_ms()
     dg36<String> = digest("h_a", h_a)
     dg37<String> = digest("attn", attn)
     println(dg37)
@@ -2391,6 +2417,8 @@ dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre
     dg31<String> = digest("streams1", streams1)
     println(dg31)
     lines = lines + dg31 + "\n"
+    tC<Int> = now_ms() - tD
+    println("SEC_DSA slot=" + slot.to_string() + " A=" + tA.to_string() + " B=" + tB.to_string() + " C=" + tC.to_string() + " tot=" + (tA + tB + tC).to_string())
     return streams1
 }
 

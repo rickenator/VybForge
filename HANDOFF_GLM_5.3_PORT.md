@@ -6975,3 +6975,25 @@ and report medians over warm steps. Do not propose a fix until those phases are 
 PROCESS NOTE: this is the third time an I/O explanation for the DSA layers has been asserted and then
 refuted by measurement (rounds 139, 140, and now 166/167). The rule that catches it: never derive a
 cost from an assumed bandwidth -- measure the bandwidth on the actual device first.
+=== ROUND 168: DSA PHASES INSTRUMENTED -- PHASE B IS THE WHOLE COST ===
+Added three DISJOINT timers inside dsa_attn_site_c (native/glm53/glm_engine.vyb):
+  A = resolve + weight read/dequant + hc mix gemm + hc_glue + CPU splits + input rms
+  B = attn_site_c (its own weight dequant + absorbed keys + indexer + attention + o_proj)
+  C = digests + hc_apply      (pure CPU; never measured before)
+Printed as SEC_DSA slot= A= B= C= tot= ; scripts/analyse_dsa.py attributes medians (step 0 separate).
+FIRST RESULT (lefty, NLAY=12, 1 step, 3 DSA layers at n=3,7,11):
+    SEC_DSA slot=0  A=1  B=61   C=0  tot=62
+    SEC_DSA slot=1  A=1  B=947  C=1  tot=949
+    SEC_DSA slot=2  A=1  B=944  C=0  tot=945
+CONCLUSIONS:
+  1. Phase B (attn_site_c) is 99.7% of the DSA layer. Phases A and C are 1 ms and 0-1 ms -- they can
+     never be the hog, and rounds 159-167 spent effort theorising about exactly those (weight residency,
+     disk reads, digest cost).
+  2. slot 0 (layer 3) costs 61 ms while slots 1 and 2 (layers 7, 11) cost ~945 ms: the SAME function on
+     the SAME shapes, 15x apart. That is a POSITION/index signature, not a per-layer property, and it
+     matches the earlier depth-dependence observation (1942 ms at NLAY=45 vs 989 ms at NLAY=24).
+  3. Therefore the next measurement is INSIDE attn_site_c. Added six disjoint internal timers:
+       S = setup/pre-section, W = q_a/q_b/kv_a weight dequant, I = indexer projections,
+       H = absorbed per-head keys/values, P = gpool pooling + per-query pool scores,
+       M = masked MLA attention per head + o_proj
+     printed as SEC_ATTN capslot= S= W= I= H= P= M= T= tot=.
