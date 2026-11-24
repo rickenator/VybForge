@@ -6785,3 +6785,27 @@ PRIME SUSPECT: my own DSA cache. deq_bf16() allocates its output INTERNALLY (n*8
 NEXT FIX (not yet implemented): cache the raw bf16 (235 MB/layer, 2.6 GB total) and dequantise into a
 SINGLE shared scratch buffer, so nothing accumulates. That needs a deq variant taking a preallocated
 output instead of allocating one per call.
+=== ROUND 159: RAW-bf16 DSA CACHE ATTEMPT FAULTED (rc=700); REVERTED TO THE GREEN STATE ===
+Tried the round-158 fix (cache the raw bf16 + dequantise into one shared scratch, so nothing accumulates).
+It faulted on the first DSA layer:
+    DSAUPFAIL alloc rc=700 len=33554432
+    DSAUPFAIL alloc rc=700 len=134217728
+    CHAIN_FAIL weight deq dsa 7
+rc=700 = CUDA_ERROR_ILLEGAL_ADDRESS at a LATER allocation, i.e. the context was already faulted by an
+earlier illegal access in the new path (deq_bf16_into with a caller-provided buffer, or the scratch
+sizing). The run covered only 2 layers before aborting.
+REVERTED both files to HEAD. The tree now holds the VERIFIED state:
+    - DSA output-cache version (deq_bf16 outputs cached per layer): 2.5x end to end, and
+    - the four-pass sweep PASS at a8a7ed8 (prefill 45/45, 9810 comparisons 0 failures, 20/20 argmax,
+      decode digests bit-identical).
+WHY REVERT RATHER THAN DEBUG IN PLACE: a faulting allocate inside the decode path can poison the context
+for everything after it, so leaving it in the tree would have made the next session's first 45-layer run
+meaningless. A broken-but-pushed decode path is worse than a slower one.
+WHAT IS STILL OPEN (unchanged by this attempt):
+    1. The 11 DSA layers cost 1.0-5.0 s each, STAIRCASING with layer index (28 s of a 37.4 s step). The
+       allocator-accumulation hypothesis fit that shape but the implementation faulted, so it remains a
+       HYPOTHESIS, not a finding.
+    2. The flat ~930 ms population at n=29,33,37,41 is unexplained.
+    3. Absolute tok/s still unmeasured.
+NEXT ATTEMPT should: verify deq_bf16_into standalone in a probe (p6r-style, one tensor, compare against
+deq_bf16) BEFORE wiring it into the layer loop -- the same rule as every other win this session.
