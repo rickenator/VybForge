@@ -7323,3 +7323,19 @@ it is compute-bound on fp64 and the only remaining lever is f32/bf16. If it does
 still overhead to find.
 PROCESS NOTE: godzilla is NOT a target for this work. Compile/syntax gates run on lefty; using the x86 box
 both wastes cycles and muddies reports with its own CUDA-context failures.
+=== ROUND 183: FP64 IS COMPUTE-BOUND AT ~50 GFLOP/s -- PRECISION IS THE LAST LEVER ===
+K-scaling test on the blocked kernel (M=1, N=2048), the check that decides between "more kernel work" and
+"change the numeric type":
+    K=4096 : 342 us   49.1 GFLOP/s
+    K=8192 : 618 us   54.3 GFLOP/s     (1.81x the time for 2x the K)
+The RATE holds while the time scales with work, which is what a throughput limit looks like. So blocking is
+done: chains are short, blocks fill the GPU, and the kernel now runs at the fp64 ceiling. bfgemm8 sustains
+537 GFLOP/s in f32 -- roughly 10x -- so the remaining headroom is in the NUMERIC TYPE, not the schedule.
+OPEN DEFECT, unexplained, flagged rather than buried: in the same K=8192 run the tensor-parallel comparison
+FAILED (maxabs=2, maxrel=0.5, ref 4 vs got 6) while the identical check at K=4096 was exact (maxabs=0), and
+the blocked-vs-reference check stayed exact at both sizes. So the row-parallel path has a size-dependent
+defect at K=8192 that has NOT been diagnosed. Until it is, TP is only proven at K=4096 and must not be
+assumed correct at arbitrary K. Likely places to look: the host-side A column gather (KOFF/KH arithmetic),
+the B row slice, or a stale device buffer reused across sizes.
+NEXT, in order: (1) explain the K=8192 TP mismatch -- correctness before optimisation; (2) then decide
+f32/bf16 for the hot path, which is where the 10x lives and which also halves every comms payload.
