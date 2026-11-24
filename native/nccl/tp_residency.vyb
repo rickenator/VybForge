@@ -1,0 +1,141 @@
+// tp_residency -- the gate for TP=2 residency: can a Spark hold its share of the model on the GPU?
+//
+// Rationale: the single-node engine streams 175.62 GB of weights per step because they do not fit in
+// 121 GB. TP=2 splits them 88.50/87.13 GB per node, which DOES fit -- but only if the device can hold
+// that much RESIDENT, and a lazy allocation proves nothing (unified memory commits pages on touch).
+// So this allocates the target size in chunks and WRITES every byte of each chunk with a device kernel,
+// then holds it, so the shell can observe real memory in use from both nodes at once.
+//
+//   lefty :  RESIDENT_MB=90112 CHUNK_MB=2048 HOLD_S=30 VYB_STDLIB=... vyb tp_residency.vyb
+//   righty:  RESIDENT_MB=89088 CHUNK_MB=2048 HOLD_S=30 ...
+//
+// Prints TPRES_ALLOC / TPRES_HOLD / TPRES_DONE plus a FAIL line on any allocation or launch error.
+import io
+import env
+import time::{time_mono_millis, sleep_ms}
+
+extern "C" {
+    cuInit(flags<CUInt>)<CInt>
+    cuDeviceGet(device<loc<CInt>>, ordinal<CInt>)<CInt>
+    cuCtxCreate_v2(pctx<loc<loc<CVoid>>>, flags<CUInt>, dev<CInt>)<CInt>
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+// fill_bytes(dst, n, seed) takes THREE int params -- the dq1s4_probe launch1 helper passes only one,
+// which would leave n=0 and write nothing, so residency needs its own launcher.
+share(all)
+launch3(hf<Int>, g<Int>, p0<Int>, p1<Int>, p2<Int>)<Int> -> {
+    freedom {
+        rc<CInt> = cuda_launch4i(from<loc<CVoid>>(hf), g, 1, 1, 256, 1, 1, p0, p1, p2, 0)
+        return rc
+    }
+    return 1
+}
+
+share(all)
+init_cuda()<Int> -> {
+    freedom {
+        if (cuInit(0) != 0) { return 1 }
+        dev<CInt> = 0
+        if (cuDeviceGet(loc(dev), 0) != 0) { return 2 }
+        ctx<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuCtxCreate_v2(loc(ctx), 0, dev) != 0) { return 3 }
+        return 0
+    }
+    return 9
+}
+
+share(all)
+allocb(bytes<Int>)<Int> -> {
+    freedom {
+        p<Int> = 0
+        rc<Int> = cuMemAlloc_v2(loc(p), bytes) as Int
+        if (rc != 0) { return 0 }
+        return p
+    }
+    return 0
+}
+
+share(all)
+loadmod(path<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(path)) { f -> { match (read_all(f)) { g -> { ptx = g } ? -> { return 0 } } } ? -> { return 0 } }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        return addr(m)
+    }
+    return 0
+}
+
+share(all)
+mfunc(hmod<Int>, name<String>)<Int> -> {
+    freedom {
+        f<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(f), from<loc<CVoid>>(hmod), name) != 0) { return 0 }
+        return addr(f)
+    }
+    return 0
+}
+
+main()<Int> -> {
+    mbT<Int> = 90112
+    sv<String> = env_get("RESIDENT_MB") else ""
+    if (sv.len() > 0) { mbT = sv.to_int() }
+    chunkMb<Int> = 2048
+    sv2<String> = env_get("CHUNK_MB") else ""
+    if (sv2.len() > 0) { chunkMb = sv2.to_int() }
+    holdS<Int> = 30
+    sv3<String> = env_get("HOLD_S") else ""
+    if (sv3.len() > 0) { holdS = sv3.to_int() }
+
+    e0<Int> = init_cuda()
+    if (e0 != 0) { println("TPRES_FAIL cuda=" + e0.to_string()); return 1 }
+    mF<Int> = loadmod("native/build/dq1s4_fill.ptx")
+    if (mF == 0) { println("TPRES_FAIL module"); return 2 }
+    fF<Int> = mfunc(mF, "fill_bytes")
+    if (fF == 0) { println("TPRES_FAIL func"); return 2 }
+
+    chunkB<Int> = chunkMb * 1048576
+    want<Int> = mbT * 1048576
+    bufs<Vec<Int>> = Vec()
+    total<Int> = 0
+    t0<Int> = time_mono_millis()
+    while (total < want) {
+        b<Int> = chunkB
+        if (want - total < b) { b = want - total }
+        p<Int> = allocb(b)
+        if (p == 0) {
+            println("TPRES_FAIL alloc at " + (total / 1048576).to_string() + "MB (wanted " + mbT.to_string() + "MB)")
+            return 3
+        }
+        blocks<Int> = (b + 255) / 256
+        rc<Int> = launch3(fF, blocks, p, b, 7)
+        if (rc != 0) { println("TPRES_FAIL fill rc=" + rc.to_string()); return 4 }
+        freedom { cuCtxSynchronize() }
+        bufs.push(p)
+        total = total + b
+    }
+    t1<Int> = time_mono_millis()
+    println("TPRES_ALLOC mb=" + (total / 1048576).to_string() + " chunks=" + bufs.len().to_string() + " ms=" + (t1 - t0).to_string())
+
+    # hold, so both nodes can be observed at once from the shell. A busy wait on time_mono_millis()
+    # was optimised away / exited immediately, so the hold must be a real syscall sleep.
+    println("TPRES_HOLD s=" + holdS.to_string())
+    sleep_ms(holdS * 1000)
+
+    i<Int> = 0
+    while (i < bufs.len()) {
+        freedom { cuMemFree_v2(bufs.get(i)) }
+        i = i + 1
+    }
+    println("TPRES_DONE freed=" + bufs.len().to_string())
+    return 0
+}

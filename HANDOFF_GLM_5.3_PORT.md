@@ -7961,3 +7961,32 @@ none of them is a defect: they are the cost of streaming 175.62 GB per step thro
 The one remaining lever of the size required is RESIDENCY (TP=2, 88.50/87.13 GB per node), whose comms
 support is already proven bit-exact. That is an architectural change, not a hog hunt, and it is the
 next body of work.
+=== ROUND 211: TP=2 IS THE DEFAULT -- RESIDENCY GATE PASSED ===
+DIRECTION (Rick, explicit): the dual-Spark TP=2 residency architecture was always the intended target; the
+single-node streaming engine was training weights. TP=2 is now the DEFAULT, not an option.
+FIRST GATE, and the one everything else depends on -- can each Spark hold its share on the device?
+`native/nccl/tp_residency.vyb` allocates the target in 2 GB chunks and WRITES every byte of each chunk with
+a device kernel (fill_bytes from dq1s4_fill.ptx), because a lazy allocation proves nothing: GB10 is unified
+memory and pages commit on touch.
+    lefty  (RESIDENT_MB=90112): TPRES_ALLOC mb=90112 chunks=44 ms=6329   -> freed 44, no FAIL
+    righty (RESIDENT_MB=89088): TPRES_ALLOC mb=89088 chunks=44 ms=3182   -> freed 44, no FAIL
+So 88 GB on lefty and 87 GB on righty are allocatable and fully touchable, matching the measured shard split
+(88.50 / 87.13 GB). The nodes share no memory, so simultaneity is arithmetic rather than an observation to
+be timed -- each holds its own share inside its own 121 GB. THE MEMORY BUDGET IS CONFIRMED; residency is
+feasible and the rest of the TP=2 work is engineering, not risk.
+TOOLING NOTES EARNED THIS ROUND:
+  * righty is gx10-12c9, LAN 192.168.1.250. Its RoCE address 192.168.192.2 is reachable from lefty but NOT
+    from godzilla, so orchestration must ssh to the LAN address and reserve the RoCE IP for NCCL internals.
+  * `sleep_ms` in stdlib/time works (verified 2 s, 6 s, 60 s all exact) -- a busy-wait on time_mono_millis()
+    does NOT hold and must not be used for pacing.
+  * pkill -f "<script name>" KILLED ITS OWN SSH SHELL, because the remote command line contains the script
+    name. This is the round-170 trap recurring in a new costume: an earlier run was still alive and writing
+    to the same log, which made a 60 s hold look like an immediate exit. Use ps + explicit PID, or a
+    bracket/concatenation trick, and give each run its own log file.
+NEXT IN THE TP=2 PLAN, in order:
+  1. sharded weight residency: each rank loads only its half of every tensor and keeps it resident
+     (allocate once, dequantise once at startup) -- this is what removes the 50-67% per-step weight load;
+  2. per-layer row-parallel GEMM + NCCL all-reduce (primitives proven: all-reduce bit-exact, blocked kernel
+     342 us vs 556);
+  3. two-rank launcher with the LAN addresses and a real barrier;
+  4. verification gate that exercises the TP path end to end against the single-node reference.
