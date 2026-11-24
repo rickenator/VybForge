@@ -7757,3 +7757,27 @@ NEXT, in order:
      covers a term that is currently 0% measured;
   2. split layerbody: shared-expert vs routed-expert vs the rest, since ~0.8 s/layer there is unexplained;
   3. find why step t=1 (116 s) is 2.3x step t=0 and emits no per-layer lines of its own.
+=== ROUND 203: THE DECODE STEP RUNS AN INLINE ATTENTION PATH, NOT THE ENGINE'S ===
+The 0.8 s/layer that round 202 could not place inside `layerbody` is ATTENTION, and the reason it looked odd
+is structural: **the decode step does not call the engine's attention sites at all.**
+- `grep attn_site` finds exactly TWO call sites (glm_serve:728 dsa_attn_site_c, :731 kda_attn_site_c) and
+  BOTH are inside the PREFILL loop (they are what print SEC P1attn).
+- The phase-2 layer body (glm_serve:973 onwards) computes attention INLINE: a call inventory over
+  1075-1400 shows 24 gx_read, 18 deq_bf16, 8 bulk_dtoh, 7 mm_host, 11 free_dev, 5 alloc_dev -- i.e. the
+  old-style read/dequantise/host-matvec path written out per layer, with no site function and no timers of
+  its own.
+CONSEQUENCE 1: `SEC layerbody` spans attention PLUS the MoE. With layerbody ~1.1 s/layer and the MoE
+(moekern) ~0.3 s/layer, DECODE ATTENTION IS ~0.8 s/layer, i.e. ~36 s per step -- the single largest term in
+the decode step, and it has never appeared in any timer.
+CONSEQUENCE 2, and the important one: **EVERY ENGINE-SIDE ATTENTION OPTIMISATION FROM THIS SESSION IS
+PREFILL-ONLY.** The DSA fix that took `dsa_attn_site_c` from ~950 ms to ~45 ms per layer (rounds 168-173)
+does not run on the decode path at all. The decode path still does its own gx_read + deq_bf16 + mm_host
+sequence per layer. That also re-explains why the full-depth end-to-end numbers never moved despite a 20x
+"attention win": the win was in a function decode does not call.
+NEXT (highest value first):
+  1. put a timer around the inline attention block in the phase-2 layer body so the ~0.8 s/layer is split
+     (reads / deq / matvec) the same way the MoE was;
+  2. then port the engine's fused attention path into the decode loop -- the work already exists and is
+     proven, it is simply wired to the wrong phase;
+  3. re-measure the step afterwards; on current numbers, moving decode attention from ~0.8 s to anything
+     near the prefill site's ~45 ms per layer would be the largest single win available anywhere.
