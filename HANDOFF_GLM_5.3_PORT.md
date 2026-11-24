@@ -7595,3 +7595,35 @@ STATE OF THE NIGHT'S WORK: rounds 187-194 stand as committed progress (MoE 350 -
 pass at 438.66 s vs 471.46 s baseline, resolver 85 -> 12 ms warm, gx_read9 proven byte-identical). The
 pending item is a trustworthy rig, then the sync removal, then the streaming/residency question that still
 accounts for ~98% of a real pass.
+=== ROUND 196: THE DECODE PATH IS INTERMITTENTLY DYING AFTER THE ROUTER ===
+Three identical guarded trials (NLAY=12, NSTEPS=2, fresh server each, clean GPU):
+    trial 1: req1 19.08 s, empty response body, no SEC moekern
+    trial 2: req1 19.06 s, empty body, no SEC moekern
+    trial 3: req1 18.43 s, empty body, no SEC moekern
+and the log for each ENDS abruptly right after the ROUTER stage:
+    12 x SEC P1attn  (so all 12 layers are entered)
+    FDEC on: fused decode path
+    BDPROBE r0=... n=4096 / n=24 / n=288   (the router logits)
+    <nothing further -- no expert lines, no SEC moestage, no SEC moekern, no error message>
+That is a CRASH (or an abort with no diagnostic), not a skipped stage: a skip would still reach the
+SEC moestage/moekern prints at the end of moe_tail_step. The empty response body is consistent with the
+serve dying mid-request.
+IT IS INTERMITTENT: the same binary produced 12 clean SEC moekern lines (288 SEC fp calls, loop 93-107 ms)
+about 20 minutes earlier, with no code change in between. So the decode MoE can complete and can also die
+after routing, run to run.
+WHY THIS BLOCKS THE GOAL: every remaining optimisation (sync removal, streaming, residency) is measured on
+the decode MoE. If the path intermittently dies after routing, a "fast" run is a run that crashed early,
+and a VALID run may not be reproducible. Optimising now risks building on unstable ground.
+ALSO FIXED: the round-195 validity guard was itself buggy -- `grep -c` exits 1 on zero matches, so
+`$(grep -c ... || echo 0)` produced "0\n0" and the numeric test fell through to the VALID branch, printing
+"VALID_RUN: 0". The guard now uses `grep -q` to decide and only then counts, so a crashed/skipped run is
+reported INVALID_RUN.
+NEXT (recommitted to the handoff as the immediate work): find why the decode MoE dies after the router.
+Cheapest first steps: capture the process exit status and any stderr from the serve (run_fgate discards
+them into the log, but a segfault line would appear -- none does, so check `dmesg` for an OOM kill or a
+fault, and run one pass under `ulimit -c` / a core dump); check MemAvailable at the moment of death --
+8 experts x 12.6 MB plus the arena on a 121 GB box holding a 175 GB model is exactly where memory
+pressure would bite; and re-run the control that worked to confirm it is still reproducible.
+ROUNDS 187-194 REMAIN VALID AND COMMITTED (they each had a VALID run):
+  MoE layer 350 -> ~91-107 ms; full 12-layer pass 438.66 s vs 471.46 s baseline; resolver 85 -> 12 ms warm;
+  gx_read9 proven byte-identical; fused_proj attributed (up 35 ms / kernels+syncs 99 ms over 144 calls).

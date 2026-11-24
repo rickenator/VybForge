@@ -75,12 +75,15 @@ kill "$SRV" 2>/dev/null
 # moe_tail_step -- the log then has digests but zero "SEC moekern" lines, and any per-layer MoE number
 # read from it is meaningless (it is prefill only, or a cached answer). A run that does not exercise the
 # decode MoE must be treated as INVALID, never as a measurement.
-MOEKERN=$(grep -c "SEC moekern" "$LOG" 2>/dev/null || echo 0)
-if [ "$MOEKERN" -eq 0 ]; then
-  echo "INVALID_RUN: no SEC moekern lines -- the decode MoE stage never ran; do not use these numbers."
-  echo "INVALID_RUN" > "$LOG.invalid"
-else
+# NOTE: `grep -c` exits 1 when it finds nothing, so `$(grep -c ... || echo 0)` yields "0\n0" and a
+# numeric test on it silently falls into the wrong branch -- use -q to decide, then count.
+if grep -q "SEC moekern" "$LOG" 2>/dev/null; then
+  MOEKERN=$(grep -c "SEC moekern" "$LOG")
   rm -f "$LOG.invalid"
   echo "VALID_RUN: $MOEKERN moekern layer-lines."
+else
+  echo "INVALID_RUN: no SEC moekern lines -- the decode MoE stage never ran (or the process died in it);"
+  echo "             do not use these numbers."
+  echo "INVALID_RUN" > "$LOG.invalid"
 fi
 echo "DONE"
