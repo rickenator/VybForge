@@ -6851,3 +6851,29 @@ WHAT SURVIVES AND WHAT DOES NOT:
 THE LESSON, and it belongs next to the measurement rule: WHEN THE THING YOU ARE TESTING CHANGES MEMORY
 FOOTPRINT, CROSS-RUN COMPARISONS ARE INVALID. Compare ON/OFF configurations back to back in the same
 condition (as here), never run A on Monday and run B on Tuesday.
+=== ROUND 162: STATE AT PAUSE -- WHAT STANDS, WHAT IS OPEN, WHAT TO DO NEXT ===
+The goal was "keep iterating until the performance hogs are eliminated". They are NOT eliminated. Honest
+status:
+STANDS (verified, four-pass sweep green):
+    - fused MoE on BOTH paths (prefill P6_FUSED_ONLY=1, decode P6_FUSED_DEC=1), deterministic output.
+    - prefill: load_fn hoisting + partial-buffer preallocation, 1668 -> 850 ms (both measured WITHIN one
+      run, well outside noise).
+    - DSA output cache: REMOVED (measured harmful: cache on 120 s vs off 97 s, round 161).
+WITHDRAWN this session (my own claims, each corrected):
+    - "175 GB/token from disk, I/O-bound" (round 139) -- refuted by /proc/io.
+    - "2.5x from the DSA cache" (round 156) -- between-run page-cache warming, not the change.
+    - "the cache accumulation explains the DSA staircase" (round 159) -- refuted: 24 layers are FLAT.
+OPEN, in order of evidence:
+    1. THE DSA LAYERS ARE THE HOG: 11 of 45 layers at ~1.9-3.0 s each (cache off), ~2/3 of a decode step.
+       Their cost is DEPTH-DEPENDENT (layer 3 costs 1942 ms at NLAY=45 vs 989 ms at NLAY=24), i.e. a
+       memory-footprint effect on a 121 GB machine touching a 175.6 GB checkpoint -- not an algorithmic
+       defect in the layer. Nothing engine-side tried so far has moved it.
+    2. The flat ~930 ms population at n=29,33,37,41 is unexplained.
+    3. Absolute tok/s never measured cleanly (needs full depth, many steps, dumps off, back-to-back).
+NEXT CONCRETE STEP: the deq_bf16_into probe (native/host/p6r18, written this round then removed because
+it needed import plumbing: env_get, GxLoc, gx_read, dev_alloc, bulk_dtoh, time_mono_millis, and the CUDA
+binding). Model it on p6r10's import block rather than building the list from scratch. Its purpose: prove
+the preallocated-output dequantise matches deq_bf16 and is faster, BEFORE wiring it into the DSA branch
+to remove ~872 MB of per-layer alloc churn. That is the last identified engine-side lever; if it does not
+move the depth effect, the remaining work is deployment-level (fit the working set in memory) rather than
+code.
