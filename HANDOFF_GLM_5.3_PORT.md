@@ -6729,3 +6729,19 @@ WHERE THE INVESTIGATION STANDS (this is the honest summary after rounds 139-155)
       path, which is the next thing to instrument.
 NEXT: find the DSA layer branch in glm_serve's step loop (the else-side, around the KDA/DSA split) and
 instrument it. That branch is ~14 s of a ~66 s step and has no timer at all.
+=== ROUND 156: DSA ATTENTION-WEIGHT CACHE -- 2.5x END TO END ===
+Located the untimed branch: `is_dsa = 1` when `(n % 4) == 3` -> 11 of 45 layers, exactly the 14 per
+step that neither take the n<3 dense branch nor call moe_tail_step (11 DSA + 3 dense). That branch makes
+18 deq_bf16 calls per layer, THREE of which are 93% of the bytes:
+    q_b 25.2 M params =  50 MB   kv_b 16.8 M = 34 MB   o 67.1 M = 134 MB   -> ~235 MB/layer
+    11 layers -> 2.6 GB re-read AND re-dequantised PER STEP, ~9 s at 280 MB/s
+They are immutable layer weights, so they are now cached per layer (dsaQB/dsaKVB/dsaO/dsaOK).
+RESULT (45 layers, 3 steps, dumps off):
+    wall            127 s      (was 318 s)     -> 2.5x
+    median layerbody 25 ms     (was  42 ms)    -> 1.7x
+    step totals      37 s for step 0, and the 65 -> 68 s GROWTH across steps is GONE
+    max layerbody   4974 ms    (was 4987)      -> unchanged: a few layers still cost seconds
+So the per-step re-reading was the growth term, and a handful of layers remain slow for a reason not yet
+identified. Decode is now ~2.5x faster than at the start of these rounds.
+CAVEAT: this is the same request shape as before (22 ids, 3 steps), dumps off. The absolute tok/s still
+needs the full-depth, full-step measurement, and the remaining max-latency layers need their own look.

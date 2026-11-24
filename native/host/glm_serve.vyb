@@ -148,6 +148,14 @@ main()<Int> -> {
     dcacheU<Vec<Int>> = Vec()
     dcacheD<Vec<Int>> = Vec()
     dcacheOK<Vec<Int>> = Vec()
+    # DSA attention-weight cache: the q_b / kv_b / o projections are 25.2M + 16.8M + 67.1M params
+    # (218 of the ~235 MB a DSA layer reads) and were re-read AND re-dequantised on every one of the
+    # 11 DSA layers on every step -- ~2.6 GB/step, ~9 s at disk speed. They are immutable layer
+    # weights, so they are cached here after the first use.
+    dsaQB<Vec<Int>> = Vec()
+    dsaKVB<Vec<Int>> = Vec()
+    dsaO<Vec<Int>> = Vec()
+    dsaOK<Vec<Int>> = Vec()
     tnb<String> = ""
     tnb2<String> = ""
     tln<Int> = 0
@@ -886,6 +894,10 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                         dcacheU.push(0)
                         dcacheD.push(0)
                         dcacheOK.push(0)
+                        dsaQB.push(0)
+                        dsaKVB.push(0)
+                        dsaO.push(0)
+                        dsaOK.push(0)
                         dci = dci + 1
                     }
                     println("DCACHE sized=" + dcacheOK.len().to_string())
@@ -1065,14 +1077,32 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
 
                                 g_lg_4 = gx_read(lg, 4)
                                 d_qa = deq_bf16(fbf, g_lg_4, sv_Q_LORA * sv_H, sv_H)
-                                g_lg_6 = gx_read(lg, 6)
-                                d_qb = deq_bf16(fbf, g_lg_6, sv_HEADS * sv_NOPE * sv_Q_LORA, sv_Q_LORA)
+                                if (dsaOK.get(n) == 0) {
+                                    g_lg_6 = gx_read(lg, 6)
+                                    d_qb = deq_bf16(fbf, g_lg_6, sv_HEADS * sv_NOPE * sv_Q_LORA, sv_Q_LORA)
+                                } else {
+                                    d_qb = dsaQB.get(n)
+                                }
                                 g_lg_7 = gx_read(lg, 7)
                                 d_kva = deq_bf16(fbf, g_lg_7, sv_KV_LORA * sv_H, sv_H)
-                                g_lg_9 = gx_read(lg, 9)
-                                d_kvb = deq_bf16(fbf, g_lg_9, sv_HEADS * (sv_NOPE + sv_VDIM) * sv_KV_LORA, 0)
-                                g_lg_10 = gx_read(lg, 10)
-                                d_o = deq_bf16(fbf, g_lg_10, sv_HEADS * sv_VDIM * sv_H, sv_HEADS * sv_VDIM)
+                                if (dsaOK.get(n) == 0) {
+                                    g_lg_9 = gx_read(lg, 9)
+                                    d_kvb = deq_bf16(fbf, g_lg_9, sv_HEADS * (sv_NOPE + sv_VDIM) * sv_KV_LORA, 0)
+                                } else {
+                                    d_kvb = dsaKVB.get(n)
+                                }
+                                if (dsaOK.get(n) == 0) {
+                                    g_lg_10 = gx_read(lg, 10)
+                                    d_o = deq_bf16(fbf, g_lg_10, sv_HEADS * sv_VDIM * sv_H, sv_HEADS * sv_VDIM)
+                                } else {
+                                    d_o = dsaO.get(n)
+                                }
+                                if (dsaOK.get(n) == 0) {
+                                    dsaQB.set(n, d_qb)
+                                    dsaKVB.set(n, d_kvb)
+                                    dsaO.set(n, d_o)
+                                    dsaOK.set(n, 1)
+                                }
                                 g_lg_11 = gx_read(lg, 11)
                                 d_wqb = deq_bf16(fbf, g_lg_11, sv_Q_LORA * sv_IHEADS * sv_IDIM, sv_Q_LORA)
                                 g_lg_12 = gx_read(lg, 12)
