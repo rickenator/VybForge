@@ -6877,3 +6877,19 @@ the preallocated-output dequantise matches deq_bf16 and is faster, BEFORE wiring
 to remove ~872 MB of per-layer alloc churn. That is the last identified engine-side lever; if it does not
 move the depth effect, the remaining work is deployment-level (fit the working set in memory) rather than
 code.
+=== ROUND 163: PROBE ATTEMPT #2 -- ABANDONED FOR A BETTER VEHICLE ===
+Retried the deq_bf16_into probe twice with p6r10's real import block:
+  attempt 1: gx_resolve_tab returned nothing (the layer-tab cache must be built from disk first,
+             which is p6r10's ~40-line cache parse).
+  attempt 2 (synthesised input): Vyb Strings have no `push`, so a byte string cannot be built
+             element-wise; Vyb has no cheap way to construct an arbitrary bf16 buffer from literals.
+Both removed; tree restored to the verified state.
+THE BETTER VEHICLE, for next time: do not build a new probe. Wire deq_bf16_into into the DSA branch
+behind a flag (P6_DEQ_INTO=1) and run the EXISTING gate -- sweep pass 4 compares decode digests
+bit-identically, so if the values are wrong it fails loudly, and if it faults (rc=700) the run dies
+visibly instead of silently. That is one cycle instead of three, and it uses a gate that is already
+trusted rather than a new instrument that itself needs verifying.
+STATE UNCHANGED FROM ROUND 162: the hogs are NOT eliminated. DSA layers remain ~1.9-3.0 s each with a
+depth-dependent cost that points at memory footprint rather than a per-layer defect. Engine-side levers
+tried and refuted: output caching (harmful), cache-accumulation (refuted). Remaining: preallocated
+dequantise output (untested), or deployment-level residency.
