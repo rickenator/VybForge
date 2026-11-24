@@ -1,0 +1,105 @@
+// gemm_blk32.vyb -- the f32 twin of gemm_blk, identical blocking and identical params layout.
+//
+// Purpose: an A/B that isolates NUMERIC TYPE from SCHEDULE. gemm_blk and gemm_blk32 differ only in the
+// element type (f64 vs f32 accumulate, f32 partials), so any speed difference is precision and any
+// accuracy difference is precision -- nothing else moves.
+//
+// Why: fp64 on this part is compute-bound at ~50 GFLOP/s and blocking cannot improve it further
+// (measured: 342 us at K=4096, 618 us at K=8192, rate flat at 49-54 GFLOP/s while time scales). bfgemm8
+// sustains ~537 GFLOP/s in f32, so the remaining headroom is the type, not the kernel shape. This
+// benchmark decides whether that headroom is real and what it costs in accuracy.
+//
+// PARAMS (device, 72 B): +0 A, +8 B, +16 C, +24 M, +32 N, +40 K, +48 KSPLIT, +56 BCOLS, +64 P
+gemm_blk32(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    KSPLIT<Int> = ld_i64(p + 48)
+    BCOLS<Int> = ld_i64(p + 56)
+    P<Int> = ld_i64(p + 64)
+
+    perblock<Int> = dim_x() * BCOLS
+    ntiles<Int> = (N + perblock - 1) / perblock
+
+    bid<Int> = blk_x()
+    tile<Int> = bid % ntiles
+    kchunk<Int> = bid / ntiles
+
+    n0<Int> = tile * perblock + tid_x() * BCOLS
+    kspan<Int> = (K + KSPLIT - 1) / KSPLIT
+    kbase<Int> = kchunk * kspan
+    kend<Int> = kbase + kspan
+    if (kend > K) { kend = K }
+
+    m<Int> = 0
+    while (m < M) {
+        a0<Float32> = 0.0
+        a1<Float32> = 0.0
+        a2<Float32> = 0.0
+        a3<Float32> = 0.0
+        kk<Int> = kbase
+        for (kk in kbase..kend - 1) {
+            av<Float32> = ld_f32(A + (m * K + kk) * 4)
+            row<Int> = B + (kk * N + n0) * 4
+            a0 = a0 + av * ld_f32(row + 0)
+            if (BCOLS > 1) { a1 = a1 + av * ld_f32(row + 4) }
+            if (BCOLS > 2) { a2 = a2 + av * ld_f32(row + 8) }
+            if (BCOLS > 3) { a3 = a3 + av * ld_f32(row + 12) }
+        }
+        base<Int> = P + ((m * N + n0) * KSPLIT + kchunk) * 4
+        st_f32(base + 0, a0)
+        if (BCOLS > 1) { st_f32(base + KSPLIT * 4, a1) }
+        if (BCOLS > 2) { st_f32(base + 2 * KSPLIT * 4, a2) }
+        if (BCOLS > 3) { st_f32(base + 3 * KSPLIT * 4, a3) }
+        m = m + 1
+    }
+}
+
+// f32 reduce, fixed index order: deterministic, same contract as gemm_red.
+gemm_red32(p<Int>) -> {
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    KSPLIT<Int> = ld_i64(p + 48)
+    P<Int> = ld_i64(p + 64)
+
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Float32> = 0.0
+        j<Int> = 0
+        for (j in 0..KSPLIT - 1) {
+            s = s + ld_f32(P + (gid * KSPLIT + j) * 4)
+        }
+        st_f32(C + gid * 4, s)
+    }
+}
+
+// Cast kernels take a PARAMS pointer, not separate arguments: cuda_launch4i / launch1 passes ONE base
+// pointer, so every argument travels in the params block. Layout for both casts: +0 src, +8 dst, +16 n.
+//
+// cast64to32 narrows an f64 array to f32 so the A/B feeds BOTH GEMMs from the same source values -- the
+// f32 path must not be handed separately-built data, or a mismatch could come from the input rather than
+// from the accumulate type.
+cast64to32(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f32(dst + gid * 4, ld_f64(src + gid * 8) as Float32)
+    }
+}
+
+// cast32to64 widens the f32 result back so it can be compared against the f64 reference with one readback.
+cast32to64(p<Int>) -> {
+    src<Int> = ld_i64(p + 0)
+    dst<Int> = ld_i64(p + 8)
+    n<Int> = ld_i64(p + 16)
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < n) {
+        st_f64(dst + gid * 8, ld_f32(src + gid * 4) as Float)
+    }
+}

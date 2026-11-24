@@ -1,0 +1,195 @@
+// f32_ab.vyb -- A/B the fp64 and fp32 blocked GEMMs on identical data: what does f32 buy, and what does
+// it cost in accuracy?
+//
+// Single node, no comms: this is a kernel question. The two kernels have IDENTICAL blocking (same tiles,
+// same BCOLS, same KSPLIT, same params layout) and differ ONLY in element type, so the speed delta is
+// precision and the accuracy delta is precision. Nothing else can explain a difference.
+//
+// Inputs are built once in f64 and narrowed with cast64to32, so the f32 path cannot be blamed on
+// separately-built data.
+//
+// The accuracy gate is explicit and stated before the run: the project's MoE projection gate is 3e-05
+// absolute on values of this magnitude, so f32 must land well inside that. K=4096 sums of O(1) terms
+// should give ~1e-6 relative error (f32 eps 1.2e-07 scaled by sqrt(K)); anything near 1e-4 means the
+// accumulate is wrong, not merely imprecise.
+import io
+import env
+import tensor::{tensor_init, dev_alloc, module_load_path, module_func, bulk_htod, bulk_dtoh, sync, htod_i, launch1}
+
+share(all)
+clock_gettime(clk<CInt>, tp<loc<CVoid>>)<CInt>
+
+clock_ns()<Int> -> {
+    ts<Vec<Int>> = Vec()
+    ts.push(0)
+    ts.push(0)
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(ts))
+        dp<Int> = at(hdr)
+        if (dp != 0) { clock_gettime(1, from<loc<CVoid>>(dp)) }
+    }
+    return ts.get(0) * 1000000000 + ts.get(1)
+}
+
+// pack the 9-field params block (72 B) shared by both kernel pairs
+share(all)
+pack_params(params<Int>, A<Int>, B<Int>, C<Int>, M<Int>, N<Int>, K<Int>, KSPLIT<Int>, BCOLS<Int>, P<Int>)<CInt> -> {
+    if (htod_i(params + 0, A) != 0) { return 1 }
+    if (htod_i(params + 8, B) != 0) { return 2 }
+    if (htod_i(params + 16, C) != 0) { return 3 }
+    if (htod_i(params + 24, M) != 0) { return 4 }
+    if (htod_i(params + 32, N) != 0) { return 5 }
+    if (htod_i(params + 40, K) != 0) { return 6 }
+    if (htod_i(params + 48, KSPLIT) != 0) { return 7 }
+    if (htod_i(params + 56, BCOLS) != 0) { return 8 }
+    if (htod_i(params + 64, P) != 0) { return 9 }
+    return 0
+}
+
+// launch a cast kernel through the params block: +0 src, +8 dst, +16 n
+share(all)
+run_cast(hcast<Int>, params<Int>, src<Int>, dst<Int>, n<Int>, threads<Int>)<CInt> -> {
+    if (htod_i(params + 0, src) != 0) { return 1 }
+    if (htod_i(params + 8, dst) != 0) { return 2 }
+    if (htod_i(params + 16, n) != 0) { return 3 }
+    if (launch1(hcast, (n + threads - 1) / threads, threads, params) != 0) { return 4 }
+    return 0
+}
+
+share(all)
+run_blocked(hblk<Int>, hred<Int>, params<Int>, A<Int>, B<Int>, C<Int>, P<Int>,
+            M<Int>, N<Int>, K<Int>, KSPLIT<Int>, BCOLS<Int>, threads<Int>)<CInt> -> {
+    if (pack_params(params, A, B, C, M, N, K, KSPLIT, BCOLS, P) != 0) { return 1 }
+    perblock<Int> = threads * BCOLS
+    ntiles<Int> = (N + perblock - 1) / perblock
+    if (launch1(hblk, ntiles * KSPLIT, threads, params) != 0) { return 2 }
+    total<Int> = M * N
+    if (launch1(hred, (total + threads - 1) / threads, threads, params) != 0) { return 3 }
+    return 0
+}
+
+main()<Int> -> {
+    ms<String> = env_get("M") else "1"
+    ks<String> = env_get("K") else "4096"
+    ns<String> = env_get("N") else "2048"
+    M<Int> = ms.to_int()
+    K<Int> = ks.to_int()
+    N<Int> = ns.to_int()
+    ksplits<String> = env_get("KSPLIT") else "32"
+    KSPLIT<Int> = ksplits.to_int()
+    BCOLS<Int> = 4
+    TH<Int> = 256
+
+    if (tensor_init() != 0) { println("AB_FAIL cuda init"); return 1 }
+    println("AB M=" + M.to_string() + " K=" + K.to_string() + " N=" + N.to_string()
+        + " KSPLIT=" + KSPLIT.to_string() + " BCOLS=" + BCOLS.to_string())
+
+    fblk<Int> = module_load_path("native/build/gemm_blk.ptx")
+    hblk<Int> = module_func(fblk, "gemm_blk")
+    hred<Int> = module_func(fblk, "gemm_red")
+    fblk32<Int> = module_load_path("native/build/gemm_blk32.ptx")
+    hblk32<Int> = module_func(fblk32, "gemm_blk32")
+    hred32<Int> = module_func(fblk32, "gemm_red32")
+    hcast<Int> = module_func(fblk32, "cast64to32")
+    hcastback<Int> = module_func(fblk32, "cast32to64")
+    if (hblk == 0 || hred == 0 || hblk32 == 0 || hred32 == 0 || hcast == 0 || hcastback == 0) {
+        println("AB_FAIL kernel load"); return 2
+    }
+
+    # deterministic inputs, built ONCE in f64
+    Av<Vec<Float>> = Vec()
+    ai<Int> = 0
+    while (ai < M * K) { Av.push((((ai % 7) - 3) as Float) / 7.0) ; ai = ai + 1 }
+    Bv<Vec<Float>> = Vec()
+    bi<Int> = 0
+    while (bi < K * N) { Bv.push((((bi % 5) - 2) as Float) / 11.0) ; bi = bi + 1 }
+
+    dA<Int> = dev_alloc(M * K * 8)
+    dB<Int> = dev_alloc(K * N * 8)
+    dC<Int> = dev_alloc(M * N * 8)
+    dP<Int> = dev_alloc(M * N * KSPLIT * 8)
+    dPar<Int> = dev_alloc(72)
+    dA32<Int> = dev_alloc(M * K * 4)
+    dB32<Int> = dev_alloc(K * N * 4)
+    dC32<Int> = dev_alloc(M * N * 4)
+    dP32<Int> = dev_alloc(M * N * KSPLIT * 4)
+    if (dA == 0 || dB == 0 || dC == 0 || dP == 0 || dPar == 0) { println("AB_FAIL alloc"); return 3 }
+    if (dA32 == 0 || dB32 == 0 || dC32 == 0 || dP32 == 0) { println("AB_FAIL alloc32"); return 3 }
+    if (bulk_htod(dA, view(Av)) != 0) { println("AB_FAIL htod A"); return 4 }
+    if (bulk_htod(dB, view(Bv)) != 0) { println("AB_FAIL htod B"); return 4 }
+    sync()
+
+    # narrow the SAME device data to f32 so the inputs cannot differ
+    if (run_cast(hcast, dPar, dA, dA32, M * K, TH) != 0) { println("AB_FAIL cast A"); return 5 }
+    if (run_cast(hcast, dPar, dB, dB32, K * N, TH) != 0) { println("AB_FAIL cast B"); return 5 }
+    sync()
+
+    # ---- fp64 blocked ----
+    if (run_blocked(hblk, hred, dPar, dA, dB, dC, dP, M, N, K, KSPLIT, BCOLS, TH) != 0) {
+        println("AB_FAIL f64 run"); return 6
+    }
+    sync()
+    t0<Int> = clock_ns()
+    if (run_blocked(hblk, hred, dPar, dA, dB, dC, dP, M, N, K, KSPLIT, BCOLS, TH) != 0) {
+        println("AB_FAIL f64 timed"); return 6
+    }
+    sync()
+    t1<Int> = clock_ns()
+    refX<Vec<Float>> = bulk_dtoh(dC, M * N)
+    us64<Int> = (t1 - t0) / 1000
+
+    # ---- fp32 blocked ----
+    params32<Int> = dPar
+    if (pack_params(params32, dA32, dB32, dC32, M, N, K, KSPLIT, BCOLS, dP32) != 0) {
+        println("AB_FAIL pack32"); return 7
+    }
+    perblock<Int> = TH * BCOLS
+    ntiles<Int> = (N + perblock - 1) / perblock
+    if (launch1(hblk32, ntiles * KSPLIT, TH, params32) != 0) { println("AB_FAIL f32 blk"); return 7 }
+    if (launch1(hred32, ((M * N + TH - 1) / TH), TH, params32) != 0) { println("AB_FAIL f32 red"); return 7 }
+    sync()
+    t2<Int> = clock_ns()
+    if (pack_params(params32, dA32, dB32, dC32, M, N, K, KSPLIT, BCOLS, dP32) != 0) { return 7 }
+    if (launch1(hblk32, ntiles * KSPLIT, TH, params32) != 0) { println("AB_FAIL f32 blk2"); return 7 }
+    if (launch1(hred32, ((M * N + TH - 1) / TH), TH, params32) != 0) { println("AB_FAIL f32 red2"); return 7 }
+    sync()
+    t3<Int> = clock_ns()
+    us32<Int> = (t3 - t2) / 1000
+
+    # compare: sample the f32 result by widening a slice (f32 D2H via cast back to f64 buffers is
+    # unnecessary here -- compare on the first 256 elements using the f64 readback of a cast)
+    # Simpler and sufficient: cast dC32 back to f64 into dC and diff, so the comparison is exact-to-f32.
+    if (run_cast(hcastback, dPar, dC32, dC, M * N, TH) != 0) { println("AB_FAIL cast back"); return 8 }
+    sync()
+    gotX<Vec<Float>> = bulk_dtoh(dC, M * N)
+
+    maxabs<Float> = 0.0
+    maxrel<Float> = 0.0
+    i<Int> = 0
+    while (i < M * N) {
+        d<Float> = gotX.get(i) - refX.get(i)
+        if (d < 0.0) { d = 0.0 - d }
+        if (d > maxabs) { maxabs = d }
+        a<Float> = refX.get(i)
+        if (a < 0.0) { a = 0.0 - a }
+        if (a > 0.0) {
+            rr<Float> = d / a
+            if (rr > maxrel) { maxrel = rr }
+        }
+        i = i + 1
+    }
+
+    g64<Float> = 0.0
+    g32<Float> = 0.0
+    fl<Float> = 2.0 * (M as Float) * (N as Float) * (K as Float)
+    if (us64 > 0) { g64 = fl / ((us64 as Float) / 1000000.0) / 1000000000.0 }
+    if (us32 > 0) { g32 = fl / ((us32 as Float) / 1000000.0) / 1000000000.0 }
+
+    println("AB_RESULT f64_us=" + us64.to_string() + " f64_gflops=" + g64.to_string()
+        + " f32_us=" + us32.to_string() + " f32_gflops=" + g32.to_string())
+    println("AB_ACCURACY maxabs=" + maxabs.to_string() + " maxrel=" + maxrel.to_string())
+
+    # explicit gate, stated up front: 3e-05 absolute is the project's MoE projection tolerance.
+    if (maxabs < 0.00003) { println("AB_GATE_PASS") } else { println("AB_GATE_FAIL") }
+    return 0
+}

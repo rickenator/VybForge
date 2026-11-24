@@ -7385,3 +7385,27 @@ the bad value 6 was exactly the 1x1x1 pack-timer's product, and it matched the O
 answer, which is why it hid. Probe buffers must never alias the buffer under test.
 Related rule already in this file and violated here: blame order is artifact present -> argument types ->
 readback width -> MY OWN INSTRUMENTATION -> compiler last. A library is the last suspect, not the third.
+=== ROUND 186: f32 BUYS 1.2x, NOT 10x -- AND A SUSPICION ABOUT THE TARGET ===
+A/B of the blocked fp64 vs f32 kernels, IDENTICAL structure (native/host/f32_ab.vyb, inputs narrowed with
+cast64to32 so both see the same source values), M=1 K=4096 N=2048, sweeping KSPLIT:
+    KSPLIT= 32 : f64 344 us (48.8 GFLOP/s) | f32 365 us (46.0)
+    KSPLIT= 64 : f64 357 us (47.0)         | f32 281 us (59.7)   <- best f32
+    KSPLIT=128 : f64 368 us (45.6)         | f32 285 us (58.9)
+    KSPLIT=256 : f64 405 us (41.4)         | f32 295 us (56.9)   <- f64 degrades
+Accuracy, fractional inputs (1/7, 1/11 -- integer data would be exact in f32 and prove nothing):
+    maxabs 2.3e-07 .. 3.9e-07, AB_GATE_PASS at every KSPLIT. (maxrel is meaningless here: some reference
+    values are near zero, so dividing by them explodes. Use maxabs.)
+CONSEQUENCE -- PRECISION IS NOT THE LEVER. f32 gives 1.1-1.3x, not the 10x that bfgemm8's 537 GFLOP/s
+suggested. bfgemm8's advantage must come from its whole structure (bf16 weights = 4x fewer bytes, 8 rows
+per thread, shared-memory tiling), not from the accumulate type. And 8 rows/thread needs M>=8, so that
+structure cannot apply at decode where M=1.
+NOR IS OCCUPANCY: f32 plateaus at ~281 us. That is 33 MB / 281 us = ~119 GB/s against ~1 TB/s available, so
+it is neither bandwidth- nor FMA-bound. The remaining loss is load-issue efficiency -- BCOLS=4 issues four
+scalar ld_f32 per iteration where one 16-byte vector load would do, leaving ~25% of peak load issue rate.
+Vectorised loads are the next kernel lever, not precision.
+SUSPICION THAT MATTERS MORE: the SERVED path may not be this kernel at all. Production runs
+P6_FUSED_ONLY=1 and feeds EXL3 trellis weights straight into the fused matvec kernels (mvnodB/mvn_run),
+about 12.6 MB per expert, never dequantising to f64 for a gemm. If so, the fp64 gemm is NOT the bottleneck
+in the served configuration and this whole kernel line, however correct, is off-target.
+NEXT ACTION, before any more kernel work: instrument which kernels the production MoE actually spends its
+time in (mvn_*/deq/gemm counts and per-kernel time inside moe_tail_step), and confirm the target.
