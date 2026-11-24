@@ -8435,3 +8435,24 @@ NEXT: (1) add the per-layer all-reduce of the routed contribution and check rank
 float tolerance (it will NOT be bit-identical: two partials associate differently from 288 experts summed
 in order -- measured earlier as exact on a pilot quantity, but this check must be done on real outputs);
 (2) run both ranks concurrently on lefty+righty; (3) only then look at speed.
+=== ROUND 226: PER-LAYER ALL-REDUCE WIRED -- TRANSPARENT AT world=1, PAIR TEST NOT YET RUN ===
+`moe_tail_step` now takes `tpc<their<Vec<Int>>>` ([0]=comm, [1]=world, [2]=device buffer) and, between the
+expert loop and the `shared` addition, does ONE all-reduce over `accr` -- the routed contribution this rank
+owns -- then adds `shared` afterwards. That ordering is the whole point: `shared` and the attention path are
+DUPLICATED on both ranks, so only `accr` may be reduced; reducing after the shared add would double-count it.
+Payload is R*H f64 = 32 KB at R=1, measured at ~0.03 ms/layer (round 223), so ~1.3 ms/token for 45 layers.
+glm_serve brings up the communicator only when VYBFORGE_WORLD > 1 (uid over TCP on VYBFORGE_TP_PORT,
+peer = VYBFORGE_TP_PEER default 192.168.192.1 -- lefty's RoCE address, the one righty can reach), allocates
+one device buffer, and passes the handle to both call sites.
+VERIFIED SO FAR: world=1 is BIT-IDENTICAL to the established baseline
+(digest 7291d8a64ab3727ecc8ef1e777e24431, req1 113.19 s, VALID_RUN) and prints NO TP_COMM line, so at world=1
+the network is never touched and nothing changes.
+NOT YET VERIFIED: the actual pair. Both ranks must process the SAME request SIMULTANEOUSLY, because each
+enters the collective only while running its own forward pass -- so the test needs both serves up and both
+curled at once, not one curled and the other idle. That is the next step and it has not been run.
+NOTE ON dtype, because it already cost a round: the reduce passes dt=8 (ncclFloat64). 4 is ncclInt64 and
+sums BIT PATTERNS -- 1.0 + 2.0 as int64 is 0x7FF0000000000000 = +inf, which is exactly the phantom "desync"
+that burned round 220-222.
+EXPECTATION for the pair check: rank0+rank1 will NOT be bit-identical to world=1, because two partial sums
+associate differently from 288 experts accumulated in order. The gate should be a tolerance on the digests or
+better a maxabs on a decode layer's output, and the size of the discrepancy is itself worth recording.

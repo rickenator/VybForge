@@ -30,6 +30,12 @@ import safetensors
 import gx
 import collections::{HashMap}
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
+
+# Expert-parallel all-reduce (round 226). ncclFloat64 is 8 -- 4 is ncclInt64, which sums BIT PATTERNS
+# (1.0 + 2.0 as int64 = +inf). Getting that wrong cost a full round of bogus "desync" results.
+extern "C" {
+    ncclAllReduce(sbuf<Int>, rbuf<Int>, count<Int>, dt<Int>, op<Int>, comm<Int>, stream<Int>)<CInt>
+}
 import vmath::{vexp, vsqrt}
 import time::{time_mono_millis}
 
@@ -4408,7 +4414,8 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>,
               fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>,
-              ech<their<Vec<String>>>, est<their<Vec<Int>>>, ekey<Int>, expLo<Int>, expHi<Int>)<Vec<Float>> -> {
+              ech<their<Vec<String>>>, est<their<Vec<Int>>>, ekey<Int>, expLo<Int>, expHi<Int>,
+              tpc<their<Vec<Int>>>)<Vec<Float>> -> {
     ms0<Int> = time_mono_millis()
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
@@ -4843,6 +4850,23 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     mlp<Vec<Float>> = Vec()
     i = 0
     while (i < R * H) {
+    # EXPERT-PARALLEL COMBINE (round 226): accr holds ONLY this rank's owned-expert contribution, while
+    # `shared` is duplicated on both ranks. So exactly one all-reduce over accr reassembles the full routed
+    # sum, and `shared` must be added AFTER it (adding before would double-count it).
+    # Payload is R*H f64 = 32 KB at R=1; measured at ~0.03 ms/layer on this pair.
+    tw<Int> = 1
+    if (tpc.len() >= 2) { tw = tpc.get(1) }
+    if (tw > 1 && tpc.len() >= 2) {
+        tc<Int> = tpc.get(0)
+        tdb<Int> = tpc.get(2)
+        if (tc != 0 && tdb != 0 && accr.len() > 0) {
+            if (bulk_htod(tdb, view(accr)) == 0) {
+                freedom { ncclAllReduce(tdb, tdb, accr.len(), 8, 0, tc, 0) }
+                sync()
+                accr = bulk_dtoh(tdb, accr.len())
+            } else { println("TPRED htod failed") }
+        }
+    }
         mlp.push(accr.get(i) + shared.get(i))
         i = i + 1
     }

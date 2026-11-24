@@ -25,6 +25,14 @@ import env::{env_get}
 import safetensors
 import gx
 import tensor::{tensor_init, module_load_path, module_func, dev_alloc, bulk_htod, bulk_dtoh, sync, gemm}
+
+# TP=2 rendezvous + collective (round 226). ncclFloat64 = 8 (4 is ncclInt64 and sums bit patterns).
+extern "C" {
+    ncclGetUniqueId(uid<String>)<CInt>
+    ncclCommInitRank(comm<loc<Int>>, nranks<Int>, uid<loc<CVoid>>, rank<Int>)<CInt>
+    ncclCommCount(comm<Int>, n<loc<Int>>)<CInt>
+}
+import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
 import vmath::{vexp, vsqrt}
 import time::{time_mono_millis}
 import json_parse
@@ -683,6 +691,57 @@ main()<Int> -> {
         if (tpRank == tpWorld - 1) { expHi = sv_NE }
     }
     println("TP_RANK rank=" + tpRank.to_string() + " world=" + tpWorld.to_string() + " experts=[" + expLo.to_string() + "," + expHi.to_string() + ")")
+
+    # ---- expert-parallel communicator (only at world>1; world==1 must NOT touch the network) ----
+    # tpc layout: [0]=comm, [1]=world, [2]=device buffer for the per-layer reduce
+    tpc<Vec<Int>> = Vec()
+    tpc.push(0)
+    tpc.push(tpWorld)
+    tpc.push(0)
+    if (tpWorld > 1) {
+        tpPort<Int> = 18450
+        tpv<String> = env_get("VYBFORGE_TP_PORT") else ""
+        if (tpv.len() > 0) { tpPort = tpv.to_int() }
+        tpPeer<String> = env_get("VYBFORGE_TP_PEER") else "192.168.192.1"
+        uidS<String> = ""
+        ui<Int> = 0
+        while (ui < 128) { uidS = uidS + " "; ui = ui + 1 }
+        if (tpRank == 0) {
+            grc<Int> = 0
+            freedom { grc = (ncclGetUniqueId(uidS) as Int) }
+            if (grc != 0) { println("TP_FAIL getuid rc=" + grc.to_string()); return 90 }
+            fd<Int> = socket_open(2, 1, 0) else 0
+            if (fd == 0) { println("TP_FAIL socket_open"); return 91 }
+            okb<Bool> = socket_bind(fd, "0.0.0.0", tpPort) else false
+            if (!okb) { println("TP_FAIL bind"); return 92 }
+            okl<Bool> = socket_listen(fd, 4) else false
+            if (!okl) { println("TP_FAIL listen"); return 93 }
+            println("TP_LISTEN port=" + tpPort.to_string())
+            c<Int> = socket_accept(fd) else 0
+            if (c == 0) { println("TP_FAIL accept"); return 94 }
+            socket_send(c, uidS)
+            socket_close(c)
+            socket_close(fd)
+        } else {
+            d<Int> = socket_open(2, 1, 0) else 0
+            if (d == 0) { println("TP_FAIL socket_open"); return 95 }
+            okc<Bool> = socket_connect(d, tpPeer, tpPort) else false
+            if (!okc) { println("TP_FAIL connect " + tpPeer + ":" + tpPort.to_string()); return 96 }
+            got<String> = socket_recv(d, 256) else ""
+            if (got.len() < 128) { println("TP_FAIL uid short"); return 97 }
+            uidS = got.substring(0, 128)
+            socket_close(d)
+        }
+        commh<Int> = 0
+        var<Int> irc2 = 0
+        freedom { irc2 = (ncclCommInitRank(loc(commh), tpWorld, uidS, tpRank) as Int) }
+        if (irc2 != 0) { println("TP_FAIL commInitRank rc=" + irc2.to_string()); return 98 }
+        tpc.set(0, commh)
+        tdbuf<Int> = dev_alloc(sv_R * sv_H * 8)
+        if (tdbuf == 0) { println("TP_FAIL dev_alloc"); return 99 }
+        tpc.set(2, tdbuf)
+        println("TP_COMM ready rank=" + tpRank.to_string() + " comm=" + commh.to_string() + " dbuf=" + tdbuf.to_string() + " bytes=" + (sv_R * sv_H * 8).to_string())
+    }
     # Expert residency cache (round 224): P6_ECACHE_GB>0 keeps routed-expert packed bytes in host RAM.
     # key = layer*2592 + expert*9 + slot; 0 disables and falls through to the disk path unchanged.
     echMax<Int> = 0
@@ -2070,14 +2129,14 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                              fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                              arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                             fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi)
+                                                             fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi, borrow(tpc))
                                     if (bN > 1) {
                                         var<Int> bRep = 1
                                         while (bRep < bN) {
                                             streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                                      fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                                      arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                                     fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi)
+                                                                     fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi, borrow(tpc))
                                             bRep = bRep + 1
                                         }
                                     }
