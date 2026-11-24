@@ -1073,6 +1073,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                             lg = gL2
 
                             secT2<Int> = now_ms()
+                            secM<Int> = now_ms()
                             if (is_dsa == 1) {
                                 # ------------------------------------------------ DSA layer step
                                 # (glm_decode_l3.vyb's step body; caches ride in ckvAll/ikAll/gscAll)
@@ -1220,6 +1221,8 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 bulk_htod(d_ukm, view(ukm))
                                 bulk_htod(d_uvm, view(uvm))
 
+                                println("SEC p2dsa ph=mix ms=" + (now_ms() - secM).to_string())
+                                secM = now_ms()
                                 # ---- hc_attn mix -> input_layernorm -> h_a
                                 flat<Vec<Float>> = rms_rows(borrow(streams), sv_R, sv_HC * sv_H, Vec())
                                 d_flat = alloc_dev(sv_R * sv_HC * sv_H * 8)
@@ -1247,6 +1250,8 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 while (i < sv_R * sv_HC * sv_HC) { combA.push(res.get(sv_R * sv_H + sv_R * sv_HC + i)); i = i + 1 }
                                 h_a<Vec<Float>> = rms_rows(borrow(collapsed), sv_R, sv_H, in_ln)
 
+                                println("SEC p2dsa ph=lat ms=" + (now_ms() - secM).to_string())
+                                secM = now_ms()
                                 # ---- latent projections; append the new cache rows
                                 qres<Vec<Float>> = mm_host(h_a, sv_R, sv_H, d_qa, sv_Q_LORA, fgemm)
                                 qa_ln<Vec<Float>> = rms_rows(borrow(qres), sv_R, sv_Q_LORA, qaln_w)
@@ -1280,6 +1285,8 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     i = i + 1
                                 }
 
+                                println("SEC p2dsa ph=idx ms=" + (now_ms() - secM).to_string())
+                                secM = now_ms()
                                 # ---- indexer: pool + topk over the cache with causal visibility
                                 nckv = nckv + 1                     # the cache now holds nckv rows
                                 # copy this slot's cache rows into locals sized [nckv, ...]
@@ -1297,9 +1304,11 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     gsc_t.push(gscAll.get(dslot * sv_CAPT * sv_IDIM + i))
                                     i = i + 1
                                 }
+                                if (dump_on == 1) {
                                 lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "ckv", ckv_t) + "\n"
                                 lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "ik", ik_t) + "\n"
                                 lines = lines + dumps("d" + t.to_string() + "l" + n.to_string() + "gsc", gsc_t) + "\n"
+                                }
                                 npools = nckv / sv_KPOOL
                                 poolk<Vec<Float>> = Vec()
                                 d2 = 0
@@ -1399,6 +1408,8 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     a = a + 1
                                 }
 
+                                println("SEC p2dsa ph=mla ms=" + (now_ms() - secM).to_string())
+                                secM = now_ms()
                                 # ---- masked MLA over the selected cache rows
                                 Kv<Vec<Float>> = mm_host(ckv_t, nckv, sv_KV_LORA, d_ukm, sv_HEADS * sv_NOPE, fgemm)
                                 Vm<Vec<Float>> = mm_host(ckv_t, nckv, sv_KV_LORA, d_uvm, sv_HEADS * sv_VDIM, fgemm)
@@ -1485,7 +1496,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 free_dev(d_gatei)
 
                                 streams1 = hc_apply(streams, attn, postA, combA)
-                                println("SEC p2attn n=" + n.to_string() + " dsa=" + (now_ms() - secT2).to_string())
+                                println("SEC p2attn n=" + n.to_string() + " dsa=" + (now_ms() - secM).to_string())
 
                                 # ---- ffn site: hc_ffn mix -> post_attn LN -> router -> experts -> shared
                                 reflat<Vec<Float>> = rms_rows(borrow(streams1), sv_R, sv_HC * sv_H, Vec())

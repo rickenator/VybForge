@@ -7882,3 +7882,33 @@ LESSON (again, and the reason this file keeps this section): I inferred an imple
 NAME and a call inventory, twice in one session -- first "attention is not optimised because it is inline",
 then "it is CPU work because the calls are called *_host". Both were guesses dressed as findings. Read the
 function body before characterising it.
+=== ROUND 208: THE DSA INDEXER'S 2,687 ms/layer WAS THREE UNGUARDED dumps() CALLS ===
+Split the decode DSA branch into phases with `SEC p2dsa` marks. Corrected attribution (each mark measures
+the span BEFORE it, so the label sits one section early):
+    mix  (1075->1223) = 16,601 ms (754/layer)   layer prologue: hc_attn mix -> LN -> h_a
+    lat  (1223->1250) =    911 ms ( 41/layer)
+    idx  (1250->1283) =    922 ms ( 41/layer)
+    "mla"(1283->1402) = 59,119 ms (2,687/layer)  <- ACTUALLY the indexer section
+    tail (1402->1488) =     58 ms (2.6/layer)    <- the actual MLA math
+ROOT CAUSE FOUND IN THE INDEXER SECTION (glm_serve:1307-1309): three `lines = lines + dumps(...)` calls for
+ckv_t / ik_t / gsc_t. `dumps` (glm_engine:913) builds the whole string with `out = out + ...` -- the O(n^2)
+concat this codebase already documents as "the 83 GB RSS / 12 GB/s allocator storm" -- and it has NO flag
+check of its own. The driver's gate variable `dump_on` (set from VYBFORGE_SERVE / VYBFORGE_SERVE_DUMP) is
+consulted in exactly ONE place (line 2063), so the MTP dumps were gated but these three were NOT: every DSA
+layer in production mode still formatted ~40x128 floats three times. The pooling loops around it are ~15K
+ops; the cache copies are a few thousand elements. The 2,687 ms was pure verification formatting.
+FIX (4 lines, zero numeric risk -- it only skips building strings that are never read in serve mode):
+wrapped the three dump lines in `if (dump_on == 1) { ... }`.
+MEASURED EFFECT (NLAY=45, NSTEPS=2, production, VALID_RUN 62 moekern lines):
+    req1            230.94 s -> 137.21 s   (-41%)
+    SEC STEP t=0     42.00 s ->  32.95 s
+    SEC STEP t=1    116.96 s ->  57.98 s   (-50%)
+    that indexer phase 59,119 ms -> 1 ms
+    attention total  76.5 s -> 35.6 s
+NOTE THE PATTERN, because it is now the THIRD instance: the biggest costs in this engine have repeatedly
+turned out to be off-by-default verification machinery, not kernels (dump-mode step inflation 16.6x in
+round 199, then this). Any remaining multi-second per-layer cost should be checked for an unguarded
+verification call BEFORE being modelled as algorithmic.
+STILL OPEN: step t=1 is now 57.98 s vs t=0 32.95 s (1.76x, was 2.8x) -- still the footprint signature.
+DECODE ATTENTION IS NOW 35.6 s of the 137 s run; re-split its phases (the indexer is now ~0) to find the
+next term, which will be in `mix` (16.6 s) or the per-call htod/dtoh in the mm_host calls.
