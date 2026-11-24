@@ -182,8 +182,11 @@ main()<Int> -> {
         bytes<Int> = count * 8
         gbs<Float> = 0.0
         if (med > 0) { gbs = (2.0 * (bytes as Float) / 1000000000.0) / ((med as Float) / 1000000.0) }
+        p10b<Int> = tms.get(tms.len() / 10)
+        p90b<Int> = tms.get((tms.len() * 9) / 10)
         println("NCCLB_ALLREDUCE bytes=" + bytes.to_string() + " min_us=" + mn.to_string()
-            + " med_us=" + med.to_string() + " max_us=" + mxv.to_string() + " gbps=" + gbs.to_string())
+            + " p10=" + p10b.to_string() + " med_us=" + med.to_string()
+            + " p90=" + p90b.to_string() + " max_us=" + mxv.to_string() + " gbps=" + gbs.to_string())
         ci = ci + 1
     }
 
@@ -237,8 +240,11 @@ main()<Int> -> {
             meda<Int> = tmsa.get(tmsa.len() / 2)
             gbsa<Float> = 0.0
             if (meda > 0) { gbsa = (2.0 * (a2b as Float) / 1000000000.0) / ((meda as Float) / 1000000.0) }
+            p10<Int> = tmsa.get(tmsa.len() / 10)
+            p90<Int> = tmsa.get((tmsa.len() * 9) / 10)
             println("NCCLB_ALLTOALL bytes=" + a2b.to_string() + " per_peer=" + cpp.to_string()
-                + " med_us=" + meda.to_string() + " min_us=" + tmsa.get(0).to_string()
+                + " min_us=" + tmsa.get(0).to_string() + " p10=" + p10.to_string()
+                + " med_us=" + meda.to_string() + " p90=" + p90.to_string()
                 + " max_us=" + tmsa.get(tmsa.len() - 1).to_string() + " gbps=" + gbsa.to_string())
             ai = ai + 1
         }

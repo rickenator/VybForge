@@ -7217,3 +7217,24 @@ DECISION UNCHANGED (TP within expert) BUT NOW ON EVIDENCE RATHER THAN A MISSING 
   ~36 us -> ~108 us/layer -> ~4.9 ms/token, which fits.
   Also note the all-to-all variance is a separate open question: if the 40 us best case can be made the
   typical case, expert-parallel would become competitive, so this is worth revisiting before any EP work.
+=== ROUND 178: THE ALL-TO-ALL "10x SLOWER" WAS A 30-SAMPLE ARTIFACT ===
+Round 177 concluded all-to-all costs ~10x an all-reduce and used that to keep expert-parallel out. THAT WAS
+WRONG, and the error was statistical, not logical: 30 repetitions sampled a distribution dominated by rare
+stalls, and the MEDIAN of those 30 became the headline. At 200 repetitions with percentiles (both ranks):
+    all-to-all  64 KB : min 30  p10 30  med 31  p90 375  max 1247
+    all-reduce  32 KB : min 26  p10 27  med 28  p90  31  max  77
+    all-to-all 1.3 MB : med 92  p90 190
+    all-to-all 5.2 MB : med 153 p90 154   (tight)
+So a token-sized all-to-all is ~31 us -- statistically the same as all-reduce's 28 us. Expert-parallel is
+NOT ruled out on latency; two dispatches per MoE layer is ~62 us/layer, comparable to TP's ~100 us.
+DECISION STANDS (TP within expert) BUT ON DIFFERENT GROUNDS, stated so it can be re-argued:
+  * the 40-45 tok/s bar is DEFINED by vLLM TP=2 on this same checkpoint, so TP keeps the comparison
+    like-for-like and any shortfall attributable;
+  * EP needs routing + load balance across 144 experts per node that TP does not;
+  * EP's real advantage is a simpler per-node weight path (whole experts, no split EXL3), which is a
+    reason to revisit, not a reason to start there.
+CAVEAT TO CARRY: all-to-all p90 is 375 us against a 31 us median, and that spread collapses at 5.2 MB
+(p90 154) -- so small-message stalls are a transport/queue effect, ~10% of calls. Over 90 collectives per
+token that is ~3-4 ms of tail jitter. Fix it before adopting EP.
+METHOD LESSON (the second time this session): never take a median from ~30 samples of a bimodal
+distribution -- report percentiles, and prefer 200 reps for anything that decides architecture.
