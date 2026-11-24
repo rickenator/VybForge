@@ -6997,3 +6997,26 @@ CONCLUSIONS:
        H = absorbed per-head keys/values, P = gpool pooling + per-query pool scores,
        M = masked MLA attention per head + o_proj
      printed as SEC_ATTN capslot= S= W= I= H= P= M= T= tot=.
+=== ROUND 169: ROOT CAUSE OF THE DSA HOG -- A 901 ms cuMemAlloc STALL ===
+Instrumented the stages of deq_bf16 (allocQ, allocO, htod, launch+sync, free) and printed calls over
+150 ms. One line in a 3-DSA-layer run:
+    SEC_DEQ SLOW tot=901 allocQ=0 allocO=901 htod=0 launchsync=0 free=0 len=16777216 n=8388608
+and in the same run the SEC_ATTN phase carrying that call read I=912 while the other slots were 40-58.
+CONCLUSION: the DSA layer's ~950 ms is ONE cuMemAlloc_v2 for a 67 MB output buffer that blocks ~901 ms.
+Everything else -- the disk read, the htod, the dequant kernel, the launch, the free, the attention
+itself, the digests -- measured 0-20 ms. The earlier phase-hopping (W=916 in one run, I=919 in another,
+and a 40 ms total when a slot drew no stall) is explained: the stall attaches to whichever deq_bf16 call
+draws it, so it appears to move between phases.
+WHY IT IS INTERMITTENT: deq_bf16 does cuMemAlloc + cuMemFree per call, ~872 MB of churn per DSA layer
+(q_b 201 / kv_b 134 / o 537 MB) on a unified-memory device that is close to full. Repeated large
+alloc/free fragments the device heap, and an alloc that cannot be satisfied from the free list blocks
+while the driver compacts or migrates -- so cost lands on the allocation, not on the data.
+THIS RETROACTIVELY VALIDATES the deq_bf16_into idea abandoned in rounds 163-166 (it was aimed at exactly
+these alloc/free pairs) and RETROACTIVELY KILLS the residency/disk/read-caching theories: they were all
+trying to speed up a phase that measures 1-20 ms.
+FIX, next: stop allocating per call. A grow-only device scratch pool behind alloc_dev/free_dev
+(ptr->bytes recorded at allocation, freed buffers retained and reused by size class) removes almost all
+driver traffic in the hot path. deq_bf16 must route through it for BOTH buffers (q is freed inside the
+function; o is freed by the caller via free_dev, so free_dev itself has to return buffers to the pool or
+the pool double-frees). Expected effect: the ~950 ms/layer becomes ~40-60 ms, i.e. 11 DSA layers from
+~10.5 s to ~0.6 s per step.

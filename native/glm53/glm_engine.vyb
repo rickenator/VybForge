@@ -295,12 +295,19 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     freedom {
         var<Int> q = 0
         var<Int> o = 0
+        # Stage timers: the DSA investigation found a ~920 ms lump that attaches to a DIFFERENT phase on
+        # each run, which smells like an allocation stall rather than work. Time every stage here and
+        # print only the slow calls, so the lump is either confirmed in alloc/free or ruled out.
+        dq0<Int> = now_ms()
         qrc<Int> = cuMemAlloc_v2(loc(q), raw.len()) as Int
         if (qrc != 0) { println("DEQFAIL alloc q rc=" + qrc.to_string() + " len=" + raw.len().to_string()); return 0 }
+        dqA<Int> = now_ms() - dq0
         orc<Int> = cuMemAlloc_v2(loc(o), n * 8) as Int
         if (orc != 0) { println("DEQFAIL alloc o rc=" + orc.to_string() + " n=" + n.to_string()); return 0 }
+        dqB<Int> = now_ms() - dq0 - dqA
         hrc<Int> = cuMemcpyHtoD_v2(q, raw, raw.len()) as Int
         if (hrc != 0) { println("DEQFAIL htod rc=" + hrc.to_string() + " len=" + raw.len().to_string()); return 0 }
+        dqC<Int> = now_ms() - dq0 - dqA - dqB
 
         blocks<Int> = (n + 255) / 256
         lrc<Int> = cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) as Int
@@ -309,8 +316,14 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
             return 0
         }
         cuCtxSynchronize()
+        dqD<Int> = now_ms() - dq0 - dqA - dqB - dqC
         cuMemFree_v2(q)
+        dqE<Int> = now_ms() - dq0 - dqA - dqB - dqC - dqD
         out = o
+        dqT<Int> = now_ms() - dq0
+        if (dqT > 150) {
+            println("SEC_DEQ SLOW tot=" + dqT.to_string() + " allocQ=" + dqA.to_string() + " allocO=" + dqB.to_string() + " htod=" + dqC.to_string() + " launchsync=" + dqD.to_string() + " free=" + dqE.to_string() + " len=" + raw.len().to_string() + " n=" + n.to_string())
+        }
     }
     return out
 }
