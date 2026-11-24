@@ -6604,3 +6604,23 @@ green. scripts/regression_sweep.sh now has PASS 4: it re-runs NLAY=6 and diffs t
 CAVEAT ON THE 2.4x: BENCH_LAYER repeats one layer with its experts already resident, so it measures the
 COMPUTE difference cleanly; a real step also re-reads evicted weights, so end-to-end gain will be
 smaller than 2.4x. Do not quote 2.4x as a tok/s number.
+=== ROUND 150: FOUR-PASS SWEEP GREEN WITH FUSED ON BOTH PATHS ===
+scripts/regression_sweep.sh, NLAY=45:
+    pass 1  prefill fast path vs exact baseline : 45/45 BIT-IDENTICAL
+    pass 2  verification mode                   : 9810 comparisons, 0 failures
+                                                  (gate 3.34e-06 / up 1.31e-06 / down 8.34e-07)
+    pass 3  logit gate vs deq logits            : 20/20 argmax, delta-top1 1.341e-05, margin 0.1607,
+                                                  SAFETY FACTOR 11,985x
+    pass 4  DECODE path vs baseline             : 18 digest lines BIT-IDENTICAL
+    VERDICT: SWEEP PASS
+The fused MoE is now the default on BOTH paths and gated on both:
+    P6_FUSED_ONLY = 1  -> prefill (tail_site)      gates 1 + 2 + 3
+    P6_FUSED_DEC  = 1  -> decode  (moe_tail_step)  gate  4
+STATE OF THE PROJECT:
+    - decode path: fused, deterministic, 2.4x measured at the layer level (compute-only; a real step
+      still pays weight eviction, so the end-to-end gain is smaller and remains unmeasured).
+    - prefill path: fused, 1.96x this session (1668 -> ~850 ms), bit-identical throughout.
+    - the 45-50 tok/s bar is still far away; the binding constraints were identified in rounds 139-149:
+      residency/eviction (round 146: the serve path's per-step cost is dominated by page-cache churn)
+      is now the thing to attack, not the matvec.
+    - `SEC mlpmoe` remains unusable as a timer across steps; BENCH_LAYER is the way to time a layer.
