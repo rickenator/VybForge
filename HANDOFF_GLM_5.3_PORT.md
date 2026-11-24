@@ -6908,3 +6908,26 @@ not mutation on String.
 LESSON, and it generalises the session's rule to API discovery: before claiming a language/runtime lacks
 a capability, grep the builtin method table. Two failed probe cycles came from asserting absence instead
 of enumerating what exists.
+=== ROUND 165: from_bytes LIFETIME AUDIT -- ONE REAL BUG CLASS, FIXED ===
+Vyb Strings are { ptr, len } with NO ownership field; freeing goes through __vyb_string_free ->
+__vyb_string_release, which looks the pointer up in a REGISTRY and is a silent NO-OP if absent. So
+String::from_bytes (zero-copy: it just wraps an existing buffer) neither owns nor frees. Correct for a
+borrow, but it gives no lifetime tracking, and release is a no-op so misuse fails silently.
+AUDIT OF EVERY CALLER:
+  Vyb (43 sites): 42 are tests using string LITERALS (static storage, always valid) and 1 production
+  site (bindings/sqlite) where the view is consumed immediately by `concat`, while sqlite owns the
+  buffer -- safe, and the file already documents the hazard ("dangling elements" from from_bytes inside
+  a freedom loop).
+  VybForge (4 sites): native/json/test_json.vyb wraps a malloc'd buffer and uses it inside the same
+  freedom block -- safe (leaks 300 bytes in a test, harmless).
+THE ONE REAL DEFECT, FIXED: native/audio/audio/mod.vyb's last_error() and error_text() returned
+String::from_bytes over va_lasterr()/va_error(), which are `static char g_err[512]` and
+`static char buf[256]`. Process-lifetime, so nothing dangles -- but the returned String ALIASED a
+mutable global: hold it across another failing audio call and it silently reads as a different error,
+violating value semantics. Both sites now copy (`"" + String::from_bytes(...)`), which concat allocates
+and freezes. Typechecked via capture_probe.
+NO USE-AFTER-FREE FOUND anywhere.
+LANGUAGE RECOMMENDATION (instead of adding String::push, which would force COW on an immutable type):
+add `String::from_bytes_copy(ptr, len)` that memcpy's into a registered buffer, or document from_bytes
+as explicitly borrowed. The existing comments in bindings/sqlite show the hazard has already been hit
+once; a copying variant removes it by construction.

@@ -33,7 +33,11 @@ last_error()<String> -> {
     msg<String> = "ok"
     freedom {
         p<loc<CChar>> = va_lasterr()
-        msg = String::from_bytes(p, strlen(p) as Int)
+        # COPY into an owned String. from_bytes is a zero-copy VIEW, and va_lasterr returns a
+        # process-lifetime `static char g_err[512]` -- so a bare view would keep reading that global
+        # and the message the caller holds could change under it when a later call overwrites g_err.
+        # concat allocates and copies, which freezes the value.
+        msg = "" + String::from_bytes(p, strlen(p) as Int)
     }
     return msg
 }
@@ -44,7 +48,8 @@ error_text(rc<Int>)<String> -> {
     msg<String> = ""
     freedom {
         p<loc<CChar>> = va_error(rc as CInt)
-        msg = String::from_bytes(p, strlen(p) as Int)
+        # same as last_error: va_error returns a static buffer (or ALSA's own static string), so copy.
+        msg = "" + String::from_bytes(p, strlen(p) as Int)
     }
     return msg
 }
