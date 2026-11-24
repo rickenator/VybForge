@@ -1182,57 +1182,6 @@ rss_mb()<Int> -> {
 
 
 share(all)
-// gx_read9 -- read all tensors of a GxLoc (an expert's 9 trellis parts) with as FEW opens as possible.
-//
-// gx_read does open_read + read_at + close PER TENSOR, i.e. 9 opens per expert and 72 per MoE layer.
-// An expert's 9 entries are adjacent in the index and almost always live in the SAME shard, so one handle
-// serves all nine: same bytes, 1 open instead of 9, and the kernel can readahead across the whole 12.6 MB
-// instead of restarting at each close.
-//
-// Shards can differ, so the general case falls back to per-tensor reads. Correctness is identical either
-// way: the same offsets and lengths against the same files.
-share(all)
-gx_read9(g<GxLoc>)<Vec<String>> -> {
-    bufs<Vec<String>> = Vec()
-    nb<Int> = g.found.len()
-    i<Int> = 0
-    while (i < nb) { bufs.push("") ; i = i + 1 }
-    if (nb == 0) { return bufs }
-
-    same<Int> = 1
-    i = 1
-    while (i < nb) {
-        if (g.found.get(i) == 1 && g.shard.get(i) != g.shard.get(0)) { same = 0 }
-        i = i + 1
-    }
-    if (g.found.get(0) == 1 && same == 1) {
-        match (open_read(g.paths.get(0))) {
-            f -> {
-                i = 0
-                while (i < nb) {
-                    if (g.found.get(i) == 1) {
-                        match (read_at(f, g.off.get(i), g.nbytes.get(i))) {
-                            s -> { bufs.set(i, s) }
-                            ? -> { bufs.set(i, "") }
-                        }
-                    }
-                    i = i + 1
-                }
-                close(f)
-            }
-            ? -> {
-                i = 0
-                while (i < nb) { bufs.set(i, gx_read(g, i)) ; i = i + 1 }
-            }
-        }
-    } else {
-        i = 0
-        while (i < nb) { bufs.set(i, gx_read(g, i)) ; i = i + 1 }
-    }
-    return bufs
-}
-
-share(all)
 gx_resolve_tab(tab<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -> {
     key<String> = ""
     p<Int> = 0
@@ -4191,13 +4140,11 @@ fused_proj(fxb<Int>, fyb<Int>, fmbDet<Int>, fmbRed<Int>, fmb<Int>, flt<Int>,
     wr_pdev(pb, 0, dLUT)
     launch_kernel(flt, 256, pb)
     sync()
-    fp0<Int> = time_mono_millis()
     cuMemcpyHtoD_v2(dsu, g_su, g_su.len())
     cuMemcpyHtoD_v2(dsv, g_sv, g_sv.len())
     cuMemcpyHtoD_v2(dQ, g_trellis, g_trellis.len())
     bulk_htod(dsub64, view(sub))
     sync()
-    fp1<Int> = time_mono_millis()
     # f64 activations -> f32
     wr_pdev(pb, 0, dsub64)
     wr_pdev(pb, 8, dxf)
@@ -4224,8 +4171,6 @@ fused_proj(fxb<Int>, fyb<Int>, fmbDet<Int>, fmbRed<Int>, fmb<Int>, flt<Int>,
     wr_pdev(pb, 40, nt)
     launch_kernel(fyb, nt * (cw / 128), pb)
     sync()
-    fp2<Int> = time_mono_millis()
-    println("SEC fp up=" + (fp1 - fp0).to_string() + " rest=" + (fp2 - fp1).to_string())
     return bulk_dtoh(dyp, nt * nout)
 }
 
@@ -4632,21 +4577,29 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             if (nfound != w2.len()) { println("CHAIN_FAIL resolve expert " + e.to_string()); return nonev }
 
             msKres<Int> = time_mono_millis()
-            ebufs<Vec<String>> = gx_read9(ge)
+            g_ge_2 = gx_read(ge, 2)
+            g_ge_1 = gx_read(ge, 1)
+            g_ge_0 = gx_read(ge, 0)
             dWg<Int> = 0
             if (fdecOn == 0) {
-                dWg = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, ebufs.get(0), ebufs.get(1),
-                                 ebufs.get(2), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+                dWg = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
+                                 g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
+            g_ge_5 = gx_read(ge, 5)
+            g_ge_4 = gx_read(ge, 4)
+            g_ge_3 = gx_read(ge, 3)
             dWu<Int> = 0
             if (fdecOn == 0) {
-                dWu = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, ebufs.get(3), ebufs.get(4),
-                                 ebufs.get(5), body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+                dWu = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
+                                 g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
+            g_ge_8 = gx_read(ge, 8)
+            g_ge_7 = gx_read(ge, 7)
+            g_ge_6 = gx_read(ge, 6)
             dWd<Int> = 0
             if (fdecOn == 0) {
-                dWd = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, ebufs.get(6), ebufs.get(7),
-                                 ebufs.get(8), body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
+                dWd = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
+                                 g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
             msKread<Int> = time_mono_millis()
             tkRes = tkRes + (msKres - msA)
@@ -4671,7 +4624,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             if (fdecOn == 1) {
                 gv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
                                 dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
-                                ebufs.get(0), ebufs.get(1), ebufs.get(2), sub, nt, H, EINTER, EINTER, pb32)
+                                g_ge_0, g_ge_1, g_ge_2, sub, nt, H, EINTER, EINTER, pb32)
                 if (gv.len() == 0) { println("FDEC_FAIL gate"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
             } else {
                 gv = mm_host(sub, nt, H, dWg, EINTER, fgemm)
@@ -4680,7 +4633,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             if (fdecOn == 1) {
                 uv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
                                 dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
-                                ebufs.get(3), ebufs.get(4), ebufs.get(5), sub, nt, H, EINTER, EINTER, pb32)
+                                g_ge_3, g_ge_4, g_ge_5, sub, nt, H, EINTER, EINTER, pb32)
                 if (uv.len() == 0) { println("FDEC_FAIL up"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
             } else {
                 uv = mm_host(sub, nt, H, dWu, EINTER, fgemm)
@@ -4700,7 +4653,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             if (fdecOn == 1) {
                 yv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
                                 dxfd, dxhd, dyrd, dypd, dsub64d, dsud, dsvd, dQd, dLUTd, pPd,
-                                ebufs.get(6), ebufs.get(7), ebufs.get(8), act, nt, EINTER, H, H, pb32)
+                                g_ge_6, g_ge_7, g_ge_8, act, nt, EINTER, H, H, pb32)
                 if (yv.len() == 0) { println("FDEC_FAIL down"); fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) ; return nonev }
             } else {
                 yv = mm_host(act, nt, EINTER, dWd, H, fgemm)

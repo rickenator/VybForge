@@ -7627,3 +7627,27 @@ pressure would bite; and re-run the control that worked to confirm it is still r
 ROUNDS 187-194 REMAIN VALID AND COMMITTED (they each had a VALID run):
   MoE layer 350 -> ~91-107 ms; full 12-layer pass 438.66 s vs 471.46 s baseline; resolver 85 -> 12 ms warm;
   gx_read9 proven byte-identical; fused_proj attributed (up 35 ms / kernels+syncs 99 ms over 144 calls).
+=== ROUND 197: gx_read9 SEGFAULTS -- REVERTED, AND MY "BYTE-IDENTICAL" PROOF WAS VACUOUS ===
+THE CRASH IS gx_read9, PROVEN BY A/B:
+    HEAD (gx_read9 + fp timers): segfault after the router, 0 SEC moekern, empty response body, 4/4 runs
+    f063db1 (no gx_read9, windowed resolve only): curl 91.5 s, 12 SEC moekern lines, NO segfault
+so the one-open-per-expert read path is what kills the decode MoE, right after routing. Reverted: the engine
+is back to f063db1's content (gx_read9 removed). MemAvailable was 121 GB at the moment of death, so this was
+a genuine fault, not memory pressure.
+** ROUND 192's CORRECTNESS "PROOF" WAS VACUOUS AND I MUST FLAG IT ** -- it compared attn/streams1/h_a
+digest lines, and those come from the ATTENTION sites. gx_read9 lives in the EXPERT read path, which those
+digests never execute, so "27 digests, 0 differences" said nothing at all about the changed code. A
+correctness check must exercise the path that changed; mine exercised a neighbour.
+CONSEQUENCE FOR ROUND 191's NUMBERS: the "read 44 -> 33 ms" gain was measured in runs that DID emit moekern
+lines, so the path worked at that time -- but given it now faults, that ~25% figure should be treated as
+UNRELIABLE until it is re-measured on a proven-stable build. Do not quote it.
+WHAT MADE THIS HARD TO SEE, and the lesson worth keeping: the crash presented as "flaky measurements" --
+runs that returned empty bodies in 19 s with digests but no MoE lines. Several rounds were spent attributing
+that to harness caching, NSTEPS semantics, and my sync change before running the serve manually and seeing
+`Segmentation fault (core dumped)`. ** When a run is 20x faster than expected and produces no output, suspect
+a crash before suspecting configuration. ** The run_fgate validity guard (round 196) now catches exactly this
+shape: INVALID_RUN instead of a number.
+STATE: engine reverted to f063db1 content (windowed resolve, no gx_read9, no fp timers). Verified one clean
+run: 12 layers, 12 moekern lines, loop ~100 ms, no fault. Rounds 187-190 (attribution, windowed resolve
+85 -> 12 ms) and round 193 (438.66 s full pass) REMAIN VALID; round 191's read gain and round 192's proof do
+NOT.
