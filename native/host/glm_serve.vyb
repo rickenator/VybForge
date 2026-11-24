@@ -1817,6 +1817,8 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 i = 0
                                 while (i < sv_HEADS) { alog.push(f32_at(raw_alog, i)); i = i + 1 }
 
+                                println("SEC p2kda ph=pre ms=" + (now_ms() - secT2).to_string())
+                                secM = now_ms()
                                 # ---- attn site: hc mix -> input_layernorm -> KDA -> o_proj -> hc apply
                                 flat<Vec<Float>> = rms_rows(borrow(streams), sv_R, sv_HC * sv_H, Vec())
                                 d_flat = alloc_dev(sv_R * sv_HC * sv_H * 8)
@@ -1940,7 +1942,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 free_dev(d_gb)
 
                                 streams1 = hc_apply(streams, attn, postA, combA)
-                                println("SEC p2attn n=" + n.to_string() + " kda=" + (now_ms() - secT2).to_string())
+                                println("SEC p2attn n=" + n.to_string() + " kda=" + (now_ms() - secM).to_string())
 
                                 println("SEC attnC n=" + n.to_string() + " " + (now_ms() - secT).to_string())
                                 secT = now_ms()

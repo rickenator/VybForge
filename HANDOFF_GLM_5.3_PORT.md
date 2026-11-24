@@ -7912,3 +7912,24 @@ verification call BEFORE being modelled as algorithmic.
 STILL OPEN: step t=1 is now 57.98 s vs t=0 32.95 s (1.76x, was 2.8x) -- still the footprint signature.
 DECODE ATTENTION IS NOW 35.6 s of the 137 s run; re-split its phases (the indexer is now ~0) to find the
 next term, which will be in `mix` (16.6 s) or the per-call htod/dtoh in the mm_host calls.
+=== ROUND 209: THE REMAINING HOG IS PER-LAYER WEIGHT LOAD, CONFIRMED ===
+Split the KDA branch (the one with no unguarded dumps) at its attn-site boundary:
+    pre-site  = 21,985 ms over 68 visits (34 layers x 2 steps) = 323 ms/layer
+    attn site =  3,919 ms over 68 visits                        =  57 ms/layer
+and the pre-site is pure weight movement: 28 gx_read + 22 deq_bf16 + 6 bulk_dtoh, NO matvecs. The DSA
+`mix` section is the same shape (24 gx_read + 18 deq_bf16 = 584 ms/layer). So per layer the engine is
+spending 323-584 ms getting the layer's weights from disk into host memory and 57-86 ms doing the attention
+math on them.
+STEP BUDGET NOW: 34 KDA layers x 323 ms + 11 DSA x 584 ms = 11.0 + 6.4 = ~17.4 s of a 26-35 s step, i.e.
+weight load is 50-67% of the step. Everything else -- MoE, MLA, indexer, KDA math, hc mixes -- is the rest.
+** THIS CLOSES THE HOG HUNT AT THE CODE LEVEL: the dominant remaining cost is not a kernel, an allocation, a
+resolver or a verification call. It is that 175.62 GB of weights do not fit in 121 GB, so every layer is
+re-read and re-dequantised on every step. The only fix of the required size is residency (TP=2, 88.50/87.13
+GB per node), whose communication support is already proven. **
+SECONDARY (worth doing only if residency is deferred): the dequant is HOST-side at ~350 MB/s while the
+prefill site dequantises on device; moving it would cut the dequant share but not the disk read.
+RUN-TO-RUN VARIANCE WARNING: this run measured req1 108.86 s against 137.21 s for the previous one with only
+timer prints added between them, which is far outside the ~17% noise floor documented for this harness. The
+KDA SPLIT above is internally consistent and trustworthy (it is two disjoint spans summed within one run),
+but the ABSOLUTE total should be re-established with repeat runs before being quoted or compared. Do not
+stack a conclusion on a single absolute number.
