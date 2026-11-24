@@ -7553,3 +7553,21 @@ STATE OF THE GOAL: the identified hogs are eliminated or reduced --
   * abandoned: fp64 GEMM kernel work (off-target, ~15% of a layer at most)
 WHAT REMAINS is the untimed ~430 s per request: streaming the checkpoint. That is not a kernel or a lookup;
 it is residency, i.e. the TP=2 split so each node holds its ~88 GB half, which is the agreed step 3.
+=== ROUND 194: INSIDE fused_proj -- SYNC/LATENCY, NOT THE UPLOAD ===
+Instrumented fused_proj with two disjoint windows: `up` (the trellis H2D plus the small su/sv copies) and
+`rest` (the four kernel launches and their syncs). NLAY=12, which is 6 MoE layers x 8 experts x 3
+projections = 144 calls:
+    calls=144  up_total=35 ms  rest_total=99 ms
+So per call the upload is ~0.24 ms and the kernels+syncs are ~0.69 ms. MY HYPOTHESIS (that the ~100 MB of
+trellis H2D per layer was the proj cost) IS WRONG; data movement is ~26% of it.
+WHAT IT ACTUALLY IS: fused_proj calls sync() FOUR TIMES per call -- after the uploads, after the f32 cast,
+after xhat, and after yhat. All four stages are kernels on the SAME stream, so stream ordering already
+guarantees they run in order; only the final synchronisation before the D2H readback (bulk_dtoh, which is
+itself synchronous) is needed for correctness. 144 calls x 4 syncs = 576 syncs per 6 layers.
+NEXT CHANGE, contained: drop the three intermediate syncs, keep the pipeline on one stream, and let
+bulk_dtoh's synchronous D2H provide the final ordering. Expected: ~3/4 of rest_total = ~74 ms per 6 layers,
+roughly 12 ms/layer. Must be verified with the 27-digest comparison, since a missing sync that DID matter
+would show as nondeterminism or wrong values rather than a crash.
+PATTERN, now seen four times tonight: the cost is per-call fixed overhead (syncs, launches, latency chains),
+not bytes moved. The ~900 ms stalls, the 540 us gemm calls, the 0.69 ms projection overhead are all the
+same shape.

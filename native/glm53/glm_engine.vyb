@@ -4191,11 +4191,13 @@ fused_proj(fxb<Int>, fyb<Int>, fmbDet<Int>, fmbRed<Int>, fmb<Int>, flt<Int>,
     wr_pdev(pb, 0, dLUT)
     launch_kernel(flt, 256, pb)
     sync()
+    fp0<Int> = time_mono_millis()
     cuMemcpyHtoD_v2(dsu, g_su, g_su.len())
     cuMemcpyHtoD_v2(dsv, g_sv, g_sv.len())
     cuMemcpyHtoD_v2(dQ, g_trellis, g_trellis.len())
     bulk_htod(dsub64, view(sub))
     sync()
+    fp1<Int> = time_mono_millis()
     # f64 activations -> f32
     wr_pdev(pb, 0, dsub64)
     wr_pdev(pb, 8, dxf)
@@ -4222,6 +4224,8 @@ fused_proj(fxb<Int>, fyb<Int>, fmbDet<Int>, fmbRed<Int>, fmb<Int>, flt<Int>,
     wr_pdev(pb, 40, nt)
     launch_kernel(fyb, nt * (cw / 128), pb)
     sync()
+    fp2<Int> = time_mono_millis()
+    println("SEC fp up=" + (fp1 - fp0).to_string() + " rest=" + (fp2 - fp1).to_string())
     return bulk_dtoh(dyp, nt * nout)
 }
 
