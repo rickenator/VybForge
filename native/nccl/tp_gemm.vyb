@@ -200,30 +200,37 @@ main()<Int> -> {
         + " p0=" + partv.get(0).to_string() + " p1=" + partv.get(1).to_string()
         + " pn=" + partv.get(N - 1).to_string())
 
-    # WARM-UP the collective before timing it. The first all-reduce on a fresh communicator pays
-    # connection establishment (~1.25 s measured), which is not the steady-state cost the design needs.
-    # ncclAllReduce overwrites recv each call, so a warm-up does not pollute the result.
+    # SIX IDENTICAL COLLECTIVES, probing after each. The defect under investigation: the first
+    # all-reduce returned the correct sum (4) and a second identical call returned rank 0's input alone
+    # (6). A loop shows whether that is "second call always", a one-off, or intermittent -- and whether
+    # the wrong value is always rank 0's.
     var<Int> arc = 0
-    freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
-    sync()
-    if (arc != 0) { println("TPG_FAIL warmup rc=" + arc.to_string()); return 16 }
-
-    # after the warm-up collective: is the INPUT intact, and what did the OUTPUT become?
-    pin<Vec<Float>> = bulk_dtoh(dPart, M * N)
-    pout<Vec<Float>> = bulk_dtoh(dC, M * N)
-    println("TPG_AFTERWARM rank=" + rank.to_string()
-        + " in0=" + pin.get(0).to_string() + " out0=" + pout.get(0).to_string())
-
-    # time the steady-state collective
+    ci2<Int> = 0
     tw0<Int> = clock_ns()
-    freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
-    sync()
+    while (ci2 < 6) {
+        tc0<Int> = clock_ns()
+        freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+        sync()
+        tc1<Int> = clock_ns()
+        if (arc != 0) { println("TPG_FAIL collective rc=" + arc.to_string()); return 16 }
+        pv<Vec<Float>> = bulk_dtoh(dC, M * N)
+        pinv<Vec<Float>> = bulk_dtoh(dPart, M * N)
+        println("TPG_COLL rank=" + rank.to_string() + " i=" + ci2.to_string()
+            + " out0=" + pv.get(0).to_string() + " in0=" + pinv.get(0).to_string()
+            + " us=" + ((tc1 - tc0) / 1000).to_string())
+        ci2 = ci2 + 1
+    }
     t2<Int> = clock_ns()
-    if (arc != 0) { println("TPG_FAIL allreduce rc=" + arc.to_string()); return 17 }
 
     # and time an EMPTY gemm launch to isolate the parameter-packing overhead from the arithmetic
     tp0<Int> = clock_ns()
-    if (gemm(hgemm, dScr, dA, dB, dC, 1, 1, 1, 1.0, 0.0) != 0) { println("TPG_FAIL gemm tiny"); return 18 }
+    # NOTE: this writes to its OWN 8-byte buffer. It used to target dC, which silently overwrote
+    # result element 0 with A[0]*B[0] (= 6) after the collectives and before the readback -- the source
+    # of the "inconsistent collective" scare. At K=4096 the corrupted value happened to equal the correct
+    # sum, so the bug hid; at K=8192 they differ and it showed.
+    dTiny<Int> = dev_alloc(8)
+    if (dTiny == 0) { println("TPG_FAIL tiny alloc"); return 18 }
+    if (gemm(hgemm, dScr, dA, dB, dTiny, 1, 1, 1, 1.0, 0.0) != 0) { println("TPG_FAIL gemm tiny"); return 18 }
     sync()
     tp1<Int> = clock_ns()
 

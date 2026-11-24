@@ -7365,3 +7365,23 @@ NEXT STEPS FOR THIS DEFECT, in order:
   3. swap which node is rank 0 to separate rank-index effects from node effects.
 BLOCKING STATUS: step 2 (f32/bf16) and step 3 (residency) are BLOCKED behind this. Sharding layers onto a
 collective that intermittently drops a rank would produce wrong outputs that look plausible.
+=== ROUND 185: WITHDRAWN -- THERE WAS NO NCCL DEFECT; MY OWN PROBE CORRUPTED THE RESULT ===
+Round 184 concluded that two identical ncclAllReduce calls returned different answers and called it "a
+reproducibility defect that would silently corrupt a TP implementation". THAT WAS WRONG. The collective
+was correct on every call. The real cause:
+    the pack-timing probe ran gemm(1x1x1) with C = dC -- THE RESULT BUFFER -- which overwrote dC[0] with
+    A[0]*B[0] = (-3)*(-2) = 6 after the collectives and before the readback.
+    At K=4096 the correct sum is ALSO 6, so the corruption was invisible and the test passed.
+    At K=8192 the correct sum is 4, so the corrupted 6 showed up and looked like a dropped rank.
+Fixed by giving the pack probe its own 8-byte buffer. Re-verified at BOTH sizes, both ranks:
+    K=8192 : TOLERANCE_OK maxabs=0 maxrel=0 ref0=4 got0=4
+    K=4096 : TOLERANCE_OK maxabs=0 maxrel=0 ref0=6 got0=6
+    blocked kernel: 334 us @ K=4096, 619 us @ K=8192, exact at both
+So the row-parallel TP path is CORRECT at both sizes, and the blocked kernel keeps its ~1.8x with
+exactness. Diagnostics 2 and 3 (NCCL_PROTO/ALGO pinning, swapping which node is rank 0) are moot.
+THE LESSON, and it is the sharpest of this whole session: BEFORE BLAMING A LIBRARY, CHECK WHETHER THE
+WRONG VALUE IS SOMETHING MY OWN INSTRUMENTATION WOULD PRODUCE. The tell was visible in the numbers --
+the bad value 6 was exactly the 1x1x1 pack-timer's product, and it matched the OTHER size's correct
+answer, which is why it hid. Probe buffers must never alias the buffer under test.
+Related rule already in this file and violated here: blame order is artifact present -> argument types ->
+readback width -> MY OWN INSTRUMENTATION -> compiler last. A library is the last suspect, not the third.
