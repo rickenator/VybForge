@@ -420,6 +420,42 @@ deq_bf16_res(faddr<Int>, qdev<Int>, n<Int>, z<Int>)<Int> -> {
     return out
 }
 
+// deq_auto -- dequantise a tensor, keeping its packed bytes resident on the device after the first touch.
+//
+// Why this shape (round 213): the decode path is 22-28 (gx_read + deq_bf16) pairs per layer and each pair
+// pulls the same bytes from disk on EVERY STEP. Hoisting a preload out of the layer loop is awkward because
+// the per-layer want-list depends on layer type (DSA vs KDA, dense vs MoE). So residence is filled LAZILY
+// per (layer, slot) instead: the first step pays the read, every later step is a device-side dequantise.
+//
+// `ch` is a caller-owned their<Vec<Int>> with layout:
+//     [0] = maxBytes   -- cache budget; 0 disables caching entirely (pure disk path)
+//     [1] = usedBytes  -- running total, maintained here
+//     [2..]            -- one device pointer per key, 0 = not yet resident
+// `key` must be in [0, ch.len()-2). Callers use key = layer * SLOTS + slot.
+// A tensor is only cached if it fits inside the budget; past that the disk path is used, so the cache can
+// never silently exceed the memory it was given.
+share(all)
+deq_auto(faddr<Int>, lg<GxLoc>, slot<Int>, key<Int>, n<Int>, z<Int>, ch<their<Vec<Int>>>)<Int> -> {
+    if (ch.len() < 3) { return deq_bf16(faddr, gx_read(lg, slot), n, z) }
+    maxB<Int> = ch.get(0)
+    if (maxB <= 0 || key < 0 || key + 2 >= ch.len()) { return deq_bf16(faddr, gx_read(lg, slot), n, z) }
+    have<Int> = ch.get(2 + key)
+    if (have != 0) { return deq_bf16_res(faddr, have, n, z) }
+    # not resident yet: read once, upload, then dequantise from the device copy
+    raw<String> = gx_read(lg, slot)
+    if (raw.len() == 0) { return 0 }
+    used<Int> = ch.get(1)
+    if (used + raw.len() > maxB) {
+        # budget exhausted: stay on the disk path rather than evicting (eviction would thrash)
+        return deq_bf16(faddr, raw, n, z)
+    }
+    qp<Int> = res_upload(raw)
+    if (qp == 0) { return deq_bf16(faddr, raw, n, z) }
+    ch.set(2 + key, qp)
+    ch.set(1, used + raw.len())
+    return deq_bf16_res(faddr, qp, n, z)
+}
+
 // deq_bf16_arena -- the same dequantise as deq_bf16, but every device buffer comes from a caller-owned
 // ARENA instead of cuMemAlloc/cuMemFree per call.
 //

@@ -8056,3 +8056,33 @@ only the idx=0 ratio as meaningful and re-measure after integration rather than 
 NEXT: wire res_upload + deq_bf16_res into glm_serve's decode path (preload once at startup, swap the deq
 call sites), then re-measure SEC STEP in production mode and compare against the ~118 s / 26-35 s-per-step
 baseline.
+=== ROUND 213: RESIDENT READER VERIFIED IN ISOLATION, BUT THE NAIVE INTEGRATION IS SLOWER -- REVERTED ===
+Attempted to wire the resident reader (round 212) into glm_serve's decode path via `deq_auto`: a lazily
+filled, budget-capped cache keyed by layer*48+slot, so the first step pays the read and later steps
+dequantise from device memory. Applied to the KDA pre-site (22 of 28 read+deq pairs swapped), behind
+`P6_RES_GB` with a default of 0 (cache off).
+RESULT: BOTH SETTINGS ARE WORSE THAN BASELINE.
+    cache ON  (P6_RES_GB=16): req1 183.31 s   steps 32.9 / 63.1 s   KDA pre-site 33,883 ms (498 ms/layer)
+    cache OFF (default)     : req1 149.01 s   steps 29.9 / 71.0 s   KDA pre-site 40,130 ms (590 ms/layer)
+    baseline (round 210)    : req1 ~118 s     steps 26-29 / 35-48 s KDA pre-site 21,985 ms (323 ms/layer)
+** THE REVERT IS THE IMPORTANT PART: even with the cache DISABLED, deq_auto nearly DOUBLED the per-layer
+load (323 -> 590 ms). ** With maxB = 0 it executes `deq_bf16(faddr, gx_read(lg, slot), n, z)` -- literally
+the original work -- so the cost came from restructuring, not from the cache. The most likely cause: the 22
+swapped sites moved their `gx_read` calls into the same statement as the deq, and the 6 remaining reads now
+interleave differently, so the reader's ACCESS ORDER changed. This reader is fast when reads are sequential
+and slow when they are not (the same 1.1 GB/s sequential vs ~380 MB/s effective gap rounds 208-209 measured
+between the fast and slow ends of this path).
+So the lesson is not "residency does not work" -- in isolation the resident dequantise is bit-exact and
+2.7x faster per call (round 212b) -- it is that **the read ORDER is load-bearing**, and any residency
+scheme must preserve it: read the shard sequentially, in shard order, and cache as you go. A per-(layer,slot)
+lazy cache is the wrong shape because it reorders reads.
+STATE: glm_serve reverted to HEAD (wiring removed); glm_engine keeps `res_upload`, `deq_bf16_res` and
+`deq_auto` as verified building blocks (the first two are proven bit-exact, the third is unused). Default
+behaviour is back to the ~118 s baseline.
+NEXT, revised: residency must be a SEQUENTIAL PRELOAD -- walk the shard in physical order, upload each
+tensor, record (layer,slot) -> pointer -- preserving the order the reader wants, then let the decode loop
+look pointers up without touching the reader at all. That also makes the TP=2 shard split natural, since a
+rank's half of the shard is itself a contiguous walk.
+ALSO WORTH KNOWING: on this node the model is largely in page cache (95 GB of buff/cache), so residency's
+raw I/O saving is small here; its real value is (a) not depending on page cache, and (b) halving bytes read
+at TP=2. Judge it on the cold and TP=2 cases, not on a warm single node.
