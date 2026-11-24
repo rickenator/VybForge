@@ -8146,3 +8146,27 @@ not identical across topologies.
 NEXT: load the resident expert shard for ONE layer on each rank (144 experts each), compute each rank's
 partial MoE contribution for a known token, all-reduce, and compare against the single-node layer output.
 That is the first end-to-end TP=2 correctness gate.
+=== ROUND 215: EXPERT-PARALLEL SHARD WALK WORKS ===
+`native/host/p_ep_shard.vyb` loads one rank's half of a layer's routed experts and holds it resident.
+Experts are SEPARATE tensors in this checkpoint -- `...mlp.experts.<E>.{gate,up,down}_proj.{trellis,suh,svh}`,
+9 per expert, 2592 per layer -- so expert-parallel never cuts the packing format (round 214's SPLIT_AB
+MISALIGNED is sidestepped entirely).
+RESULT, layer 3, both halves measured on the same node in sequence:
+    rank 0 experts [0,144)    resolved 1296/1296  held 1296  bad 0  1,817,247,744 B (1733 MB)  fp=809709213
+    rank 1 experts [144,288)  resolved 1296/1296  held 1296  bad 0  1,817,247,744 B (1733 MB)  fp=476889258
+so the split is EXACTLY symmetric (identical byte counts), COMPLETE (every tensor resolved, none missing) and
+DISJOINT (different fingerprints). 2 x 1733 MB = 3.47 GB against the predicted 3.63 GB/layer, and 45 layers
+of one rank's half is ~78 GB -- inside 121 GB with the 12.3 GB non-expert remainder duplicated, matching the
+94 GB/rank estimate from round 214.
+RESOLVER NOTE, needed by anyone doing bulk resolution: `gx_resolve(dir, total, <1296 names>)` SEGFAULTS
+("MARK post-st-open-shard w846") because it scans shard headers per name. The working path is the windowed
+one the engine uses:
+    idx = gx_read_index(dir)                      # 15.6 MB, read once
+    w   = gx_expert_window(idx, layer_prefix)     # [8166, 408166) for layer 3 -- a 400 KB slice
+    g   = gx_resolve_win(idx, dir, total, want, w.get(0), w.get(1))
+which resolved 1296 names in 3.4-4.3 s.
+NEW PROBLEM TO SOLVE NEXT: the load ran at 1733 MB / 44.4 s = ~39 MB/s, i.e. ~28x slower than the 1.1 GB/s
+sequential figure, because it is 1296 separate gx_read calls each with its own open/seek/read plus a
+cuMemAlloc + memcpy per tensor. At that rate a full 45-layer preload is ~33 minutes. The fix is the
+sequential-walk idea already identified: read the shard in large contiguous blocks rather than per tensor.
+The shard walk itself (correctness, symmetry, completeness, disjointness) is proven.

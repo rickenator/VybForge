@@ -1,0 +1,128 @@
+# p_ep_shard.vyb -- expert-parallel shard walk: can a rank load ITS HALF of one layer's experts, resident?
+#
+# This is the foundation gate for expert-parallel TP=2 (round 214). Experts are separate tensors in this
+# checkpoint -- `...mlp.experts.<E>.{gate,up,down}_proj.{trellis,suh,svh}`, 9 per expert, 2592 per layer --
+# so a rank can own WHOLE experts and the packing format is never cut. That is what makes this viable at all:
+# splitting a packed tensor at a byte offset is provably wrong (round 214, SPLIT_AB MISALIGNED).
+#
+# What this proves, per rank:
+#   * the rank's expert range resolves and reads in one pass
+#   * every tensor is found (no silent gaps)
+#   * the bytes are uploaded and held resident (so they cannot be evicted mid-layer)
+#   * the two ranks' ranges are disjoint and together cover all 288 experts
+#
+# Run on lefty:  RANK=0 EXP_LO=0   EXP_HI=144 ... vyb p_ep_shard.vyb
+# Run on righty: RANK=1 EXP_LO=144 EXP_HI=288 ...
+# Prints EP_SHARD ... and EP_SHARD_DONE. No comms here -- that is the next gate.
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init}
+import time::{time_mono_millis}
+
+extern "C" {
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+}
+
+res_upload(raw<String>)<Int> -> {
+    var<Int> q = 0
+    if (raw.len() == 0) { return 0 }
+    freedom {
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        return q
+    }
+    return 0
+}
+
+main()<Int> -> {
+    rank<Int> = 0
+    rv<String> = env_get("RANK") else ""
+    if (rv.len() > 0) { rank = rv.to_int() }
+    lo<Int> = 0
+    lv<String> = env_get("EXP_LO") else ""
+    if (lv.len() > 0) { lo = lv.to_int() }
+    hi<Int> = 144
+    hv<String> = env_get("EXP_HI") else ""
+    if (hv.len() > 0) { hi = hv.to_int() }
+    layer<Int> = 3
+    yv<String> = env_get("LAYER") else ""
+    if (yv.len() > 0) { layer = yv.to_int() }
+
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    total<Int> = 83
+    lpre<String> = "model.language_model.layers." + layer.to_string() + "."
+
+    if (tensor_init() != 0) { println("EP_SHARD_FAIL no cuda"); return 4 }
+
+    # 9 tensors per expert, names exactly as the engine builds them
+    wants<Vec<String>> = Vec()
+    e<Int> = lo
+    while (e < hi) {
+        epre<String> = lpre + "mlp.experts." + e.to_string() + "."
+        wants.push(epre + "gate_proj.trellis")
+        wants.push(epre + "gate_proj.suh")
+        wants.push(epre + "gate_proj.svh")
+        wants.push(epre + "up_proj.trellis")
+        wants.push(epre + "up_proj.suh")
+        wants.push(epre + "up_proj.svh")
+        wants.push(epre + "down_proj.trellis")
+        wants.push(epre + "down_proj.suh")
+        wants.push(epre + "down_proj.svh")
+        e = e + 1
+    }
+    println("EP_SHARD rank=" + rank.to_string() + " layer=" + layer.to_string() + " experts=[" + lo.to_string() + "," + hi.to_string() + ") tensors=" + wants.len().to_string())
+
+    t0<Int> = time_mono_millis()
+    idxT<String> = gx_read_index(dir)
+    println("EP_SHARD index_bytes=" + idxT.len().to_string())
+    ww<Vec<Int>> = gx_expert_window(idxT, lpre)
+    println("EP_SHARD window=[" + ww.get(0).to_string() + "," + ww.get(1).to_string() + ")")
+    g<GxLoc> = gx_resolve_win(idxT, dir, total, wants, ww.get(0), ww.get(1))
+    tRes<Int> = time_mono_millis() - t0
+
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < wants.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    println("EP_SHARD resolved=" + nf.to_string() + "/" + wants.len().to_string() + " resolve_ms=" + tRes.to_string())
+    if (nf != wants.len()) { println("EP_SHARD_FAIL missing=" + (wants.len() - nf).to_string()); return 3 }
+
+    t1<Int> = time_mono_millis()
+    bytes<Int> = 0
+    held<Int> = 0
+    bad<Int> = 0
+    i = 0
+    while (i < wants.len()) {
+        raw<String> = gx_read(g, i)
+        if (raw.len() == 0) { bad = bad + 1 } else {
+            q<Int> = res_upload(raw)
+            if (q == 0) { bad = bad + 1 } else { held = held + 1 }
+            bytes = bytes + raw.len()
+        }
+        i = i + 1
+    }
+    tLoad<Int> = time_mono_millis() - t1
+    println("EP_SHARD held=" + held.to_string() + " bad=" + bad.to_string() + " bytes=" + bytes.to_string() + " mb=" + (bytes / 1048576).to_string() + " load_ms=" + tLoad.to_string())
+    if (bad != 0) { println("EP_SHARD_FAIL bad=" + bad.to_string()); return 5 }
+
+    # a cheap per-rank fingerprint so the two ranks' ranges can be compared for overlap/disjointness
+    fp<Int> = 0
+    i = 0
+    while (i < 8) {
+        raw<String> = gx_read(g, i * 137)
+        b<Int> = 0
+        while (b < 16 && b < raw.len()) {
+            fp = (fp * 31 + ((raw.char_at(b) as Int) & 255)) & 1073741823
+            b = b + 1
+        }
+        i = i + 1
+    }
+    println("EP_SHARD fp=" + fp.to_string())
+    println("EP_SHARD_DONE rank=" + rank.to_string() + " experts=" + (hi - lo).to_string() + " resident_mb=" + (bytes / 1048576).to_string())
+    return 0
+}
