@@ -7695,3 +7695,28 @@ it leaves on -- and the tell here was a per-step cost that GROWS with step index
 flat (the accumulating host work signature this same file warns about).
 NEXT: re-derive the layer budget in production mode (per-layer timers were dump-contaminated), then decide
 what the real remaining hog is. Do not carry any pre-round-199 end-to-end figure forward.
+=== ROUND 200: HONEST FULL-DEPTH NUMBERS (PRODUCTION MODE) ===
+NLAY=45, NSTEPS=2, REQS=1, VYBFORGE_SERVE=1 (dumps OFF), VALID_RUN with 62 moekern lines:
+    req1                = 212.80 s      (dump mode: 968.55 s -> 4.55x inflation)
+    SEC STEP t=0        =  50,986 ms    (51 s, i.e. ~1.13 s/layer)
+    SEC STEP t=1        = 115,954 ms    (116 s, i.e. ~2.58 s/layer)
+    per-layer MoE loop  = 69-72 ms (early layers) -> 304-311 ms (late layers)
+    stalls             = 21 SEC_DEQ
+TWO REAL FINDINGS, now measured without the dump path:
+ 1. THE STEP GROWS WITH INDEX AT FULL DEPTH ONLY. At NLAY=12 production the steps were FLAT (6,098 and
+    6,972 ms); at NLAY=45 they are 51 s then 116 s (2.3x). Same binary, same flags, only depth differs --
+    so this is the footprint effect (175.62 GB of weights against 121 GB of RAM), exactly the depth-sweep
+    signature the measurement reference describes: flat-then-climbing means the RUN's footprint, not
+    per-layer accumulation, and no per-layer fix can address it.
+ 2. THE MoE IS NOT THE BULK EVEN HERE. Late-layer MoE loops are ~305 ms against a ~2,580 ms layer, i.e.
+    ~12%. The remaining ~2.2 s/layer is elsewhere in the layer (the attention-side weight loads and the
+    non-MoE tensors) and has never been attributed per layer in production mode.
+HONEST GAP TO THE BAR: 45 layers in 116 s is 0.009 tok/s against a 45-50 tok/s target (20-22 ms/token),
+i.e. ~2,000-5,000x. That is not a kernel gap; it is the model being streamed rather than resident.
+CONSEQUENCE: residency (the TP=2 split, 88.50/87.13 GB per node -- measured in round 174) remains the only
+lever of the required size, and the support for it is already proven (NCCL all-reduce bit-exact at ~31 us
+small and 36 GB/s large; row-parallel TP verified at two sizes).
+WHAT TO RE-MEASURE NEXT, in order: (a) attribute the ~2.2 s/layer that is not the MoE, in production mode,
+per layer -- it is now the largest single term nobody has split; (b) confirm the step-1 growth is page-cache
+thrash by watching /proc/diskstats across a 45-layer run; (c) only then start the residency work with a
+measured budget instead of an assumed one.
