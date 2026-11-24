@@ -7128,3 +7128,33 @@ SPLIT, measured from the safetensors headers of all 83 shards (scripts/split_rep
 For the record, the alternatives: single node needs ~2.5 bpw (175.62 -> ~110 GB) -- a real quality cost to
 avoid a split that was already the plan; 3 bpw (66 GB/half) buys headroom nobody needs; the 0.81 GB visual
 tower is skippable for text serving.
+=== ROUND 175: NCCL ALL-REDUCE ACROSS BOTH SPARKS -- BIT-EXACT, STEP 1 OF TP=2 DONE ===
+Rick's frame: the bar is vLLM at 4bpw TP=2 (~40-45 tok/s), and two nodes exist FOR TP=2. That retires the
+layer-24 pipeline split proposed in round 174: a pipeline gives no single-stream latency gain (a token
+still visits all 45 layers in order), whereas TP=2 halves each layer's work. Memory math at TP=2 is
+~87.8 GB per node (half of every tensor) against 121 GB -- resident, no re-quantisation.
+GATE FOR ALL OF IT: can two Vyb processes exchange a buffer at all? ANSWER: YES, verified.
+  native/nccl/nccl_ping.vyb -- self-contained two-node test; nccl_ping runs on lefty (rank 0) and righty
+  (rank 1), exchanging the 128-byte unique id over TCP and all-reducing a device buffer.
+  RESULT at COUNT=4096, both ranks: pre-reduce v0=1 (rank 0) / v0=2 (rank 1) -> post-reduce v0=3
+  vlast=3, bad=0, firstbad=-1, NCCLPING_EXACT, exit 0. Every element exact, not merely close.
+  NCCL 2.31.2 present on both nodes; rails rocep1s0f0 + roceP2p1s0f0 via NCCL_IB_HCA.
+FOUR REAL DEFECTS FOUND AND FIXED ALONG THE WAY (each cost a cycle; all are reusable knowledge):
+ 1. libnccl was NOT in Vyb's FFI dlopen preload list, so `nccl*` symbols were unresolvable from Vyb at
+    all. Added "libnccl.so", "libnccl.so.2" beside libcuda in src/main.cpp (~/Projects/Vyb). This is the
+    compiler-side change that makes comms possible from Vyb.
+ 2. String::from_bytes on a pinned host pointer SEGFAULTS (both loc<CVoid> and loc<CChar>), so the unique
+    id could not be wrapped that way. Working alternative: let NCCL write directly into a Vyb String's
+    buffer (`ncclGetUniqueId(uid<String>)`), since the FFI passes a String as its data pointer. The id
+    then travels as a String with no host allocation at all.
+ 3. Passing a String to an FFI param for OUTPUT writes into a COPY: the readback still held the original
+    ASCII digits, reinterpreted as 0x33323130 = 4.14886e-08. Extracting the String header with
+    addr()/at() the way bulk_dtoh does SEGFAULTS for a String. The working path is the engine's own
+    tensor::bulk_dtoh / bulk_htod.
+ 4. Vyb's Vec<Float> is float64, and bulk_htod/bulk_dtoh move 8 bytes per element. Mixing an f32 device
+    buffer with those helpers fails the upload (and NCCL datatype must be ncclFloat64 = 8).
+  Also: the tensor module already declares the CUDA driver functions, so redeclaring them in the test is
+  a "redefinition" error; use tensor::sync() rather than cuCtxSynchronize.
+NEXT (step 2 of the plan): per-layer TP sharding -- column-parallel gate/up, row-parallel down/o, one
+all-reduce per layer point -- on top of this proven primitive. Expert placement for 288 experts across the
+pair still needs settling first (TP-within-expert vs expert-parallel): it decides the comms pattern.

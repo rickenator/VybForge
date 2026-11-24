@@ -1,0 +1,231 @@
+// nccl_ping.vyb -- prove two Vyb processes on lefty+righty can exchange a buffer over NCCL/RoCE.
+//
+// This gates tensor-parallel serving: nothing else is worth building until two nodes can all-reduce
+// correctly and at the expected bandwidth. Self-contained: no glm modules, no checkpoint.
+//
+//   lefty :  RANK=0 WORLD=2 PORT=18400 ...
+//   righty:  RANK=1 WORLD=2 PEER_IP=192.168.192.1 PORT=18400 ...
+//
+// Buffers are Vyb Strings, which the FFI passes to C as their data pointer -- so NCCL writes straight
+// into a String's own heap buffer and no raw host allocation or pointer arithmetic is needed. Each rank
+// fills the device buffer with an exactly-representable value (rank 0 -> 1.0f, rank 1 -> 2.0f),
+// SUM-reduces, and every element must read back exactly 3.0f: bit-exact, not approximate.
+import io
+import env
+import time
+import tensor::{tensor_init, dev_alloc, bulk_htod, bulk_dtoh, sync}
+import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
+
+# ---------------- CUDA driver ----------------
+# ---------------- NCCL ----------------
+# ncclComm_t is an opaque handle and crosses the Vyb surface as an Int, like CUDA handles do.
+# ncclGetUniqueId takes its destination as a String: the FFI hands C the String's data pointer, so the
+# 128-byte id lands in a Vyb string buffer and can be socket_send't unchanged.
+share(all)
+ncclGetUniqueId(uid<String>)<CInt>
+
+share(all)
+ncclCommInitRank(comm<loc<Int>>, nranks<Int>, uid<loc<CVoid>>, rank<Int>)<CInt>
+
+share(all)
+ncclCommCount(comm<Int>, count<loc<Int>>)<CInt>
+
+share(all)
+ncclAllReduce(sendbuff<Int>, recvbuff<Int>, count<Int>, datatype<CInt>, op<CInt>, comm<Int>, stream<Int>)<CInt>
+
+share(all)
+ncclCommDestroy(comm<Int>)<CInt>
+
+share(all)
+ncclGetVersion(version<loc<Int>>)<CInt>
+
+# NCCL enum values from nccl.h: ncclSum = 0; ncclFloat32 = 7.
+share(all)
+nccl_sum()<CInt> -> { return 0 }
+
+
+# Vec<Float> is float64 in Vyb, and tensor::bulk_htod/bulk_dtoh move 8 bytes per element, so f64 is the
+# natural type here: ncclFloat64 = 8 in nccl.h.
+share(all)
+nccl_f64()<CInt> -> { return 8 }
+
+# A String of n bytes built by repeated doubling: O(log n) concatenations, not O(n).
+blanks(n<Int>)<String> -> {
+    s<String> = "0123456789"
+    while (s.len() < n) { s = s + s }
+    return s.substring(0, n)
+}
+
+# Milliseconds from /proc/uptime, whole-second resolution (enough to time a 1M-element reduce).
+now_ms()<Int> -> {
+    st<String> = ""
+    match (open_read("/proc/uptime")) {
+        f -> { match (read_all(f)) { s -> { st = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    # "<seconds>.<centiseconds> <idle>" -> milliseconds, including the fraction
+    sec<Int> = 0
+    frac<Int> = 0
+    fdig<Int> = 0
+    seen<Int> = 0
+    i<Int> = 0
+    while (i < st.len()) {
+        c<Int> = (st.char_at(i) as Int) & 255
+        if (c == 46) { seen = 1 }
+        else if (c >= 48 && c <= 57) {
+            if (seen == 0) { sec = sec * 10 + (c - 48) }
+            else if (fdig < 2) { frac = frac * 10 + (c - 48) ; fdig = fdig + 1 }
+        } else if (c == 32) { i = st.len() }
+        i = i + 1
+    }
+    if (fdig == 0) { frac = 0 }
+    if (fdig == 1) { frac = frac * 10 }
+    return sec * 1000 + frac * 10
+}
+
+f32_at(raw<String>, idx<Int>)<Float> -> {
+    w<Int> = 0
+    b<Int> = 0
+    while (b < 4) {
+        c<Int> = (raw.char_at(idx * 4 + b) as Int) & 255
+        w = w | (c << (b * 8))
+        b = b + 1
+    }
+    sign<Float> = 1.0
+    if ((w & 2147483648) != 0) { sign = 0.0 - 1.0 }
+    ex<Int> = (w >> 23) & 255
+    man<Int> = w & 8388607
+    v<Float> = 0.0
+    if (ex > 0) {
+        den<Float> = 1.0 + (man as Float) / 8388608.0
+        p2<Float> = 1.0
+        e2<Int> = 0
+        while (e2 < (ex - 127)) { p2 = p2 * 2.0 ; e2 = e2 + 1 }
+        while (e2 > (ex - 127)) { p2 = p2 / 2.0 ; e2 = e2 - 1 }
+        v = sign * den * p2
+    }
+    return v
+}
+
+main()<Int> -> {
+    rs<String> = env_get("RANK") else "0"
+    ws<String> = env_get("WORLD") else "2"
+    ps<String> = env_get("PORT") else "18400"
+    peer<String> = env_get("PEER_IP") else "192.168.192.1"
+    ns<String> = env_get("COUNT") else "1048576"
+    rank<Int> = rs.to_int()
+    world<Int> = ws.to_int()
+    port<Int> = ps.to_int()
+    count<Int> = ns.to_int()
+    bytes<Int> = count * 8
+
+    println("NCCLPING rank=" + rank.to_string() + " world=" + world.to_string()
+        + " port=" + port.to_string() + " count=" + count.to_string() + " bytes=" + bytes.to_string())
+
+    if (tensor_init() != 0) { println("NCCLPING_FAIL cuda init"); return 1 }
+
+    vver<Int> = 0
+    freedom { ncclGetVersion(loc(vver)) }
+    println("NCCLPING nccl_version=" + vver.to_string())
+
+    # ---- rendezvous: the 128-byte unique id travels as a String ----
+    uid<String> = blanks(128)
+    if (rank == 0) {
+        grc<Int> = 0
+        freedom { grc = (ncclGetUniqueId(uid) as Int) }
+        if (grc != 0) { println("NCCLPING_FAIL getuid rc=" + grc.to_string()); return 11 }
+        println("NCCLPING step getuid ok len=" + uid.len().to_string())
+
+        fd<Int> = socket_open(2, 1, 0) else 0
+        if (fd == 0) { println("NCCLPING_FAIL socket_open"); return 12 }
+        okb<Bool> = socket_bind(fd, "0.0.0.0", port) else false
+        if (!okb) { println("NCCLPING_FAIL bind " + port.to_string()); return 13 }
+        okl<Bool> = socket_listen(fd, 4) else false
+        if (!okl) { println("NCCLPING_FAIL listen"); return 14 }
+        println("NCCLPING listening port=" + port.to_string())
+        c<Int> = socket_accept(fd) else 0
+        if (c == 0) { println("NCCLPING_FAIL accept"); return 15 }
+        n<Int> = socket_send(c, uid) else 0
+        println("NCCLPING sent uid bytes=" + n.to_string())
+        socket_close(c)
+        socket_close(fd)
+    } else {
+        d<Int> = socket_open(2, 1, 0) else 0
+        if (d == 0) { println("NCCLPING_FAIL socket_open"); return 16 }
+        okc<Bool> = socket_connect(d, peer, port) else false
+        if (!okc) { println("NCCLPING_FAIL connect " + peer + ":" + port.to_string()); return 17 }
+        got<String> = socket_recv(d, 256) else ""
+        if (got.len() < 128) { println("NCCLPING_FAIL uid short len=" + got.len().to_string()); return 18 }
+        uid = got.substring(0, 128)
+        socket_close(d)
+        println("NCCLPING step uid received len=" + uid.len().to_string())
+    }
+
+    comm<Int> = 0
+    var<Int> irc = 0
+    freedom { irc = (ncclCommInitRank(loc(comm), world, uid, rank) as Int) }
+    if (irc != 0) { println("NCCLPING_FAIL commInitRank rc=" + irc.to_string()); return 19 }
+
+    nrank<Int> = 0
+    freedom { ncclCommCount(comm, loc(nrank)) }
+    println("NCCLPING comm ready nranks=" + nrank.to_string())
+
+    # ---- device buffer: exact fill, SUM all-reduce ----
+    dbuf<Int> = dev_alloc(bytes)
+    if (dbuf == 0) { println("NCCLPING_FAIL dev alloc"); return 20 }
+
+    # Fill via bulk_htod (the tested upload path). cuMemsetD32_v2 ran without error but the buffer
+    # arrived at the reduce as zeros, so it is not trusted here.
+    fillv<Float> = 1.0
+    if (rank == 1) { fillv = 2.0 }
+    fill<Vec<Float>> = Vec()
+    fi<Int> = 0
+    while (fi < count) { fill.push(fillv) ; fi = fi + 1 }
+    if (bulk_htod(dbuf, view(fill)) != 0) { println("NCCLPING_FAIL htod"); return 21 }
+    sync()
+
+    var<Int> arc = 0
+    freedom { arc = (ncclAllReduce(dbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+    if (arc != 0) { println("NCCLPING_FAIL warmup rc=" + arc.to_string()); return 22 }
+    sync()
+
+    # the warm-up already summed the pattern; re-upload before the timed exchange
+    if (bulk_htod(dbuf, view(fill)) != 0) { println("NCCLPING_FAIL htod2"); return 22 }
+    sync()
+    pre<Vec<Float>> = bulk_dtoh(dbuf, 4)
+    println("NCCLPING pre-reduce v0=" + pre.get(0).to_string() + " v3=" + pre.get(3).to_string())
+
+    t0<Int> = now_ms()
+    freedom { arc = (ncclAllReduce(dbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+    if (arc != 0) { println("NCCLPING_FAIL allreduce rc=" + arc.to_string()); return 23 }
+    sync()
+    dt<Int> = now_ms() - t0
+
+    # ---- verify: read the device result back into a String, check EVERY element == 3.0f ----
+    # Read back through the engine's bulk_dtoh (device -> Vec<Float>). Passing a String straight to the
+    # FFI writes into a COPY, so an earlier attempt read back the original ASCII digits (0x33323130 =
+    # 4.14886e-08); extracting the String header by hand instead segfaulted. bulk_dtoh is the tested path.
+    got2<Vec<Float>> = bulk_dtoh(dbuf, count)
+    println("NCCLPING probe v0=" + got2.get(0).to_string() + " vlast=" + got2.get(count - 1).to_string())
+    bad<Int> = 0
+    firstbad<Int> = -1
+    i<Int> = 0
+    while (i < count) {
+        if (got2.get(i) != 3.0) {
+            bad = bad + 1
+            if (firstbad < 0) { firstbad = i }
+        }
+        i = i + 1
+    }
+
+    gbs<Float> = 0.0
+    if (dt > 0) { gbs = (2.0 * (bytes as Float) / 1000000000.0) / ((dt as Float) / 1000.0) }
+    println("NCCLPING_RESULT rank=" + rank.to_string() + " count=" + count.to_string()
+        + " ms=" + dt.to_string() + " gbps=" + gbs.to_string()
+        + " bad=" + bad.to_string() + " firstbad=" + firstbad.to_string())
+    if (bad == 0) { println("NCCLPING_EXACT") } else { println("NCCLPING_MISMATCH") }
+
+    freedom { ncclCommDestroy(comm) }
+    if (bad == 0) { return 0 }
+    return 25
+}
