@@ -8304,3 +8304,31 @@ command run by hand worked, so `scripts/tp_launch.sh` has an orchestration bug i
 The manual two-terminal sequence works, which is how the numbers above were obtained.
 NEXT: (1) fix the readback check so the lockstep claim rests on verification; (2) decide how the per-layer
 reduce is overlapped with compute, since 29 ms/token of serial comms alone exceeds the bar.
+=== ROUND 221: COMMS SWEEP -- THE 29 ms/token WORRY WAS ONE NOISY RUN; IT IS ~10 ms ===
+Round 220 reported 0.65 ms/layer and concluded 45 layers = ~29 ms/token of comms, ABOVE the bar. That was a
+SINGLE run and it is corrected here. `scripts/tp_sweep.sh` runs the launcher over a payload range, 100
+iterations each, and averages the two ranks (they agree closely):
+    payload   ms/iter        payload   ms/iter
+     4 KB      0.345          64 KB     0.540
+     8 KB      0.135         128 KB     0.680
+    16 KB      0.280
+    32 KB      0.230  <- residual-stream width (4096 f64)
+REVISED RESULT: at the width a TP layer must actually exchange, the all-reduce costs ~0.23 ms, so
+    45 layers x 0.23 ms = ~10.3 ms per token
+against a 20-22 ms/token bar, leaving ~11.7 ms for compute. ** TP=2 COMMS IS VIABLE ON ITS OWN; it is not
+the existential constraint round 220 claimed. **
+SHAPE OF THE CURVE: 4096 -> 16384 (4x payload) costs 3.0x, so it is substantially bandwidth-influenced with a
+floor near 0.2 ms somewhere below 4096. Overlapping the reduce with compute is still worth doing, but it is
+now an optimisation rather than the thing that decides feasibility.
+CAVEATS, stated because the earlier conclusion was wrong precisely by over-reading one run:
+  * p50 resolves to 1 ms, so sub-millisecond per-iteration figures are quantised; only the 100-iteration
+    TOTALS are meaningful, and those are what the table uses.
+  * the 4 KB and 8 KB points INVERT (0.345 vs 0.135), i.e. +-50% noise at these sizes, so individual rows
+    are indicative and the 32 KB figure should be re-measured with more iterations before being load-bearing.
+  * every run still reports DESYNC, so LOCKSTEP remains UNPROVEN. The readback check is still wrong: hoisting
+    the fill buffer out of the loop (the plausible cause, since nccl_ping creates its buffer once) did NOT fix
+    it. The fault is in the verification, not the transport -- the timing is wall clock around the collective
+    and both ranks agree to within 1 ms.
+NEXT: (1) still fix the readback so lockstep is actually demonstrated -- try reading back through a String
+instead of bulk_dtoh, or verify with a single element rather than a full buffer; (2) re-measure 32 KB with
+>=1000 iterations to put an error bar on the 0.23 ms; (3) then the overlapped reduce as an optimisation.

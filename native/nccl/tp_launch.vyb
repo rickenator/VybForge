@@ -127,13 +127,17 @@ main()<Int> -> {
     firstbad<Int> = -1
     worst<Int> = 0
     hist<Vec<Int>> = Vec()
+    # the fill buffer is created ONCE and updated in place: passing view() of a Vec that is rebuilt inside
+    # the loop uploads garbage, which is what made every iteration look desynced
+    fv<Vec<Float>> = Vec()
+    fj<Int> = 0
+    while (fj < count) { fv.push(0.0); fj = fj + 1 }
     it<Int> = 0
     while (it < iters) {
         v<Float> = 1.0 * ((it + 1) as Float)
         if (rank == 1) { v = 2.0 * ((it + 1) as Float) }
-        fv<Vec<Float>> = Vec()
-        fj<Int> = 0
-        while (fj < count) { fv.push(v); fj = fj + 1 }
+        fj = 0
+        while (fj < count) { fv.set(fj, v); fj = fj + 1 }
         if (bulk_htod(dbuf, view(fv)) != 0) { println("TPLAUNCH_FAIL htod iter=" + it.to_string()); return 23 }
         sync()
         t0<Int> = time_mono_millis()
