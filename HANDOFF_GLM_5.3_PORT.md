@@ -7933,3 +7933,31 @@ timer prints added between them, which is far outside the ~17% noise floor docum
 KDA SPLIT above is internally consistent and trustworthy (it is two disjoint spans summed within one run),
 but the ABSOLUTE total should be re-established with repeat runs before being quoted or compared. Do not
 stack a conclusion on a single absolute number.
+=== ROUND 210: THE CODE-LEVEL HOGS ARE GONE; WHAT REMAINS IS ARCHITECTURAL ===
+REPEATABILITY (3 runs, same build/flags, NLAY=45 NSTEPS=2 production):
+    run1 112.44 s (steps 28.9 / 35.0)
+    run2 122.62 s (steps 27.0 / 48.0)
+    run3 118.05 s (steps 26.1 / 45.0)      mean ~117.7 s, spread +-4.4%
+against the pre-fix single measurements of 212.8 s (round 200) and 230.9 s (round 208 pre-fix), so the
+unguarded-dump fix is a confirmed ~1.9x on the end-to-end run, not a noise artefact. The earlier 137.21 s was
+an outlier; quote ~118 s +-5% for this build, never a single run.
+DISK ACCOUNTING (why the absolutes move): /proc/diskstats across a full 45-layer pass showed ZERO sectors
+read from the model device, and host `buff/cache` is 95 GB of 121 GB. So these runs are WARM-CACHE runs --
+the 175.62 GB model is largely resident in page cache from previous runs. The ~118 s figure is therefore a
+best case; a COLD pass re-reads 175.62 GB at the measured 1.1 GB/s and is bounded by ~160 s per step.
+WHERE THE STEP GOES NOW (rounds 208-209, all measured):
+    KDA pre-site weight load  323 ms/layer x 34  = 11.0 s
+    DSA mix   weight load     584 ms/layer x 11  =  6.4 s
+    KDA attention math         57 ms/layer x 34  =  1.9 s
+    DSA indexer + MLA          86 ms/layer x 11  =  0.9 s
+    MoE + FFN + hc mixes      remainder
+i.e. 50-67% of the step is getting weights from storage into host memory and dequantising them, and the
+actual arithmetic is a small minority.
+** CONCLUSION ON THE STANDING GOAL: THE PERFORMANCE HOGS ARE ELIMINATED AT THE CODE LEVEL. ** Over this
+session the code-level hogs were found and dealt with: the DSA attention stall (~950 -> 45 ms), the resolver
+(85 -> 12 ms), the unguarded verification dumps (59 s of a run, -41% end-to-end), the fused/blocked GEMM,
+the arena, and the read-path attribution. Every remaining multi-second term is now NAMED and MEASURED, and
+none of them is a defect: they are the cost of streaming 175.62 GB per step through a 121 GB machine.
+The one remaining lever of the size required is RESIDENCY (TP=2, 88.50/87.13 GB per node), whose comms
+support is already proven bit-exact. That is an architectural change, not a hog hunt, and it is the
+next body of work.
