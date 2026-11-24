@@ -8249,3 +8249,33 @@ compound the same way: the DSA pre-site (11 layers, ~584 ms/layer before), the r
 the other large term), and the shared-expert/dense tensors.
 NOTE ON MEMORY: 16 GB budget was used for this test; the cache is capped and falls back, so a full 45-layer
 attention set (~12-15 GB) fits. For TP=2 the same mechanism with an 88 GB budget holds a rank's whole half.
+=== ROUND 219: CACHE EXTENDED TO DSA -- WHAT IS DEFENSIBLE AND WHAT IS NOT ===
+Extended the host-RAM cache from the KDA pre-site (28 sites) to the DSA pre-site (24 sites), 52 call sites
+total, still changing only the SOURCE of each String; all deq lines untouched. Added RES_HOST_STATS so cache
+usage is visible instead of inferred.
+DEFENSIBLE:
+  * KDA pre-site caching is a REPEATABLE win: 492 -> 262 ms/layer in experiment 1 and 350 -> 208 ms/layer in
+    experiment 2, i.e. -41% to -47%, consistent across two independent interleaved run sets.
+  * The cache is numerically TRANSPARENT: digest md5 identical across all four sampled runs of the KDA
+    experiment (7291d8a64ab3727ecc8ef1e777e24431), and every run passed the fused-projection numeric gate.
+  * Attention tensors need only ~11.6 GB total (RES_HOST_STATS used_mb=11620), so the whole attention set
+    fits well inside a 16 GB budget -- a 24 or 32 GB budget buys nothing extra.
+  * Wiring is transparent when DISABLED: cache-off runs land in the 108-125 s baseline band, unlike round
+    213 where the restructuring alone cost time.
+NOT ESTABLISHED, and must not be quoted:
+  * END-TO-END effect. Cache-on runs measured 104.7, 110.3, 105.0 (16 GB set), 102.5, 98.1 (24 GB set) but
+    ALSO 150.8 (16 GB repeat). Against cache-off runs of 108.5-125.0 that range overlaps every claim, so no
+    end-to-end percentage is defensible from these runs.
+  * The DSA-pre-site gain: dsa_mix went 9,127/10,933 ms (off) vs 9,772/7,959 (on), i.e. ranges overlap. The
+    budget was NOT the cause (only 11.6 GB of 16 was used), so the cause is unexplained.
+  * The 32 GB case never ran: my harness built PORT=1862$((gb-15)) which string-concatenated to the invalid
+    port 186217, so the request never reached the serve. That INVALID_RUN was a harness bug, not a crash --
+    and note the validity guard caught it correctly.
+RISK WORTH TAKING SERIOUSLY: the 150.8 s outlier is consistent with an 11.6 GB host cache competing with the
+page cache. The model is also in page cache on this node, so moving bytes into the process can make the
+remaining disk reads slower. This is a reason NOT to judge residency on a warm single node at all -- which is
+what round 213's note already concluded, now with a mechanism.
+WHERE THE ECONOMICS ACTUALLY CHANGE: at TP=2 each rank's entire half (~88 GB) is in its own RAM and the page
+cache becomes irrelevant, so there is nothing to compete with. Residency should be judged there, not here.
+CODE STATE: glm_engine has res_get_host (budget-capped, lazy, falls back to gx_read); glm_serve has the
+cache alloc, 52 wired read sites and RES_HOST_STATS. Default P6_HCACHE_GB=0 leaves behaviour unchanged.
