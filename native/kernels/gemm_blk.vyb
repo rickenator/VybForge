@@ -1,0 +1,85 @@
+// gemm_blk.vyb -- latency-blocked fp64 GEMM, split into two deterministic kernels.
+//
+// WHY THIS EXISTS (measured, round 180-181): the original gemm.vyb runs one thread per output with a
+// serial acc = acc + av*bv chain over K. At M=1 that is only N threads (8 blocks for N=2048), so the
+// kernel costs ~540 us regardless of size -- 4x the work in the same wall time -- and batching launches
+// changed nothing (10 calls with one sync still 538 us each). The cost is the kernel, not the launch.
+//
+// The fix is parallelism in the REDUCTION dimension, which M=1 cannot supply on its own:
+//   phase 1  gemm_blk : grid = (tiles, KSPLIT). Each thread owns BCOLS output columns and one K chunk,
+//                       giving BCOLS independent accumulator chains (ILP) and short chains (K/KSPLIT).
+//                       Writes partials P[(m*N+n)*KSPLIT + kchunk] -- no atomics, no ordering hazard.
+//   phase 2  gemm_red : one thread per output; C[i] = sum over kchunk of P[i*KSPLIT + kchunk] in FIXED
+//                       order, so the result is run-to-run deterministic (this project's standing rule).
+//
+// PARAMS (device, 72 B, 64-bit words): +0 A, +8 B, +16 C, +24 M, +32 N, +40 K,
+//                                     +48 KSPLIT, +56 BCOLS, +64 P
+gemm_blk(p<Int>) -> {
+    A<Int> = ld_i64(p + 0)
+    B<Int> = ld_i64(p + 8)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    K<Int> = ld_i64(p + 40)
+    KSPLIT<Int> = ld_i64(p + 48)
+    BCOLS<Int> = ld_i64(p + 56)
+    P<Int> = ld_i64(p + 64)
+
+    perblock<Int> = dim_x() * BCOLS          # output columns covered by one block
+    ntiles<Int> = (N + perblock - 1) / perblock
+
+    bid<Int> = blk_x()
+    tile<Int> = bid % ntiles
+    kchunk<Int> = bid / ntiles
+
+    n0<Int> = tile * perblock + tid_x() * BCOLS
+    kspan<Int> = (K + KSPLIT - 1) / KSPLIT
+    kbase<Int> = kchunk * kspan
+    kend<Int> = kbase + kspan
+    if (kend > K) { kend = K }
+
+    m<Int> = 0
+    while (m < M) {
+        # BCOLS independent accumulators: one A load amortised over BCOLS multiply-adds
+        a0<Float> = 0.0
+        a1<Float> = 0.0
+        a2<Float> = 0.0
+        a3<Float> = 0.0
+        kk<Int> = kbase
+        for (kk in kbase..kend - 1) {
+            av<Float> = ld_f64(A + (m * K + kk) * 8)
+            row<Int> = B + (kk * N + n0) * 8
+            a0 = a0 + av * ld_f64(row + 0)
+            if (BCOLS > 1) { a1 = a1 + av * ld_f64(row + 8) }
+            if (BCOLS > 2) { a2 = a2 + av * ld_f64(row + 16) }
+            if (BCOLS > 3) { a3 = a3 + av * ld_f64(row + 24) }
+        }
+        # write partials for this (m, n, kchunk); each (m,n) slot is written by exactly one thread
+        base<Int> = P + ((m * N + n0) * KSPLIT + kchunk) * 8
+        st_f64(base + 0, a0)
+        if (BCOLS > 1) { st_f64(base + KSPLIT * 8, a1) }
+        if (BCOLS > 2) { st_f64(base + 2 * KSPLIT * 8, a2) }
+        if (BCOLS > 3) { st_f64(base + 3 * KSPLIT * 8, a3) }
+        m = m + 1
+    }
+}
+
+// phase 2: sum the KSPLIT partials per output in fixed index order (deterministic)
+gemm_red(p<Int>) -> {
+    C<Int> = ld_i64(p + 16)
+    M<Int> = ld_i64(p + 24)
+    N<Int> = ld_i64(p + 32)
+    KSPLIT<Int> = ld_i64(p + 48)
+    BCOLS<Int> = ld_i64(p + 56)
+    P<Int> = ld_i64(p + 64)
+
+    total<Int> = M * N
+    gid<Int> = blk_x() * dim_x() + tid_x()
+    if (gid < total) {
+        s<Float> = 0.0
+        j<Int> = 0
+        for (j in 0..KSPLIT - 1) {
+            s = s + ld_f64(P + (gid * KSPLIT + j) * 8)
+        }
+        st_f64(C + gid * 8, s)
+    }
+}

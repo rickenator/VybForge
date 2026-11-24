@@ -14,7 +14,7 @@
 import io
 import env
 import time
-import tensor::{tensor_init, dev_alloc, module_load_path, module_func, bulk_htod, bulk_dtoh, sync, gemm}
+import tensor::{tensor_init, dev_alloc, module_load_path, module_func, bulk_htod, bulk_dtoh, sync, gemm, htod_i, launch1}
 import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
 
 share(all)
@@ -43,6 +43,31 @@ gflops_str(M<Int>, N<Int>, K<Int>, us<Int>)<String> -> {
     g<Float> = 0.0
     if (us > 0) { g = fl / ((us as Float) / 1000000.0) / 1000000000.0 }
     return g.to_string()
+}
+
+// Launch the blocked fp64 GEMM: gemm_blk fills KSPLIT partials per output, gemm_red sums them in fixed
+// order. Deterministic by construction (no atomics) and parallel in the reduction dimension, which is
+// what M=1 cannot supply. Returns 0 on success.
+share(all)
+gemm_blocked(hblk<Int>, hred<Int>, params<Int>, AC<Int>, BC<Int>, CC<Int>, P<Int>,
+             M<Int>, N<Int>, K<Int>, KSPLIT<Int>, BCOLS<Int>, threads<Int>)<CInt> -> {
+    if (htod_i(params + 0, AC) != 0) { return 1 }
+    if (htod_i(params + 8, BC) != 0) { return 2 }
+    if (htod_i(params + 16, CC) != 0) { return 3 }
+    if (htod_i(params + 24, M) != 0) { return 4 }
+    if (htod_i(params + 32, N) != 0) { return 5 }
+    if (htod_i(params + 40, K) != 0) { return 6 }
+    if (htod_i(params + 48, KSPLIT) != 0) { return 7 }
+    if (htod_i(params + 56, BCOLS) != 0) { return 8 }
+    if (htod_i(params + 64, P) != 0) { return 9 }
+    perblock<Int> = threads * BCOLS
+    ntiles<Int> = (N + perblock - 1) / perblock
+    blocks<Int> = ntiles * KSPLIT
+    if (launch1(hblk, blocks, threads, params) != 0) { return 10 }
+    total<Int> = M * N
+    rblocks<Int> = (total + threads - 1) / threads
+    if (launch1(hred, rblocks, threads, params) != 0) { return 11 }
+    return 0
 }
 
 clock_ns()<Int> -> {
@@ -230,6 +255,56 @@ main()<Int> -> {
     tb1<Int> = clock_ns()
     batch_us<Int> = (tb1 - tb0) / 1000
     percall_us<Int> = batch_us / NB
+
+    # ---- blocked kernel: phase 1 (KSPLIT partials) + phase 2 (fixed-order reduce) ----
+    fblk<Int> = module_load_path("native/build/gemm_blk.ptx")
+    hblk<Int> = module_func(fblk, "gemm_blk")
+    hred<Int> = module_func(fblk, "gemm_red")
+    if (hblk == 0 || hred == 0) { println("TPG_FAIL blocked kernel"); return 20 }
+
+    KSPLIT<Int> = 32
+    BCOLS<Int> = 4
+    TH<Int> = 256
+    dP<Int> = dev_alloc(M * N * KSPLIT * 8)
+    dPar<Int> = dev_alloc(72)
+    dCB<Int> = dev_alloc(M * N * 8)
+    if (dP == 0 || dPar == 0 || dCB == 0) { println("TPG_FAIL blocked alloc"); return 21 }
+
+    if (gemm_blocked(hblk, hred, dPar, dA, dB, dCB, dP, M, N, K, KSPLIT, BCOLS, TH) != 0) {
+        println("TPG_FAIL blocked launch"); return 22
+    }
+    sync()
+    gotB<Vec<Float>> = bulk_dtoh(dCB, M * N)
+
+    # compare the blocked result against the unblocked reference (different summation order, so tolerance)
+    maxB<Float> = 0.0
+    maxRelB<Float> = 0.0
+    ib<Int> = 0
+    while (ib < M * N) {
+        db<Float> = gotB.get(ib) - refv.get(ib)
+        if (db < 0.0) { db = 0.0 - db }
+        if (db > maxB) { maxB = db }
+        ab<Float> = refv.get(ib)
+        if (ab < 0.0) { ab = 0.0 - ab }
+        if (ab > 0.0) {
+            rb<Float> = db / ab
+            if (rb > maxRelB) { maxRelB = rb }
+        }
+        ib = ib + 1
+    }
+
+    tb3<Int> = clock_ns()
+    if (gemm_blocked(hblk, hred, dPar, dA, dB, dCB, dP, M, N, K, KSPLIT, BCOLS, TH) != 0) {
+        println("TPG_FAIL blocked timed"); return 23
+    }
+    sync()
+    tb4<Int> = clock_ns()
+    blk_us<Int> = (tb4 - tb3) / 1000
+
+    gflops_blk<String> = gflops_str(M, N, K, blk_us)
+    println("TPG_BLOCKED KSPLIT=" + KSPLIT.to_string() + " BCOLS=" + BCOLS.to_string()
+        + " us=" + blk_us.to_string() + " gflops=" + gflops_blk
+        + " maxabs=" + maxB.to_string() + " maxrel=" + maxRelB.to_string())
 
     println("TPG_RESULT rank=" + rank.to_string()
         + " gemm_us=" + gemm_us.to_string() + " comm_us=" + comm_us.to_string()

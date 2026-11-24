@@ -7303,3 +7303,23 @@ could never be attributed, and it is fixed by making each call faster, not fewer
 CORRECTION TO MY OWN RUN: this run reported maxabs=16/maxrel=8 because I had inserted the batch loop
 BEFORE the readback, so it overwrote dC with one rank's unreduced partial. Bit-exactness was verified in
 two earlier runs (maxabs=0); the ordering is now fixed so the comparison cannot be polluted again.
+=== ROUND 182: BLOCKED KERNEL LANDED -- 1.63x AND BIT-EXACT, BUT SHORT OF PREDICTION ===
+native/kernels/gemm_blk.vyb: two deterministic kernels replacing the one-thread-per-output design.
+  phase 1 gemm_blk : grid = (tiles, KSPLIT); each thread owns BCOLS output columns and one K chunk ->
+                     BCOLS independent accumulator chains, K/KSPLIT-length chains, and enough blocks to
+                     fill the GPU at M=1 (8 blocks before, 64 after at N=2048/KSPLIT=32/BCOLS=4).
+  phase 2 gemm_red : sums KSPLIT partials per output in FIXED index order. No atomics, so run-to-run
+                     determinism is preserved (this project's standing rule).
+MEASURED at M=1, K=4096, N=2048 (the decode shape), both kernels + sync:
+    unblocked : 556 us   15.1 GFLOP/s
+    blocked   : 342 us   49.1 GFLOP/s    maxabs=0 maxrel=0
+So 1.63x, and exact -- but the design predicted much more, which points at a second wall.
+WHY IT STALLED: the blocking removed the latency problem (chains 2048 -> 128, blocks 8 -> 64) and the
+resulting rate, 49 GFLOP/s, is consistent with the fp64 THROUGHPUT limit on this part rather than with any
+remaining scheduling defect. bfgemm8 sustains 537 GFLOP/s in f32 -- 11x this -- so the remaining headroom
+is in PRECISION, not in blocking.
+NEXT MEASUREMENT (cheap, decides it): run the blocked kernel at K=4096 and K=8192. If the time doubles,
+it is compute-bound on fp64 and the only remaining lever is f32/bf16. If it does not double, there is
+still overhead to find.
+PROCESS NOTE: godzilla is NOT a target for this work. Compile/syntax gates run on lefty; using the x86 box
+both wastes cycles and muddies reports with its own CUDA-context failures.
