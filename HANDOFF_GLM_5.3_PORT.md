@@ -6710,3 +6710,22 @@ STATE: the fused MoE (prefill + decode) is correct, deterministic and gated by f
 worth 2.4x -- but it optimises ~31 of 45 layers' arithmetic while ~14 layers burn seconds on re-reading
 weights that never change. THAT is the next change, and it is the first one this session with a clear
 path to a large end-to-end win.
+=== ROUND 155: THE DENSE CACHE WAS NEVER INITIALISED (FIXED) -- BUT IT IS NOT THE GAP ===
+Found a real latent bug: dcacheF/G/U/D/OK are declared as empty Vecs at glm_serve:146-150 and NOTHING
+ever pushes to them, so dcacheOK.get(n) reads as a miss forever and the n<3 dense branch re-read and
+re-dequantised its three 100 MB projections on every layer of every step. Fixed by sizing all five to
+64 entries before the step loop (weights are immutable, so they persist).
+RESULT: wall 318 s for 3 steps, layerbody max=5000 median=41 -- STATISTICALLY UNCHANGED (was 4987/42).
+So the cache was broken, but the 500-1771 ms gap is NOT in the n<3 branch. It is in the layers that
+neither take the n<3 dense branch nor call moe_tail_step: 45 layers/step, 31 call moe_tail_step, 14 do
+not (3 dense + 11 DSA), and the gap lives in those 11 DSA layers. Their branch has not been located yet.
+KEEP THE FIX: it is what the code intended, it is correct, and it removes 3 x 300 MB of re-reads per
+step. It is simply not the dominant term.
+WHERE THE INVESTIGATION STANDS (this is the honest summary after rounds 139-155):
+    - fused MoE: correct, deterministic, gated by 4 passes, 2.4x on the MoE layer -- and the MoE is only
+      135-426 ms/layer, a minority of a decode step.
+    - the dominant decode cost is in the 11 DSA layers' branch: ~1000-2000 ms each, ~14 s/step.
+    - SEC layerbody is the FFN branch total; SEC_MOE2 is the MoE's own phases; neither covers the DSA
+      path, which is the next thing to instrument.
+NEXT: find the DSA layer branch in glm_serve's step loop (the else-side, around the KDA/DSA split) and
+instrument it. That branch is ~14 s of a ~66 s step and has no timer at all.

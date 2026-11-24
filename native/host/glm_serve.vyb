@@ -873,6 +873,23 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                     sc_scale = 1.0 / vsqrt(sv_NOPE as Float, 40)
                     wscale = 1.0 / vsqrt(sv_IHEADS as Float, 40)
 
+                    # ---- dense-MLP weight cache: SIZE IT BEFORE USE ----
+                    # These five vectors were declared empty and never pushed to, so dcacheOK.get(n)
+                    # always read as a MISS: the three dense projections (H*INTER = 50.3M params each,
+                    # 100 MB of bf16) were re-read from the checkpoint AND re-dequantised on every
+                    # layer of every step. That is the 500-1771 ms per-layer gap measured in round 154.
+                    # Sized here, they persist across steps (weights are immutable).
+                    var<Int> dci = 0
+                    while (dci < 64) {
+                        dcacheF.push(0)
+                        dcacheG.push(0)
+                        dcacheU.push(0)
+                        dcacheD.push(0)
+                        dcacheOK.push(0)
+                        dci = dci + 1
+                    }
+                    println("DCACHE sized=" + dcacheOK.len().to_string())
+
                     t = 0
                     while (t < nsteps) {
                         # Refresh the long-lived index/map strings. Phase 1's 45 layers of String
