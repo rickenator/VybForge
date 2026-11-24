@@ -8119,3 +8119,30 @@ RULE going forward: after any remote run, verify with `ps -eo pid,cmd | grep <sc
 `nvidia-smi --query-compute-apps` that nothing survived, and kill remote PIDs explicitly. Never treat the
 local shell's exit as proof the remote job ended.
 STATE: no serve processes, no GPU contexts, tree clean at ab1b0e3 + this note.
+=== ROUND 214: PACKED TENSORS DO NOT SPLIT -- AND THAT POINTS AT EXPERT-PARALLEL ==
+GATED the assumption the row-parallel TP design rested on: that a packed EXL3 tensor can be cut in half and
+each half dequantised independently. `native/host/p_split_ab.vyb` dequantises a real tensor whole, then
+dequantises bytes [0,len/2) as n/2 outputs and [len/2,end) as the other n/2:
+    idx=0 n=6,291,456 packed=12,582,912  nd1=520,232/524,288  nd2=520,075  firstbad=3,145,728 (= half)
+    idx=1 n=2,097,152 packed=4,194,304   nd1=1,041,259/1,048,576            firstbad=1,048,576 (= half)
+    SPLIT_AB_VERDICT MISALIGNED
+so ~99% of elements differ and the FIRST element of the second half is already wrong. EXL3 packs by
+tile-interleaving, so a byte offset does not correspond to a row boundary. **ROW-PARALLEL TP ON PACKED
+WEIGHTS IS NOT VIABLE** without implementing tile-lattice-aware splitting, which would couple residency to
+the exact packing internals of every tensor shape.
+THIS POINTS AT A BETTER SPLIT, and the geometry makes it obvious once the arithmetic is done correctly:
+    experts = 288/layer x 45 layers x 12.6 MB = 163.3 GB = 93.0% of the 175.6 GB model
+    per rank (144 experts/layer)              =  81.6 GB
+    non-expert remainder (attn/shared/etc)    =  12.3 GB, DUPLICATED on both ranks
+    per rank total                            =  94.0 GB  vs 121 GB/node  -> 27 GB headroom
+** EXPERT-PARALLEL NEEDS NO INTRA-TENSOR SPLIT AT ALL: each rank owns WHOLE experts, so the packing format
+is never cut. ** Combination uses only primitives already proven on this pair: each rank accumulates the
+weighted contributions of the selected experts IT owns, then one ncclSum all-reduce per layer produces the
+full sum (bit-exact all-reduce verified, rounds 156-157).
+CONSEQUENCE FOR DETERMINISM: the 2-rank reduce is deterministic run-to-run, but the result is NOT
+bit-identical to the single-node path, because summing two partials is not the same association as summing
+eight expert contributions in sequence. That is an accepted, documented trade: reproducible across runs,
+not identical across topologies.
+NEXT: load the resident expert shard for ONE layer on each rank (144 experts each), compute each rank's
+partial MoE contribution for a known token, all-reduce, and compare against the single-node layer output.
+That is the first end-to-end TP=2 correctness gate.

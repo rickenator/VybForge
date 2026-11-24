@@ -1,0 +1,155 @@
+# p_split_ab.vyb -- can a packed EXL3 tensor be cut in half and still dequantise correctly?
+#
+# This gates the whole TP=2 design. Row-parallel tensor parallelism needs each rank to hold HALF of every
+# weight matrix, and residency holds PACKED bytes rather than dequantised ones (round 211b: dequantised would
+# be ~4x, ~700 GB). So each rank must take half of a packed tensor's BYTES and dequantise that half on its
+# own. That only works if the packed layout is contiguous along the output dimension at this granularity.
+#
+# Test: dequantise the whole tensor, then dequantise bytes [0, len/2) as n/2 outputs and bytes [len/2, len)
+# as the other n/2, and require  half1 ++ half2 == whole  element for element.
+#
+# If the halves match, TP=2 sharding is just a byte-range walk over the shard.
+# If they do not, the report prints where the first divergence is, which reveals the alignment granularity
+# (EXL3 uses 4096-wide tiles, so a split may have to land on a tile boundary rather than an element midpoint).
+#
+# Run: VYB_STDLIB=... vyb --module-path <...> native/host/p_split_ab.vyb
+# Prints SPLIT_AB ... per tensor and SPLIT_AB_VERDICT at the end.
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, dtoh_vec}
+
+H<Int> = 4096
+KV_LORA<Int> = 512
+Q_LORA<Int> = 1536
+
+extern "C" {
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), m, fn_name) != 0) { return 0 }
+        return addr(hf)
+    }
+    return 0
+}
+
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) { return 0 }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    total<Int> = 83
+    pre<String> = "model.language_model.layers.3."
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "self_attn.q_a_proj.weight")       # 0: n = Q_LORA*H, z = H
+    want.push(pre + "self_attn.kv_a_proj_with_mqa.weight")  # 1: n = KV_LORA*H, z = H
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("SPLIT_AB_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("SPLIT_AB_FAIL no cuda"); return 4 }
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fbf == 0) { println("SPLIT_AB_FAIL kernel"); return 5 }
+
+    idx<Vec<Int>> = Vec()
+    ns<Vec<Int>> = Vec()
+    zs<Vec<Int>> = Vec()
+    idx.push(0); ns.push(Q_LORA * H); zs.push(H)
+    idx.push(1); ns.push(KV_LORA * H); zs.push(H)
+
+    bad_total<Int> = 0
+    k<Int> = 0
+    while (k < idx.len()) {
+        ti<Int> = idx.get(k)
+        n<Int> = ns.get(k)
+        z<Int> = zs.get(k)
+        raw<String> = gx_read(g, ti)
+        if (raw.len() == 0) { println("SPLIT_AB_FAIL read idx=" + ti.to_string()); return 6 }
+
+        half<Int> = n / 2
+        blen<Int> = raw.len()
+        bhalf<Int> = blen / 2
+        s1<String> = raw.substring(0, bhalf)
+        s2<String> = raw.substring(bhalf, blen)
+
+        dAll<Int> = deq_bf16(fbf, raw, n, z)
+        dH1<Int> = deq_bf16(fbf, s1, half, z)
+        dH2<Int> = deq_bf16(fbf, s2, n - half, z)
+        if (dAll == 0 || dH1 == 0 || dH2 == 0) { println("SPLIT_AB_FAIL deq idx=" + ti.to_string()); return 7 }
+
+        vAll<Vec<Float>> = dtoh_vec(dAll, n)
+        vH1<Vec<Float>> = dtoh_vec(dH1, half)
+        vH2<Vec<Float>> = dtoh_vec(dH2, n - half)
+
+        # sampled compare (dtoh_vec is ~us/element, so a full walk of 6.3M is slow but survivable here)
+        stride<Int> = 1
+        if (n > 4000000) { stride = n / 1000000 }
+        nd1<Int> = 0
+        nd2<Int> = 0
+        fb<Int> = -1
+        ncmp<Int> = 0
+        j<Int> = 0
+        while (j < half) {
+            if (vH1.get(j) != vAll.get(j)) {
+                nd1 = nd1 + 1
+                if (fb < 0) { fb = j }
+            }
+            if (vH2.get(j) != vAll.get(half + j)) {
+                nd2 = nd2 + 1
+                if (fb < 0) { fb = half + j }
+            }
+            ncmp = ncmp + 1
+            j = j + stride
+        }
+        bad_total = bad_total + nd1 + nd2
+        println("SPLIT_AB idx=" + ti.to_string() + " n=" + n.to_string() + " z=" + z.to_string() + " packed=" + blen.to_string() + " bhalf=" + bhalf.to_string() + " half=" + half.to_string() + " nd1=" + nd1.to_string() + " nd2=" + nd2.to_string() + " firstbad=" + fb.to_string() + " ncmp=" + ncmp.to_string())
+
+        freedom { cuMemFree_v2(dAll) }
+        freedom { cuMemFree_v2(dH1) }
+        freedom { cuMemFree_v2(dH2) }
+        k = k + 1
+    }
+
+    if (bad_total == 0) { println("SPLIT_AB_VERDICT SPLITTABLE") } else { println("SPLIT_AB_VERDICT MISALIGNED total=" + bad_total.to_string()) }
+    return 0
+}
