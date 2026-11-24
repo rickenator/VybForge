@@ -8005,3 +8005,14 @@ architecture is:
     instead of a disk address and the whole per-step load disappears.
 So TP=2 residency is really "replace the disk-backed tensor reader with a device-resident one, sharded by
 rank". The kernels and the arena already exist; the reader is the piece to build.
+--- ROUND 211c: CORRECTION TO THE 211 TOOLING NOTE ---
+Round 211 attributed the "60 s hold looked like an immediate exit" to an orphan process writing the same log.
+That is WRONG for the run in question and is withdrawn. The run that printed `HOLD s=50` and `DONE`
+immediately was running the BUSY-WAIT version (before the sleep_ms patch), so it exited at once on its own --
+no orphan needed. The busy-wait explanation is sufficient and is the one that matches the evidence.
+For the LATER patched run (sleep_ms present, verified by md5 against the local file) the cause of the early
+`DONE` is NOT established; two possibilities remain untested (a stale writer, or the remote process not
+picking up the patched file for some reason). It does not matter for the result: residency is proven by the
+allocation and the byte-fill, and the hold is observational only.
+The `pkill -f <script>` self-kill in that round DID happen and is real -- it is what left the shell dead
+before any process started -- so that note stands.
