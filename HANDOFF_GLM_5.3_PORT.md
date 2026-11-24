@@ -6828,3 +6828,26 @@ large environment-dependent component that a shorter run does not show.
 NEXT (cheap, no code): run NLAY=45 with the DSA output-cache DISABLED (deq_bf16 per call, no cache) and
 compare the n=3 cost. If uncached n=3 is also ~1900 ms, the cache is irrelevant to the depth effect and
 the footprint is the whole story; if it is ~990 ms, the cache itself is what inflates the footprint.
+=== ROUND 161: THE DSA CACHE IS HARMFUL -- AND ROUND 156's 2.5x WAS ILLUSORY ===
+The round-160 test, executed (P6_DSA_CACHE flag added to bypass the cache), NLAY=45, same request, back
+to back on the same machine:
+    cache ON  : DSA layers 1967, 1984, 1985, 1993, 2981, 2990, 2988, 4972, 4973, 4972, 4076   wall 120 s
+    cache OFF : DSA layers 1942, 1946, 1079, 2001, 1999, 2000, 2052, 2081, 2981, 2980, 2982   wall  97 s
+TWO CORRECTIONS, BOTH MINE:
+1) THE CACHE IS HARMFUL. Caching deq_bf16's f64 outputs stores 872 MB per DSA layer (~9.6 GB across
+   11), and the added memory pressure makes those layers SLOWER (max 4973 vs 2982; wall 120 vs 97 s).
+   Default flipped to 0 (P6_DSA_CACHE=1 re-enables it for experiments).
+2) THE "2.5x FROM THE DSA CACHE" (round 156) IS WITHDRAWN. That claim came from 318 s -> 127 s across two
+   runs, but a single-step run now costs 97-120 s, so a 3-step run cannot be 127 s unless the page cache
+   was warm. The 318 vs 127 gap was BETWEEN-RUN page-cache state, not my change -- the same class of
+   error as the 10x dumps finding, in the opposite direction.
+WHAT SURVIVES AND WHAT DOES NOT:
+    - fused MoE on both paths, deterministic, four-pass gate: STANDS (all verified).
+    - load_fn hoisting (1578 -> 1009 ms) and partial-buffer preallocation (1009 -> 850 ms) in the
+      PREFILL path: STAND (measured within one run, ratio well outside noise).
+    - DSA output cache: REMOVED (harmful).
+    - the decode path's absolute speed: still unmeasured cleanly, and every cross-run comparison in this
+      area is suspect because page-cache state dominates.
+THE LESSON, and it belongs next to the measurement rule: WHEN THE THING YOU ARE TESTING CHANGES MEMORY
+FOOTPRINT, CROSS-RUN COMPARISONS ARE INVALID. Compare ON/OFF configurations back to back in the same
+condition (as here), never run A on Monday and run B on Tuesday.
