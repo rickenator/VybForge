@@ -8106,3 +8106,16 @@ METHOD CONSEQUENCE: this path has +-40% run-to-run variance on a per-phase timer
 documented elsewhere. Any future residency A/B must be INTERLEAVED (alternate build A, build B, A, B) and
 reported as a median of >=3 runs per side, or it will produce confident nonsense -- which is exactly what
 round 213 did.
+--- ROUND 213c: THE 213 TIMINGS WERE ALSO DISK-CONTAMINATED ---
+Three orphaned `p_res_ab` processes were still running 22-30 minutes after their runs, holding 1.3 GB and
+2 x 682 MB of GPU memory and CONTINUOUSLY READING THE MODEL. They were only found because the GPU context
+check showed allocations with no matching serve process.
+CAUSE: `process_manage kill` on a terminal background job kills the LOCAL ssh wrapper, not the remote
+process. Every "killed" remote run in this session that used that path may still have been alive.
+CONSEQUENCE: round 213's A/B numbers (KDA pre-site 498 and 590 ms/layer) were measured while three other
+processes were streaming the same disk, so they are contaminated on top of the +-40% variance already
+recorded in 213b. Both withdrawals stand and the residency integration remains UNMEASURED.
+RULE going forward: after any remote run, verify with `ps -eo pid,cmd | grep <script>` AND
+`nvidia-smi --query-compute-apps` that nothing survived, and kill remote PIDs explicitly. Never treat the
+local shell's exit as proof the remote job ended.
+STATE: no serve processes, no GPU contexts, tree clean at ab1b0e3 + this note.
