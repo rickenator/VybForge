@@ -36,6 +36,15 @@ ncclCommCount(comm<Int>, count<loc<Int>>)<CInt>
 share(all)
 ncclAllReduce(sendbuff<Int>, recvbuff<Int>, count<Int>, datatype<CInt>, op<CInt>, comm<Int>, stream<Int>)<CInt>
 
+# TWO traps, both of which read like "this build has no all-to-all":
+#  1. the spelling is ncclAlltoAll -- lowercase "t" in "to" (NCCL capitalises AllReduce/AllGather but
+#     not this one), so ncclAllToAll is an unresolved symbol;
+#  2. even spelled correctly it is a WEAK alias (`nm -D`: W ncclAlltoAll) whose strong implementation is
+#     pncclAlltoAll (`T`), and the ORC JIT resolves the strong symbol but not the weak wrapper.
+# So bind the strong name.
+share(all)
+pncclAlltoAll(sendbuff<Int>, recvbuff<Int>, count<Int>, datatype<CInt>, comm<Int>, stream<Int>)<CInt>
+
 share(all)
 ncclCommDestroy(comm<Int>)<CInt>
 
@@ -178,10 +187,62 @@ main()<Int> -> {
         ci = ci + 1
     }
 
-    # NOTE: an all-to-all section was removed because this NCCL build does not export ncclAllToAll.
-    # Expert-parallel routing therefore has to be built from ncclSend/ncclRecv or ncclAllGather; the
-    # all-reduce numbers above already bound the fabric's small-message latency, which is the binding
-    # constraint either way.
+    # ---- all-to-all: the expert-parallel dispatch primitive ----
+    # count is PER PEER, so a2a moves count*world elements in each direction. Sizes chosen to match
+    # token routing: one token's hidden (4096 f64) and a 20-token block.
+    acnts<Vec<Int>> = Vec()
+    acnts.push(4096)
+    acnts.push(81920)
+    acnts.push(327680)
+    ai<Int> = 0
+    while (ai < acnts.len()) {
+        cpp<Int> = acnts.get(ai)
+        total<Int> = cpp * world
+        sbuf<Int> = dev_alloc(total * 8)
+        rbuf<Int> = dev_alloc(total * 8)
+        if (sbuf == 0 || rbuf == 0) { println("NCCLB_FAIL alloc a2a"); return 13 }
+        filla<Vec<Float>> = Vec()
+        fj<Int> = 0
+        while (fj < total) { filla.push(1.0) ; fj = fj + 1 }
+        if (bulk_htod(sbuf, view(filla)) != 0) { println("NCCLB_FAIL htod a2a"); return 14 }
+        sync()
+        var<Int> ra = 0
+        freedom { ra = (pncclAlltoAll(sbuf, rbuf, cpp, nccl_f64(), comm, 0) as Int) }
+        sync()
+        if (ra != 0) { println("NCCLB_A2A bytes=" + (total * 8).to_string() + " FAILED rc=" + ra.to_string()); ai = ai + 1 } else {
+            tmsa<Vec<Int>> = Vec()
+            r2<Int> = 0
+            while (r2 < reps) {
+                ta0<Int> = clock_ns()
+                freedom { ra = (pncclAlltoAll(sbuf, rbuf, cpp, nccl_f64(), comm, 0) as Int) }
+                sync()
+                ta1<Int> = clock_ns()
+                tmsa.push((ta1 - ta0) / 1000)
+                r2 = r2 + 1
+            }
+            a2<Int> = 0
+            while (a2 < tmsa.len()) {
+                b2<Int> = a2 + 1
+                while (b2 < tmsa.len()) {
+                    if (tmsa.get(b2) < tmsa.get(a2)) {
+                        tm2<Int> = tmsa.get(a2)
+                        tmsa.set(a2, tmsa.get(b2))
+                        tmsa.set(b2, tm2)
+                    }
+                    b2 = b2 + 1
+                }
+                a2 = a2 + 1
+            }
+            a2b<Int> = total * 8
+            meda<Int> = tmsa.get(tmsa.len() / 2)
+            gbsa<Float> = 0.0
+            if (meda > 0) { gbsa = (2.0 * (a2b as Float) / 1000000000.0) / ((meda as Float) / 1000000.0) }
+            println("NCCLB_ALLTOALL bytes=" + a2b.to_string() + " per_peer=" + cpp.to_string()
+                + " med_us=" + meda.to_string() + " min_us=" + tmsa.get(0).to_string()
+                + " max_us=" + tmsa.get(tmsa.len() - 1).to_string() + " gbps=" + gbsa.to_string())
+            ai = ai + 1
+        }
+    }
 
     freedom { ncclCommDestroy(comm) }
     println("NCCLB_DONE rank=" + rank.to_string())

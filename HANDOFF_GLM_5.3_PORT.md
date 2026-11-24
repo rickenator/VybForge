@@ -7193,3 +7193,27 @@ DECISION -- TENSOR-PARALLEL WITHIN EXPERT (not expert-parallel):
 LANDMINE CARRIED FORWARD: Vyb computes in f64 (Vec<Float> = 8 bytes), which doubles comms payload versus
 bf16. Harmless today because 32 KB is on the latency floor, but it halves the batch size at which comms
 starts to bite -- the first thing to revisit if throughput (not latency) becomes the goal.
+=== ROUND 177: CORRECTION -- ncclAlltoAll EXISTS, AND MEASURED IT ANYWAY ===
+Round 176 recorded "this NCCL build does not export ncclAlltoAll" and used that as part of the reason to
+choose TP-within-expert. THE CLAIM WAS FALSE, and the way it was false is worth keeping:
+  1. the symbol is spelled ncclAlltoAll -- lowercase "t" in "to" (NCCL capitalises AllReduce and
+     AllGather, but not this one), so declaring `ncclAllToAll` yields an unresolved-symbol error that
+     reads exactly like a missing feature;
+  2. even spelled correctly it is a WEAK alias: `nm -D` shows `W ncclAlltoAll` with the strong
+     implementation exported as `T pncclAlltoAll`. The ORC JIT resolves the strong symbol and not the
+     weak wrapper, so the binding must name pncclAlltoAll.
+The root lesson is the same one this session keeps relearning: an unresolved-symbol error is a claim about
+the BINDING, not about the library -- check `nm -D` before concluding a capability is absent.
+MEASURED all-to-all once it was reachable (median of 30 reps, both ranks agree):
+    bytes        per_peer    med_us   min_us   max_us
+      65,536        4096      385/410      40       1115
+   1,310,720       81920      500/486     159        778
+   5,242,880      327680      447/457     146        884
+against all-reduce at 32 KB: med 36 us, min 30 us (tight).
+DECISION UNCHANGED (TP within expert) BUT NOW ON EVIDENCE RATHER THAN A MISSING SYMBOL:
+  all-to-all costs ~10x an all-reduce at comparable payload and its median is wildly unstable (385 us
+  median vs 40 us best). Expert-parallel needs two dispatches per MoE layer -> ~800 us/layer -> ~36
+  ms/token of comms alone, which is over the entire 20-22 ms/token budget. TP needs ~3 collectives of
+  ~36 us -> ~108 us/layer -> ~4.9 ms/token, which fits.
+  Also note the all-to-all variance is a separate open question: if the 40 us best case can be made the
+  typical case, expert-parallel would become competitive, so this is worth revisiting before any EP work.
