@@ -4512,6 +4512,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         i = i + 1
     }
     nex = 0
+    tkRes<Int> = 0
     tkRead<Int> = 0
     tkSub<Int> = 0
     tkProj<Int> = 0
@@ -4557,6 +4558,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             }
             if (nfound != w2.len()) { println("CHAIN_FAIL resolve expert " + e.to_string()); return nonev }
 
+            msKres<Int> = time_mono_millis()
             g_ge_2 = gx_read(ge, 2)
             g_ge_1 = gx_read(ge, 1)
             g_ge_0 = gx_read(ge, 0)
@@ -4582,6 +4584,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                                  g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
             msKread<Int> = time_mono_millis()
+            tkRes = tkRes + (msKres - msA)
             if (fdecOn == 0 && (dWg == 0 || dWu == 0 || dWd == 0)) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
                 return nonev
@@ -4650,7 +4653,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 j = j + 1
             }
             msKacc<Int> = time_mono_millis()
-            tkRead = tkRead + (msKread - msA)
+            tkRead = tkRead + (msKread - msKres)
             tkSub = tkSub + (msKsub - msKread)
             tkProj = tkProj + (msKproj - msKsub)
             tkAcc = tkAcc + (msKacc - msKproj)
@@ -4664,7 +4667,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         e = e + 1
     }
     println("SEC moestage loop=" + (time_mono_millis() - msT).to_string() + " pre=" + (msT - ms0).to_string())
-    println("SEC moekern experts=" + nex.to_string() + " read=" + tkRead.to_string()
+    println("SEC moekern experts=" + nex.to_string() + " res=" + tkRes.to_string() + " read=" + tkRead.to_string()
         + " sub=" + tkSub.to_string() + " proj=" + tkProj.to_string()
         + " acc=" + tkAcc.to_string()
         + " loop=" + (time_mono_millis() - msT).to_string())

@@ -7433,3 +7433,28 @@ NEXT HOG, in order: the gx_read path. Four hypotheses worth measuring rather tha
   * repeated resolution work (gx_resolve_tab already has a cache; the READ side may not benefit from it).
 The measurable target: 100 MB/layer at 1.1 GB/s would be ~91 ms instead of 265 ms, i.e. ~170 ms/layer
 saved, which at 45 layers is ~7.7 s per token of pure I/O.
+=== ROUND 188: THE READ HOG DECOMPOSED -- 50% real I/O, 25% A LINEAR INDEX SCAN ===
+Split the round-187 "read=265 ms" window into resolve vs I/O (NLAY=12, 8 experts/layer):
+    SEC moekern experts=8 res=91 read=180 sub=0 proj=51 acc=0 loop=360
+    SEC moekern experts=8 res=90 read=180 sub=2 proj=43 acc=0 loop=350
+so per layer: read 178-181 ms (~50%), res 81-91 ms (~25%), proj 43-62 ms (~14%).
+TWO SEPARATE DEFECTS:
+ 1. READ: ~100 MB of trellis per layer at ~555 MB/s effective, against 1.1 GB/s measured for a cold
+    sequential read on this disk. The path is gx_read -> open_read + read_at + close PER TENSOR, i.e. 9
+    open/read/close cycles per expert, 72 per layer. No handle reuse, no readahead benefit across tensors
+    that live in the same shard.
+ 2. RESOLVE: ~1.2 ms PER NAME. The cause is now identified in code, not inferred --
+    gx_resolve_tab does `key = want.get(i) + " "` then `p = tab.index_of(key)`, a LINEAR SCAN OF THE WHOLE
+    INDEX TEXT (~7 MB) for each of the 9 names per expert. 9 x 1.2 ms x 8 experts = ~86 ms, matching the
+    measured res=85 exactly. The file's own header already warned that this resolver costs "9 opens
+    (73 ms) per expert resolve -> 8 s per MoE layer and ~1.2 GB of retained header".
+  ALREADY IN THE CODEBASE, UNUSED HERE: gx_resolve_win narrows the scan to a WINDOW of the index and
+    falls back to a full scan on a miss. The MoE expert path calls the unwindowed variant.
+FIXES, cheapest first:
+  * RESOLVE: use a windowed lookup. The 9 expert tensors are adjacent in the index, so after the first
+    full scan the remaining 8 can search a small window (a few tens of KB) instead of 7 MB -> that is the
+    ~85 ms/layer, i.e. ~3.8 s/token at 45 layers, for essentially no risk.
+  * READ: open the shard ONCE per expert and issue the 9 positional reads against that handle (and, if
+    the 9 tensors are contiguous, one windowed read sliced in memory). Target 100 MB/layer at 1.1 GB/s is
+    ~91 ms instead of 180.
+TOGETHER: ~175 ms/layer of the 360 ms loop, ~7.9 s/token at 45 layers, with no kernel work involved.
