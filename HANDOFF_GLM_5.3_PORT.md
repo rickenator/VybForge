@@ -6645,3 +6645,23 @@ STATE OF THE PROJECT:
    compute-side outlier, not I/O and not logging.
 ACTION: timing runs MUST set VYBFORGE_SERVE=1. Digest/gate runs must NOT (the flag exists to keep
 offline-verification output), so the sweep stays as-is and bench_decode.sh now sets SERVE=1.
+=== ROUND 152: HONEST END-TO-END -- ~66 s/token (~0.015 tok/s), 3000x from the bar ===
+45 layers, dumps OFF (VYBFORGE_SERVE=1), 4 decode steps, one request:
+    wall = 482 s (prefill ~218 s + 4 steps)
+    SEC mlpmoe summed per step: 56137 / 67011 / 70770 / 71001 ms
+    -> ~66 s per token = ~0.015 tok/s. The 45-50 tok/s bar is ~3000x away.
+THE GAP IS A QUARTER OF THE LAYERS, NOT THE STEADY STATE. At full depth the per-layer mlpmoe values are
+bimodal and the slow ones are NOT 1-2 per step as at NLAY=6 -- roughly one in four:
+    20 920 22 1962 | 15 13 16 2001 | 41 38 939 4056 | 943 39 39 4060 | ... | 5923 49 42 943 5023
+Most layers are 20-40 ms; a quarter cost 900-6000 ms, and the largest GROW with step index
+(4056 -> 5023 -> 5923 at fixed layer), i.e. something scales with context length. /proc/io showed only
+123 MB read across a whole 6-step request, so these are NOT disk reads.
+SO THE MODEL IS: ~34 layers at ~25 ms (~0.85 s) + ~11 layers at ~5 s (~55 s). Optimising the 25 ms
+layers further cannot matter; the 5 s layers are the whole problem.
+PRESENT STATE FOR THE USER: the fused MoE (prefill + decode) is correct, deterministic, gated by four
+passes, and worth 2.4x on the decode MoE layer -- but the MoE is not what dominates a decoded token.
+NEXT: find what makes a quarter of the layers take seconds. Candidates, none yet tested: the DSA/indexer
+path (TOPK=2048 pool scanned per step, plausibly O(context)), a per-layer cache miss that is CPU-side
+rather than disk, or the growing KV cache in the layer's attention section. Instrument the layer with
+per-PHASE timers (attn / indexer / moe / hc_apply) rather than the single mlpmoe number, then look at
+whether the slow layers are a fixed set (structural) or changing (state).
