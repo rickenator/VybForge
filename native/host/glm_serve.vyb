@@ -923,6 +923,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
 
                     t = 0
                     while (t < nsteps) {
+                        stT<Int> = now_ms()
                         # Refresh the long-lived index/map strings. Phase 1's 45 layers of String
                         # churn corrupt a buffer held across it (the 12-layer debug run showed every
                         # EXL3 dequant in phase 2 reading the same wrong map: mlp max bit-identical
@@ -2162,6 +2163,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 println("MTP draft token: " + cbesti.to_string() + " (logit " + cbestv.to_string() + ")")
                             }
                         }
+                        println("SEC STEP t=" + t.to_string() + " ms=" + (now_ms() - stT).to_string())
                         t = t + 1
                     }
 

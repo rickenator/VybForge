@@ -7672,3 +7672,26 @@ end-to-end number, because every one of those lives inside the ~2%. The remainin
 88.50 / 87.13 GB, both inside 121 GB -- see round 174), and that is now the only lever with a large effect.
 The support for it is already built and verified: NCCL all-reduce across the pair is bit-exact (~31 us small,
 36 GB/s large), and the row-parallel TP pattern is proven correct at two sizes.
+=== ROUND 199: THE 90% "UNTIMED STREAMING" WAS THE VERIFICATION DUMP PATH ===
+Added a step-level timer (`SEC STEP t=<i> ms=<n>`) around the decode step loop, which nothing had ever
+measured. NLAY=12, NSTEPS=2, dump mode (the harness default):
+    SEC STEP t=0 ms=11979        SEC STEP t=1 ms=115971      <- 10x growth between steps
+and the same run with VYBFORGE_SERVE=1 (production flag, dumps OFF):
+    req1 27.32 s (was 91.50 s)   SEC STEP t=0 ms=6098   SEC STEP t=1 ms=6972
+So step t=1 was **16.6x inflated by the dump path** and the whole request 3.3x.
+MECHANISM: the step body accumulates digest text with `lines = lines + dumps(...)`, O(n) per append, per
+step -- quadratic host work that only runs when the production flag is unset. The engine's own comment says
+the dumps are skipped only for `VYBFORGE_SERVE=1`, and run_fgate.sh never set it.
+** THIS SOLVES THE "90% UNTIMED" MYSTERY FROM ROUND 187 AND INVALIDATES THE CONCLUSION BUILT ON IT. **
+The 438.66 s / 968.55 s full-depth figures, the 484 s per-step differential, and the claim that ~90% of a
+step was checkpoint streaming were all measured through the dump path. The real step is ~7 s at 12 layers,
+not 116 s. Withdraw the "streaming dominates" attribution until it is re-derived in production mode --
+the honest number now is `SEC STEP` in production, and the per-layer timers must be re-read in that mode
+too because they were also collected with dumps on.
+WHY THIS WAS MISSED FOR SO LONG, despite the skill documenting it: the flag's effect is gated on a
+comparison (`if (srv == "1" && dsFlag != "1")`), the harness "worked" either way, and every number it
+produced looked plausible. The check to run FIRST on any timing harness is which verification/output flags
+it leaves on -- and the tell here was a per-step cost that GROWS with step index while bytes read stay
+flat (the accumulating host work signature this same file warns about).
+NEXT: re-derive the layer budget in production mode (per-layer timers were dump-contaminated), then decide
+what the real remaining hog is. Do not carry any pre-round-199 end-to-end figure forward.
