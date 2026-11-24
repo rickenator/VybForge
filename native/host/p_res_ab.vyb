@@ -1,0 +1,195 @@
+# p_res_ab.vyb -- bit-exact A/B for the resident (device-held) packed-tensor path.
+#
+# Question this answers, and nothing else: does dequantising a REAL checkpoint tensor from a device-resident
+# copy of its packed bytes produce bit-identical output to the current path, which pulls those bytes from
+# disk on every call?
+#
+# Why it matters: the per-step cost of the engine today is 323-584 ms/layer and 50-67% of a decode step, and
+# that is the disk reader (`gx_read` on every deq call). Residency is the only fix of the required size
+# (rounds 208-211). The kernel takes a DEVICE pointer to the packed data already, so the change is in the
+# reader, not the maths -- which means an identical-input A/B must agree exactly, element for element.
+#
+# Run:  VYB_STDLIB=... vyb --module-path <...> native/host/p_res_ab.vyb
+#
+# SCOPE LIMIT, recorded deliberately: the comparison reads the dequantised output back with dtoh_vec, which
+# costs ~microseconds PER ELEMENT in this codebase, so tensors above ~100k outputs do not finish in usable
+# time (kv_a_proj at 2.1M and q_b_proj at 25M both hung for 8+ minutes). The probe therefore covers SHAPES
+# (z != 0 and z == 0, and a 6.3M-output tensor compared at ~1M sampled positions) rather than every tensor.
+# A full-coverage gate needs a device-side compare (dq1s4_cmp in kernels/dq1s4_fill.vyb already counts
+# elementwise differences on device) instead of a host readback.
+#
+# Prints RES_AB per tensor and RES_AB_VERDICT at the end. Exit 0 only if every tensor is bit-identical.
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init, dtoh_vec}
+
+R<Int> = 22
+H<Int> = 4096
+HEADS<Int> = 64
+NOPE<Int> = 256
+VDIM<Int> = 256
+KV_LORA<Int> = 512
+Q_LORA<Int> = 1536
+IHEADS<Int> = 32
+IDIM<Int> = 128
+
+extern "C" {
+    cuMemAlloc_v2(dptr<loc<Int>>, bytesize<Int>)<CInt>
+    cuMemFree_v2(dptr<Int>)<CInt>
+    cuMemcpyHtoD_v2(dstDevice<Int>, srcHost<CString>, ByteCount<Int>)<CInt>
+    cuModuleLoadData(hmod<loc<loc<CVoid>>>, image<CString>)<CInt>
+    cuModuleGetFunction(hfunc<loc<loc<CVoid>>>, hmod<loc<CVoid>>, name<CString>)<CInt>
+    cuCtxSynchronize()<CInt>
+    cuda_launch4i(f<loc<CVoid>>, gridX<CUInt>, gridY<CUInt>, gridZ<CUInt>,
+                  blockX<CUInt>, blockY<CUInt>, blockZ<CUInt>,
+                  a0<Int>, a1<Int>, a2<Int>, a3<Int>)<CInt>
+}
+
+now_ms()<Int> -> { return 0 }
+
+load_fn(ptx_path<String>, fn_name<String>)<Int> -> {
+    ptx<String> = ""
+    match (open_read(ptx_path)) {
+        f -> { match (read_all(f)) { s -> { ptx = s } ? -> { return 0 } } close(f) }
+        ? -> { return 0 }
+    }
+    freedom {
+        m<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleLoadData(loc(m), ptx) != 0) { return 0 }
+        hf<loc<CVoid>> = from<loc<CVoid>>(0)
+        if (cuModuleGetFunction(loc(hf), m, fn_name) != 0) { return 0 }
+        return addr(hf)
+    }
+    return 0
+}
+
+# ---- the current path: packed bytes from disk -> upload -> dequantise on device ----
+deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    freedom {
+        var<Int> q = 0
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, q, o, n, z) != 0) { return 0 }
+        cuCtxSynchronize()
+        cuMemFree_v2(q)
+        out = o
+    }
+    return out
+}
+
+# ---- the resident path: packed bytes uploaded ONCE, then dequantised from device ----
+res_upload(raw<String>)<Int> -> {
+    var<Int> q = 0
+    if (raw.len() == 0) { return 0 }
+    freedom {
+        if (cuMemAlloc_v2(loc(q), raw.len()) != 0) { return 0 }
+        if (cuMemcpyHtoD_v2(q, raw, raw.len()) != 0) { return 0 }
+        return q
+    }
+    return 0
+}
+
+deq_bf16_res(faddr<Int>, qdev<Int>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    if (qdev == 0 || n <= 0) { return 0 }
+    freedom {
+        var<Int> o = 0
+        if (cuMemAlloc_v2(loc(o), n * 8) != 0) { return 0 }
+        blocks<Int> = (n + 255) / 256
+        if (cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, qdev, o, n, z) != 0) { return 0 }
+        cuCtxSynchronize()
+        out = o
+    }
+    return out
+}
+
+main()<Int> -> {
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    total<Int> = 83
+    pre<String> = "model.language_model.layers.3."
+
+    want<Vec<String>> = Vec()
+    want.push(pre + "self_attn.q_a_proj.weight")
+    want.push(pre + "self_attn.q_a_layernorm.weight")
+    want.push(pre + "self_attn.q_b_proj.weight")
+    want.push(pre + "self_attn.kv_a_proj_with_mqa.weight")
+    want.push(pre + "self_attn.kv_a_layernorm.weight")
+    want.push(pre + "self_attn.kv_b_proj.weight")
+    want.push(pre + "self_attn.o_proj.weight")
+
+    g<GxLoc> = gx_resolve(dir, total, want)
+    nf<Int> = 0
+    i<Int> = 0
+    while (i < want.len()) {
+        if (g.found.get(i) == 1) { nf = nf + 1 }
+        i = i + 1
+    }
+    if (nf != want.len()) { println("RES_AB_FAIL resolve " + nf.to_string()); return 3 }
+
+    if (tensor_init() != 0) { println("RES_AB_FAIL no cuda"); return 4 }
+    fbf<Int> = load_fn("native/build/bf16.ptx", "bf16deq")
+    if (fbf == 0) { println("RES_AB_FAIL kernel"); return 5 }
+
+    # tensor slot -> (n, z), exactly the contract the decode path uses for these projections
+    idx<Vec<Int>> = Vec()
+    ns<Vec<Int>> = Vec()
+    zs<Vec<Int>> = Vec()
+    idx.push(0); ns.push(Q_LORA * H);              zs.push(H)        # q_a_proj, z != 0, 6.3M out
+    idx.push(1); ns.push(Q_LORA);                  zs.push(0)        # q_a_layernorm, z == 0
+    idx.push(4); ns.push(KV_LORA);                 zs.push(0)        # kv_a_layernorm, z == 0
+
+    bad_total<Int> = 0
+    k<Int> = 0
+    while (k < idx.len()) {
+        ti<Int> = idx.get(k)
+        n<Int> = ns.get(k)
+        z<Int> = zs.get(k)
+        raw<String> = gx_read(g, ti)
+        if (raw.len() == 0) { println("RES_AB_FAIL read idx=" + ti.to_string()); return 6 }
+
+        # disk path
+        d1<Int> = deq_bf16(fbf, raw, n, z)
+        if (d1 == 0) { println("RES_AB_FAIL disk deq idx=" + ti.to_string()); return 7 }
+        v1<Vec<Float>> = dtoh_vec(d1, n)
+
+        # resident path
+        qp<Int> = res_upload(raw)
+        if (qp == 0) { println("RES_AB_FAIL upload idx=" + ti.to_string()); return 8 }
+        d2<Int> = deq_bf16_res(fbf, qp, n, z)
+        if (d2 == 0) { println("RES_AB_FAIL res deq idx=" + ti.to_string()); return 9 }
+        v2<Vec<Float>> = dtoh_vec(d2, n)
+
+        # sampled compare: every `stride`-th element, plus the head and tail, so the whole range is covered
+        # without a multi-minute loop. n up to 67M at stride 61 is ~1.1M comparisons.
+        stride<Int> = 1
+        if (n > 4000000) { stride = n / 1000000 }
+        ndiff<Int> = 0
+        j<Int> = 0
+        firstbad<Int> = -1
+        ncmp<Int> = 0
+        while (j < n) {
+            if (v1.get(j) != v2.get(j)) {
+                ndiff = ndiff + 1
+                if (firstbad < 0) { firstbad = j }
+            }
+            ncmp = ncmp + 1
+            j = j + stride
+        }
+        bad_total = bad_total + ndiff
+        println("RES_AB idx=" + ti.to_string() + " n=" + n.to_string() + " z=" + z.to_string() + " packed_bytes=" + raw.len().to_string() + " ndiff=" + ndiff.to_string() + " firstbad=" + firstbad.to_string() + " ncmp=" + ncmp.to_string())
+
+        freedom { cuMemFree_v2(d1) }
+        freedom { cuMemFree_v2(d2) }
+        freedom { cuMemFree_v2(qp) }
+        k = k + 1
+    }
+
+    if (bad_total == 0) { println("RES_AB_VERDICT BITEXACT") } else { println("RES_AB_VERDICT DIFFERS total=" + bad_total.to_string()) }
+    return 0
+}

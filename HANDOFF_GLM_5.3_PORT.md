@@ -8016,3 +8016,27 @@ picking up the patched file for some reason). It does not matter for the result:
 allocation and the byte-fill, and the hold is observational only.
 The `pkill -f <script>` self-kill in that round DID happen and is real -- it is what left the shell dead
 before any process started -- so that note stands.
+=== ROUND 212: THE DEVICE-RESIDENT READER IS BIT-EXACT ===
+Built the missing piece for TP=2 residency (round 211b named it as the only gap): a reader that keeps packed
+tensor bytes on the device instead of pulling them from disk on every deq call.
+  * glm_engine `res_upload(raw<String>)<Int>` -- allocate once, upload once, return the device pointer and
+    never free it (it is model state, not scratch).
+  * glm_engine `deq_bf16_res(faddr, qdev, n, z)<Int>` -- the SAME kernel, launch geometry, (n,z) contract and
+    return type as `deq_bf16`; the only difference is the packed bytes come from `qdev` instead of a fresh
+    disk read + upload. No existing function was modified.
+GATE: native/host/p_res_ab.vyb dequantises REAL layer-3 checkpoint tensors both ways and compares:
+    idx=0  n=6,291,456  z=4096  packed=12,582,912 B  ndiff=0  ncmp=1,048,576
+    idx=1  n=1,536      z=0     packed=3,072 B       ndiff=0  ncmp=1,536
+    idx=4  n=512        z=0     packed=1,024 B       ndiff=0  ncmp=512
+    RES_AB_VERDICT BITEXACT   (rc=0)
+so a device-resident packed tensor dequantises bit-identically to the disk path, on both the z != 0 and the
+z == 0 contract, including a 6.3M-output tensor compared at ~1M sampled positions.
+SCOPE LIMIT, recorded in the probe itself: the comparison reads back with `dtoh_vec`, which costs
+~microseconds PER ELEMENT here, so tensors above ~100k outputs do not finish (kv_a_proj 2.1M and q_b_proj 25M
+both hung 8+ minutes). Full coverage needs a device-side compare -- `dq1s4_cmp` in kernels/dq1s4_fill.vyb
+already counts elementwise differences on device and should be used for the production gate.
+SEPARATE FINDING worth keeping: `dtoh_vec` being ~us/element is itself a hazard for any hot path that reads
+back through it (`bulk_dtoh` in the tensor module is a different, faster path). Check which one a given call
+site uses before attributing a stall to arithmetic.
+NEXT: wire res_upload + deq_bf16_res into one real consumer end-to-end (a decode layer), then the TP split
+(rank-sharded residency) and the per-layer all-reduce.

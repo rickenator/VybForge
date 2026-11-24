@@ -375,6 +375,51 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     return out
 }
 
+// res_upload -- read a packed tensor ONCE and keep it resident on the device.
+//
+// This is the first half of TP=2 residency (round 211b): the per-step cost of 323-584 ms/layer is the reader
+// pulling packed bytes from disk on every deq call. Here the bytes are uploaded once and the pointer is
+// kept for the life of the process, so deq_bf16_res can dequantise straight from device memory.
+//
+// The returned buffer is deliberately NEVER freed: it is model state, not scratch, and its lifetime is the
+// process. Callers hold the pointer in a Vec indexed by tensor slot.
+share(all)
+res_upload(raw<String>)<Int> -> {
+    var<Int> q = 0
+    if (raw.len() == 0) { return 0 }
+    freedom {
+        qrc<Int> = cuMemAlloc_v2(loc(q), raw.len()) as Int
+        if (qrc != 0) { return 0 }
+        hrc<Int> = cuMemcpyHtoD_v2(q, raw, raw.len()) as Int
+        if (hrc != 0) { return 0 }
+        return q
+    }
+    return 0
+}
+
+// deq_bf16_res -- deq_bf16 against a device-resident packed tensor (no disk read, no upload).
+//
+// Identical maths to deq_bf16: same kernel, same launch geometry, same (n, z) contract, same return (the
+// device pointer to the n*8-byte f64 output). The ONLY difference is that `qdev` was uploaded once by
+// res_upload instead of being fetched from disk and uploaded on every call -- which is why an A/B against
+// deq_bf16 on identical tensors must agree bit-for-bit.
+share(all)
+deq_bf16_res(faddr<Int>, qdev<Int>, n<Int>, z<Int>)<Int> -> {
+    var<Int> out = 0
+    if (qdev == 0 || n <= 0) { return 0 }
+    freedom {
+        var<Int> o = 0
+        orc<Int> = cuMemAlloc_v2(loc(o), n * 8) as Int
+        if (orc != 0) { println("RESFAIL alloc o rc=" + orc.to_string() + " n=" + n.to_string()); return 0 }
+        blocks<Int> = (n + 255) / 256
+        lrc<Int> = cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, qdev, o, n, z) as Int
+        if (lrc != 0) { println("RESFAIL launch rc=" + lrc.to_string()); return 0 }
+        cuCtxSynchronize()
+        out = o
+    }
+    return out
+}
+
 // deq_bf16_arena -- the same dequantise as deq_bf16, but every device buffer comes from a caller-owned
 // ARENA instead of cuMemAlloc/cuMemFree per call.
 //
