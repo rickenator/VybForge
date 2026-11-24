@@ -7061,3 +7061,21 @@ once at the end. This is the only remaining lever, and it is now justified by me
 CHEAPER DIAGNOSTIC IF IT IS TRIED AGAIN: leak q in deq_bf16 for one diagnostic run (do NOT free) and see
 whether the hitch count changes. If frees are the trigger, hitches vanish; if allocations are, they stay.
 Budget the risk: leaking every q at NLAY=12 could reach tens of GB on a 121 GB unified box -- run at NLAY=4.
+=== ROUND 172: ARENA IMPLEMENTED -- AND IT FALSIFIES THE ALLOCATION HYPOTHESIS ===
+Built the arena: one 3.5 GB device allocation (512 MB `q` scratch slot + 3 GB output region), created once
+in glm_serve, threaded as a their<Vec<Int>> borrow through dsa_attn_site_c into attn_site_c, cursor rewound
+at each layer boundary, and all 13 dequantise calls in attn_site_c routed through deq_bf16_arena.
+Fallbacks (ARENA_SMALL / ARENA_OVERFLOW / ARENA_FAIL) degrade to the old deq_bf16 rather than corrupting.
+First run sized smax off the FIRST call (16 MB) so every big tensor fell back -- fixed to a 512 MB scratch
+slot; second run: ARENA init cap=3584MB smax=512MB, ARENA_USE used=953MB cap=3072MB on all three slots, no
+fallbacks at all. So the hot attention path now performs ZERO large allocations and frees.
+RESULT: THE STALL IS UNCHANGED. SEC_ATTN capslot 0 and 1 still read I=917 and I=912 with the arena in
+place, and two SEC_DEQ stalls (htod=901, allocO=901) remain in other code paths.
+** THIS FALSIFIES the round-169/170/171 hypothesis that the ~900 ms event is large alloc/free churn or
+driver page-table teardown. ** With every allocation removed from the attention path the same ~900 ms
+lands in the same phase. It also remains independent of size (134/268 MB both ~901) and of stage (allocQ,
+allocO, htod, and now a phase that only reads and computes).
+WHAT SURVIVES AS EVIDENCE: fixed ~900 ms; lands at random; 1-4 per run; unaffected by every code change so
+far. That is equally the signature of an EXTERNAL GPU user. Prior practice only checked for foreign
+compute processes BEFORE a run, never during one. Now sampling nvidia-smi compute-apps + utilization every
+2 s across a whole run -- if another PID appears at the stalls, the entire "hog" is contention, not code.

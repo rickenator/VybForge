@@ -375,6 +375,91 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
     return out
 }
 
+// deq_bf16_arena -- the same dequantise as deq_bf16, but every device buffer comes from a caller-owned
+// ARENA instead of cuMemAlloc/cuMemFree per call.
+//
+// Why (round 169-171): a ~900 ms stall lands on the operation FOLLOWING a large device free, while the
+// free itself measures 0 ms -- i.e. it is driver page-table teardown, not the call. The host kernel is
+// exonerated by /proc/vmstat (pswpin, pswpout, pgmajfault, pgsteal all unchanged across a run). The only
+// way to stop paying it is to stop allocating and freeing large buffers mid-step.
+//
+// Layout: bytes [0, smax) are a scratch slot reused for `q` on every call (safe: q is consumed by the
+// launch and we synchronise before returning, so the next call may overwrite it). Outputs bump upward
+// from smax. The cursor never rewinds, so two tensors can never receive the same bytes while both live
+// -- which is the hazard a naive size-class free list would have.
+//
+// `ar` is a their<Vec<Int>> holding [base, cap, cursor, smax]. It is created by the caller ONCE and
+// reused across layers and steps; that persistence is the whole point, since re-creating it per layer
+// would just move the allocation back into the loop.
+share(all)
+deq_bf16_arena(faddr<Int>, raw<String>, n<Int>, z<Int>, ar<their<Vec<Int>>>)<Int> -> {
+    need<Int> = n * 8
+    scratch<Int> = raw.len()
+    var<Int> base = 0
+    var<Int> cap = 0
+    var<Int> cur = 0
+    var<Int> smax = 0
+    if (ar.len() >= 4) {
+        base = ar.get(0)
+        cap = ar.get(1)
+        cur = ar.get(2)
+        smax = ar.get(3)
+    }
+    if (cur == 0 || base == 0) {
+        # first use: one allocation for the whole process. The scratch slot is sized for the largest raw
+        # tensor seen so far with a margin; outputs get 3 GB, which covers the largest projection with
+        # room for everything the layer holds live at once.
+        # Size the scratch slot from the LARGEST raw tensor the path sees, not from the first call: the
+        # first call is small (16 MB) and sizing off it made every big tensor fall back to the old
+        # allocate-per-call path -- which is exactly where the ~900 ms stalls live. 512 MB covers the
+        # biggest observed tensor (128 MB) with 4x headroom; ARENA_SMALL still guards the rest.
+        smax = 512 * 1024 * 1024
+        cap = smax + (3 * 1024 * 1024 * 1024)
+        var<Int> nb = 0
+        freedom {
+            if (cuMemAlloc_v2(loc(nb), cap) != 0) { nb = 0 }
+        }
+        if (nb == 0) { println("ARENA_FAIL alloc cap=" + cap.to_string()); return deq_bf16(faddr, raw, n, z) }
+        base = nb
+        cur = smax
+        ar.push(base)
+        ar.push(cap)
+        ar.push(cur)
+        ar.push(smax)
+        println("ARENA init cap=" + (cap / 1048576).to_string() + "MB smax=" + (smax / 1048576).to_string() + "MB")
+    }
+    # A larger raw tensor than the scratch slot can hold would corrupt the outputs above it.
+    if (scratch + 65536 > smax) {
+        println("ARENA_SMALL scratch=" + scratch.to_string() + " smax=" + smax.to_string() + " (fallback)")
+        return deq_bf16(faddr, raw, n, z)
+    }
+    if (cur + need > cap) {
+        println("ARENA_OVERFLOW need=" + need.to_string() + " cur=" + cur.to_string() + " cap=" + cap.to_string() + " (fallback)")
+        return deq_bf16(faddr, raw, n, z)
+    }
+
+    var<Int> o = cur
+    cur = cur + need
+    ar.set(2, cur)
+
+    var<Int> rc = 0
+    freedom {
+        hrc<Int> = 0
+        lrc<Int> = 0
+        # q always lives at the arena base; we synchronise below, so reuse across calls is safe.
+        hrc = cuMemcpyHtoD_v2(base, raw, raw.len()) as Int
+        if (hrc != 0) { rc = 1 }
+        if (rc == 0) {
+            blocks<Int> = (n + 255) / 256
+            lrc = cuda_launch4i(from<loc<CVoid>>(faddr), blocks, 1, 1, 256, 1, 1, base, base + o, n, z) as Int
+            if (lrc != 0) { rc = 2 }
+        }
+        cuCtxSynchronize()
+    }
+    if (rc != 0) { println("ARENA_FAIL rc=" + rc.to_string() + " n=" + n.to_string()); return 0 }
+    return base + o
+}
+
 // deq_bf16f — the f32-output twin of deq_bf16: same bf16 raw htod + launch,
 // but the output is n*4 bytes of f32 (bf16deq32) and the caller must consume
 // it with an f32 gemm (mm_host32 / gemm32_p) or cast32 it back to f64.
@@ -1824,7 +1909,7 @@ delta_rule_cap(q<their<Vec<Float> const>>, k<their<Vec<Float> const>>, v<their<V
 # attn_site + the DSA cache rows (ckv / indexer k / gsc) copied to the layer slot.
 
 share(all)
-attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, capslot<Int>)<Vec<Float>> -> {
+attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, ar<their<Vec<Int>>>, capslot<Int>)<Vec<Float>> -> {
     t0<Int> = now_ms()
     nonev<Vec<Float>> = Vec()
     a<Int> = 0
@@ -1953,15 +2038,15 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     var<Int> d_kvb = 0
     var<Int> d_o = 0
     g_g_0 = gx_read(g, 0)
-    d_qa = deq_bf16(fbf, g_g_0, Q_LORA * H, H)
+    d_qa = deq_bf16_arena(fbf, g_g_0, Q_LORA * H, H, ar)
     g_g_2 = gx_read(g, 2)
-    d_qb = deq_bf16(fbf, g_g_2, HEADS * NOPE * Q_LORA, Q_LORA)
+    d_qb = deq_bf16_arena(fbf, g_g_2, HEADS * NOPE * Q_LORA, Q_LORA, ar)
     g_g_3 = gx_read(g, 3)
-    d_kva = deq_bf16(fbf, g_g_3, KV_LORA * H, H)
+    d_kva = deq_bf16_arena(fbf, g_g_3, KV_LORA * H, H, ar)
     g_g_5 = gx_read(g, 5)
-    d_kvb = deq_bf16(fbf, g_g_5, HEADS * (NOPE + VDIM) * KV_LORA, 0)
+    d_kvb = deq_bf16_arena(fbf, g_g_5, HEADS * (NOPE + VDIM) * KV_LORA, 0, ar)
     g_g_6 = gx_read(g, 6)
-    d_o = deq_bf16(fbf, g_g_6, HEADS * VDIM * H, HEADS * VDIM)
+    d_o = deq_bf16_arena(fbf, g_g_6, HEADS * VDIM * H, HEADS * VDIM, ar)
     if (d_qa == 0 || d_qb == 0 || d_kva == 0 || d_kvb == 0 || d_o == 0) { return nonev }
 
     qres<Vec<Float>> = mm_host(h_a, R, H, d_qa, Q_LORA, fgemm)
@@ -1971,10 +2056,9 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
 
     var<Int> d_qaln = 0
     g_g_1 = gx_read(g, 1)
-    d_qaln = deq_bf16(fbf, g_g_1, Q_LORA, 0)
+    d_qaln = deq_bf16_arena(fbf, g_g_1, Q_LORA, 0, ar)
     if (d_qaln == 0) { return nonev }
     qaln_w<Vec<Float>> = bulk_dtoh(d_qaln, Q_LORA)
-    free_dev(d_qaln)
     qa_ln<Vec<Float>> = rms_rows(view(qres), R, Q_LORA, qaln_w)
     qfull<Vec<Float>> = mm_host(qa_ln, R, Q_LORA, d_qb, HEADS * NOPE, fgemm)
     dg1<String> = digest("qb", qfull)
@@ -1984,10 +2068,9 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     ckraw<Vec<Float>> = mm_host(h_a, R, H, d_kva, KV_LORA, fgemm)
     var<Int> d_kvaln = 0
     g_g_4 = gx_read(g, 4)
-    d_kvaln = deq_bf16(fbf, g_g_4, KV_LORA, 0)
+    d_kvaln = deq_bf16_arena(fbf, g_g_4, KV_LORA, 0, ar)
     if (d_kvaln == 0) { return nonev }
     kvaln_w<Vec<Float>> = bulk_dtoh(d_kvaln, KV_LORA)
-    free_dev(d_kvaln)
     ckv<Vec<Float>> = rms_rows(view(ckraw), R, KV_LORA, kvaln_w)
     dg2<String> = digest("ckv", ckv)
     println(dg2)
@@ -1996,7 +2079,6 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     t2<Int> = now_ms()
     # ---- per-head absorbed keys/values from kv_b ----
     kvb<Vec<Float>> = bulk_dtoh(d_kvb, HEADS * (NOPE + VDIM) * KV_LORA)
-    free_dev(d_kvb)
     dg3<String> = digest("kvb", kvb)
     println(dg3)
     lines = lines + dg3 + "\n"
@@ -2008,13 +2090,13 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     var<Int> d_wproj = 0
     var<Int> d_gate = 0
     g_g_7 = gx_read(g, 7)
-    d_wqb = deq_bf16(fbf, g_g_7, Q_LORA * IHEADS * IDIM, Q_LORA)
+    d_wqb = deq_bf16_arena(fbf, g_g_7, Q_LORA * IHEADS * IDIM, Q_LORA, ar)
     g_g_8 = gx_read(g, 8)
-    d_wk = deq_bf16(fbf, g_g_8, H * IDIM, H)
+    d_wk = deq_bf16_arena(fbf, g_g_8, H * IDIM, H, ar)
     g_g_11 = gx_read(g, 11)
-    d_wproj = deq_bf16(fbf, g_g_11, H * IHEADS, H)
+    d_wproj = deq_bf16_arena(fbf, g_g_11, H * IHEADS, H, ar)
     g_g_13 = gx_read(g, 13)
-    d_gate = deq_bf16(fbf, g_g_13, H * IDIM, H)
+    d_gate = deq_bf16_arena(fbf, g_g_13, H * IDIM, H, ar)
     if (d_wqb == 0 || d_wk == 0 || d_wproj == 0 || d_gate == 0) { return nonev }
 
     qidx<Vec<Float>> = mm_host(qres, R, Q_LORA, d_wqb, IHEADS * IDIM, fgemm)
@@ -2022,14 +2104,12 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
     knw<Vec<Float>> = Vec()
     knb<Vec<Float>> = Vec()
     g_g_9 = gx_read(g, 9)
-    d_knw = deq_bf16(fbf, g_g_9, IDIM, 0)
+    d_knw = deq_bf16_arena(fbf, g_g_9, IDIM, 0, ar)
     g_g_10 = gx_read(g, 10)
-    d_knb = deq_bf16(fbf, g_g_10, IDIM, 0)
+    d_knb = deq_bf16_arena(fbf, g_g_10, IDIM, 0, ar)
     if (d_knw == 0 || d_knb == 0) { return nonev }
     knw = bulk_dtoh(d_knw, IDIM)
     knb = bulk_dtoh(d_knb, IDIM)
-    free_dev(d_knw)
-    free_dev(d_knb)
     kn<Vec<Float>> = ln_rows(borrow(kraw), R, IDIM, knw, knb)
     gsc<Vec<Float>> = mm_host(h_a, R, H, d_gate, IDIM, fgemm)
     # chained-decode capture: this layer's cache rows for the phase-2 walk
@@ -2375,7 +2455,7 @@ attn_site_c(h_a<Vec<Float>>, tab<String>, lpre<String>, fgemm<Int>, fbf<Int>, ck
 # dsa_attn_site, passing the cache borrows through to attn_site_c.
 
 share(all)
-dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, slot<Int>)<Vec<Float>> -> {
+dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre<String>, fgemm<Int>, fbf<Int>, fdeq<Int>, fhgen<Int>, fhad1<Int>, fhad2<Int>, mapbody<String>, ckv_out<their<Vec<Float>>>, ik_out<their<Vec<Float>>>, gsc_out<their<Vec<Float>>>, ar<their<Vec<Int>>>, slot<Int>)<Vec<Float>> -> {
     nonev<Vec<Float>> = Vec()
     i<Int> = 0
     j<Int> = 0
@@ -2464,7 +2544,14 @@ dsa_attn_site_c(streams0<Vec<Float>>, tab<String>, dir<String>, total<Int>, lpre
     lines<String> = ""
 
     # ---- attention site (verbatim from glm_l3_attn_fwd.vyb) ----
-    attn<Vec<Float>> = attn_site_c(h_a, tab, lpre, fgemm, fbf, ckv_out, ik_out, gsc_out, slot)
+    # Rewind the arena cursor to the top of the output region. Safe here and only here: the previous
+    # layer's attention has finished consuming every arena tensor, so nothing is live. The scratch slot
+    # at [0, smax) is untouched by the rewind.
+    if (ar.len() >= 4) { ar.set(2, ar.get(3)) }
+    attn<Vec<Float>> = attn_site_c(h_a, tab, lpre, fgemm, fbf, ckv_out, ik_out, gsc_out, ar, slot)
+    if (ar.len() >= 4) {
+        println("ARENA_USE slot=" + slot.to_string() + " used=" + ((ar.get(2) - ar.get(3)) / 1048576).to_string() + "MB cap=" + ((ar.get(1) - ar.get(3)) / 1048576).to_string() + "MB")
+    }
     tB<Int> = now_ms() - tD
     tD = now_ms()
     dg36<String> = digest("h_a", h_a)

@@ -653,6 +653,10 @@ main()<Int> -> {
                     ckvAll<Vec<Float>> = Vec()
                     ikAll<Vec<Float>> = Vec()
                     gscAll<Vec<Float>> = Vec()
+                    # Device arena for the DSA attention dequantise buffers: created once here and reused
+                    # across every layer and step, so the hot loop does no large cuMemAlloc/cuMemFree at
+                    # all (round 169-171: a ~900 ms driver stall follows large frees).
+                    arAll<Vec<Int>> = Vec()
                     i = 0
                     while (i < sv_NSLOT * sv_HEADS * sv_KD * sv_KD) { stAll.push(0.0); i = i + 1 }
                     i = 0
@@ -721,7 +725,7 @@ main()<Int> -> {
                         secP = now_ms()
                         if (is_dsa == 1) {
                             dslot = (n - 3) / 4
-                            streams1 = dsa_attn_site_c(streams, tab, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, borrow(ckvAll), borrow(ikAll), borrow(gscAll), dslot)
+                            streams1 = dsa_attn_site_c(streams, tab, dir, total, lpre, fgemm, fbf, fdeq, fhgen, fhad1, fhad2, mapbody, borrow(ckvAll), borrow(ikAll), borrow(gscAll), borrow(arAll), dslot)
                         } else {
                             kslot = n - ((n + 1) / 4)
                             streams1 = kda_attn_site_c(borrow(streams), tab, dir, total, lpre, fgemm, fbf, borrow(stAll), kslot, borrow(ringQ), borrow(ringK), borrow(ringV))
