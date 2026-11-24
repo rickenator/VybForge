@@ -7158,3 +7158,11 @@ FOUR REAL DEFECTS FOUND AND FIXED ALONG THE WAY (each cost a cycle; all are reus
 NEXT (step 2 of the plan): per-layer TP sharding -- column-parallel gate/up, row-parallel down/o, one
 all-reduce per layer point -- on top of this proven primitive. Expert placement for 288 experts across the
 pair still needs settling first (TP-within-expert vs expert-parallel): it decides the comms pattern.
+BANDWIDTH, COUNT=8,388,608 doubles (64 MB per buffer):
+    rank 0: ms=10  gbps=13.42  bad=0  NCCLPING_EXACT
+    rank 1: ms=0 (its /proc/uptime centisecond granularity rounds 1M..64MB reduces to 0)  bad=0 EXACT
+So a 64 MB all-reduce completes in ~10 ms -> ~12.8-13.4 GB/s effective, ABOVE the 4.8 GB/s the CX7 link is
+rated at. Comms is not the bottleneck and the primitive is usable for per-layer TP all-reduces.
+CAVEAT: the test's clock reads /proc/uptime at centisecond resolution, so timings below ~10 ms are 0 or
+quantised. Any future microbenchmark of small collectives must swap in a finer clock (or repeat N times
+and divide) or it will report meaningless zeros -- rank 1 did exactly that here.
