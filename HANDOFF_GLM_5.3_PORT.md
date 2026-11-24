@@ -7813,3 +7813,27 @@ MEASUREMENT RULES EARNED TONIGHT (all now in the skill reference): production fl
 to 16.6x and must be checked FIRST; a run ~20x faster with no output is a crash; a digest gate only covers
 the path that emits it; check nvidia-smi and pgrep before any number; and never compare read numbers across
 runs without stating cache state.
+=== ROUND 205: DECODE ATTENTION MEASURED -- 63-68% OF THE STEP, AND DSA IS THE WORST ===
+Instrumented the phase-2 attention block properly: `secT2` at the single `if (is_dsa == 1)` (glm_serve:1075)
+whose if/else covers BOTH branches, with a print after each branch's `hc_apply` (DSA ends 1488, KDA 1932).
+NLAY=45, NSTEPS=2, production mode, VALID_RUN (62 moekern lines):
+    ATTENTION PER STEP:  step 0 = 26,297 ms of 42,002 ms  (63%)
+                         step 1 = 80,035 ms of 116,962 ms (68%)
+    PER LAYER:           p50 = 995 ms   p90 = 4,036 ms   max = 4,939 ms
+    PER LAYER TYPE:      DSA = 2,828 ms/layer (62,226 ms over 22 layer-visits)
+                         KDA = 1,297 ms/layer (44,106 ms over 68 layer-visits)
+so THREE quarters of it is attention, and the 11 DSA layers carry 59% of the attention cost (31 s/step)
+while being only 24% of the layers. DSA decode attention is 2.2x more expensive per layer than KDA.
+*** THE ACTIONABLE NUMBER: the engine's `dsa_attn_site_c` does the same work in ~45 ms/layer in PREFILL
+(rounds 168-173) against 2,828 ms/layer here -- a ~60x gap for the same computation. If the prefill path's
+speed transfers to decode, the 11 DSA layers go from ~31 s/step to well under 1 s. ***
+CAVEAT ON THE OTHER TIMER: `SEC layerbody` prints with an OFF-BY-ONE layer index relative to `SEC p2attn`
+(layerbody n=1 = 21 ms while p2attn n=1 = 25 ms), so the two must NOT be paired per layer and their sums
+do not nest (106.3 s vs 96.8 s). Use `p2attn` alone, which is measured directly around the attention call;
+the share above is p2attn against SEC STEP, which needs no pairing.
+CAUSE OF THE DSA/KDA ASYMMETRY: the inline decode path does its own gx_read + deq_bf16 + mm_host per layer
+(round 203), so DSA pays for its larger tensor set (more q/kv projections, the sparse indexer) every layer
+with no fusion, while the engine's fused site amortises exactly that.
+NEXT: port the fused DSA attention path into the decode loop, behind a flag (P62_FUSED_ATTN) so the current
+path stays available for A/B, and verify with the per-projection numeric gate plus an attention-digest
+comparison that ACTUALLY exercises the decode attention (round 192's mistake was a gate that did not).

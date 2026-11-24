@@ -1072,6 +1072,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                             }
                             lg = gL2
 
+                            secT2<Int> = now_ms()
                             if (is_dsa == 1) {
                                 # ------------------------------------------------ DSA layer step
                                 # (glm_decode_l3.vyb's step body; caches ride in ckvAll/ikAll/gscAll)
@@ -1484,6 +1485,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 free_dev(d_gatei)
 
                                 streams1 = hc_apply(streams, attn, postA, combA)
+                                println("SEC p2attn n=" + n.to_string() + " dsa=" + (now_ms() - secT2).to_string())
 
                                 # ---- ffn site: hc_ffn mix -> post_attn LN -> router -> experts -> shared
                                 reflat<Vec<Float>> = rms_rows(borrow(streams1), sv_R, sv_HC * sv_H, Vec())
@@ -1927,6 +1929,7 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 free_dev(d_gb)
 
                                 streams1 = hc_apply(streams, attn, postA, combA)
+                                println("SEC p2attn n=" + n.to_string() + " kda=" + (now_ms() - secT2).to_string())
 
                                 println("SEC attnC n=" + n.to_string() + " " + (now_ms() - secT).to_string())
                                 secT = now_ms()
