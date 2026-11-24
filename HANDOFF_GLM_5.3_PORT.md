@@ -7837,3 +7837,25 @@ with no fusion, while the engine's fused site amortises exactly that.
 NEXT: port the fused DSA attention path into the decode loop, behind a flag (P62_FUSED_ATTN) so the current
 path stays available for A/B, and verify with the per-projection numeric gate plus an attention-digest
 comparison that ACTUALLY exercises the decode attention (round 192's mistake was a gate that did not).
+=== ROUND 206: WHY DECODE ATTENTION IS 60x SLOWER THAN THE SAME MATH IN PREFILL ===
+Call inventory of the decode DSA attention branch (glm_serve:1075-1488, one layer):
+    24 gx_read   18 deq_bf16 (HOST)   10 mm_host (CPU matvec)   8 bulk_dtoh   3 bulk_htod   1 gemm (GPU)
+So decode attention is a HOST-SIDE implementation: it dequantises 18 model tensors per layer into host
+memory and multiplies them on the CPU, with a single GPU GEMM in the whole branch. The prefill site
+(`dsa_attn_site_c`) does the same attention on-device with one fused GEMM and measures ~45 ms/layer.
+Volume check: the prefill site's arena reports `used=953MB` per DSA layer, and the decode branch dequantises
+a comparable set, so at host dequant speed (~0.35-1 GB/s measured for this loop) the deq alone is ~1 s of
+the observed 2,828 ms/layer, with the CPU matvecs making up most of the rest. Both terms are fixable only
+by moving the work to the device.
+NOT A MECHANICAL SWAP: `deq_bf16_arena` dequantises ON DEVICE, but its output is a device buffer, while the
+decode consumers are `mm_host` calls that need host memory. Swapping the dequantiser alone would break the
+consumer chain. The fix is to port the consumer as well -- i.e. call the fused attention path, which is what
+prefill already does.
+THE WORK, scoped: replace the inline decode attention block with a call into the engine's fused path behind
+a flag (`P62_FUSED_ATTN`), keeping the current path for A/B. Effort is bounded by ~56 call sites across the
+two branches (DSA 1075-1488, KDA ~1705-1929). Must be verified by a gate that genuinely exercises decode
+attention -- round 192's failure was a gate that measured a neighbouring path -- i.e. an attention-digest
+comparison covering the decode step, or the per-projection numeric gate on a decode-layer call.
+EXPECTED EFFECT IF THE PREFILL SPEED TRANSFERS: DSA layers 2,828 -> ~45 ms and KDA 1,297 -> a smaller but
+similar cut, taking attention from 63-68% of the step to a few percent. That is the largest single win
+available on this model: even with everything else unchanged it removes ~30 of ~45 s per step.
