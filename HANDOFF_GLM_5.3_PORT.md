@@ -7100,3 +7100,31 @@ Remaining: the intermittent ~900 ms event (0 to 4 per run; one run had ZERO, whi
 reproduced on demand). Ruled out by measurement: alloc/free churn (arena test), page-table teardown, host
 swap/reclaim/faults (vmstat identical), external GPU user (sampler saw only our own PID), size
 dependence, and stage dependence. What is left needs driver-level tracing rather than app-level timers.
+=== ROUND 174: FULL-DEPTH MEASUREMENT + THE SPLIT THE NUMBERS ACTUALLY REQUIRE ===
+45-layer differential (nsteps 2 minus nsteps 1, same harness, warm server):
+    nsteps=1 : 471.455 s
+    nsteps=2 : 957.644 s
+    ONE STEP : 486.19 s   (= 10.8 s/layer)
+WARM-REQUEST CAVEAT, and it invalidates older "warm request" numbers from this harness: req2 and req3
+returned 0.029 s and 0.0001 s with body {"draft_token": 0} -- the server answered from cache despite the
+appended request index that run_fgate.sh's comment claims defeats it. Only req1 is real work.
+STEP BUDGET, from the per-layer timers in that same log:
+    P1ffn  (FFN/MoE)   med 967 ms x 45 = 29,074 ms   6.0%
+    P1attn (attention) med  39 ms x 45 =  1,606 ms   0.3%   <- was ~10.5 s before rounds 168-173
+    P1tail             med   3 ms x 45 =    191 ms   0.0%
+    ~900 ms events (47 layer phases >= 200 ms)  = 44,998 ms  9.3%
+    TOTAL TIMED                        = 47,020 ms   9.7%
+    UNTIMED                            = 439,170 ms  90.3%
+The untimed 90% is the checkpoint stream: 175.62 GB in 486 s = 361 MB/s effective, against 1.1 GB/s
+measured for a sequential read on the same disk. So the step re-reads the whole model AND does it 3x
+slower than the hardware allows (scattered small reads across 83 shards).
+HARD CONSEQUENCE: 175.62 GB per step cannot reach 20-22 ms/token at ANY bandwidth -- 8 TB/s would be
+needed. The bar requires residency, not tuning.
+SPLIT, measured from the safetensors headers of all 83 shards (scripts/split_report.py):
+    total 175.62 GB; 46 layers; layers 0-2 DENSE at 0.58 GB, layers 3-45 MoE at ~3.95 GB each
+    non-layer 3.66 GB (lm_head 1.27, embed 1.27, visual tower 0.81)
+    best contiguous split at layer 24:  node A 84.83 + 3.66 = 88.50 GB,  node B 87.13 GB
+    => BOTH HALVES FIT in 121 GB with ~33 GB headroom each. 4 bpw STAYS. No re-quantisation needed.
+For the record, the alternatives: single node needs ~2.5 bpw (175.62 -> ~110 GB) -- a real quality cost to
+avoid a split that was already the plan; 3 bpw (66 GB/half) buys headroom nobody needs; the 0.81 GB visual
+tower is skippable for text serving.
