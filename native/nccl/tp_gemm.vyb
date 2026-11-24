@@ -38,6 +38,13 @@ nccl_sum()<CInt> -> { return 0 }
 share(all)
 nccl_f64()<CInt> -> { return 8 }
 
+gflops_str(M<Int>, N<Int>, K<Int>, us<Int>)<String> -> {
+    fl<Float> = 2.0 * (M as Float) * (N as Float) * (K as Float)
+    g<Float> = 0.0
+    if (us > 0) { g = fl / ((us as Float) / 1000000.0) / 1000000000.0 }
+    return g.to_string()
+}
+
 clock_ns()<Int> -> {
     ts<Vec<Int>> = Vec()
     ts.push(0)
@@ -66,9 +73,12 @@ main()<Int> -> {
     port<Int> = ps.to_int()
 
     # Decode-shaped: few tokens, full hidden, an MoE-sized output. B (the weight) dominates the data.
-    M<Int> = 4
-    K<Int> = 4096
-    N<Int> = 1024
+    ms<String> = env_get("M") else "4"
+    ks<String> = env_get("K") else "4096"
+    ns2<String> = env_get("N") else "1024"
+    M<Int> = ms.to_int()
+    K<Int> = ks.to_int()
+    N<Int> = ns2.to_int()
     KH<Int> = K / world          # this rank's slice of the reduction dimension
     KOFF<Int> = rank * KH
 
@@ -205,6 +215,7 @@ main()<Int> -> {
     println("TPG_RESULT rank=" + rank.to_string()
         + " gemm_us=" + gemm_us.to_string() + " comm_us=" + comm_us.to_string()
         + " pack_us=" + pack_us.to_string()
+        + " gflops=" + gflops_str(M, N, KH, gemm_us)
         + " maxabs=" + maxabs.to_string() + " maxrel=" + maxrel.to_string()
         + " ref0=" + refv.get(0).to_string() + " got0=" + got.get(0).to_string())
 

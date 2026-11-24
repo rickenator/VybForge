@@ -7259,3 +7259,26 @@ NEXT HOG CANDIDATE, ahead of further TP work: the gemm kernel's uncoalesced B ac
 B so the reduction dimension walks contiguously, then re-measure at the real MoE shapes
 (K=4096, N=2048, 8 experts). This affects every layer of the single-node path too, so it pays whether or
 not TP lands.
+=== ROUND 180: THE GEMM KERNEL IS LATENCY-BOUND, NOT MEMORY- OR FP64-BOUND ===
+Measured the same fp64 gemm kernel across shapes (TP slice, bit-exact each time):
+    M=1, N=2048, K=2048 : 8.4 MFLOP  -> 569/571 us  (14.7 GFLOP/s)
+    M=4, N=2048, K=2048 : 33.5 MFLOP -> 549/559 us  (60-61 GFLOP/s)
+    M=4, N=1024, K=2048 : 16.8 MFLOP -> 531/562 us  (31.6 GFLOP/s)
+    M=1, N=1,   K=1     : packing+launch only -> 53-64 us
+FOUR TIMES THE WORK, THE SAME WALL TIME. That rules out, by measurement:
+  * memory bandwidth (B traffic varies 4x between M=1 and M=4, time does not);
+  * fp64 throughput (FLOPs vary 4x, time does not);
+  * the access pattern (round 179's claim that B is read column-wise/uncoalesced is WITHDRAWN: in
+    gemm.vyb adjacent threads read adjacent B[kk*N+n] and A[m*K+kk] is a broadcast within a row).
+WHAT IT ACTUALLY IS: LATENCY-BOUND. One thread per output, a serial `acc = acc + av*bv` chain over K,
+and only M*N/256 blocks (8 blocks at M=1, 32 at M=4) on a GPU with far more SMs. Each thread's dependent
+chain is ~K x (fp64 FMA + load latency) ~= 500 us, and adding rows adds parallel blocks rather than time
+-- hence a flat cost across shapes.
+FIX, and it already exists in this repo: register blocking with several rows per thread, which is exactly
+what bfgemm8 does for f32 (8 rows/thread, recorded at ~537 GFLOP/s -- 9x to 36x this kernel). Either
+block the fp64 gemm the same way (multiple outputs per thread, shared B loads, K-split so no thread runs a
+full-length serial chain) or adopt the f32/bf16 path outright.
+WHY THIS IS THE NEXT HOG: at ~550 us per gemm call and roughly 20-30 calls per MoE layer (8 experts x 3
+projections plus attention projections), the layer costs 11-16 ms of pure per-call time -- the same order
+as the 967 ms/layer we could never attribute. A faster kernel helps every layer of the single-node path,
+independent of whether TP ever lands.
