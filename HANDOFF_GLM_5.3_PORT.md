@@ -8479,3 +8479,24 @@ SO THE REMAINING STEP IS EXACTLY ONE THING: get the checkpoint onto righty quick
 with a TOLERANCE (two partial sums do not associate like 288 experts in order).
 CODE STATE (all verified this session): expert split live and digest-verified; per-layer all-reduce wired and
 transparent at world=1 (bit-identical, network untouched); comms ~0.03 ms/layer; lockstep proven.
+=== ROUND 228: THE FRONT-END DESIGN (Rick's point, and it simplifies expert-parallel) ===
+Two independent HTTP servers curled together is a TEST SCAFFOLD, not the architecture. A real TP server has
+ONE front-end that dispatches to all ranks, so the collective sequence cannot diverge.
+FOR EXPERT-PARALLEL IT SIMPLIFIES FURTHER THAN CLASSIC TP: both ranks compute IDENTICAL attention and
+IDENTICAL shared experts; the only difference is which routed experts each owns, and the per-layer all-reduce
+already combines that. So rank 1's final output is REDUNDANT -- it is a compute donor and only rank 0's
+response matters. Therefore:
+  * rank 0 hosts the front-end and the response;
+  * rank 0 sends rank 1 the prompt/token sequence over the CONTROL CHANNEL IT ALREADY HAS (the same socket
+    that carries the NCCL unique id);
+  * both run the same forward pass; rank 1's output is discarded;
+  * rank 1 does not need an HTTP server at all.
+WHY THIS MATTERS: it eliminates the whole failure class described in round 227's note -- no stagger to tune,
+no token-count mismatch (rank 0 dictates it), no deadlock when a second user arrives, and no possibility of the
+two ranks diverging in control flow, because there is only one control flow.
+CONSEQUENCE FOR THE PAIR TEST: `scripts/tp_pair.sh`'s two-curl approach is a GATE, not the design -- it proves
+the collectives line up on real model traffic. The real test, once the data is staged, is: curl rank 0 ONLY,
+have rank 0 push the prompt to rank 1 over the control socket, and compare rank 0's output against world=1
+within tolerance. That is both the correct architecture and a simpler test.
+STATUS: model staging to righty is still running in the background (~27 MB/s, ~1.7 h for 164 GB). Everything
+else is in place and verified.
