@@ -7339,3 +7339,29 @@ assumed correct at arbitrary K. Likely places to look: the host-side A column ga
 the B row slice, or a stale device buffer reused across sizes.
 NEXT, in order: (1) explain the K=8192 TP mismatch -- correctness before optimisation; (2) then decide
 f32/bf16 for the hot path, which is where the 10x lives and which also halves every comms payload.
+=== ROUND 184: THE K=8192 TP FAILURE IS AN INCONSISTENT COLLECTIVE, NOT ARITHMETIC ===
+Diagnosed with per-rank partial dumps and a post-collective probe, at M=1, K=8192, N=2048:
+    rank 0: partial p0=6      (expected 6)
+    rank 1: partial p0=-2     (expected -2)   -> sum should be 4, and the reference says 4
+    after the WARM-UP collective : dPart still 6 / -2, dC = 4 ON BOTH RANKS  <- CORRECT
+    after the TIMED collective   : dC = 6 ON BOTH RANKS                      <- rank 0's input alone
+So the inputs are correct before each call, and TWO IDENTICAL ncclAllReduce CALLS on the same communicator
+with the same buffers return DIFFERENT ANSWERS -- the first the correct sum, the second rank 0's input
+alone. This is not a gather/offset bug (the halves are provably right) and not a precision issue.
+** This is a reproducibility defect that would silently corrupt a TP implementation: a single-shot test
+passes, and the failure only appears on a later call of the same shape. **
+WHY THE K=4096 RUN "PASSED": computed the partials for both sizes by hand --
+    K=4096: rank0=11, rank1=-5, sum=6   and rank 0's own partial IS 6, so a dropped rank-1 term is
+            invisible at that size.
+    K=8192: rank0= 6, rank1=-2, sum=4    and rank 0's partial (6) != the sum (4), so the drop shows.
+The earlier "bit-exact at K=4096" conclusion was therefore LUCK OF THE TEST DATA, not proof. Any TP
+correctness claim must use data where every rank's partial differs from the sum -- test vectors that
+cannot mask a dropped rank.
+NEXT STEPS FOR THIS DEFECT, in order:
+  1. add a third and fourth allreduce and probe after each, to see whether it is "second call always
+     wrong" or intermittent, and whether the pattern follows the rank index or the node;
+  2. try NCCL_PROTO / NCCL_ALGO pinned to one value -- NCCL upgrades protocols and algorithms after the
+     first calls, so a lazily-selected path is a prime suspect;
+  3. swap which node is rank 0 to separate rank-index effects from node effects.
+BLOCKING STATUS: step 2 (f32/bf16) and step 3 (residency) are BLOCKED behind this. Sharding layers onto a
+collective that intermittently drops a rank would produce wrong outputs that look plausible.

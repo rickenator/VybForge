@@ -193,6 +193,13 @@ main()<Int> -> {
     sync()
     t1<Int> = clock_ns()
 
+    # DIAGNOSTIC (keep): dump this rank's OWN partial before any communication. If the halves are right
+    # and the sum is wrong the fault is in comms; if a half is wrong it is the gather/offset arithmetic.
+    partv<Vec<Float>> = bulk_dtoh(dPart, M * N)
+    println("TPG_PARTIAL rank=" + rank.to_string() + " KOFF=" + KOFF.to_string()
+        + " p0=" + partv.get(0).to_string() + " p1=" + partv.get(1).to_string()
+        + " pn=" + partv.get(N - 1).to_string())
+
     # WARM-UP the collective before timing it. The first all-reduce on a fresh communicator pays
     # connection establishment (~1.25 s measured), which is not the steady-state cost the design needs.
     # ncclAllReduce overwrites recv each call, so a warm-up does not pollute the result.
@@ -200,6 +207,12 @@ main()<Int> -> {
     freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
     sync()
     if (arc != 0) { println("TPG_FAIL warmup rc=" + arc.to_string()); return 16 }
+
+    # after the warm-up collective: is the INPUT intact, and what did the OUTPUT become?
+    pin<Vec<Float>> = bulk_dtoh(dPart, M * N)
+    pout<Vec<Float>> = bulk_dtoh(dC, M * N)
+    println("TPG_AFTERWARM rank=" + rank.to_string()
+        + " in0=" + pin.get(0).to_string() + " out0=" + pout.get(0).to_string())
 
     # time the steady-state collective
     tw0<Int> = clock_ns()
