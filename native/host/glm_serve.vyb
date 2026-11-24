@@ -667,6 +667,22 @@ main()<Int> -> {
                     hst<Vec<Int>> = Vec()
                     hst.push(hchMax)
                     hst.push(0)
+    # ---- expert-parallel rank (round 225): VYBFORGE_WORLD=2 splits the routed experts across the pair ----
+    tpRank<Int> = 0
+    trv<String> = env_get("VYBFORGE_RANK") else ""
+    if (trv.len() > 0) { tpRank = trv.to_int() }
+    tpWorld<Int> = 1
+    twv<String> = env_get("VYBFORGE_WORLD") else ""
+    if (twv.len() > 0) { tpWorld = twv.to_int() }
+    expLo<Int> = 0
+    expHi<Int> = sv_NE
+    if (tpWorld > 1) {
+        per<Int> = sv_NE / tpWorld
+        expLo = tpRank * per
+        expHi = expLo + per
+        if (tpRank == tpWorld - 1) { expHi = sv_NE }
+    }
+    println("TP_RANK rank=" + tpRank.to_string() + " world=" + tpWorld.to_string() + " experts=[" + expLo.to_string() + "," + expHi.to_string() + ")")
     # Expert residency cache (round 224): P6_ECACHE_GB>0 keeps routed-expert packed bytes in host RAM.
     # key = layer*2592 + expert*9 + slot; 0 disables and falls through to the disk path unchanged.
     echMax<Int> = 0
@@ -2054,14 +2070,14 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                              fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                              arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                             fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592)
+                                                             fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi)
                                     if (bN > 1) {
                                         var<Int> bRep = 1
                                         while (bRep < bN) {
                                             streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                                      fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                                      arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                                     fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592)
+                                                                     fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592, expLo, expHi)
                                             bRep = bRep + 1
                                         }
                                     }

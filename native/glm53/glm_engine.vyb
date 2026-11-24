@@ -4408,7 +4408,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>,
               fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>,
-              ech<their<Vec<String>>>, est<their<Vec<Int>>>, ekey<Int>)<Vec<Float>> -> {
+              ech<their<Vec<String>>>, est<their<Vec<Int>>>, ekey<Int>, expLo<Int>, expHi<Int>)<Vec<Float>> -> {
     ms0<Int> = time_mono_millis()
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
@@ -4646,8 +4646,12 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     tkProj<Int> = 0
     tkAcc<Int> = 0
     msT<Int> = time_mono_millis()
-    e = 0
-    while (e < NE) {
+    # EXPERT-PARALLEL: this rank processes only the experts it owns. glm_serve passes [0,NE) for
+    # single-node (unchanged behaviour) and [rank*NE/2, (rank+1)*NE/2) at TP=2, so the two ranks'
+    # routed contributions are disjoint and one all-reduce per layer reassembles the full sum.
+    e = expLo
+    if (e < 0) { e = 0 }
+    while (e < expHi) {
         toks<Vec<Int>> = Vec()
         lanes<Vec<Int>> = Vec()
         r = 0

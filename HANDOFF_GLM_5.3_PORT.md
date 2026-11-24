@@ -8411,3 +8411,27 @@ BUILD NOTES (three failed builds before it ran, all my own):
     because the same 9 read lines exist in both. It failed with "Undefined identifier: est/ekey" -- which is
     the compiler telling you the edit landed in the wrong function. Reverted and re-applied within the
     definition's line range.
+=== ROUND 225: EXPERT-PARALLEL SPLIT IS LIVE IN THE REAL ENGINE ===
+glm_serve now reads VYBFORGE_RANK / VYBFORGE_WORLD and derives this rank's expert range
+(`experts=[rank*NE/world, ...)`, last rank absorbing the remainder), and `moe_tail_step` takes `expLo`/`expHi`
+and uses them as its expert-loop bounds -- a two-line change to the loop head rather than an edit inside a
+400-line body, so the risk is contained.
+VERIFIED THREE WAYS, all VALID_RUN:
+    world=1 (full)       digest 7291d8a64ab3727ecc8ef1e777e24431   <- IDENTICAL to the established baseline,
+                                                                     so the plumbing is transparent
+    rank0 experts [0,144)   digest 8463435331cf8d14bf0eaa3365015534
+    rank1 experts [144,288) digest 334123ac28013813df1ba233421e97b9
+All three digests DIFFER, and the two rank digests differ from EACH OTHER, so each rank really is computing
+only its own half's contribution -- the split is active, not merely plumbed.
+MEASUREMENT TRAP AVOIDED: the obvious check ("routed experts used: N") is USELESS here -- it is printed by the
+PREFILL path (`tail_site`), a different function, so it reports 113 on every rank regardless of the split. The
+digest is the correct instrument: a rank holding half the experts must produce a partial sum, hence a
+distinct digest.
+WHAT THIS IS NOT YET: the two ranks are still run SEPARATELY, on one node. Their outputs are partial sums and
+are NOT combined. The remaining piece is one ncclSum per layer over the routed contribution (primitives all
+verified: bit-exact reduce, lockstep, ~0.03 ms/layer), so that rank0's partial + rank1's partial reproduces
+the world=1 result. Until that exists this is a split, not a working TP=2 server.
+NEXT: (1) add the per-layer all-reduce of the routed contribution and check rank0+rank1 == world=1 within
+float tolerance (it will NOT be bit-identical: two partials associate differently from 288 experts summed
+in order -- measured earlier as exact on a pilot quantity, but this check must be done on real outputs);
+(2) run both ranks concurrently on lefty+righty; (3) only then look at speed.
