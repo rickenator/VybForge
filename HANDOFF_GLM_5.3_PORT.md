@@ -7737,3 +7737,23 @@ NEXT, in order:
   2. find why step t=1 emits no per-layer lines at all -- whether it takes a different branch or the prints
      are gated -- because a step that grows 2.3x and reports nothing is the highest-value unknown;
   3. then residency, with a measured budget.
+=== ROUND 202: CORRECTION + THE DECODE STEP'S REAL SPLIT ===
+ROUND 201 WAS WRONG and is withdrawn: the P1attn/P1ffn/P1tail lines it summed come from PREFILL, not from a
+decode step. Proof: the first SEC P1attn is at log line 88 while the first SEC STEP is at line 36,297, and
+"CHAIN phase 1: prefill 20 tokens, 45 layers" precedes them. So that attribution described the 20-token
+prefill (attn 26.8 s, ffn 17.2 s, tail 1.0 s over 45 layers), NOT the 51 s decode step.
+THE DECODE STEP'S OWN TIMERS are `SEC layerbody` plus `SEC ioF1/2/3`. Summed over BOTH steps in the
+production 45-layer run (360 lines = 4 per layer per step):
+    layerbody = 99,081 ms      ioF1 = 3,744      ioF3 = 2,061      total = 104,887 ms
+    against SEC STEP 51,000 + 115,954 = 167 s  ->  63% accounted, ~62 s unattributed
+so per step: layerbody ~50 s (1.1 s/layer).
+** THE IMPORTANT SUBTRACTION: layerbody is ~1.1 s/layer while the MoE inside it (SEC moekern) is ~0.3 s/layer
+in the same run -- so ~0.8 s/layer sits INSIDE layerbody but OUTSIDE the MoE. ** The shared expert and the
+non-routed part of that branch have never been split out, and they are now the largest identified term.
+ALSO: phase-2 ATTENTION HAS NO TIMER AT ALL (only the prefill's P1attn exists), so the decode attention cost
+is invisible in every measurement so far. That is the second unknown of the same size.
+NEXT, in order:
+  1. add a phase-2 attention timer (one secT around the kda/dsa call in the step loop) -- free, and it
+     covers a term that is currently 0% measured;
+  2. split layerbody: shared-expert vs routed-expert vs the rest, since ~0.8 s/layer there is unexplained;
+  3. find why step t=1 (116 s) is 2.3x step t=0 and emits no per-layer lines of its own.
