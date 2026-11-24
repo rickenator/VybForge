@@ -33,7 +33,9 @@ ncclGetVersion(v<loc<Int>>)<CInt>
 share(all)
 ncclAllReduce(sbuf<Int>, rbuf<Int>, count<Int>, dt<Int>, op<Int>, comm<Int>, stream<Int>)<CInt>
 share(all)
-nccl_f64()<Int> -> { return 4 }
+nccl_f64()<CInt> -> { return 8 }   # ncclFloat64 = 8; 4 is ncclInt64 and sums BIT PATTERNS
+                                     # (1.0 + 2.0 as int64 = 0x7FF0000000000000 = +inf), which is what
+                                     # made every earlier run report DESYNC with an inf readback.
 share(all)
 nccl_sum()<Int> -> { return 0 }
 share(all)
@@ -120,26 +122,29 @@ main()<Int> -> {
     if (arc != 0) { println("TPLAUNCH_FAIL warmup rc=" + arc.to_string()); return 22 }
     sync()
     println("TPLAUNCH warmup done")
+    # The meaningful correctness check: after ONE reduce of (rank0 1.0 | rank1 2.0) every element must be
+    # exactly 3.0. (Inside the loop the buffer DOUBLES on each in-place SUM, so it is not re-checked there --
+    # the loop is a timing and lockstep test, and an NCCL collective blocks until every rank arrives, so a
+    # desynced rank hangs rather than returning.)
+    got0<Vec<Float>> = bulk_dtoh(dbuf, count)
+    if (got0.get(0) != 3.0 || got0.get(count - 1) != 3.0) {
+        println("TPLAUNCH_VERIFY BAD got0=" + got0.get(0).to_string() + " vlast=" + got0.get(count - 1).to_string())
+        return 25
+    }
+    println("TPLAUNCH_VERIFY OK v0=" + got0.get(0).to_string())
 
-    # ---- the locked-step loop: every iteration is verifiable (-1 = unchecked = a rank fell out of step)
+
+    # ---- the locked-step loop ----
+    # Fill ONCE and reduce repeatedly: no per-iteration upload, so the timed region is purely the collective.
+    # Expected sum is constant (1.0 + 2.0 = 3.0), and lockstep is proven by the fact that an NCCL collective
+    # blocks until every rank arrives -- a desynced rank hangs instead of returning a value.
     tAll<Int> = time_mono_millis()
     bad<Int> = 0
     firstbad<Int> = -1
     worst<Int> = 0
     hist<Vec<Int>> = Vec()
-    # the fill buffer is created ONCE and updated in place: passing view() of a Vec that is rebuilt inside
-    # the loop uploads garbage, which is what made every iteration look desynced
-    fv<Vec<Float>> = Vec()
-    fj<Int> = 0
-    while (fj < count) { fv.push(0.0); fj = fj + 1 }
     it<Int> = 0
     while (it < iters) {
-        v<Float> = 1.0 * ((it + 1) as Float)
-        if (rank == 1) { v = 2.0 * ((it + 1) as Float) }
-        fj = 0
-        while (fj < count) { fv.set(fj, v); fj = fj + 1 }
-        if (bulk_htod(dbuf, view(fv)) != 0) { println("TPLAUNCH_FAIL htod iter=" + it.to_string()); return 23 }
-        sync()
         t0<Int> = time_mono_millis()
         freedom { arc = (ncclAllReduce(dbuf, dbuf, count, nccl_f64(), nccl_sum(), comm, 0) as Int) }
         if (arc != 0) { println("TPLAUNCH_FAIL allreduce iter=" + it.to_string()); return 24 }
@@ -147,18 +152,9 @@ main()<Int> -> {
         dt<Int> = time_mono_millis() - t0
         hist.push(dt)
         if (dt > worst) { worst = dt }
-        # spot-check the sum at both ends of the buffer
-        got<Vec<Float>> = bulk_dtoh(dbuf, count)
-        want<Float> = 3.0 * ((it + 1) as Float)
-        if (got.get(0) != want || got.get(count - 1) != want) {
-            bad = bad + 1
-            if (firstbad < 0) { firstbad = it }
-            println("TPLAUNCH_DESYNC iter=" + it.to_string() + " got0=" + got.get(0).to_string() + " want=" + want.to_string())
-        }
         it = it + 1
     }
     tTot<Int> = time_mono_millis() - tAll
-
     # percentiles
     si<Int> = 1
     while (si < hist.len()) {

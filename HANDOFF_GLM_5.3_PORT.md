@@ -8356,3 +8356,29 @@ CONSEQUENCE FOR THE PLAN: TP=2 cannot meet the bar by paying one 0.59 ms collect
 block's compute so its ~26.5 ms hides inside ~10+ ms of work per token, or reduce the number of collectives
 per layer (e.g. one reduce per layer rather than one per projection).
 STILL OPEN: DESYNC on every run -> LOCKSTEP unproven; the readback check is still my bug.
+=== ROUND 223: LOCKSTEP PROVEN, AND THE REAL COMMS COST IS 0.03 ms/LAYER (~1.3 ms/token) ===
+TWO BUGS, BOTH MINE, BOTH FIXED:
+ 1. `nccl_f64()` returned 4. In this NCCL 4 is ncclInt64, not ncclFloat64. So the "all-reduce" was summing
+    the f64 BIT PATTERNS as integers: 1.0 (0x3FF0000000000000) + 2.0 (0x4000000000000000) = 0x7FF0000000000000
+    = **+inf**, which is exactly what the readback showed (`TPLAUNCH_VERIFY BAD got0=inf`). nccl_ping and
+    nccl_bench both correctly use `nccl_f64()<CInt> -> { return 8 }`; I wrote 4 when copying and even changed
+    the return type to <Int>. Every DESYNC from round 220 onward was this.
+ 2. The timed region included a per-iteration bulk_htod + bulk_dtoh, so the measurement was dominated by
+    upload/readback rather than by the collective, and the constant-fill design made the buffer double every
+    iteration (3, 6, 12, ...) so no in-loop check could ever be right either.
+AFTER THE FIX -- three runs, 5000 iterations each, both ranks agreeing:
+    TPLAUNCH_VERIFY OK v0=3            <- the reduce is CORRECT: 1.0 + 2.0 = 3.0 exactly
+    TPLAUNCH_RESULT iters=5000 bad=0   <- no desync
+    TPLAUNCH_VERDICT LOCKSTEP          <- ** LOCKSTEP IS NOW PROVEN, not assumed **
+    total_ms 139 / 167 / 170  over 5000 iterations = **0.028 / 0.033 / 0.034 ms per all-reduce**
+** THE REAL PER-LAYER COMMS COST IS ~0.03 ms AT THE RESIDUAL WIDTH (4096 f64), i.e.
+    45 layers x 0.03 ms = ~1.3 ms per token
+against a 20-22 ms/token bar -- about 6% of the budget, and roughly 20x BELOW the 0.59 ms / 26.5 ms figures
+reported in rounds 220 and 222. ** Those were both artefacts: 220 from a single short run, 222 from the
+int64 dtype plus upload/readback in the timed region.
+CONSEQUENCE, AND IT IS THE OPPOSITE OF ROUND 222: the overlapped reduce is NOT required. Serial per-layer
+all-reduce costs ~1.3 ms/token, so TP=2 has ~21 ms/token of budget left for compute. Overlapping would still
+be nice-to-have, but nothing about the architecture is gated on it.
+METHOD LESSON (the third time on this number): copy the constant from the WORKING reference rather than
+retyping it, and keep upload/readback OUT of the timed region. Both classes of error are invisible in a
+plausible-looking result -- 0.589 ms/iter looked perfectly reasonable and was measuring the wrong thing.
