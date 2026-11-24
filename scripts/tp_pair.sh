@@ -27,18 +27,26 @@ L_VYB='$HOME/Projects/Vyb/build2/vyb'
 L_MODS='--module-path native/glm53 --module-path native/tensor --module-path native/json --module-path native/kernels --module-path native/torchload --module-path $HOME/Projects/Vyb/stdlib/network --module-path $HOME/Projects/Vyb/bindings/cuda'
 R_MODS='--module-path native/glm53 --module-path native/tensor --module-path native/json --module-path native/kernels --module-path native/torchload --module-path /tmp/nccltest/stdlib/network --module-path /tmp/nccltest/bindings/cuda'
 
+if [ "${SKIP_STAGE:-0}" = "0" ]; then
 echo "== staging engine tree on righty (modules + ptx; the model copy is separate)"
-for d in native/glm53 native/tensor native/json native/kernels native/torchload native/host native/build native/exl3; do
-  rsync -a --include='*/' --include='*.vyb' --include='*.ptx' --include='*.bin' --include='*.json' --exclude='*' \
-    "$d" "rick@$RIGHTY:/srv/models/vybforge/$d" 2>/dev/null || true
+ssh -o ConnectTimeout=8 "$RIGHTY" 'mkdir -p /srv/models/vybforge/native'
+for d in native/glm53 native/tensor native/json native/kernels native/torchload native/host native/build native/exl3 scripts; do
+  rsync -a "$d" "rick@$RIGHTY:/srv/models/vybforge/$(dirname $d)/" || echo "   STAGE FAILED: $d"
 done
+ssh -o ConnectTimeout=8 "$RIGHTY" 'ls /srv/models/vybforge/native/glm53/glm_engine.vyb >/dev/null 2>&1 && echo "   engine staged OK" || echo "   ENGINE STILL MISSING"'
+# righty runs ./vyb from its working dir
+ssh -o ConnectTimeout=8 "$RIGHTY" 'mkdir -p /srv/models/vybforge && cp /tmp/nccltest/vyb /srv/models/vybforge/vyb && chmod +x /srv/models/vybforge/vyb' && echo "   binary staged (from righty's own aarch64 build)" || echo "   BINARY STAGE FAILED"
 echo "   staged"
+else
+  echo "== staging skipped (SKIP_STAGE=1); verifying engine present"
+  ssh -o ConnectTimeout=8 "$RIGHTY" 'ls /srv/models/vybforge/native/glm53/glm_engine.vyb >/dev/null 2>&1 && echo "   engine present" || echo "   ENGINE MISSING"'
+fi
 
 echo "== starting rank 0 on lefty (http $HTTP0, tp $TPPORT, experts [0,144))"
-ssh -o ConnectTimeout=8 "$LEFTY" "cd /srv/models/vybforge && VYB_STDLIB=\$HOME/Projects/Vyb/stdlib VYBFORGE_GX_DIR=$MODEL_L VYBFORGE_RANK=0 VYBFORGE_WORLD=2 VYBFORGE_TP_PORT=$TPPORT VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=$HTTP0 VYBFORGE_NLAYERS=$NLAY VYBFORGE_CHAIN_OUT=native/out/pair0.txt $HCA nohup $L_VYB $L_MODS native/host/glm_serve.vyb > /tmp/pair0.log 2>&1 & echo started"
+ssh -o ConnectTimeout=8 "$LEFTY" "cd /srv/models/vybforge && VYB_STDLIB=\$HOME/Projects/Vyb/stdlib VYBFORGE_GX_DIR=$MODEL_L VYBFORGE_SKIP_MTP=1 VYBFORGE_RANK=0 VYBFORGE_WORLD=2 VYBFORGE_TP_PORT=$TPPORT VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=$HTTP0 VYBFORGE_NLAYERS=$NLAY VYBFORGE_CHAIN_OUT=native/out/pair0.txt $HCA nohup $L_VYB $L_MODS native/host/glm_serve.vyb > /tmp/pair0.log 2>&1 & echo started"
 
 echo "== starting rank 1 on righty (http $HTTP1, tp $TPPORT, experts [144,288))"
-ssh -o ConnectTimeout=8 "$RIGHTY" "cd /srv/models/vybforge && VYB_STDLIB=/tmp/nccltest/stdlib VYBFORGE_GX_DIR=$MODEL_R VYBFORGE_RANK=1 VYBFORGE_WORLD=2 VYBFORGE_TP_PORT=$TPPORT VYBFORGE_TP_PEER=$LEFTY_ROCE VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=$HTTP1 VYBFORGE_NLAYERS=$NLAY VYBFORGE_CHAIN_OUT=native/out/pair1.txt $HCA nohup ./vyb $R_MODS native/host/glm_serve.vyb > /tmp/pair1.log 2>&1 & echo started"
+ssh -o ConnectTimeout=8 "$RIGHTY" "cd /srv/models/vybforge && VYB_STDLIB=/tmp/nccltest/stdlib VYBFORGE_GX_DIR=$MODEL_R VYBFORGE_SKIP_MTP=1 VYBFORGE_RANK=1 VYBFORGE_WORLD=2 VYBFORGE_TP_PORT=$TPPORT VYBFORGE_TP_PEER=$LEFTY_ROCE VYBFORGE_SERVE=1 VYBFORGE_SERVE_PORT=$HTTP1 VYBFORGE_NLAYERS=$NLAY VYBFORGE_CHAIN_OUT=native/out/pair1.txt $HCA nohup ./vyb $R_MODS native/host/glm_serve.vyb > /tmp/pair1.log 2>&1 & echo started"
 
 # wait for BOTH to be listening (grep -q, never grep -c, so the count never leaks a newline into a test)
 for i in $(seq 1 120); do
