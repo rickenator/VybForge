@@ -7781,3 +7781,35 @@ NEXT (highest value first):
      proven, it is simply wired to the wrong phase;
   3. re-measure the step afterwards; on current numbers, moving decode attention from ~0.8 s to anything
      near the prefill site's ~45 ms per layer would be the largest single win available anywhere.
+=== ROUND 204: SESSION STATE (end of night) ===
+TREE: clean, everything pushed, no serve or GPU context left running on either Spark.
+THE HOG IS NOW IDENTIFIED WITH EVIDENCE, AND IT IS NOT WHAT THIS SESSION SPENT MOST OF ITS TIME ON:
+  * The DECODE step's attention runs as INLINE DRIVER CODE in the phase-2 layer body (glm_serve ~1075
+    onwards: 24 gx_read, 18 deq_bf16, 8 bulk_dtoh, 7 mm_host, 11 free_dev, 5 alloc_dev per layer). It does
+    NOT call dsa_attn_site_c / kda_attn_site_c -- those two call sites exist only in the prefill loop.
+  * By subtraction from measured timers: SEC layerbody is ~1.1 s/layer, the MoE inside it (moekern) is
+    ~0.3 s/layer, so DECODE ATTENTION IS ~0.8 s/layer (~36 s/step) -- the largest single term in the
+    decode step, and it has never had a timer of its own.
+  * Therefore EVERY engine-side attention optimisation from this session is PREFILL-ONLY. The DSA fix
+    (950 -> 45 ms/layer, rounds 168-173) does not execute on the decode path at all. That is why a 20x
+    "attention win" never moved an end-to-end number.
+ATTEMPTED AND REVERTED THIS ROUND: a `SEC p2attn` mark after the attention block. The block has TWO
+branches (hc_apply at ~1486 and ~1931) plus a nested FFN dispatch, so a single insertion point instruments
+one branch only and would report a misleading number. Reverted rather than left in. The correct shape: mark
+the JOIN after both attention branches and before the FFN dispatch, then verify the two lines sum to
+`layerbody`.
+ALSO STILL OPEN: step t=1 is 2.3x step t=0 at full depth (51 s -> 116 s) while NLAY=12 is flat -- footprint
+signature, so residency rather than a per-layer fix. The MoE, resolver, read-handle, GEMM, f32 and arena work
+all landed in the ~2-30% band and no further work inside them can move the step.
+NEXT SESSION, in order:
+  1. instrument the phase-2 attention block properly (join point, both branches) and split its ~0.8 s/layer
+     into reads / deq / matvec the way the MoE was split;
+  2. port the engine's fused attention path into the DECODE loop -- the code exists, is proven, and is
+     currently wired only to prefill. On current numbers this is the largest available win on the board;
+  3. re-measure SEC STEP in production mode (VYBFORGE_SERVE=1) afterwards;
+  4. then residency (TP=2, 88.50/87.13 GB per node) for the footprint problem, whose comms support is
+     already verified (NCCL all-reduce bit-exact, ~31 us small / 36 GB/s large; row-parallel TP proven).
+MEASUREMENT RULES EARNED TONIGHT (all now in the skill reference): production flag off inflates timings up
+to 16.6x and must be checked FIRST; a run ~20x faster with no output is a crash; a digest gate only covers
+the path that emits it; check nvidia-smi and pgrep before any number; and never compare read numbers across
+runs without stating cache state.
