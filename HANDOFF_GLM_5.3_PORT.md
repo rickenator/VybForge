@@ -8086,3 +8086,23 @@ rank's half of the shard is itself a contiguous walk.
 ALSO WORTH KNOWING: on this node the model is largely in page cache (95 GB of buff/cache), so residency's
 raw I/O saving is small here; its real value is (a) not depending on page cache, and (b) halving bytes read
 at TP=2. Judge it on the cold and TP=2 cases, not on a warm single node.
+--- ROUND 213b: THE 213 CONCLUSION IS NOT DECIDABLE -- CORRECTED ---
+After reverting glm_serve to HEAD, a confirmation run gives:
+    req1 129.44 s, steps 32.0 / 49.0 s, KDA pre-site 30,893 ms (avg 454 ms/layer)
+and that is the ORIGINAL code, unchanged. Put beside round 213's numbers:
+    round 209 baseline      : KDA pre-site 21,985 ms  (323 ms/layer)
+    round 213 cache ON      : KDA pre-site 33,883 ms  (498 ms/layer)
+    round 213 cache OFF     : KDA pre-site 40,130 ms  (590 ms/layer)
+    round 213 reverted (now): KDA pre-site 30,893 ms  (454 ms/layer)
+So the REVERTED baseline itself spans 323 -> 454 ms/layer across runs, and every 213 measurement sits inside
+that spread. ** Round 213's claim that the deq_auto restructuring "nearly doubled" the per-layer load is
+WITHDRAWN -- it is indistinguishable from run-to-run variance. ** Nothing about the residency integration is
+established: neither that it helps nor that it hurts.
+WHAT SURVIVES FROM 213: the code is reverted, the default path is back to the same behaviour, and the
+seq/preload insight (read order may be load-bearing) remains a HYPOTHESIS worth testing, not a finding.
+WHAT SURVIVES FROM 212: `deq_bf16_res` is bit-exact against the disk path, measured in one process on
+identical inputs (that comparison is within-run and unaffected by this variance).
+METHOD CONSEQUENCE: this path has +-40% run-to-run variance on a per-phase timer, far wider than the ~17%
+documented elsewhere. Any future residency A/B must be INTERLEAVED (alternate build A, build B, A, B) and
+reported as a median of >=3 runs per side, or it will produce confident nonsense -- which is exactly what
+round 213 did.
