@@ -470,6 +470,9 @@ main()<Int> -> {
     mlp<Vec<Float>> = Vec()
 
     if (tensor_init() != 0) { println("CHAIN_FAIL no cuda"); return 3 }
+    # Pay the driver's per-size-class allocation cost before the hot loop (round 169: a single 67 MB
+    # cuMemAlloc blocked 901 ms and the unlucky call moved between runs).
+    dev_warm_pool()
     fgemm = load_fn("native/build/gemm.ptx", "gemm")
     fbf = load_fn("native/build/bf16.ptx", "bf16deq")
     fdeq = load_fn("native/build/exl3.ptx", "exl3deq")

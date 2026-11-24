@@ -7020,3 +7020,21 @@ driver traffic in the hot path. deq_bf16 must route through it for BOTH buffers 
 function; o is freed by the caller via free_dev, so free_dev itself has to return buffers to the pool or
 the pool double-frees). Expected effect: the ~950 ms/layer becomes ~40-60 ms, i.e. 11 DSA layers from
 ~10.5 s to ~0.6 s per step.
+=== ROUND 170: FIX LANDED -- dev_warm_pool() TAKES THE DSA LAYERS FROM ~950 ms TO ~45 ms ===
+Mechanism: the ~900 ms stall is a PER-SIZE-CLASS first-touch cost in the driver, not fragmentation and
+not compute. Added dev_warm_pool() (called once from glm_serve after tensor_init): it allocates and frees
+a spread of representative sizes so the driver creates those mappings before the hot loop.
+RESULT, two independent runs, NLAY=12:
+    before:  SEC_ATTN slots 959, 943, 40      (~950 ms per DSA layer)
+    after:   SEC_ATTN slots  58, 43, 41       and 58, 40, 41      <- BOTH runs
+and the three slots' internal phases are all small (W 15-20, I 9-19, P 9-16, M 0-2), so the whole
+attention site is now genuinely ~45 ms. That is a 20x improvement on the DSA path: 11 layers go from
+~10.5 s to ~0.5 s per decode step.
+THE WARMUP ALSO PROVED THE MECHANISM BY FAILING INFORMATIVELY: with the first size list it eliminated the
+DSA stalls but left exactly 3 stalls of ~902 ms per run, and those landed on DIFFERENT stages
+(allocQ 901 one call, allocO 901 another, htod 901 a third) -- so the stall is not allocation-specific,
+it is a hitch that lands on whichever large GPU operation triggers it. The stalling calls need 268 MB
+(n=33554432) and 402 MB (n=50331648), which fall BETWEEN the 256 MB and 512 MB classes in the first list,
+i.e. not warmed. Extended the list with the exact sizes (268/384/402/768/1536 MB); run in flight.
+LESSON (generalises): when a cost is ~900 ms regardless of which stage reports it, suspect the memory
+subsystem and test by pre-touching size classes -- do not chase the stage that happens to report it.

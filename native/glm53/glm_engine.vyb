@@ -271,6 +271,53 @@ f32_at(raw<String>, idx<Int>)<Float> -> {
 
 # ---------------------------------------------------------------- device plumbing
 
+// dev_warm_pool -- pay the driver's per-size-class alloc cost ONCE at startup.
+//
+// Measured (round 169): a single cuMemAlloc_v2 of 67 MB blocked 901 ms while every other stage of the
+// same dequantise call was 0 ms, and which call drew it varied between runs. Only ONE allocation in a
+// 3-DSA-layer run was slow, which fits a first-touch/mapping cost per size class rather than continuous
+// fragmentation. Allocating and freeing a spread of representative sizes up front exercises exactly
+// those paths before the hot loop, so the hot loop sees warm pools.
+//
+// This is deliberately the cheap test of the mechanism: it needs no lifetime change and no state, so if
+// the stall is per-size-class the numbers improve immediately, and if it is not, nothing is risked.
+share(all)
+dev_warm_pool()<Int> -> {
+    var<Int> k = 0
+    var<Int> p = 0
+    # 8 MB .. 1 GB in powers of two, plus the two sizes the DSA path actually hits (16 MB and 67 MB).
+    sizes<Vec<Int>> = Vec()
+    sizes.push(8 * 1024 * 1024)
+    sizes.push(16 * 1024 * 1024)
+    sizes.push(32 * 1024 * 1024)
+    sizes.push(67 * 1024 * 1024)
+    sizes.push(128 * 1024 * 1024)
+    sizes.push(256 * 1024 * 1024)
+    # The exact output sizes the big dequantise calls need. These are NOT covered by the powers of two
+    # above: n=33554432 needs 268 MB and n=50331648 needs 402 MB, both of which fall BETWEEN the 256 MB
+    # and 512 MB classes -- and after the first warmup pass those two sizes still stalled 901 ms while
+    # everything inside the warmed classes ran at 0-1 ms. Per-size-class first touch, not fragmentation.
+    sizes.push(268 * 1024 * 1024)
+    sizes.push(384 * 1024 * 1024)
+    sizes.push(402 * 1024 * 1024)
+    sizes.push(512 * 1024 * 1024)
+    sizes.push(768 * 1024 * 1024)
+    sizes.push(1024 * 1024 * 1024)
+    sizes.push(1536 * 1024 * 1024)
+    t0<Int> = now_ms()
+    while (k < sizes.len()) {
+        var<Int> hp = 0
+        freedom {
+            if (cuMemAlloc_v2(loc(hp), sizes.get(k)) != 0) { hp = 0 }
+            else { cuMemFree_v2(hp) }
+        }
+        p = p + (sizes.get(k) / (1024 * 1024))
+        k = k + 1
+    }
+    println("DEVPOOL warm " + (now_ms() - t0).to_string() + " ms for " + p.to_string() + " MB of size classes")
+    return 0
+}
+
 share(all)
 alloc_dev(n<Int>)<Int> -> {
     var<Int> p = 0
