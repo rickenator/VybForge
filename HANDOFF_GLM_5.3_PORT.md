@@ -6931,3 +6931,26 @@ LANGUAGE RECOMMENDATION (instead of adding String::push, which would force COW o
 add `String::from_bytes_copy(ptr, len)` that memcpy's into a registered buffer, or document from_bytes
 as explicitly borrowed. The existing comments in bindings/sqlite show the hazard has already been hit
 once; a copying variant removes it by construction.
+=== ROUND 166: from_bytes_copy ATTEMPTED IN THE COMPILER -- IMPLEMENTED, BROKEN, REVERTED ===
+Rick directed a compiler change, so I implemented String::from_bytes_copy end to end in ~/Projects/Vyb:
+  runtime/vyb_runtime.c       __vyb_string_from_bytes_copy(src, len): malloc(len+1), memcpy,
+                              NUL-terminate, __vyb_string_register (so release frees it)
+  cgen_string_type.cpp        handleStringFromBytesCopy + dispatch entry
+  codegen.hpp                 declaration
+  semantic.cpp                two sites: the full typing path and the pass-through whitelist
+It BUILT clean, but every call returned a null String. Only len/first-call differences were visible at
+first, which sent me chasing length-dependence that was not the cause.
+** MY FIRST TEST WAS A FALSE POSITIVE ** and it is worth recording precisely because it is the same trap as
+the rest of this session: `FROM_BYTES_COPY_PASS` printed because a null receiver made `a.len()` error out,
+the `if` body was SKIPPED, and the failure counter never incremented. A test whose assertions are skipped
+on null reports success. Guard for it: assert the value is non-null FIRST, and have the harness fail on any
+"Error at" line in the output.
+REVERTED all four files; `cmake --build build-new` is clean and the compiler is back to its previous
+behaviour. A half-working String constructor is worse than none.
+WHAT VYBFORGE ACTUALLY NEEDS IS ALREADY AVAILABLE: `"" + String::from_bytes(p, n)` copies, because concat
+allocates and registers. native/audio/audio/mod.vyb now uses exactly that and typechecks (commit 34e7686).
+So the audio aliasing bug is FIXED WITHOUT a compiler change, and the language addition is a nicety rather
+than a requirement.
+IF SOMEONE RETRIES THE COMPILER WORK: start from why the struct comes back null -- the runtime returns a
+valid non-null char*, so the fault is in how the handler assembles/returns the String value (compare
+against handleStringFromBytes, which returns a working view) rather than in the allocation.
