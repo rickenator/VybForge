@@ -7866,3 +7866,19 @@ versus DSA (18 deq, 10 mm_host, 1 gemm). So BOTH branches are host-side implemen
 is the whole decode attention, not just DSA: ~40 host deq_bf16 and ~19 mm_host per layer across the two.
 DSA is 2.2x slower per layer despite FEWER deq calls, which means its tensors are individually larger -- so
 port cost should be sized by BYTES dequantised per layer, not by call count.
+=== ROUND 207: CORRECTION -- `mm_host` IS NOT A CPU MATVEC ===
+Round 206 called the decode attention a "HOST-SIDE implementation" with "CPU matvecs". That is WRONG and is
+withdrawn. `mm_host` (glm_engine:571) takes `faddr` = the loaded PTX GEMM kernel, and its body is
+`bulk_htod(dA, view(x))` -> gemm -> `bulk_dtoh(dC, rows * N)`. So each `mm_host` IS a GPU matvec; what makes
+it cost more than the fused path is the PER-CALL upload/download (plus any per-call allocation), not CPU
+arithmetic.
+WHAT IS ACTUALLY HOST-SIDE in the decode attention branch: the 18 `deq_bf16` calls (DSA) / 22 (KDA). Those
+dequantise bf16 weights into host memory before the upload. So the candidate costs are:
+  (a) host dequantisation of ~18-22 tensors per layer, and
+  (b) per-call htod + gemm + dtoh on ~10 `mm_host` calls,
+and which dominates is exactly what the `SEC p2dsa` sub-phase instrumentation now measures. Round 206's
+attribution should not be quoted; the port targets whichever of (a)/(b) the measurement names.
+LESSON (again, and the reason this file keeps this section): I inferred an implementation from a function
+NAME and a call inventory, twice in one session -- first "attention is not optimised because it is inline",
+then "it is CPU work because the calls are called *_host". Both were guesses dressed as findings. Read the
+function body before characterising it.
