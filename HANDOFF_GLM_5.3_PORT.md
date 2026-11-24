@@ -7571,3 +7571,27 @@ would show as nondeterminism or wrong values rather than a crash.
 PATTERN, now seen four times tonight: the cost is per-call fixed overhead (syncs, launches, latency chains),
 not bytes moved. The ~900 ms stalls, the 540 us gemm calls, the 0.69 ms projection overhead are all the
 same shape.
+=== ROUND 195: THE MEASUREMENT RIG IS UNRELIABLE -- AND THE SYNC CHANGE WAS NOT KEPT ===
+Attempted the round-194 change (per-stage params in the 192-byte pb32 buffer, drop the intermediate syncs
+so fused_proj runs one stream with only the final ordering). It could NOT be validated, twice:
+    run 1 (NSTEPS=1, sync change deployed): 27 digests, 0 SEC fp, 0 SEC moekern
+    run 2 (NSTEPS=2, sync change deployed): 27 digests, 0 SEC fp, 0 SEC moekern
+    control (NSTEPS=2, sync change REVERTED): 12 SEC moekern, 288 SEC fp calls, loop 93-107 ms
+A control run of the reverted code DID exercise the decode MoE, so the harness can run it -- but the same
+settings also produce digests-only runs with no MoE at all. ** So identical harness configuration sometimes
+answers WITHOUT ever reaching moe_tail_step. ** Log evidence from one such run: "routed experts used: 113"
+and zero "SEC moekern" -- that is the PREFILL path counting all 113 routed experts, i.e. the request never
+got to the decode MoE stage.
+CONSEQUENCE: the sync change is REVERTED (not kept). Optimising it is pointless until the rig can be
+trusted, because a fast run that skipped the work looks like a win.
+THE BLOCKER, stated plainly: this measurement harness is not deterministic about which code path a request
+exercises. Possible causes worth checking next: response caching inside the server, the request ids being
+repeatable, or the prompt/step count being satisfied by prefill alone. Whatever the cause, the fix has to
+come before more optimisation.
+GUARD ADDED (scripts/run_fgate.sh, deployed to lefty /tmp): every run now prints VALID_RUN with the moekern
+line count, or INVALID_RUN when the decode MoE never ran, and writes "$LOG.invalid" so a bad run cannot be
+mistaken for a measurement. Any future number must come from a VALID_RUN.
+STATE OF THE NIGHT'S WORK: rounds 187-194 stand as committed progress (MoE 350 -> ~91-107 ms with a full
+pass at 438.66 s vs 471.46 s baseline, resolver 85 -> 12 ms warm, gx_read9 proven byte-identical). The
+pending item is a trustworthy rig, then the sync removal, then the streaming/residency question that still
+accounts for ~98% of a real pass.

@@ -70,4 +70,17 @@ grep -iE "CHAIN_FAIL|Error|panic" "$LOG" | head -5
 echo "--- tail:"
 tail -4 "$LOG"
 kill "$SRV" 2>/dev/null
+
+# VALIDITY GUARD (round 195). Identical harness settings sometimes answer WITHOUT ever reaching
+# moe_tail_step -- the log then has digests but zero "SEC moekern" lines, and any per-layer MoE number
+# read from it is meaningless (it is prefill only, or a cached answer). A run that does not exercise the
+# decode MoE must be treated as INVALID, never as a measurement.
+MOEKERN=$(grep -c "SEC moekern" "$LOG" 2>/dev/null || echo 0)
+if [ "$MOEKERN" -eq 0 ]; then
+  echo "INVALID_RUN: no SEC moekern lines -- the decode MoE stage never ran; do not use these numbers."
+  echo "INVALID_RUN" > "$LOG.invalid"
+else
+  rm -f "$LOG.invalid"
+  echo "VALID_RUN: $MOEKERN moekern layer-lines."
+fi
 echo "DONE"
