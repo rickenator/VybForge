@@ -6665,3 +6665,23 @@ path (TOPK=2048 pool scanned per step, plausibly O(context)), a per-layer cache 
 rather than disk, or the growing KV cache in the layer's attention section. Instrument the layer with
 per-PHASE timers (attn / indexer / moe / hc_apply) rather than the single mlpmoe number, then look at
 whether the slow layers are a fixed set (structural) or changing (state).
+=== ROUND 153: THE MoE IS NOT THE BOTTLENECK -- "SEC mlpmoe" DOES NOT MEASURE THE MoE ===
+Instrumented moe_tail_step (it had NO internal timers; only the caller's single SEC mlpmoe number).
+NLAY=45, 2 steps, dumps off, per-phase:
+    SLOWEST MoE layers : router 34-38   experts 330-338   shared 39-41   combine+hc 0-1   total 401-413 ms
+    FASTEST MoE layers : router 14      experts 92-98     shared 28-39   combine+hc 0     total 135-148 ms
+    SEC attnC          : 2 ms on 66 of 68 samples; 902 ms on 2
+So the MoE function costs 135-413 ms per layer -- NOT the 900-6000 ms that the caller's SEC mlpmoe
+reported. **"SEC mlpmoe" is mis-named: it does not measure moe_tail_step.** It must span additional work
+between the attention print and its own print (the DSA/indexer path, KV-cache writes, or the per-layer
+cache update).
+CONSEQUENCE FOR THE BUDGET: ~31 MoE layers x 0.2-0.4 s = 6-12 s, plus ~0.1 s of attention, against a
+measured 36-68 s per step. So 60-80% of a decode step is in the UNTIMED region, not in any of:
+    - the fused/deq matvec (already 2.4x faster, and now shown to be a minority of the MoE anyway)
+    - moe_tail_step as a whole (135-413 ms)
+    - attention (2 ms typical)
+THIS IS THE FOURTH TIME THE INSTRUMENT HAS MOVED THE TARGET, each time away from the assumed hotspot:
+I/O (refuted) -> router/shared (3%) -> load_fn (real, fixed) -> dumps (10x, fixed) -> MoE (not it).
+NEXT: instrument the gap between `SEC attnC` and `SEC mlpmoe` in the layer body of glm_serve's step loop.
+That region holds 60-80% of a decode step and is currently invisible. Also worth noting the step totals
+GROW with index (36 -> 65 -> 68 s at 2-3 steps), so whatever is in that region scales with context.
