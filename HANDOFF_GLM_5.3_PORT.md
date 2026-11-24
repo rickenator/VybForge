@@ -8456,3 +8456,26 @@ that burned round 220-222.
 EXPECTATION for the pair check: rank0+rank1 will NOT be bit-identical to world=1, because two partial sums
 associate differently from 288 experts accumulated in order. The gate should be a tolerance on the digests or
 better a maxabs on a decode layer's output, and the size of the discrepancy is itself worth recording.
+=== ROUND 227: PAIR TEST BLOCKED ON DATA STAGING (NOT ON CODE) ===
+The TP=2 pair needs BOTH ranks to read the same 164 GB checkpoint. Lefty has it at
+/mnt/apex/rick/vybforge/glm53-checkpoint (an NFS mount: 164 GB, 97 entries). RIGHTY HAS NO COPY AND NO MOUNT:
+/mnt/apex is empty there and /srv/models holds only a 836 KB config shell. The Sparks are rootless, so
+mounting apex on righty is not available.
+Attempted the obvious fix -- rsync over ssh from lefty to righty:/srv/models/glm53-checkpoint -- and measured
+it: 411 MB in ~2 minutes, i.e. ~3.4 MB/s, which projects to ~13 HOURS for 164 GB. That is not viable, and it
+is a data-staging problem, not a code problem: every TP=2 primitive is already verified.
+WHY THE SLOW RATE, for whoever picks this up: per-file ssh+rsync overhead across many blobs, and the source
+is an NFS mount. The fix is a bulk stream rather than per-file rsync -- e.g. `tar | ssh` over the RoCE rail
+(192.168.192.2, which righty can reach at ~10 GB/s) or parallel rsync streams, aiming for minutes not hours.
+Alternatively mount apex on righty if sudo ever becomes available.
+DELIVERED ANYWAY: `scripts/tp_pair.sh` -- starts rank 0 on lefty (HTTP 18660) and rank 1 on righty (HTTP
+18661) with the TP rendezvous on 18460, stages the engine tree (modules + ptx + map) to righty, waits for both
+listeners using `grep -q` (never `grep -c`, whose newline broke an earlier guard), then CURLS BOTH RANKS
+CONCURRENTLY -- which is required, because each rank enters the per-layer all-reduce only while running its own
+forward pass, so curling one and leaving the other idle deadlocks the first. It compares the two chain
+digests at the end and cleans up by PID.
+SO THE REMAINING STEP IS EXACTLY ONE THING: get the checkpoint onto righty quickly, then run
+`scripts/tp_pair.sh 45 2` and compare the pair's digests against world=1's 7291d8a64ab3727ecc8ef1e777e24431
+with a TOLERANCE (two partial sums do not associate like 288 experts in order).
+CODE STATE (all verified this session): expert split live and digest-verified; per-layer all-reduce wired and
+transparent at world=1 (bit-identical, network untouched); comms ~0.03 ms/layer; lockstep proven.
