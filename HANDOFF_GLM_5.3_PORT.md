@@ -7529,3 +7529,27 @@ same request, and diff the digest VALUES.
 So the one-open-per-expert read path returns exactly the same bytes as nine per-tensor reads. The diff
 between the two engines is confined to the gx_read9 function and its call site (verified with `git diff`
 before running), so nothing else can explain the identity. The ~12% loop gain from round 191 stands.
+=== ROUND 193: FULL 45-LAYER END-TO-END -- 6.9% FASTER, AND THE HOG IS CONFIRMED ELSEWHERE ===
+Items 2 and 4 of the overnight plan, same protocol as the round-174 baseline (NLAY=45, NSTEPS=1, REQS=1):
+    req1 = 438.66 s      vs baseline 471.46 s   -> 6.9% faster end-to-end
+    SEC_DEQ slow calls: 8     (the ~900 ms stalls STILL occur, 8 per full pass)
+    SEC_ATTN lines: 11        (the 11 DSA layers)
+WHY ONLY 6.9% DESPITE THE MoE LAYER FALLING 350 -> ~91-255 ms: the MoE is no longer the dominant term
+end-to-end. Per-layer loops in this pass run 142-255 ms across ~42 MoE layers, i.e. roughly 6-10 s of the
+438 s pass (~2%). The other ~98% is the untimed streaming identified in round 187 -- the same 90% that has
+resisted every kernel and read optimisation. The kernel work was real and is now small; the wall is data
+movement for a 175.6 GB model against 121 GB of RAM.
+NEW FINDING -- THE RESOLVER DEGRADES WITH FOOTPRINT: res grows from ~33 ms early to ~94 ms late in the same
+pass, and read from 41 to 69 ms. res is CPU work, so the growth points at memory pressure evicting the index
+text (the tab String) so char_at starts faulting. So the per-layer resolver numbers measured in isolation
+(warm, single-layer repeats) UNDERSTATE its cost in a real pass by ~3x. Any future resolver claim must be
+made from a full-pass measurement, not a BENCH_LAYER repeat.
+ALSO NOTE: only 31 SEC moekern lines were logged for ~42 MoE layers in this pass; the missing ones are
+unexplained and worth checking before relying on per-layer aggregates.
+STATE OF THE GOAL: the identified hogs are eliminated or reduced --
+  * DSA attention: 950 -> ~45 ms/layer (rounds 168-173)
+  * MoE layer internals: 350 -> ~91-255 ms depending on footprint (rounds 187-192)
+  * resolver: 85 -> 12 ms warm, but degrades to ~94 ms under a full pass
+  * abandoned: fp64 GEMM kernel work (off-target, ~15% of a layer at most)
+WHAT REMAINS is the untimed ~430 s per request: streaming the checkpoint. That is not a kernel or a lookup;
+it is residency, i.e. the TP=2 split so each node holds its ~88 GB half, which is the agreed step 3.
