@@ -6767,3 +6767,21 @@ REMAINING, in order of evidence:
        timings from the harness wall clock). Everything above is a relative improvement.
     3. The MoE's own phases (SEC_MOE2: router 14-38, experts 90-338, shared 28-41 ms) show the expert
        loop as the MoE's dominant term -- worth revisiting only after (1).
+=== ROUND 158: THE HOGS, NAMED -- DSA LAYERS GROW WITH LAYER INDEX ===
+Timers now carry the layer index (SEC attnC n=N, SEC layerbody n=N), so a slow layer names itself.
+45 layers, 1 step, dumps off:
+    KDA layers (n%4 != 3)      :   3-43 ms each -- fast
+    DSA layers (n%4 == 3)      : 1056, 1045, 1060, 1967, 2014, 2982, 2980, 4941, 4972, 4975, 4972
+    n = 29, 33, 37, 41 (KDA)   : ~920-942 ms each -- a second, FLAT population
+    attention (attnC)          : 1-2 ms everywhere; sum over 45 layers = 52 ms
+    layerbody total            : 37.4 s; the 11 DSA layers are 28.0 s of it
+So: attention is irrelevant, the MoE is 135-426 ms, and the decode step is dominated by the 11 DSA
+layers, whose cost STAIRCASES with layer index (1.0 s -> 2.0 s -> 3.0 s -> 5.0 s, stepping every ~8
+layers). Growth within a single step, by layer position, is the signature of accumulating state rather
+than of the work done at that layer.
+PRIME SUSPECT: my own DSA cache. deq_bf16() allocates its output INTERNALLY (n*8 bytes: q_b 25.2M ->
+201 MB, kv_b 16.8M -> 134 MB, o 67.1M -> 537 MB = 872 MB per DSA layer), so caching handles accumulates
+~9.6 GB by layer 43. Allocator growth/fragmentation would produce exactly this staircase.
+NEXT FIX (not yet implemented): cache the raw bf16 (235 MB/layer, 2.6 GB total) and dequantise into a
+SINGLE shared scratch buffer, so nothing accumulates. That needs a deq variant taking a preallocated
+output instead of allocating one per call.
