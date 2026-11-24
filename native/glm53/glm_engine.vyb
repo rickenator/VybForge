@@ -4512,6 +4512,10 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         i = i + 1
     }
     nex = 0
+    tkRead<Int> = 0
+    tkSub<Int> = 0
+    tkProj<Int> = 0
+    tkAcc<Int> = 0
     msT<Int> = time_mono_millis()
     e = 0
     while (e < NE) {
@@ -4577,6 +4581,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 dWd = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
                                  g_ge_8, body, H, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
+            msKread<Int> = time_mono_millis()
             if (fdecOn == 0 && (dWg == 0 || dWu == 0 || dWd == 0)) {
                 println("CHAIN_FAIL deq expert " + e.to_string())
                 return nonev
@@ -4593,6 +4598,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 }
                 j = j + 1
             }
+            msKsub<Int> = time_mono_millis()
             gv<Vec<Float>> = Vec()
             if (fdecOn == 1) {
                 gv = fused_proj(fxbd, fybd, fmbDd, fmbRd, fmbAd, fltd, fcast32, hdg32, mapdev, invbase,
@@ -4631,6 +4637,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             } else {
                 yv = mm_host(act, nt, EINTER, dWd, H, fgemm)
             }
+            msKproj<Int> = time_mono_millis()
             j = 0
             while (j < nt) {
                 tk = toks.get(j)
@@ -4642,6 +4649,11 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
                 }
                 j = j + 1
             }
+            msKacc<Int> = time_mono_millis()
+            tkRead = tkRead + (msKread - msA)
+            tkSub = tkSub + (msKsub - msKread)
+            tkProj = tkProj + (msKproj - msKsub)
+            tkAcc = tkAcc + (msKacc - msKproj)
             freedom {
                 cuMemFree_v2(dWg)
                 cuMemFree_v2(dWu)
@@ -4652,6 +4664,10 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         e = e + 1
     }
     println("SEC moestage loop=" + (time_mono_millis() - msT).to_string() + " pre=" + (msT - ms0).to_string())
+    println("SEC moekern experts=" + nex.to_string() + " read=" + tkRead.to_string()
+        + " sub=" + tkSub.to_string() + " proj=" + tkProj.to_string()
+        + " acc=" + tkAcc.to_string()
+        + " loop=" + (time_mono_millis() - msT).to_string())
     msS<Int> = time_mono_millis()
     println("  routed experts used: " + nex.to_string())
 

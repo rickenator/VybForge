@@ -7409,3 +7409,27 @@ about 12.6 MB per expert, never dequantising to f64 for a gemm. If so, the fp64 
 in the served configuration and this whole kernel line, however correct, is off-target.
 NEXT ACTION, before any more kernel work: instrument which kernels the production MoE actually spends its
 time in (mvn_*/deq/gemm counts and per-kernel time inside moe_tail_step), and confirm the target.
+=== ROUND 187: ATTRIBUTED -- THE HOG IS gx_read, NOT ANY KERNEL ===
+Instrumented moe_tail_step with four disjoint per-layer accumulators (read / CPU gather / projections /
+CPU accumulate), printed as SEC moekern. NLAY=12, 1 step, 8 experts per layer:
+    SEC moekern experts=8 read=271 sub=3 proj=43 acc=0 loop=354
+    SEC moekern experts=8 read=269 sub=1 proj=64 acc=0 loop=370
+    SEC moekern experts=8 read=270 sub=0 proj=45 acc=0 loop=350
+So per MoE layer: gx_read 261-271 ms (~76%), fused_proj 43-64 ms (~15%), CPU gather 0-3 ms, accumulate 0.
+CONTEXT that makes this conclusive: pre-layer work is 71 ms and the shared expert 58 ms, so the layer is
+~479 ms total and the routed-expert READ alone is over half of it.
+THE READ IS ALSO SLOW IN ABSOLUTE TERMS: 8 experts x ~12.6 MB = ~100 MB in 265 ms -> ~380 MB/s effective,
+against 1.1 GB/s measured for a cold sequential read on this disk and ~10 ms per 235 MB from page cache.
+So the loader runs at about a third of disk speed and far below cache speed -- there is real headroom
+before any kernel matters.
+CONSEQUENCE, and it closes the last two rounds' question: the fp64 GEMM line (blocked kernel, f32 A/B,
+KSPLIT sweep) is about 15% of the layer at most, and the fused projections a fraction of that. Optimising
+kernels was OFF-TARGET for the served configuration -- which is exactly what round 186's suspicion said,
+now confirmed by measurement rather than inferred from the code.
+NEXT HOG, in order: the gx_read path. Four hypotheses worth measuring rather than guessing:
+  * per-tensor open/seek churn -- 9 tensors per expert across 83 shards means many small positional reads;
+  * read size granularity -- reading a whole shard window and slicing beats many small reads if so;
+  * page-cache bypass or re-eviction between layers;
+  * repeated resolution work (gx_resolve_tab already has a cache; the READ side may not benefit from it).
+The measurable target: 100 MB/layer at 1.1 GB/s would be ~91 ms instead of 265 ms, i.e. ~170 ms/layer
+saved, which at 45 layers is ~7.7 s per token of pure I/O.
