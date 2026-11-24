@@ -1965,7 +1965,11 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                             }
 
                             println("step" + t.to_string() + " layer " + n.to_string() + " done")
-                            println("SEC mlpmoe " + (now_ms() - secT).to_string())
+                            # NOT "mlpmoe": this window is the whole FFN branch (dense for n<3, MoE
+                            # otherwise) plus its wrappers. moe_tail_step's own cost is SEC_MOE2, which
+                            # measures 135-413 ms while this reads 900-6000 -- i.e. most of this window
+                            # is NOT the MoE. Kept as SEC layerbody for continuity with old logs.
+                            println("SEC layerbody " + (now_ms() - secT).to_string())
                             secT = now_ms()
                             dg2 = digest("l" + n.to_string() + "s" + t.to_string() + " s2", streams2)
                             println(dg2)

@@ -6685,3 +6685,28 @@ I/O (refuted) -> router/shared (3%) -> load_fn (real, fixed) -> dumps (10x, fixe
 NEXT: instrument the gap between `SEC attnC` and `SEC mlpmoe` in the layer body of glm_serve's step loop.
 That region holds 60-80% of a decode step and is currently invisible. Also worth noting the step totals
 GROW with index (36 -> 65 -> 68 s at 2-3 steps), so whatever is in that region scales with context.
+=== ROUND 154: FOUND IT -- THE DENSE-MLP WEIGHTS ARE RE-READ AND RE-DEQUANTISED EVERY STEP ===
+Closed the loop by measuring three nested timers over 45 layers x 2 steps (dumps off):
+    SEC layerbody (whole FFN branch) : max 4987 ms   median  42 ms
+    BENCH_LAYER   (the MoE call)     : max  426 ms   median 388 ms
+    SEC_MOE2      (MoE phases)       : max  410 ms   median 381 ms
+    gap outside the MoE call         : 500 - 1771 ms
+    samples: layerbody=90, call=62 -> 28 layer-steps took a DIFFERENT branch.
+62 = 31 MoE layers x 2 steps; the other 28 are the DENSE branch (the 11 DSA layers + the 3 dense ones
+per step). So the seconds are in the dense path, and glm_serve's dense branch does this PER LAYER PER STEP:
+    g_lg_12 = gx_read(lg, 12) ; d_gate = deq_bf16(fbf, g_lg_12, H*INTER, H)
+    g_lg_13 = gx_read(lg, 13) ; d_up   = deq_bf16(...)
+    g_lg_14 = gx_read(lg, 14) ; d_down = deq_bf16(...)
+THE ARITHMETIC (H=4096, INTER=12288):
+    one projection 50.3 M params -> 100 MB as bf16; three = 302 MB per layer
+    14 non-MoE layers per step -> 4.2 GB RE-READ AND RE-DEQUANTISED PER STEP
+    at 280 MB/s that is ~15 s/step of pure reading, before the deq cost -- matching the 36-68 s measured.
+These tensors are IMMUTABLE across steps (they are layer weights). Caching them once (4.2 GB of f32, or
+better: fusing the dense matvec straight from bf16 like the MoE path does) removes the whole cost.
+WHY THIS WAS INVISIBLE FOR SO LONG: every timer named after the MoE ("SEC mlpmoe") was actually the FFN
+branch, and the dense path sat inside it unnamed. The label is now SEC layerbody, and moe_tail_step has
+its own SEC_MOE2 phases, so the two can never be confused again.
+STATE: the fused MoE (prefill + decode) is correct, deterministic and gated by four harness passes, and
+worth 2.4x -- but it optimises ~31 of 45 layers' arithmetic while ~14 layers burn seconds on re-reading
+weights that never change. THAT is the next change, and it is the first one this session with a clear
+path to a large end-to-end win.
