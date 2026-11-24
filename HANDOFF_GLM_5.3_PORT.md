@@ -6893,3 +6893,18 @@ STATE UNCHANGED FROM ROUND 162: the hogs are NOT eliminated. DSA layers remain ~
 depth-dependent cost that points at memory footprint rather than a per-layer defect. Engine-side levers
 tried and refuted: output caching (harmful), cache-accumulation (refuted). Remaining: preallocated
 dequantise output (untested), or deployment-level residency.
+=== ROUND 164: CORRECTION -- VYB STRING DOES NOT NEED `push`, AND I WAS WRONG ===
+Round 163 claimed "Vyb Strings have no push, so a byte string cannot be built element-wise; Vyb has no
+cheap way to construct an arbitrary bf16 buffer". The first clause is true; the second is FALSE.
+String's methods (src/vre/llvm/cgen_string_type.cpp) include concat, replace, format, substring, char_at,
+to_bytes, from_bytes, starts_with, ends_with, contains, to_upper, to_lower, trim, compare, len.
+`String::from_bytes(byte_ptr, len)` is ZERO-COPY: it wraps an existing buffer as a String struct.
+So procedural byte strings ARE constructible; the probe used the wrong primitive and then asserted a
+language gap without checking the method table.
+SHOULD `push` BE ADDED TO String? NO. String is an immutable value type with concat/replace/format; a
+mutating push would impose COW/aliasing semantics on every shared String for no gain over from_bytes
+plus a buffer. If element-wise construction is genuinely needed later, the right shape is a builder type,
+not mutation on String.
+LESSON, and it generalises the session's rule to API discovery: before claiming a language/runtime lacks
+a capability, grep the builtin method table. Two failed probe cycles came from asserting absence instead
+of enumerating what exists.
