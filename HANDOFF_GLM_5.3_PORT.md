@@ -8500,3 +8500,69 @@ have rank 0 push the prompt to rank 1 over the control socket, and compare rank 
 within tolerance. That is both the correct architecture and a simpler test.
 STATUS: model staging to righty is still running in the background (~27 MB/s, ~1.7 h for 164 GB). Everything
 else is in place and verified.
+
+################################################################################
+=== NEXT CONTEXT: START HERE (state at 2026-11-24, commit b1ef586, tree clean) ===
+################################################################################
+FRAMING (Rick, explicit and it overrides anything earlier in this file): the two Sparks are ONE TP=2 UNIT.
+Testing them independently / judging residency on a single node is measuring the wrong configuration. TP=2
+working together is THE current focus of VybForge. Every single-node measurement in this file should be read
+as scaffolding, not as the target.
+WHAT IS VERIFIED (do not redo):
+  * memory budget: 88/87 GB per node allocatable and byte-written (round 211)
+  * expert-parallel shard walk: 144 experts/rank, 1296 tensors, symmetric/disjoint/complete; coalesced load
+    1296 tensors -> 4 ranges at ~1.7 GB/s, mapping verified byte-for-byte (rounds 215-216)
+  * ownership partition: p0+p1 == full, exactly (round 217)
+  * NCCL all-reduce: bit-exact; LOCKSTEP proven with a correct verify (round 223)
+  * PER-LAYER COMMS COST: ~0.03 ms at 4096 f64 = ~1.3 ms/token over 45 layers (round 223). The earlier
+    0.59 and 26.5 ms figures were artefacts of a wrong dtype (4=ncclInt64 sums BIT PATTERNS) and of
+    upload/readback inside the timed region. DTYPE MUST BE 8 (ncclFloat64).
+  * expert split LIVE in the engine: world=1 digest 7291d8a64ab3727ecc8ef1e777e24431 is the baseline and is
+    BIT-IDENTICAL; rank0 [0,144) and rank1 [144,288) produce two DISTINCT partial digests, so the split is
+    active (round 225).
+  * per-layer all-reduce wired into moe_tail_step between the expert loop and the `shared` addition
+    (accr reduced, shared NOT -- it is duplicated); transparent at world=1, network untouched (round 226)
+WHAT HAS NEVER HAPPENED: the two-node pair has NOT run. Every attempt failed on integration bugs (all now
+fixed) or on shell/ssh problems -- never on the TP code itself.
+=== OPERATIONAL RULES THAT COST HOURS TODAY ===
+1. SSH: use the aliases `ssh lefty` / `ssh righty`. RAW IPs (192.168.1.249/.250) BYPASS ~/.ssh/config and
+   therefore the correct IdentityFile, producing intermittent "Too many authentication failures" and
+   exit 255. Tailscale names also exist: lefty.tail62b3b3.ts.net, righty.tail62b3b3.ts.net
+   (Tailnet IPs 100.70.233.74 / 100.75.153.81).
+2. NEVER compose long inline compound ssh commands (for-loops, nested quotes, >400 chars): they return 255.
+   Put the logic in a script FILE and run the file. `bash -n` the script first.
+3. The HTTP endpoint is /v1/generate. NOT /v1/chat/completions. A wrong path returns {"error":"not found"}
+   WITHOUT running the model or entering any collective -- that 404 was misdiagnosed as a network hang for
+   several rounds.
+4. VYBFORGE_SKIP_MTP=1 is REQUIRED or rank startup dies in the known MTP DEQFAIL rc=700 path.
+5. NCCL needs BOTH: NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 AND NCCL_SOCKET_IFNAME=enp1s0f0np0 (the 192.168.192.x
+   rail). NCCL_IB_HCA alone leaves the TCP bootstrap free to pick any interface, and righty has Wi-Fi in its
+   candidate list, so the two nodes can pick different ones and never meet. Rendezvous peer = 192.168.192.1.
+6. pkill -f / grep patterns match your OWN ssh command line. Kill by PID. `grep -q`, never `grep -c` in a
+   numeric test (grep -c emits a newline and broke a guard).
+7. Edit tools: `replace(first)` hits the WRONG function when the same lines exist in several (it patched
+   tail_site instead of moe_tail_step; it also misplaced the TP block candidate). Always confirm which
+   function a match is in -- the compiler error "undefined identifier" is the tell.
+=== MACHINE STATE ===
+  lefty  (gx10-037e, 192.168.1.249, ROCE 192.168.192.1): model /mnt/apex/rick/vybforge/glm53-checkpoint
+         (164 GB); engine at /srv/models/vybforge; binary ~/Projects/Vyb/build2/vyb; S0cache warm.
+  righty (gx10-12c9, 192.168.1.250, ROCE 192.168.192.2): model /srv/models/glm53-checkpoint (164 GB, 97
+         entries, fully copied this session); engine tree staged at /srv/models/vybforge (all native/*);
+         binary /srv/models/vybforge/vyb; VYB_STDLIB=/tmp/nccltest/stdlib; S0cache SAVED.
+  Ports used: HTTP 18660 (rank0) / 18661 (rank1); TP rendezvous 18460.
+=== NEXT STEPS, IN ORDER ===
+1. Confirm the TP block actually executes: one-line ssh run with VYBFORGE_WORLD=2 and look for
+   `TP_RANK rank=0 world=2 experts=[0,144)`. It lives in glm_serve main at ~lines 677-693 and is unconditional.
+   If it does not print, bisect with a print at the top of main.
+2. Update scripts/tp_pair.sh to use the lefty/righty ALIASES (currently raw IPs) + NCCL_SOCKET_IFNAME, then
+   run it as a FILE. It already: stages the tree, waits on both listeners with grep -q, curls BOTH ranks
+   concurrently (REQUIRED -- each rank enters the collective only while running its own forward pass, so
+   curling one and leaving the other idle deadlocks it), compares digests, cleans up by PID.
+3. Watch for `TP_COMM ready` on BOTH ranks, then curl /v1/generate on both.
+4. GATE: rank0's output must match world=1 WITH A TOLERANCE, not bit-exactly -- two partial expert sums
+   associate differently from 288 summed in order. Set the tolerance up front or a correct run looks failed.
+5. THE REAL ARCHITECTURE (Rick's point, round 228): two independently-curled serves is only a GATE. The
+   design is ONE front-end -- rank 0 hosts it and pushes the prompt to rank 1 over the control socket it
+   already has; rank 1 is a pure compute donor (its output is redundant since attention and shared are
+   identical and the experts are already combined by the all-reduce). Build that next; it removes the whole
+   deadlock/mismatch failure class.
