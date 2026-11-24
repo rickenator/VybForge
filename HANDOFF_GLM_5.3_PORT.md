@@ -7651,3 +7651,24 @@ STATE: engine reverted to f063db1 content (windowed resolve, no gx_read9, no fp 
 run: 12 layers, 12 moekern lines, loop ~100 ms, no fault. Rounds 187-190 (attribution, windowed resolve
 85 -> 12 ms) and round 193 (438.66 s full pass) REMAIN VALID; round 191's read gain and round 192's proof do
 NOT.
+=== ROUND 198: STABLE-BUILD FULL-DEPTH BASELINE -- AND THE MOE IS ONLY ~2% OF IT ===
+NLAY=45, NSTEPS=2, REQS=1, on the REVERTED (non-faulting) engine:
+    req1 = 968.55 s       baseline (round 174, NSTEPS=2) = 957.64 s   -> +1.1%, i.e. UNCHANGED
+    VALID_RUN: 62 SEC moekern lines  (2 steps x ~31 MoE layers, so the run is trustworthy)
+    per-layer loop at full depth: 229-392 ms   (first layers 229/230, later 392/359)
+    23 SEC_DEQ stalls
+SO THE WHOLE SESSION'S MoE WORK NETS ~2% OF A REAL STEP. 31 MoE layers x ~300 ms = ~9.3 s against a 484 s
+step. The warm 91-103 ms number measured at NLAY=12 does NOT survive full depth: here the same loop runs
+229-392 ms, because the run's footprint evicts what a shallow run keeps cached. Rounds 187-190 (attribution,
+windowed resolve) are real and measured, but they were measured in a regime that overstates their share of a
+production step.
+WHERE THE 484 s ACTUALLY GOES (round 187's numbers, unchanged by any of tonight's work): ~90% is UNTIMED
+checkpoint streaming. 175.62 GB per step against 121 GB of RAM cannot be resident on one node, so every
+step re-reads the model; 175.62 GB in 484 s is 363 MB/s against 1.1 GB/s measured for a sequential read,
+i.e. the stream is also ~3x slower than the hardware.
+CONSEQUENCE FOR THE GOAL: no further kernel, resolver, read-handle or fused-projection work can move the
+end-to-end number, because every one of those lives inside the ~2%. The remaining hog is not a code defect
+-- it is residency. The agreed fix is the TP=2 split so each node holds its ~88 GB half (measured split:
+88.50 / 87.13 GB, both inside 121 GB -- see round 174), and that is now the only lever with a large effect.
+The support for it is already built and verified: NCCL all-reduce across the pair is bit-exact (~31 us small,
+36 GB/s large), and the row-parallel TP pattern is proven correct at two sizes.
