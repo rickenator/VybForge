@@ -656,6 +656,18 @@ main()<Int> -> {
                     # Device arena for the DSA attention dequantise buffers: created once here and reused
                     # across every layer and step, so the hot loop does no large cuMemAlloc/cuMemFree at
                     # all (round 169-171: a ~900 ms driver stall follows large frees).
+                    # Host-RAM residency cache (round 218): P6_HCACHE_GB>0 keeps packed tensor bytes in RAM so the
+                    # per-layer load stops hitting the disk. 0 (default) leaves the disk path untouched.
+                    hchMax<Int> = 0
+                    hcv<String> = env_get("P6_HCACHE_GB") else ""
+                    if (hcv.len() > 0) { hchMax = hcv.to_int() * 1073741824 }
+                    hch<Vec<String>> = Vec()
+                    hci<Int> = 0
+                    while (hci < nlay * 48) { hch.push(""); hci = hci + 1 }
+                    hst<Vec<Int>> = Vec()
+                    hst.push(hchMax)
+                    hst.push(0)
+                    if (hchMax > 0) { println("RES_HOST_CACHE gb=" + (hchMax / 1073741824).to_string() + " keys=" + hch.len().to_string()) }
                     arAll<Vec<Int>> = Vec()
                     i = 0
                     while (i < sv_NSLOT * sv_HEADS * sv_KD * sv_KD) { stAll.push(0.0); i = i + 1 }
@@ -1719,69 +1731,69 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 # ------------------------------------------------ KDA layer step
                                 kslot = n - ((n + 1) / 4)
                                 if (n < 3) {
-                                    g_lg_17 = gx_read(lg, 17)
+                                    g_lg_17 = res_get_host(borrow(hch), borrow(hst), n * 48 + 17, lg, 17)
                                     d_fnA = deq_bf16(fbf, g_lg_17, 24 * sv_HC * sv_H, sv_HC * sv_H)
                                 } else {
-                                    g_lg_14 = gx_read(lg, 14)
+                                    g_lg_14 = res_get_host(borrow(hch), borrow(hst), n * 48 + 14, lg, 14)
                                     d_fnA = deq_bf16(fbf, g_lg_14, 24 * sv_HC * sv_H, sv_HC * sv_H)
                                 }
                                 if (d_fnA == 0) { return 11 }
                                 base<Vec<Float>> = Vec()
                                 raw_base<String> = ""
-                                g_lg_15 = gx_read(lg, 15)
-                                g_lg_18 = gx_read(lg, 18)
+                                g_lg_15 = res_get_host(borrow(hch), borrow(hst), n * 48 + 15, lg, 15)
+                                g_lg_18 = res_get_host(borrow(hch), borrow(hst), n * 48 + 18, lg, 18)
                                 if (n < 3) { raw_base = g_lg_18 } else { raw_base = g_lg_15 }
                                 j = 0
                                 while (j < 24) { base.push(f32_at(raw_base, j)); j = j + 1 }
                                 scale<Vec<Float>> = Vec()
                                 raw_scale<String> = ""
-                                g_lg_16 = gx_read(lg, 16)
-                                g_lg_19 = gx_read(lg, 19)
+                                g_lg_16 = res_get_host(borrow(hch), borrow(hst), n * 48 + 16, lg, 16)
+                                g_lg_19 = res_get_host(borrow(hch), borrow(hst), n * 48 + 19, lg, 19)
                                 if (n < 3) { raw_scale = g_lg_19 } else { raw_scale = g_lg_16 }
                                 j = 0
                                 while (j < 3) { scale.push(f32_at(raw_scale, j)); j = j + 1 }
 
                                 println("SEC preS " + (now_ms() - secT).to_string())
                                 secT = now_ms()
-                                g_lg_0 = gx_read(lg, 0)
+                                g_lg_0 = res_get_host(borrow(hch), borrow(hst), n * 48 + 0, lg, 0)
                                 d_q = deq_bf16(fbf, g_lg_0, sv_H * sv_HEADS * sv_KD, sv_H)
-                                g_lg_1 = gx_read(lg, 1)
+                                g_lg_1 = res_get_host(borrow(hch), borrow(hst), n * 48 + 1, lg, 1)
                                 d_k = deq_bf16(fbf, g_lg_1, sv_H * sv_HEADS * sv_KD, sv_H)
-                                g_lg_2 = gx_read(lg, 2)
+                                g_lg_2 = res_get_host(borrow(hch), borrow(hst), n * 48 + 2, lg, 2)
                                 d_v = deq_bf16(fbf, g_lg_2, sv_H * sv_HEADS * sv_KD, sv_H)
-                                g_lg_3 = gx_read(lg, 3)
+                                g_lg_3 = res_get_host(borrow(hch), borrow(hst), n * 48 + 3, lg, 3)
                                 d_o = deq_bf16(fbf, g_lg_3, sv_HEADS * sv_KD * sv_H, sv_HEADS * sv_KD)
-                                g_lg_4 = gx_read(lg, 4)
+                                g_lg_4 = res_get_host(borrow(hch), borrow(hst), n * 48 + 4, lg, 4)
                                 d_b = deq_bf16(fbf, g_lg_4, sv_H * sv_HEADS, sv_H)
-                                g_lg_5 = gx_read(lg, 5)
+                                g_lg_5 = res_get_host(borrow(hch), borrow(hst), n * 48 + 5, lg, 5)
                                 d_fa = deq_bf16(fbf, g_lg_5, sv_H * 128, sv_H)
-                                g_lg_6 = gx_read(lg, 6)
+                                g_lg_6 = res_get_host(borrow(hch), borrow(hst), n * 48 + 6, lg, 6)
                                 d_fb = deq_bf16(fbf, g_lg_6, 128 * sv_HEADS * sv_KD, 128)
-                                g_lg_7 = gx_read(lg, 7)
+                                g_lg_7 = res_get_host(borrow(hch), borrow(hst), n * 48 + 7, lg, 7)
                                 d_ga = deq_bf16(fbf, g_lg_7, sv_H * 128, sv_H)
-                                g_lg_8 = gx_read(lg, 8)
+                                g_lg_8 = res_get_host(borrow(hch), borrow(hst), n * 48 + 8, lg, 8)
                                 d_gb = deq_bf16(fbf, g_lg_8, 128 * sv_HEADS * sv_KD, 128)
                                 if (n < 3) {
-                                    g_lg_15 = gx_read(lg, 15)
+                                    g_lg_15 = res_get_host(borrow(hch), borrow(hst), n * 48 + 15, lg, 15)
                                     d_ln = deq_bf16(fbf, g_lg_15, sv_H, 0)
-                                    g_lg_16 = gx_read(lg, 16)
+                                    g_lg_16 = res_get_host(borrow(hch), borrow(hst), n * 48 + 16, lg, 16)
                                     d_ln2 = deq_bf16(fbf, g_lg_16, sv_H, 0)
-                                    g_lg_24 = gx_read(lg, 24)
+                                    g_lg_24 = res_get_host(borrow(hch), borrow(hst), n * 48 + 24, lg, 24)
                                     d_cq = deq_bf16(fbf, g_lg_24, sv_HEADS * sv_KD * sv_CONV_K, 0)
-                                    g_lg_25 = gx_read(lg, 25)
+                                    g_lg_25 = res_get_host(borrow(hch), borrow(hst), n * 48 + 25, lg, 25)
                                     d_ck = deq_bf16(fbf, g_lg_25, sv_HEADS * sv_KD * sv_CONV_K, 0)
-                                    g_lg_26 = gx_read(lg, 26)
+                                    g_lg_26 = res_get_host(borrow(hch), borrow(hst), n * 48 + 26, lg, 26)
                                     d_cv = deq_bf16(fbf, g_lg_26, sv_HEADS * sv_KD * sv_CONV_K, 0)
                                 } else {
-                                    g_lg_12 = gx_read(lg, 12)
+                                    g_lg_12 = res_get_host(borrow(hch), borrow(hst), n * 48 + 12, lg, 12)
                                     d_ln = deq_bf16(fbf, g_lg_12, sv_H, 0)
-                                    g_lg_13 = gx_read(lg, 13)
+                                    g_lg_13 = res_get_host(borrow(hch), borrow(hst), n * 48 + 13, lg, 13)
                                     d_ln2 = deq_bf16(fbf, g_lg_13, sv_H, 0)
-                                    g_lg_20 = gx_read(lg, 20)
+                                    g_lg_20 = res_get_host(borrow(hch), borrow(hst), n * 48 + 20, lg, 20)
                                     d_cq = deq_bf16(fbf, g_lg_20, sv_HEADS * sv_KD * sv_CONV_K, 0)
-                                    g_lg_21 = gx_read(lg, 21)
+                                    g_lg_21 = res_get_host(borrow(hch), borrow(hst), n * 48 + 21, lg, 21)
                                     d_ck = deq_bf16(fbf, g_lg_21, sv_HEADS * sv_KD * sv_CONV_K, 0)
-                                    g_lg_22 = gx_read(lg, 22)
+                                    g_lg_22 = res_get_host(borrow(hch), borrow(hst), n * 48 + 22, lg, 22)
                                     d_cv = deq_bf16(fbf, g_lg_22, sv_HEADS * sv_KD * sv_CONV_K, 0)
                                 }
                                 if (d_q == 0 || d_k == 0 || d_v == 0 || d_o == 0 || d_b == 0 || d_fa == 0 || d_fb == 0 ||
@@ -1798,20 +1810,20 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                 free_dev(d_ck)
                                 free_dev(d_cv)
 
-                                g_lg_9 = gx_read(lg, 9)
+                                g_lg_9 = res_get_host(borrow(hch), borrow(hst), n * 48 + 9, lg, 9)
                                 d_onorm = deq_bf16(fbf, g_lg_9, sv_KD, 0)
                                 if (d_onorm == 0) { return 16 }
                                 onorm<Vec<Float>> = bulk_dtoh(d_onorm, sv_KD)
                                 free_dev(d_onorm)
 
-                                g_lg_10 = gx_read(lg, 10)
+                                g_lg_10 = res_get_host(borrow(hch), borrow(hst), n * 48 + 10, lg, 10)
                                 println("SEC stageS " + (now_ms() - secT).to_string())
                                 secT = now_ms()
                                 raw_dt<String> = g_lg_10
                                 dt<Vec<Float>> = Vec()
                                 i = 0
                                 while (i < sv_HEADS * sv_KD) { dt.push(f32_at(raw_dt, i)); i = i + 1 }
-                                g_lg_11 = gx_read(lg, 11)
+                                g_lg_11 = res_get_host(borrow(hch), borrow(hst), n * 48 + 11, lg, 11)
                                 raw_alog<String> = g_lg_11
                                 alog<Vec<Float>> = Vec()
                                 i = 0

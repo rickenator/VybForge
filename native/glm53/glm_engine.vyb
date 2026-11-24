@@ -420,6 +420,34 @@ deq_bf16_res(faddr<Int>, qdev<Int>, n<Int>, z<Int>)<Int> -> {
     return out
 }
 
+// res_get_host -- return a tensor's packed bytes from a host-RAM residency cache, reading once on first use.
+//
+// Why host RAM and not device memory: the per-call cost being attacked is the DISK READ, not the upload.
+// exl3_deq copies the packed bytes to a staging buffer every call regardless, and that copy is tiny next to
+// a disk read (1.3 MB at tens of GB/s is microseconds). Caching the packed bytes in host RAM removes the
+// disk read while leaving every existing call site, kernel and shape parameter untouched -- which matters,
+// because round 213 showed that restructuring this path changes the reader's access order and can cost more
+// than it saves. Here the ONLY change at a call site is where the String comes from.
+//
+// `ch` holds the payloads (one String per key, "" = absent); `st` holds the budget and the running total as
+// integers: st[0] = maxBytes (0 disables), st[1] = usedBytes. Keeping the counters out of the String vector
+// avoids parsing integers back out of strings on every call.
+// A tensor that does not fit the budget falls back to gx_read, so the cache can never silently overrun.
+share(all)
+res_get_host(ch<their<Vec<String>>>, st<their<Vec<Int>>>, key<Int>, lg<GxLoc>, slot<Int>)<String> -> {
+    if (ch.len() < 1 || st.len() < 2 || key < 0 || key >= ch.len()) { return gx_read(lg, slot) }
+    have<String> = ch.get(key)
+    if (have.len() > 0) { return have }
+    raw<String> = gx_read(lg, slot)
+    if (raw.len() == 0) { return raw }
+    maxB<Int> = st.get(0)
+    used<Int> = st.get(1)
+    if (maxB <= 0 || used + raw.len() > maxB) { return raw }
+    ch.set(key, raw)
+    st.set(1, used + raw.len())
+    return raw
+}
+
 // deq_auto -- dequantise a tensor, keeping its packed bytes resident on the device after the first touch.
 //
 // Why this shape (round 213): the decode path is 22-28 (gx_read + deq_bf16) pairs per layer and each pair

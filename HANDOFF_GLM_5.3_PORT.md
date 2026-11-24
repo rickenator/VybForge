@@ -8221,3 +8221,31 @@ WHAT REMAINS IS WIRING, NOT VALIDATION:
        from (4) should finally be measured on real numbers.
 NOTE: none of this touches row-parallel TP, which round 214 showed is impossible on packed weights. The
 whole design is expert-parallel: 144 whole experts per rank, one ncclSum per layer.
+=== ROUND 218: HOST-RAM RESIDENCY CACHE -- FIRST CLEAN, REPRODUCIBLE WIN OF THIS STRETCH ===
+DESIGN CHOICE THAT MADE IT CHEAP: attack the DISK READ, not the device upload. exl3_deq copies packed bytes
+to a staging buffer every call regardless, and that copy is microseconds next to a disk read, so the packed
+bytes can live in HOST RAM with every kernel, shape parameter and call site untouched. This directly avoids
+round 213's failure mode: there the deq CALL SITES were restructured and the reader's access order changed;
+here only the SOURCE of the String changes -- `gx_read(lg, N)` became
+`res_get_host(borrow(hch), borrow(hst), n*48+N, lg, N)` and all 22 deq lines stayed byte-identical.
+`res_get_host` (glm_engine) fills lazily on first touch, budget-capped by P6_HCACHE_GB (default 0 = disabled),
+falling back to gx_read for anything that does not fit, so it can never silently overrun.
+MEASUREMENT -- 3 interleaved pairs (off,on,off,on,off,on), all six VALID_RUN:
+    req1      off 115.85 / 124.95 / 119.12   -> median 119.12
+              on  104.72 / 110.26 / 104.99   -> median 104.99   ** -11.9%, ranges DISJOINT **
+    kda ms/l  off 366 / 559 / 492            -> median 492
+              on  262 / 267 / 198            -> median 262      ** -46.7%, ranges DISJOINT **
+    step t=1  off 37.0 / 47.0 / 46.0         -> median 46.0
+              on  27.0 / 31.0 / 30.0         -> median 30.0     ** -34.8% **
+The off-range [115.8,125.0] and on-range [104.7,110.3] do not overlap, and neither do the kda ranges
+[366,559] vs [198,267], so this is not the ±40% noise band that made round 213 undecidable.
+MECHANISM CONFIRMS ITSELF: the kda spread COLLAPSES from 193 ms to 69 ms with the cache on. The variance was
+the disk, exactly as hypothesised, and removing the disk removes the variance.
+CORRECTNESS: the digest files are IDENTICAL across all four sampled runs
+(md5 7291d8a64ab3727ecc8ef1e777e24431 for ab_off1, ab_on1, ab_off2, ab_on2), so the cache is numerically
+transparent, and every run passed the fused-projection numeric gate.
+SCOPE: this covers only the KDA pre-site (34 of 45 layers' attention). NOT yet covered, and each should
+compound the same way: the DSA pre-site (11 layers, ~584 ms/layer before), the routed-expert path (the MoE,
+the other large term), and the shared-expert/dense tensors.
+NOTE ON MEMORY: 16 GB budget was used for this test; the cache is capped and falls back, so a full 45-layer
+attention set (~12-15 GB) fits. For TP=2 the same mechanism with an 88 GB budget holds a rank's whole half.
