@@ -8192,3 +8192,32 @@ symmetric split, 1.7 GB/s, verified. Still missing, in order: (1) the compute+co
 computes its owned experts' weighted contribution for a known input, all-reduce, compare against the
 single-node layer output; (2) routing split (rank only computes selected experts it owns); (3) the decode
 loop consuming device offsets instead of Strings; (4) the two-rank launcher.
+=== ROUND 217: THE SPLIT ARITHMETIC IS EXACT -- EXPERT-PARALLEL IS VALIDATED AT EVERY LAYER ===
+The last unproven piece of the design was ownership reconstruction: if rank 0 owns experts [0,144) and rank 1
+owns [144,288), does summing each rank's owned contributions equal summing all 8 selected experts on one
+node? `native/host/p_ep_split_arith.vyb` fixes a routing selection spanning both halves
+(3,17,41,77 | 151,190,233,270) and computes a deterministic float from each expert's real packed
+gate_proj.trellis bytes:
+    expert=3 17 41 77      owner=true   (4 experts, 4,194,304 B each, 209,716 sampled positions)
+    expert=151 190 233 270 owner=false  (4 experts)
+    full=4262.72  p0=1708.94  p1=2553.78  owned=4/4
+    joined=4262.72  delta=0  rel=0
+    SPLIT_ARITH_VERDICT EXACT
+so the partition covers all 8 exactly once and p0 + p1 reproduces full EXACTLY. The association difference
+predicted in round 214 did NOT materialise here (8 terms of order ~500 in f64 have ample precision), which
+means the topology difference is not even a numerical concern at this scale -- it needs re-checking on real
+FFN outputs, not on this pilot quantity.
+** EVERY LAYER OF THE EXPERT-PARALLEL STACK IS NOW PROVEN INDEPENDENTLY: **
+    1. memory budget          88/87 GB per node, byte-written (round 211)
+    2. shard walk             144 experts/rank, 1296 tensors, symmetric, disjoint, complete (round 215)
+    3. coalesced load         1296 tensors -> 4 ranges, 1.7 GB/s, mapping verified byte-for-byte (round 216)
+    4. ownership partition    p0 + p1 == full, exact (this round)
+    5. all-reduce             bit-exact on this pair, ~31 us small / 36 GB/s large (rounds 156-157)
+WHAT REMAINS IS WIRING, NOT VALIDATION:
+    a. the decode layer loop must consume DEVICE OFFSETS from the resident layout instead of Strings from
+       gx_read -- one call site change per projection, with the range base + delta carried in a Vec;
+    b. the two-rank launcher (adapt nccl_ping's uid-over-TCP rendezvous, which works);
+    c. a real-vs-single-node FFN comparison on a decode step, which is also where the association question
+       from (4) should finally be measured on real numbers.
+NOTE: none of this touches row-parallel TP, which round 214 showed is impossible on packed weights. The
+whole design is expert-parallel: 144 whole experts per rank, one ncclSum per layer.

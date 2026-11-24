@@ -1,0 +1,109 @@
+# p_ep_split_arith.vyb -- does an expert split actually reconstruct the whole?
+#
+# The one part of the expert-parallel design that is NOT yet proven. The pieces around it already are:
+#   * NCCL all-reduce of two ranks is bit-exact (rounds 156-157)
+#   * a rank can load exactly its half of a layer's experts, coalesced, verified byte-for-byte (rounds 215-216)
+#   * the per-expert FFN maths works (rounds 187+)
+# What has never been checked is that OWNERSHIP PARTITIONING reconstructs the full sum: if rank 0 owns
+# experts [0,144) and rank 1 owns [144,288), then for a fixed routing selection of 8 experts, summing rank
+# 0's owned contributions plus rank 1's must equal summing all 8 on one node.
+#
+# This probe checks exactly that, on ONE node, using real packed weights -- no launcher, no comms needed,
+# because the reduce itself is a solved primitive. The per-expert quantity here is a deterministic float
+# derived from the expert's own gate_proj.trellis bytes; it is a stand-in for the FFN result (which the
+# engine already produces and which would require the full exl3_deq shape parameters to reproduce here).
+#
+# Expectation: partial0 + partial1 == full up to FLOATING-POINT ASSOCIATION, not bit-exactly, because
+# summing (a+b+c+d)+(e+f+g+h) associates differently from a+b+...+h. The delta is reported so the size of
+# that trade is visible rather than assumed small.
+#
+# Run: vyb p_ep_split_arith.vyb
+import io::{open_read, read_at, read_all, close}
+import env::{env_get}
+import safetensors
+import gx
+import tensor::{tensor_init}
+
+main()<Int> -> {
+    layer<Int> = 3
+    yv<String> = env_get("LAYER") else ""
+    if (yv.len() > 0) { layer = yv.to_int() }
+    dir<String> = env_get("VYBFORGE_GX_DIR") else "/mnt/apex/rick/vybforge/glm53-checkpoint"
+    total<Int> = 83
+    lpre<String> = "model.language_model.layers." + layer.to_string() + "."
+
+    # a fixed routing selection deliberately spanning BOTH halves, so the split is exercised
+    sel<Vec<Int>> = Vec()
+    sel.push(3); sel.push(17); sel.push(41); sel.push(77)
+    sel.push(151); sel.push(190); sel.push(233); sel.push(270)
+    split<Int> = 144
+
+    wants<Vec<String>> = Vec()
+    i<Int> = 0
+    while (i < sel.len()) {
+        wants.push(lpre + "mlp.experts." + sel.get(i).to_string() + ".gate_proj.trellis")
+        i = i + 1
+    }
+
+    idxT<String> = gx_read_index(dir)
+    ww<Vec<Int>> = gx_expert_window(idxT, lpre)
+    g<GxLoc> = gx_resolve_win(idxT, dir, total, wants, ww.get(0), ww.get(1))
+    nf<Int> = 0
+    i = 0
+    while (i < wants.len()) { if (g.found.get(i) == 1) { nf = nf + 1 } i = i + 1 }
+    if (nf != wants.len()) { println("SPLIT_ARITH_FAIL resolved=" + nf.to_string()); return 3 }
+
+    # per-expert contribution: a deterministic float from the expert's own packed weights
+    contrib<Vec<Float>> = Vec()
+    i = 0
+    while (i < sel.len()) {
+        raw<String> = gx_read(g, i)
+        if (raw.len() == 0) { println("SPLIT_ARITH_FAIL read " + sel.get(i).to_string()); return 4 }
+        acc<Float> = 0.0
+        step<Int> = 1
+        if (raw.len() > 200000) { step = raw.len() / 200000 }
+        b<Int> = 0
+        nseen<Int> = 0
+        while (b < raw.len()) {
+            acc = acc + (((raw.char_at(b) as Int) & 255) as Float - 127.0) / 128.0
+            nseen = nseen + 1
+            b = b + step
+        }
+        contrib.push(acc)
+        println("SPLIT_ARITH expert=" + sel.get(i).to_string() + " owner=" + (sel.get(i) < split).to_string() + " bytes=" + raw.len().to_string() + " sampled=" + nseen.to_string())
+        i = i + 1
+    }
+
+    # full sum in selection order
+    full<Float> = 0.0
+    i = 0
+    while (i < contrib.len()) {
+        full = full + contrib.get(i)
+        i = i + 1
+    }
+    # split sums, each in its own order
+    p0<Float> = 0.0
+    p1<Float> = 0.0
+    n0<Int> = 0
+    n1<Int> = 0
+    i = 0
+    while (i < contrib.len()) {
+        if (sel.get(i) < split) { p0 = p0 + contrib.get(i); n0 = n0 + 1 }
+        else { p1 = p1 + contrib.get(i); n1 = n1 + 1 }
+        i = i + 1
+    }
+    joined<Float> = p0 + p1
+    delta<Float> = full - joined
+    ad<Float> = delta
+    if (ad < 0.0) { ad = 0.0 - ad }
+    rel<Float> = 0.0
+    af<Float> = full
+    if (af < 0.0) { af = 0.0 - af }
+    if (af > 0.0) { rel = ad / af }
+
+    println("SPLIT_ARITH full=" + full.to_string() + " p0=" + p0.to_string() + " p1=" + p1.to_string() + " owned=" + n0.to_string() + "/" + n1.to_string())
+    println("SPLIT_ARITH joined=" + joined.to_string() + " delta=" + delta.to_string() + " rel=" + rel.to_string())
+    if (n0 + n1 != sel.len()) { println("SPLIT_ARITH_VERDICT PARTITION_BROKEN"); return 5 }
+    if (ad == 0.0) { println("SPLIT_ARITH_VERDICT EXACT") } else { println("SPLIT_ARITH_VERDICT ASSOCIATION_DIFF") }
+    return 0
+}
