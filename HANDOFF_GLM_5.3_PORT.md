@@ -7859,3 +7859,10 @@ comparison covering the decode step, or the per-projection numeric gate on a dec
 EXPECTED EFFECT IF THE PREFILL SPEED TRANSFERS: DSA layers 2,828 -> ~45 ms and KDA 1,297 -> a smaller but
 similar cut, taking attention from 63-68% of the step to a few percent. That is the largest single win
 available on this model: even with everything else unchanged it removes ~30 of ~45 s per step.
+--- ROUND 206 ADDENDUM: the KDA branch has the same shape, so the port covers BOTH branches ---
+KDA branch (glm_serve:1705-1929) call inventory, one layer:
+    28 gx_read   22 deq_bf16 (HOST)   9 mm_host (CPU)   7 bulk_dtoh   1 bulk_htod   1 gemm (GPU)
+versus DSA (18 deq, 10 mm_host, 1 gemm). So BOTH branches are host-side implementations and the port scope
+is the whole decode attention, not just DSA: ~40 host deq_bf16 and ~19 mm_host per layer across the two.
+DSA is 2.2x slower per layer despite FEWER deq calls, which means its tensors are individually larger -- so
+port cost should be sized by BYTES dequantised per layer, not by call count.
