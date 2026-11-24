@@ -667,6 +667,18 @@ main()<Int> -> {
                     hst<Vec<Int>> = Vec()
                     hst.push(hchMax)
                     hst.push(0)
+    # Expert residency cache (round 224): P6_ECACHE_GB>0 keeps routed-expert packed bytes in host RAM.
+    # key = layer*2592 + expert*9 + slot; 0 disables and falls through to the disk path unchanged.
+    echMax<Int> = 0
+    ecv<String> = env_get("P6_ECACHE_GB") else ""
+    if (ecv.len() > 0) { echMax = ecv.to_int() * 1073741824 }
+    ech<Vec<String>> = Vec()
+    eci<Int> = 0
+    while (eci < 116640) { ech.push(""); eci = eci + 1 }
+    est<Vec<Int>> = Vec()
+    est.push(echMax)
+    est.push(0)
+    if (echMax > 0) { println("RES_EXPERT_CACHE gb=" + (echMax / 1073741824).to_string() + " keys=" + ech.len().to_string()) }
                     if (hchMax > 0) { println("RES_HOST_CACHE gb=" + (hchMax / 1073741824).to_string() + " keys=" + hch.len().to_string()) }
                     arAll<Vec<Int>> = Vec()
                     i = 0
@@ -2042,14 +2054,14 @@ glg<GxLoc> = gx_resolve_tab(tabs.get(44), dir, total, wlg)
                                     streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                              fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                              arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                             fcast32, fgp, fgr, pb32)
+                                                             fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592)
                                     if (bN > 1) {
                                         var<Int> bRep = 1
                                         while (bRep < bN) {
                                             streams2 = moe_tail_step(streams1, lpre, tab, dir, total, mapbody, lg,
                                                                      fgemm, fbf, fdeq32, fdqs, fhad132, fhad232, fcvt32, hdg32,
                                                                      arA, arB, arC, arD, arG, arH, arI, mapdev, invbase,
-                                                                     fcast32, fgp, fgr, pb32)
+                                                                     fcast32, fgp, fgr, pb32, borrow(ech), borrow(est), n * 2592)
                                             bRep = bRep + 1
                                         }
                                     }

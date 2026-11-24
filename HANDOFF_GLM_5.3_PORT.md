@@ -8382,3 +8382,32 @@ be nice-to-have, but nothing about the architecture is gated on it.
 METHOD LESSON (the third time on this number): copy the constant from the WORKING reference rather than
 retyping it, and keep upload/readback OUT of the timed region. Both classes of error are invisible in a
 plausible-looking result -- 0.589 ms/iter looked perfectly reasonable and was measuring the wrong thing.
+=== ROUND 224: EXPERT RESIDENCY WIRED AND CORRECT, BUT SLOWER ON THIS NODE (+10%) ===
+Wired routed-expert residency into the decode path: `moe_tail_step` takes `ech<their<Vec<String>>>`,
+`est<their<Vec<Int>>>`, `ekey<Int>` and routes its NINE per-expert reads (3 projections x trellis/suh/svh)
+through `res_get_host` with key = layer*2592 + expert*9 + slot; glm_serve allocates a 116,640-key cache
+budgeted by P6_ECACHE_GB (default 0 = disabled, falls through to gx_read unchanged).
+CORRECTNESS: digests are IDENTICAL with the cache on and off
+(md5 7291d8a64ab3727ecc8ef1e777e24431 both) and both runs are VALID_RUN, so the cache is numerically
+transparent -- it changes where bytes come from, nothing else.
+PERFORMANCE: it is a LOSS here.
+    cache OFF: req1 105.55 s   steps 25.0 / 35.0
+    cache ON : req1 116.64 s   steps 29.1 / 39.0   (+10.5% end-to-end, slower on BOTH steps)
+so this is not merely the one-off fill cost (step t=0 +16%): the warm step is +11% too.
+LIKELY CAUSE, and it is the same mechanism flagged in round 219: a >13 GB in-process cache COMPETES WITH THE
+PAGE CACHE that the rest of the engine is reading through. The expert working set is 8 experts x 9 tensors =
+72 tensors per layer, ~13 GB across 45 layers at ~4 MB each, so it is large enough to evict the pages that
+the remaining disk reads depend on. The attention cache (11.6 GB) helped; this one (13+ GB and hotter) hurts.
+CONCLUSION: host-RAM residency is NOT a general win on a single warm node -- it depends on footprint versus
+what gets evicted. Keep the code as a flag-gated capability because it is verified transparent and it is the
+exact mechanism TP=2 needs, but do NOT enable it by default, and do not judge residency here. At TP=2 each
+rank holds its whole ~82 GB half and there is no competing page cache, which is the only regime where the
+arithmetic is unambiguous.
+BUILD NOTES (three failed builds before it ran, all my own):
+  * `ech`/`est` needed `borrow(...)` AT THE CALL SITE and on the SAME LINE as the last argument; on a
+    continuation line the parser reported "Prefix 'borrow expr' syntax is no longer supported". Inside the
+    function they are passed to res_get_host WITHOUT borrow (propagating an existing borrow).
+  * a `replace(first)` on the read lines patched `tail_site` (line 3307) instead of `moe_tail_step` (4407),
+    because the same 9 read lines exist in both. It failed with "Undefined identifier: est/ekey" -- which is
+    the compiler telling you the edit landed in the wrong function. Reverted and re-applied within the
+    definition's line range.

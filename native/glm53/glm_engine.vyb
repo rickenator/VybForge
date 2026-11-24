@@ -4407,7 +4407,8 @@ share(all)
 moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, total<Int>, mapbody<String>,
               gt<GxLoc>, fgemm<Int>, fbf<Int>, fdeq32<Int>, fdqs<Int>, fhad132<Int>, fhad232<Int>, fcvt32<Int>, hdg32<Int>,
               arA<Int>, arB<Int>, arC<Int>, arD<Int>, arG<Int>, arH<Int>, arI<Int>, mapdev<Int>, invbase<Int>,
-              fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>)<Vec<Float>> -> {
+              fcast32<Int>, fgp<Int>, fgr<Int>, pb32<Int>,
+              ech<their<Vec<String>>>, est<their<Vec<Int>>>, ekey<Int>)<Vec<Float>> -> {
     ms0<Int> = time_mono_millis()
     nonev<Vec<Float>> = Vec()
     best<Int> = 0
@@ -4686,25 +4687,25 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
             if (nfound != w2.len()) { println("CHAIN_FAIL resolve expert " + e.to_string()); return nonev }
 
             msKres<Int> = time_mono_millis()
-            g_ge_2 = gx_read(ge, 2)
-            g_ge_1 = gx_read(ge, 1)
-            g_ge_0 = gx_read(ge, 0)
+            g_ge_2 = res_get_host(ech, est, ekey + e * 9 + 2, ge, 2)
+            g_ge_1 = res_get_host(ech, est, ekey + e * 9 + 1, ge, 1)
+            g_ge_0 = res_get_host(ech, est, ekey + e * 9 + 0, ge, 0)
             dWg<Int> = 0
             if (fdecOn == 0) {
                 dWg = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_0, g_ge_1,
                                  g_ge_2, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
-            g_ge_5 = gx_read(ge, 5)
-            g_ge_4 = gx_read(ge, 4)
-            g_ge_3 = gx_read(ge, 3)
+            g_ge_5 = res_get_host(ech, est, ekey + e * 9 + 5, ge, 5)
+            g_ge_4 = res_get_host(ech, est, ekey + e * 9 + 4, ge, 4)
+            g_ge_3 = res_get_host(ech, est, ekey + e * 9 + 3, ge, 3)
             dWu<Int> = 0
             if (fdecOn == 0) {
                 dWu = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_3, g_ge_4,
                                  g_ge_5, body, EINTER, 32768, hdg32, arA, arB, arC, arD, arG, arH, arI, mapdev, invbase)
             }
-            g_ge_8 = gx_read(ge, 8)
-            g_ge_7 = gx_read(ge, 7)
-            g_ge_6 = gx_read(ge, 6)
+            g_ge_8 = res_get_host(ech, est, ekey + e * 9 + 8, ge, 8)
+            g_ge_7 = res_get_host(ech, est, ekey + e * 9 + 7, ge, 7)
+            g_ge_6 = res_get_host(ech, est, ekey + e * 9 + 6, ge, 6)
             dWd<Int> = 0
             if (fdecOn == 0) {
                 dWd = exl3_deq32(fdeq32, fdqs, fhad132, fhad232, fcvt32, g_ge_6, g_ge_7,
