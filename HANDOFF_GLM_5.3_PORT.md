@@ -7478,3 +7478,20 @@ parse the entry without copying, or precompute an (layer,expert) offset table on
 READ still ~100 ms for ~100 MB = ~1 GB/s, i.e. now at the disk's measured sequential rate, so the read path
 is no longer obviously inefficient -- the earlier 555 MB/s figure needs re-measuring on a cold cache before
 any more read work is justified.
+=== ROUND 190: RESOLVER 60 -> 12 ms (ONE-LINE WINDOW FIX); LOOP 350 -> 103 ms ===
+Narrowed the resolve window from ~68 KB to ~8.7 KB (forward-biased: [lastp-512, lastp+8192]). An expert's
+9 entries are adjacent index lines, so a tight forward window is the right shape.
+    before (round 189): res=60  read=100  proj=46  loop=230
+    after             : res=12  read=44   proj=35  loop=103      (6 layers agree, 8-15 / 42-48 / 30-38)
+ATTRIBUTION, stated carefully because the run is not clean:
+  * res 60 -> 12 ms is CPU work and is REAL (~48 ms/layer, and 85 -> 12 ms from round 188).
+  * read 100 -> 44 ms happened with NO code change touching reads -> page-cache warming between runs, NOT a
+    fix. Do not bank it. This is the third time in this session that a read number moved for cache reasons.
+  * proj 46 -> 35 is inside the noise of a warm run; not claimed.
+So: reproducible gain this round ~48 ms/layer on the resolver; the loop's fall from 350 to 103 mixes two
+code fixes (resolve windowing: 350 -> 230 -> 103) with cache warming on the read side.
+CUMULATIVE on the MoE layer, code-only: 350 -> ~103 ms in the warm state, with res now 12 ms.
+WHAT DOMINATES NOW (warm): read 44 ms, proj 30-38 ms, res 8-15 ms. On a COLD cache the read will be back
+near 180 ms, so read is still the biggest real term and the open-once-per-expert / windowed-read work is
+the next honest target -- but it must be measured cold, which needs a way to drop page cache (root) or a
+paired cold/warm comparison designed up front.

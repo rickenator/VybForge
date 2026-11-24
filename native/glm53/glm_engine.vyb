@@ -1218,9 +1218,9 @@ gx_resolve_tab(tab<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -
         key = want.get(i) + " "
         p<Int> = -1
         if (lastp >= 0) {
-            ws<Int> = lastp - 4096
+            ws<Int> = lastp - 512
             if (ws < 0) { ws = 0 }
-            we<Int> = lastp + 65536
+            we<Int> = lastp + 8192
             if (we > tab.len()) { we = tab.len() }
             if (we > ws) {
                 win<String> = tab.substring(ws, we)
