@@ -4256,6 +4256,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     d_gw<Int> = deq_bf16(fbf, g_g_0, NE * H, H)
     if (d_gw == 0) { return nonev }
     logits<Vec<Float>> = mm_host(h2, R, H, d_gw, NE, fgemm)
+    mR2<Int> = time_mono_millis()      # end of router (moe_tail_step)
     freedom {
         cuMemFree_v2(d_gw)
     }
@@ -4474,6 +4475,7 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
     msS<Int> = time_mono_millis()
     println("  routed experts used: " + nex.to_string())
 
+    mE2<Int> = time_mono_millis()      # end of the expert loop
     # ---- shared expert ----
     w3<Vec<String>> = Vec()
     w3.push(lpre + "mlp.shared_experts.gate_proj.weight")
@@ -4514,7 +4516,12 @@ moe_tail_step(streams1<Vec<Float>>, lpre<String>, tab<String>, dir<String>, tota
         i = i + 1
     }
 
+    mS2<Int> = time_mono_millis()      # end of the shared expert + combine
     streams2<Vec<Float>> = hc_apply(streams1, mlp, post2, comb2)
+    mH2<Int> = time_mono_millis()      # end of hc_apply
+    println("SEC_MOE2 router=" + (mR2 - ms0).to_string() + " experts=" + (mE2 - mR2).to_string() +
+            " shared=" + (mS2 - mE2).to_string() + " combine+hc=" + (mH2 - mS2).to_string() +
+            " total=" + (mH2 - ms0).to_string())
     println("SEC moestage share=" + (time_mono_millis() - msS).to_string())
     if (fdecOn == 1) { fdec_free(dQd, dLUTd, dsud, dsvd, dsub64d, dxfd, dxhd, dyrd, dypd, pPd) }
     return streams2
