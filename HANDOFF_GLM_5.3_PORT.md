@@ -7282,3 +7282,24 @@ WHY THIS IS THE NEXT HOG: at ~550 us per gemm call and roughly 20-30 calls per M
 projections plus attention projections), the layer costs 11-16 ms of pure per-call time -- the same order
 as the 967 ms/layer we could never attribute. A faster kernel helps every layer of the single-node path,
 independent of whether TP ever lands.
+=== ROUND 181: BATCHING DOES NOT HELP -- THE KERNEL ITSELF TAKES ~540 us ===
+The decision that round 180 left open was: is the ~550 us per gemm call LAUNCH/serialisation overhead
+(fix: fewer or batched calls, or a captured graph) or the KERNEL's own execution time (fix: a blocked
+kernel)? Measured directly, same shape (M=4, N=2048, K=2048), same binary:
+    single call                 : 558 us
+    10 back-to-back, ONE sync   : 5384 us total -> 538 us per call
+Batching with a single synchronisation changes the per-call cost by 4%. So the cost is the KERNEL, not the
+launch or the sync, and reducing the NUMBER of calls will not buy anything. (Ten kernels on one stream
+execute in sequence, so this is a clean measurement of kernel duration rather than a lost-overlap test.)
+DECISION: BLOCK THE KERNEL. Register baking with several outputs per thread and a K-split, which is
+exactly what bfgemm8 already does for f32 (~537 GFLOP/s measured, 9-36x this kernel). At M=1 (the decode
+case) blocking on N is the lever: one thread computing several output columns reuses its A element and
+amortises the B loads, and the K-chain stops being a single serial run per thread.
+DYNAMIC CALL COUNT, measured from the production MoE (moe_tail_step): the loop walks all 288 experts but
+only enters the body when nt > 0, so with R=1 and ROUTE_TOPK=8 exactly 8 experts do work per layer ->
+~24 projection calls + 8 dequantises + ~100 MB of trellis reads per layer per token. At ~540 us of kernel
+time per call that is ~13 ms/layer of pure kernel latency -- the right order for the 967 ms/layer that
+could never be attributed, and it is fixed by making each call faster, not fewer.
+CORRECTION TO MY OWN RUN: this run reported maxabs=16/maxrel=8 because I had inserted the batch loop
+BEFORE the readback, so it overwrote dC with one rank's unreduced partial. Bit-exactness was verified in
+two earlier runs (maxabs=0); the ordering is now fixed so the comparison cannot be polluted again.

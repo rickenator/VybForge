@@ -212,15 +212,37 @@ main()<Int> -> {
     gemm_us<Int> = (t1 - t0) / 1000
     comm_us<Int> = (t2 - tw0) / 1000
     pack_us<Int> = (tp1 - tp0) / 1000
+    if (maxrel < 0.000000001) { println("TPG_TOLERANCE_OK") } else { println("TPG_TOLERANCE_FAIL") }
+
+    # BATCHED LAUNCH TEST -- the number that decides the next fix.
+    # Ten launches back-to-back with ONE sync at the end. If the per-call cost collapses, the ~550 us is
+    # launch/serialisation overhead and the fix is fewer or batched launches (or a captured graph). If it
+    # stays ~550 us, each kernel genuinely takes that long (a latency chain) and the fix is a blocked
+    # kernel. Same work, same shape, only the sync pattern differs.
+    NB<Int> = 10
+    tb0<Int> = clock_ns()
+    bi2<Int> = 0
+    while (bi2 < NB) {
+        if (gemm(hgemm, dScr, dA, dB, dC, M, N, KH, 1.0, 0.0) != 0) { println("TPG_FAIL batch gemm"); return 19 }
+        bi2 = bi2 + 1
+    }
+    sync()
+    tb1<Int> = clock_ns()
+    batch_us<Int> = (tb1 - tb0) / 1000
+    percall_us<Int> = batch_us / NB
+
     println("TPG_RESULT rank=" + rank.to_string()
         + " gemm_us=" + gemm_us.to_string() + " comm_us=" + comm_us.to_string()
         + " pack_us=" + pack_us.to_string()
         + " gflops=" + gflops_str(M, N, KH, gemm_us)
+        + " batch10_us=" + batch_us.to_string() + " percall_us=" + percall_us.to_string()
         + " maxabs=" + maxabs.to_string() + " maxrel=" + maxrel.to_string()
         + " ref0=" + refv.get(0).to_string() + " got0=" + got.get(0).to_string())
 
     # tolerance: values are O(1e3..1e4) sums of small integers, so f64 error should be ~1e-10 relative
-    if (maxrel < 0.000000001) { println("TPG_TOLERANCE_OK") } else { println("TPG_TOLERANCE_FAIL") }
+
+
+
     freedom { ncclCommDestroy(comm) }
     return 0
 }
