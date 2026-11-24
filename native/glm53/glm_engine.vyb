@@ -1208,10 +1208,28 @@ gx_resolve_tab(tab<String>, dir<String>, total<Int>, want<Vec<String>>)<GxLoc> -
         g.paths.push("")
         i = i + 1
     }
+    # Windowed lookup. tab.index_of(key) scans the WHOLE ~7 MB index text, and the MoE expert path calls
+    # this 9x per expert (measured ~1.2 ms per name -> ~86 ms per layer). An expert's 9 tensors are
+    # ADJACENT in the index, so after the first hit the rest can be found in a small window around it.
+    # The full scan remains the fallback, so a miss (or an out-of-order index) cannot change behaviour.
+    lastp<Int> = -1
     i = 0
     while (i < want.len()) {
         key = want.get(i) + " "
-        p = tab.index_of(key)
+        p<Int> = -1
+        if (lastp >= 0) {
+            ws<Int> = lastp - 4096
+            if (ws < 0) { ws = 0 }
+            we<Int> = lastp + 65536
+            if (we > tab.len()) { we = tab.len() }
+            if (we > ws) {
+                win<String> = tab.substring(ws, we)
+                q<Int> = win.index_of(key)
+                if (q >= 0) { p = ws + q }
+            }
+        }
+        if (p < 0) { p = tab.index_of(key) }
+        if (p >= 0) { lastp = p }
         if (p >= 0) {
             k = p
             fld = 0

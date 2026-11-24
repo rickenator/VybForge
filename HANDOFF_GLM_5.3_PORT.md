@@ -7458,3 +7458,23 @@ FIXES, cheapest first:
     the 9 tensors are contiguous, one windowed read sliced in memory). Target 100 MB/layer at 1.1 GB/s is
     ~91 ms instead of 180.
 TOGETHER: ~175 ms/layer of the 360 ms loop, ~7.9 s/token at 45 layers, with no kernel work involved.
+=== ROUND 189: WINDOWED RESOLVE -- res 85 -> 60 ms, layer loop 350 -> 230 ms ===
+Changed gx_resolve_tab to search a WINDOW around the previous hit instead of scanning the whole ~7 MB
+index per name, keeping the full scan as the fallback so a miss or an out-of-order index cannot change
+behaviour (an expert's 9 tensors are adjacent in the index, so this is the expected case).
+MEASURED, NLAY=12, 8 experts/layer:
+    before: res=85  read=180  proj=48  loop=350
+    after : res=60  read=100  proj=46  loop=230     (5 layers agree; one cold layer 367)
+  * res 85 -> 60 ms is CPU work, so that gain is REAL (~30%).
+  * loop 350 -> 230 ms, ~1.5x on the MoE layer.
+  * read 180 -> 100 ms is NOT claimed: reads are page-cache dependent and this is a different run against a
+    warmer cache. The session has already been burned twice by exactly that confound.
+  * digest line count unchanged (27); values were not diffed, so treat correctness as "same shape, not
+    yet proven identical" until a digest comparison is run.
+STILL OPEN: res = 60 ms per layer (~26% of the loop). The window removed the 7 MB scans but what remains is
+the per-expert FIRST full scan (8 per layer), the ~68 KB substring copies (9 per expert), and the
+byte-at-a-time field parse. Next levers there: widen the window reuse so one scan serves several experts,
+parse the entry without copying, or precompute an (layer,expert) offset table once.
+READ still ~100 ms for ~100 MB = ~1 GB/s, i.e. now at the disk's measured sequential rate, so the read path
+is no longer obviously inefficient -- the earlier 555 MB/s figure needs re-measuring on a cold cache before
+any more read work is justified.
