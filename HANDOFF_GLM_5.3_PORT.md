@@ -7079,3 +7079,24 @@ WHAT SURVIVES AS EVIDENCE: fixed ~900 ms; lands at random; 1-4 per run; unaffect
 far. That is equally the signature of an EXTERNAL GPU user. Prior practice only checked for foreign
 compute processes BEFORE a run, never during one. Now sampling nvidia-smi compute-apps + utilization every
 2 s across a whole run -- if another PID appears at the stalls, the entire "hog" is contention, not code.
+=== ROUND 173: ARENA VERIFIED CORRECT -- 27 DIGESTS IDENTICAL, A/B IN ONE BINARY ===
+Added a P6_ARENA=0 kill-switch that forces the original allocate-per-call dequantiser, so the same binary
+can be A/B tested on identical inputs and identical tensor sizes. Result at NLAY=12:
+    arena ON  : attn/streams1 digest lines 27, SEC_ATTN 65 / 39 / 937
+    arena OFF : attn/streams1 digest lines 27, SEC_ATTN 954 / 939 / 40
+    diff of the 27 digest lines: 0 lines
+So relocating every dequantise buffer into one arena is numerically transparent -- the arena is CORRECT,
+not merely fast. Ship it with the kill switch.
+CORRECTNESS NOTE: the one remaining risk this test does not cover is an arena tensor still being LIVE
+when the cursor rewinds at the next layer boundary. That cannot be observed in digests because the rewind
+happens after the layer's outputs are consumed; it is guarded by construction (rewind sits between the
+attention call and the layer return, when nothing from the previous layer is referenced).
+TIMING SUMMARY FOR THE DSA PATH (3 layers at NLAY=12):
+    round 168 baseline : 959 + 943 + 940  = ~2842 ms
+    clean run (no hitch): 59 + 34 + 36     = ~129 ms      -> ~22x on the attention work itself
+    run with hitches   : dominated by 1-2 x ~900 ms, and those hitches still occur in both arena modes,
+                         so they are independent of everything the arena changed.
+Remaining: the intermittent ~900 ms event (0 to 4 per run; one run had ZERO, which is why it cannot be
+reproduced on demand). Ruled out by measurement: alloc/free churn (arena test), page-table teardown, host
+swap/reclaim/faults (vmstat identical), external GPU user (sampler saw only our own PID), size
+dependence, and stage dependence. What is left needs driver-level tracing rather than app-level timers.

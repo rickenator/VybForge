@@ -393,6 +393,11 @@ deq_bf16(faddr<Int>, raw<String>, n<Int>, z<Int>)<Int> -> {
 // would just move the allocation back into the loop.
 share(all)
 deq_bf16_arena(faddr<Int>, raw<String>, n<Int>, z<Int>, ar<their<Vec<Int>>>)<Int> -> {
+    # P6_ARENA=0 forces the original allocate-per-call path. This exists so the arena can be A/B tested
+    # on identical input in the same binary: the sizes of every tensor are unchanged, so any digest
+    # difference is a defect in the arena, not in the maths.
+    aoff<String> = env_get("P6_ARENA") else "1"
+    if (aoff == "0") { return deq_bf16(faddr, raw, n, z) }
     need<Int> = n * 8
     scratch<Int> = raw.len()
     var<Int> base = 0
