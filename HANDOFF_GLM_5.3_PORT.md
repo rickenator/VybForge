@@ -7238,3 +7238,24 @@ CAVEAT TO CARRY: all-to-all p90 is 375 us against a 31 us median, and that sprea
 token that is ~3-4 ms of tail jitter. Fix it before adopting EP.
 METHOD LESSON (the second time this session): never take a median from ~30 samples of a bimodal
 distribution -- report percentiles, and prefer 200 reps for anything that decides architecture.
+=== ROUND 179: TP SLICE WORKS BIT-EXACTLY, AND EXPOSES A GEMM-KERNEL HOG ===
+native/nccl/tp_gemm.vyb -- smallest real TP slice: row-parallel (split K), each rank computes a partial
+C[M*N], one all-reduce sums them, compared against the unsharded A@B on the same rank.
+RESULT, both ranks: maxabs=0 maxrel=0 TPG_TOLERANCE_OK. BIT-EXACT -- the integer-valued f64 sums are
+exact, so the sharded path reproduces the full result with no error at all, not merely within tolerance.
+The TP pattern is therefore proven end to end: correct, and ~8x cheaper than not sharding
+(halving the GEMM saves ~265 us, the collective costs ~31 us at steady state).
+THREE TIMING FACTS, one of which corrected a wrong guess of mine:
+  * pack_us = 55-57 for a 1x1x1 GEMM -> parameter packing is ~56 us, NOT the ~500 us I hypothesised from
+    the first run. Do not "optimise" the 8 htod_i calls on the strength of a guess.
+  * gemm_us = 531-562 for M=4,N=1024,K=2048 -- i.e. ~475 us of actual GEMM for 8.4 MFLOP, about 17
+    GFLOP/s. That is 1-2 orders below what the shape should reach, and the cause is the access pattern:
+    a thread-per-output kernel with M=4 reads B[:,n] COLUMN-WISE, so it moves ~134 MB uncoalesced instead
+    of 16.8 MB coalesced. ** This is a new, large hog candidate and it is in the kernel, not in comms. **
+  * comm_us = 820-842 on a SINGLE warm-up call is NOT steady state (the 200-rep bench measured 28-31 us
+    for the same 32 KB collective). NCCL needs several calls before it settles; never time a collective
+    from one warm-up.
+NEXT HOG CANDIDATE, ahead of further TP work: the gemm kernel's uncoalesced B access. Tile it or transpose
+B so the reduction dimension walks contiguously, then re-measure at the real MoE shapes
+(K=4096, N=2048, 8 experts). This affects every layer of the single-node path too, so it pays whether or
+not TP lands.

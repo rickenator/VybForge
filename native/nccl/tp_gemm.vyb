@@ -1,0 +1,215 @@
+// tp_gemm.vyb -- smallest end-to-end slice of tensor parallelism: shard ONE matmul across the pair,
+// all-reduce the partial sums, and check the result against the unsharded computation.
+//
+// This is the pattern every TP layer reuses: row-parallel splits K, each rank computes a partial
+// C[M*N], one all-reduce sums them. If this is correct and its cost matches the prediction, extending
+// to real layers is repetition rather than new design.
+//
+// It also answers the question predictions cannot: does TP actually halve the per-layer time at decode?
+// At decode the GEMM is bound by the weight matrix (K*N), so halving K halves each node's weight read.
+// The prototype measures both paths rather than arguing about them.
+//
+//   lefty :  RANK=0 WORLD=2 PORT=18430 ...
+//   righty:  RANK=1 WORLD=2 PEER_IP=192.168.192.1 PORT=18430 ...
+import io
+import env
+import time
+import tensor::{tensor_init, dev_alloc, module_load_path, module_func, bulk_htod, bulk_dtoh, sync, gemm}
+import network::{socket_open, socket_bind, socket_listen, socket_accept, socket_connect, socket_send, socket_recv, socket_close}
+
+share(all)
+clock_gettime(clk<CInt>, tp<loc<CVoid>>)<CInt>
+
+share(all)
+ncclGetUniqueId(uid<String>)<CInt>
+
+share(all)
+ncclCommInitRank(comm<loc<Int>>, nranks<Int>, uid<loc<CVoid>>, rank<Int>)<CInt>
+
+share(all)
+ncclAllReduce(sendbuff<Int>, recvbuff<Int>, count<Int>, datatype<CInt>, op<CInt>, comm<Int>, stream<Int>)<CInt>
+
+share(all)
+ncclCommDestroy(comm<Int>)<CInt>
+
+share(all)
+nccl_sum()<CInt> -> { return 0 }
+
+share(all)
+nccl_f64()<CInt> -> { return 8 }
+
+clock_ns()<Int> -> {
+    ts<Vec<Int>> = Vec()
+    ts.push(0)
+    ts.push(0)
+    freedom {
+        hdr<loc<Int>> = from<loc<Int>>(addr(ts))
+        dp<Int> = at(hdr)
+        if (dp != 0) { clock_gettime(1, from<loc<CVoid>>(dp)) }
+    }
+    return ts.get(0) * 1000000000 + ts.get(1)
+}
+
+blanks(n<Int>)<String> -> {
+    s<String> = "0123456789"
+    while (s.len() < n) { s = s + s }
+    return s.substring(0, n)
+}
+
+main()<Int> -> {
+    rs<String> = env_get("RANK") else "0"
+    ws<String> = env_get("WORLD") else "2"
+    ps<String> = env_get("PORT") else "18430"
+    peer<String> = env_get("PEER_IP") else "192.168.192.1"
+    rank<Int> = rs.to_int()
+    world<Int> = ws.to_int()
+    port<Int> = ps.to_int()
+
+    # Decode-shaped: few tokens, full hidden, an MoE-sized output. B (the weight) dominates the data.
+    M<Int> = 4
+    K<Int> = 4096
+    N<Int> = 1024
+    KH<Int> = K / world          # this rank's slice of the reduction dimension
+    KOFF<Int> = rank * KH
+
+    if (tensor_init() != 0) { println("TPG_FAIL cuda init"); return 1 }
+    println("TPG rank=" + rank.to_string() + " M=" + M.to_string() + " K=" + K.to_string()
+        + " N=" + N.to_string() + " KH=" + KH.to_string() + " KOFF=" + KOFF.to_string())
+
+    # ---- rendezvous ----
+    uid<String> = blanks(128)
+    if (rank == 0) {
+        grc<Int> = 0
+        freedom { grc = (ncclGetUniqueId(uid) as Int) }
+        if (grc != 0) { println("TPG_FAIL getuid"); return 2 }
+        fd<Int> = socket_open(2, 1, 0) else 0
+        o1<Bool> = socket_bind(fd, "0.0.0.0", port) else false
+        o2<Bool> = socket_listen(fd, 4) else false
+        if (!o1 || !o2) { println("TPG_FAIL bind/listen"); return 3 }
+        println("TPG listening")
+        c<Int> = socket_accept(fd) else 0
+        socket_send(c, uid)
+        socket_close(c)
+        socket_close(fd)
+    } else {
+        d<Int> = socket_open(2, 1, 0) else 0
+        oc<Bool> = socket_connect(d, peer, port) else false
+        if (!oc) { println("TPG_FAIL connect"); return 4 }
+        got<String> = socket_recv(d, 256) else ""
+        if (got.len() < 128) { println("TPG_FAIL uid"); return 5 }
+        uid = got.substring(0, 128)
+        socket_close(d)
+    }
+    comm<Int> = 0
+    var<Int> irc = 0
+    freedom { irc = (ncclCommInitRank(loc(comm), world, uid, rank) as Int) }
+    if (irc != 0) { println("TPG_FAIL commInitRank rc=" + irc.to_string()); return 6 }
+
+    # ---- deterministic data, IDENTICAL on both ranks (so the reference is comparable) ----
+    # A: M*K, B: K*N, both small-magnitude integers so f64 sums are well conditioned.
+    Av<Vec<Float>> = Vec()
+    ai<Int> = 0
+    while (ai < M * K) { Av.push(((ai % 7) - 3) as Float) ; ai = ai + 1 }
+    Bv<Vec<Float>> = Vec()
+    bi<Int> = 0
+    while (bi < K * N) { Bv.push(((bi % 5) - 2) as Float) ; bi = bi + 1 }
+
+    dA<Int> = dev_alloc(M * K * 8)
+    dB<Int> = dev_alloc(K * N * 8)
+    dC<Int> = dev_alloc(M * N * 8)
+    dPart<Int> = dev_alloc(M * N * 8)
+    dScr<Int> = dev_alloc(64)
+    if (dA == 0 || dB == 0 || dC == 0 || dPart == 0 || dScr == 0) { println("TPG_FAIL alloc"); return 7 }
+    if (bulk_htod(dA, view(Av)) != 0) { println("TPG_FAIL htod A"); return 8 }
+    if (bulk_htod(dB, view(Bv)) != 0) { println("TPG_FAIL htod B"); return 9 }
+    sync()
+
+    fgemm<Int> = module_load_path("native/build/gemm.ptx")
+    hgemm<Int> = module_func(fgemm, "gemm")
+    if (hgemm == 0) { println("TPG_FAIL kernel"); return 10 }
+
+    # ---- reference: full C = A @ B on one rank ----
+    if (gemm(hgemm, dScr, dA, dB, dC, M, N, K, 1.0, 0.0) != 0) { println("TPG_FAIL gemm ref"); return 11 }
+    sync()
+    refv<Vec<Float>> = bulk_dtoh(dC, M * N)
+
+    # ---- tensor-parallel: each rank computes A[:, KOFF..KOFF+KH) @ B[KOFF.., :] ----
+    # A's column slice is strided in row-major, so gather it host-side; B's row slice is contiguous.
+    Ah<Vec<Float>> = Vec()
+    r0<Int> = 0
+    while (r0 < M) {
+        c0<Int> = 0
+        while (c0 < KH) { Ah.push(Av.get(r0 * K + KOFF + c0)) ; c0 = c0 + 1 }
+        r0 = r0 + 1
+    }
+    Bh<Vec<Float>> = Vec()
+    b0<Int> = 0
+    while (b0 < KH * N) { Bh.push(Bv.get(KOFF * N + b0)) ; b0 = b0 + 1 }
+
+    dAh<Int> = dev_alloc(M * KH * 8)
+    dBh<Int> = dev_alloc(KH * N * 8)
+    if (dAh == 0 || dBh == 0) { println("TPG_FAIL alloc half"); return 12 }
+    if (bulk_htod(dAh, view(Ah)) != 0) { println("TPG_FAIL htod Ah"); return 13 }
+    if (bulk_htod(dBh, view(Bh)) != 0) { println("TPG_FAIL htod Bh"); return 14 }
+    sync()
+
+    t0<Int> = clock_ns()
+    if (gemm(hgemm, dScr, dAh, dBh, dPart, M, N, KH, 1.0, 0.0) != 0) { println("TPG_FAIL gemm half"); return 15 }
+    sync()
+    t1<Int> = clock_ns()
+
+    # WARM-UP the collective before timing it. The first all-reduce on a fresh communicator pays
+    # connection establishment (~1.25 s measured), which is not the steady-state cost the design needs.
+    # ncclAllReduce overwrites recv each call, so a warm-up does not pollute the result.
+    var<Int> arc = 0
+    freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+    sync()
+    if (arc != 0) { println("TPG_FAIL warmup rc=" + arc.to_string()); return 16 }
+
+    # time the steady-state collective
+    tw0<Int> = clock_ns()
+    freedom { arc = (ncclAllReduce(dPart, dC, M * N, nccl_f64(), nccl_sum(), comm, 0) as Int) }
+    sync()
+    t2<Int> = clock_ns()
+    if (arc != 0) { println("TPG_FAIL allreduce rc=" + arc.to_string()); return 17 }
+
+    # and time an EMPTY gemm launch to isolate the parameter-packing overhead from the arithmetic
+    tp0<Int> = clock_ns()
+    if (gemm(hgemm, dScr, dA, dB, dC, 1, 1, 1, 1.0, 0.0) != 0) { println("TPG_FAIL gemm tiny"); return 18 }
+    sync()
+    tp1<Int> = clock_ns()
+
+    got<Vec<Float>> = bulk_dtoh(dC, M * N)
+
+    # ---- compare: FP sum order differs (two partials vs one reduction), so this is a tolerance test,
+    # not a bit-exact one -- and it is stated as such rather than pretended otherwise.
+    maxabs<Float> = 0.0
+    maxrel<Float> = 0.0
+    i<Int> = 0
+    while (i < M * N) {
+        d<Float> = got.get(i) - refv.get(i)
+        if (d < 0.0) { d = 0.0 - d }
+        if (d > maxabs) { maxabs = d }
+        a<Float> = refv.get(i)
+        if (a < 0.0) { a = 0.0 - a }
+        if (a > 0.0) {
+            rr<Float> = d / a
+            if (rr > maxrel) { maxrel = rr }
+        }
+        i = i + 1
+    }
+
+    gemm_us<Int> = (t1 - t0) / 1000
+    comm_us<Int> = (t2 - tw0) / 1000
+    pack_us<Int> = (tp1 - tp0) / 1000
+    println("TPG_RESULT rank=" + rank.to_string()
+        + " gemm_us=" + gemm_us.to_string() + " comm_us=" + comm_us.to_string()
+        + " pack_us=" + pack_us.to_string()
+        + " maxabs=" + maxabs.to_string() + " maxrel=" + maxrel.to_string()
+        + " ref0=" + refv.get(0).to_string() + " got0=" + got.get(0).to_string())
+
+    # tolerance: values are O(1e3..1e4) sums of small integers, so f64 error should be ~1e-10 relative
+    if (maxrel < 0.000000001) { println("TPG_TOLERANCE_OK") } else { println("TPG_TOLERANCE_FAIL") }
+    freedom { ncclCommDestroy(comm) }
+    return 0
+}
